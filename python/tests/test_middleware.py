@@ -443,7 +443,7 @@ class TestMiddlewareMetadata:
             assert data["session_id"] == "sess-abc"
 
     def test_rust_arg_prebinding_missing_value_falls_back_to_injector(self):
-        """Missing prebound values must fall back to injector to preserve 422 semantics."""
+        """Missing required prebound values now short-circuit with 422 in Rust."""
         api = BoltAPI()
 
         @api.get("/requires-header")
@@ -470,10 +470,10 @@ class TestMiddlewareMetadata:
             assert response.status_code == 422
             assert response.json()["detail"] == "Missing required header: x-api-key"
 
-        assert calls["count"] == 1
+        assert calls["count"] == 0
 
     def test_rust_arg_prebinding_keeps_injector_path_when_python_middleware_present(self):
-        """Prebound args/kwargs are not used when Python middleware chain is active."""
+        """Prebound args/kwargs are used even when Python middleware chain is active."""
         class PassThroughMiddleware(Middleware):
             call_count = 0
 
@@ -506,7 +506,7 @@ class TestMiddlewareMetadata:
             assert response.status_code == 200
             assert response.json() == {"item_id": 42, "q": "hello"}
 
-        assert calls["count"] == 1
+        assert calls["count"] == 0
         assert PassThroughMiddleware.call_count == 1
 
 
@@ -543,9 +543,10 @@ class TestMiddlewareExecution:
 
         # Dispatch with handler_id
         result = await api._dispatch(handler, test_request, handler_id)
-        status, headers, body = result
+        status, meta, body_kind, body = result
 
         assert status == 200
+        assert body_kind == "bytes"
         data = json.loads(body)
         assert "has_context" in data
 
@@ -589,9 +590,10 @@ class TestMiddlewareExecution:
         handler_id = 0  # First registered handler
         handler = api._handlers[handler_id]
         result = await api._dispatch(handler, test_request, handler_id)
-        status, headers, body = result
+        status, meta, body_kind, body = result
 
         assert status == 200
+        assert body_kind == "bytes"
         data = msgspec.json.decode(body)
         assert data["id"] == 1
         assert data["name"] == "Test"

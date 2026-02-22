@@ -276,7 +276,8 @@ class TestSerializationWithCookies:
     def test_plaintext_serialization_includes_cookies(self):
         """Test that PlainText serialization includes raw cookie tuples for Rust."""
         response = PlainText("Hello").set_cookie("greeting", "sent")
-        status, meta, body = serialize_plaintext_response(response)
+        status, meta, body_kind, body = serialize_plaintext_response(response)
+        assert body_kind == "bytes"
         # Verify ResponseMeta format: (response_type, custom_ct, custom_headers, cookies)
         assert isinstance(meta, tuple)
         assert len(meta) == 4
@@ -291,7 +292,8 @@ class TestSerializationWithCookies:
     def test_html_serialization_includes_cookies(self):
         """Test that HTML serialization includes raw cookie tuples for Rust."""
         response = HTML("<h1>Hi</h1>").set_cookie("page", "home")
-        status, meta, body = serialize_html_response(response)
+        status, meta, body_kind, body = serialize_html_response(response)
+        assert body_kind == "bytes"
         assert isinstance(meta, tuple)
         response_type, custom_ct, custom_headers, cookies = meta
         assert response_type == "html"
@@ -303,7 +305,8 @@ class TestSerializationWithCookies:
     def test_redirect_serialization_includes_cookies(self):
         """Test that Redirect serialization includes raw cookie tuples for Rust."""
         response = Redirect("/dashboard").set_cookie("redirected", "true")
-        status, meta, body = serialize_redirect_response(response)
+        status, meta, body_kind, body = serialize_redirect_response(response)
+        assert body_kind == "bytes"
         assert isinstance(meta, tuple)
         response_type, custom_ct, custom_headers, cookies = meta
         assert response_type == "redirect"
@@ -315,7 +318,8 @@ class TestSerializationWithCookies:
     def test_multiple_cookies_in_serialization(self):
         """Test that multiple cookies produce multiple raw tuples for Rust."""
         response = PlainText("OK").set_cookie("a", "1").set_cookie("b", "2").set_cookie("c", "3")
-        status, meta, body = serialize_plaintext_response(response)
+        status, meta, body_kind, body = serialize_plaintext_response(response)
+        assert body_kind == "bytes"
         assert isinstance(meta, tuple)
         response_type, custom_ct, custom_headers, cookies = meta
         assert cookies is not None
@@ -346,7 +350,8 @@ class TestAsyncSerializationWithCookies:
         from django_bolt.serialization import serialize_json_response
 
         response = JSON({"ok": True}).set_cookie("api_token", "secret123", httponly=True)
-        status, meta, body = await serialize_json_response(response, None, None)
+        status, meta, body_kind, body = await serialize_json_response(response, None, None)
+        assert body_kind == "bytes"
         assert isinstance(meta, tuple)
         response_type, custom_ct, custom_headers, cookies = meta
         assert response_type == "json"
@@ -362,7 +367,8 @@ class TestAsyncSerializationWithCookies:
         from django_bolt.serialization import serialize_generic_response
 
         response = Response({"status": "logged_in"}).set_cookie("session", "xyz", secure=True)
-        status, meta, body = await serialize_generic_response(response, None, None)
+        status, meta, body_kind, body = await serialize_generic_response(response, None, None)
+        assert body_kind == "bytes"
         assert isinstance(meta, tuple)
         response_type, custom_ct, custom_headers, cookies = meta
         assert cookies is not None

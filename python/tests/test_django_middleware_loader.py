@@ -257,8 +257,7 @@ class TestMiddlewareHTTPCycle:
 
     def test_custom_middleware_adds_header(self):
         """Test custom middleware runs and adds response header."""
-        api = BoltAPI()
-        api._middleware = [DjangoMiddlewareStack([CustomHeaderMiddleware])]
+        api = BoltAPI(middleware=[DjangoMiddlewareStack([CustomHeaderMiddleware])])
 
         @api.get("/test")
         async def test_route():
@@ -273,8 +272,7 @@ class TestMiddlewareHTTPCycle:
     def test_middleware_execution_order(self):
         """Test middleware executes in correct order (both request and response phases)."""
         # This test verifies middleware runs by checking headers added during response phase
-        api = BoltAPI()
-        api._middleware = [DjangoMiddlewareStack([CustomHeaderMiddleware])]
+        api = BoltAPI(middleware=[DjangoMiddlewareStack([CustomHeaderMiddleware])])
 
         @api.get("/test")
         async def test_route():
@@ -339,8 +337,7 @@ class TestMiddlewareHTTPCycle:
     def test_middleware_with_exclude_config(self):
         """Test that excluded middleware doesn't run."""
         # Create middleware stack with one middleware excluded
-        api = BoltAPI()
-        api._middleware = [DjangoMiddlewareStack([CustomHeaderMiddleware])]
+        api = BoltAPI(middleware=[DjangoMiddlewareStack([CustomHeaderMiddleware])])
 
         @api.get("/test")
         async def test_route():

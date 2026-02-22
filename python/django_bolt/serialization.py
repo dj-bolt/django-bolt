@@ -149,9 +149,9 @@ def _dispatch_non_json_type(
     if isinstance(result, HTML):
         return serialize_html_response(result)
     if isinstance(result, (bytes, bytearray)):
-        return int(status_code), _RESPONSE_META_OCTETSTREAM, bytes(result)
+        return _wire_bytes(status_code, _RESPONSE_META_OCTETSTREAM, bytes(result))
     if isinstance(result, str):
-        return int(status_code), _RESPONSE_META_PLAINTEXT, result.encode()
+        return _wire_bytes(status_code, _RESPONSE_META_PLAINTEXT, result.encode())
     if isinstance(result, Redirect):
         return serialize_redirect_response(result)
     if isinstance(result, File):
