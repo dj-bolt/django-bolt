@@ -154,6 +154,17 @@ impl PyRequest {
         self.query_params.clone_ref(py)
     }
 
+    /// Get path params as a dict.
+    /// Values are pre-typed by Rust (int, float, bool, str).
+    ///
+    /// Example:
+    ///     id_ = request.query.get("id", 1)
+    #[getter]
+    #[inline]
+    fn params<'py>(&self, py: Python<'py>) -> Py<PyDict> {
+        self.path_params.clone_ref(py)
+    }
+
     /// Get the state dict for middleware to store arbitrary data.
     ///
     /// This follows the Starlette pattern where middleware can store

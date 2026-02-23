@@ -62,6 +62,9 @@ def extract_response_metadata(response_type: Any) -> dict[str, Any]:
                 # instead of loading all fields and converting to dict
                 fields = getattr(elem_type, "__annotations__", {})
                 metadata["response_field_names"] = list(fields.keys())
+    elif is_msgspec_struct(response_type):
+        fields = getattr(response_type, "__annotations__", {})
+        metadata["response_field_names"] = list(fields.keys())
 
     return metadata
 

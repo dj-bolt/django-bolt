@@ -1,5 +1,7 @@
 use pyo3::prelude::*;
 
+use crate::request::PyRequest;
+
 mod asgi_http;
 mod asgi_mounts;
 mod cookies;
@@ -51,6 +53,9 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         register_test_middleware_metadata, register_test_routes, register_test_websocket_routes,
         test_request,
     };
+
+    // Class
+    m.add_class::<PyRequest>()?;
 
     // Production server functions
     m.add_function(wrap_pyfunction!(register_routes, m)?)?;

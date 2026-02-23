@@ -13,6 +13,8 @@ from typing import (
     runtime_checkable,
 )
 
+from ._core import PyRequest
+
 if TYPE_CHECKING:
     from django.contrib.sessions.backends.base import SessionBase
 
@@ -62,6 +64,11 @@ class Request(Protocol):
         ...
 
     @property
+    def params(self) -> dict[str, str]:
+        """Path parameters"""
+        ...
+
+    @property
     def user(self) -> Any:
         """Authenticated user (set by middleware)"""
         ...
@@ -94,7 +101,16 @@ class Request(Protocol):
         """Django session (requires SessionMiddleware)"""
         ...
 
+    def __getitem__(self, name: str, /) -> Any:
+        """Support `request["args"]`"""
+        ...
+
+
+def is_request(request: Any):
+    return isinstance(request, PyRequest)
+
 
 __all__ = [
     "Request",
+    "is_request",
 ]

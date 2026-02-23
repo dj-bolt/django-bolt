@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 from asgiref.sync import sync_to_async
-from django.db.models import QuerySet
+from django.db.models import Model, QuerySet
 from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 
@@ -209,6 +209,8 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
     if isinstance(result, QuerySet):
         result_list = await sync_to_async(list, thread_sensitive=True)(result)
         return await serialize_json_data(result_list, response_tp, meta)
+    if isinstance(result, Model):
+        return await serialize_json_data(result, response_tp, meta)
 
     raise TypeError(
         f"Handler returned unsupported type {type(result).__name__!r}. "
@@ -300,6 +302,8 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
         return serialize_json_data_sync(result, response_tp, meta)
     elif isinstance(result, QuerySet):
         return serialize_json_data_sync(list(result), response_tp, meta)
+    elif isinstance(result, Model):
+        return serialize_json_data_sync(result, response_tp, meta)
 
     raise TypeError(
         f"Handler returned unsupported type {type(result).__name__!r}. "
