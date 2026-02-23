@@ -9,7 +9,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from django_bolt import _core
-from django_bolt.api import BoltAPI
+from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts
 
 try:
     from django.utils import autoreload
@@ -549,19 +549,4 @@ class Command(BaseCommand):
 
     def validate_asgi_mount_conflicts(self, routes, asgi_mounts):
         """Validate exact-path conflicts for ASGI mounts."""
-        if not asgi_mounts:
-            return
-
-        route_paths = {path for _method, path, _handler_id, _handler in routes}
-        seen_mounts = set()
-
-        for mount_prefix, _asgi_app in asgi_mounts:
-            if mount_prefix in seen_mounts:
-                raise CommandError(f"Duplicate ASGI mount prefix: {mount_prefix}")
-            seen_mounts.add(mount_prefix)
-
-            if mount_prefix in route_paths:
-                raise CommandError(
-                    f"ASGI mount prefix {mount_prefix} conflicts with an existing HTTP route "
-                    f"(exact collision is not allowed)."
-                )
+        _validate_asgi_mount_conflicts(routes, asgi_mounts, error_cls=CommandError)

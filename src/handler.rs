@@ -639,8 +639,15 @@ pub async fn handle_request(
             // - only after Bolt route miss
             // - only after trailing-slash/API-method near-miss checks above
             if let Some(asgi_mount) = find_asgi_mount(state.get_ref(), path) {
-                return asgi_http::handle_asgi_mount_request(req, payload, asgi_mount, state.debug)
-                    .await;
+                return asgi_http::handle_asgi_mount_request(
+                    req,
+                    payload,
+                    asgi_mount,
+                    state.debug,
+                    state.max_payload_size,
+                    state.asgi_mount_timeout,
+                )
+                .await;
             }
 
             // Handle OPTIONS preflight for non-existent routes

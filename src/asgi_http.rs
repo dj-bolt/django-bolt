@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 
 use crate::handler::handle_python_error;
@@ -21,6 +22,11 @@ struct AsgiResponseStart {
 struct AsgiSendState {
     response_start: Mutex<Option<AsgiResponseStart>>,
     body_tx: Mutex<Option<mpsc::UnboundedSender<Bytes>>>,
+}
+
+enum AwaitCoroutineError {
+    TimedOut,
+    Python(PyErr),
 }
 
 #[pyclass]
@@ -185,14 +191,20 @@ fn parse_asgi_body(message: &Bound<'_, PyDict>) -> PyResult<Vec<u8>> {
 }
 
 #[inline]
-fn parse_host_port(host: &str) -> (String, u16) {
+fn parse_host_port(host: &str, scheme: &str) -> (String, u16) {
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+
     if let Some(bracket_end) = host.find(']') {
         if host.len() > bracket_end + 2 && host.as_bytes()[bracket_end + 1] == b':' {
             if let Ok(port) = host[bracket_end + 2..].parse::<u16>() {
                 return (host[..bracket_end + 1].to_string(), port);
             }
         }
-        return (host[..bracket_end + 1].to_string(), 80);
+        return (host[..bracket_end + 1].to_string(), default_port);
     }
 
     if let Some((name, port)) = host.rsplit_once(':') {
@@ -201,7 +213,7 @@ fn parse_host_port(host: &str) -> (String, u16) {
         }
     }
 
-    (host.to_string(), 80)
+    (host.to_string(), default_port)
 }
 
 #[inline]
@@ -281,7 +293,7 @@ fn build_scope(py: Python<'_>, req: &HttpRequest, mount: &AsgiMount) -> PyResult
 
     scope.set_item("headers", headers)?;
 
-    let (server_host, server_port) = parse_host_port(conn_info.host());
+    let (server_host, server_port) = parse_host_port(conn_info.host(), conn_info.scheme());
     scope.set_item("server", (server_host, server_port))?;
 
     let client_host = conn_info
@@ -294,46 +306,83 @@ fn build_scope(py: Python<'_>, req: &HttpRequest, mount: &AsgiMount) -> PyResult
     Ok(scope.unbind())
 }
 
-async fn await_coroutine_on_task_loop(coroutine: Py<PyAny>) -> PyResult<Py<PyAny>> {
+async fn await_coroutine_on_task_loop(
+    coroutine: Py<PyAny>,
+    timeout: Duration,
+) -> Result<Py<PyAny>, AwaitCoroutineError> {
     tokio::task::spawn_blocking(move || {
-        Python::attach(|py| -> PyResult<Py<PyAny>> {
-            let locals = TASK_LOCALS
-                .get()
-                .ok_or_else(|| PyRuntimeError::new_err("Asyncio loop not initialized"))?;
+        Python::attach(|py| -> Result<Py<PyAny>, AwaitCoroutineError> {
+            let locals = TASK_LOCALS.get().ok_or_else(|| {
+                AwaitCoroutineError::Python(PyRuntimeError::new_err("Asyncio loop not initialized"))
+            })?;
             let event_loop = locals.event_loop(py);
 
-            let asyncio = py.import("asyncio")?;
+            let asyncio = py.import("asyncio").map_err(AwaitCoroutineError::Python)?;
             let future = asyncio
-                .call_method1("run_coroutine_threadsafe", (coroutine.bind(py), event_loop))?;
-            let result = future.call_method0("result")?;
-            Ok(result.unbind())
+                .call_method1("run_coroutine_threadsafe", (coroutine.bind(py), event_loop))
+                .map_err(AwaitCoroutineError::Python)?;
+
+            match future.call_method1("result", (timeout.as_secs_f64(),)) {
+                Ok(result) => Ok(result.unbind()),
+                Err(err) => {
+                    let is_timeout = err.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py)
+                        || (|| -> PyResult<bool> {
+                            let timeout_cls =
+                                py.import("concurrent.futures")?.getattr("TimeoutError")?;
+                            err.value(py).is_instance(&timeout_cls)
+                        })()
+                        .unwrap_or(false);
+
+                    if is_timeout {
+                        let _ = future.call_method0("cancel");
+                        return Err(AwaitCoroutineError::TimedOut);
+                    }
+
+                    Err(AwaitCoroutineError::Python(err))
+                }
+            }
         })
     })
     .await
-    .map_err(|err| PyRuntimeError::new_err(format!("ASGI coroutine join error: {}", err)))?
+    .map_err(|err| {
+        AwaitCoroutineError::Python(PyRuntimeError::new_err(format!(
+            "ASGI coroutine join error: {}",
+            err
+        )))
+    })?
 }
 
 /// Handle a request by delegating to an HTTP ASGI mount.
 ///
 /// This is used only on Bolt router misses, so API hot-path routing remains unchanged.
+/// Current bridge behavior buffers ASGI body chunks until the app coroutine completes.
 pub async fn handle_asgi_mount_request(
     req: HttpRequest,
     mut payload: web::Payload,
     mount: &AsgiMount,
     debug: bool,
+    max_payload_size: usize,
+    asgi_mount_timeout: Duration,
 ) -> HttpResponse {
     let mut request_body = Vec::new();
-    let has_potential_body = req.headers().contains_key("content-length")
-        || req.headers().contains_key("transfer-encoding");
-    if has_potential_body {
-        while let Some(chunk) = payload.next().await {
-            match chunk {
-                Ok(data) => request_body.extend_from_slice(&data),
-                Err(err) => {
-                    return HttpResponse::BadRequest()
+    while let Some(chunk) = payload.next().await {
+        match chunk {
+            Ok(data) => {
+                if request_body.len().saturating_add(data.len()) > max_payload_size {
+                    return HttpResponse::PayloadTooLarge()
                         .content_type("text/plain; charset=utf-8")
-                        .body(format!("Failed to read request body: {}", err));
+                        .body(format!(
+                            "Request body too large for ASGI mount (limit: {} bytes)",
+                            max_payload_size
+                        ));
                 }
+
+                request_body.extend_from_slice(&data);
+            }
+            Err(err) => {
+                return HttpResponse::BadRequest()
+                    .content_type("text/plain; charset=utf-8")
+                    .body(format!("Failed to read request body: {}", err));
             }
         }
     }
@@ -374,7 +423,7 @@ pub async fn handle_asgi_mount_request(
         }
     };
 
-    let app_result = await_coroutine_on_task_loop(app_coroutine).await;
+    let app_result = await_coroutine_on_task_loop(app_coroutine, asgi_mount_timeout).await;
     response_done.notify_waiters();
     let _ = send_state
         .body_tx
@@ -390,14 +439,24 @@ pub async fn handle_asgi_mount_request(
             .unwrap_or(false);
 
         if !response_started {
-            return Python::attach(|py| {
-                handle_python_error(py, err, req.path(), req.method().as_str(), debug)
-            });
+            return match err {
+                AwaitCoroutineError::TimedOut => HttpResponse::GatewayTimeout()
+                    .content_type("text/plain; charset=utf-8")
+                    .body(format!(
+                        "ASGI mount timed out after {:.3} seconds",
+                        asgi_mount_timeout.as_secs_f64()
+                    )),
+                AwaitCoroutineError::Python(err) => Python::attach(|py| {
+                    handle_python_error(py, err, req.path(), req.method().as_str(), debug)
+                }),
+            };
         }
 
-        Python::attach(|py| {
-            err.print(py);
-        });
+        if let AwaitCoroutineError::Python(err) = err {
+            Python::attach(|py| {
+                err.print(py);
+            });
+        }
     }
 
     let response_start = match send_state

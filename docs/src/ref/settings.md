@@ -102,6 +102,20 @@ BOLT_MAX_UPLOAD_SIZE = FileSize.MB_10
 
     This distinction is important for security and resource management. Always set `BOLT_MAX_UPLOAD_SIZE` to the maximum file size your server should ever accept, and use `File(max_size=...)` for endpoint-specific needs.
 
+## ASGI mount settings
+
+### BOLT_ASGI_MOUNT_TIMEOUT
+
+Maximum time (seconds) to wait for a mounted ASGI app to complete.
+
+```python
+BOLT_ASGI_MOUNT_TIMEOUT = 30
+```
+
+**Default:** `30`
+
+When exceeded, Django-Bolt returns `504 Gateway Timeout` for the mounted request.
+
 ### BOLT_MEMORY_SPOOL_THRESHOLD
 
 Size threshold before file uploads are spooled to disk. Files smaller than this are kept in memory; larger files are written to a temporary file on disk.
@@ -314,4 +328,3 @@ api = BoltAPI(
 | `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |
 | `BOLT_AUTHENTICATION_CLASSES` | `list` | `[]` | Default authentication backends |
 | `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |
-

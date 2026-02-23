@@ -93,6 +93,26 @@ This means mounted apps do not override matching Bolt routes.
 
 Additionally, API near-miss behavior (such as method mismatch and trailing-slash redirect checks) is resolved before mount fallback, so ASGI mounts do not hijack those API semantics.
 
+## Middleware boundary
+
+ASGI mounts run outside Bolt's route middleware pipeline.
+
+That means Bolt-level middleware features (for example rate limits, Bolt auth guards, and Bolt CORS behavior) do not apply to mounted ASGI apps. Mounted Django apps should rely on Django middleware/settings for those concerns.
+
+## Current bridge limitations
+
+The current HTTP ASGI mount bridge is response-buffering, not fully streaming:
+
+- The ASGI app coroutine is awaited to completion before Bolt constructs the outgoing Actix response.
+- Response chunks are accumulated in memory first, then sent to the client.
+
+Because of this design, mounted ASGI apps are not suitable for true streaming semantics (for example long-lived SSE streams) and do not get end-to-end backpressure from the client.
+
+## Timeouts and body limits
+
+- `BOLT_ASGI_MOUNT_TIMEOUT` (seconds, default `30`) limits how long Bolt waits for a mounted ASGI app to complete. Timeout returns `504 Gateway Timeout`.
+- `BOLT_MAX_UPLOAD_SIZE` also applies to ASGI mount request bodies. Oversized bodies return `413 Payload Too Large`.
+
 ## Testing
 
 `TestClient` and `AsyncTestClient` use the same mount conflict validation and mount dispatch behavior as production startup.

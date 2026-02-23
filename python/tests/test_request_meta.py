@@ -197,6 +197,22 @@ class TestRequestMETA:
         assert meta["SERVER_NAME"] == "example.com"
         assert meta["SERVER_PORT"] == "80"  # Default port when not specified
 
+    def test_meta_server_info_default_port_https(self, api):
+        """META defaults SERVER_PORT to 443 when scheme is HTTPS."""
+        with TestClient(api) as secure_client:
+            response = secure_client.get(
+                "/meta",
+                headers={
+                    "Host": "example.com",
+                    "X-Forwarded-Proto": "https",
+                },
+            )
+        assert response.status_code == 200
+        meta = response.json()
+
+        assert meta["SERVER_NAME"] == "example.com"
+        assert meta["SERVER_PORT"] == "443"
+
     def test_meta_remote_addr(self, client):
         """META contains REMOTE_ADDR and REMOTE_HOST."""
         response = client.get("/meta")

@@ -237,11 +237,15 @@ Mount an HTTP ASGI application under a static prefix.
 
 See [ASGI Mounts](../topics/asgi-mounts.md) for full behavior, examples, and constraints.
 
+Mounted ASGI apps are outside Bolt middleware/auth/CORS flow and currently use a buffered response bridge (not true streaming passthrough).
+
 #### api.mount_django(path, app=None)
 
 Convenience wrapper for mounting Django's ASGI app (or a custom ASGI app) under a prefix.
 
 See [ASGI Mounts](../topics/asgi-mounts.md) for usage examples and dispatch/conflict rules.
+
+`mount_django()` inherits the same mount boundary and buffered-bridge behavior as `mount_asgi()`.
 
 ## Dependency injection
 

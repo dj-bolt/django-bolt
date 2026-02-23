@@ -5,9 +5,12 @@ from django.http import JsonResponse, StreamingHttpResponse
 from django.shortcuts import redirect
 from django.urls import reverse
 
+import test_data
 
-def index(request):
-    return JsonResponse({}, safe=False)
+
+
+async def index(request):
+    return JsonResponse(test_data.JSON_1K, safe=False)
 
 
 def sse(request):

@@ -5,6 +5,7 @@ use pyo3_async_runtimes::TaskLocals;
 use regex::Regex;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
 use crate::router::Router;
@@ -60,6 +61,8 @@ pub struct AppState {
     pub dispatch: Py<PyAny>,
     pub debug: bool,
     pub max_header_size: usize,
+    pub max_payload_size: usize,
+    pub asgi_mount_timeout: Duration,
     pub global_cors_config: Option<CorsConfig>, // Global CORS configuration from Django settings
     pub cors_origin_regexes: Vec<Regex>,        // Compiled regex patterns for origin matching
     pub global_compression_config: Option<CompressionConfig>, // Global compression configuration used by middleware

@@ -1,5 +1,6 @@
 """Tests for HTTP ASGI mounts."""
 
+import asyncio
 import json
 
 import pytest
@@ -65,6 +66,32 @@ def test_mount_asgi_scope_root_path_and_subpath():
     assert captured[0]["event_type"] == "http.request"
     assert captured[1]["path"] == "/accounts/login/"
     assert captured[1]["query_string"] == b"next=%2Fadmin%2F"
+
+
+def test_mount_asgi_scope_server_defaults_to_443_on_https():
+    api = BoltAPI()
+    captured = {}
+
+    async def asgi_app(scope, receive, send):
+        captured["server"] = scope["server"]
+        await receive()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    api.mount_asgi("/secure", asgi_app)
+
+    with TestClient(api) as client:
+        response = client.get(
+            "/secure",
+            headers={
+                "Host": "example.com",
+                "X-Forwarded-Proto": "https",
+            },
+        )
+
+    assert response.status_code == 204
+    assert captured["server"][0] == "example.com"
+    assert captured["server"][1] == 443
 
 
 def test_mount_asgi_longest_prefix_wins():
@@ -151,6 +178,42 @@ def test_mount_asgi_post_body_is_buffered_single_event():
         assert response.json() == {"ok": True}
 
     assert captured_body == {"event_type": "http.request", "body": b"abc123", "more_body": False}
+
+
+def test_mount_asgi_enforces_max_payload_size(settings):
+    settings.BOLT_MAX_UPLOAD_SIZE = 4
+    api = BoltAPI()
+    captured = {"called": False}
+
+    async def asgi_app(scope, receive, send):
+        captured["called"] = True
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    api.mount_asgi("/upload", asgi_app)
+
+    with TestClient(api) as client:
+        response = client.post("/upload", content=b"12345")
+
+    assert response.status_code == 413
+    assert captured["called"] is False
+
+
+def test_mount_asgi_timeout_returns_504(settings):
+    settings.BOLT_ASGI_MOUNT_TIMEOUT = 0.05
+    api = BoltAPI()
+
+    async def hanging_asgi(scope, receive, send):
+        await receive()
+        await asyncio.Event().wait()
+
+    api.mount_asgi("/hang", hanging_asgi)
+
+    with TestClient(api) as client:
+        response = client.get("/hang")
+
+    assert response.status_code == 504
 
 
 def test_mount_asgi_does_not_hijack_api_trailing_slash_redirects():

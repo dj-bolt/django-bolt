@@ -22,8 +22,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::asgi_http;
+use crate::asgi_mounts::validate_and_sort_asgi_mounts;
 use crate::form_parsing::{
     parse_multipart, parse_urlencoded, FormParseResult, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
 };
@@ -130,6 +132,7 @@ pub struct TestAppState {
     pub global_cors_config: Option<CorsConfig>,
     pub debug: bool,
     pub max_payload_size: usize,
+    pub asgi_mount_timeout: Duration,
     /// Trailing slash handling mode: "strip", "append", or "keep"
     pub trailing_slash: String,
     /// Static files configuration for testing static file serving
@@ -294,6 +297,18 @@ pub fn create_test_app(
     })()
     .unwrap_or(10 * 1024 * 1024); // Default to 10MB for tests
 
+    let asgi_mount_timeout = (|| -> PyResult<f64> {
+        let django_conf = py.import("django.conf")?;
+        let settings = django_conf.getattr("settings")?;
+        settings
+            .getattr("BOLT_ASGI_MOUNT_TIMEOUT")?
+            .extract::<f64>()
+    })()
+    .ok()
+    .filter(|value| value.is_finite() && *value > 0.0)
+    .map(Duration::from_secs_f64)
+    .unwrap_or_else(|| Duration::from_secs(30)); // Default 30s
+
     let app = TestAppState {
         router: Arc::new(Router::new()),
         websocket_router: Arc::new(WebSocketRouter::new()),
@@ -303,6 +318,7 @@ pub fn create_test_app(
         global_cors_config,
         debug,
         max_payload_size,
+        asgi_mount_timeout,
         trailing_slash: trailing_slash.unwrap_or_else(|| "strip".to_string()),
         static_files_config: static_config,
     };
@@ -374,17 +390,7 @@ pub fn register_test_asgi_mounts(
         .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
 
     let mut app = entry.write();
-    let mut asgi_mounts: Vec<AsgiMount> = Vec::with_capacity(mounts.len());
-
-    for (prefix, mount_app) in mounts {
-        asgi_mounts.push(AsgiMount {
-            prefix,
-            app: mount_app,
-        });
-    }
-
-    // Longest-prefix match requires descending sort.
-    asgi_mounts.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+    let asgi_mounts = validate_and_sort_asgi_mounts(mounts)?;
     app.asgi_mounts = Arc::new(asgi_mounts);
     Ok(())
 }
@@ -473,6 +479,7 @@ pub fn test_request(
                 global_cors_config,
                 debug,
                 max_payload_size,
+                asgi_mount_timeout,
                 _trailing_slash,
                 static_files_config,
             ) = {
@@ -485,6 +492,7 @@ pub fn test_request(
                     state.global_cors_config.clone(),
                     state.debug,
                     state.max_payload_size,
+                    state.asgi_mount_timeout,
                     state.trailing_slash.clone(),
                     state.static_files_config.clone(),
                 )
@@ -496,6 +504,8 @@ pub fn test_request(
                 dispatch,
                 debug,
                 max_header_size: 8192,
+                max_payload_size,
+                asgi_mount_timeout,
                 global_cors_config: global_cors_config.clone(),
                 cors_origin_regexes: vec![],
                 global_compression_config: None,
@@ -683,8 +693,15 @@ async fn handle_test_request_internal(
             // - only after Bolt route miss
             // - only after trailing-slash/API-method near-miss checks above
             if let Some(asgi_mount) = find_asgi_mount(&state, path) {
-                return asgi_http::handle_asgi_mount_request(req, payload, asgi_mount, state.debug)
-                    .await;
+                return asgi_http::handle_asgi_mount_request(
+                    req,
+                    payload,
+                    asgi_mount,
+                    state.debug,
+                    state.max_payload_size,
+                    state.asgi_mount_timeout,
+                )
+                .await;
             }
 
             if method == "OPTIONS" {

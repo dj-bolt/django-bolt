@@ -108,6 +108,31 @@ def _normalize_mount_prefix(path: str) -> str:
     return mount_path
 
 
+def _validate_asgi_mount_conflicts(
+    routes: list[tuple[str, str, int, Any]],
+    asgi_mounts: list[tuple[str, Any]],
+    *,
+    error_cls: type[Exception] = ValueError,
+) -> None:
+    """Validate exact-path conflicts and duplicate prefixes for ASGI mounts."""
+    if not asgi_mounts:
+        return
+
+    route_paths = {path for _method, path, _handler_id, _handler in routes}
+    seen_mounts: set[str] = set()
+
+    for mount_prefix, _mount_app in asgi_mounts:
+        if mount_prefix in seen_mounts:
+            raise error_cls(f"Duplicate ASGI mount prefix: {mount_prefix}")
+        seen_mounts.add(mount_prefix)
+
+        if mount_prefix in route_paths:
+            raise error_cls(
+                f"ASGI mount prefix {mount_prefix} conflicts with an existing HTTP route "
+                "(exact collision is not allowed)."
+            )
+
+
 def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
     """
     Adjust scope for Django mounted under a non-empty root_path.
@@ -1736,7 +1761,14 @@ class BoltAPI:
             _BOLT_API_REGISTRY.remove(app)
 
     def mount_asgi(self, path: str, app: Callable[..., Any]) -> None:
-        """Mount a generic HTTP ASGI application at a static path prefix."""
+        """Mount a generic HTTP ASGI app at a static prefix.
+
+        Notes:
+        - Mounts are evaluated only after Bolt route lookup misses, so mounted apps
+          do not run Bolt middleware/auth/rate-limit/CORS handlers.
+        - The current bridge buffers mounted ASGI responses before returning them to
+          the client (not true wire-level streaming/backpressure).
+        """
         if not callable(app):
             raise TypeError(
                 f"mount_asgi() expects a callable ASGI application, got {type(app).__name__}"
@@ -1757,7 +1789,11 @@ class BoltAPI:
         self._asgi_mounts.append((mount_path, app))
 
     def mount_django(self, path: str, app: Any | None = None) -> None:
-        """Mount Django's ASGI application (or a custom ASGI app) at a path prefix."""
+        """Mount Django's ASGI app (or a custom ASGI app) at a path prefix.
+
+        This is a convenience wrapper over `mount_asgi()` and inherits the same
+        middleware and response-buffering behavior.
+        """
         asgi_app = app
         if asgi_app is None:
             from django.core.asgi import get_asgi_application

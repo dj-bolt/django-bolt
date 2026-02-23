@@ -19,6 +19,7 @@ import httpx
 from httpx import Response
 
 from django_bolt import BoltAPI, _core
+from django_bolt.api import _validate_asgi_mount_conflicts
 
 try:
     from django.conf import settings
@@ -312,23 +313,7 @@ class TestClient(httpx.Client):
     @staticmethod
     def _validate_asgi_mount_conflicts(api: BoltAPI) -> None:
         """Validate exact-path conflicts for ASGI mounts (same rule as production startup)."""
-        asgi_mounts = getattr(api, "_asgi_mounts", [])
-        if not asgi_mounts:
-            return
-
-        route_paths = {path for _method, path, _handler_id, _handler in api._routes}
-        seen_mounts: set[str] = set()
-
-        for mount_prefix, _mount_app in asgi_mounts:
-            if mount_prefix in seen_mounts:
-                raise ValueError(f"Duplicate ASGI mount prefix: {mount_prefix}")
-            seen_mounts.add(mount_prefix)
-
-            if mount_prefix in route_paths:
-                raise ValueError(
-                    f"ASGI mount prefix {mount_prefix} conflicts with an existing HTTP route "
-                    "(exact collision is not allowed)."
-                )
+        _validate_asgi_mount_conflicts(api._routes, getattr(api, "_asgi_mounts", []))
 
     def __init__(
         self,
