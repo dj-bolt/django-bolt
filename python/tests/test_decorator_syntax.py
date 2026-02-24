@@ -80,8 +80,8 @@ def test_viewset_decorator_syntax(api):
         async def list(self, request):
             return []
 
-        async def retrieve(self, request, pk: int):
-            article = await self.get_object(pk)
+        async def retrieve(self, request):
+            article = await self.get_object()
             return ArticleSchema(id=article.id, title=article.title)
 
     # Create test article
@@ -111,16 +111,17 @@ def test_viewset_decorator_with_custom_actions(api):
     @api.viewset("/articles")
     class ArticleViewSet(ViewSet):
         queryset = Article.objects.all()
+        serializer_class = ArticleSchema
 
         async def list(self, request):
             return []
 
         @action(methods=["POST"], detail=True)
-        async def publish(self, request, pk: int):
-            article = await self.get_object(pk)
+        async def publish(self, request):
+            article = await self.get_object()
             article.is_published = True
             await article.asave()
-            return {"published": True, "article_id": pk}
+            return {"published": True, "article_id": article.pk}
 
         @action(methods=["GET"], detail=False)
         async def published(self, request):

@@ -12,6 +12,7 @@ from django_bolt import (
     BoltAPI,
     CursorPagination,
     LimitOffsetPagination,
+    ListMixin,
     ModelViewSet,
     PageNumberPagination,
     ViewSet,
@@ -761,6 +762,7 @@ def test_viewset_with_pagination(sample_articles):
     @api.viewset("/articles")
     class ArticleViewSet(ViewSet):
         queryset = Article.objects.all()
+        serializer_class = ArticleSchema
 
         @paginate(SmallPagePagination)
         async def list(self, request):
@@ -784,6 +786,7 @@ def test_viewset_with_limit_offset_pagination(sample_articles):
     @api.viewset("/articles")
     class ArticleViewSet(ViewSet):
         queryset = Article.objects.all()
+        serializer_class = ArticleSchema
 
         @paginate(LimitOffsetPagination)
         async def list(self, request):
@@ -811,6 +814,7 @@ def test_viewset_with_cursor_pagination(sample_articles):
     @api.viewset("/articles")
     class ArticleViewSet(ViewSet):
         queryset = Article.objects.all()
+        serializer_class = ArticleSchema
 
         @paginate(SmallCursorPagination)
         async def list(self, request):
@@ -832,18 +836,10 @@ def test_viewset_without_pagination(sample_articles):
     api = BoltAPI()
 
     @api.viewset("/articles")
-    class ArticleViewSet(ViewSet):
+    class ArticleViewSet(ListMixin, ViewSet):
         queryset = Article.objects.all()
+        serializer_class = ArticleSchema
         pagination_class = None
-
-        async def list(self, request):
-            qs = await self.get_queryset()
-            result = await self.paginate_queryset(qs)
-
-            articles = []
-            async for article in result:
-                articles.append(ArticleListSchema(id=article.id, title=article.title, author=article.author))
-            return articles
 
     with TestClient(api) as client:
         response = client.get("/articles")

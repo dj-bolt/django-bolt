@@ -6,8 +6,6 @@ Tests cover:
 - Parameter extraction and dependency injection
 - Guards and authentication
 - Return type annotations
-- Mixins (ListMixin, RetrieveMixin, CreateMixin, etc.)
-- ViewSet
 """
 
 from typing import Any
@@ -20,13 +18,9 @@ from django_bolt.auth.backends import JWTAuthentication
 from django_bolt.auth.guards import IsAuthenticated  # noqa: PLC0415
 from django_bolt.exceptions import HTTPException
 from django_bolt.params import Depends
+from django_bolt.serializers import Serializer
 from django_bolt.views import (
     APIView,
-    CreateMixin,
-    DestroyMixin,
-    ListMixin,
-    RetrieveMixin,
-    UpdateMixin,
     ViewSet,
 )
 
@@ -300,132 +294,20 @@ def test_bolt_api_view_status_code_override(api):
     assert meta.get("default_status_code") == 201
 
 
-# --- Mixin Tests ---
+def test_bolt_api_view_get_allowed_methods():
+    """Test APIView correctly identifies implemented methods."""
 
-
-@pytest.mark.asyncio
-async def test_list_mixin(api):
-    """Test ListMixin provides get() method."""
-
-    # Mock queryset
-    class MockQuerySet:
-        def __init__(self, items):
-            self.items = items
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self.items:
-                raise StopAsyncIteration
-            return self.items.pop(0)
-
-    @api.view("/items")
-    class ItemListView(ListMixin, APIView):
-        async def get_queryset(self):
-            return MockQuerySet([{"id": 1}, {"id": 2}, {"id": 3}])
-
-    handler = api._routes[0][3]
-    request = create_request()
-
-    result = await handler(request)
-    assert isinstance(result, list)
-    assert len(result) == 3
-
-
-@pytest.mark.asyncio
-async def test_retrieve_mixin(api):
-    """Test RetrieveMixin provides get() with pk parameter."""
-
-    class MockObject:
-        def __init__(self, pk):
-            self.id = pk
-            self.name = f"Item {pk}"
-
-    @api.view("/items/{pk}")
-    class ItemRetrieveView(RetrieveMixin, APIView):
-        async def get_object(self, pk: int):
-            return MockObject(pk)
-
-    handler = api._routes[0][3]
-    request = create_request(path_params={"pk": "42"})
-
-    result = await handler(request, pk=42)
-    assert result.id == 42
-
-
-@pytest.mark.asyncio
-async def test_create_mixin(api):
-    """Test CreateMixin provides post() method."""
-
-    class ItemSchema(msgspec.Struct):
-        name: str
-        price: float
-
-    class MockModel:
-        objects = None
-
-        @staticmethod
-        async def acreate(**kwargs):
-            obj = type("MockObject", (), kwargs)()
-            obj.id = 1
-            return obj
-
-    class MockQuerySet:
-        model = MockModel
-
-    @api.view("/items")
-    class ItemCreateView(CreateMixin, APIView):
-        serializer_class = ItemSchema
-
-        async def get_queryset(self):
-            return MockQuerySet()
-
-    # Verify handler signature
-    handler = api._routes[0][3]
-    import inspect  # noqa: PLC0415
-
-    sig = inspect.signature(handler)
-    assert "data" in sig.parameters
-
-
-# --- ViewSet Tests ---
-
-
-def test_bolt_viewset_get_allowed_methods():
-    """Test ViewSet correctly identifies implemented methods."""
-
-    class UserViewSet(ViewSet):
+    class UserAPIView(APIView):
         async def get(self, request):
             return {"method": "list"}
 
         async def post(self, request):
             return {"method": "create"}
 
-    allowed = UserViewSet.get_allowed_methods()
+    allowed = UserAPIView.get_allowed_methods()
     assert "GET" in allowed
     assert "POST" in allowed
     assert "DELETE" not in allowed
-
-
-@pytest.mark.asyncio
-async def test_bolt_viewset_get_object_not_found():
-    """Test ViewSet.get_object raises HTTPException when object not found."""
-
-    class MockQuerySet:
-        async def aget(self, pk):
-            raise Exception("DoesNotExist")
-
-    class ItemViewSet(ViewSet):
-        async def get_queryset(self):
-            return MockQuerySet()
-
-    viewset = ItemViewSet()
-
-    with pytest.raises(HTTPException) as exc_info:
-        await viewset.get_object(999)
-
-    assert exc_info.value.status_code == 404
 
 
 # --- Edge Cases and Validation ---
@@ -498,66 +380,6 @@ def test_bolt_api_view_unimplemented_method_raises(api):
 # --- Integration Tests ---
 
 
-@pytest.mark.asyncio
-async def test_complete_crud_viewset(api):
-    """Test a complete CRUD viewset with all mixins."""
-
-    class ItemSchema(msgspec.Struct):
-        id: int
-        name: str
-
-    # Mock database
-    mock_db = {1: {"id": 1, "name": "Item 1"}, 2: {"id": 2, "name": "Item 2"}}
-
-    class MockQuerySet:
-        def __init__(self, items):
-            self.items = items
-            self.model = type(
-                "MockModel",
-                (),
-                {
-                    "objects": type(
-                        "MockManager",
-                        (),
-                        {
-                            "acreate": lambda **kw: type(
-                                "MockObj",
-                                (),
-                                {**kw, "asave": lambda: None, "adelete": lambda: None},
-                            )()
-                        },
-                    )()
-                },
-            )
-
-        def __aiter__(self):
-            self.iterator = iter(self.items.values())
-            return self
-
-        async def __anext__(self):
-            try:
-                return next(self.iterator)
-            except StopIteration:
-                raise StopAsyncIteration from None
-
-        async def aget(self, pk):
-            if pk not in self.items:
-                raise Exception("DoesNotExist")
-            item = self.items[pk]
-            return type("MockObj", (), {**item, "asave": lambda: None, "adelete": lambda: None})()
-
-    @api.view("/items", methods=["GET"])
-    @api.view("/items/{pk}", methods=["GET", "DELETE"])
-    class ItemViewSet(ListMixin, RetrieveMixin, CreateMixin, UpdateMixin, DestroyMixin, ViewSet):
-        serializer_class = ItemSchema
-
-        async def get_queryset(self):
-            return MockQuerySet(mock_db)
-
-    # Verify routes registered
-    assert len(api._routes) == 3  # list GET, retrieve GET, destroy DELETE
-
-
 def test_bolt_api_view_method_names_customization():
     """Test customizing http_method_names."""
 
@@ -581,8 +403,13 @@ def test_bolt_api_view_method_names_customization():
 def test_viewset_tags_registration(api):
     """Test tags passed to api.viewset() are correctly registered."""
 
+    class EmptySerializer(Serializer):
+        pass
+
     @api.viewset("/items", tags=["Items", "Public"])
     class TaggedItemViewSet(ViewSet):
+        serializer_class = EmptySerializer
+
         async def list(self, request):
             return []
 

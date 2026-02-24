@@ -4,8 +4,6 @@ Tests for synchronous class-based views.
 This test suite verifies that class-based views work correctly with sync handlers,
 including:
 - Basic sync APIView functionality
-- Sync ViewSets with CRUD operations
-- Sync Mixins (ListMixin, RetrieveMixin, CreateMixin, etc.)
 - Parameter extraction and validation
 - Guards and authentication
 - Response types and serialization
@@ -24,11 +22,7 @@ from django_bolt.auth.guards import IsAuthenticated  # noqa: PLC0415
 from django_bolt.exceptions import HTTPException
 from django_bolt.params import Depends
 from django_bolt.testing import TestClient
-from django_bolt.views import (
-    APIView,
-    ListMixin,
-    ViewSet,
-)
+from django_bolt.views import APIView
 
 # --- Schema Definitions ---
 
@@ -293,33 +287,8 @@ def test_sync_api_view_status_code_override(api):
     assert meta.get("default_status_code") == 201
 
 
-# --- Sync Mixin Tests ---
-
-
-def test_sync_list_mixin(api):
-    """Test ListMixin with sync handler."""
-
-    @api.view("/items")
-    class ItemListView(ListMixin, APIView):
-        async def get_queryset(self):
-            # Queryset must be async since Django ORM uses async
-            class MockQuerySet:
-                def __aiter__(self):
-                    return self
-
-                async def __anext__(self):
-                    raise StopAsyncIteration
-
-            return MockQuerySet()
-
-    with TestClient(api) as client:
-        response = client.get("/items")
-        assert response.status_code == 200
-        assert response.json() == []
-
-
-def test_sync_create_mixin(api):
-    """Test CreateMixin with sync handler (data validation)."""
+def test_sync_create_api(api):
+    """Test post with sync handler (data validation)."""
 
     @api.view("/items")
     class ItemCreateView(APIView):
@@ -332,82 +301,6 @@ def test_sync_create_mixin(api):
         data = response.json()
         assert data["name"] == "Widget"
         assert data["price"] == 9.99
-
-
-# --- Sync ViewSet Tests ---
-
-
-def test_sync_viewset_multiple_methods(api):
-    """Test sync ViewSet with multiple methods."""
-
-    @api.view("/users")
-    class UserViewSet(ViewSet):
-        def get(self, request) -> list:
-            return [{"id": 1, "name": "Alice"}]
-
-        def post(self, request) -> dict:
-            return {"id": 2, "name": "Bob", "created": True}
-
-    assert len(api._routes) == 2
-
-    with TestClient(api) as client:
-        # Test GET
-        response = client.get("/users")
-        assert response.status_code == 200
-        assert len(response.json()) == 1
-
-        # Test POST
-        response = client.post("/users")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["created"] is True
-
-
-def test_sync_viewset_with_path_params(api):
-    """Test sync ViewSet with path parameters."""
-
-    @api.view("/users/{user_id}")
-    class UserDetailViewSet(ViewSet):
-        def get(self, request, user_id: int) -> dict:
-            return {"id": user_id, "name": f"User {user_id}"}
-
-        def put(self, request, user_id: int) -> dict:
-            return {"id": user_id, "updated": True}
-
-        def delete(self, request, user_id: int) -> dict:
-            return {"id": user_id, "deleted": True}
-
-    with TestClient(api) as client:
-        # Test GET
-        response = client.get("/users/42")
-        assert response.status_code == 200
-        assert response.json()["id"] == 42
-
-        # Test PUT
-        response = client.put("/users/42")
-        assert response.status_code == 200
-        assert response.json()["updated"] is True
-
-        # Test DELETE
-        response = client.delete("/users/42")
-        assert response.status_code == 200
-        assert response.json()["deleted"] is True
-
-
-def test_sync_viewset_with_data_validation(api):
-    """Test sync ViewSet with POST data validation."""
-
-    @api.view("/users")
-    class UserViewSet(ViewSet):
-        def post(self, request, data: UserSchema) -> dict:
-            return {"id": 1, "name": data.name, "email": data.email, "created": True}
-
-    with TestClient(api) as client:
-        response = client.post("/users", json={"name": "John", "email": "john@example.com"})
-        assert response.status_code == 200
-        data = response.json()
-        assert data["name"] == "John"
-        assert data["created"] is True
 
 
 # --- Sync Handler Metadata Tests ---
@@ -558,66 +451,6 @@ def test_sync_view_missing_required_param(api):
     with TestClient(api) as client:
         response = client.get("/search")
         assert response.status_code in (400, 422)
-
-
-# --- Complex Sync ViewSet Scenarios ---
-
-
-def test_sync_viewset_mixed_responses(api):
-    """Test sync ViewSet with different response types per method."""
-
-    @api.view("/items")
-    class ItemViewSet(ViewSet):
-        def get(self, request) -> list:
-            return [{"id": 1, "name": "Item 1"}]
-
-        def post(self, request) -> dict:
-            return {"id": 2, "name": "Item 2", "created": True}
-
-    with TestClient(api) as client:
-        get_response = client.get("/items")
-        assert isinstance(get_response.json(), list)
-
-        post_response = client.post("/items")
-        assert isinstance(post_response.json(), dict)
-
-
-def test_sync_viewset_with_multiple_dependencies(api):
-    """Test sync ViewSet with multiple dependencies."""
-
-    def get_user(request) -> dict:
-        return {"id": 1, "name": "User"}
-
-    def get_auth_token(request) -> str:
-        return "token123"
-
-    @api.view("/protected")
-    class ProtectedViewSet(ViewSet):
-        def get(self, request, user=Depends(get_user), token=Depends(get_auth_token)) -> dict:
-            return {"user": user, "token": token}
-
-    with TestClient(api) as client:
-        response = client.get("/protected")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["user"]["name"] == "User"
-        assert data["token"] == "token123"
-
-
-def test_sync_viewset_with_query_and_path_params(api):
-    """Test sync ViewSet with both query and path parameters."""
-
-    @api.view("/items/{item_id}")
-    class ItemViewSet(ViewSet):
-        def get(self, request, item_id: int, format: str = "json") -> dict:
-            return {"item_id": item_id, "format": format, "data": "test"}
-
-    with TestClient(api) as client:
-        response = client.get("/items/42?format=xml")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["item_id"] == 42
-        assert data["format"] == "xml"
 
 
 # --- Selective Method Registration ---

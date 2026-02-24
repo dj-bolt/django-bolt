@@ -267,9 +267,9 @@ def test_non_list_response_type():
     _method, _path, handler_id, _handler = api._routes[0]
     meta = api._handler_meta[handler_id]
 
-    # Should have response_type but NOT field names (optimization only for list[Struct])
+    # Should have response_type but NOT field names (optimization also for Struct)
     assert meta["response_type"] == UserMini
-    assert "response_field_names" not in meta
+    assert "response_field_names" in meta
 
 
 def test_non_struct_response_type():

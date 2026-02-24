@@ -70,12 +70,12 @@ def test_action_decorator_detail_true(api):
             return ArticleSchema(id=article.id, title=article.title, content=article.content)
 
         @action(methods=["POST"], detail=True)
-        async def publish(self, request, pk: int):
+        async def publish(self, request):
             """Publish an article. POST /articles/{pk}/publish"""
-            article = await self.get_object(pk)
+            article = await self.get_object()
             article.is_published = True
             await article.asave()
-            return {"published": True, "article_id": pk}
+            return {"published": True, "article_id": article.pk}
 
     # Create test article
     article = Article.objects.create(
@@ -154,15 +154,15 @@ def test_action_decorator_multiple_methods(api):
             return []
 
         @action(methods=["GET"], detail=True, path="status")
-        async def get_status(self, request, pk: int):
+        async def get_status(self, request):
             """GET /articles/{pk}/status - Get article status"""
-            article = await self.get_object(pk)
+            article = await self.get_object()
             return {"is_published": article.is_published}
 
         @action(methods=["POST"], detail=True, path="status")
-        async def update_status(self, request, pk: int, data: StatusUpdate):
+        async def update_status(self, request, data: StatusUpdate):
             """POST /articles/{pk}/status - Update article status"""
-            article = await self.get_object(pk)
+            article = await self.get_object()
             article.is_published = data.is_published
             await article.asave()
             return {"updated": True, "is_published": article.is_published}

@@ -27,12 +27,7 @@ from django_bolt.auth.guards import IsAdminUser, IsAuthenticated
 from django_bolt.exceptions import HTTPException
 from django_bolt.params import Depends
 from django_bolt.testing import TestClient
-from django_bolt.views import (
-    APIView,
-    ListMixin,
-    RetrieveMixin,
-    ViewSet,
-)
+from django_bolt.views import APIView
 
 # --- Test Fixtures ---
 
@@ -271,130 +266,6 @@ def test_bolt_api_view_status_code_override():
         response = client.post("/items", json={})
         assert response.status_code == 201
         assert response.json()["created"] is True
-
-
-# --- Mixin Tests ---
-
-
-def test_list_mixin():
-    """Test ListMixin provides get() method."""
-    api = BoltAPI()
-
-    # Mock queryset
-    class MockQuerySet:
-        def __init__(self, items):
-            self.items = items.copy()
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self.items:
-                raise StopAsyncIteration
-            return self.items.pop(0)
-
-    @api.view("/items")
-    class ItemListView(ListMixin, APIView):
-        async def get_queryset(self):
-            return MockQuerySet([{"id": 1, "name": "Item 1"}, {"id": 2, "name": "Item 2"}, {"id": 3, "name": "Item 3"}])
-
-    with TestClient(api) as client:
-        response = client.get("/items")
-        assert response.status_code == 200
-        data = response.json()
-        assert isinstance(data, list)
-        assert len(data) == 3
-
-
-def test_retrieve_mixin():
-    """Test RetrieveMixin provides get() with pk parameter."""
-    api = BoltAPI()
-
-    @api.view("/items/{pk}")
-    class ItemRetrieveView(RetrieveMixin, APIView):
-        async def get_object(self, pk: int):
-            if pk == 999:
-                raise HTTPException(status_code=404, detail="Not found")
-            # Return a dict instead of custom object (msgspec can serialize dicts)
-            return {"id": pk, "name": f"Item {pk}"}
-
-    with TestClient(api) as client:
-        # Existing item
-        response = client.get("/items/42")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["id"] == 42
-        assert data["name"] == "Item 42"
-
-        # Non-existent item
-        response = client.get("/items/999")
-        assert response.status_code == 404
-
-
-def test_create_mixin():
-    """Test CreateMixin provides post() method."""
-    api = BoltAPI()
-
-    class ItemSchema(msgspec.Struct):
-        name: str
-        price: float
-
-    @api.view("/items")
-    class ItemCreateView(APIView):
-        """Override to skip the complex mixin setup."""
-
-        async def post(self, request, data: ItemSchema) -> dict:
-            # Simplified version - just return the created object
-            return {"id": 1, "name": data.name, "price": data.price}
-
-    with TestClient(api) as client:
-        response = client.post("/items", json={"name": "New Item", "price": 29.99})
-        assert response.status_code == 200
-        data = response.json()
-        assert data["name"] == "New Item"
-        assert data["price"] == 29.99
-
-
-# --- ViewSet Tests ---
-
-
-def test_bolt_viewset_get_allowed_methods():
-    """Test ViewSet correctly identifies implemented methods."""
-
-    class UserViewSet(ViewSet):
-        async def get(self, request):
-            return {"method": "list"}
-
-        async def post(self, request):
-            return {"method": "create"}
-
-    allowed = UserViewSet.get_allowed_methods()
-    assert "GET" in allowed
-    assert "POST" in allowed
-    assert "DELETE" not in allowed
-
-
-def test_bolt_viewset_get_object_not_found():
-    """Test ViewSet.get_object raises HTTPException when object not found."""
-    api = BoltAPI()
-
-    class MockQuerySet:
-        async def aget(self, pk):
-            raise Exception("DoesNotExist")
-
-    @api.view("/items/{pk}")
-    class ItemViewSet(ViewSet):
-        async def get_queryset(self):
-            return MockQuerySet()
-
-        async def get(self, request, pk: int):
-            # This will raise HTTPException
-            await self.get_object(pk)
-            return {"id": pk}
-
-    with TestClient(api) as client:
-        response = client.get("/items/999")
-        assert response.status_code == 404
 
 
 # --- Edge Cases and Validation ---

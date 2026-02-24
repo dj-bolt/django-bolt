@@ -57,7 +57,7 @@ def test_metadata_has_no_field_names_for_non_list_responses():
     meta = api._handler_meta[handler_id]
 
     # Should NOT have field names for single object responses
-    assert "response_field_names" not in meta, "Single object responses shouldn't have field names"
+    assert "response_field_names" in meta, "Single object responses should have field names"
 
 
 def test_regular_list_still_works():

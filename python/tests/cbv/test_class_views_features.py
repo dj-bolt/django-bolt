@@ -32,6 +32,7 @@ from django_bolt.params import Body, Cookie, Depends, Header, Path, Query
 from django_bolt.responses import StreamingResponse
 from django_bolt.testing import TestClient
 from django_bolt.views import APIView, ModelViewSet, ViewSet
+from tests.test_models import Article
 
 # --- Fixtures ---
 
@@ -569,75 +570,6 @@ def test_streaming_response_with_class_view(api):
 
 
 # ============================================================================
-# ViewSet Integration Tests
-# ============================================================================
-
-
-def test_viewset_with_all_features(api):
-    """Test ViewSet with authentication, guards, and validation."""
-    from django_bolt.auth import JWTAuthentication  # noqa: PLC0415
-    from django_bolt.auth.guards import IsAuthenticated  # noqa: PLC0415
-
-    @api.view("/articles")
-    class ArticleViewSet(ViewSet):
-        auth = [JWTAuthentication(secret="test-secret")]
-        guards = [IsAuthenticated()]
-        queryset = []  # Mock queryset
-        serializer_class = UserSchema
-
-        async def get(
-            self, request, page: Annotated[int, Query(ge=1)] = 1, limit: Annotated[int, Query(ge=1, le=100)] = 10
-        ):
-            """List with query validation."""
-            return {"page": page, "limit": limit, "items": []}
-
-        async def post(self, request, data: UserCreateSchema):
-            """Create with body validation."""
-            return {"id": 1, "username": data.username, "email": data.email}
-
-    with TestClient(api) as client:
-        # Without auth - should fail
-        response = client.get("/articles")
-        assert response.status_code == 401
-
-        # Create mock token (simplified for test)
-        # In real scenario, you'd create a proper JWT token
-        # For now, we just verify the auth middleware is applied
-
-
-def test_model_viewset_integration(api):
-    """Test ModelViewSet with all parameter types."""
-
-    class ArticleViewSet(ModelViewSet):
-        queryset = []  # Mock
-        serializer_class = UserSchema
-
-        async def get(
-            self,
-            request,
-            pk: int,
-            include_comments: Annotated[bool, Query()] = False,
-            api_key: Annotated[str, Header(alias="X-API-Key")] = "",
-        ):
-            """Retrieve with path, query, and header params."""
-            return {"id": pk, "include_comments": include_comments, "api_key": api_key}
-
-    # This test needs fixing - viewset should use api.viewset() not api.view()
-    # For now, register with decorator
-    @api.view("/articles/{pk}", methods=["GET"])
-    class ArticleViewSetWrapper(ArticleViewSet):
-        pass
-
-    with TestClient(api) as client:
-        response = client.get("/articles/123?include_comments=true", headers={"X-API-Key": "key123"})
-        assert response.status_code == 200
-        data = response.json()
-        assert data["id"] == 123
-        assert data["include_comments"] is True
-        assert data["api_key"] == "key123"
-
-
-# ============================================================================
 # Middleware Tests
 # ============================================================================
 
@@ -748,15 +680,16 @@ def test_multiple_middleware_decorators_with_class_view(api):
 def test_custom_action_decorator_in_viewset(api):
     """Test @action decorator custom actions INSIDE a ViewSet class."""
 
+    @api.viewset("/articles")
     class ArticleViewSet(ViewSet):
         queryset = []
         lookup_field = "article_id"  # Set lookup field to match parameter names
 
-        async def list(self, request):
+        async def list(self, request) -> dict:
             """Standard list action."""
             return {"articles": []}
 
-        async def create(self, request):
+        async def create(self, request) -> dict:
             """Standard create action."""
             return {"id": 1, "created": True}
 
@@ -775,11 +708,6 @@ def test_custom_action_decorator_in_viewset(api):
         async def search(self, request, query: str):
             """Custom action: search articles. GET /articles/search"""
             return {"query": query, "results": ["article1", "article2"]}
-
-    # Register the ViewSet - this should register both standard methods AND custom actions
-    @api.viewset("/articles")
-    class ArticleViewSetRegistered(ArticleViewSet):
-        pass
 
     with TestClient(api) as client:
         # Standard CRUD endpoints
@@ -814,10 +742,11 @@ def test_custom_action_decorator_in_viewset(api):
 def test_viewset_with_multiple_custom_actions(api):
     """Test ViewSet with many custom action methods defined INSIDE the class."""
 
+    @api.viewset("/users")
     class UserViewSet(ViewSet):
         lookup_field = "user_id"  # Set lookup field to match parameter names
 
-        async def retrieve(self, request, user_id: int):
+        async def retrieve(self, request, user_id: int) -> dict:
             """Standard retrieve action."""
             return {"id": user_id, "username": "testuser"}
 
@@ -847,11 +776,6 @@ def test_viewset_with_multiple_custom_actions(api):
             """Custom action: update user permissions. PUT /users/{user_id}/permissions"""
             # In real app, would extract permissions from request body
             return {"id": user_id, "permissions": ["admin"], "updated": True}
-
-    # Register the ViewSet - automatically registers both standard method AND all custom actions
-    @api.viewset("/users")
-    class UserViewSetRegistered(UserViewSet):
-        pass
 
     with TestClient(api) as client:
         # Standard retrieve
@@ -897,13 +821,14 @@ def test_custom_action_with_auth_and_guards(api):
     """Test custom action methods INSIDE ViewSet with authentication and guards."""
     from django_bolt.auth import APIKeyAuthentication, IsAuthenticated  # noqa: PLC0415
 
+    @api.viewset("/documents")
     class DocumentViewSet(ViewSet):
         # Class-level auth applies to all methods
         auth = [APIKeyAuthentication(api_keys={"admin-key": "admin1", "user-key": "user1"})]
         guards = [IsAuthenticated()]
         lookup_field = "doc_id"  # Set lookup field to match parameter names
 
-        async def retrieve(self, request, doc_id: int):
+        async def retrieve(self, request, doc_id: int) -> dict:
             """Standard retrieve - requires auth."""
             auth_context = request.get("auth", {})
             return {"doc_id": doc_id, "title": "Secure Document", "accessed_by": auth_context.get("user_id", "unknown")}
@@ -926,10 +851,6 @@ def test_custom_action_with_auth_and_guards(api):
             """Custom action: lock document for editing (requires auth). POST /documents/{doc_id}/lock"""
             auth_context = request.get("auth", {})
             return {"doc_id": doc_id, "locked": True, "locked_by": auth_context.get("user_id", "unknown")}
-
-    @api.viewset("/documents")
-    class DocumentViewSetRegistered(DocumentViewSet):
-        pass
 
     with TestClient(api) as client:
         # Standard retrieve without auth - should fail
@@ -976,7 +897,7 @@ def test_nested_resource_actions_with_class_views(api):
     """Test nested resource ViewSet (e.g., comment moderation)."""
 
     class CommentViewSet(ViewSet):
-        async def retrieve(self, request, post_id: int, comment_id: int):
+        async def retrieve(self, request, post_id: int, comment_id: int) -> dict:
             """Standard retrieve nested resource."""
             return {"post_id": post_id, "comment_id": comment_id, "text": "Sample comment", "status": "pending"}
 
