@@ -46,40 +46,31 @@ use crate::request_pipeline::validate_and_cache_typed_params;
 use crate::static_files::handle_static_file;
 use crate::type_coercion::{coerce_param, params_to_py_dict, TYPE_STRING};
 
-/// One-time initialization flag for async runtime
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
-/// Initialize TASK_LOCALS for test environment if not already set.
-/// This is required for SSE/streaming responses that use async generators.
+/// Initialize the tokio runtime, asyncio event loop, and TASK_LOCALS once
+/// for the test environment (required for SSE/streaming and ASGI mounts).
 fn ensure_task_locals_initialized() {
     use std::sync::mpsc;
 
-    // Only initialize once
     ASYNC_RUNTIME_INITIALIZED.call_once(|| {
-        // Initialize pyo3_async_runtimes tokio runtime (like production server)
-        let runtime_builder = tokio::runtime::Builder::new_multi_thread();
+        let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+        runtime_builder.enable_all();
         pyo3_async_runtimes::tokio::init(runtime_builder);
 
-        // Channel to signal when event loop is ready
         let (tx, rx) = mpsc::channel();
 
-        // Create event loop and start it in background thread
         let loop_obj_opt: Option<Py<PyAny>> = Python::attach(|py| {
             let asyncio = match py.import("asyncio") {
                 Ok(m) => m,
-                Err(_) => {
-                    return None;
-                }
+                Err(_) => return None,
             };
 
             let event_loop = match asyncio.call_method0("new_event_loop") {
                 Ok(ev) => ev,
-                Err(_) => {
-                    return None;
-                }
+                Err(_) => return None,
             };
 
-            // Create TaskLocals with the event loop
             match pyo3_async_runtimes::TaskLocals::new(event_loop.clone()).copy_context(py) {
                 Ok(locals) => {
                     let _ = TASK_LOCALS.set(locals);
@@ -89,7 +80,6 @@ fn ensure_task_locals_initialized() {
             }
         });
 
-        // GIL is now released - spawn background thread to run event loop
         if let Some(loop_obj) = loop_obj_opt {
             std::thread::spawn(move || {
                 Python::attach(|py| {
@@ -102,19 +92,16 @@ fn ensure_task_locals_initialized() {
                     };
                     let ev = loop_obj.bind(py);
                     let _ = asyncio.call_method1("set_event_loop", (ev.as_any(),));
-
-                    // Signal that we're about to run forever
                     let _ = tx.send(());
                     let _ = ev.call_method0("run_forever");
                 });
             });
 
-            // Wait for the background thread while releasing the GIL.
-            // Otherwise the thread cannot acquire Python and start run_forever().
+            // Release the GIL so the background thread can acquire it and
+            // enter run_forever().
             Python::attach(|py| {
                 py.detach(move || {
                     let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
-                    // Give it a tiny bit more time to actually enter run_forever.
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 });
             });

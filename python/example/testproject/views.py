@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 from django.contrib.auth import authenticate, login, logout
@@ -13,12 +14,12 @@ async def index(request):
     return JsonResponse(test_data.JSON_1K, safe=False)
 
 
-def sse(request):
-    """Server-Sent Events endpoint that sends timestamp data every second"""
+async def sse(request):
+    """Server-Sent Events endpoint that sends timestamp data every second."""
 
-    def gen():
+    async def gen():
         while True:
-            time.sleep(1)
+            await asyncio.sleep(1)
             yield f"data: {time.time()}\n\n"
 
     return StreamingHttpResponse(gen(), content_type="text/event-stream")

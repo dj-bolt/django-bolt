@@ -849,6 +849,7 @@ dependencies = [
  "futures-util",
  "governor",
  "jsonwebtoken",
+ "log",
  "matchit",
  "mimalloc",
  "once_cell",

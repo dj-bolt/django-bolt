@@ -9,7 +9,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 
 use crate::handler::handle_python_error;
 use crate::state::{AsgiMount, TASK_LOCALS};
@@ -19,14 +19,12 @@ struct AsgiResponseStart {
     headers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Shared state between `AsgiSend`, `AsgiDoneCallback`, and the Rust handler.
 struct AsgiSendState {
-    response_start: Mutex<Option<AsgiResponseStart>>,
+    /// Fires once on `http.response.start`; dropped by `AsgiDoneCallback` if
+    /// the coroutine finishes before sending, causing `start_rx` to error.
+    response_start_tx: Mutex<Option<oneshot::Sender<AsgiResponseStart>>>,
     body_tx: Mutex<Option<mpsc::UnboundedSender<Bytes>>>,
-}
-
-enum AwaitCoroutineError {
-    TimedOut,
-    Python(PyErr),
 }
 
 #[pyclass]
@@ -91,29 +89,22 @@ impl AsgiSend {
 
                 let mut start_guard = self
                     .state
-                    .response_start
+                    .response_start_tx
                     .lock()
-                    .map_err(|_| PyRuntimeError::new_err("Failed to lock response_start"))?;
-                if start_guard.is_some() {
-                    return Err(PyRuntimeError::new_err(
-                        "http.response.start sent more than once",
-                    ));
+                    .map_err(|_| PyRuntimeError::new_err("Failed to lock response_start_tx"))?;
+
+                match start_guard.take() {
+                    Some(tx) => {
+                        let _ = tx.send(AsgiResponseStart { status, headers });
+                    }
+                    None => {
+                        return Err(PyRuntimeError::new_err(
+                            "http.response.start sent more than once",
+                        ));
+                    }
                 }
-                *start_guard = Some(AsgiResponseStart { status, headers });
             }
             "http.response.body" => {
-                let has_start = self
-                    .state
-                    .response_start
-                    .lock()
-                    .map_err(|_| PyRuntimeError::new_err("Failed to lock response_start"))?
-                    .is_some();
-                if !has_start {
-                    return Err(PyRuntimeError::new_err(
-                        "http.response.body received before http.response.start",
-                    ));
-                }
-
                 let body = parse_asgi_body(message)?;
                 let more_body = message
                     .get_item("more_body")?
@@ -129,7 +120,12 @@ impl AsgiSend {
 
                 if let Some(ref tx) = *tx_guard {
                     if !body.is_empty() {
-                        let _ = tx.send(Bytes::from(body));
+                        if tx.send(Bytes::from(body)).is_err() {
+                            log::debug!(
+                                "ASGI mount: body chunk dropped — receiver already closed \
+                                 (request may have timed out or been cancelled)"
+                            );
+                        }
                     }
 
                     if !more_body {
@@ -150,6 +146,48 @@ impl AsgiSend {
         }
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(()) })
+    }
+}
+
+/// Done-callback that closes both channels when the ASGI coroutine finishes,
+/// ensuring the body stream always terminates.
+#[pyclass]
+struct AsgiDoneCallback {
+    state: Arc<AsgiSendState>,
+    response_done: Arc<Notify>,
+    debug: bool,
+}
+
+#[pymethods]
+impl AsgiDoneCallback {
+    fn __call__(&self, _py: Python<'_>, future: &Bound<'_, PyAny>) {
+        match future.call_method0("exception") {
+            Err(_) => {
+                log::debug!("ASGI mount: coroutine was cancelled");
+            }
+            Ok(exc) if !exc.is_none() => {
+                if self.debug {
+                    log::error!(
+                        "ASGI mount: coroutine raised an exception: {}",
+                        exc.call_method0("__str__")
+                            .ok()
+                            .and_then(|s| s.extract::<String>().ok())
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            Ok(_) => {}
+        }
+
+        // Drop channels so the handler observes end-of-stream / error.
+        if let Ok(mut guard) = self.state.response_start_tx.lock() {
+            guard.take();
+        }
+        if let Ok(mut guard) = self.state.body_tx.lock() {
+            guard.take();
+        }
+
+        self.response_done.notify_waiters();
     }
 }
 
@@ -306,56 +344,23 @@ fn build_scope(py: Python<'_>, req: &HttpRequest, mount: &AsgiMount) -> PyResult
     Ok(scope.unbind())
 }
 
-async fn await_coroutine_on_task_loop(
-    coroutine: Py<PyAny>,
-    timeout: Duration,
-) -> Result<Py<PyAny>, AwaitCoroutineError> {
-    tokio::task::spawn_blocking(move || {
-        Python::attach(|py| -> Result<Py<PyAny>, AwaitCoroutineError> {
-            let locals = TASK_LOCALS.get().ok_or_else(|| {
-                AwaitCoroutineError::Python(PyRuntimeError::new_err("Asyncio loop not initialized"))
-            })?;
-            let event_loop = locals.event_loop(py);
-
-            let asyncio = py.import("asyncio").map_err(AwaitCoroutineError::Python)?;
-            let future = asyncio
-                .call_method1("run_coroutine_threadsafe", (coroutine.bind(py), event_loop))
-                .map_err(AwaitCoroutineError::Python)?;
-
-            match future.call_method1("result", (timeout.as_secs_f64(),)) {
-                Ok(result) => Ok(result.unbind()),
-                Err(err) => {
-                    let is_timeout = err.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py)
-                        || (|| -> PyResult<bool> {
-                            let timeout_cls =
-                                py.import("concurrent.futures")?.getattr("TimeoutError")?;
-                            err.value(py).is_instance(&timeout_cls)
-                        })()
-                        .unwrap_or(false);
-
-                    if is_timeout {
-                        let _ = future.call_method0("cancel");
-                        return Err(AwaitCoroutineError::TimedOut);
-                    }
-
-                    Err(AwaitCoroutineError::Python(err))
-                }
-            }
-        })
-    })
-    .await
-    .map_err(|err| {
-        AwaitCoroutineError::Python(PyRuntimeError::new_err(format!(
-            "ASGI coroutine join error: {}",
-            err
-        )))
-    })?
+/// Submit a coroutine to the Python asyncio event loop via `run_coroutine_threadsafe`.
+/// Returns the `concurrent.futures.Future` wrapping the asyncio task.
+fn submit_to_event_loop(py: Python<'_>, coroutine: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let locals = TASK_LOCALS
+        .get()
+        .ok_or_else(|| PyRuntimeError::new_err("Asyncio loop not initialized"))?;
+    let event_loop = locals.event_loop(py);
+    let asyncio = py.import("asyncio")?;
+    let future = asyncio.call_method1("run_coroutine_threadsafe", (coroutine.bind(py), event_loop))?;
+    Ok(future.unbind())
 }
 
 /// Handle a request by delegating to an HTTP ASGI mount.
 ///
-/// This is used only on Bolt router misses, so API hot-path routing remains unchanged.
-/// Current bridge behavior buffers ASGI body chunks until the app coroutine completes.
+/// Streams the response: body chunks are forwarded via mpsc as they arrive,
+/// so SSE/chunked streaming works in real time. `asgi_mount_timeout` applies
+/// only to the initial `http.response.start`; the body streams indefinitely.
 pub async fn handle_asgi_mount_request(
     req: HttpRequest,
     mut payload: web::Payload,
@@ -364,6 +369,7 @@ pub async fn handle_asgi_mount_request(
     max_payload_size: usize,
     asgi_mount_timeout: Duration,
 ) -> HttpResponse {
+    // 1. Buffer request body.
     let mut request_body = Vec::new();
     while let Some(chunk) = payload.next().await {
         match chunk {
@@ -376,7 +382,6 @@ pub async fn handle_asgi_mount_request(
                             max_payload_size
                         ));
                 }
-
                 request_body.extend_from_slice(&data);
             }
             Err(err) => {
@@ -387,101 +392,121 @@ pub async fn handle_asgi_mount_request(
         }
     }
 
+    // 2. Build scope/protocol objects, submit coroutine, register done-callback.
+    //
+    // run_coroutine_threadsafe and add_done_callback are non-blocking Python
+    // calls, so we do everything in one inline GIL acquisition instead of
+    // dispatching through spawn_blocking.
     let (body_tx, body_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (start_tx, start_rx) = oneshot::channel::<AsgiResponseStart>();
+    let response_done = Arc::new(Notify::new());
+
     let send_state = Arc::new(AsgiSendState {
-        response_start: Mutex::new(None),
+        response_start_tx: Mutex::new(Some(start_tx)),
         body_tx: Mutex::new(Some(body_tx)),
     });
-    let response_done = Arc::new(Notify::new());
-    let receive = Arc::new(AsyncMutex::new(Some(request_body)));
 
-    let app_coroutine = match Python::attach(|py| -> PyResult<_> {
+    let py_future: Py<PyAny> = match Python::attach(|py| -> PyResult<Py<PyAny>> {
         let scope = build_scope(py, &req, mount)?;
         let receive_obj = Py::new(
             py,
             AsgiReceive {
-                body: receive.clone(),
+                body: Arc::new(AsyncMutex::new(Some(request_body))),
                 response_done: response_done.clone(),
             },
         )?;
-        let send_obj = Py::new(
+        let send_obj = Py::new(py, AsgiSend { state: send_state.clone() })?;
+        let coroutine = mount.app.call1(py, (scope, receive_obj, send_obj))?;
+
+        let py_future = submit_to_event_loop(py, coroutine)?;
+        let callback = Py::new(
             py,
-            AsgiSend {
+            AsgiDoneCallback {
                 state: send_state.clone(),
+                response_done: response_done.clone(),
+                debug,
             },
         )?;
-
-        let app_callable = mount.app.clone_ref(py);
-        let coroutine = app_callable.call1(py, (scope, receive_obj, send_obj))?;
-        Ok(coroutine)
+        py_future.bind(py).call_method1("add_done_callback", (callback,))?;
+        Ok(py_future)
     }) {
-        Ok(coroutine) => coroutine,
+        Ok(f) => f,
         Err(err) => {
             return Python::attach(|py| {
                 handle_python_error(py, err, req.path(), req.method().as_str(), debug)
-            })
-        }
-    };
-
-    let app_result = await_coroutine_on_task_loop(app_coroutine, asgi_mount_timeout).await;
-    response_done.notify_waiters();
-    let _ = send_state
-        .body_tx
-        .lock()
-        .map(|mut tx_guard| tx_guard.take())
-        .ok();
-
-    if let Err(err) = app_result {
-        let response_started = send_state
-            .response_start
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false);
-
-        if !response_started {
-            return match err {
-                AwaitCoroutineError::TimedOut => HttpResponse::GatewayTimeout()
-                    .content_type("text/plain; charset=utf-8")
-                    .body(format!(
-                        "ASGI mount timed out after {:.3} seconds",
-                        asgi_mount_timeout.as_secs_f64()
-                    )),
-                AwaitCoroutineError::Python(err) => Python::attach(|py| {
-                    handle_python_error(py, err, req.path(), req.method().as_str(), debug)
-                }),
-            };
-        }
-
-        if let AwaitCoroutineError::Python(err) = err {
-            Python::attach(|py| {
-                err.print(py);
             });
         }
-    }
+    };
 
-    let response_start = match send_state
-        .response_start
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take())
-    {
-        Some(start) => start,
-        None => {
-            return HttpResponse::InternalServerError()
+    // 5. Wait for http.response.start (with timeout).
+    let response_start = tokio::select! {
+        result = start_rx => {
+            match result {
+                Ok(start) => start,
+                Err(_) => {
+                    return HttpResponse::InternalServerError()
+                        .content_type("text/plain; charset=utf-8")
+                        .body("ASGI app did not send http.response.start");
+                }
+            }
+        }
+        _ = tokio::time::sleep(asgi_mount_timeout) => {
+            Python::attach(|py| {
+                let _ = py_future.call_method0(py, "cancel");
+            });
+            response_done.notify_waiters();
+            return HttpResponse::GatewayTimeout()
                 .content_type("text/plain; charset=utf-8")
-                .body("ASGI app did not send http.response.start")
+                .body(format!(
+                    "ASGI mount timed out after {:.3} seconds waiting for response headers",
+                    asgi_mount_timeout.as_secs_f64()
+                ));
         }
     };
 
+    // 6. Build and stream the response.
     let status = StatusCode::from_u16(response_start.status).unwrap_or(StatusCode::OK);
     let mut builder = HttpResponse::build(status);
 
+    let mut is_event_stream = false;
     for (name_bytes, value_bytes) in response_start.headers {
-        if let Ok(name) = HeaderName::from_bytes(&name_bytes) {
-            if let Ok(value) = HeaderValue::from_bytes(&value_bytes) {
-                builder.append_header((name, value));
+        match HeaderName::from_bytes(&name_bytes) {
+            Ok(name) => match HeaderValue::from_bytes(&value_bytes) {
+                Ok(value) => {
+                    if name == "content-type"
+                        && value.as_bytes().starts_with(b"text/event-stream")
+                    {
+                        is_event_stream = true;
+                    }
+                    builder.append_header((name, value));
+                }
+                Err(_) => {
+                    log::debug!(
+                        "ASGI mount: dropping response header {:?} — value contains \
+                         invalid bytes (embedded CR/LF or non-ASCII)",
+                        String::from_utf8_lossy(&name_bytes)
+                    );
+                }
+            },
+            Err(_) => {
+                log::debug!(
+                    "ASGI mount: dropping response header with invalid name bytes: {:?}",
+                    String::from_utf8_lossy(&name_bytes)
+                );
             }
         }
+    }
+
+    // SSE: add anti-buffering headers (mirrors the native django-bolt SSE path).
+    // Content-Encoding: identity tells our CompressionMiddleware to skip
+    // compression (it strips the header before sending). Without this, the
+    // compressor buffers chunks and the browser receives nothing until flush.
+    if is_event_stream {
+        builder.insert_header(("X-Accel-Buffering", "no"));
+        builder.insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"));
+        builder.insert_header(("Pragma", "no-cache"));
+        builder.insert_header(("Expires", "0"));
+        builder.insert_header(("Content-Encoding", "identity"));
     }
 
     if req.method() == Method::HEAD {

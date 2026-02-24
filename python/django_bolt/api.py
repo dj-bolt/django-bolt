@@ -95,7 +95,7 @@ def _normalize_path(path: str, trailing_slash: str = "strip") -> str:
 
 
 def _normalize_mount_prefix(path: str) -> str:
-    """Normalize an ASGI mount prefix to a static path."""
+    """Normalize an ASGI mount prefix: ensure leading slash, strip trailing, reject dynamic segments."""
     mount_path = "/" + path.strip("/") if path else "/"
     if mount_path != "/" and mount_path.endswith("/"):
         mount_path = mount_path.rstrip("/")
@@ -114,7 +114,7 @@ def _validate_asgi_mount_conflicts(
     *,
     error_cls: type[Exception] = ValueError,
 ) -> None:
-    """Validate exact-path conflicts and duplicate prefixes for ASGI mounts."""
+    """Reject duplicate ASGI mount prefixes and exact collisions with HTTP routes."""
     if not asgi_mounts:
         return
 
@@ -134,13 +134,7 @@ def _validate_asgi_mount_conflicts(
 
 
 def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
-    """
-    Adjust scope for Django mounted under a non-empty root_path.
-
-    Django's ASGI request handling expects ``scope["path"]`` to include
-    ``scope["root_path"]`` so it can derive ``path_info`` and redirects
-    correctly (for example APPEND_SLASH redirects).
-    """
+    """Prepend root_path to scope["path"] so Django derives path_info correctly."""
     if scope.get("type") != "http":
         return scope
 
@@ -154,7 +148,6 @@ def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
     if not path.startswith("/"):
         path = "/" + path
 
-    # Already full path.
     if path.startswith(root_path):
         return scope
 
@@ -188,13 +181,7 @@ def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
 def _rewrite_django_mount_redirect_message(
     message: dict[str, Any], root_path: str
 ) -> dict[str, Any]:
-    """
-    Rewrite root-relative redirect locations to stay inside the mount prefix.
-
-    Example:
-    - root_path="/django"
-    - Location: "/accounts/" -> "/django/accounts/"
-    """
+    """Prepend root_path to root-relative redirect Location headers."""
     if not root_path:
         return message
 
@@ -213,7 +200,6 @@ def _rewrite_django_mount_redirect_message(
     rewritten: list[tuple[Any, Any]] = []
 
     for header_name, header_value in headers:
-        # Keep original types where possible (ASGI headers are usually bytes).
         name_bytes = (
             header_name.tobytes()
             if isinstance(header_name, memoryview)
@@ -235,7 +221,6 @@ def _rewrite_django_mount_redirect_message(
         )
         location = value_bytes.decode("latin1")
 
-        # Rewrite only root-relative redirects and keep absolute/protocol-relative untouched.
         if location.startswith("/") and not location.startswith("//"):
             if not (location == root_path or location.startswith(root_path + "/")):
                 location = f"{root_path}{location}"
@@ -399,6 +384,7 @@ class BoltAPI:
         self._admin_routes_registered = False
         self._static_routes_registered = False
         self._asgi_mounts: list[tuple[str, Callable[..., Any]]] = []
+        self._asgi_mount_prefixes: set[str] = set()
 
         # Middleware chain (built lazily on first request)
         self._middleware_chain_built = False
@@ -1610,14 +1596,7 @@ class BoltAPI:
         registrar.register_routes()
 
     def _register_admin_routes(self, host: str = "localhost", port: int = 8000) -> None:
-        """Register Django admin as an ASGI mount.
-
-        Delegates to AdminRouteRegistrar for cleaner separation of concerns.
-
-        Args:
-            host: Reserved for backward compatibility
-            port: Reserved for backward compatibility
-        """
+        """Register Django admin as an ASGI mount."""
 
         registrar = AdminRouteRegistrar(self)
         registrar.register_routes(host, port)
@@ -1742,7 +1721,6 @@ class BoltAPI:
             # _handler_api_map is always initialized in __init__
             self._handler_api_map[new_handler_id] = app
 
-        # Copy ASGI mounts from sub-app to this app with path prefix
         for asgi_prefix, asgi_app in app._asgi_mounts:
             if mount_path:
                 if asgi_prefix == "/":
@@ -1752,8 +1730,9 @@ class BoltAPI:
             else:
                 new_asgi_prefix = asgi_prefix
 
-            if any(existing == new_asgi_prefix for existing, _ in self._asgi_mounts):
+            if new_asgi_prefix in self._asgi_mount_prefixes:
                 raise ValueError(f"Duplicate ASGI mount prefix: {new_asgi_prefix}")
+            self._asgi_mount_prefixes.add(new_asgi_prefix)
             self._asgi_mounts.append((new_asgi_prefix, asgi_app))
 
         # Remove sub-app from global registry (parent handles its routes now)
@@ -1761,14 +1740,7 @@ class BoltAPI:
             _BOLT_API_REGISTRY.remove(app)
 
     def mount_asgi(self, path: str, app: Callable[..., Any]) -> None:
-        """Mount a generic HTTP ASGI app at a static prefix.
-
-        Notes:
-        - Mounts are evaluated only after Bolt route lookup misses, so mounted apps
-          do not run Bolt middleware/auth/rate-limit/CORS handlers.
-        - The current bridge buffers mounted ASGI responses before returning them to
-          the client (not true wire-level streaming/backpressure).
-        """
+        """Mount an ASGI app at a static prefix (evaluated after Bolt route miss)."""
         if not callable(app):
             raise TypeError(
                 f"mount_asgi() expects a callable ASGI application, got {type(app).__name__}"
@@ -1776,23 +1748,27 @@ class BoltAPI:
 
         mount_path = _normalize_mount_prefix(path)
 
-        # Apply API prefix semantics (same as route registration).
         if self.prefix:
             if mount_path == "/":
                 mount_path = _normalize_mount_prefix(self.prefix)
             else:
                 mount_path = _normalize_mount_prefix(self.prefix + mount_path)
 
-        if any(existing == mount_path for existing, _ in self._asgi_mounts):
+        if mount_path in self._asgi_mount_prefixes:
             raise ValueError(f"Duplicate ASGI mount prefix: {mount_path}")
 
+        self._asgi_mount_prefixes.add(mount_path)
         self._asgi_mounts.append((mount_path, app))
 
-    def mount_django(self, path: str, app: Any | None = None) -> None:
-        """Mount Django's ASGI app (or a custom ASGI app) at a path prefix.
+    def mount_django(self, path: str, app: Any | None = None, *, clear_root_path: bool = False) -> None:
+        """Mount Django's ASGI app at a path prefix (convenience wrapper over mount_asgi).
 
-        This is a convenience wrapper over `mount_asgi()` and inherits the same
-        middleware and response-buffering behavior.
+        Args:
+            path: URL prefix (e.g. ``"/admin"``).
+            app: ASGI callable; defaults to ``get_asgi_application()``.
+            clear_root_path: Set ``root_path=""`` before Django sees the scope.
+                Required when URL patterns already include the mount prefix
+                (e.g. ``/admin/...``).
         """
         asgi_app = app
         if asgi_app is None:
@@ -1802,6 +1778,10 @@ class BoltAPI:
 
         async def django_mount_wrapper(scope, receive, send):
             django_scope = _rewrite_scope_for_django_mount(scope)
+            if clear_root_path:
+                if django_scope is scope:
+                    django_scope = dict(scope)
+                django_scope["root_path"] = ""
             root_path = django_scope.get("root_path") or ""
 
             async def django_send(message):
