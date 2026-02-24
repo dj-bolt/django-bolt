@@ -110,16 +110,11 @@ class MiddlewareResponse:
             self._raw_cookies if self._raw_cookies else None,
         )
 
+        # Trust the slot set at construction time; only override when middleware
+        # has actually swapped in a StreamingResponse object.
         body_kind = self._body_kind
         if hasattr(self.body, "content"):
             body_kind = "stream"
-        elif isinstance(self.body, (bytes, bytearray)):
-            body_kind = "bytes"
-        elif isinstance(self.body, str):
-            # file responses pass filesystem path as body
-            body_kind = "file"
-        else:
-            body_kind = "bytes"
 
         body_payload = bytes(self.body) if isinstance(self.body, bytearray) else self.body
         return (self.status_code, meta, body_kind, body_payload)

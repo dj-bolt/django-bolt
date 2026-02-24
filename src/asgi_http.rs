@@ -166,14 +166,15 @@ impl AsgiDoneCallback {
                 log::debug!("ASGI mount: coroutine was cancelled");
             }
             Ok(exc) if !exc.is_none() => {
+                let msg = exc
+                    .call_method0("__str__")
+                    .ok()
+                    .and_then(|s| s.extract::<String>().ok())
+                    .unwrap_or_default();
                 if self.debug {
-                    log::error!(
-                        "ASGI mount: coroutine raised an exception: {}",
-                        exc.call_method0("__str__")
-                            .ok()
-                            .and_then(|s| s.extract::<String>().ok())
-                            .unwrap_or_default()
-                    );
+                    log::error!("ASGI mount: coroutine raised an exception: {}", msg);
+                } else {
+                    log::warn!("ASGI mount: coroutine raised an exception: {}", msg);
                 }
             }
             Ok(_) => {}

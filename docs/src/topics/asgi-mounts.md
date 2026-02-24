@@ -99,18 +99,9 @@ ASGI mounts run outside Bolt's route middleware pipeline.
 
 That means Bolt-level middleware features (for example rate limits, Bolt auth guards, and Bolt CORS behavior) do not apply to mounted ASGI apps. Mounted Django apps should rely on Django middleware/settings for those concerns.
 
-## Current bridge limitations
-
-The current HTTP ASGI mount bridge is response-buffering, not fully streaming:
-
-- The ASGI app coroutine is awaited to completion before Bolt constructs the outgoing Actix response.
-- Response chunks are accumulated in memory first, then sent to the client.
-
-Because of this design, mounted ASGI apps are not suitable for true streaming semantics (for example long-lived SSE streams) and do not get end-to-end backpressure from the client.
-
 ## Timeouts and body limits
 
-- `BOLT_ASGI_MOUNT_TIMEOUT` (seconds, default `30`) limits how long Bolt waits for a mounted ASGI app to complete. Timeout returns `504 Gateway Timeout`.
+- `BOLT_ASGI_MOUNT_TIMEOUT` (seconds, default `30`) limits how long Bolt waits for the mounted ASGI app to send the first `http.response.start` message (response headers). Once headers arrive, the response body streams indefinitely with no additional timeout. Timeout returns `504 Gateway Timeout`.
 - `BOLT_MAX_UPLOAD_SIZE` also applies to ASGI mount request bodies. Oversized bodies return `413 Payload Too Large`.
 
 ## Testing
