@@ -118,7 +118,7 @@ python manage.py runbolt --dev
 
 ```bash
 # Clone repository
-git clone https://github.com/FarhanAliRaza/django-bolt.git
+git clone https://github.com/dj-bolt/django-bolt.git
 cd django-bolt
 # Install dependencies
 uv sync
