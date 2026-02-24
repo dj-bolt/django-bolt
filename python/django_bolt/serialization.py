@@ -426,7 +426,7 @@ def serialize_django_response(result: DjangoHttpResponse) -> ResponseWireV1:
         return _wire_bytes(result.status_code, _build_response_meta("redirect", headers, None), b"")
 
     # Generic Django HttpResponse - extract content and headers
-    headers = {key: value for key, value in result.items()}
+    headers = dict(result.items())
     content = result.content if isinstance(result.content, bytes) else result.content.encode()
     return _wire_bytes(result.status_code, _build_response_meta("octetstream", headers, None), content)
 

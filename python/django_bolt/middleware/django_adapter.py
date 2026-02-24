@@ -496,7 +496,9 @@ class DjangoMiddlewareStack:
         self._django_process_request = [
             instance for instance in self._django_hook_middleware if hasattr(instance, "process_request")
         ]
-        self._django_process_view = [instance for instance in self._django_hook_middleware if hasattr(instance, "process_view")]
+        self._django_process_view = [
+            instance for instance in self._django_hook_middleware if hasattr(instance, "process_view")
+        ]
         self._django_process_response_reversed = list(
             reversed([instance for instance in self._django_hook_middleware if hasattr(instance, "process_response")])
         )
@@ -507,7 +509,9 @@ class DjangoMiddlewareStack:
             instance for instance in self._thirdparty_hook_middleware if hasattr(instance, "process_view")
         ]
         self._thirdparty_process_response_reversed = list(
-            reversed([instance for instance in self._thirdparty_hook_middleware if hasattr(instance, "process_response")])
+            reversed(
+                [instance for instance in self._thirdparty_hook_middleware if hasattr(instance, "process_response")]
+            )
         )
 
         has_hook_middleware = bool(self._ordered_hook_middleware)

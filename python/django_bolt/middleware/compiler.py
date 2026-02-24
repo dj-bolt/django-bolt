@@ -198,9 +198,7 @@ def compile_middleware_meta(
     return result
 
 
-def _extract_type_hints_from_field(
-    field: Any, target: dict[str, int], skip_string: bool = False
-) -> None:
+def _extract_type_hints_from_field(field: Any, target: dict[str, int], skip_string: bool = False) -> None:
     """Extract type hints from a field (struct or individual) into target dict.
 
     For struct fields, registers both the attribute name and the encoded name

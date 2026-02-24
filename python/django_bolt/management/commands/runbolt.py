@@ -535,8 +535,7 @@ class Command(BaseCommand):
                 asgi_key = f"ASGI {asgi_prefix}"
                 if asgi_key in route_map:
                     raise CommandError(
-                        f"ASGI mount conflict: {asgi_prefix} defined in both "
-                        f"{route_map[asgi_key]} and {api_path}"
+                        f"ASGI mount conflict: {asgi_prefix} defined in both {route_map[asgi_key]} and {api_path}"
                     )
 
                 route_map[asgi_key] = api_path

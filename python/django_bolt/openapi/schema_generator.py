@@ -685,7 +685,8 @@ class SchemaGenerator:
                 # this from Python's built-in types.UnionType (which uses
                 # .__args__ instead).
                 non_none_types = [
-                    t for t in type_annotation.types
+                    t
+                    for t in type_annotation.types
                     # String comparison because msgspec.inspect.NoneType is
                     # not the same object as builtins.NoneType.
                     if type(t).__name__ != "NoneType"
@@ -694,10 +695,7 @@ class SchemaGenerator:
                     return self._type_to_schema(non_none_types[0], register_component=register_component)
                 if len(non_none_types) > 1:
                     return Schema(
-                        any_of=[
-                            self._type_to_schema(t, register_component=register_component)
-                            for t in non_none_types
-                        ]
+                        any_of=[self._type_to_schema(t, register_component=register_component) for t in non_none_types]
                     )
                 return Schema(type="object")
             if type_name == "ListType":

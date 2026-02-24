@@ -117,6 +117,7 @@ That means Bolt-level middleware features (for example rate limits, Bolt auth gu
 
 - `BOLT_ASGI_MOUNT_TIMEOUT` (seconds, default `30`) limits how long Bolt waits for the mounted ASGI app to send the first `http.response.start` message (response headers). Once headers arrive, the response body streams indefinitely with no additional timeout. Timeout returns `504 Gateway Timeout`.
 - `BOLT_MAX_UPLOAD_SIZE` also applies to ASGI mount request bodies. Oversized bodies return `413 Payload Too Large`.
+- Request-body buffering for mounts currently has no dedicated read timeout before handoff to the mounted ASGI app. Enforce slow-client/read timeouts at your reverse proxy or ingress.
 
 ## Testing
 

@@ -628,9 +628,15 @@ def compile_argument_injector(
         _SRC_FALLBACK_D = 8
 
         _dep_source_map = {
-            "request": _SRC_REQUEST_D, "path": _SRC_PATH_D, "query": _SRC_QUERY_D,
-            "header": _SRC_HEADER_D, "cookie": _SRC_COOKIE_D, "form": _SRC_FORM_D,
-            "file": _SRC_FILE_D, "body": _SRC_BODY_D, "dependency": _SRC_DEP,
+            "request": _SRC_REQUEST_D,
+            "path": _SRC_PATH_D,
+            "query": _SRC_QUERY_D,
+            "header": _SRC_HEADER_D,
+            "cookie": _SRC_COOKIE_D,
+            "form": _SRC_FORM_D,
+            "file": _SRC_FILE_D,
+            "body": _SRC_BODY_D,
+            "dependency": _SRC_DEP,
         }
 
         _dep_plan: list[tuple[int, Any, Any, str, bool, Any]] = []
@@ -687,9 +693,18 @@ def compile_argument_injector(
                 # Pre-resolve all async deps in parallel
                 async def _resolve_one(dependency):
                     return await resolve_dependency(
-                        dependency.dependency, dependency, request, dep_cache,
-                        params_map, query_map, headers_map, cookies_map,
-                        handler_meta_dict, compile_binder_fn, http_method, path,
+                        dependency.dependency,
+                        dependency,
+                        request,
+                        dep_cache,
+                        params_map,
+                        query_map,
+                        headers_map,
+                        cookies_map,
+                        handler_meta_dict,
+                        compile_binder_fn,
+                        http_method,
+                        path,
                     )
 
                 dep_coros = []
@@ -714,9 +729,18 @@ def compile_argument_injector(
                         if dependency is None:
                             raise ValueError(f"Depends for parameter {name} requires a callable")
                         value = await resolve_dependency(
-                            dependency.dependency, dependency, request, dep_cache,
-                            params_map, query_map, headers_map, cookies_map,
-                            handler_meta_dict, compile_binder_fn, http_method, path,
+                            dependency.dependency,
+                            dependency,
+                            request,
+                            dep_cache,
+                            params_map,
+                            query_map,
+                            headers_map,
+                            cookies_map,
+                            handler_meta_dict,
+                            compile_binder_fn,
+                            http_method,
+                            path,
                         )
                 elif src_id == _SRC_REQUEST_D:
                     value = request
@@ -740,8 +764,17 @@ def compile_argument_injector(
                 else:
                     field = _dep_fallback_by_name[name]
                     value, body_obj, body_loaded = extract_parameter_value(
-                        field, request, params_map, query_map, headers_map, cookies_map,
-                        form_map, files_map, meta, body_obj, body_loaded,
+                        field,
+                        request,
+                        params_map,
+                        query_map,
+                        headers_map,
+                        cookies_map,
+                        form_map,
+                        files_map,
+                        meta,
+                        body_obj,
+                        body_loaded,
                     )
 
                 if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
@@ -853,8 +886,17 @@ def compile_argument_injector(
                 # Fallback for unknown/no-extractor sources
                 field = _fallback_by_name[name]
                 value, body_obj, body_loaded = extract_parameter_value(
-                    field, request, params_map, query_map, headers_map, cookies_map,
-                    form_map, files_map, meta, body_obj, body_loaded,
+                    field,
+                    request,
+                    params_map,
+                    query_map,
+                    headers_map,
+                    cookies_map,
+                    form_map,
+                    files_map,
+                    meta,
+                    body_obj,
+                    body_loaded,
                 )
 
             if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):

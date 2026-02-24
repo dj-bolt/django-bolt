@@ -99,23 +99,16 @@ def main() -> int:
     print(f"Core median gain: {core_median_gain:.2f}%")
 
     if regressions:
-        print(
-            f"FAIL: {len(regressions)} endpoint(s) regressed by more than {args.max_regression:.2f}%:"
-        )
+        print(f"FAIL: {len(regressions)} endpoint(s) regressed by more than {args.max_regression:.2f}%:")
         for key, old, new, delta in sorted(regressions, key=lambda x: x[3]):
             print(f"  - {key}: {old:.2f} -> {new:.2f} ({delta:.2f}%)")
         return 1
 
     if core_median_gain < args.core_median_min_gain:
-        print(
-            "FAIL: core median gain below target "
-            f"({core_median_gain:.2f}% < {args.core_median_min_gain:.2f}%)"
-        )
+        print(f"FAIL: core median gain below target ({core_median_gain:.2f}% < {args.core_median_min_gain:.2f}%)")
         return 1
 
-    print(
-        "PASS: no endpoint exceeded regression threshold and core median gain target was met."
-    )
+    print("PASS: no endpoint exceeded regression threshold and core median gain target was met.")
     return 0
 
 

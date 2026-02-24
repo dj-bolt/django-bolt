@@ -474,6 +474,7 @@ class TestMiddlewareMetadata:
 
     def test_rust_arg_prebinding_keeps_injector_path_when_python_middleware_present(self):
         """Prebound args/kwargs are used even when Python middleware chain is active."""
+
         class PassThroughMiddleware(Middleware):
             call_count = 0
 

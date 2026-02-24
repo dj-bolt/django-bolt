@@ -1253,9 +1253,7 @@ class TestCSRFMiddleware:
 
         @api.get("/form")
         async def form_route(request):
-            template = Template(
-                "<form method='post'>{% csrf_token %}<input name='value' value='x'></form>"
-            )
+            template = Template("<form method='post'>{% csrf_token %}<input name='value' value='x'></form>")
             return HTML(template.render(RequestContext(request, {})))
 
         @api.post("/submit")

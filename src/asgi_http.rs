@@ -384,6 +384,8 @@ pub async fn handle_asgi_mount_request(
     asgi_mount_timeout: Duration,
 ) -> HttpResponse {
     // 1. Buffer request body.
+    // NOTE: This read loop currently has no timeout. Slow-client request body timeouts
+    // should be enforced at the edge proxy/load balancer for now.
     let mut request_body = Vec::new();
     while let Some(chunk) = payload.next().await {
         match chunk {
@@ -459,7 +461,7 @@ pub async fn handle_asgi_mount_request(
         }
     };
 
-    // 5. Wait for http.response.start (with timeout).
+    // 3. Wait for http.response.start (with timeout).
     let response_start = tokio::select! {
         result = start_rx => {
             match result {
@@ -485,7 +487,7 @@ pub async fn handle_asgi_mount_request(
         }
     };
 
-    // 6. Build and stream the response.
+    // 4. Build and stream the response.
     let status = StatusCode::from_u16(response_start.status).unwrap_or(StatusCode::OK);
     let mut builder = HttpResponse::build(status);
 
@@ -501,7 +503,7 @@ pub async fn handle_asgi_mount_request(
                     builder.append_header((name, value));
                 }
                 Err(_) => {
-                    log::debug!(
+                    log::warn!(
                         "ASGI mount: dropping response header {:?} — value contains \
                          invalid bytes (embedded CR/LF or non-ASCII)",
                         String::from_utf8_lossy(&name_bytes)
@@ -509,7 +511,7 @@ pub async fn handle_asgi_mount_request(
                 }
             },
             Err(_) => {
-                log::debug!(
+                log::warn!(
                     "ASGI mount: dropping response header with invalid name bytes: {:?}",
                     String::from_utf8_lossy(&name_bytes)
                 );

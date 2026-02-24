@@ -226,7 +226,10 @@ def _upload_file_dec_hook(typ: type, obj: Any) -> Any:
 
 
 def _collect_struct_errors(
-    struct_type: type, data: dict[str, Any], param_type: str, has_files: bool = False,
+    struct_type: type,
+    data: dict[str, Any],
+    param_type: str,
+    has_files: bool = False,
 ) -> list[dict[str, Any]]:
     """Collect all validation errors by validating each field individually.
 
@@ -243,20 +246,24 @@ def _collect_struct_errors(
             try:
                 msgspec.convert(data[encoded_name], type=field.type, strict=False, dec_hook=dec_hook)
             except (msgspec.ValidationError, NotImplementedError) as e:
-                errors.append({
-                    "type": "validation_error",
-                    "loc": (loc_prefix, encoded_name),
-                    "msg": str(e),
-                    "input": data[encoded_name],
-                })
+                errors.append(
+                    {
+                        "type": "validation_error",
+                        "loc": (loc_prefix, encoded_name),
+                        "msg": str(e),
+                        "input": data[encoded_name],
+                    }
+                )
         elif field.required:
             is_file = is_upload_file_type(field.type)
-            errors.append({
-                "type": "file_missing" if is_file else "missing_field",
-                "loc": ("body", field.name) if is_file else (param_type, field.name),
-                "msg": "Missing required file" if is_file else f"Missing required {param_type}: {field.name}",
-                "input": None,
-            })
+            errors.append(
+                {
+                    "type": "file_missing" if is_file else "missing_field",
+                    "loc": ("body", field.name) if is_file else (param_type, field.name),
+                    "msg": "Missing required file" if is_file else f"Missing required {param_type}: {field.name}",
+                    "input": None,
+                }
+            )
     return errors
 
 

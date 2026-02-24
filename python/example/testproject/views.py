@@ -9,7 +9,6 @@ from django.urls import reverse
 import test_data
 
 
-
 async def index(request):
     return JsonResponse(test_data.JSON_1K, safe=False)
 

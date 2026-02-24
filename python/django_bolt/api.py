@@ -18,6 +18,7 @@ except ImportError:
 
 
 # Import local modules
+from django.core.asgi import get_asgi_application
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
 from django.utils.functional import SimpleLazyObject
@@ -101,9 +102,7 @@ def _normalize_mount_prefix(path: str) -> str:
         mount_path = mount_path.rstrip("/")
 
     if "{" in mount_path or "}" in mount_path:
-        raise ValueError(
-            f"ASGI mount path must be static (no dynamic parameters), got: {mount_path}"
-        )
+        raise ValueError(f"ASGI mount path must be static (no dynamic parameters), got: {mount_path}")
 
     return mount_path
 
@@ -134,7 +133,12 @@ def _validate_asgi_mount_conflicts(
 
 
 def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
-    """Prepend root_path to scope["path"] so Django derives path_info correctly."""
+    """Prepend root_path to scope["path"] so Django derives path_info correctly.
+
+    Rust `build_scope()` intentionally sets `scope["path"]` to the subpath relative
+    to the mount (ASGI convention). Django's ASGI handler expects the full request
+    path for URL resolution in mounted setups, so we reconstruct it here.
+    """
     if scope.get("type") != "http":
         return scope
 
@@ -178,9 +182,7 @@ def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
     return new_scope
 
 
-def _rewrite_django_mount_redirect_message(
-    message: dict[str, Any], root_path: str
-) -> dict[str, Any]:
+def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: str) -> dict[str, Any]:
     """Prepend root_path to root-relative redirect Location headers."""
     if not root_path:
         return message
@@ -221,17 +223,18 @@ def _rewrite_django_mount_redirect_message(
         )
         location = value_bytes.decode("latin1")
 
-        if location.startswith("/") and not location.startswith("//"):
-            if not (location == root_path or location.startswith(root_path + "/")):
-                location = f"{root_path}{location}"
-                changed = True
-                if isinstance(header_value, memoryview):
-                    rewritten.append((header_name, location.encode("latin1")))
-                elif isinstance(header_value, (bytes, bytearray)):
-                    rewritten.append((header_name, location.encode("latin1")))
-                else:
-                    rewritten.append((header_name, location))
-                continue
+        if (
+            location.startswith("/")
+            and not location.startswith("//")
+            and not (location == root_path or location.startswith(root_path + "/"))
+        ):
+            location = f"{root_path}{location}"
+            changed = True
+            if isinstance(header_value, (memoryview, bytes, bytearray)):
+                rewritten.append((header_name, location.encode("latin1")))
+            else:
+                rewritten.append((header_name, location))
+            continue
 
         rewritten.append((header_name, header_value))
 
@@ -245,6 +248,19 @@ def _rewrite_django_mount_redirect_message(
 
 def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: bytes) -> ResponseWireV1:
     """Convert error-handler parts into ResponseWireV1."""
+
+    def _infer_response_type(content_type: str | None) -> str:
+        if not content_type:
+            return "octetstream"
+        normalized = content_type.split(";", 1)[0].strip().lower()
+        if normalized == "application/json" or normalized.endswith("+json"):
+            return "json"
+        if normalized == "text/plain":
+            return "plaintext"
+        if normalized == "text/html":
+            return "html"
+        return "octetstream"
+
     custom_content_type = None
     custom_headers: list[tuple[str, str]] = []
 
@@ -255,7 +271,7 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
             custom_headers.append((key, value))
 
     meta = (
-        "octetstream",
+        _infer_response_type(custom_content_type),
         custom_content_type,
         custom_headers or None,
         None,
@@ -319,9 +335,7 @@ class BoltAPI:
         # Add custom middleware
         if middleware:
             self._middleware.extend(normalize_middleware_specs(middleware, context="api"))
-        self._has_python_global_middleware = any(
-            self._is_python_middleware_spec(spec) for spec in self._middleware
-        )
+        self._has_python_global_middleware = any(self._is_python_middleware_spec(spec) for spec in self._middleware)
 
         # Logging configuration (opt-in, setup happens at server startup)
         self._enable_logging = enable_logging
@@ -1271,9 +1285,7 @@ class BoltAPI:
     def _handle_generic_exception(self, e: Exception, request: dict[str, Any] = None) -> Response:
         """Handle generic exception using error_handlers module."""
         # Use the error handler which respects Django DEBUG setting
-        status, headers, body = handle_exception(
-            e, debug=None, request=request
-        )  # debug will be checked dynamically
+        status, headers, body = handle_exception(e, debug=None, request=request)  # debug will be checked dynamically
         return _wire_from_error_parts(status, headers, body)
 
     @staticmethod
@@ -1344,6 +1356,7 @@ class BoltAPI:
         Returns:
             The outermost middleware callable.
         """
+
         # Route executors are request-scoped and injected via request.state.
         async def inner_handler(req):
             route_executor = req.state["_bolt_route_executor"]
@@ -1517,7 +1530,9 @@ class BoltAPI:
             middleware_owner = original_api if original_api is not None else self
             has_python_global_middleware = middleware_owner._has_python_global_middleware
             has_route_python_middleware = bool(meta.get("_has_route_python_middleware", False))
-            api_with_middleware = middleware_owner if (has_python_global_middleware or has_route_python_middleware) else None
+            api_with_middleware = (
+                middleware_owner if (has_python_global_middleware or has_route_python_middleware) else None
+            )
 
             if api_with_middleware:
                 # Execute through middleware chain (Django-style)
@@ -1727,9 +1742,7 @@ class BoltAPI:
     def mount_asgi(self, path: str, app: Callable[..., Any]) -> None:
         """Mount an ASGI app at a static prefix (evaluated after Bolt route miss)."""
         if not callable(app):
-            raise TypeError(
-                f"mount_asgi() expects a callable ASGI application, got {type(app).__name__}"
-            )
+            raise TypeError(f"mount_asgi() expects a callable ASGI application, got {type(app).__name__}")
 
         mount_path = _normalize_mount_prefix(path)
 
@@ -1757,8 +1770,6 @@ class BoltAPI:
         """
         asgi_app = app
         if asgi_app is None:
-            from django.core.asgi import get_asgi_application
-
             asgi_app = get_asgi_application()
 
         async def django_mount_wrapper(scope, receive, send):
