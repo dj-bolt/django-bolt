@@ -7,6 +7,7 @@ import pytest
 from django.core.management.base import CommandError
 
 from django_bolt import BoltAPI
+from django_bolt.api import _rewrite_django_mount_redirect_message
 from django_bolt.management.commands.runbolt import Command
 from django_bolt.testing import TestClient
 
@@ -332,6 +333,28 @@ def test_mount_django_rewrites_root_relative_redirect_location():
 
     assert response.history
     assert response.history[0].headers["location"] == "/django/accounts/"
+
+
+@pytest.mark.parametrize(
+    ("header_name", "header_value", "expected_value"),
+    [
+        (b"location", b"/accounts/", b"/django/accounts/"),
+        ("location", "/accounts/", "/django/accounts/"),
+    ],
+)
+def test_rewrite_django_mount_redirect_message_handles_location_value_types(
+    header_name, header_value, expected_value
+):
+    message = {
+        "type": "http.response.start",
+        "status": 302,
+        "headers": [(header_name, header_value)],
+    }
+
+    rewritten = _rewrite_django_mount_redirect_message(message, "/django")
+
+    assert rewritten["headers"][0][0] == header_name
+    assert rewritten["headers"][0][1] == expected_value
 
 
 def test_testclient_rejects_exact_route_mount_collision():

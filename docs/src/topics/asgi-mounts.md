@@ -13,7 +13,7 @@ Use this when you want to serve existing Django URLconf apps (for example admin,
 Django-Bolt provides two mount APIs:
 
 - `api.mount_asgi(path, app)`: Mount any HTTP ASGI callable.
-- `api.mount_django(path, app=None)`: Mount Django's ASGI app (or a provided ASGI app).
+- `api.mount_django(path, app=None, *, clear_root_path=False)`: Mount Django's ASGI app (or a provided ASGI app).
 
 These mounts are HTTP-only (no WebSocket/lifespan support in this mount bridge).
 
@@ -72,6 +72,20 @@ You can also pass your own ASGI app:
 ```python
 api.mount_django("/legacy", app=custom_asgi_app)
 ```
+
+### `clear_root_path` behavior
+
+`mount_django()` can clear `scope["root_path"]` before passing control to Django:
+
+```python
+api.mount_django("/admin", clear_root_path=True)
+```
+
+Use `clear_root_path=True` when the mounted Django app's URL patterns already include the mount prefix.
+
+- Example: admin URL patterns are `/admin/...` and you mount at `/admin`.
+  - With `clear_root_path=True`, Django sees full paths like `/admin/login/`.
+- If Django URL patterns are relative to the mount root (for example `/login/` under the mount), keep the default `clear_root_path=False`.
 
 ## Rules and constraints
 

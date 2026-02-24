@@ -24,8 +24,10 @@ struct AsgiSendState {
     /// Fires once on `http.response.start`; dropped by `AsgiDoneCallback` if
     /// the coroutine finishes before sending, causing `start_rx` to error.
     response_start_tx: Mutex<Option<oneshot::Sender<AsgiResponseStart>>>,
-    body_tx: Mutex<Option<mpsc::UnboundedSender<Bytes>>>,
+    body_tx: Mutex<Option<mpsc::Sender<Bytes>>>,
 }
+
+const ASGI_MOUNT_BODY_CHANNEL_CAPACITY: usize = 32;
 
 #[pyclass]
 struct AsgiReceive {
@@ -118,24 +120,34 @@ impl AsgiSend {
                     .lock()
                     .map_err(|_| PyRuntimeError::new_err("Failed to lock body channel"))?;
 
-                if let Some(ref tx) = *tx_guard {
-                    if !body.is_empty() {
-                        if tx.send(Bytes::from(body)).is_err() {
-                            log::debug!(
-                                "ASGI mount: body chunk dropped — receiver already closed \
-                                 (request may have timed out or been cancelled)"
-                            );
-                        }
-                    }
-
+                let tx = if let Some(ref tx) = *tx_guard {
+                    let tx = tx.clone();
                     if !more_body {
+                        // Mark the stream as closed immediately so duplicate body messages fail fast.
                         tx_guard.take();
                     }
+                    Some(tx)
                 } else if more_body || !body.is_empty() {
                     return Err(PyRuntimeError::new_err(
                         "Response body channel is already closed",
                     ));
-                }
+                } else {
+                    None
+                };
+
+                return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                    if let Some(tx) = tx {
+                        if !body.is_empty() {
+                            if tx.send(Bytes::from(body)).await.is_err() {
+                                log::debug!(
+                                    "ASGI mount: body chunk dropped — receiver already closed \
+                                     (request may have timed out or been cancelled)"
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                });
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -353,7 +365,8 @@ fn submit_to_event_loop(py: Python<'_>, coroutine: Py<PyAny>) -> PyResult<Py<PyA
         .ok_or_else(|| PyRuntimeError::new_err("Asyncio loop not initialized"))?;
     let event_loop = locals.event_loop(py);
     let asyncio = py.import("asyncio")?;
-    let future = asyncio.call_method1("run_coroutine_threadsafe", (coroutine.bind(py), event_loop))?;
+    let future =
+        asyncio.call_method1("run_coroutine_threadsafe", (coroutine.bind(py), event_loop))?;
     Ok(future.unbind())
 }
 
@@ -398,7 +411,7 @@ pub async fn handle_asgi_mount_request(
     // run_coroutine_threadsafe and add_done_callback are non-blocking Python
     // calls, so we do everything in one inline GIL acquisition instead of
     // dispatching through spawn_blocking.
-    let (body_tx, body_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (body_tx, body_rx) = mpsc::channel::<Bytes>(ASGI_MOUNT_BODY_CHANNEL_CAPACITY);
     let (start_tx, start_rx) = oneshot::channel::<AsgiResponseStart>();
     let response_done = Arc::new(Notify::new());
 
@@ -416,7 +429,12 @@ pub async fn handle_asgi_mount_request(
                 response_done: response_done.clone(),
             },
         )?;
-        let send_obj = Py::new(py, AsgiSend { state: send_state.clone() })?;
+        let send_obj = Py::new(
+            py,
+            AsgiSend {
+                state: send_state.clone(),
+            },
+        )?;
         let coroutine = mount.app.call1(py, (scope, receive_obj, send_obj))?;
 
         let py_future = submit_to_event_loop(py, coroutine)?;
@@ -428,7 +446,9 @@ pub async fn handle_asgi_mount_request(
                 debug,
             },
         )?;
-        py_future.bind(py).call_method1("add_done_callback", (callback,))?;
+        py_future
+            .bind(py)
+            .call_method1("add_done_callback", (callback,))?;
         Ok(py_future)
     }) {
         Ok(f) => f,
@@ -474,8 +494,7 @@ pub async fn handle_asgi_mount_request(
         match HeaderName::from_bytes(&name_bytes) {
             Ok(name) => match HeaderValue::from_bytes(&value_bytes) {
                 Ok(value) => {
-                    if name == "content-type"
-                        && value.as_bytes().starts_with(b"text/event-stream")
+                    if name == "content-type" && value.as_bytes().starts_with(b"text/event-stream")
                     {
                         is_event_stream = true;
                     }

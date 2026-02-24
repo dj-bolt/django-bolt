@@ -41,6 +41,8 @@ static DATETIME_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static DATE_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static TIME_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static STREAMING_RESPONSE_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+const SKIP_CORS_HEADER_NAME: HeaderName = HeaderName::from_static("x-bolt-skip-cors");
+const SKIP_CORS_HEADER_VALUE: HeaderValue = HeaderValue::from_static("true");
 
 fn get_streaming_response_class(py: Python<'_>) -> &Py<PyAny> {
     STREAMING_RESPONSE_CLASS.get_or_init(py, || {
@@ -432,7 +434,7 @@ fn mark_skip_cors(response: &mut HttpResponse, skip_cors: bool) {
     if skip_cors {
         response
             .headers_mut()
-            .insert("x-bolt-skip-cors".parse().unwrap(), "true".parse().unwrap());
+            .insert(SKIP_CORS_HEADER_NAME, SKIP_CORS_HEADER_VALUE);
     }
 }
 

@@ -9,12 +9,9 @@ This is in a separate module to avoid circular imports:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from .responses import StreamingResponse
-else:
-    StreamingResponse = Any
+from .responses import StreamingResponse
 
 # Raw cookie tuple type (matches serialization.py CookieTuple)
 CookieTuple = tuple[str, str, str, int | None, str | None, str | None, bool, bool, str | None]
@@ -113,7 +110,7 @@ class MiddlewareResponse:
         # Trust the slot set at construction time; only override when middleware
         # has actually swapped in a StreamingResponse object.
         body_kind = self._body_kind
-        if hasattr(self.body, "content"):
+        if isinstance(self.body, StreamingResponse):
             body_kind = "stream"
 
         body_payload = bytes(self.body) if isinstance(self.body, bytearray) else self.body

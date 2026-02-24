@@ -406,6 +406,7 @@ impl PyRequest {
             "query" => self.query_params.clone_ref(py).into_any(),
             "headers" => self.headers.clone_ref(py).into_any(),
             "cookies" => self.cookies.clone_ref(py).into_any(),
+            "state" => self.state.clone_ref(py).into_any(),
             "auth" | "context" => match &self.context {
                 Some(ctx) => ctx.clone_ref(py).into_any(),
                 None => default.unwrap_or_else(|| py.None()),
@@ -423,12 +424,26 @@ impl PyRequest {
             "query" => Ok(self.query_params.clone_ref(py).into_any()),
             "headers" => Ok(self.headers.clone_ref(py).into_any()),
             "cookies" => Ok(self.cookies.clone_ref(py).into_any()),
+            "state" => Ok(self.state.clone_ref(py).into_any()),
             "context" => Ok(match &self.context {
                 Some(ctx) => ctx.clone_ref(py).into_any(),
                 None => py.None(),
             }),
             _ => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
         }
+    }
+
+    #[pyo3(signature = (key, /, default=None))]
+    fn setdefault<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        if key == "state" {
+            return Ok(self.state.clone_ref(py).into_any());
+        }
+        Ok(self.get(py, key, default))
     }
 
     fn __setitem__(&mut self, key: &str, value: Py<PyAny>) -> PyResult<()> {

@@ -1217,12 +1217,7 @@ class BoltAPI:
         injector_is_async = meta["injector_is_async"]
 
         async def execute(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-            if hasattr(request, "state"):
-                request_state = request.state
-            elif isinstance(request, dict):
-                request_state = request.setdefault("state", {})
-            else:
-                request_state = {}
+            request_state = request.setdefault("state", {})
 
             if mode == "request_only":
                 if is_async:
@@ -1439,12 +1434,7 @@ class BoltAPI:
                     api._middleware_chain = self._build_middleware_chain(api)
                     api._middleware_chain_built = True
 
-        if hasattr(request, "state"):
-            request_state = request.state
-        elif isinstance(request, dict):
-            request_state = request.setdefault("state", {})
-        else:
-            request_state = {}
+        request_state = request.setdefault("state", {})
 
         # Store csrf_exempt in request.state for CSRF middleware to check.
         request_state["_csrf_exempt"] = meta.get("csrf_exempt", False)
@@ -1562,12 +1552,7 @@ class BoltAPI:
             # Auto-cleanup UploadFiles to prevent resource leaks
             # Only runs for handlers with file uploads (optimization: skip for 95%+ of requests)
             if meta.get("has_file_uploads"):
-                if hasattr(request, "state"):
-                    request_state = request.state
-                elif isinstance(request, dict):
-                    request_state = request.get("state", {})
-                else:
-                    request_state = {}
+                request_state = request.setdefault("state", {})
                 upload_files = request_state.get("_upload_files", [])
                 for upload in upload_files:
                     with suppress(Exception):
