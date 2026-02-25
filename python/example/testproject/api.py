@@ -1171,6 +1171,30 @@ async def bench_serializer_validated(author: BenchAuthorWithValidators) -> Bench
 
 
 # ============================================================================
+# Multi-Response Benchmark Endpoints
+# ============================================================================
+
+
+class BenchOk(msgspec.Struct):
+    id: int
+    name: str
+
+
+class BenchError(msgspec.Struct):
+    detail: str
+
+
+@api.get("/bench/multi/tuple", response_model={200: BenchOk, 400: BenchError})
+async def bench_multi_tuple():
+    return (200, {"id": 1, "name": "alice"})
+
+
+@api.get("/bench/multi/dict", response_model={200: BenchOk, 400: BenchError})
+async def bench_multi_dict():
+    return {"id": 1, "name": "alice"}
+
+
+# ============================================================================
 # Class-Based Views (APIView) - Using Decorator Syntax
 # ============================================================================
 

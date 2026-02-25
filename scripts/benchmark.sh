@@ -27,6 +27,37 @@ if [ -z "$BOMBARDIER_BIN" ]; then
     exit 1
 fi
 
+# Check if setsid is available (needed for process group management)
+SETSID_BIN=""
+if command -v setsid &> /dev/null; then
+    SETSID_BIN="setsid"
+elif [ -f "/opt/homebrew/opt/util-linux/bin/setsid" ]; then
+    SETSID_BIN="/opt/homebrew/opt/util-linux/bin/setsid"
+fi
+
+if [ -z "$SETSID_BIN" ]; then
+    echo "ERROR: setsid not installed. Install with: brew install util-linux (macOS) or apt install util-linux (Linux)"
+    exit 1
+fi
+
+# Wait for server to respond with 200 on /, retrying up to MAX_WAIT seconds.
+wait_for_server() {
+  local max_wait=${MAX_WAIT:-15}
+  local elapsed=0
+  while [ $elapsed -lt $max_wait ]; do
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/)
+    if [ "$CODE" = "200" ]; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo "Server not ready after ${max_wait}s (last status: $CODE); aborting." >&2
+  kill -TERM -$SERVER_PID 2>/dev/null || true
+  pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+  exit 1
+}
+
 echo "# Django-Bolt Benchmark"
 echo "Generated: $(date)"
 echo "Config: $P processes × $WORKERS workers | C=$C N=$N"
@@ -34,18 +65,9 @@ echo ""
 
 echo "## Root Endpoint Performance"
 cd python/example
-DJANGO_BOLT_WORKERS=$WORKERS setsid uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
+DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
 SERVER_PID=$!
-sleep 2
-
-# Sanity check: ensure 200 OK before benchmarking
-CODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/)
-if [ "$CODE" != "200" ]; then
-  echo "Expected 200 from / but got $CODE; aborting benchmark." >&2
-  kill -TERM -$SERVER_PID 2>/dev/null || true
-  pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
-  exit 1
-fi
+wait_for_server
 
 $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/ 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
@@ -171,9 +193,9 @@ echo "## ORM Performance"
 uv run python manage.py makemigrations users --noinput >/dev/null 2>&1 || true
 uv run python manage.py migrate --noinput >/dev/null 2>&1 || true
 
-DJANGO_BOLT_WORKERS=$WORKERS setsid uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
+DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
 SERVER_PID=$!
-sleep 2
+wait_for_server
 
 # Sanity check
 UCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/users/full10)
@@ -223,9 +245,9 @@ pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
 echo ""
 echo "## Class-Based Views (CBV) Performance"
 
-DJANGO_BOLT_WORKERS=$WORKERS setsid uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
+DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
 SERVER_PID=$!
-sleep 2
+wait_for_server
 
 echo "### Simple APIView GET (/cbv-simple)"
 $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-simple 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
@@ -325,9 +347,9 @@ echo ""
 echo "## Form and File Upload Performance"
 
 # Start server for form/file tests
-DJANGO_BOLT_WORKERS=$WORKERS setsid uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
+DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
 SERVER_PID=$!
-sleep 2
+wait_for_server
 
 echo "### Form Data (POST /form)"
 # Create form data
@@ -384,9 +406,9 @@ echo ""
 echo "## Django Middleware Performance"
 
 # Start server for middleware test
-DJANGO_BOLT_WORKERS=$WORKERS setsid uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
+DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
 SERVER_PID=$!
-sleep 2
+wait_for_server
 
 # Sanity check middleware endpoint
 MCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/middleware/demo)
@@ -419,9 +441,9 @@ JSON
 
 echo "### JSON Parse/Validate (POST /bench/parse)"
 # Start a fresh server for this test
-DJANGO_BOLT_WORKERS=$WORKERS setsid uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
+DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
 SERVER_PID=$!
-sleep 2
+wait_for_server
 
 # Sanity check
 PCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/)
@@ -485,6 +507,17 @@ else
 fi
 rm -f "$USER_BENCH"
 
+echo ""
+echo "## Multi-Response Performance"
+
+echo ""
+echo "### Multi-response tuple return (/bench/multi/tuple)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/tuple 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+echo ""
+echo "### Multi-response bare dict (/bench/multi/dict)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/dict 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
 kill -TERM -$SERVER_PID 2>/dev/null || true
 pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
 
@@ -493,9 +526,9 @@ echo "## Latency Percentile Benchmarks"
 echo "Measures p50/p75/p90/p99 latency for type coercion overhead analysis"
 
 # Start server for latency tests
-DJANGO_BOLT_WORKERS=$WORKERS setsid uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
+DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
 SERVER_PID=$!
-sleep 2
+wait_for_server
 
 echo ""
 echo "### Baseline - No Parameters (/)"
