@@ -12,35 +12,44 @@ import msgspec
 import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.openapi.config import OpenAPIConfig
+from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.responses import JSON
 from django_bolt.serialization import (
-    _RESPONSE_META_EMPTY,
-    _RESPONSE_META_JSON,
     serialize_response,
     serialize_response_sync,
 )
 from django_bolt.serializers import Serializer
 
-
-# ── Test schemas ──────────────────────────────────────────────────────────
+# ============================================================================
+# Test schemas
+# ============================================================================
 
 
 class OkSchema(Serializer):
+    """OK response schema for testing."""
+
     id: int
     name: str
 
 
 class ErrorSchema(Serializer):
+    """Error response schema for testing."""
+
     detail: str
 
 
 class CreatedSchema(Serializer):
+    """Created response schema for testing."""
+
     id: int
     name: str
     created: bool
 
 
-# ── 1. Tuple return (200, data) validates against OkSchema ───────────────
+# ============================================================================
+# 1. Tuple return (200, data) validates against OkSchema
+# ============================================================================
 
 
 @pytest.mark.asyncio
@@ -63,7 +72,9 @@ async def test_tuple_200_validates_against_ok_schema():
     assert decoded == {"id": 1, "name": "Alice"}
 
 
-# ── 2. Tuple return (400, data) validates against ErrorSchema ────────────
+# ============================================================================
+# 2. Tuple return (400, data) validates against ErrorSchema
+# ============================================================================
 
 
 @pytest.mark.asyncio
@@ -86,7 +97,9 @@ async def test_tuple_400_validates_against_error_schema():
     assert decoded == {"detail": "Not valid"}
 
 
-# ── 3. JSON(data, status_code=404) selects 404 schema ───────────────────
+# ============================================================================
+# 3. JSON(data, status_code=404) selects 404 schema
+# ============================================================================
 
 
 @pytest.mark.asyncio
@@ -109,7 +122,9 @@ async def test_json_response_selects_schema_by_status_code():
     assert decoded == {"detail": "Not found"}
 
 
-# ── 4. Bare dict return uses default (lowest 2xx) schema ────────────────
+# ============================================================================
+# 4. Bare dict return uses default (lowest 2xx) schema
+# ============================================================================
 
 
 @pytest.mark.asyncio
@@ -134,7 +149,9 @@ async def test_bare_dict_uses_default_status_code():
     assert decoded == {"id": 1, "name": "Test"}
 
 
-# ── 5. {204: None} with (204, None) → empty body ────────────────────────
+# ============================================================================
+# 5. {204: None} with (204, None) → empty body
+# ============================================================================
 
 
 @pytest.mark.asyncio
@@ -156,7 +173,9 @@ async def test_204_none_produces_empty_body():
     assert body == b""
 
 
-# ── 6. Unmapped status code raises TypeError ─────────────────────────────
+# ============================================================================
+# 6. Unmapped status code raises TypeError
+# ============================================================================
 
 
 @pytest.mark.asyncio
@@ -175,7 +194,9 @@ async def test_unmapped_status_code_raises():
         await serialize_response((500, {"detail": "Server error"}), meta)
 
 
-# ── 7. Ellipsis catch-all works ──────────────────────────────────────────
+# ============================================================================
+# 7. Ellipsis catch-all works
+# ============================================================================
 
 
 @pytest.mark.asyncio
@@ -198,14 +219,13 @@ async def test_ellipsis_catch_all():
     assert decoded == {"detail": "Server error"}
 
 
-# ── 8. OpenAPI has per-status-code entries ───────────────────────────────
+# ============================================================================
+# 8. OpenAPI has per-status-code entries
+# ============================================================================
 
 
 def test_openapi_per_status_code_entries():
     """OpenAPI schema has per-status-code response entries."""
-    from django_bolt.openapi.config import OpenAPIConfig
-    from django_bolt.openapi.schema_generator import SchemaGenerator
-
     api = BoltAPI()
 
     @api.post("/items", response_model={201: CreatedSchema, 400: ErrorSchema})
@@ -225,14 +245,13 @@ def test_openapi_per_status_code_entries():
     assert responses["400"].content is not None
 
 
-# ── 9. OpenAPI 204 entry has no content ──────────────────────────────────
+# ============================================================================
+# 9. OpenAPI 204 entry has no content
+# ============================================================================
 
 
 def test_openapi_204_no_content():
     """OpenAPI 204 response entry has no content field."""
-    from django_bolt.openapi.config import OpenAPIConfig
-    from django_bolt.openapi.schema_generator import SchemaGenerator
-
     api = BoltAPI()
 
     @api.delete("/items/{item_id}", response_model={204: None, 404: ErrorSchema})
@@ -252,7 +271,9 @@ def test_openapi_204_no_content():
     assert responses["404"].content is not None
 
 
-# ── 10. Sync handler works ───────────────────────────────────────────────
+# ============================================================================
+# 10. Sync handler works
+# ============================================================================
 
 
 def test_sync_handler_multi_response():
@@ -312,7 +333,9 @@ def test_sync_json_response_multi():
     assert decoded == {"detail": "Not found"}
 
 
-# ── 11. Existing response_model=Type behavior preserved ─────────────────
+# ============================================================================
+# 11. Existing response_model=Type behavior preserved
+# ============================================================================
 
 
 def test_existing_single_response_model_preserved():
@@ -327,7 +350,7 @@ def test_existing_single_response_model_preserved():
     meta = api._handler_meta[handler_id]
 
     assert meta["response_type"] == OkSchema
-    assert meta.get("is_multi_response") is None or not meta.get("is_multi_response")
+    assert meta["is_multi_response"] is False
     assert "response_map" not in meta
 
 
@@ -343,10 +366,12 @@ def test_existing_annotation_response_preserved():
     meta = api._handler_meta[handler_id]
 
     assert meta["response_type"] == OkSchema
-    assert meta.get("is_multi_response") is None or not meta.get("is_multi_response")
+    assert meta["is_multi_response"] is False
 
 
-# ── Registration-time metadata tests ─────────────────────────────────────
+# ============================================================================
+# Registration-time metadata tests
+# ============================================================================
 
 
 def test_multi_response_metadata_stored_correctly():

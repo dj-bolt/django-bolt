@@ -1135,9 +1135,11 @@ class BoltAPI:
                         final_response_type = default_type
                 else:
                     # Single type (existing behavior, unchanged)
+                    meta["is_multi_response"] = False
                     final_response_type = response_model
             else:
                 # No response_model - check for return annotation
+                meta["is_multi_response"] = False
                 # Need to resolve string annotations (from __future__ import annotations)
                 globalns = sys.modules.get(fn.__module__, {}).__dict__ if fn.__module__ else {}
                 type_hints = get_type_hints(fn, globalns=globalns, include_extras=True)
@@ -1164,7 +1166,7 @@ class BoltAPI:
                         original.__serializer_class__ = item_type
 
             # Guarantee all keys exist at registration time for direct access
-            if meta.get("is_multi_response"):
+            if meta["is_multi_response"]:
                 meta["default_status_code"] = int(effective_status) if effective_status is not None else 200
             else:
                 meta["default_status_code"] = int(status_code) if status_code is not None else 200
@@ -1175,6 +1177,22 @@ class BoltAPI:
                 meta["openapi_summary"] = summary
             if description is not None:
                 meta["openapi_description"] = description
+
+            # Pre-compute per-status-code meta dicts at registration time
+            # so _resolve_response_type is a dict lookup (zero allocation per request)
+            if meta["is_multi_response"]:
+                resolved_metas: dict[int | type(...), dict] = {}
+                field_names_map = meta.get("response_field_names_map", {})
+                for code, resp_type in meta["response_map"].items():
+                    code_meta = dict(meta)
+                    code_meta["response_type"] = resp_type
+                    code_meta["is_multi_response"] = False
+                    if code in field_names_map:
+                        code_meta["response_field_names"] = field_names_map[code]
+                    else:
+                        code_meta.pop("response_field_names", None)
+                    resolved_metas[code] = code_meta
+                meta["_resolved_metas"] = resolved_metas
 
             # Compile optimized argument injector (once at registration time)
             # This pre-compiles all parameter extraction logic for maximum performance
