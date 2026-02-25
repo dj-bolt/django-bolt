@@ -1102,8 +1102,40 @@ class BoltAPI:
             # 2. sig.return_annotation (fallback if response_model not provided)
             final_response_type = None
             if response_model is not None:
-                # Explicit response_model provided - use it (ignore annotation)
-                final_response_type = response_model
+                if isinstance(response_model, dict):
+                    # Dict mode: per-status-code response schemas
+                    meta["is_multi_response"] = True
+                    meta["response_map"] = response_model
+
+                    # Pre-compute field names for each code's type
+                    field_names_map = {}
+                    for code, resp_type in response_model.items():
+                        if resp_type is not None and code is not ...:
+                            resp_meta = extract_response_metadata(resp_type)
+                            if "response_field_names" in resp_meta:
+                                field_names_map[code] = resp_meta["response_field_names"]
+                    if field_names_map:
+                        meta["response_field_names_map"] = field_names_map
+
+                    # Determine effective default status code
+                    effective_status = status_code
+                    if effective_status is None:
+                        success_codes = sorted(
+                            c for c in response_model if isinstance(c, int) and 200 <= c < 300
+                        )
+                        if success_codes:
+                            effective_status = success_codes[0]
+
+                    # Set response_type to default code's type (backward compat)
+                    default_code = effective_status if effective_status is not None else next(
+                        c for c in sorted(c for c in response_model if isinstance(c, int))
+                    )
+                    default_type = response_model.get(default_code)
+                    if default_type is not None:
+                        final_response_type = default_type
+                else:
+                    # Single type (existing behavior, unchanged)
+                    final_response_type = response_model
             else:
                 # No response_model - check for return annotation
                 # Need to resolve string annotations (from __future__ import annotations)
@@ -1132,7 +1164,10 @@ class BoltAPI:
                         original.__serializer_class__ = item_type
 
             # Guarantee all keys exist at registration time for direct access
-            meta["default_status_code"] = int(status_code) if status_code is not None else 200
+            if meta.get("is_multi_response"):
+                meta["default_status_code"] = int(effective_status) if effective_status is not None else 200
+            else:
+                meta["default_status_code"] = int(status_code) if status_code is not None else 200
             # Store OpenAPI metadata
             if tags is not None:
                 meta["openapi_tags"] = tags

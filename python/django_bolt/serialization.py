@@ -127,6 +127,27 @@ def _convert_serializers(result: Any) -> Any:
     return result
 
 
+def _resolve_response_type(status_code: int, meta: HandlerMetadata) -> tuple[Any, HandlerMetadata]:
+    """Look up response type for a status code in multi-response mode."""
+    response_map = meta["response_map"]
+    if status_code in response_map:
+        resp_type = response_map[status_code]
+        field_names_map = meta.get("response_field_names_map", {})
+        if status_code in field_names_map:
+            code_meta = dict(meta)
+            code_meta["response_field_names"] = field_names_map[status_code]
+            return resp_type, code_meta
+        code_meta = dict(meta)
+        code_meta.pop("response_field_names", None)
+        return resp_type, code_meta
+    if ... in response_map:
+        return response_map[...], meta
+    raise TypeError(
+        f"Status {status_code} has no response schema. "
+        f"Defined: {sorted(c for c in response_map if c is not ...)}"
+    )
+
+
 def _dispatch_non_json_type(
     result: Any, response_tp: Any | None, meta: HandlerMetadata, status_code: int
 ) -> ResponseWireV1 | None:
@@ -179,8 +200,31 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
     if result is None and status_code == 204:
         return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
 
+    is_multi = meta.get("is_multi_response", False)
+
+    # Detect (status_code, data) tuple in multi-response mode
+    if is_multi and isinstance(result, tuple) and len(result) == 2:
+        code, data = result
+        if isinstance(code, int):
+            resp_type, eff_meta = _resolve_response_type(code, meta)
+            if resp_type is None or data is None:
+                return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
+            eff_meta = dict(eff_meta)
+            eff_meta["response_type"] = resp_type
+            eff_meta["default_status_code"] = code
+            eff_meta["is_multi_response"] = False  # prevent re-entrance
+            return await serialize_response(data, eff_meta)
+
     # Fast path: dict/list are the most common response types (90%+ of handlers)
     if isinstance(result, dict):
+        if is_multi:
+            resp_type, eff_meta = _resolve_response_type(status_code, meta)
+            if resp_type is None:
+                return _wire_bytes(status_code, _RESPONSE_META_EMPTY, b"")
+            eff_meta = dict(eff_meta)
+            eff_meta["response_type"] = resp_type
+            eff_meta["is_multi_response"] = False
+            return await serialize_json_data(result, resp_type, eff_meta)
         return await serialize_json_data(result, response_tp, meta)
     if isinstance(result, list):
         result = _convert_serializers(result)
@@ -201,6 +245,12 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
 
     # Async-specific handling for types that need await
     if isinstance(result, JSON):
+        if is_multi:
+            resp_type, eff_meta = _resolve_response_type(result.status_code, meta)
+            eff_meta = dict(eff_meta)
+            eff_meta["response_type"] = resp_type
+            eff_meta["is_multi_response"] = False
+            return await serialize_json_response(result, resp_type, eff_meta)
         return await serialize_json_response(result, response_tp, meta)
     if isinstance(result, ResponseClass):
         return await serialize_generic_response(result, response_tp, meta)
@@ -226,8 +276,31 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
     if result is None and status_code == 204:
         return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
 
+    is_multi = meta.get("is_multi_response", False)
+
+    # Detect (status_code, data) tuple in multi-response mode
+    if is_multi and isinstance(result, tuple) and len(result) == 2:
+        code, data = result
+        if isinstance(code, int):
+            resp_type, eff_meta = _resolve_response_type(code, meta)
+            if resp_type is None or data is None:
+                return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
+            eff_meta = dict(eff_meta)
+            eff_meta["response_type"] = resp_type
+            eff_meta["default_status_code"] = code
+            eff_meta["is_multi_response"] = False  # prevent re-entrance
+            return serialize_response_sync(data, eff_meta)
+
     # Fast path: dict/list are the most common response types (90%+ of handlers)
     if isinstance(result, dict):
+        if is_multi:
+            resp_type, eff_meta = _resolve_response_type(status_code, meta)
+            if resp_type is None:
+                return _wire_bytes(status_code, _RESPONSE_META_EMPTY, b"")
+            eff_meta = dict(eff_meta)
+            eff_meta["response_type"] = resp_type
+            eff_meta["is_multi_response"] = False
+            return serialize_json_data_sync(result, resp_type, eff_meta)
         return serialize_json_data_sync(result, response_tp, meta)
     if isinstance(result, list):
         result = _convert_serializers(result)
@@ -248,6 +321,13 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
 
     # Sync-specific handling
     if isinstance(result, JSON):
+        if is_multi:
+            resp_type, eff_meta = _resolve_response_type(result.status_code, meta)
+            eff_meta = dict(eff_meta)
+            eff_meta["response_type"] = resp_type
+            eff_meta["is_multi_response"] = False
+            response_tp = resp_type
+            meta = eff_meta
         if response_tp is not None:
             try:
                 validated = coerce_to_response_type(result.data, response_tp, meta=meta)

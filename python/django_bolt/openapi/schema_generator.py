@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import inspect
 from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin
 
@@ -474,28 +475,45 @@ class SchemaGenerator:
         """
         responses: dict[str, OpenAPIResponse] = {}
 
-        # Get response type
-        response_type = meta.get("response_type")
-        default_status = meta.get("default_status_code", 200)
-
-        # Add successful response
-        if response_type and response_type != inspect._empty:
-            schema = self._type_to_schema(response_type, register_component=True)
-
-            responses[str(default_status)] = OpenAPIResponse(
-                description="Successful response",
-                content={
-                    "application/json": OpenAPIMediaType(schema=schema),
-                },
-            )
+        if meta.get("is_multi_response"):
+            # Multi-response mode: per-status-code response schemas
+            response_map = meta["response_map"]
+            for code in sorted(c for c in response_map if isinstance(c, int)):
+                resp_type = response_map[code]
+                desc = http.client.responses.get(code, f"Response {code}")
+                if resp_type is None:
+                    responses[str(code)] = OpenAPIResponse(description=desc)
+                else:
+                    schema = self._type_to_schema(resp_type, register_component=True)
+                    responses[str(code)] = OpenAPIResponse(
+                        description=desc,
+                        content={"application/json": OpenAPIMediaType(schema=schema)},
+                    )
+            # fall through to error response logic below
         else:
-            # Default response
-            responses["200"] = OpenAPIResponse(
-                description="Successful response",
-                content={
-                    "application/json": OpenAPIMediaType(schema=Schema(type="object")),
-                },
-            )
+            # Single-response mode (existing behavior, unchanged)
+            # Get response type
+            response_type = meta.get("response_type")
+            default_status = meta.get("default_status_code", 200)
+
+            # Add successful response
+            if response_type and response_type != inspect._empty:
+                schema = self._type_to_schema(response_type, register_component=True)
+
+                responses[str(default_status)] = OpenAPIResponse(
+                    description="Successful response",
+                    content={
+                        "application/json": OpenAPIMediaType(schema=schema),
+                    },
+                )
+            else:
+                # Default response
+                responses["200"] = OpenAPIResponse(
+                    description="Successful response",
+                    content={
+                        "application/json": OpenAPIMediaType(schema=Schema(type="object")),
+                    },
+                )
 
         # Add common error responses if enabled in config
         if self.config.include_error_responses:
