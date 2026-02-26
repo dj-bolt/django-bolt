@@ -489,6 +489,17 @@ class SchemaGenerator:
                         description=desc,
                         content={"application/json": OpenAPIMediaType(schema=schema)},
                     )
+            # Ellipsis catch-all → OpenAPI "default" response
+            if ... in response_map:
+                ellipsis_type = response_map[...]
+                if ellipsis_type is None:
+                    responses["default"] = OpenAPIResponse(description="Default response")
+                else:
+                    schema = self._type_to_schema(ellipsis_type, register_component=True)
+                    responses["default"] = OpenAPIResponse(
+                        description="Default response",
+                        content={"application/json": OpenAPIMediaType(schema=schema)},
+                    )
             # fall through to error response logic below
         else:
             # Single-response mode (existing behavior, unchanged)

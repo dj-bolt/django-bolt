@@ -492,3 +492,28 @@ def test_non_2xx_only_dict_uses_lowest_code():
     meta = api._handler_meta[handler_id]
 
     assert meta["default_status_code"] == 400
+
+
+# ============================================================================
+# OpenAPI: ellipsis catch-all emits "default" response
+# ============================================================================
+
+
+def test_openapi_ellipsis_default_response():
+    """OpenAPI schema emits 'default' response entry for ellipsis catch-all."""
+    api = BoltAPI()
+
+    @api.get("/items/{item_id}", response_model={200: OkSchema, ...: ErrorSchema})
+    async def get_item(item_id: int):
+        pass
+
+    config = OpenAPIConfig(title="Test", version="1.0")
+    generator = SchemaGenerator(api, config)
+    openapi = generator.generate()
+
+    path_item = openapi.paths["/items/{item_id}"]
+    responses = path_item.get.responses
+
+    assert "200" in responses
+    assert "default" in responses
+    assert responses["default"].content is not None
