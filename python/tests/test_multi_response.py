@@ -422,3 +422,38 @@ def test_multi_response_explicit_status_code():
     meta = api._handler_meta[handler_id]
 
     assert meta["default_status_code"] == 201
+
+
+# ============================================================================
+# Edge case: ellipsis catch-all with different status codes (thread-safety)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_ellipsis_catch_all_different_codes():
+    """Ellipsis catch-all works with multiple different status codes without shared state corruption."""
+    api = BoltAPI()
+
+    @api.get("/items/{item_id}", response_model={200: OkSchema, ...: ErrorSchema})
+    async def get_item(item_id: int):
+        pass
+
+    _method, _path, handler_id, _handler = api._routes[0]
+    meta = api._handler_meta[handler_id]
+
+    # First request with 500
+    status1, _, _, body1 = await serialize_response(
+        (500, {"detail": "Server error"}), meta
+    )
+    assert status1 == 500
+
+    # Second request with 503 — must not be affected by first
+    status2, _, _, body2 = await serialize_response(
+        (503, {"detail": "Unavailable"}), meta
+    )
+    assert status2 == 503
+
+    # Verify the shared ellipsis meta was NOT mutated
+    ellipsis_meta = meta["_resolved_metas"][...]
+    assert ellipsis_meta["default_status_code"] != 500
+    assert ellipsis_meta["default_status_code"] != 503

@@ -1187,6 +1187,8 @@ class BoltAPI:
                     code_meta = dict(meta)
                     code_meta["response_type"] = resp_type
                     code_meta["is_multi_response"] = False
+                    if isinstance(code, int):
+                        code_meta["default_status_code"] = code
                     if code in field_names_map:
                         code_meta["response_field_names"] = field_names_map[code]
                     else:

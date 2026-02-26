@@ -208,12 +208,15 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
             response_type, resolved_meta = _resolve_response_type(code, meta)
             if response_type is None or data is None:
                 return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-            resolved_meta["default_status_code"] = code
             # Inline dispatch for common types to avoid recursion overhead
             if isinstance(data, (dict, list)):
                 if isinstance(data, list):
                     data = _convert_serializers(data)
-                return await serialize_json_data(data, response_type, resolved_meta)
+                return await serialize_json_data(data, response_type, resolved_meta, status_code=code)
+            # For non-dict/list types that recurse, ensure correct status code
+            # without mutating the shared resolved_meta (ellipsis entry is shared)
+            if resolved_meta["default_status_code"] != code:
+                resolved_meta = {**resolved_meta, "default_status_code": code}
             return await serialize_response(data, resolved_meta)
 
     # Fast path: dict/list are the most common response types (90%+ of handlers)
@@ -280,12 +283,15 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
             response_type, resolved_meta = _resolve_response_type(code, meta)
             if response_type is None or data is None:
                 return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-            resolved_meta["default_status_code"] = code
             # Inline dispatch for common types to avoid recursion overhead
             if isinstance(data, (dict, list)):
                 if isinstance(data, list):
                     data = _convert_serializers(data)
-                return serialize_json_data_sync(data, response_type, resolved_meta)
+                return serialize_json_data_sync(data, response_type, resolved_meta, status_code=code)
+            # For non-dict/list types that recurse, ensure correct status code
+            # without mutating the shared resolved_meta (ellipsis entry is shared)
+            if resolved_meta["default_status_code"] != code:
+                resolved_meta = {**resolved_meta, "default_status_code": code}
             return serialize_response_sync(data, resolved_meta)
 
     # Fast path: dict/list are the most common response types (90%+ of handlers)
@@ -542,7 +548,9 @@ def serialize_file_streaming_response(result: FileResponse) -> ResponseWireV1:
     return _wire_file(result.status_code, resp_meta, result.path)
 
 
-async def serialize_json_data(result: Any, response_tp: Any | None, meta: HandlerMetadata) -> ResponseWireV1:
+async def serialize_json_data(
+    result: Any, response_tp: Any | None, meta: HandlerMetadata, *, status_code: int | None = None
+) -> ResponseWireV1:
     """Serialize dict/list/other data as JSON.
 
     Uses the new ResponseMeta tuple format for Rust-side header building.
@@ -565,11 +573,13 @@ async def serialize_json_data(result: Any, response_tp: Any | None, meta: Handle
     else:
         data = _json.encode(result)
 
-    status = meta["default_status_code"]
+    status = status_code if status_code is not None else meta["default_status_code"]
     return _wire_bytes(status, _RESPONSE_META_JSON, data)
 
 
-def serialize_json_data_sync(result: Any, response_tp: Any | None, meta: HandlerMetadata) -> ResponseWireV1:
+def serialize_json_data_sync(
+    result: Any, response_tp: Any | None, meta: HandlerMetadata, *, status_code: int | None = None
+) -> ResponseWireV1:
     """Serialize dict/list/other data as JSON (sync version for sync handlers).
 
     Uses the new ResponseMeta tuple format for Rust-side header building.
@@ -592,5 +602,5 @@ def serialize_json_data_sync(result: Any, response_tp: Any | None, meta: Handler
     else:
         data = _json.encode(result)
 
-    status = meta["default_status_code"]
+    status = status_code if status_code is not None else meta["default_status_code"]
     return _wire_bytes(status, _RESPONSE_META_JSON, data)
