@@ -517,3 +517,72 @@ def test_openapi_ellipsis_default_response():
     assert "200" in responses
     assert "default" in responses
     assert responses["default"].content is not None
+
+
+# ============================================================================
+# Edge case: bare list return in multi-response mode
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_bare_list_multi_response():
+    """Bare list return in multi-response mode resolves default schema."""
+    api = BoltAPI()
+
+    @api.get("/items", response_model={200: list[OkSchema], 400: ErrorSchema})
+    async def list_items():
+        return [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+    _method, _path, handler_id, _handler = api._routes[0]
+    meta = api._handler_meta[handler_id]
+
+    status, _resp_meta, _kind, body = await serialize_response(
+        [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}], meta
+    )
+    assert status == 200
+    decoded = msgspec.json.decode(body)
+    assert len(decoded) == 2
+    assert decoded[0] == {"id": 1, "name": "Alice"}
+
+
+def test_bare_list_multi_response_sync():
+    """Bare list return in multi-response mode works for sync handlers."""
+    api = BoltAPI()
+
+    @api.get("/items", response_model={200: list[OkSchema], 400: ErrorSchema})
+    def list_items():
+        return [{"id": 1, "name": "Alice"}]
+
+    _method, _path, handler_id, _handler = api._routes[0]
+    meta = api._handler_meta[handler_id]
+
+    status, _resp_meta, _kind, body = serialize_response_sync(
+        [{"id": 1, "name": "Alice"}], meta
+    )
+    assert status == 200
+    decoded = msgspec.json.decode(body)
+    assert decoded == [{"id": 1, "name": "Alice"}]
+
+
+# ============================================================================
+# Validation failure returns 500
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_validation_failure_returns_500():
+    """Data that doesn't match the schema for a status code returns 500."""
+    api = BoltAPI()
+
+    @api.get("/items/{item_id}", response_model={200: OkSchema, 400: ErrorSchema})
+    async def get_item(item_id: int):
+        return 200, {"wrong_field": "no id or name"}
+
+    _method, _path, handler_id, _handler = api._routes[0]
+    meta = api._handler_meta[handler_id]
+
+    status, _resp_meta, _kind, body = await serialize_response(
+        (200, {"wrong_field": "no id or name"}), meta
+    )
+    assert status == 500
+    assert b"Response validation error" in body

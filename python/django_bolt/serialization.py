@@ -229,6 +229,11 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
         return await serialize_json_data(result, response_type, meta)
     if isinstance(result, list):
         result = _convert_serializers(result)
+        if is_multi:
+            response_type, resolved_meta = _resolve_response_type(status_code, meta)
+            if response_type is None:
+                return _wire_bytes(status_code, _RESPONSE_META_EMPTY, b"")
+            return await serialize_json_data(result, response_type, resolved_meta)
         return await serialize_json_data(result, response_type, meta)
 
     # Convert Serializer instances to dicts (handles write_only, computed_field)
@@ -304,6 +309,11 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
         return serialize_json_data_sync(result, response_type, meta)
     if isinstance(result, list):
         result = _convert_serializers(result)
+        if is_multi:
+            response_type, resolved_meta = _resolve_response_type(status_code, meta)
+            if response_type is None:
+                return _wire_bytes(status_code, _RESPONSE_META_EMPTY, b"")
+            return serialize_json_data_sync(result, response_type, resolved_meta)
         return serialize_json_data_sync(result, response_type, meta)
 
     # Convert Serializer instances
