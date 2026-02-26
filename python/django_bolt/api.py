@@ -1104,6 +1104,13 @@ class BoltAPI:
             if response_model is not None:
                 if isinstance(response_model, dict):
                     # Dict mode: per-status-code response schemas
+                    int_codes = sorted(c for c in response_model if isinstance(c, int))
+                    if not int_codes:
+                        raise ValueError(
+                            "response_model dict must contain at least one integer "
+                            "status code key (e.g. {200: Schema, ...: Fallback})"
+                        )
+
                     meta["is_multi_response"] = True
                     meta["response_map"] = response_model
 
@@ -1120,16 +1127,12 @@ class BoltAPI:
                     # Determine effective default status code
                     effective_status = status_code
                     if effective_status is None:
-                        success_codes = sorted(
-                            c for c in response_model if isinstance(c, int) and 200 <= c < 300
-                        )
+                        success_codes = [c for c in int_codes if 200 <= c < 300]
                         if success_codes:
                             effective_status = success_codes[0]
 
                     # Set response_type to default code's type (backward compat)
-                    default_code = effective_status if effective_status is not None else next(
-                        c for c in sorted(c for c in response_model if isinstance(c, int))
-                    )
+                    default_code = effective_status if effective_status is not None else int_codes[0]
                     default_type = response_model.get(default_code)
                     if default_type is not None:
                         final_response_type = default_type
@@ -1167,7 +1170,7 @@ class BoltAPI:
 
             # Guarantee all keys exist at registration time for direct access
             if meta["is_multi_response"]:
-                meta["default_status_code"] = int(effective_status) if effective_status is not None else 200
+                meta["default_status_code"] = int(effective_status) if effective_status is not None else default_code
             else:
                 meta["default_status_code"] = int(status_code) if status_code is not None else 200
             # Store OpenAPI metadata

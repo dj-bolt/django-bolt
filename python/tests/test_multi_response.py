@@ -457,3 +457,38 @@ async def test_ellipsis_catch_all_different_codes():
     ellipsis_meta = meta["_resolved_metas"][...]
     assert ellipsis_meta["default_status_code"] != 500
     assert ellipsis_meta["default_status_code"] != 503
+
+
+# ============================================================================
+# Edge case: ellipsis-only dict rejected at registration
+# ============================================================================
+
+
+def test_ellipsis_only_dict_raises_at_registration():
+    """response_model with only ellipsis key raises ValueError at registration."""
+    api = BoltAPI()
+
+    with pytest.raises(ValueError, match="at least one integer status code"):
+
+        @api.get("/items", response_model={...: ErrorSchema})
+        async def get_items():
+            pass
+
+
+# ============================================================================
+# Edge case: non-2xx-only dict uses lowest int code as default
+# ============================================================================
+
+
+def test_non_2xx_only_dict_uses_lowest_code():
+    """response_model with only non-2xx codes defaults to lowest int code."""
+    api = BoltAPI()
+
+    @api.get("/items", response_model={400: ErrorSchema, 500: ErrorSchema})
+    async def get_items():
+        pass
+
+    _method, _path, handler_id, _handler = api._routes[0]
+    meta = api._handler_meta[handler_id]
+
+    assert meta["default_status_code"] == 400
