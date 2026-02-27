@@ -254,21 +254,21 @@ async def list_articles(page: int = 1, page_size: int = 20):
 In ViewSets, optimize the queryset at the class level:
 
 ```python
-from django_bolt.views import ModelViewSet
+from django_bolt.views import ViewSet
 
 @api.viewset("/articles")
-class ArticleViewSet(ModelViewSet):
+class ArticleViewSet(ViewSet):
     # Optimize here - applies to all actions
     queryset = Article.objects.select_related("author").prefetch_related("tags")
 
-    async def list(self, request):
+    async def list(self, request) -> list[dict]:
         articles = []
         async for article in await self.get_queryset():
             articles.append(self.serialize(article))
         return articles
 
-    async def retrieve(self, request, pk: int):
-        article = await self.get_object(pk)
+    async def retrieve(self, request) -> dict:
+        article = await self.get_object()
         return self.serialize(article)
 
     def serialize(self, article):

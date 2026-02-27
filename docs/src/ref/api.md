@@ -200,13 +200,26 @@ class ResourceView(APIView):
 
 #### @api.viewset(path)
 
-Register a ViewSet with automatic CRUD routing.
+Register a ViewSet with automatic CRUD routing (routes only; no built-in CRUD logic).
 
 ```python
 @api.viewset("/items")
 class ItemViewSet(ViewSet):
+    serializer_class = ItemSerializer
+
     async def list(self, request):
-        return []
+        return Item.objects.all()
+```
+
+Register a ModelViewSet with automatic CRUD routing (routes + default CRUD implementations).
+
+```python
+@api.viewset("/items")
+class ItemViewSet(ModelViewSet):
+    queryset = Item.objects.all()
+    serializer_class = ItemSerializer
+    create_serializer_class = ItemCreateSerializer
+    pagination_class = PageNumberPagination
 ```
 
 ### WebSocket decorator

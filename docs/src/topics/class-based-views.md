@@ -97,29 +97,29 @@ from django_bolt.views import ViewSet
 
 @api.viewset("/items")
 class ItemViewSet(ViewSet):
-    async def list(self, request):
+    async def list(self, request) -> list[dict]:
         """GET /items"""
         return [{"id": 1}, {"id": 2}]
 
-    async def retrieve(self, request, pk: int):
+    async def retrieve(self, request, pk: int) -> dict:
         """GET /items/{pk}"""
         return {"id": pk}
 
-    async def create(self, request, item: ItemCreate):
+    async def create(self, request, item: ItemCreate) -> dict:
         """POST /items"""
         return {"id": 1, "created": True}
 
-    async def update(self, request, pk: int, item: ItemUpdate):
+    async def update(self, request, pk: int, item: ItemUpdate) -> dict:
         """PUT /items/{pk}"""
         return {"id": pk, "updated": True}
 
-    async def partial_update(self, request, pk: int, item: ItemPatch):
+    async def partial_update(self, request, pk: int, item: ItemPatch) -> dict:
         """PATCH /items/{pk}"""
         return {"id": pk, "patched": True}
 
     async def destroy(self, request, pk: int):
         """DELETE /items/{pk}"""
-        return {"id": pk, "deleted": True}
+        return None
 ```
 
 This creates:
@@ -138,12 +138,16 @@ This creates:
 `ModelViewSet` provides built-in Django ORM integration:
 
 ```python
-import msgspec
-from django_bolt.views import ModelViewSet
+from django_bolt import ModelViewSet, PageNumberPagination
+from django_bolt.serializers import Serializer
 from myapp.models import Article
 
-class ArticleSchema(msgspec.Struct):
+class ArticleSchema(Serializer):
     id: int
+    title: str
+    content: str
+
+class ArticleCreateSchema(Serializer):
     title: str
     content: str
 
@@ -151,24 +155,8 @@ class ArticleSchema(msgspec.Struct):
 class ArticleViewSet(ModelViewSet):
     queryset = Article.objects.all()
     serializer_class = ArticleSchema
-
-    async def list(self, request):
-        articles = []
-        async for article in await self.get_queryset():
-            articles.append(ArticleSchema(
-                id=article.id,
-                title=article.title,
-                content=article.content
-            ))
-        return articles
-
-    async def retrieve(self, request, pk: int):
-        article = await self.get_object(pk)
-        return ArticleSchema(
-            id=article.id,
-            title=article.title,
-            content=article.content
-        )
+    create_serializer_class = ArticleCreateSchema
+    pagination_class = PageNumberPagination
 ```
 
 ### get_queryset
@@ -190,8 +178,8 @@ class MyArticleViewSet(ModelViewSet):
 Get a single object by primary key:
 
 ```python
-async def retrieve(self, request, pk: int):
-    article = await self.get_object(pk)  # Raises 404 if not found
+async def retrieve(self, request):
+    article = await self.get_object()  # Raises 404 if not found
     return ArticleSchema.from_model(article)
 ```
 
@@ -205,10 +193,23 @@ class ArticleViewSet(ModelViewSet):
     queryset = Article.objects.all()
     lookup_field = "slug"  # Use slug instead of pk
 
-    async def retrieve(self, request, slug: str):
-        article = await self.get_object(slug)
+    async def retrieve(self, request):
+        article = await self.get_object()
         return {"slug": article.slug}
 ```
+
+### Serializer Priority
+
+| Action                      | Validation                                                                                | Response                                            |
+|-----------------------------|-------------------------------------------------------------------------------------------|-----------------------------------------------------|
+| `list`                      |                                                                                           | `list_serializer_class` </br> or `serializer_class` |
+| `retrieve`                  |                                                                                           | `serializer_class`                                  |
+| `create`                    | `create_serializer_class` </br> or `serializer_class`                                     | `serializer_class`                                  |
+| `update` / `partial_update` | `update_serializer_class` </br> or `create_serializer_class`  </br> or `serializer_class` | `serializer_class`                                  |
+
+!!! warning
+
+    If there is no available `serializer_class` or return type annotation for `list` / `retrieve` / `create` / `update` / `partial_update`, a `ValueError` will be raised.
 
 ## Custom actions
 
@@ -242,11 +243,18 @@ class ArticleViewSet(ViewSet):
 
 ### Action parameters
 
-| Parameter | Description |
-|-----------|-------------|
-| `methods` | List of HTTP methods: `["GET"]`, `["POST"]`, etc. |
-| `detail` | `True` for instance actions (`/{pk}/action`), `False` for collection actions (`/action`) |
-| `path` | Custom URL path (defaults to function name) |
+| Parameter        | Required | Description                                                                              |
+|------------------|----------|------------------------------------------------------------------------------------------|
+| `methods`        | yes      | List of HTTP methods: `["GET"]`, `["POST"]`, etc.                                        |
+| `detail`         | yes      | `True` for instance actions (`/{pk}/action`), `False` for collection actions (`/action`) |
+| `path`           | no       | Custom URL path (defaults to function name)                                              |
+| `auth`           | no       | List of authentication backends (overrides class-level `auth`)                           |
+| `guards`         | no       | List of permission guards (overrides class-level `guards`)                               |
+| `response_model` | no       | Response model for serialization                                                         |
+| `status_code`    | no       | HTTP status code                                                                         |
+| `tags`           | no       | List of tags for OpenAPI documentation                                                   |
+| `summary`        | no       | Summary for OpenAPI documentation                                                        |
+| `description`    | no       | Detailed description for OpenAPI documentation                                           |
 
 ### Custom path
 
@@ -318,9 +326,9 @@ class ArticleViewSet(ViewSet):
     queryset = Article.objects.all()
     lookup_field = 'id'  # Use 'id' instead of 'pk'
 
-    async def retrieve(self, request, id: int):
+    async def retrieve(self, request):
         """GET /articles/{id}"""
-        article = await self.get_object(id=id)
+        article = await self.get_object()
         return {"id": article.id, "title": article.title}
 
     @action(methods=["POST"], detail=True)
@@ -359,6 +367,7 @@ from django_bolt.views import (
     RetrieveMixin,
     CreateMixin,
     UpdateMixin,
+    PartialUpdateMixin,
     DestroyMixin,
     ViewSet,
 )
@@ -367,13 +376,21 @@ from django_bolt.views import (
 @api.viewset("/readonly-items")
 class ReadOnlyItemViewSet(ListMixin, RetrieveMixin, ViewSet):
     queryset = Item.objects.all()
+    serializer_class = ItemSerializer
 
 # Full CRUD viewset
 @api.viewset("/items")
 class ItemViewSet(
-    ListMixin, RetrieveMixin, CreateMixin, UpdateMixin, DestroyMixin, ViewSet
+    ListMixin,
+    RetrieveMixin,
+    CreateMixin,
+    UpdateMixin,
+    PartialUpdateMixin,
+    DestroyMixin,
+    ViewSet,
 ):
     queryset = Item.objects.all()
+    serializer_class = ItemSerializer
 ```
 
 Available mixins:
@@ -397,13 +414,14 @@ from django_bolt.views import ReadOnlyModelViewSet
 @api.viewset("/public-articles")
 class PublicArticleViewSet(ReadOnlyModelViewSet):
     queryset = Article.objects.filter(published=True)
+    serializer_class = ItemSerializer
 ```
 
 This provides only `list` and `retrieve` actions.
 
 ## Sync handlers
 
-ViewSets also support synchronous handlers:
+APIView support synchronous handlers:
 
 ```python
 @api.view("/sync-resource")
@@ -412,4 +430,18 @@ class SyncResourceView(APIView):
         return {"sync": True}
 ```
 
+`@action` decorators on `ViewSet` and `ModelViewSet` also support synchronous handlers:
+
+```python
+@api.viewset("/sync-items")
+class SyncItemViewSet(ViewSet):
+    @action(methods=["GET"], detail=False)
+    def sync(self, request):
+        return {"sync": True}
+```
+
 Sync handlers are automatically wrapped to run in a thread pool.
+
+!!! warning
+
+    CRUD methods on ViewSets (`list`, `retrieve`, `create`, `update`, `partial_update`, `destroy`) currently do not support synchronous handlers.

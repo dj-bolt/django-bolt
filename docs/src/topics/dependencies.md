@@ -309,7 +309,7 @@ from django_bolt import ViewSet
 class ItemViewSet(ViewSet):
     queryset = Item.objects.all()
 
-    async def list(self, request, pagination=Depends(get_pagination)):
+    async def list(self, request, pagination=Depends(get_pagination)) -> list[dict]:
         items = []
         queryset = await self.get_queryset()
         async for item in queryset[pagination.offset:pagination.offset + pagination.page_size]:

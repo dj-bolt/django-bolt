@@ -456,14 +456,14 @@ def api():
     class ArticleViewSet(ViewSet):
         queryset = Article.objects.all()
 
-        async def list(self, request):
+        async def list(self, request) -> list[dict]:
             articles = []
             async for article in await self.get_queryset():
                 articles.append({"id": article.id, "title": article.title})
             return articles
 
-        async def retrieve(self, request, pk: int):
-            article = await self.get_object(pk)
+        async def retrieve(self, request) -> dict:
+            article = await self.get_object()
             return {"id": article.id, "title": article.title}
 
     return api
