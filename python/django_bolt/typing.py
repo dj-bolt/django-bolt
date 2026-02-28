@@ -193,7 +193,7 @@ def is_simple_type(annotation: Any) -> bool:
 def is_sequence_type(annotation: Any) -> bool:
     """Check if annotation is a sequence type like List[T]."""
     origin = get_origin(annotation)
-    return origin in (list, list, tuple, set, frozenset)
+    return origin in (list, tuple, set, frozenset)
 
 
 def is_optional(annotation: Any) -> bool:

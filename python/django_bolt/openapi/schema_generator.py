@@ -734,14 +734,14 @@ class SchemaGenerator:
             else:
                 return self._struct_to_schema(type_annotation)
 
-        # Handle list/List
-        if origin in (list, list):
+        # Handle list
+        if origin is list:
             item_type = args[0] if args else Any
             item_schema = self._type_to_schema(item_type, register_component=register_component)
             return Schema(type="array", items=item_schema)
 
-        # Handle dict/Dict
-        if origin in (dict, dict):
+        # Handle dict
+        if origin is dict:
             return Schema(type="object", additional_properties=True)
 
         # Handle primitive types
