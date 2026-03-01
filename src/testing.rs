@@ -996,9 +996,13 @@ async fn handle_test_request_internal(
             cookies: cookies_dict.unbind(),
             context,
             user: None,
-            state: state_dict.unbind(),
-            form_map: form_map_dict,
-            files_map: files_map_dict,
+            state: {
+                let lock = std::sync::OnceLock::new();
+                let _ = lock.set(state_dict.unbind());
+                lock
+            },
+            form_map: Some(form_map_dict),
+            files_map: Some(files_map_dict),
             meta_cache: std::sync::OnceLock::new(),
             conn_host: conn_host.clone(),
             conn_scheme: conn_scheme.clone(),

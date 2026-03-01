@@ -41,7 +41,7 @@ from .error_handlers import handle_exception
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
 from .middleware import CompressionConfig
-from .middleware.compiler import add_optimization_flags_to_metadata, compile_middleware_meta
+from .middleware.compiler import _compile_rust_arg_bindings, add_optimization_flags_to_metadata, compile_middleware_meta
 from .middleware.django_loader import load_django_middleware
 from .middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
 from .middleware_response import MiddlewareResponse
@@ -57,7 +57,7 @@ from .openapi.routes import OpenAPIRouteRegistrar
 from .openapi.schema_generator import SchemaGenerator
 from .pagination import extract_pagination_item_type
 from .router import Router
-from .serialization import ResponseWireV1, serialize_response, serialize_response_sync
+from .serialization import _BODY_BYTES, ResponseWireV1, serialize_response, serialize_response_sync
 from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata
 from .views import APIView, ViewSet
@@ -276,7 +276,7 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
         custom_headers or None,
         None,
     )
-    return int(status), meta, "bytes", body
+    return int(status), meta, _BODY_BYTES, body
 
 
 class BoltAPI:
@@ -1230,6 +1230,21 @@ class BoltAPI:
         injector = meta["injector"]
         injector_is_async = meta["injector_is_async"]
 
+        # Pre-compute at registration time: can Rust ever pre-bind args into request.state?
+        # Only true for simple path/query/header/cookie params with required scalar types.
+        # When False, we skip the state.setdefault + 2 pop calls on every request.
+        has_rust_prebound = bool(_compile_rust_arg_bindings(meta))
+
+        # Fast path: async no-params handler without rust-prebound args (most common benchmark pattern).
+        # Eliminates: state.setdefault, 2×state.pop, has_prebound check, injector call, *args/**kwargs unpack.
+        if mode != "request_only" and is_async and not is_blocking and not has_rust_prebound and not injector_is_async:
+            async def execute_async_no_prebound(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                args, kwargs = injector(request)
+                result = await handler(*args, **kwargs)
+                return await serialize_response(result, meta)
+
+            return execute_async_no_prebound
+
         async def execute(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
             request_state = request.setdefault("state", {})
 
@@ -1241,9 +1256,12 @@ class BoltAPI:
                 else:
                     result = handler(request)
             else:
-                prebound_args = request_state.pop("_bolt_prebound_args", None)
-                prebound_kwargs = request_state.pop("_bolt_prebound_kwargs", None)
-                has_prebound = prebound_args is not None and prebound_kwargs is not None
+                if has_rust_prebound:
+                    prebound_args = request_state.pop("_bolt_prebound_args", None)
+                    prebound_kwargs = request_state.pop("_bolt_prebound_kwargs", None)
+                    has_prebound = prebound_args is not None and prebound_kwargs is not None
+                else:
+                    has_prebound = False
 
                 if has_prebound:
                     args, kwargs = prebound_args, prebound_kwargs
@@ -1514,8 +1532,7 @@ class BoltAPI:
             if user_id:
                 backend_name = auth_context.get("auth_backend")
                 # Use pre-computed is_async from handler metadata (avoids runtime loop check)
-                # Default True for handlers without explicit async metadata
-                is_async_ctx = meta.get("is_async", True)
+                is_async_ctx = meta["is_async"]
                 # Use functools.partial instead of lambda - faster, no closure overhead
                 request["user"] = SimpleLazyObject(
                     partial(load_user_sync, user_id, backend_name, auth_context, is_async_ctx)
@@ -1529,7 +1546,7 @@ class BoltAPI:
             # - Router/route Python middleware on this handler
             middleware_owner = original_api if original_api is not None else self
             has_python_global_middleware = middleware_owner._has_python_global_middleware
-            has_route_python_middleware = bool(meta.get("_has_route_python_middleware", False))
+            has_route_python_middleware = meta["_has_route_python_middleware"]
             api_with_middleware = (
                 middleware_owner if (has_python_global_middleware or has_route_python_middleware) else None
             )
@@ -1566,7 +1583,7 @@ class BoltAPI:
         finally:
             # Auto-cleanup UploadFiles to prevent resource leaks
             # Only runs for handlers with file uploads (optimization: skip for 95%+ of requests)
-            if meta.get("has_file_uploads"):
+            if meta["has_file_uploads"]:
                 request_state = request.setdefault("state", {})
                 upload_files = request_state.get("_upload_files", [])
                 for upload in upload_files:

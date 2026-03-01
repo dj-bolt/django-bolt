@@ -33,12 +33,14 @@ ResponseMetaTuple = tuple[
     list[CookieTuple] | None,  # cookies: list of raw cookie tuples or None
 ]
 
-BodyKind = Literal["bytes", "stream", "file"]
-ResponseWireV1 = tuple[int, ResponseMetaTuple, BodyKind, bytes | StreamingResponse | str]
+# Integer body-kind tags sent to Rust (avoids String alloc per response in parse_response_wire).
+# Must match the match arms in src/handler.rs parse_response_wire().
+_BODY_BYTES: int = 0
+_BODY_STREAM: int = 1
+_BODY_FILE: int = 2
 
-_BODY_BYTES: BodyKind = "bytes"
-_BODY_STREAM: BodyKind = "stream"
-_BODY_FILE: BodyKind = "file"
+BodyKind = Literal[0, 1, 2]
+ResponseWireV1 = tuple[int, ResponseMetaTuple, BodyKind, bytes | StreamingResponse | str]
 
 
 def _build_response_meta(

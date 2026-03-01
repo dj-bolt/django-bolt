@@ -122,6 +122,7 @@ class StaticRouteRegistrar:
         meta["_router_middleware"] = []
         meta["_route_middleware"] = []
         meta["_has_route_python_middleware"] = False
+        meta["has_file_uploads"] = False
 
         self.api._handler_meta[handler_id] = meta
 

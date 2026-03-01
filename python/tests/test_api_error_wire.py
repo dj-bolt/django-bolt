@@ -26,5 +26,5 @@ def test_wire_from_error_parts_infers_response_type_from_content_type(content_ty
     assert custom_content_type == content_type
     assert custom_headers == [("x-extra", "1")]
     assert cookies is None
-    assert body_kind == "bytes"
+    assert body_kind == 0  # _BODY_BYTES
     assert body == b"payload"

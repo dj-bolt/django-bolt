@@ -547,7 +547,7 @@ class TestMiddlewareExecution:
         status, meta, body_kind, body = result
 
         assert status == 200
-        assert body_kind == "bytes"
+        assert body_kind == 0  # _BODY_BYTES
         data = json.loads(body)
         assert "has_context" in data
 
@@ -594,7 +594,7 @@ class TestMiddlewareExecution:
         status, meta, body_kind, body = result
 
         assert status == 200
-        assert body_kind == "bytes"
+        assert body_kind == 0  # _BODY_BYTES
         data = msgspec.json.decode(body)
         assert data["id"] == 1
         assert data["name"] == "Test"

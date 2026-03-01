@@ -1,5 +1,6 @@
 from django_bolt.middleware_response import MiddlewareResponse
 from django_bolt.responses import StreamingResponse
+from django_bolt.serialization import _BODY_BYTES, _BODY_STREAM
 
 
 def test_middleware_response_does_not_promote_content_attribute_objects_to_stream():
@@ -11,11 +12,11 @@ def test_middleware_response_does_not_promote_content_attribute_objects_to_strea
         status_code=200,
         headers={},
         body=ContentObject(),
-        body_kind="bytes",
+        body_kind=_BODY_BYTES,
     )
 
     _status, _meta, body_kind, _payload = response.to_tuple()
-    assert body_kind == "bytes"
+    assert body_kind == _BODY_BYTES  # 0
 
 
 def test_middleware_response_marks_streaming_response_body_as_stream():
@@ -26,8 +27,8 @@ def test_middleware_response_marks_streaming_response_body_as_stream():
         status_code=200,
         headers={},
         body=StreamingResponse(gen(), media_type="text/plain"),
-        body_kind="bytes",
+        body_kind=_BODY_BYTES,
     )
 
     _status, _meta, body_kind, _payload = response.to_tuple()
-    assert body_kind == "stream"
+    assert body_kind == _BODY_STREAM  # 1

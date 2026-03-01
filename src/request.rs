@@ -49,11 +49,13 @@ pub struct PyRequest {
     pub context: Option<Py<PyDict>>, // Middleware context data
     // None if no auth context or user not found
     pub user: Option<Py<PyAny>>,
-    pub state: Py<PyDict>, // Arbitrary state for middleware AND dynamic attributes (e.g. _messages)
-    /// Form data - pre-typed by Rust (int, float, bool, str, etc.)
-    pub form_map: Py<PyDict>,
-    /// Files data - dict of {field_name: {filename, content, content_type, size, temp_path?}}
-    pub files_map: Py<PyDict>,
+    /// Lazy state dict for middleware AND dynamic attributes (e.g. _messages, _bolt_prebound_args).
+    /// Only allocated on first access, so fast-path handlers with no prebound args pay zero cost.
+    pub state: OnceLock<Py<PyDict>>,
+    /// Form data - pre-typed by Rust. None when no form data (saves 1 PyDict alloc per request).
+    pub form_map: Option<Py<PyDict>>,
+    /// Files data. None when no file uploads (saves 1 PyDict alloc per request).
+    pub files_map: Option<Py<PyDict>>,
     /// Lazy cached META dict for Django template compatibility
     /// Uses OnceLock for thread-safe lazy initialization (required by PyO3's pyclass)
     pub meta_cache: OnceLock<Py<PyDict>>,
@@ -165,7 +167,21 @@ impl PyRequest {
     #[getter]
     #[inline]
     fn state<'py>(&self, py: Python<'py>) -> Py<PyDict> {
-        self.state.clone_ref(py)
+        self.get_or_init_state(py)
+    }
+
+    /// Internal: get or lazily create the state dict (OnceLock - zero cost when never accessed).
+    #[inline]
+    fn get_or_init_state(&self, py: Python<'_>) -> Py<PyDict> {
+        if let Some(s) = self.state.get() {
+            return s.clone_ref(py);
+        }
+        let new_dict = PyDict::new(py).unbind();
+        // OnceLock::set returns Err if already set (harmless race — each request owns its object)
+        match self.state.set(new_dict.clone_ref(py)) {
+            Ok(()) => new_dict,
+            Err(_) => self.state.get().unwrap().clone_ref(py),
+        }
     }
 
     /// Get form data as a dict for parameter access.
@@ -177,7 +193,10 @@ impl PyRequest {
     #[getter]
     #[inline]
     fn form<'py>(&self, py: Python<'py>) -> Py<PyDict> {
-        self.form_map.clone_ref(py)
+        match &self.form_map {
+            Some(d) => d.clone_ref(py),
+            None => PyDict::new(py).unbind(),
+        }
     }
 
     /// Get files as a dict for file access.
@@ -188,7 +207,10 @@ impl PyRequest {
     #[getter]
     #[inline]
     fn files<'py>(&self, py: Python<'py>) -> Py<PyDict> {
-        self.files_map.clone_ref(py)
+        match &self.files_map {
+            Some(d) => d.clone_ref(py),
+            None => PyDict::new(py).unbind(),
+        }
     }
 
     /// Get META dict for Django template compatibility.
@@ -212,7 +234,8 @@ impl PyRequest {
     fn META<'py>(&self, py: Python<'py>) -> PyResult<Py<PyDict>> {
         // If Django middleware synced a META dict into request.state, reuse it.
         // This keeps template-time CSRF token generation aligned with middleware validation.
-        let state_dict = self.state.bind(py);
+        let state_py = self.get_or_init_state(py);
+        let state_dict = state_py.bind(py);
         if let Some(state_meta) = state_dict.get_item("META")? {
             if let Ok(state_meta_dict) = state_meta.cast::<PyDict>() {
                 let meta_unbind = state_meta_dict.clone().unbind();
@@ -305,7 +328,8 @@ impl PyRequest {
     #[getter]
     fn auser<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         // Get "auser" from state dict (set by Django middleware adapter)
-        let state_dict = self.state.bind(py);
+        let state_py = self.get_or_init_state(py);
+        let state_dict = state_py.bind(py);
         match state_dict.get_item("auser") {
             Ok(Some(auser)) => Ok(auser.unbind()),
             _ => {
@@ -324,8 +348,8 @@ impl PyRequest {
     /// just like in standard Django.
     #[setter]
     fn set_auser(&mut self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
-        let state_dict = self.state.bind(py);
-        state_dict.set_item("auser", value)?;
+        let state_py = self.get_or_init_state(py);
+        state_py.bind(py).set_item("auser", value)?;
         Ok(())
     }
 
@@ -406,7 +430,7 @@ impl PyRequest {
             "query" => self.query_params.clone_ref(py).into_any(),
             "headers" => self.headers.clone_ref(py).into_any(),
             "cookies" => self.cookies.clone_ref(py).into_any(),
-            "state" => self.state.clone_ref(py).into_any(),
+            "state" => self.get_or_init_state(py).into_any(),
             "auth" | "context" => match &self.context {
                 Some(ctx) => ctx.clone_ref(py).into_any(),
                 None => default.unwrap_or_else(|| py.None()),
@@ -424,7 +448,7 @@ impl PyRequest {
             "query" => Ok(self.query_params.clone_ref(py).into_any()),
             "headers" => Ok(self.headers.clone_ref(py).into_any()),
             "cookies" => Ok(self.cookies.clone_ref(py).into_any()),
-            "state" => Ok(self.state.clone_ref(py).into_any()),
+            "state" => Ok(self.get_or_init_state(py).into_any()),
             "context" => Ok(match &self.context {
                 Some(ctx) => ctx.clone_ref(py).into_any(),
                 None => py.None(),
@@ -441,7 +465,7 @@ impl PyRequest {
         default: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         if key == "state" {
-            return Ok(self.state.clone_ref(py).into_any());
+            return Ok(self.get_or_init_state(py).into_any());
         }
         Ok(self.get(py, key, default))
     }
@@ -466,7 +490,8 @@ impl PyRequest {
     /// Example:
     ///     messages = request._messages  # Reads from state["_messages"]
     fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
-        let state_dict = self.state.bind(py);
+        let state_py = self.get_or_init_state(py);
+        let state_dict = state_py.bind(py);
         match state_dict.get_item(name)? {
             Some(value) => Ok(value.unbind()),
             None => Err(pyo3::exceptions::PyAttributeError::new_err(format!(

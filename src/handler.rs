@@ -383,19 +383,24 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
     let status_code: u16 = tuple.get_item(0)?.extract()?;
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
     let meta = ResponseMeta::from_python(&tuple.get_item(1)?)?;
-    let body_kind: String = tuple.get_item(2)?.extract()?;
+    // body_kind is an integer tag: 0=bytes, 1=file, 2=stream (avoids String alloc per response)
+    let body_kind: u8 = tuple.get_item(2)?.extract()?;
     let payload = tuple.get_item(3)?;
 
-    let body = match body_kind.as_str() {
-        "bytes" => {
+    // body_kind integer tags must match Python's _BODY_BYTES/STREAM/FILE in serialization.py:
+    //   0 = bytes, 1 = stream, 2 = file
+    let body = match body_kind {
+        0 => {
+            // bytes
             if let Ok(py_bytes) = payload.cast::<PyBytes>() {
                 ResponseWireBody::Bytes(py_bytes.as_bytes().to_vec())
             } else {
                 ResponseWireBody::Bytes(payload.extract::<Vec<u8>>()?)
             }
         }
-        "file" => ResponseWireBody::FilePath(payload.extract::<String>()?),
-        "stream" => {
+        2 => ResponseWireBody::FilePath(payload.extract::<String>()?), // file
+        1 => {
+            // stream
             let streaming_cls = get_streaming_response_class(py);
             if !payload.is_instance(streaming_cls.bind(py))? {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
@@ -755,15 +760,6 @@ pub async fn handle_request(
     // Get peer address for rate limiting fallback
     let peer_addr = req.peer_addr().map(|addr| addr.ip().to_string());
 
-    // Get connection info from Actix - handles proxies, IPv6, etc. correctly
-    let conn_info = req.connection_info();
-    let conn_host = conn_info.host().to_owned();
-    let conn_scheme = conn_info.scheme().to_owned();
-    let conn_remote_addr = conn_info
-        .realip_remote_addr()
-        .unwrap_or("127.0.0.1")
-        .to_owned();
-
     // Compute skip flags (e.g., skip compression)
     let skip_compression = route_metadata
         .map(|m| m.plan.skip_compression())
@@ -809,6 +805,29 @@ pub async fn handle_request(
         parse_cookies_inline(headers.get("cookie").map(|s| s.as_str()))
     } else {
         AHashMap::new()
+    };
+
+    // Derive connection info from already-extracted headers (avoids a second header-parse pass).
+    // conn_info is only used for request.META (Django templates) and build_absolute_uri().
+    // When headers weren't extracted (pure API routes with no auth/cookies/middleware),
+    // empty strings are safe because no Django middleware will call META anyway.
+    let (conn_host, conn_scheme, conn_remote_addr) = if must_extract_headers {
+        let host = headers.get("host").cloned().unwrap_or_default();
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .cloned()
+            .unwrap_or_else(|| "http".to_string());
+        // X-Forwarded-For: leftmost IP is the original client (RFC 7239 §7.1)
+        let remote_addr = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.split(',').next().map(|s| s.trim().to_string()))
+            .or_else(|| headers.get("x-real-ip").cloned())
+            .or_else(|| peer_addr.clone())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        (host, scheme, remote_addr)
+    } else {
+        // No headers extracted → no Django middleware → META won't be accessed
+        (String::new(), String::new(), String::new())
     };
 
     // Determine if form parsing is needed and get content type
@@ -953,7 +972,9 @@ pub async fn handle_request(
         };
         let cookies_dict = params_to_py_dict(py, &cookies, param_types)?;
 
-        let state_dict = PyDict::new(py);
+        // Only create state dict when Rust-side prebound args exist.
+        // For fast-path handlers (no rust_arg_bindings), state is lazily allocated on first access.
+        let state_lock = std::sync::OnceLock::new();
         if let Some(bindings) = route_metadata.and_then(|m| m.rust_arg_bindings.as_deref()) {
             if let Some((pre_args, pre_kwargs)) = build_prebound_args_kwargs(
                 py,
@@ -963,16 +984,19 @@ pub async fn handle_request(
                 &headers_dict,
                 &cookies_dict,
             ) {
+                let state_dict = PyDict::new(py);
                 state_dict.set_item("_bolt_prebound_args", pre_args)?;
                 state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
+                let _ = state_lock.set(state_dict.unbind());
             }
         }
 
-        // Create form_map and files_map from form parsing result
-        let (form_map_dict, files_map_dict) = if let Some(ref result) = form_result {
-            form_result_to_py(py, result)?
+        // Only create form/files dicts when form data is present (saves 2 allocs per request).
+        let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {
+            let (fm, fi) = form_result_to_py(py, result)?;
+            (Some(fm), Some(fi))
         } else {
-            (PyDict::new(py).unbind(), PyDict::new(py).unbind())
+            (None, None)
         };
 
         let request = PyRequest {
@@ -985,9 +1009,9 @@ pub async fn handle_request(
             cookies: cookies_dict.unbind(),
             context,
             user: None,
-            state: state_dict.unbind(), // State dict for middleware and dynamic attributes
-            form_map: form_map_dict,
-            files_map: files_map_dict,
+            state: state_lock,
+            form_map: form_map_opt,
+            files_map: files_map_opt,
             meta_cache: std::sync::OnceLock::new(),
             conn_host: conn_host.clone(),
             conn_scheme: conn_scheme.clone(),
