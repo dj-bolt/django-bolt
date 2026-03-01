@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "django-bolt"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "actix",
  "actix-cors",

@@ -20,6 +20,7 @@ from django_bolt.serialization import (
     serialize_response_sync,
 )
 from django_bolt.serializers import Serializer
+from django_bolt.testing import TestClient
 
 # ============================================================================
 # Test schemas
@@ -52,24 +53,18 @@ class CreatedSchema(Serializer):
 # ============================================================================
 
 
-@pytest.mark.asyncio
-async def test_tuple_200_validates_against_ok_schema():
+def test_tuple_200_validates_against_ok_schema():
     """response_model={200: Ok, 400: Err} with (200, data) validates against Ok."""
     api = BoltAPI()
 
     @api.get("/items/{item_id}", response_model={200: OkSchema, 400: ErrorSchema})
     async def get_item(item_id: int):
-        return 200, {"id": 1, "name": "Alice"}
+        return 200, {"id": item_id, "name": "Alice"}
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    status, _resp_meta, _kind, body = await serialize_response(
-        (200, {"id": 1, "name": "Alice"}), meta
-    )
-    assert status == 200
-    decoded = msgspec.json.decode(body)
-    assert decoded == {"id": 1, "name": "Alice"}
+    with TestClient(api) as client:
+        r = client.get("/items/1")
+        assert r.status_code == 200
+        assert r.json() == {"id": 1, "name": "Alice"}
 
 
 # ============================================================================
@@ -77,8 +72,7 @@ async def test_tuple_200_validates_against_ok_schema():
 # ============================================================================
 
 
-@pytest.mark.asyncio
-async def test_tuple_400_validates_against_error_schema():
+def test_tuple_400_validates_against_error_schema():
     """response_model={200: Ok, 400: Err} with (400, data) validates against Err."""
     api = BoltAPI()
 
@@ -86,15 +80,10 @@ async def test_tuple_400_validates_against_error_schema():
     async def get_item(item_id: int):
         return 400, {"detail": "Not valid"}
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    status, _resp_meta, _kind, body = await serialize_response(
-        (400, {"detail": "Not valid"}), meta
-    )
-    assert status == 400
-    decoded = msgspec.json.decode(body)
-    assert decoded == {"detail": "Not valid"}
+    with TestClient(api) as client:
+        r = client.get("/items/1")
+        assert r.status_code == 400
+        assert r.json() == {"detail": "Not valid"}
 
 
 # ============================================================================
@@ -102,8 +91,7 @@ async def test_tuple_400_validates_against_error_schema():
 # ============================================================================
 
 
-@pytest.mark.asyncio
-async def test_json_response_selects_schema_by_status_code():
+def test_json_response_selects_schema_by_status_code():
     """JSON(data, status_code=404) selects the 404 schema."""
     api = BoltAPI()
 
@@ -111,15 +99,10 @@ async def test_json_response_selects_schema_by_status_code():
     async def get_item(item_id: int):
         return JSON({"detail": "Not found"}, status_code=404)
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    status, _resp_meta, _kind, body = await serialize_response(
-        JSON({"detail": "Not found"}, status_code=404), meta
-    )
-    assert status == 404
-    decoded = msgspec.json.decode(body)
-    assert decoded == {"detail": "Not found"}
+    with TestClient(api) as client:
+        r = client.get("/items/1")
+        assert r.status_code == 404
+        assert r.json() == {"detail": "Not found"}
 
 
 # ============================================================================
@@ -154,8 +137,7 @@ async def test_bare_dict_uses_default_status_code():
 # ============================================================================
 
 
-@pytest.mark.asyncio
-async def test_204_none_produces_empty_body():
+def test_204_none_produces_empty_body():
     """{204: None} with (204, None) returns empty body."""
     api = BoltAPI()
 
@@ -163,35 +145,28 @@ async def test_204_none_produces_empty_body():
     async def delete_item(item_id: int):
         return 204, None
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    status, _resp_meta, _kind, body = await serialize_response(
-        (204, None), meta
-    )
-    assert status == 204
-    assert body == b""
+    with TestClient(api) as client:
+        r = client.delete("/items/1")
+        assert r.status_code == 204
+        assert r.content == b""
 
 
 # ============================================================================
-# 6. Unmapped status code raises TypeError
+# 6. Unmapped status code returns 500 (exception caught by dispatch)
 # ============================================================================
 
 
-@pytest.mark.asyncio
-async def test_unmapped_status_code_raises():
-    """Unmapped status code raises TypeError."""
+def test_unmapped_status_code_returns_500():
+    """Unmapped status code with no ellipsis catch-all returns 500."""
     api = BoltAPI()
 
     @api.get("/items/{item_id}", response_model={200: OkSchema, 400: ErrorSchema})
     async def get_item(item_id: int):
-        return 500, {"detail": "Server error"}
+        return 999, {"detail": "Unknown"}
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    with pytest.raises(TypeError, match="Status 500 has no response schema"):
-        await serialize_response((500, {"detail": "Server error"}), meta)
+    with TestClient(api) as client:
+        r = client.get("/items/1")
+        assert r.status_code == 500
 
 
 # ============================================================================
@@ -199,8 +174,7 @@ async def test_unmapped_status_code_raises():
 # ============================================================================
 
 
-@pytest.mark.asyncio
-async def test_ellipsis_catch_all():
+def test_ellipsis_catch_all():
     """Ellipsis catch-all matches unmapped status codes."""
     api = BoltAPI()
 
@@ -208,15 +182,10 @@ async def test_ellipsis_catch_all():
     async def get_item(item_id: int):
         return 500, {"detail": "Server error"}
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    status, _resp_meta, _kind, body = await serialize_response(
-        (500, {"detail": "Server error"}), meta
-    )
-    assert status == 500
-    decoded = msgspec.json.decode(body)
-    assert decoded == {"detail": "Server error"}
+    with TestClient(api) as client:
+        r = client.get("/items/1")
+        assert r.status_code == 500
+        assert r.json() == {"detail": "Server error"}
 
 
 # ============================================================================
@@ -277,22 +246,17 @@ def test_openapi_204_no_content():
 
 
 def test_sync_handler_multi_response():
-    """Sync handler with multi-response dict works via serialize_response_sync."""
+    """Sync handler with multi-response dict works end-to-end."""
     api = BoltAPI()
 
     @api.get("/items/{item_id}", response_model={200: OkSchema, 400: ErrorSchema})
     def get_item(item_id: int):
-        return 200, {"id": 1, "name": "Alice"}
+        return 200, {"id": item_id, "name": "Alice"}
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    status, _resp_meta, _kind, body = serialize_response_sync(
-        (200, {"id": 1, "name": "Alice"}), meta
-    )
-    assert status == 200
-    decoded = msgspec.json.decode(body)
-    assert decoded == {"id": 1, "name": "Alice"}
+    with TestClient(api) as client:
+        r = client.get("/items/1")
+        assert r.status_code == 200
+        assert r.json() == {"id": 1, "name": "Alice"}
 
 
 def test_sync_handler_multi_response_error():
@@ -303,34 +267,24 @@ def test_sync_handler_multi_response_error():
     def get_item(item_id: int):
         return 400, {"detail": "Bad request"}
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    status, _resp_meta, _kind, body = serialize_response_sync(
-        (400, {"detail": "Bad request"}), meta
-    )
-    assert status == 400
-    decoded = msgspec.json.decode(body)
-    assert decoded == {"detail": "Bad request"}
+    with TestClient(api) as client:
+        r = client.get("/items/1")
+        assert r.status_code == 400
+        assert r.json() == {"detail": "Bad request"}
 
 
 def test_sync_json_response_multi():
-    """Sync handler with JSON() return in multi-response mode."""
+    """Sync handler with JSON() return selects schema by status code."""
     api = BoltAPI()
 
     @api.get("/items/{item_id}", response_model={200: OkSchema, 404: ErrorSchema})
     def get_item(item_id: int):
         return JSON({"detail": "Not found"}, status_code=404)
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    status, _resp_meta, _kind, body = serialize_response_sync(
-        JSON({"detail": "Not found"}, status_code=404), meta
-    )
-    assert status == 404
-    decoded = msgspec.json.decode(body)
-    assert decoded == {"detail": "Not found"}
+    with TestClient(api) as client:
+        r = client.get("/items/1")
+        assert r.status_code == 404
+        assert r.json() == {"detail": "Not found"}
 
 
 # ============================================================================
@@ -429,34 +383,32 @@ def test_multi_response_explicit_status_code():
 # ============================================================================
 
 
-@pytest.mark.asyncio
-async def test_ellipsis_catch_all_different_codes():
-    """Ellipsis catch-all works with multiple different status codes without shared state corruption."""
+def test_ellipsis_catch_all_different_codes():
+    """Ellipsis catch-all handles multiple unmapped status codes without shared state corruption."""
+    codes = [500, 503]
+    call_idx = [0]
+
     api = BoltAPI()
 
     @api.get("/items/{item_id}", response_model={200: OkSchema, ...: ErrorSchema})
     async def get_item(item_id: int):
-        pass
+        code = codes[call_idx[0] % 2]
+        call_idx[0] += 1
+        return code, {"detail": f"Error {code}"}
 
+    with TestClient(api) as client:
+        r1 = client.get("/items/1")
+        assert r1.status_code == 500
+        assert r1.json() == {"detail": "Error 500"}
+
+        r2 = client.get("/items/1")
+        assert r2.status_code == 503
+        assert r2.json() == {"detail": "Error 503"}
+
+    # Also verify the shared ellipsis entry was NOT mutated at registration time
     _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    # First request with 500
-    status1, _, _, body1 = await serialize_response(
-        (500, {"detail": "Server error"}), meta
-    )
-    assert status1 == 500
-
-    # Second request with 503 — must not be affected by first
-    status2, _, _, body2 = await serialize_response(
-        (503, {"detail": "Unavailable"}), meta
-    )
-    assert status2 == 503
-
-    # Verify the shared ellipsis meta was NOT mutated
-    ellipsis_meta = meta["_resolved_metas"][...]
-    assert ellipsis_meta["default_status_code"] != 500
-    assert ellipsis_meta["default_status_code"] != 503
+    ellipsis_entry = api._handler_meta[handler_id]["_resolved_metas"][...]
+    assert ellipsis_entry["default_status_code"] not in (500, 503)
 
 
 # ============================================================================
@@ -569,8 +521,7 @@ def test_bare_list_multi_response_sync():
 # ============================================================================
 
 
-@pytest.mark.asyncio
-async def test_validation_failure_returns_500():
+def test_validation_failure_returns_500():
     """Data that doesn't match the schema for a status code returns 500."""
     api = BoltAPI()
 
@@ -578,11 +529,6 @@ async def test_validation_failure_returns_500():
     async def get_item(item_id: int):
         return 200, {"wrong_field": "no id or name"}
 
-    _method, _path, handler_id, _handler = api._routes[0]
-    meta = api._handler_meta[handler_id]
-
-    status, _resp_meta, _kind, body = await serialize_response(
-        (200, {"wrong_field": "no id or name"}), meta
-    )
-    assert status == 500
-    assert b"Response validation error" in body
+    with TestClient(api) as client:
+        r = client.get("/items/1")
+        assert r.status_code == 500

@@ -199,41 +199,11 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
     if result is None and status_code == 204:
         return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
 
-    is_multi = meta["is_multi_response"]
-
-    # Detect (status_code, data) tuple in multi-response mode
-    if is_multi and isinstance(result, tuple) and len(result) == 2:
-        code, data = result
-        if isinstance(code, int):
-            response_type, resolved_meta = _resolve_response_type(code, meta)
-            if response_type is None or data is None:
-                return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-            # Inline dispatch for common types to avoid recursion overhead
-            if isinstance(data, (dict, list)):
-                if isinstance(data, list):
-                    data = _convert_serializers(data)
-                return await serialize_json_data(data, response_type, resolved_meta, status_code=code)
-            # For non-dict/list types that recurse, ensure correct status code
-            # without mutating the shared resolved_meta (ellipsis entry is shared)
-            if resolved_meta["default_status_code"] != code:
-                resolved_meta = {**resolved_meta, "default_status_code": code}
-            return await serialize_response(data, resolved_meta)
-
     # Fast path: dict/list are the most common response types (90%+ of handlers)
     if isinstance(result, dict):
-        if is_multi:
-            response_type, resolved_meta = _resolve_response_type(status_code, meta)
-            if response_type is None:
-                return _wire_bytes(status_code, _RESPONSE_META_EMPTY, b"")
-            return await serialize_json_data(result, response_type, resolved_meta)
         return await serialize_json_data(result, response_type, meta)
     if isinstance(result, list):
         result = _convert_serializers(result)
-        if is_multi:
-            response_type, resolved_meta = _resolve_response_type(status_code, meta)
-            if response_type is None:
-                return _wire_bytes(status_code, _RESPONSE_META_EMPTY, b"")
-            return await serialize_json_data(result, response_type, resolved_meta)
         return await serialize_json_data(result, response_type, meta)
 
     # Convert Serializer instances to dicts (handles write_only, computed_field)
@@ -251,9 +221,6 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
 
     # Async-specific handling for types that need await
     if isinstance(result, JSON):
-        if is_multi:
-            response_type, resolved_meta = _resolve_response_type(result.status_code, meta)
-            return await serialize_json_response(result, response_type, resolved_meta)
         return await serialize_json_response(result, response_type, meta)
     if isinstance(result, ResponseClass):
         return await serialize_generic_response(result, response_type, meta)
@@ -279,41 +246,11 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
     if result is None and status_code == 204:
         return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
 
-    is_multi = meta["is_multi_response"]
-
-    # Detect (status_code, data) tuple in multi-response mode
-    if is_multi and isinstance(result, tuple) and len(result) == 2:
-        code, data = result
-        if isinstance(code, int):
-            response_type, resolved_meta = _resolve_response_type(code, meta)
-            if response_type is None or data is None:
-                return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-            # Inline dispatch for common types to avoid recursion overhead
-            if isinstance(data, (dict, list)):
-                if isinstance(data, list):
-                    data = _convert_serializers(data)
-                return serialize_json_data_sync(data, response_type, resolved_meta, status_code=code)
-            # For non-dict/list types that recurse, ensure correct status code
-            # without mutating the shared resolved_meta (ellipsis entry is shared)
-            if resolved_meta["default_status_code"] != code:
-                resolved_meta = {**resolved_meta, "default_status_code": code}
-            return serialize_response_sync(data, resolved_meta)
-
     # Fast path: dict/list are the most common response types (90%+ of handlers)
     if isinstance(result, dict):
-        if is_multi:
-            response_type, resolved_meta = _resolve_response_type(status_code, meta)
-            if response_type is None:
-                return _wire_bytes(status_code, _RESPONSE_META_EMPTY, b"")
-            return serialize_json_data_sync(result, response_type, resolved_meta)
         return serialize_json_data_sync(result, response_type, meta)
     if isinstance(result, list):
         result = _convert_serializers(result)
-        if is_multi:
-            response_type, resolved_meta = _resolve_response_type(status_code, meta)
-            if response_type is None:
-                return _wire_bytes(status_code, _RESPONSE_META_EMPTY, b"")
-            return serialize_json_data_sync(result, response_type, resolved_meta)
         return serialize_json_data_sync(result, response_type, meta)
 
     # Convert Serializer instances
@@ -331,9 +268,6 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
 
     # Sync-specific handling
     if isinstance(result, JSON):
-        if is_multi:
-            response_type, resolved_meta = _resolve_response_type(result.status_code, meta)
-            meta = resolved_meta
         if response_type is not None:
             try:
                 validated = coerce_to_response_type(result.data, response_type, meta=meta)

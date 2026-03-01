@@ -96,11 +96,6 @@ seed-data host=host port=port:
 # Save baseline vs dev benchmark comparison
 save-bench host=host port=port c=c n=n p=p workers=workers:
     #!/usr/bin/env bash
-    set -e
-    if ! command -v bombardier &>/dev/null && [ ! -f "$HOME/go/bin/bombardier" ] && [ ! -f "$HOME/.local/bin/bombardier" ]; then
-        echo "ERROR: bombardier not installed. Install with: brew install bombardier"
-        exit 1
-    fi
     mkdir -p bench
     if [ ! -f bench/BENCHMARK_BASELINE.md ]; then
         echo "Creating baseline benchmark..."
