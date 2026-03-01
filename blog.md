@@ -35,7 +35,6 @@ For the ORM to work, Django needs to be bootstrapped — its environment configu
 
 
 ## Sync vs Async
-{{Actually read code for this}}
 
 First of all, I just wanted to prove that this thing could work. So I told Claude to build a kind of an proof-of-concept of the framework in which it used sync calls — it just called the Python function from the Actix layer in full sync mode.
 
@@ -44,6 +43,34 @@ At this point, I was getting about 27,000 requests per second using four workers
 But for database endpoints, sync does not perform as well. Initially I was testing with just simple JSON endpoints, which is why it was performing very well. But for database endpoints, it does not perform very well.
 
 So the mission was: I wanted to have async functionality — async calling of the views — but that proved to be a very big refactor of the first proof of concept. The issue was that for handling async, I had to handle Tokio on the Rust side and figure out how to call Python asynchronously. It was not the first design, but what I landed on was: I should have a Python event loop that I store at registration time and use to call the Python functions from the Rust side.
+
+The POC just called Python synchronously from Rust, blocking the entire Actix thread:
+
+```rust
+// Before (POC): blocking call — Rust thread is frozen until Python returns
+let result = Python::with_gil(|py| {
+    handler.call1(py, (request,))
+})?;
+```
+
+The fix was to store the asyncio event loop at startup and bridge it to Tokio with `pyo3_async_runtimes`:
+
+```rust
+// After: dispatch returns a coroutine, Tokio awaits it without blocking
+let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
+pyo3_async_runtimes::into_future_with_locals(locals, coroutine.into_bound(py))
+```
+
+On the Python side, the executor decides at dispatch time how to call the handler:
+
+```python
+if is_async:
+    result = await handler(*args, **kwargs)       # native coroutine
+elif is_blocking:
+    result = await sync_to_thread(handler, *args, **kwargs)  # sync with DB: run in thread pool
+else:
+    result = handler(*args, **kwargs)             # pure sync, no I/O
+```
 
 The async event loop was not the first solution I explored. I explored subinterpreters, using threads, and other approaches. I liked subinterpreters, butthe PyO3 support was not there yet. For some reason I was very afraid of the GIL, because in my mind the GIL was a killer of performance. So I decided to use an event loop and then use process forking in Rust, which would give me scalability across different workers, each having their own event loop, resulting in less GIL contention. At this point, I was making the mistake of having more than one Actix thread with one python event loop handling both of those Actix threads. But then I realized the bottleneck will always be the Python code, not the Rust code, so we are not getting any help by increasing the Actix threads for a given worker. So after some time, I just fixed that to one Actix thread per one Python event loop.
 
@@ -81,7 +108,38 @@ From the start of this framework, my goal was to have a proper way to stream AI 
 Measure the correct thing. Python is not always the bottleneck.
 
 ### The Bridge
-So what was the problem? In a normal view, we have one full cycle: we call a Python function, we await it, and we get the response. But in streaming, the cycle breaks. What happens is when we call a view, it returns a generator. The generator sends a response back — for example, if we are returning from a while loop, it will return that response after one second or so. So it is not just awaiting a simple Python function. We have to send that response to the client, and then also await the next response. This actually amplifies the problem of the Python-Rust bridge handled by PyO3. Every time a new response comes, we have to cross that bridge every time. The other stupid thing I was doing was measuring requests per second for streaming responses. That was not the right thing to measure for streaming responses. {{Solution from code}}
+So what was the problem? In a normal view, we have one full cycle: we call a Python function, we await it, and we get the response. But in streaming, the cycle breaks. What happens is when we call a view, it returns a generator. The generator sends a response back — for example, if we are returning from a while loop, it will return that response after one second or so. So it is not just awaiting a simple Python function. We have to send that response to the client, and then also await the next response. This actually amplifies the problem of the Python-Rust bridge handled by PyO3. Every time a new response comes, we have to cross that bridge every time. The other stupid thing I was doing was measuring requests per second for streaming responses. That was not the right thing to measure for streaming responses.
+
+The solution was a Tokio mpsc channel as a bridge between the Python generator and the Actix response stream. Python pushes chunks into the channel; Rust drains it without holding the GIL:
+
+```rust
+let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(channel_capacity);
+
+// Tokio task: calls __anext__ on the Python async generator, sends each chunk
+tokio::spawn(async move {
+    // ...
+    let chunk = async_iter.bind(py).call_method0("__anext__");
+    // convert chunk to bytes, then:
+    tx.send(Ok(bytes)).await;
+});
+
+// Actix streams from the channel — GIL is never held here
+let s = stream::unfold(rx, |mut rx| async move {
+    match rx.recv().await {
+        Some(item) => Some((item, rx)),
+        None => None,
+    }
+});
+builder.streaming(s)
+```
+
+For SSE specifically, batching is forced to 1 so each yielded chunk is delivered immediately instead of being buffered:
+
+```rust
+pub fn create_sse_stream(content: Py<PyAny>, is_async_generator: bool) -> ... {
+    create_python_stream_with_config(content, /*async_batch=*/1, /*sync_batch=*/1, is_async_generator)
+}
+```
 
 
 ### Vibe Coder vs Software Engineer
@@ -95,7 +153,61 @@ This is where a normal vibe coder and a software engineer differentiate themselv
 
 - Solution
 
-What I found was that the response transfer path between Python and Rust was spending too much time in GIL-bound extraction and conversion for larger payloads. The data is still copied at the Python-Rust boundary, but moving that hot-path work out of the GIL-heavy path fixed the bottleneck. Now I get about 90,000 requests per second for the same number of workers, where I was previously stuck under 35,000 requests per second.
+Two things were wrong. The first was the event loop. The code had a fallback that called `pyo3_async_runtimes::tokio::get_current_locals(py)` on every request if the stored event loop wasn't available — which meant it could be creating a fresh event loop context per request:
+
+```rust
+// Before: might create a new event loop context on every request
+let locals_owned;
+let locals = if let Some(globals) = TASK_LOCALS.get() {
+    globals
+} else {
+    locals_owned = pyo3_async_runtimes::tokio::get_current_locals(py)?; // ← expensive per-request fallback
+    &locals_owned
+};
+```
+
+```rust
+// After: always use the one event loop stored at server startup, error if missing
+let locals = TASK_LOCALS.get().ok_or_else(|| {
+    pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
+})?;
+```
+
+The second and bigger problem was how the response body was extracted. The old code called `.extract::<Vec<u8>>()` inside the GIL — which copies the entire body bytes while the GIL is held. For a 100KB response that memcpy takes real time, and every other Python thread on that worker is frozen waiting for it:
+
+```rust
+// Before: Vec<u8> copy happens INSIDE the GIL
+let tuple_result: Result<(u16, Vec<(String, String)>, Vec<u8>), _> =
+    Python::attach(|py| result_obj.extract(py));  // ← entire body copied here, GIL held throughout
+```
+
+The fix uses `downcast::<PyBytes>()` — PyO3's direct cast to the Python bytes type — to grab a raw pointer and length without copying anything. The GIL is then released, and the actual `memcpy` happens in pure Rust outside of it:
+
+```rust
+// After: inside GIL — only get pointer + length, no copy yet
+let fast_tuple = Python::attach(|py| {
+    let tuple = result_obj.bind(py).downcast::<PyTuple>().ok()?;
+    // ...
+    if let Ok(pybytes) = body_obj.downcast::<PyBytes>() {
+        let slice = pybytes.as_bytes();
+        let ptr = slice.as_ptr();   // raw pointer into the Python buffer
+        let len = slice.len();
+        let owner: Py<PyAny> = body_obj.unbind(); // keep Python object alive
+        Some((status_code, resp_headers, owner, ptr, len))
+    } else { None }
+}); // ← GIL released here
+
+// Outside GIL — do the actual copy in pure Rust, other Python threads can run freely
+let mut body_vec = Vec::<u8>::with_capacity(body_len);
+unsafe {
+    body_vec.set_len(body_len);
+    std::ptr::copy_nonoverlapping(body_ptr, body_vec.as_mut_ptr(), body_len);
+}
+// Re-acquire GIL briefly just to drop the Python owner
+let _ = Python::attach(|_| drop(body_owner));
+```
+
+The data still has to be copied — there is no way around the Python-Rust boundary — but moving the memcpy out of the GIL meant other Python threads could run during that time. Root endpoint: 31,000 → 67,000 req/sec. The 10KB+ ceiling was gone.
 
 
 ## Testing
@@ -157,7 +269,45 @@ I had to decide between type safety and development productivity. With a seriali
 
 Another feature I like very much that I built from this learning was having a subset of the parent serializer. In Django REST Framework, you have to define an admin serializer for all the fields and then a normal serializer that is a subset of those fields. What I decided instead was to have one class, and in the config we just define two levels of fields and use one class to have two serializers, instead of defining those two serializers separately. I had to fight a lot of msgspec's design to build this serialization layer, and it is still in development.
 
-{{Code example}}
+DRF forces you to repeat yourself:
+
+```python
+# DRF: two separate classes, no shared definition, no static type safety on fields
+class UserAdminSerializer(ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["id", "username", "email", "password", "last_login", "date_joined"]
+
+class UserPublicSerializer(ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["id", "username"]  # a copy — IDE knows nothing about these field names
+```
+
+Django Bolt lets you define once and derive:
+
+```python
+class UserSerializer(Serializer):
+    id: int
+    username: str
+    email: str
+    password: str
+    last_login: datetime
+    date_joined: datetime
+
+    class Config:
+        write_only = {"password"}   # excluded from all output automatically
+        field_sets = {
+            "public":  ["id", "username"],
+            "detail":  ["id", "username", "email", "last_login"],
+        }
+
+# Type-safe subsets — the IDE knows exactly what fields exist
+UserPublicSerializer = UserSerializer.use("public")   # id, username
+UserDetailSerializer = UserSerializer.use("detail")   # id, username, email, last_login
+```
+
+The `use()` call creates a real subclass at module load time, so response_model annotations and IDE autocomplete both work correctly.
 
 ### Learning
 Choose libraries carefully.
@@ -186,4 +336,79 @@ When I run without Django signals and just call the functions directly, I get ab
 
 
 
+## Hot Path: GIL-Free Body Copy, Round Two
+
+The GIL-free memcpy optimization described earlier needed a more structured home as the codebase grew. I introduced a `ResponseWireV1` wire format — a typed 4-tuple `(status, meta, body_kind, body_payload)` parsed by a dedicated `parse_response_wire` function — and used that opportunity to give the optimization proper shape with a named struct:
+
+```rust
+struct DeferredBytes {
+    owner: Py<PyAny>,   // keeps the Python object alive
+    ptr: *const u8,     // raw pointer into the bytes buffer
+    len: usize,
+}
+unsafe impl Send for DeferredBytes {}
+```
+
+Inside `Python::attach`, we only grab the pointer and length — no copy:
+
+```rust
+struct DeferredBytes {
+    owner: Py<PyAny>,   // keeps the Python object alive
+    ptr: *const u8,     // raw pointer into the bytes buffer
+    len: usize,
+}
+unsafe impl Send for DeferredBytes {}
+```
+
+Inside `Python::attach`, we only grab the pointer and length — no copy:
+
+```rust
+// Inside GIL: capture pointer + length only
+if let Ok(py_bytes) = payload.cast::<PyBytes>() {
+    let bytes = py_bytes.as_bytes();
+    let ptr = bytes.as_ptr();
+    let len = bytes.len();
+    // bytes / py_bytes borrows end here (NLL); payload is moved into owner
+    ResponseWireBody::DeferredBytes(DeferredBytes {
+        owner: payload.unbind(),   // keep Python object alive
+        ptr,
+        len,
+    })
+}
+```
+
+Then after `Python::attach` returns and the GIL is released, the actual copy happens in pure Rust:
+
+```rust
+// Outside GIL — other Python threads can run freely during this copy
+let mut vec = Vec::with_capacity(deferred.len);
+unsafe {
+    vec.set_len(deferred.len);
+    std::ptr::copy_nonoverlapping(deferred.ptr, vec.as_mut_ptr(), deferred.len);
+}
+drop(deferred.owner);   // release Python owner after copy
+```
+
+The safety argument is the same as before: CPython never moves objects in memory, so the raw pointer is stable as long as the reference count stays above zero — which `owner: Py<PyAny>` guarantees.
+
+Results after re-applying the fix (8 processes, C=100, N=10k):
+
+| Endpoint | Before | After | Delta |
+|---|---|---|---|
+| Root `/` | 101k req/s | 118k req/s | +17% |
+| 10k JSON async | 84k req/s | 91k req/s | +9% |
+| 10k JSON sync | 74k req/s | 91k req/s | +22% |
+
+The sync endpoint gained the most because sync handlers hold the GIL longer overall, so any time spent inside it hurts proportionally more.
+
+### Learning
+Name your unsafe invariants. The `DeferredBytes` struct makes the safety argument explicit and keeps the optimization auditable as the codebase grows.
+
+
 ## What has come out of it?
+
+Six months of work on a "quick experiment" has produced a framework that genuinely outperforms FastAPI and Litestar on pure throughput — over 100k requests per second on a simple JSON endpoint, with Django's ORM and ecosystem fully available. The framework is not done. The serialization layer needs work, the testing story needs work, and signals are still a tax on every request. But the core is solid: Actix Web handles HTTP, PyO3 bridges to Python with minimal GIL time, and Django handles what Django is good at.
+
+The biggest technical lessons have not been about Rust or Python individually — they have been about the boundary between them. Every millisecond of improvement came from pushing more work to one side of that boundary or the other, and from being very careful about what crosses it and when.
+
+If you are building something performance-critical on Python, I hope this story is useful. Measure everything. Distrust AI when it tells you something is a hard limitation. And run benchmarks after refactors, not just tests.

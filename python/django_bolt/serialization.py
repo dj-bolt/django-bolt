@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
+import inspect
 import mimetypes
-from typing import TYPE_CHECKING, Any, Literal
+import types
+from collections.abc import (
+    AsyncGenerator as AsyncGeneratorABC,
+    AsyncIterable as AsyncIterableABC,
+    AsyncIterator as AsyncIteratorABC,
+    Generator as GeneratorABC,
+    Iterable as IterableABC,
+    Iterator as IteratorABC,
+)
+from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 
 import msgspec
 from asgiref.sync import sync_to_async
@@ -99,6 +109,16 @@ _RESPONSE_META_JSON = _build_response_meta("json", None, None)
 _RESPONSE_META_PLAINTEXT = _build_response_meta("plaintext", None, None)
 _RESPONSE_META_OCTETSTREAM = _build_response_meta("octetstream", None, None)
 _RESPONSE_META_EMPTY = _build_response_meta("empty", None, None)
+_TYPED_STREAM_MEDIA_TYPE = "application/x-ndjson"
+_RAW_STREAM_CHUNK_TYPES = (bytes, bytearray, memoryview, str)
+_STREAM_ANNOTATION_ORIGINS = {
+    AsyncIterableABC,
+    AsyncIteratorABC,
+    AsyncGeneratorABC,
+    IterableABC,
+    IteratorABC,
+    GeneratorABC,
+}
 
 
 def _convert_serializers(result: Any) -> Any:
@@ -127,6 +147,110 @@ def _convert_serializers(result: Any) -> Any:
             return [item.dump() for item in result]
 
     return result
+
+
+def _extract_stream_item_type(annotation: Any) -> tuple[bool, Any | None]:
+    """Return (is_stream_annotation, item_type) for streaming return annotations."""
+    if annotation is None:
+        return False, None
+
+    if annotation in _STREAM_ANNOTATION_ORIGINS:
+        return True, None
+
+    origin = get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        for arg in get_args(annotation):
+            if arg is type(None):
+                continue
+            is_stream, item_type = _extract_stream_item_type(arg)
+            if is_stream:
+                return True, item_type
+        return False, None
+
+    if origin in _STREAM_ANNOTATION_ORIGINS:
+        args = get_args(annotation)
+        return True, args[0] if args else None
+
+    return False, None
+
+
+def _is_stream_protocol_instance(value: Any) -> bool:
+    """Check if a runtime value can be consumed as a stream."""
+    if isinstance(value, (str, bytes, bytearray, memoryview, dict, list, tuple, set, frozenset, QuerySet)):
+        return False
+    return hasattr(value, "__aiter__") or hasattr(value, "__anext__") or hasattr(value, "__iter__") or hasattr(
+        value, "__next__"
+    )
+
+
+def _serialize_stream_chunk_sync(chunk: Any, item_type: Any | None, meta: HandlerMetadata) -> bytes | str | bytearray | memoryview:
+    """Serialize one stream chunk for sync generators."""
+    if isinstance(chunk, _RAW_STREAM_CHUNK_TYPES):
+        return chunk
+
+    chunk = _convert_serializers(chunk)
+    if item_type is not None:
+        chunk = coerce_to_response_type(chunk, item_type, meta=meta)
+    return _json.encode(chunk) + b"\n"
+
+
+async def _serialize_stream_chunk_async(
+    chunk: Any, item_type: Any | None, meta: HandlerMetadata
+) -> bytes | str | bytearray | memoryview:
+    """Serialize one stream chunk for async generators."""
+    if isinstance(chunk, _RAW_STREAM_CHUNK_TYPES):
+        return chunk
+
+    chunk = _convert_serializers(chunk)
+    if item_type is not None:
+        chunk = await coerce_to_response_type_async(chunk, item_type, meta=meta)
+    return _json.encode(chunk) + b"\n"
+
+
+def _wrap_sync_stream_chunks(content: Any, item_type: Any | None, meta: HandlerMetadata):
+    for chunk in content:
+        yield _serialize_stream_chunk_sync(chunk, item_type, meta)
+
+
+async def _wrap_async_stream_chunks(content: Any, item_type: Any | None, meta: HandlerMetadata):
+    async for chunk in content:
+        yield await _serialize_stream_chunk_async(chunk, item_type, meta)
+
+
+def _to_stream_wire(stream_response: StreamingResponse) -> ResponseWireV1:
+    custom_headers: dict[str, str] = {"content-type": stream_response.media_type}
+    if stream_response.headers:
+        custom_headers.update(stream_response.headers)
+    cookies = getattr(stream_response, "_cookies", None)
+    resp_meta = _build_response_meta("streaming", custom_headers, cookies)
+    return _wire_stream(stream_response.status_code, resp_meta, stream_response)
+
+
+def _build_auto_streaming_response(
+    result: Any,
+    stream_info: tuple[bool, Any | None],
+    meta: HandlerMetadata,
+    status_code: int,
+) -> StreamingResponse | None:
+    """Auto-wrap generator/iterator return values into StreamingResponse."""
+    is_stream_annotation, item_type = stream_info
+    is_async_gen = inspect.isasyncgen(result)
+    is_generator_result = is_async_gen or inspect.isgenerator(result)
+
+    if not is_generator_result and not (is_stream_annotation and _is_stream_protocol_instance(result)):
+        return None
+
+    needs_json_chunk_encoding = is_stream_annotation and item_type is not None and item_type not in _RAW_STREAM_CHUNK_TYPES
+    if needs_json_chunk_encoding:
+        is_async_stream = is_async_gen or hasattr(result, "__aiter__")
+        content = (
+            _wrap_async_stream_chunks(result, item_type, meta)
+            if is_async_stream
+            else _wrap_sync_stream_chunks(result, item_type, meta)
+        )
+        return StreamingResponse(content, status_code=status_code, media_type=_TYPED_STREAM_MEDIA_TYPE)
+
+    return StreamingResponse(result, status_code=status_code)
 
 
 def _resolve_response_type(status_code: int, meta: HandlerMetadata) -> tuple[Any, HandlerMetadata]:
@@ -160,12 +284,12 @@ def _dispatch_non_json_type(
     if isinstance(result, JSON):
         return None  # JSON needs async/sync-specific handling
     if isinstance(result, StreamingResponse):
-        custom_headers: dict[str, str] = {"content-type": result.media_type}
-        if result.headers:
-            custom_headers.update(result.headers)
-        cookies = getattr(result, "_cookies", None)
-        resp_meta = _build_response_meta("streaming", custom_headers, cookies)
-        return _wire_stream(result.status_code, resp_meta, result)
+        return _to_stream_wire(result)
+
+    auto_stream = _build_auto_streaming_response(result, meta["_stream_info"], meta, status_code)
+    if auto_stream is not None:
+        return _to_stream_wire(auto_stream)
+
     if isinstance(result, PlainText):
         return serialize_plaintext_response(result)
     if isinstance(result, HTML):

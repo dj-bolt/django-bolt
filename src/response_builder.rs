@@ -2,6 +2,7 @@
 ///
 /// Reduces the number of mutations on HttpResponse::Builder
 /// by batching operations and pre-allocating capacity.
+use actix_web::body::MessageBody;
 use actix_web::http::header::{HeaderName, HeaderValue};
 use actix_web::{http::StatusCode, HttpResponse, HttpResponseBuilder};
 
@@ -99,12 +100,15 @@ pub fn meta_to_headers(meta: &ResponseMeta) -> Vec<(String, String)> {
 /// - Custom headers with keys lowercased in Rust (single location)
 /// - Cookies serialized directly in Rust (replaces SimpleCookie)
 #[inline]
-pub fn build_response_from_meta(
+pub fn build_response_from_meta<B>(
     status: StatusCode,
     meta: ResponseMeta,
-    body: Vec<u8>,
+    body: B,
     skip_compression: bool,
-) -> HttpResponse {
+) -> HttpResponse
+where
+    B: MessageBody + 'static,
+{
     let mut builder = HttpResponse::build(status);
 
     // 1. Content-Type: use custom or derive from response_type

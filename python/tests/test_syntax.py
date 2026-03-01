@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from collections.abc import AsyncIterable
 from typing import Annotated
 
 import msgspec
@@ -228,6 +229,15 @@ def api():
             yield memoryview(b"memoryview-chunk\n")
 
         return StreamingResponse(async_gen(), media_type="text/plain")
+
+    @api.get("/stream-items-typed")
+    async def stream_items_typed() -> AsyncIterable[Item]:
+        async def gen():
+            for i in range(3):
+                await asyncio.sleep(0.001)
+                yield Item(name=f"item-{i}", price=float(i), is_offer=(i % 2 == 0))
+
+        return gen()
 
     @api.get("/stream-async-error")
     async def stream_async_error():
@@ -570,6 +580,20 @@ def test_streaming_async_mixed_types(client):
 
     for expected in expected_chunks:
         assert expected in text
+
+
+def test_streaming_typed_async_iterable_ndjson(client):
+    response = client.get("/stream-items-typed")
+    assert response.status_code == 200
+    assert response.headers.get("content-type", "").startswith("application/x-ndjson")
+
+    lines = [line for line in response.content.splitlines() if line]
+    assert len(lines) == 3
+    payload = [json.loads(line) for line in lines]
+
+    assert payload[0] == {"name": "item-0", "price": 0.0, "is_offer": True}
+    assert payload[1] == {"name": "item-1", "price": 1.0, "is_offer": False}
+    assert payload[2] == {"name": "item-2", "price": 2.0, "is_offer": True}
 
 
 def test_streaming_async_vs_sync_compatibility(client):

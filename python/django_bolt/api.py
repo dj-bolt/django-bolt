@@ -63,6 +63,7 @@ from .serialization import (
     _RESPONSE_META_EMPTY,
     ResponseWireV1,
     _convert_serializers,
+    _extract_stream_item_type,
     _wire_bytes,
     serialize_json_data,
     serialize_json_data_sync,
@@ -1172,6 +1173,8 @@ class BoltAPI:
                 meta.update(response_meta)
             else:
                 meta["response_type"] = None
+            # Pre-compute stream annotation analysis (registration time only)
+            meta["_stream_info"] = _extract_stream_item_type(meta["response_type"])
 
             # If handler is paginated, extract and store the item serializer
             # This enables @paginate to use Serializer.dump_many() for efficient serialization
@@ -1210,6 +1213,7 @@ class BoltAPI:
                     entry: dict = {
                         "response_type": resp_type,
                         "default_status_code": code if isinstance(code, int) else handler_default_status,
+                        "_stream_info": _extract_stream_item_type(resp_type),
                     }
                     if code in field_names_map:
                         entry["response_field_names"] = field_names_map[code]

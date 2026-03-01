@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use futures_util::StreamExt;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::collections::HashMap;
@@ -357,6 +358,9 @@ pub fn form_result_to_py(
 
 enum ResponseWireBody {
     Bytes(Vec<u8>),
+    /// Zero-copy path: PyBackedBytes holds a reference to the Python bytes object.
+    /// bytes::Bytes::from_owner wraps it directly — no memcpy at any point.
+    ZeroCopyBytes(PyBackedBytes),
     FilePath(String),
     Stream {
         media_type: String,
@@ -383,7 +387,7 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
     let status_code: u16 = tuple.get_item(0)?.extract()?;
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
     let meta = ResponseMeta::from_python(&tuple.get_item(1)?)?;
-    // body_kind is an integer tag: 0=bytes, 1=file, 2=stream (avoids String alloc per response)
+    // body_kind is an integer tag: 0=bytes, 1=stream, 2=file (avoids String alloc per response)
     let body_kind: u8 = tuple.get_item(2)?.extract()?;
     let payload = tuple.get_item(3)?;
 
@@ -391,10 +395,12 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
     //   0 = bytes, 1 = stream, 2 = file
     let body = match body_kind {
         0 => {
-            // bytes
-            if let Ok(py_bytes) = payload.cast::<PyBytes>() {
-                ResponseWireBody::Bytes(py_bytes.as_bytes().to_vec())
+            // Zero-copy path: PyBackedBytes holds a Python reference + slice pointer.
+            // No memcpy here. bytes::Bytes::from_owner (outside GIL) wraps it directly.
+            if let Ok(backed) = payload.extract::<PyBackedBytes>() {
+                ResponseWireBody::ZeroCopyBytes(backed)
             } else {
+                // Fallback for non-bytes payloads (uncommon).
                 ResponseWireBody::Bytes(payload.extract::<Vec<u8>>()?)
             }
         }
@@ -462,6 +468,25 @@ pub async fn response_from_wire_result(
                 parsed.status,
                 parsed.meta,
                 response_body,
+                skip_compression,
+            );
+            mark_skip_cors(&mut response, skip_cors);
+            Ok(response)
+        }
+        ResponseWireBody::ZeroCopyBytes(backed) => {
+            // GIL already released. Wrap PyBackedBytes directly into bytes::Bytes —
+            // no memcpy at any point. The Python object stays alive until Actix is done
+            // sending, then PyO3's deferred-drop queue decrements the refcount.
+            let body = if is_head_request {
+                drop(backed);
+                Bytes::new()
+            } else {
+                Bytes::from_owner(backed)
+            };
+            let mut response = response_builder::build_response_from_meta(
+                parsed.status,
+                parsed.meta,
+                body,
                 skip_compression,
             );
             mark_skip_cors(&mut response, skip_cors);

@@ -69,37 +69,37 @@ DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host 
 SERVER_PID=$!
 wait_for_server
 
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/ 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/ 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "## 10kb JSON Response Performance"
 
 printf "### 10kb JSON (Async) (/10k-json)\n"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/10k-json 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/10k-json 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 printf "### 10kb JSON (Sync) (/sync-10k-json)\n"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/sync-10k-json 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/sync-10k-json 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "## Response Type Endpoints"
 
 printf "### Header Endpoint (/header)\n"
-$BOMBARDIER_BIN -c $C -n $N -l -H 'x-test: val' http://$HOST:$PORT/header 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -H 'x-test: val' http://$HOST:$PORT/header 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 printf "### Cookie Endpoint (/cookie)\n"
-$BOMBARDIER_BIN -c $C -n $N -l -H 'Cookie: session=abc' http://$HOST:$PORT/cookie 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -H 'Cookie: session=abc' http://$HOST:$PORT/cookie 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 printf "### Exception Endpoint (/exc)\n"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/exc 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/exc 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 printf "### HTML Response (/html)\n"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/html 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/html 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 printf "### Redirect Response (/redirect)\n"
-$BOMBARDIER_BIN -c $C -n $N -l --no-redirect http://$HOST:$PORT/redirect 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l --no-redirect http://$HOST:$PORT/redirect 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 printf "### File Static via FileResponse (/file-static)\n"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/file-static 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/file-static 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "## Authentication & Authorization Performance"
@@ -150,16 +150,16 @@ if [ -n "$TOKEN" ] && [ ${#TOKEN} -gt 50 ]; then
     AUTH_HEADER="Authorization: Bearer $TOKEN"
 
     printf "### Auth NO User Access (/auth/no-user-access) - lazy loading, no DB query\n"
-    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/no-user-access 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/no-user-access 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
     printf "### Get Authenticated User (/auth/me) - accesses request.user, triggers DB query\n"
-    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/me 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/me 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
     printf "### Get User via Dependency (/auth/me-dependency)\n"
-    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/me-dependency 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/me-dependency 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
     printf "### Get Auth Context (/auth/context) validated jwt no db\n"
-    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/context 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/context 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 else
     echo "Skipped auth benchmarks: Could not generate JWT token"
 fi
@@ -167,7 +167,7 @@ fi
 # Additional endpoint: GET /items/{item_id}
 echo ""
 echo "## Items GET Performance (/items/1?q=hello)"
-$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/items/1?q=hello" 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/items/1?q=hello" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 # Additional endpoint: PUT /items/{item_id} with JSON body
 echo ""
@@ -180,7 +180,7 @@ PCODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: applicat
 if [ "$PCODE" != "200" ]; then
   echo "Expected 200 from PUT /items/1 but got $PCODE; skipping Items PUT benchmark." >&2
 else
-  $BOMBARDIER_BIN -c $C -n $N -l -m PUT -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/items/1 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+  $BOMBARDIER_BIN -c $C -n $N -l -m PUT -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/items/1 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 fi
 rm -f "$BODY_FILE"
 
@@ -224,16 +224,16 @@ else
 fi
 
 echo "### Users Full10 (Async) (/users/full10)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/full10 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/full10 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo "### Users Full10 (Sync) (/users/sync-full10)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/sync-full10 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/sync-full10 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo "### Users Mini10 (Async) (/users/mini10)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/mini10 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/mini10 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo "### Users Mini10 (Sync) (/users/sync-mini10)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/sync-mini10 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/sync-mini10 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 # Clean up: delete all users
 echo "Cleaning up test users..."
@@ -250,16 +250,16 @@ SERVER_PID=$!
 wait_for_server
 
 echo "### Simple APIView GET (/cbv-simple)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-simple 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-simple 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo "### Simple APIView POST (/cbv-simple)"
 BODY_FILE=$(mktemp)
 echo '{"name":"bench","price":1.23,"is_offer":true}' > "$BODY_FILE"
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/cbv-simple 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/cbv-simple 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$BODY_FILE"
 
 echo "### Items100 ViewSet GET (/cbv-items100)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-items100 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-items100 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "## CBV Items - Basic Operations"
@@ -267,7 +267,7 @@ echo "## CBV Items - Basic Operations"
 echo "### CBV Items GET (Retrieve) (/cbv-items/1)"
 GCODE=$(curl -s -o /dev/null -w '%{http_code}' "http://$HOST:$PORT/cbv-items/1?q=test")
 if [ "$GCODE" = "200" ]; then
-  $BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/cbv-items/1?q=test" 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+  $BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/cbv-items/1?q=test" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 else
   echo "Skipped: CBV Items GET returned $GCODE" >&2
 fi
@@ -277,7 +277,7 @@ BODY_FILE=$(mktemp)
 echo '{"name":"updated-item","price":79.99,"is_offer":true}' > "$BODY_FILE"
 PCODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' --data-binary @"$BODY_FILE" http://$HOST:$PORT/cbv-items/1)
 if [ "$PCODE" = "200" ]; then
-  $BOMBARDIER_BIN -c $C -n $N -l -m PUT -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/cbv-items/1 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+  $BOMBARDIER_BIN -c $C -n $N -l -m PUT -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/cbv-items/1 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 else
   echo "Skipped: CBV Items PUT returned $PCODE" >&2
 fi
@@ -297,11 +297,11 @@ cat > "$BODY_FILE" << 'JSON'
   ]
 }
 JSON
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/cbv-bench-parse 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/cbv-bench-parse 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$BODY_FILE"
 
 echo "### CBV Response Types (/cbv-response)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-response 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-response 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 # ORM endpoints with CBV
 echo ""
@@ -331,7 +331,7 @@ if [ "$UCODE" != "200" ]; then
   echo "Expected 200 from /users/cbv-mini10 but got $UCODE; skipping CBV ORM benchmark." >&2
 else
   echo "### Users CBV Mini10 (List) (/users/cbv-mini10)"
-  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/cbv-mini10 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/cbv-mini10 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 fi
 
 # Clean up: delete all users
@@ -355,7 +355,7 @@ echo "### Form Data (POST /form)"
 # Create form data
 FORM_FILE=$(mktemp)
 echo "name=TestUser&age=25&email=test%40example.com" > "$FORM_FILE"
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/x-www-form-urlencoded' -f "$FORM_FILE" http://$HOST:$PORT/form 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/x-www-form-urlencoded' -f "$FORM_FILE" http://$HOST:$PORT/form 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$FORM_FILE"
 
 echo "### File Upload (POST /upload)"
@@ -374,7 +374,7 @@ printf "Content-Type: text/plain\r\n" >> "$UPLOAD_FILE"
 printf "\r\n" >> "$UPLOAD_FILE"
 printf "This is test file content 2\r\n" >> "$UPLOAD_FILE"
 printf -- "--%s--\r\n" "$BOUNDARY" >> "$UPLOAD_FILE"
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$UPLOAD_FILE" http://$HOST:$PORT/upload 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$UPLOAD_FILE" http://$HOST:$PORT/upload 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$UPLOAD_FILE"
 
 # Mixed form with files benchmark
@@ -396,7 +396,7 @@ printf "Content-Type: text/plain\r\n" >> "$MIXED_FILE"
 printf "\r\n" >> "$MIXED_FILE"
 printf "File attachment content\r\n" >> "$MIXED_FILE"
 printf -- "--%s--\r\n" "$BOUNDARY" >> "$MIXED_FILE"
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$MIXED_FILE" http://$HOST:$PORT/mixed-form 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$MIXED_FILE" http://$HOST:$PORT/mixed-form 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$MIXED_FILE"
 
 kill -TERM -$SERVER_PID 2>/dev/null || true
@@ -417,7 +417,7 @@ if [ "$MCODE" != "200" ]; then
 else
   echo "### Django Middleware + Messages Framework (/middleware/demo)"
   echo "Tests: SessionMiddleware, AuthenticationMiddleware, MessageMiddleware, custom middleware, template rendering"
-  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/middleware/demo 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/middleware/demo 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 fi
 
 kill -TERM -$SERVER_PID 2>/dev/null || true
@@ -450,7 +450,7 @@ PCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/)
 if [ "$PCODE" != "200" ]; then
   echo "Expected 200 from / before parse test but got $PCODE; skipping." >&2
 else
-  $BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/bench/parse 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+  $BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/bench/parse 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 fi
 rm -f "$BODY_FILE"
 
@@ -469,7 +469,7 @@ cat > "$SERIALIZER_RAW" << 'JSON'
 JSON
 
 echo "### Raw msgspec Serializer (POST /bench/serializer-raw)"
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$SERIALIZER_RAW" http://$HOST:$PORT/bench/serializer-raw 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$SERIALIZER_RAW" http://$HOST:$PORT/bench/serializer-raw 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$SERIALIZER_RAW"
 
 # Test with custom validators
@@ -484,7 +484,7 @@ cat > "$SERIALIZER_VALIDATED" << 'JSON'
 JSON
 
 echo "### Django-Bolt Serializer with Validators (POST /bench/serializer-validated)"
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$SERIALIZER_VALIDATED" http://$HOST:$PORT/bench/serializer-validated 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$SERIALIZER_VALIDATED" http://$HOST:$PORT/bench/serializer-validated 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$SERIALIZER_VALIDATED"
 
 # Test users endpoint with raw msgspec
@@ -501,7 +501,7 @@ JSON
 echo "### Users msgspec Serializer (POST /users/bench/msgspec)"
 USCODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary @"$USER_BENCH" http://$HOST:$PORT/users/bench/msgspec)
 if [ "$USCODE" = "200" ]; then
-  $BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$USER_BENCH" http://$HOST:$PORT/users/bench/msgspec 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+  $BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$USER_BENCH" http://$HOST:$PORT/users/bench/msgspec 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 else
   echo "Skipped: Users msgspec endpoint returned $USCODE" >&2
 fi
@@ -512,11 +512,11 @@ echo "## Multi-Response Performance"
 
 echo ""
 echo "### Multi-response tuple return (/bench/multi/tuple)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/tuple 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/tuple 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "### Multi-response bare dict (/bench/multi/dict)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/dict 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/dict 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 kill -TERM -$SERVER_PID 2>/dev/null || true
 pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
@@ -532,28 +532,28 @@ wait_for_server
 
 echo ""
 echo "### Baseline - No Parameters (/)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/ 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/ 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "### Path Parameter - int (/items/12345)"
-$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/items/12345" 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/items/12345" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "### Path + Query Parameters (/items/12345?q=hello)"
-$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/items/12345?q=hello" 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/items/12345?q=hello" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "### Header Parameter (/header)"
-$BOMBARDIER_BIN -c $C -n $N -l -H "x-test: testvalue" http://$HOST:$PORT/header 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -H "x-test: testvalue" http://$HOST:$PORT/header 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "### Cookie Parameter (/cookie)"
-$BOMBARDIER_BIN -c $C -n $N -l -H "Cookie: session=abc123" http://$HOST:$PORT/cookie 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+$BOMBARDIER_BIN -c $C -n $N -l -H "Cookie: session=abc123" http://$HOST:$PORT/cookie 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "### Auth Context - JWT validated, no DB (/auth/context)"
 if [ -n "$TOKEN" ] && [ ${#TOKEN} -gt 50 ]; then
-    $BOMBARDIER_BIN -c $C -n $N -l -H "Authorization: Bearer $TOKEN" http://$HOST:$PORT/auth/context 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+    $BOMBARDIER_BIN -c $C -n $N -l -H "Authorization: Bearer $TOKEN" http://$HOST:$PORT/auth/context 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 else
     echo "Skipped: No valid JWT token"
 fi
