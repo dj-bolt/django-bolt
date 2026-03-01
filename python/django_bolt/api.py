@@ -56,8 +56,20 @@ from .openapi import (
 from .openapi.routes import OpenAPIRouteRegistrar
 from .openapi.schema_generator import SchemaGenerator
 from .pagination import extract_pagination_item_type
+from .responses import JSON as _JSONResponse
 from .router import Router
-from .serialization import _BODY_BYTES, ResponseWireV1, serialize_response, serialize_response_sync
+from .serialization import (
+    _BODY_BYTES,
+    _RESPONSE_META_EMPTY,
+    ResponseWireV1,
+    _convert_serializers,
+    _wire_bytes,
+    serialize_json_data,
+    serialize_json_data_sync,
+    serialize_json_response,
+    serialize_response,
+    serialize_response_sync,
+)
 from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata
 from .views import APIView, ViewSet
@@ -1101,11 +1113,52 @@ class BoltAPI:
             # 1. response_model parameter (explicit, takes precedence)
             # 2. sig.return_annotation (fallback if response_model not provided)
             final_response_type = None
+            # Initialized here to avoid unbound variable risk in the default_status_code
+            # assignment below when is_multi_response=True.
+            effective_status: int | None = None
+            default_code: int = 0
             if response_model is not None:
-                # Explicit response_model provided - use it (ignore annotation)
-                final_response_type = response_model
+                if isinstance(response_model, dict):
+                    # Dict mode: per-status-code response schemas
+                    int_codes = sorted(c for c in response_model if isinstance(c, int))
+                    if not int_codes:
+                        raise ValueError(
+                            "response_model dict must contain at least one integer "
+                            "status code key (e.g. {200: Schema, ...: Fallback})"
+                        )
+
+                    meta["is_multi_response"] = True
+                    meta["response_map"] = response_model
+
+                    # Pre-compute field names for each code's type
+                    field_names_map = {}
+                    for code, resp_type in response_model.items():
+                        if resp_type is not None and code is not ...:
+                            resp_meta = extract_response_metadata(resp_type)
+                            if "response_field_names" in resp_meta:
+                                field_names_map[code] = resp_meta["response_field_names"]
+                    if field_names_map:
+                        meta["response_field_names_map"] = field_names_map
+
+                    # Determine effective default status code
+                    effective_status = status_code
+                    if effective_status is None:
+                        success_codes = [c for c in int_codes if 200 <= c < 300]
+                        if success_codes:
+                            effective_status = success_codes[0]
+
+                    # Set response_type to default code's type (backward compat)
+                    default_code = effective_status if effective_status is not None else int_codes[0]
+                    default_type = response_model.get(default_code)
+                    if default_type is not None:
+                        final_response_type = default_type
+                else:
+                    # Single type (existing behavior, unchanged)
+                    meta["is_multi_response"] = False
+                    final_response_type = response_model
             else:
                 # No response_model - check for return annotation
+                meta["is_multi_response"] = False
                 # Need to resolve string annotations (from __future__ import annotations)
                 globalns = sys.modules.get(fn.__module__, {}).__dict__ if fn.__module__ else {}
                 type_hints = get_type_hints(fn, globalns=globalns, include_extras=True)
@@ -1132,7 +1185,10 @@ class BoltAPI:
                         original.__serializer_class__ = item_type
 
             # Guarantee all keys exist at registration time for direct access
-            meta["default_status_code"] = int(status_code) if status_code is not None else 200
+            if meta["is_multi_response"]:
+                meta["default_status_code"] = int(effective_status) if effective_status is not None else default_code
+            else:
+                meta["default_status_code"] = int(status_code) if status_code is not None else 200
             # Store OpenAPI metadata
             if tags is not None:
                 meta["openapi_tags"] = tags
@@ -1140,6 +1196,25 @@ class BoltAPI:
                 meta["openapi_summary"] = summary
             if description is not None:
                 meta["openapi_description"] = description
+
+            # Pre-compute per-status-code mini-metas at registration time.
+            # Only store the 3-4 keys actually read by the serialization hot path,
+            # avoiding a full dict(meta) copy (~25 keys) per status code entry.
+            # Keys needed: response_type, default_status_code, is_multi_response,
+            # and optionally response_field_names (for QuerySet .values() optimisation).
+            if meta["is_multi_response"]:
+                resolved_metas: dict[int | type(...), dict] = {}
+                field_names_map = meta.get("response_field_names_map", {})
+                handler_default_status = meta["default_status_code"]
+                for code, resp_type in meta["response_map"].items():
+                    entry: dict = {
+                        "response_type": resp_type,
+                        "default_status_code": code if isinstance(code, int) else handler_default_status,
+                    }
+                    if code in field_names_map:
+                        entry["response_field_names"] = field_names_map[code]
+                    resolved_metas[code] = entry
+                meta["_resolved_metas"] = resolved_metas
 
             # Compile optimized argument injector (once at registration time)
             # This pre-compiles all parameter extraction logic for maximum performance
@@ -1231,12 +1306,102 @@ class BoltAPI:
         injector_is_async = meta["injector_is_async"]
 
         # Pre-compute at registration time: can Rust ever pre-bind args into request.state?
-        # Only true for simple path/query/header/cookie params with required scalar types.
         # When False, we skip the state.setdefault + 2 pop calls on every request.
         has_rust_prebound = bool(_compile_rust_arg_bindings(meta))
 
-        # Fast path: async no-params handler without rust-prebound args (most common benchmark pattern).
-        # Eliminates: state.setdefault, 2×state.pop, has_prebound check, injector call, *args/**kwargs unpack.
+        # Multi-response: specialize the executor at registration time so that the
+        # is_multi branching never touches the hot path of normal (single-schema) routes.
+        if meta.get("is_multi_response"):
+            resolved_metas = meta["_resolved_metas"]
+            default_status = meta["default_status_code"]
+            default_entry = resolved_metas.get(default_status) or next(iter(resolved_metas.values()))
+
+            def _lookup(code: int) -> dict:
+                entry = resolved_metas.get(code)
+                if entry is None:
+                    entry = resolved_metas.get(...)  # ellipsis catch-all
+                if entry is None:
+                    defined = sorted(c for c in resolved_metas if c is not ...)
+                    raise TypeError(
+                        f"Status {code} has no response schema. Defined: {defined}"
+                    )
+                return entry
+
+            async def _dispatch_multi_async(result: Any) -> ResponseWireV1:
+                # Tuple (status, data): the primary multi-response return pattern.
+                if isinstance(result, tuple) and len(result) == 2:
+                    code, data = result
+                    if isinstance(code, int):
+                        entry = _lookup(code)
+                        response_type = entry["response_type"]
+                        if response_type is None or data is None:
+                            return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
+                        if isinstance(data, (dict, list)):
+                            if isinstance(data, list):
+                                data = _convert_serializers(data)
+                            return await serialize_json_data(data, response_type, entry, status_code=code)
+                        # Non-dict/list: adjust status code if entry is a shared ellipsis entry.
+                        if entry["default_status_code"] != code:
+                            entry = {**entry, "default_status_code": code}
+                        return await serialize_response(data, entry)
+
+                # JSON() with explicit status: pick schema by its status_code.
+                if isinstance(result, _JSONResponse):
+                    entry = resolved_metas.get(result.status_code) or resolved_metas.get(...)
+                    if entry is not None:
+                        return await serialize_json_response(result, entry["response_type"], entry)
+
+                # Bare dict/list or any other type: use the default status schema.
+                return await serialize_response(result, default_entry)
+
+            def _dispatch_multi_sync(result: Any) -> ResponseWireV1:
+                if isinstance(result, tuple) and len(result) == 2:
+                    code, data = result
+                    if isinstance(code, int):
+                        entry = _lookup(code)
+                        response_type = entry["response_type"]
+                        if response_type is None or data is None:
+                            return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
+                        if isinstance(data, (dict, list)):
+                            if isinstance(data, list):
+                                data = _convert_serializers(data)
+                            return serialize_json_data_sync(data, response_type, entry, status_code=code)
+                        if entry["default_status_code"] != code:
+                            entry = {**entry, "default_status_code": code}
+                        return serialize_response_sync(data, entry)
+
+                # JSON() with explicit status: pick schema by its status_code.
+                if isinstance(result, _JSONResponse):
+                    entry = resolved_metas.get(result.status_code) or resolved_metas.get(...)
+                    if entry is not None:
+                        return serialize_response_sync(result, entry)
+
+                return serialize_response_sync(result, default_entry)
+
+            async def execute_multi(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                request_state = request.setdefault("state", {})
+                prebound_args = request_state.pop("_bolt_prebound_args", None)
+                prebound_kwargs = request_state.pop("_bolt_prebound_kwargs", None)
+                has_prebound = prebound_args is not None and prebound_kwargs is not None
+
+                if has_prebound:
+                    args, kwargs = prebound_args, prebound_kwargs
+                elif injector_is_async:
+                    args, kwargs = await injector(request)
+                else:
+                    args, kwargs = injector(request)
+
+                if is_async:
+                    return await _dispatch_multi_async(await handler(*args, **kwargs))
+                if is_blocking:
+                    result = await sync_to_thread(handler, *args, **kwargs)
+                    return await sync_to_thread(_dispatch_multi_sync, result)
+                return _dispatch_multi_sync(handler(*args, **kwargs))
+
+            return execute_multi
+
+        # Fast path: async handler without rust-prebound args (most common pattern).
+        # Eliminates: state.setdefault, 2×state.pop, has_prebound check.
         if mode != "request_only" and is_async and not is_blocking and not has_rust_prebound and not injector_is_async:
             async def execute_async_no_prebound(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
                 args, kwargs = injector(request)

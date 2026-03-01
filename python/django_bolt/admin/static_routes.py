@@ -118,6 +118,7 @@ class StaticRouteRegistrar:
         # Guarantee all required metadata keys exist (same as _route_decorator).
         # Without these, _dispatch will KeyError on the hot path.
         meta["response_type"] = None
+        meta["is_multi_response"] = False
         meta["default_status_code"] = 200
         meta["_router_middleware"] = []
         meta["_route_middleware"] = []

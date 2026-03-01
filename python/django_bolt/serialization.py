@@ -129,8 +129,28 @@ def _convert_serializers(result: Any) -> Any:
     return result
 
 
+def _resolve_response_type(status_code: int, meta: HandlerMetadata) -> tuple[Any, HandlerMetadata]:
+    """Resolve the response type for a status code in multi-response mode.
+
+    Returns a pre-built meta dict with the resolved ``response_type``.
+    """
+    resolved_metas = meta["_resolved_metas"]
+    if status_code in resolved_metas:
+        resolved_meta = resolved_metas[status_code]
+    elif ... in resolved_metas:
+        resolved_meta = resolved_metas[...]
+    else:
+        response_map = meta["response_map"]
+        raise TypeError(
+            f"Status {status_code} has no response schema. "
+            f"Defined: {sorted(c for c in response_map if c is not ...)}"
+        )
+
+    return resolved_meta["response_type"], resolved_meta
+
+
 def _dispatch_non_json_type(
-    result: Any, response_tp: Any | None, meta: HandlerMetadata, status_code: int
+    result: Any, response_type: Any | None, meta: HandlerMetadata, status_code: int
 ) -> ResponseWireV1 | None:
     """Shared type dispatch for non-dict/list response types.
 
@@ -175,7 +195,7 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
     """Serialize handler result to HTTP response."""
     # Direct access -- keys guaranteed at registration time
     status_code = meta["default_status_code"]
-    response_tp = meta["response_type"]
+    response_type = meta["response_type"]
 
     # Handle 204 No Content
     if result is None and status_code == 204:
@@ -183,10 +203,10 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
 
     # Fast path: dict/list are the most common response types (90%+ of handlers)
     if isinstance(result, dict):
-        return await serialize_json_data(result, response_tp, meta)
+        return await serialize_json_data(result, response_type, meta)
     if isinstance(result, list):
         result = _convert_serializers(result)
-        return await serialize_json_data(result, response_tp, meta)
+        return await serialize_json_data(result, response_type, meta)
 
     # Convert Serializer instances to dicts (handles write_only, computed_field)
     original = result
@@ -194,23 +214,23 @@ async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWire
 
     # If _convert_serializers changed the value, it IS dict/list -- skip isinstance re-check
     if result is not original:
-        return await serialize_json_data(result, response_tp, meta)
+        return await serialize_json_data(result, response_type, meta)
 
     # Try shared dispatch first (handles most non-JSON types)
-    shared_result = _dispatch_non_json_type(result, response_tp, meta, status_code)
+    shared_result = _dispatch_non_json_type(result, response_type, meta, status_code)
     if shared_result is not None:
         return shared_result
 
     # Async-specific handling for types that need await
     if isinstance(result, JSON):
-        return await serialize_json_response(result, response_tp, meta)
+        return await serialize_json_response(result, response_type, meta)
     if isinstance(result, ResponseClass):
-        return await serialize_generic_response(result, response_tp, meta)
+        return await serialize_generic_response(result, response_type, meta)
     if isinstance(result, msgspec.Struct):
-        return await serialize_json_data(result, response_tp, meta)
+        return await serialize_json_data(result, response_type, meta)
     if isinstance(result, QuerySet):
         result_list = await sync_to_async(list, thread_sensitive=True)(result)
-        return await serialize_json_data(result_list, response_tp, meta)
+        return await serialize_json_data(result_list, response_type, meta)
 
     raise TypeError(
         f"Handler returned unsupported type {type(result).__name__!r}. "
@@ -222,7 +242,7 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
     """Serialize handler result to HTTP response (sync version for sync handlers)."""
     # Direct access -- keys guaranteed at registration time
     status_code = meta["default_status_code"]
-    response_tp = meta["response_type"]
+    response_type = meta["response_type"]
 
     # Handle 204 No Content
     if result is None and status_code == 204:
@@ -230,10 +250,10 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
 
     # Fast path: dict/list are the most common response types (90%+ of handlers)
     if isinstance(result, dict):
-        return serialize_json_data_sync(result, response_tp, meta)
+        return serialize_json_data_sync(result, response_type, meta)
     if isinstance(result, list):
         result = _convert_serializers(result)
-        return serialize_json_data_sync(result, response_tp, meta)
+        return serialize_json_data_sync(result, response_type, meta)
 
     # Convert Serializer instances
     original = result
@@ -241,18 +261,18 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
 
     # If _convert_serializers changed the value, skip isinstance re-check
     if result is not original:
-        return serialize_json_data_sync(result, response_tp, meta)
+        return serialize_json_data_sync(result, response_type, meta)
 
     # Try shared dispatch first (handles most non-JSON types)
-    shared_result = _dispatch_non_json_type(result, response_tp, meta, status_code)
+    shared_result = _dispatch_non_json_type(result, response_type, meta, status_code)
     if shared_result is not None:
         return shared_result
 
     # Sync-specific handling
     if isinstance(result, JSON):
-        if response_tp is not None:
+        if response_type is not None:
             try:
-                validated = coerce_to_response_type(result.data, response_tp, meta=meta)
+                validated = coerce_to_response_type(result.data, response_type, meta=meta)
                 data_bytes = _json.encode(validated)
             except Exception as e:
                 err = f"Response validation error: {e}"
@@ -271,9 +291,9 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
         resp_meta = _build_response_meta("json", result.headers, cookies)
         return _wire_bytes(result.status_code, resp_meta, data_bytes)
     elif isinstance(result, ResponseClass):
-        if response_tp is not None:
+        if response_type is not None:
             try:
-                validated = coerce_to_response_type(result.content, response_tp, meta=meta)
+                validated = coerce_to_response_type(result.content, response_type, meta=meta)
                 data_bytes = _json.encode(validated) if result.media_type == "application/json" else result.to_bytes()
             except Exception as e:
                 err = f"Response validation error: {e}"
@@ -299,9 +319,9 @@ def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV
         resp_meta = _build_response_meta(response_type, headers, cookies)
         return _wire_bytes(result.status_code, resp_meta, data_bytes)
     elif isinstance(result, msgspec.Struct):
-        return serialize_json_data_sync(result, response_tp, meta)
+        return serialize_json_data_sync(result, response_type, meta)
     elif isinstance(result, QuerySet):
-        return serialize_json_data_sync(list(result), response_tp, meta)
+        return serialize_json_data_sync(list(result), response_type, meta)
 
     raise TypeError(
         f"Handler returned unsupported type {type(result).__name__!r}. "
@@ -474,7 +494,9 @@ def serialize_file_streaming_response(result: FileResponse) -> ResponseWireV1:
     return _wire_file(result.status_code, resp_meta, result.path)
 
 
-async def serialize_json_data(result: Any, response_tp: Any | None, meta: HandlerMetadata) -> ResponseWireV1:
+async def serialize_json_data(
+    result: Any, response_tp: Any | None, meta: HandlerMetadata, *, status_code: int | None = None
+) -> ResponseWireV1:
     """Serialize dict/list/other data as JSON.
 
     Uses the new ResponseMeta tuple format for Rust-side header building.
@@ -497,11 +519,13 @@ async def serialize_json_data(result: Any, response_tp: Any | None, meta: Handle
     else:
         data = _json.encode(result)
 
-    status = meta["default_status_code"]
+    status = status_code if status_code is not None else meta["default_status_code"]
     return _wire_bytes(status, _RESPONSE_META_JSON, data)
 
 
-def serialize_json_data_sync(result: Any, response_tp: Any | None, meta: HandlerMetadata) -> ResponseWireV1:
+def serialize_json_data_sync(
+    result: Any, response_tp: Any | None, meta: HandlerMetadata, *, status_code: int | None = None
+) -> ResponseWireV1:
     """Serialize dict/list/other data as JSON (sync version for sync handlers).
 
     Uses the new ResponseMeta tuple format for Rust-side header building.
@@ -524,5 +548,5 @@ def serialize_json_data_sync(result: Any, response_tp: Any | None, meta: Handler
     else:
         data = _json.encode(result)
 
-    status = meta["default_status_code"]
+    status = status_code if status_code is not None else meta["default_status_code"]
     return _wire_bytes(status, _RESPONSE_META_JSON, data)

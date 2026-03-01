@@ -113,6 +113,28 @@ async def get_user(user_id: int):
 
 The schema is automatically generated from the `msgspec.Struct`.
 
+### Per-status-code response schemas
+
+When `response_model` is a dict mapping status codes to types, the OpenAPI schema generates a separate response entry for each status code:
+
+```python
+@api.get("/items/{item_id}", response_model={200: Item, 404: Error})
+async def get_item(item_id: int):
+    ...
+```
+
+This produces OpenAPI responses with both `200` and `404` entries, each with their own schema.
+
+Using `...` (ellipsis) as a key emits a `"default"` response entry in the OpenAPI spec, which represents any status code not explicitly listed:
+
+```python
+@api.get("/items/{item_id}", response_model={200: Item, ...: Error})
+async def get_item(item_id: int):
+    ...
+```
+
+Using `{204: None}` generates a response entry with no content body, appropriate for No Content responses.
+
 ### Request body schemas
 
 Request bodies are documented automatically:

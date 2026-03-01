@@ -177,7 +177,7 @@ All route decorators accept these options:
 | Option | Type | Description |
 |--------|------|-------------|
 | `status_code` | `int` | Default response status code |
-| `response_model` | `type` | Schema for response validation |
+| `response_model` | `type` or `dict` | Schema for response validation. Pass a dict mapping status codes to types for per-status-code schemas (e.g., `{200: Ok, 404: Err}`) |
 | `summary` | `str` | Short description for OpenAPI |
 | `description` | `str` | Detailed description for OpenAPI |
 | `tags` | `list[str]` | OpenAPI tags for grouping |

@@ -759,8 +759,8 @@ def coerce_to_response_type(value: Any, annotation: Any, meta: HandlerMetadata |
         # This is a list[Struct] response - use pre-computed field names
         origin = get_origin(annotation)
 
-        # Handle List[T]
-        if origin in (list, list):
+        # Handle list[T]
+        if origin is list:
             # Check if value is actually a list/iterable
             if not isinstance(value, (list, tuple)) and value is not None:
                 args = get_args(annotation)
@@ -824,7 +824,7 @@ def coerce_to_response_type(value: Any, annotation: Any, meta: HandlerMetadata |
 
     # Fallback: Check if it's a list without metadata
     origin = get_origin(annotation)
-    if origin in (list, list):
+    if origin is list:
         if not isinstance(value, (list, tuple)) and value is not None:
             args = get_args(annotation)
             elem_name = args[0].__name__ if args else "Any"

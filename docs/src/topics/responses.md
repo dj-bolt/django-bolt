@@ -550,6 +550,78 @@ async def get_user(user_id: int) -> User:
     return {"id": user_id, "username": "john", "email": "john@example.com"}
 ```
 
+### Per-status-code response schemas
+
+`response_model` also accepts a dict mapping status codes to types. This enables per-status-code validation and generates separate OpenAPI response entries for each code.
+
+```python
+import msgspec
+
+class Item(msgspec.Struct):
+    id: int
+    name: str
+
+class Error(msgspec.Struct):
+    detail: str
+
+@api.get("/items/{item_id}", response_model={200: Item, 404: Error})
+async def get_item(item_id: int):
+    item = await find_item(item_id)
+    if item is None:
+        return 404, {"detail": "Item not found"}
+    return 200, {"id": item.id, "name": item.name}
+```
+
+**Tuple return** — Return `(status_code, data)` to select the schema by code:
+
+```python
+return 200, {"id": 1, "name": "Alice"}   # validates against Item
+return 404, {"detail": "Not found"}       # validates against Error
+```
+
+**JSON() return** — `JSON(data, status_code=...)` also selects the schema:
+
+```python
+return JSON({"detail": "Not found"}, status_code=404)
+```
+
+**Bare return** — A plain dict or list uses the default status code (lowest 2xx in the map):
+
+```python
+@api.get("/items", response_model={200: list[Item], 400: Error})
+async def list_items():
+    return [{"id": 1, "name": "Alice"}]  # validates against list[Item] at 200
+```
+
+**204 No Content** — Use `{204: None}` with `return (204, None)` for empty body responses:
+
+```python
+@api.delete("/items/{item_id}", response_model={204: None, 404: Error})
+async def delete_item(item_id: int):
+    deleted = await try_delete(item_id)
+    if not deleted:
+        return 404, {"detail": "Item not found"}
+    return 204, None
+```
+
+**Ellipsis catch-all** — Use `...` as a key to match any unmapped status code:
+
+```python
+@api.get("/items/{item_id}", response_model={200: Item, ...: Error})
+async def get_item(item_id: int):
+    ...  # any non-200 status code validates against Error
+```
+
+**Explicit status_code** — Override the auto-detected default status code:
+
+```python
+@api.post("/items", response_model={201: Item, 400: Error}, status_code=201)
+async def create_item():
+    return {"id": 1, "name": "New"}  # bare return uses 201 instead of auto-detected
+```
+
+**Validation** — If the returned data doesn't match the schema for the status code, a 500 error is returned.
+
 ## Setting default status codes
 
 Set a default status code for an endpoint:

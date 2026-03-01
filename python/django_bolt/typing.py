@@ -102,6 +102,21 @@ class HandlerMetadata(TypedDict, total=False):
     response_field_names: list[str]
     """Pre-computed field names for QuerySet.values() call"""
 
+    # Multi-response (per-status-code) metadata
+    response_map: dict[int | type, Any]
+    """Status code → response type mapping (when response_model is a dict).
+    Keys are int status codes or ``...`` (Ellipsis) for catch-all."""
+
+    response_field_names_map: dict[int, list[str]]
+    """Per-status-code QuerySet field names"""
+
+    is_multi_response: bool
+    """Whether this handler uses per-status-code response schemas"""
+
+    _resolved_metas: dict[int | type, dict]
+    """Pre-built per-status-code meta dicts for O(1) lookup at request time.
+    Keys mirror ``response_map`` (int codes + optional ``...``)."""
+
     # Performance optimizations
     needs_form_parsing: bool
     """Whether this handler needs form/multipart parsing (Form/File params)"""
@@ -193,7 +208,7 @@ def is_simple_type(annotation: Any) -> bool:
 def is_sequence_type(annotation: Any) -> bool:
     """Check if annotation is a sequence type like List[T]."""
     origin = get_origin(annotation)
-    return origin in (list, list, tuple, set, frozenset)
+    return origin in (list, tuple, set, frozenset)
 
 
 def is_optional(annotation: Any) -> bool:

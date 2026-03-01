@@ -1171,6 +1171,143 @@ async def bench_serializer_validated(author: BenchAuthorWithValidators) -> Bench
 
 
 # ============================================================================
+# Multi-Response Example
+#
+# response_model accepts a dict mapping status codes to schemas, enabling
+# per-status validation and accurate OpenAPI documentation.
+#
+# Return conventions:
+#   (status_code, data)  — validates data against the schema for that code
+#   bare dict/list       — validated against the default (lowest 2xx) schema
+#   {204: None}          — return (204, None) for an empty-body response
+#   {...: ErrorSchema}   — ellipsis is a catch-all for any unmapped code
+# ============================================================================
+
+
+class ItemOut(msgspec.Struct):
+    """A catalog item."""
+
+    id: int
+    name: str
+    price: float
+
+
+class ItemIn(msgspec.Struct):
+    """Payload for creating an item."""
+
+    name: str
+    price: float
+
+
+class ValidationError(msgspec.Struct):
+    """Validation failure details."""
+
+    detail: str
+    field: str | None = None
+
+
+# Tiny in-memory store so the example is self-contained.
+_ITEMS: dict[int, dict] = {
+    1: {"id": 1, "name": "Widget", "price": 9.99},
+    2: {"id": 2, "name": "Gadget", "price": 24.99},
+}
+_NEXT_ID = 3
+
+
+@api.get(
+    "/multi/items/{item_id}",
+    response_model={200: ItemOut, 404: ValidationError},
+    tags=["Multi-Response"],
+    summary="Get item by ID",
+)
+async def multi_get_item(item_id: int):
+    """
+    Returns 200 + ItemOut when the item exists, 404 + ValidationError otherwise.
+
+    Try:
+        curl http://localhost:8000/multi/items/1
+        curl http://localhost:8000/multi/items/99
+    """
+    item = _ITEMS.get(item_id)
+    if item is None:
+        return 404, {"detail": f"Item {item_id} not found"}
+    return 200, item
+
+
+@api.post(
+    "/multi/items",
+    response_model={201: ItemOut, 400: ValidationError},
+    status_code=201,
+    tags=["Multi-Response"],
+    summary="Create an item",
+)
+async def multi_create_item(payload: ItemIn):
+    """
+    Returns 201 + ItemOut on success, 400 + ValidationError when price ≤ 0.
+
+    Try:
+        curl -X POST http://localhost:8000/multi/items \\
+             -H 'Content-Type: application/json' \\
+             -d '{"name": "Doohickey", "price": 4.50}'
+
+        curl -X POST http://localhost:8000/multi/items \\
+             -H 'Content-Type: application/json' \\
+             -d '{"name": "Free?", "price": -1}'
+    """
+    global _NEXT_ID
+    if payload.price <= 0:
+        return 400, {"detail": "Price must be greater than zero", "field": "price"}
+    item = {"id": _NEXT_ID, "name": payload.name, "price": payload.price}
+    _ITEMS[_NEXT_ID] = item
+    _NEXT_ID += 1
+    return 201, item
+
+
+@api.delete(
+    "/multi/items/{item_id}",
+    response_model={204: None, 404: ValidationError},
+    tags=["Multi-Response"],
+    summary="Delete an item",
+)
+async def multi_delete_item(item_id: int):
+    """
+    Returns 204 (empty body) on success, 404 + ValidationError when not found.
+
+    Try:
+        curl -X DELETE http://localhost:8000/multi/items/1
+        curl -X DELETE http://localhost:8000/multi/items/99
+    """
+    if item_id not in _ITEMS:
+        return 404, {"detail": f"Item {item_id} not found"}
+    del _ITEMS[item_id]
+    return 204, None
+
+
+# ============================================================================
+# Multi-Response Benchmark Endpoints
+# ============================================================================
+
+
+class BenchOk(msgspec.Struct):
+    id: int
+    name: str
+
+
+class BenchError(msgspec.Struct):
+    detail: str
+
+
+@api.get("/bench/multi/tuple", response_model={200: BenchOk, 400: BenchError})
+async def bench_multi_tuple():
+    return (200, {"id": 1, "name": "alice"})
+
+
+@api.get("/bench/multi/dict", response_model={200: BenchOk, 400: BenchError})
+async def bench_multi_dict():
+    return {"id": 1, "name": "alice"}
+
+
+# ============================================================================
 # Class-Based Views (APIView) - Using Decorator Syntax
 # ============================================================================
 

@@ -52,7 +52,7 @@ def extract_response_metadata(response_type: Any) -> dict[str, Any]:
 
     # Check if response type is list[Struct] for QuerySet optimization
     origin = get_origin(response_type)
-    if origin in (list, list):
+    if origin is list:
         args = get_args(response_type)
         if args:
             elem_type = args[0]
