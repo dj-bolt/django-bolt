@@ -101,7 +101,7 @@ pub fn register_middleware_metadata(
 }
 
 #[pyfunction]
-pub fn start_server_async(
+pub fn start_server(
     py: Python<'_>,
     dispatch: Py<PyAny>,
     host: String,

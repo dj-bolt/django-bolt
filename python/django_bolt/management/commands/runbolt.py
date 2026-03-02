@@ -366,7 +366,7 @@ class Command(BaseCommand):
             )
 
         # Start the server (all handlers go through async dispatch with thread pool for sync)
-        _core.start_server_async(
+        _core.start_server(
             merged_api._dispatch,
             options["host"],
             options["port"],

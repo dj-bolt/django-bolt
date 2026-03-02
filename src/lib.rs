@@ -44,7 +44,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     use crate::server::{
         register_asgi_mounts, register_middleware_metadata, register_routes,
-        register_websocket_routes, start_server_async,
+        register_websocket_routes, start_server,
     };
     use crate::testing::{
         create_test_app, destroy_test_app, handle_test_websocket, register_test_asgi_mounts,
@@ -57,7 +57,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(register_websocket_routes, m)?)?;
     m.add_function(wrap_pyfunction!(register_asgi_mounts, m)?)?;
     m.add_function(wrap_pyfunction!(register_middleware_metadata, m)?)?;
-    m.add_function(wrap_pyfunction!(start_server_async, m)?)?;
+    m.add_function(wrap_pyfunction!(start_server, m)?)?;
 
     // Test infrastructure functions (async-native, uses Actix test utilities)
     m.add_function(wrap_pyfunction!(create_test_app, m)?)?;
