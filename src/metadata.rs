@@ -228,6 +228,7 @@ impl RouteExecutionPlan {
     const SKIP_COMPRESSION: u16 = 1 << 6;
     const HAS_AUTH_OR_GUARDS: u16 = 1 << 7;
     const HAS_RATE_LIMIT: u16 = 1 << 8;
+    const CAN_SYNC_DISPATCH: u16 = 1 << 9;
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
@@ -240,6 +241,7 @@ impl RouteExecutionPlan {
         skip_compression: bool,
         has_auth_or_guards: bool,
         has_rate_limit: bool,
+        can_sync_dispatch: bool,
     ) -> Self {
         let mut bits = 0u16;
         if needs_body {
@@ -268,6 +270,9 @@ impl RouteExecutionPlan {
         }
         if has_rate_limit {
             bits |= Self::HAS_RATE_LIMIT;
+        }
+        if can_sync_dispatch {
+            bits |= Self::CAN_SYNC_DISPATCH;
         }
         Self { bits }
     }
@@ -315,6 +320,11 @@ impl RouteExecutionPlan {
     #[inline]
     pub const fn has_rate_limit(self) -> bool {
         (self.bits & Self::HAS_RATE_LIMIT) != 0
+    }
+
+    #[inline]
+    pub const fn can_sync_dispatch(self) -> bool {
+        (self.bits & Self::CAN_SYNC_DISPATCH) != 0
     }
 }
 
@@ -501,6 +511,12 @@ impl RouteMetadata {
         let skip_compression = skip.contains("compression");
         let has_auth_or_guards = !auth_backends.is_empty() || !guards.is_empty();
         let has_rate_limit = rate_limit_config.is_some();
+        let can_sync_dispatch = py_meta
+            .get_item("can_sync_dispatch")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false);
         let plan = RouteExecutionPlan::from_parts(
             needs_body,
             needs_query,
@@ -511,6 +527,7 @@ impl RouteMetadata {
             skip_compression,
             has_auth_or_guards,
             has_rate_limit,
+            can_sync_dispatch,
         );
 
         // Form field type hints (same format as param_types)

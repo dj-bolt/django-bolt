@@ -371,6 +371,7 @@ class Command(BaseCommand):
             options["host"],
             options["port"],
             compression_config,
+            merged_api._dispatch_sync,
         )
 
     # ------------------------------------------------------------------

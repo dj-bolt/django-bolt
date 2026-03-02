@@ -59,6 +59,7 @@ pub struct StaticFilesConfig {
 
 pub struct AppState {
     pub dispatch: Py<PyAny>,
+    pub dispatch_sync: Py<PyAny>,
     pub debug: bool,
     pub max_header_size: usize,
     pub max_payload_size: usize,

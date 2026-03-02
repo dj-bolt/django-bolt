@@ -92,23 +92,25 @@ def _build_response_meta(
     return (response_type, custom_ct, headers_list, cookies_data)
 
 
-def _wire_bytes(status: int, meta: ResponseMetaTuple, body: bytes) -> ResponseWireV1:
-    return int(status), meta, _BODY_BYTES, body
+def _wire_bytes(status: int, meta: ResponseMetaTuple | int, body: bytes) -> ResponseWireV1:
+    return status, meta, _BODY_BYTES, body
 
 
-def _wire_stream(status: int, meta: ResponseMetaTuple, stream: StreamingResponse) -> ResponseWireV1:
-    return int(status), meta, _BODY_STREAM, stream
+def _wire_stream(status: int, meta: ResponseMetaTuple | int, stream: StreamingResponse) -> ResponseWireV1:
+    return status, meta, _BODY_STREAM, stream
 
 
-def _wire_file(status: int, meta: ResponseMetaTuple, path: str) -> ResponseWireV1:
-    return int(status), meta, _BODY_FILE, path
+def _wire_file(status: int, meta: ResponseMetaTuple | int, path: str) -> ResponseWireV1:
+    return status, meta, _BODY_FILE, path
 
 
-# Pre-computed response metadata tuples for common cases (module-level constants)
-_RESPONSE_META_JSON = _build_response_meta("json", None, None)
-_RESPONSE_META_PLAINTEXT = _build_response_meta("plaintext", None, None)
-_RESPONSE_META_OCTETSTREAM = _build_response_meta("octetstream", None, None)
-_RESPONSE_META_EMPTY = _build_response_meta("empty", None, None)
+# Pre-computed response metadata for common cases.
+# Integer tags avoid per-response tuple parsing on the Rust side.
+# Must match STATIC_META_* constants in src/response_meta.rs.
+_RESPONSE_META_JSON: int = 0
+_RESPONSE_META_PLAINTEXT: int = 1
+_RESPONSE_META_OCTETSTREAM: int = 2
+_RESPONSE_META_EMPTY: int = 3
 _TYPED_STREAM_MEDIA_TYPE = "application/x-ndjson"
 _RAW_STREAM_CHUNK_TYPES = (bytes, bytearray, memoryview, str)
 _STREAM_ANNOTATION_ORIGINS = {

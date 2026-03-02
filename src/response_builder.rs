@@ -102,7 +102,7 @@ pub fn meta_to_headers(meta: &ResponseMeta) -> Vec<(String, String)> {
 #[inline]
 pub fn build_response_from_meta<B>(
     status: StatusCode,
-    meta: ResponseMeta,
+    meta: &ResponseMeta,
     body: B,
     skip_compression: bool,
 ) -> HttpResponse
@@ -122,11 +122,11 @@ where
     }
 
     // 2. Custom headers (lowercase keys in Rust - single location)
-    if let Some(headers) = meta.custom_headers {
+    if let Some(ref headers) = meta.custom_headers {
         for (k, v) in headers {
             // Lowercase here instead of in Python (best practice from Robyn)
             if let Ok(name) = HeaderName::try_from(k.to_ascii_lowercase()) {
-                if let Ok(val) = HeaderValue::try_from(v) {
+                if let Ok(val) = HeaderValue::try_from(v.as_str()) {
                     builder.append_header((name, val));
                 }
             }
@@ -134,9 +134,9 @@ where
     }
 
     // 3. Cookies: serialize in Rust (skip invalid cookies with warning)
-    if let Some(cookies) = meta.cookies {
+    if let Some(ref cookies) = meta.cookies {
         for cookie in cookies {
-            if let Some(header_value) = format_cookie(&cookie) {
+            if let Some(header_value) = format_cookie(cookie) {
                 builder.append_header(("set-cookie", header_value));
             }
             // Invalid cookies are logged and skipped by format_cookie
@@ -170,7 +170,7 @@ mod tests {
             custom_headers: None,
             cookies: None,
         };
-        let response = build_response_from_meta(StatusCode::OK, meta, b"{}".to_vec(), false);
+        let response = build_response_from_meta(StatusCode::OK, &meta, b"{}".to_vec(), false);
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -182,7 +182,7 @@ mod tests {
             custom_headers: None,
             cookies: None,
         };
-        let response = build_response_from_meta(StatusCode::OK, meta, b"{}".to_vec(), false);
+        let response = build_response_from_meta(StatusCode::OK, &meta, b"{}".to_vec(), false);
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -197,7 +197,7 @@ mod tests {
             ]),
             cookies: None,
         };
-        let response = build_response_from_meta(StatusCode::OK, meta, b"{}".to_vec(), false);
+        let response = build_response_from_meta(StatusCode::OK, &meta, b"{}".to_vec(), false);
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -219,7 +219,7 @@ mod tests {
                 samesite: Some("Lax".to_string()),
             }]),
         };
-        let response = build_response_from_meta(StatusCode::OK, meta, b"{}".to_vec(), false);
+        let response = build_response_from_meta(StatusCode::OK, &meta, b"{}".to_vec(), false);
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -232,7 +232,7 @@ mod tests {
             cookies: None,
         };
         let response =
-            build_response_from_meta(StatusCode::OK, meta, b"<html></html>".to_vec(), false);
+            build_response_from_meta(StatusCode::OK, &meta, b"<html></html>".to_vec(), false);
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -245,7 +245,7 @@ mod tests {
             cookies: None,
         };
         let response =
-            build_response_from_meta(StatusCode::OK, meta, b"Hello, World!".to_vec(), false);
+            build_response_from_meta(StatusCode::OK, &meta, b"Hello, World!".to_vec(), false);
         assert_eq!(response.status(), StatusCode::OK);
     }
 }

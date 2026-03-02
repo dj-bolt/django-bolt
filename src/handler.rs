@@ -35,6 +35,17 @@ use crate::streaming::{create_python_stream, create_sse_stream};
 use crate::type_coercion::{params_to_py_dict, CoercedValue};
 use crate::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
 
+use std::future::Future;
+use std::pin::Pin;
+
+/// Result of the unified dispatch block.
+/// Sync-eligible routes return Ready (no async bridge overhead).
+/// Async routes return Pending (existing coroutine + future path).
+enum DispatchOutcome {
+    Ready(HttpResponse),
+    Pending(Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>),
+}
+
 // Cache Python classes for type construction (avoids repeated imports)
 static UUID_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static DECIMAL_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -369,9 +380,26 @@ enum ResponseWireBody {
     },
 }
 
+enum MetaRef {
+    /// Fast path: static reference from integer tag (no allocation)
+    Static(&'static ResponseMeta),
+    /// Slow path: parsed from Python tuple (custom headers/cookies)
+    Owned(ResponseMeta),
+}
+
+impl MetaRef {
+    #[inline]
+    fn as_ref(&self) -> &ResponseMeta {
+        match self {
+            MetaRef::Static(s) => s,
+            MetaRef::Owned(o) => o,
+        }
+    }
+}
+
 struct ParsedResponseWire {
     status: StatusCode,
-    meta: ResponseMeta,
+    meta: MetaRef,
     body: ResponseWireBody,
 }
 
@@ -386,7 +414,22 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
 
     let status_code: u16 = tuple.get_item(0)?.extract()?;
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
-    let meta = ResponseMeta::from_python(&tuple.get_item(1)?)?;
+    // Fast path: integer meta tag maps to static ResponseMeta (no String alloc, no tuple parse).
+    // Slow path: parse full tuple for responses with custom headers/cookies.
+    let meta_item = tuple.get_item(1)?;
+    let meta = if let Ok(tag) = meta_item.extract::<u8>() {
+        match ResponseMeta::from_tag(tag) {
+            Some(static_meta) => MetaRef::Static(static_meta),
+            None => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown response meta tag: {}",
+                    tag
+                )))
+            }
+        }
+    } else {
+        MetaRef::Owned(ResponseMeta::from_python(&meta_item)?)
+    };
     // body_kind is an integer tag: 0=bytes, 1=stream, 2=file (avoids String alloc per response)
     let body_kind: u8 = tuple.get_item(2)?.extract()?;
     let payload = tuple.get_item(3)?;
@@ -457,6 +500,8 @@ pub async fn response_from_wire_result(
 ) -> PyResult<HttpResponse> {
     let parsed = Python::attach(|py| parse_response_wire(py, &result_obj))?;
 
+    let meta_ref = parsed.meta.as_ref();
+
     match parsed.body {
         ResponseWireBody::Bytes(body_bytes) => {
             let response_body = if is_head_request {
@@ -466,7 +511,7 @@ pub async fn response_from_wire_result(
             };
             let mut response = response_builder::build_response_from_meta(
                 parsed.status,
-                parsed.meta,
+                meta_ref,
                 response_body,
                 skip_compression,
             );
@@ -485,7 +530,7 @@ pub async fn response_from_wire_result(
             };
             let mut response = response_builder::build_response_from_meta(
                 parsed.status,
-                parsed.meta,
+                meta_ref,
                 body,
                 skip_compression,
             );
@@ -493,7 +538,7 @@ pub async fn response_from_wire_result(
             Ok(response)
         }
         ResponseWireBody::FilePath(file_path) => {
-            let headers = response_builder::meta_to_headers(&parsed.meta);
+            let headers = response_builder::meta_to_headers(meta_ref);
             let mut response = build_file_response(
                 &file_path,
                 parsed.status,
@@ -510,7 +555,7 @@ pub async fn response_from_wire_result(
             content_obj,
             is_async_generator,
         } => {
-            let headers = response_builder::meta_to_headers(&parsed.meta);
+            let headers = response_builder::meta_to_headers(meta_ref);
             if media_type == "text/event-stream" {
                 if is_head_request {
                     let mut response = response_builder::build_sse_response(
@@ -948,12 +993,17 @@ pub async fn handle_request(
     // Check if this is a HEAD request (needed for body stripping after Python handler)
     let is_head_request = method == "HEAD";
 
-    // All handlers (sync and async) go through async dispatch path
-    // Sync handlers are executed in thread pool via sync_to_thread() in Python layer
+    // Sync dispatch bypass: eligible routes call Python synchronously and parse
+    // the response in the same GIL block. Eliminates coroutine creation,
+    // into_future_with_locals, and asyncio event loop polling (~6-12μs savings).
+    let can_sync_dispatch = route_metadata
+        .map(|m| m.plan.can_sync_dispatch())
+        .unwrap_or(false);
+
+    // Unified GIL block: build request + dispatch (sync or async)
     // OPTIMIZATION: Single GIL acquisition for handler clone + dispatch call
-    let fut = match Python::attach(|py| -> PyResult<_> {
+    let dispatch_result: Result<DispatchOutcome, PyErr> = Python::attach(|py| {
         let handler = route_handler.clone_ref(py);
-        let dispatch = state.dispatch.clone_ref(py);
 
         // Create context dict only if auth context is present
         let context = if let Some(ref auth) = auth_ctx {
@@ -1044,48 +1094,101 @@ pub async fn handle_request(
         };
         let request_obj = Py::new(py, request)?;
 
-        // Reuse the global event loop locals initialized at server startup
-        let locals = TASK_LOCALS.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
-        })?;
-
-        // Call dispatch (always returns a coroutine since _dispatch is async)
-        let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
-        pyo3_async_runtimes::into_future_with_locals(locals, coroutine.into_bound(py))
-    }) {
-        Ok(f) => f,
-        Err(e) => {
-            return Python::attach(|py| {
-                handle_python_error(py, e, &path_owned, &method_owned, state.debug)
-            });
+        if can_sync_dispatch {
+            // SYNC PATH: Call dispatch_sync directly → returns tuple (not coroutine).
+            // Parse response wire and build HTTP response in the same GIL block.
+            // Eliminates: coroutine creation, into_future_with_locals, asyncio polling.
+            let result_obj =
+                state
+                    .dispatch_sync
+                    .call1(py, (handler, request_obj, handler_id))?;
+            let parsed = parse_response_wire(py, &result_obj)?;
+            let meta_ref = parsed.meta.as_ref();
+            let response = match parsed.body {
+                ResponseWireBody::ZeroCopyBytes(backed) => {
+                    let body = if is_head_request {
+                        drop(backed);
+                        Bytes::new()
+                    } else {
+                        Bytes::from_owner(backed)
+                    };
+                    let mut resp = response_builder::build_response_from_meta(
+                        parsed.status,
+                        meta_ref,
+                        body,
+                        skip_compression,
+                    );
+                    mark_skip_cors(&mut resp, skip_cors);
+                    resp
+                }
+                ResponseWireBody::Bytes(body_bytes) => {
+                    let body = if is_head_request {
+                        Vec::new()
+                    } else {
+                        body_bytes
+                    };
+                    let mut resp = response_builder::build_response_from_meta(
+                        parsed.status,
+                        meta_ref,
+                        body,
+                        skip_compression,
+                    );
+                    mark_skip_cors(&mut resp, skip_cors);
+                    resp
+                }
+                // File/stream responses are rare for sync handlers, but handle gracefully
+                // by falling through. This shouldn't happen with can_sync_dispatch=true.
+                _ => {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "Sync dispatch returned file/stream body (unexpected)",
+                    ));
+                }
+            };
+            Ok(DispatchOutcome::Ready(response))
+        } else {
+            // ASYNC PATH: Create coroutine + future (existing behavior)
+            let dispatch = state.dispatch.clone_ref(py);
+            let locals = TASK_LOCALS.get().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
+            })?;
+            let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
+            let fut = pyo3_async_runtimes::into_future_with_locals(
+                locals,
+                coroutine.into_bound(py),
+            )?;
+            Ok(DispatchOutcome::Pending(Box::pin(fut)))
         }
-    };
+    });
 
-    match fut.await {
-        Ok(result_obj) => match response_from_wire_result(
-            result_obj,
-            skip_compression,
-            skip_cors,
-            is_head_request,
-        )
-        .await
-        {
-            Ok(response) => response,
+    match dispatch_result {
+        Ok(DispatchOutcome::Ready(response)) => response,
+        Ok(DispatchOutcome::Pending(fut)) => match fut.await {
+            Ok(result_obj) => match response_from_wire_result(
+                result_obj,
+                skip_compression,
+                skip_cors,
+                is_head_request,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(e) => Python::attach(|py| {
+                    error::build_error_response(
+                        py,
+                        500,
+                        format!("Handler returned unsupported response wire format: {}", e),
+                        vec![],
+                        None,
+                        state.debug,
+                    )
+                }),
+            },
             Err(e) => Python::attach(|py| {
-                error::build_error_response(
-                    py,
-                    500,
-                    format!("Handler returned unsupported response wire format: {}", e),
-                    vec![],
-                    None,
-                    state.debug,
-                )
+                handle_python_error(py, e, &path_owned, &method_owned, state.debug)
             }),
         },
-        Err(e) => {
-            return Python::attach(|py| {
-                handle_python_error(py, e, &path_owned, &method_owned, state.debug)
-            });
-        }
+        Err(e) => Python::attach(|py| {
+            handle_python_error(py, e, &path_owned, &method_owned, state.debug)
+        }),
     }
 }

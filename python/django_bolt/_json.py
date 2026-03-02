@@ -12,7 +12,6 @@ Inspired by Litestar's serialization approach.
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -31,9 +30,6 @@ from uuid import UUID
 import msgspec
 
 T = TypeVar("T")
-
-# Thread-local storage for encoder/decoder instances
-_thread_local = threading.local()
 
 # Default type encoders for non-JSON-native types
 # Maps type -> encoder function
@@ -77,29 +73,11 @@ def default_serializer(value: Any) -> Any:
     raise TypeError(f"Unsupported type: {type(value)!r}")
 
 
-def _get_encoder() -> msgspec.json.Encoder:
-    """Return a thread-local msgspec JSON Encoder instance.
-
-    Using a per-thread encoder is thread-safe and avoids cross-thread contention
-    while still reusing the internal buffer for repeated encodes on the same thread.
-    """
-    encoder = getattr(_thread_local, "encoder", None)
-    if encoder is None:
-        encoder = msgspec.json.Encoder(enc_hook=default_serializer)
-        _thread_local.encoder = encoder
-    return encoder
-
-
-def _get_decoder() -> msgspec.json.Decoder:
-    """Return a thread-local msgspec JSON Decoder instance.
-
-    Using a per-thread decoder is thread-safe and reuses the internal buffer.
-    """
-    decoder = getattr(_thread_local, "decoder", None)
-    if decoder is None:
-        decoder = msgspec.json.Decoder()
-        _thread_local.decoder = decoder
-    return decoder
+# Module-level singleton encoder/decoder instances (Litestar pattern).
+# Thread-safe under GIL: only one thread can access Python objects at a time.
+# Reuses internal buffer across calls for better performance.
+_ENCODER = msgspec.json.Encoder(enc_hook=default_serializer)
+_DECODER = msgspec.json.Decoder()
 
 
 def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
@@ -120,8 +98,8 @@ def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
         # Custom serializer provided - use one-off encoder
         return msgspec.json.encode(value, enc_hook=serializer)
 
-    # Use thread-local cached encoder with default serializer
-    return _get_encoder().encode(value)
+    # Use module-level singleton encoder with default serializer
+    return _ENCODER.encode(value)
 
 
 def decode(value: bytes | str) -> Any:
@@ -136,7 +114,7 @@ def decode(value: bytes | str) -> Any:
     Raises:
         msgspec.DecodeError: If decoding fails
     """
-    return _get_decoder().decode(value)
+    return _DECODER.decode(value)
 
 
 def decode_typed[T](

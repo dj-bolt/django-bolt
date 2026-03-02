@@ -12,7 +12,23 @@ from __future__ import annotations
 from typing import Any
 
 from .responses import StreamingResponse
-from .serialization import _BODY_BYTES, _BODY_FILE, _BODY_STREAM
+from .serialization import (
+    _BODY_BYTES,
+    _BODY_FILE,
+    _BODY_STREAM,
+    _RESPONSE_META_EMPTY,
+    _RESPONSE_META_JSON,
+    _RESPONSE_META_OCTETSTREAM,
+    _RESPONSE_META_PLAINTEXT,
+)
+
+# Map integer meta tags back to (response_type, None, None, None) for middleware compat
+_META_TAG_TO_RESPONSE_TYPE = {
+    _RESPONSE_META_JSON: "json",
+    _RESPONSE_META_PLAINTEXT: "plaintext",
+    _RESPONSE_META_OCTETSTREAM: "octetstream",
+    _RESPONSE_META_EMPTY: "empty",
+}
 
 # Raw cookie tuple type (matches serialization.py CookieTuple)
 CookieTuple = tuple[str, str, str, int | None, str | None, str | None, bool, bool, str | None]
@@ -71,10 +87,18 @@ class MiddlewareResponse:
             raise TypeError("Middleware response must be a ResponseWireV1 4-tuple.")
 
         status_code, meta, body_kind, body = response
-        if not (isinstance(meta, tuple) and len(meta) == 4):
-            raise TypeError("Invalid middleware response metadata tuple")
         if body_kind not in {_BODY_BYTES, _BODY_STREAM, _BODY_FILE}:
             raise TypeError(f"Invalid middleware response body_kind {body_kind!r}")
+
+        # Handle integer meta tags (fast path) and tuple meta (slow path)
+        if isinstance(meta, int):
+            response_type = _META_TAG_TO_RESPONSE_TYPE.get(meta)
+            if response_type is None:
+                raise TypeError(f"Unknown response meta tag {meta!r}")
+            return cls(status_code, {}, body, response_type, None, body_kind=body_kind)
+
+        if not (isinstance(meta, tuple) and len(meta) == 4):
+            raise TypeError("Invalid middleware response metadata tuple")
 
         response_type, custom_ct, custom_headers, cookies = meta
         headers: dict[str, str] = {}

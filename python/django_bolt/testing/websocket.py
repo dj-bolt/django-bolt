@@ -177,7 +177,8 @@ class WebSocketTestClient:
 
         # Create a test app instance for this WebSocket test with CORS config
         # This ensures WebSocket origin validation uses same config as HTTP
-        self._app_id = _core.create_test_app(self.api._dispatch, False, self._cors_config)
+        dispatch_sync = getattr(self.api, "_dispatch_sync", None)
+        self._app_id = _core.create_test_app(self.api._dispatch, False, self._cors_config, None, None, dispatch_sync)
 
         # Register WebSocket routes with pre-compiled injectors (same as production)
         ws_routes = []

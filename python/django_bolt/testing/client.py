@@ -364,7 +364,8 @@ class TestClient(httpx.Client):
         # Pass trailing_slash setting to configure NormalizePath middleware
         trailing_slash = getattr(api, "trailing_slash", "strip")
         debug = getattr(settings, "DEBUG", False) if settings else False
-        self.app_id = _core.create_test_app(api._dispatch, debug, cors_config, trailing_slash, static_config)
+        dispatch_sync = getattr(api, "_dispatch_sync", None)
+        self.app_id = _core.create_test_app(api._dispatch, debug, cors_config, trailing_slash, static_config, dispatch_sync)
 
         # Validate mount collisions to mirror production startup behavior.
         self._validate_asgi_mount_conflicts(api)
@@ -593,7 +594,8 @@ class AsyncTestClient(httpx.AsyncClient):
         # Create test app instance with trailing_slash setting
         trailing_slash = getattr(api, "trailing_slash", "strip")
         debug = getattr(settings, "DEBUG", False) if settings else False
-        self.app_id = _core.create_test_app(api._dispatch, debug, cors_config, trailing_slash, static_config)
+        dispatch_sync = getattr(api, "_dispatch_sync", None)
+        self.app_id = _core.create_test_app(api._dispatch, debug, cors_config, trailing_slash, static_config, dispatch_sync)
 
         # Validate mount collisions to mirror production startup behavior.
         TestClient._validate_asgi_mount_conflicts(api)

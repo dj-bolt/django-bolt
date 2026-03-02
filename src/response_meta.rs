@@ -78,7 +78,52 @@ pub struct ResponseMeta {
     pub cookies: Option<Vec<CookieData>>,
 }
 
+/// Pre-built static ResponseMeta for common response types.
+/// Integer tags from Python map directly to these constants,
+/// avoiding String allocation + tuple parsing per response.
+/// Must match _RESPONSE_META_* constants in serialization.py.
+pub static STATIC_META_JSON: ResponseMeta = ResponseMeta {
+    response_type: ResponseType::Json,
+    custom_content_type: None,
+    custom_headers: None,
+    cookies: None,
+};
+
+pub static STATIC_META_PLAINTEXT: ResponseMeta = ResponseMeta {
+    response_type: ResponseType::PlainText,
+    custom_content_type: None,
+    custom_headers: None,
+    cookies: None,
+};
+
+pub static STATIC_META_OCTETSTREAM: ResponseMeta = ResponseMeta {
+    response_type: ResponseType::OctetStream,
+    custom_content_type: None,
+    custom_headers: None,
+    cookies: None,
+};
+
+pub static STATIC_META_EMPTY: ResponseMeta = ResponseMeta {
+    response_type: ResponseType::Empty,
+    custom_content_type: None,
+    custom_headers: None,
+    cookies: None,
+};
+
 impl ResponseMeta {
+    /// Fast-path: resolve integer meta tag to static ResponseMeta.
+    /// Returns None if the tag is not a known constant.
+    #[inline]
+    pub fn from_tag(tag: u8) -> Option<&'static ResponseMeta> {
+        match tag {
+            0 => Some(&STATIC_META_JSON),
+            1 => Some(&STATIC_META_PLAINTEXT),
+            2 => Some(&STATIC_META_OCTETSTREAM),
+            3 => Some(&STATIC_META_EMPTY),
+            _ => None,
+        }
+    }
+
     /// Extract from Python tuple: (response_type, custom_ct, headers, cookies)
     pub fn from_python(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
         let tuple = obj.cast::<PyTuple>()?;
