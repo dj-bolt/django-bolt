@@ -1805,18 +1805,16 @@ class BoltAPI:
 
             # 2. Lazy user loading using SimpleLazyObject (Django pattern)
             # User is only loaded from DB when request.user is actually accessed
+            # Skip setting user=None — PyRequest.user getter already returns None.
             auth_context = request.get("auth")
-            user_id = auth_context.get("user_id") if auth_context else None
-            if user_id:
-                backend_name = auth_context.get("auth_backend")
-                # Use pre-computed is_async from handler metadata (avoids runtime loop check)
-                is_async_ctx = meta["is_async"]
-                # Use functools.partial instead of lambda - faster, no closure overhead
-                request["user"] = SimpleLazyObject(
-                    partial(load_user_sync, user_id, backend_name, auth_context, is_async_ctx)
-                )
-            else:
-                request["user"] = None
+            if auth_context:
+                user_id = auth_context.get("user_id")
+                if user_id:
+                    backend_name = auth_context.get("auth_backend")
+                    is_async_ctx = meta["is_async"]
+                    request["user"] = SimpleLazyObject(
+                        partial(load_user_sync, user_id, backend_name, auth_context, is_async_ctx)
+                    )
 
             # 3. Check if we need to execute middleware
             # Middleware runs for:
@@ -1895,16 +1893,16 @@ class BoltAPI:
         try:
             meta = self._handler_meta[handler_id]
 
-            # Lazy user loading (same as async path)
+            # Lazy user loading: only set when auth context has a user_id.
+            # Skip setting user=None — PyRequest.user getter already returns None.
             auth_context = request.get("auth")
-            user_id = auth_context.get("user_id") if auth_context else None
-            if user_id:
-                backend_name = auth_context.get("auth_backend")
-                request["user"] = SimpleLazyObject(
-                    partial(load_user_sync, user_id, backend_name, auth_context, False)
-                )
-            else:
-                request["user"] = None
+            if auth_context:
+                user_id = auth_context.get("user_id")
+                if user_id:
+                    backend_name = auth_context.get("auth_backend")
+                    request["user"] = SimpleLazyObject(
+                        partial(load_user_sync, user_id, backend_name, auth_context, False)
+                    )
 
             # Call pre-compiled sync executor directly (no coroutine, no await)
             response = meta["_sync_executor"](handler, request)

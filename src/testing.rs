@@ -968,7 +968,8 @@ async fn handle_test_request_internal(
         let headers_dict = params_to_py_dict(py, &headers_for_python, &param_types)?;
         let cookies_dict = params_to_py_dict(py, &cookies, &param_types)?;
 
-        let state_dict = PyDict::new(py);
+        // Only create state dict when Rust-side prebound args exist (matches production).
+        let state_lock = std::sync::OnceLock::new();
         if let Some(bindings) = route_meta
             .as_ref()
             .and_then(|m| m.rust_arg_bindings.as_deref())
@@ -981,17 +982,20 @@ async fn handle_test_request_internal(
                 &headers_dict,
                 &cookies_dict,
             ) {
+                let state_dict = PyDict::new(py);
                 state_dict.set_item("_bolt_prebound_args", pre_args)?;
                 state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
+                let _ = state_lock.set(state_dict.unbind());
             }
         }
 
-        // Create form_map and files_map from form parsing result
-        let (form_map_dict, files_map_dict) = if let Some(ref result) = form_result {
-            form_result_to_py(py, result)
-                .unwrap_or_else(|_| (PyDict::new(py).unbind(), PyDict::new(py).unbind()))
+        // Only create form/files dicts when form data is present (matches production).
+        let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {
+            let (fm, fi) = form_result_to_py(py, result)
+                .unwrap_or_else(|_| (PyDict::new(py).unbind(), PyDict::new(py).unbind()));
+            (Some(fm), Some(fi))
         } else {
-            (PyDict::new(py).unbind(), PyDict::new(py).unbind())
+            (None, None)
         };
 
         let request = PyRequest {
@@ -1004,13 +1008,9 @@ async fn handle_test_request_internal(
             cookies: cookies_dict.unbind(),
             context,
             user: None,
-            state: {
-                let lock = std::sync::OnceLock::new();
-                let _ = lock.set(state_dict.unbind());
-                lock
-            },
-            form_map: Some(form_map_dict),
-            files_map: Some(files_map_dict),
+            state: state_lock,
+            form_map: form_map_opt,
+            files_map: files_map_opt,
             meta_cache: std::sync::OnceLock::new(),
             conn_host: conn_host.clone(),
             conn_scheme: conn_scheme.clone(),
