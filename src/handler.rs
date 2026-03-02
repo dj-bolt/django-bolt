@@ -43,6 +43,8 @@ use std::pin::Pin;
 /// Async routes return Pending (existing coroutine + future path).
 enum DispatchOutcome {
     Ready(HttpResponse),
+    /// Sync dispatch completed but body requires async post-processing (stream/file).
+    SyncResult(Py<PyAny>),
     Pending(Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>),
 }
 
@@ -1136,12 +1138,11 @@ pub async fn handle_request(
                     mark_skip_cors(&mut resp, skip_cors);
                     resp
                 }
-                // File/stream responses are rare for sync handlers, but handle gracefully
-                // by falling through. This shouldn't happen with can_sync_dispatch=true.
+                // Stream/file body: sync dispatch ran the handler but the response
+                // needs async processing (e.g. StreamingResponse from a trivially-async handler).
+                // Fall back to async response building with the already-computed result.
                 _ => {
-                    return Err(pyo3::exceptions::PyTypeError::new_err(
-                        "Sync dispatch returned file/stream body (unexpected)",
-                    ));
+                    return Ok(DispatchOutcome::SyncResult(result_obj));
                 }
             };
             Ok(DispatchOutcome::Ready(response))
@@ -1160,29 +1161,31 @@ pub async fn handle_request(
         }
     });
 
+    // Shared wire-result → HttpResponse conversion (used by SyncResult and Pending paths).
+    let process_wire_result = |result_obj: Py<PyAny>| async {
+        match response_from_wire_result(result_obj, skip_compression, skip_cors, is_head_request)
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => Python::attach(|py| {
+                error::build_error_response(
+                    py,
+                    500,
+                    format!("Handler returned unsupported response wire format: {}", e),
+                    vec![],
+                    None,
+                    state.debug,
+                )
+            }),
+        }
+    };
+
     match dispatch_result {
         Ok(DispatchOutcome::Ready(response)) => response,
+        // Sync dispatch completed but body needs async post-processing (stream/file).
+        Ok(DispatchOutcome::SyncResult(result_obj)) => process_wire_result(result_obj).await,
         Ok(DispatchOutcome::Pending(fut)) => match fut.await {
-            Ok(result_obj) => match response_from_wire_result(
-                result_obj,
-                skip_compression,
-                skip_cors,
-                is_head_request,
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(e) => Python::attach(|py| {
-                    error::build_error_response(
-                        py,
-                        500,
-                        format!("Handler returned unsupported response wire format: {}", e),
-                        vec![],
-                        None,
-                        state.debug,
-                    )
-                }),
-            },
+            Ok(result_obj) => process_wire_result(result_obj).await,
             Err(e) => Python::attach(|py| {
                 handle_python_error(py, e, &path_owned, &method_owned, state.debug)
             }),
