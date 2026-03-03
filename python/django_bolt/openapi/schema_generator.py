@@ -489,13 +489,19 @@ class SchemaGenerator:
                 },
             )
         else:
-            # Default response
-            responses["200"] = OpenAPIResponse(
-                description="Successful response",
-                content={
-                    "application/json": OpenAPIMediaType(schema=Schema(type="object")),
-                },
-            )
+            # Default response when no response model is available.
+            #
+            # Respect the route's default status code (e.g. 201 for create, 204 for destroy).
+            if int(default_status) == 204:
+                # 204 No Content MUST NOT include a response body
+                responses["204"] = OpenAPIResponse(description="No Content")
+            else:
+                responses[str(default_status)] = OpenAPIResponse(
+                    description="Successful response",
+                    content={
+                        "application/json": OpenAPIMediaType(schema=Schema(type="object")),
+                    },
+                )
 
         # Add common error responses if enabled in config
         if self.config.include_error_responses:

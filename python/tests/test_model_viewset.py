@@ -1,8 +1,10 @@
 """
 Tests for ModelViewSet and ReadOnlyModelViewSet (DRF-style usage).
 
-This test suite verifies that ModelViewSet and ReadOnlyModelViewSet work similarly
-to Django REST Framework's ModelViewSet, where you just set queryset and serializer_class.
+These tests verify that mixin-based viewsets work similarly to DRF:
+- You can register a single ViewSet class with api.viewset()
+- Default CRUD actions are provided by ModelViewSet / ReadOnlyModelViewSet
+- Request body schemas can be configured via create_serializer_class/update_serializer_class
 """
 
 import msgspec
@@ -63,27 +65,12 @@ def test_readonly_model_viewset(api):
         author="Author 2",
     )
 
-    @api.view("/articles", methods=["GET"])
-    class ArticleListViewSet(ReadOnlyModelViewSet):
+    @api.viewset("/articles")
+    class ArticleViewSet(ReadOnlyModelViewSet):
         queryset = Article.objects.all()
         serializer_class = ArticleSchema
 
-        async def get(self, request):
-            """List all articles."""
-            articles = []
-            async for article in await self.get_queryset():
-                articles.append(ArticleSchema.from_model(article))
-            return articles
-
-    @api.view("/articles/{pk}", methods=["GET"])
-    class ArticleDetailViewSet(ReadOnlyModelViewSet):
-        queryset = Article.objects.all()
-        serializer_class = ArticleSchema
-
-        async def get(self, request, pk: int):
-            """Retrieve a single article."""
-            article = await self.get_object(pk)
-            return ArticleSchema.from_model(article)
+        # No method overrides needed: list/retrieve come from mixins
 
     with TestClient(api) as client:
         # List
@@ -103,65 +90,14 @@ def test_readonly_model_viewset(api):
 
 @pytest.mark.django_db(transaction=True)
 def test_model_viewset_with_custom_methods(api):
-    """Test ModelViewSet with full CRUD implementation."""
+    """Test ModelViewSet provides full CRUD with only configuration."""
 
-    @api.view("/articles", methods=["GET", "POST"])
-    class ArticleListViewSet(ModelViewSet):
+    @api.viewset("/articles")
+    class ArticleViewSet(ModelViewSet):
         queryset = Article.objects.all()
         serializer_class = ArticleSchema
-
-        async def get(self, request):
-            """List all articles."""
-            articles = []
-            async for article in await self.get_queryset():
-                articles.append(ArticleSchema.from_model(article))
-            return articles
-
-        async def post(self, request, data: ArticleCreateSchema):
-            """Create a new article."""
-            article = await Article.objects.acreate(
-                title=data.title,
-                content=data.content,
-                author=data.author,
-            )
-            return ArticleSchema.from_model(article)
-
-    @api.view("/articles/{pk}", methods=["GET", "PUT", "PATCH", "DELETE"])
-    class ArticleDetailViewSet(ModelViewSet):
-        queryset = Article.objects.all()
-        serializer_class = ArticleSchema
-
-        async def get(self, request, pk: int):
-            """Retrieve a single article."""
-            article = await self.get_object(pk)
-            return ArticleSchema.from_model(article)
-
-        async def put(self, request, pk: int, data: ArticleCreateSchema):
-            """Update an article."""
-            article = await self.get_object(pk)
-            article.title = data.title
-            article.content = data.content
-            article.author = data.author
-            await article.asave()
-            return ArticleSchema.from_model(article)
-
-        async def patch(self, request, pk: int, data: ArticleCreateSchema):
-            """Partially update an article."""
-            article = await self.get_object(pk)
-            if data.title:
-                article.title = data.title
-            if data.content:
-                article.content = data.content
-            if data.author:
-                article.author = data.author
-            await article.asave()
-            return ArticleSchema.from_model(article)
-
-        async def delete(self, request, pk: int):
-            """Delete an article."""
-            article = await self.get_object(pk)
-            await article.adelete()
-            return {"detail": "Object deleted successfully"}
+        create_serializer_class = ArticleCreateSchema
+        update_serializer_class = ArticleCreateSchema
 
     with TestClient(api) as client:
         # List
@@ -174,7 +110,7 @@ def test_model_viewset_with_custom_methods(api):
             "/articles",
             json={"title": "New Article", "content": "New Content", "author": "Test Author"},
         )
-        assert response.status_code == 200
+        assert response.status_code == 201
         article_id = response.json()["id"]
 
         # Retrieve
@@ -200,7 +136,7 @@ def test_model_viewset_with_custom_methods(api):
 
         # Delete
         response = client.delete(f"/articles/{article_id}")
-        assert response.status_code == 200
+        assert response.status_code == 204
 
         # Verify deletion
         response = client.get(f"/articles/{article_id}")
@@ -211,17 +147,11 @@ def test_model_viewset_with_custom_methods(api):
 def test_model_viewset_queryset_reevaluation(api):
     """Test that queryset is re-evaluated on each request (like DRF)."""
 
-    @api.view("/articles", methods=["GET"])
+    @api.viewset("/articles")
     class ArticleViewSet(ReadOnlyModelViewSet):
         queryset = Article.objects.all()
         serializer_class = ArticleSchema
-
-        async def get(self, request):
-            """List all articles."""
-            articles = []
-            async for article in await self.get_queryset():
-                articles.append(ArticleSchema.from_model(article))
-            return articles
+        # list() comes from ListMixin
 
     with TestClient(api) as client:
         # First request - empty
@@ -259,7 +189,7 @@ def test_model_viewset_custom_queryset(api):
         is_published=False,
     )
 
-    @api.view("/articles/published", methods=["GET"])
+    @api.viewset("/articles/published")
     class PublishedArticleViewSet(ReadOnlyModelViewSet):
         queryset = Article.objects.all()  # Base queryset
         serializer_class = ArticleSchema
@@ -269,12 +199,7 @@ def test_model_viewset_custom_queryset(api):
             queryset = await super().get_queryset()
             return queryset.filter(is_published=True)
 
-        async def get(self, request):
-            """List published articles."""
-            articles = []
-            async for article in await self.get_queryset():
-                articles.append(ArticleSchema.from_model(article))
-            return articles
+        # list() comes from ListMixin
 
     with TestClient(api) as client:
         response = client.get("/articles/published")
@@ -296,17 +221,13 @@ def test_model_viewset_lookup_field(api):
         author="test-author",
     )
 
-    # Use {pk} in URL pattern (will be matched to author field)
-    @api.view("/articles/by-author/{pk}", methods=["GET"])
+    # URL uses lookup_field as the path parameter name when registered with api.viewset()
+    @api.viewset("/articles/by-author")
     class ArticleViewSet(ReadOnlyModelViewSet):
         queryset = Article.objects.all()
         serializer_class = ArticleSchema
         lookup_field = "author"  # Look up by author instead of pk
-
-        async def get(self, request, pk: str):  # pk will be the author name
-            """Retrieve article by author."""
-            article = await self.get_object(pk)
-            return ArticleSchema.from_model(article)
+        # retrieve() comes from RetrieveMixin; as_view() maps {author} -> pk for the mixin method
 
     with TestClient(api) as client:
         # Lookup by author

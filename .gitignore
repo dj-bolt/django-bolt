@@ -8,6 +8,11 @@ wheels/
 target/
 # Virtual environments
 .venv
+
+# Environment variables (secrets)
+.env
+.env.local
+.env.*.local
 ignore/
 db.sqlite3
 python/django_bolt/_core.cpython-312-x86_64-linux-gnu.so

@@ -754,6 +754,33 @@ class BoltAPI:
                     original = getattr(handler, "__original_handler__", None)
                     if original is not None:
                         method_response_model = getattr(original, "response_model", None)
+                # Fallback: infer response model from viewset serializer configuration
+                # This enables DRF-style usage where only queryset/serializer_class are set.
+                if method_response_model is None:
+                    try:
+                        view_instance = viewset_cls()
+                        if hasattr(view_instance, "action"):
+                            view_instance.action = action_name
+                        serializer = view_instance.get_serializer_class(action=action_name)
+                        if action_name == "list":
+                            pagination_cls = None
+                            if hasattr(view_instance, "get_pagination_class"):
+                                pagination_cls = view_instance.get_pagination_class()
+                            else:
+                                pagination_cls = getattr(view_instance, "pagination_class", None)
+
+                            if pagination_cls is not None:
+                                from .pagination import PaginatedResponse
+
+                                method_response_model = PaginatedResponse[serializer]
+                            else:
+                                method_response_model = list[serializer]
+                        elif action_name == "destroy":
+                            method_response_model = None
+                        else:
+                            method_response_model = serializer
+                    except Exception:
+                        method_response_model = None
 
                 # Register the route
                 route_name = f"{name}-{action_name}" if name else None

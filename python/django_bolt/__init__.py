@@ -145,6 +145,7 @@ from .views import (
     CreateMixin,
     DestroyMixin,
     ListMixin,
+    GenericViewSet,
     ModelViewSet,
     PartialUpdateMixin,
     ReadOnlyModelViewSet,
@@ -190,6 +191,7 @@ __all__ = [
     # Views
     "APIView",
     "ViewSet",
+    "GenericViewSet",
     "ModelViewSet",
     "ReadOnlyModelViewSet",
     "ListMixin",
