@@ -34,29 +34,46 @@ class HealthCheck:
         Returns:
             Dictionary with health check results
         """
+        import asyncio
+        
+        # Run all checks concurrently for better performance
+        check_tasks = [self._execute_single_check(check) for check in self._checks]
+        results_list = await asyncio.gather(*check_tasks, return_exceptions=True)
+        
         results = {}
         all_healthy = True
-
-        for check in self._checks:
-            try:
-                is_healthy, message = await check()
+        
+        # Process results
+        for i, check in enumerate(self._checks):
+            result = results_list[i]
+            
+            if isinstance(result, Exception):
+                # Handle exceptions from the gathered tasks
+                results[check.__name__] = {
+                    "healthy": False,
+                    "message": f"Check failed: {str(result)}",
+                }
+                all_healthy = False
+            else:
+                is_healthy, message = result
                 results[check.__name__] = {
                     "healthy": is_healthy,
                     "message": message,
                 }
                 if not is_healthy:
                     all_healthy = False
-            except Exception as e:
-                results[check.__name__] = {
-                    "healthy": False,
-                    "message": f"Check failed: {str(e)}",
-                }
-                all_healthy = False
 
         return {
             "status": "healthy" if all_healthy else "unhealthy",
             "checks": results,
         }
+    
+    async def _execute_single_check(self, check):
+        """Helper method to execute a single check and handle exceptions."""
+        try:
+            return await check()
+        except Exception as e:
+            raise e
 
 
 # Global health check instance
