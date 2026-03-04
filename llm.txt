@@ -332,6 +332,6 @@ from django_bolt.auth import JWTAuthentication, IsAuthenticated
 
 BOLT_AUTHENTICATION_CLASSES = [JWTAuthentication()]
 BOLT_DEFAULT_PERMISSION_CLASSES = [IsAuthenticated()]  # Default: AllowAny
-BOLT_CORS_ALLOWED_ORIGINS = ["https://example.com"]
+CORS_ALLOWED_ORIGINS = ["https://example.com"]
 BOLT_ALLOWED_FILE_PATHS = ["/var/www/static"]
 ```
