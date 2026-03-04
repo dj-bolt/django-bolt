@@ -804,8 +804,13 @@ pub async fn handle_request(
         AHashMap::new()
     };
 
-    // Get peer address for rate limiting fallback
-    let peer_addr = req.peer_addr().map(|addr| addr.ip().to_string());
+    // Get peer address only when needed (rate limiting or conn_remote_addr fallback).
+    // Skip ip().to_string() for simple API routes with no auth/middleware/rate-limiting.
+    let peer_addr = if has_route_rate_limit || must_extract_headers {
+        req.peer_addr().map(|addr| addr.ip().to_string())
+    } else {
+        None
+    };
 
     // Process rate limiting (Rust-native, no GIL)
     if let Some(route_meta) = route_metadata {
@@ -966,9 +971,9 @@ pub async fn handle_request(
     let is_head_request = method == "HEAD";
 
     // Unified GIL block: build request + dispatch (sync or async)
-    // OPTIMIZATION: Single GIL acquisition for handler clone + dispatch call
+    // OPTIMIZATION: Single GIL acquisition — route_handler moved in (no clone_ref)
     let dispatch_result: Result<DispatchOutcome, PyErr> = Python::attach(|py| {
-        let handler = route_handler.clone_ref(py);
+        let handler = route_handler;
 
         // Create context dict only if auth context is present
         let context = if let Some(ref auth) = auth_ctx {
@@ -986,47 +991,76 @@ pub async fn handle_request(
             .map(|m| &m.param_types)
             .unwrap_or(&empty_param_types);
 
-        // Create typed dicts - reuse pre-coerced path/query values from validation phase.
-        let path_params_dict = PyDict::new(py);
-        for (name, value) in &path_params {
-            if let Some(coerced) = path_coerced.get(name) {
-                path_params_dict.set_item(name, coerced_value_to_py(py, coerced))?;
-            } else {
-                path_params_dict.set_item(name, value)?;
-            }
-        }
-
-        let query_params_dict = PyDict::new(py);
-        for (name, value) in &query_params {
-            if let Some(coerced) = query_coerced.get(name) {
-                query_params_dict.set_item(name, coerced_value_to_py(py, coerced))?;
-            } else {
-                query_params_dict.set_item(name, value)?;
-            }
-        }
-
-        let headers_dict = if needs_headers {
-            params_to_py_dict(py, &headers, param_types)?
+        // OPTIMIZATION: Create typed PyDicts only when non-empty.
+        // Saves 1 Python heap alloc per empty source (up to 4 for simple API handlers).
+        let path_params_py: Option<Py<PyDict>> = if path_params.is_empty() {
+            None
         } else {
-            PyDict::new(py)
+            let dict = PyDict::new(py);
+            for (name, value) in &path_params {
+                if let Some(coerced) = path_coerced.get(name) {
+                    dict.set_item(name, coerced_value_to_py(py, coerced))?;
+                } else {
+                    dict.set_item(name, value)?;
+                }
+            }
+            Some(dict.unbind())
         };
-        let cookies_dict = if needs_cookies {
-            params_to_py_dict(py, &cookies, param_types)?
+
+        let query_params_py: Option<Py<PyDict>> = if query_params.is_empty() {
+            None
         } else {
-            PyDict::new(py)
+            let dict = PyDict::new(py);
+            for (name, value) in &query_params {
+                if let Some(coerced) = query_coerced.get(name) {
+                    dict.set_item(name, coerced_value_to_py(py, coerced))?;
+                } else {
+                    dict.set_item(name, value)?;
+                }
+            }
+            Some(dict.unbind())
+        };
+
+        let headers_py: Option<Py<PyDict>> = if needs_headers {
+            Some(params_to_py_dict(py, &headers, param_types)?.unbind())
+        } else {
+            None
+        };
+        let cookies_py: Option<Py<PyDict>> = if needs_cookies {
+            Some(params_to_py_dict(py, &cookies, param_types)?.unbind())
+        } else {
+            None
         };
 
         // Only create state dict when Rust-side prebound args exist.
         // For fast-path handlers (no rust_arg_bindings), state is lazily allocated on first access.
         let state_lock = std::sync::OnceLock::new();
         if let Some(bindings) = route_metadata.and_then(|m| m.rust_arg_bindings.as_deref()) {
+            // Create temp empty dict for prebound arg extraction (only when bindings exist)
+            let empty_dict = PyDict::new(py);
+            let pp_ref = match &path_params_py {
+                Some(d) => d.bind(py),
+                None => &empty_dict,
+            };
+            let qp_ref = match &query_params_py {
+                Some(d) => d.bind(py),
+                None => &empty_dict,
+            };
+            let hd_ref = match &headers_py {
+                Some(d) => d.bind(py),
+                None => &empty_dict,
+            };
+            let ck_ref = match &cookies_py {
+                Some(d) => d.bind(py),
+                None => &empty_dict,
+            };
             if let Some((pre_args, pre_kwargs)) = build_prebound_args_kwargs(
                 py,
                 bindings,
-                &path_params_dict,
-                &query_params_dict,
-                &headers_dict,
-                &cookies_dict,
+                pp_ref,
+                qp_ref,
+                hd_ref,
+                ck_ref,
             ) {
                 let state_dict = PyDict::new(py);
                 state_dict.set_item("_bolt_prebound_args", pre_args)?;
@@ -1043,23 +1077,25 @@ pub async fn handle_request(
             (None, None)
         };
 
+        // OPTIMIZATION: Move owned strings into PyRequest — no .clone() needed.
+        // Error paths reconstruct from req.method()/req.path() (cold path, HttpRequest still alive).
         let request = PyRequest {
-            method: method_owned.clone(),
-            path: path_owned.clone(),
+            method: method_owned,
+            path: path_owned,
             body,
-            path_params: path_params_dict.unbind(),
-            query_params: query_params_dict.unbind(),
-            headers: headers_dict.unbind(),
-            cookies: cookies_dict.unbind(),
+            path_params: path_params_py,
+            query_params: query_params_py,
+            headers: headers_py,
+            cookies: cookies_py,
             context,
             user: None,
             state: state_lock,
             form_map: form_map_opt,
             files_map: files_map_opt,
             meta_cache: std::sync::OnceLock::new(),
-            conn_host: conn_host.clone(),
-            conn_scheme: conn_scheme.clone(),
-            conn_remote_addr: conn_remote_addr.clone(),
+            conn_host,
+            conn_scheme,
+            conn_remote_addr,
         };
         let request_obj = Py::new(py, request)?;
 
@@ -1162,11 +1198,12 @@ pub async fn handle_request(
                 }
             }
             Err(e) => Python::attach(|py| {
-                handle_python_error(py, e, &path_owned, &method_owned, state.debug)
+                // Cold path: reconstruct from HttpRequest (strings were moved into PyRequest)
+                handle_python_error(py, e, req.path(), req.method().as_str(), state.debug)
             }),
         },
         Err(e) => Python::attach(|py| {
-            handle_python_error(py, e, &path_owned, &method_owned, state.debug)
+            handle_python_error(py, e, req.path(), req.method().as_str(), state.debug)
         }),
     }
 }
