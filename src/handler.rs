@@ -540,11 +540,7 @@ async fn build_response_from_parsed(
         ResponseWireBody::FilePath(file_path) => {
             let headers = response_builder::meta_to_headers(meta_ref);
             let mut response = build_file_response(
-                &file_path,
-                parsed.status,
-                headers,
-                skip_compression,
-                is_head_request,
+                &file_path, parsed.status, headers, skip_compression, is_head_request,
             )
             .await;
             mark_skip_cors(&mut response, skip_cors);
@@ -559,9 +555,7 @@ async fn build_response_from_parsed(
             if media_type == "text/event-stream" {
                 if is_head_request {
                     let mut response = response_builder::build_sse_response(
-                        parsed.status,
-                        headers,
-                        skip_compression,
+                        parsed.status, headers, skip_compression,
                     )
                     .body(Vec::<u8>::new());
                     mark_skip_cors(&mut response, skip_cors);
@@ -910,6 +904,29 @@ pub async fn handle_request(
             .and_then(|h| h.get("x-forwarded-for"))
             .and_then(|v| v.split(',').next().map(|s| s.trim().to_string()))
             .or_else(|| headers.as_ref().and_then(|h| h.get("x-real-ip").cloned()))
+            .or_else(|| peer_addr.clone())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        (host, scheme, remote_addr)
+    } else {
+        // No headers extracted → no Django middleware → META won't be accessed
+        (String::new(), String::new(), String::new())
+    };
+
+    // Derive connection info from already-extracted headers (avoids a second header-parse pass).
+    // conn_info is only used for request.META (Django templates) and build_absolute_uri().
+    // When headers weren't extracted (pure API routes with no auth/cookies/middleware),
+    // empty strings are safe because no Django middleware will call META anyway.
+    let (conn_host, conn_scheme, conn_remote_addr) = if must_extract_headers {
+        let host = headers.get("host").cloned().unwrap_or_default();
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .cloned()
+            .unwrap_or_else(|| "http".to_string());
+        // X-Forwarded-For: leftmost IP is the original client (RFC 7239 §7.1)
+        let remote_addr = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.split(',').next().map(|s| s.trim().to_string()))
+            .or_else(|| headers.get("x-real-ip").cloned())
             .or_else(|| peer_addr.clone())
             .unwrap_or_else(|| "127.0.0.1".to_string());
         (host, scheme, remote_addr)
