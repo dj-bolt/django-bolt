@@ -507,9 +507,16 @@ async fn build_response_from_parsed(
 
     match parsed.body {
         ResponseWireBody::Bytes(body_bytes) => {
-            let body = if is_head_request { Vec::new() } else { body_bytes };
+            let body = if is_head_request {
+                Vec::new()
+            } else {
+                body_bytes
+            };
             let mut response = response_builder::build_response_from_meta(
-                parsed.status, meta_ref, body, skip_compression,
+                parsed.status,
+                meta_ref,
+                body,
+                skip_compression,
             );
             mark_skip_cors(&mut response, skip_cors);
             response
@@ -522,7 +529,10 @@ async fn build_response_from_parsed(
                 Bytes::from_owner(backed)
             };
             let mut response = response_builder::build_response_from_meta(
-                parsed.status, meta_ref, body, skip_compression,
+                parsed.status,
+                meta_ref,
+                body,
+                skip_compression,
             );
             mark_skip_cors(&mut response, skip_cors);
             response
@@ -530,7 +540,11 @@ async fn build_response_from_parsed(
         ResponseWireBody::FilePath(file_path) => {
             let headers = response_builder::meta_to_headers(meta_ref);
             let mut response = build_file_response(
-                &file_path, parsed.status, headers, skip_compression, is_head_request,
+                &file_path,
+                parsed.status,
+                headers,
+                skip_compression,
+                is_head_request,
             )
             .await;
             mark_skip_cors(&mut response, skip_cors);
@@ -545,7 +559,9 @@ async fn build_response_from_parsed(
             if media_type == "text/event-stream" {
                 if is_head_request {
                     let mut response = response_builder::build_sse_response(
-                        parsed.status, headers, skip_compression,
+                        parsed.status,
+                        headers,
+                        skip_compression,
                     )
                     .body(Vec::<u8>::new());
                     mark_skip_cors(&mut response, skip_cors);
@@ -645,14 +661,12 @@ pub async fn handle_request(
         if let Some(route_match) = router.find(method, path) {
             let handler_id = route_match.handler_id();
             let handler = Python::attach(|py| route_match.route().handler.clone_ref(py));
-            let raw_params = route_match.path_params(); // No allocation for static routes
+            let raw_params = route_match.path_params();
 
             // URL-decode path parameters for consistency with query string parsing
             // This ensures /items/hello%20world correctly yields id="hello world"
-            let path_params: AHashMap<String, String> = if raw_params.is_empty() {
-                raw_params
-            } else {
-                raw_params
+            let path_params = raw_params.map(|params| {
+                params
                     .into_iter()
                     .map(|(k, v)| {
                         let decoded = if v.as_bytes().iter().any(|&b| b == b'%' || b == b'+') {
@@ -666,7 +680,7 @@ pub async fn handle_request(
                         (k, decoded)
                     })
                     .collect()
-            };
+            });
             (handler, path_params, handler_id)
         } else {
             // No route found - check for trailing slash redirect FIRST
@@ -755,29 +769,32 @@ pub async fn handle_request(
 
     let needs_query = plan.map_or(true, |p| p.needs_query());
     let query_params = if needs_query {
-        if let Some(q) = req.uri().query() {
-            parse_query_string(q)
-        } else {
-            AHashMap::new()
-        }
+        req.uri().query().and_then(|q| {
+            let parsed = parse_query_string(q);
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            }
+        })
     } else {
-        AHashMap::new()
+        None
     };
 
     let needs_body = plan.map_or(true, |p| p.needs_body());
 
     // Type validation for path and query parameters (Rust-native, no GIL)
-    let (path_coerced, query_coerced): (
-        AHashMap<String, CoercedValue>,
-        AHashMap<String, CoercedValue>,
-    ) = if let Some(route_meta) = route_metadata {
-        match validate_and_cache_typed_params(&path_params, &query_params, &route_meta.param_types)
-        {
+    let (path_coerced, query_coerced) = if let Some(route_meta) = route_metadata {
+        match validate_and_cache_typed_params(
+            path_params.as_ref(),
+            query_params.as_ref(),
+            &route_meta.param_types,
+        ) {
             Ok(cached) => cached,
             Err(response) => return response,
         }
     } else {
-        (AHashMap::new(), AHashMap::new())
+        (None, None)
     };
 
     let needs_headers = plan.map_or(true, |p| p.needs_headers());
@@ -797,11 +814,11 @@ pub async fn handle_request(
     // Extract and validate headers
     let headers = if must_extract_headers {
         match extract_headers(&req, state.max_header_size) {
-            Ok(h) => h,
+            Ok(h) => Some(h),
             Err(response) => return response,
         }
     } else {
-        AHashMap::new()
+        None
     };
 
     // Get peer address only when needed (rate limiting or conn_remote_addr fallback).
@@ -815,32 +832,46 @@ pub async fn handle_request(
     // Process rate limiting (Rust-native, no GIL)
     if let Some(route_meta) = route_metadata {
         if let Some(ref rate_config) = route_meta.rate_limit_config {
-            if let Some(response) = middleware::rate_limit::check_rate_limit(
-                handler_id,
-                &headers,
-                peer_addr.as_deref(),
-                rate_config,
-                &method,
-                &path,
-            ) {
-                // CORS headers will be added by CorsMiddleware
-                return response;
+            if let Some(headers_map) = headers.as_ref() {
+                if let Some(response) = middleware::rate_limit::check_rate_limit(
+                    handler_id,
+                    headers_map,
+                    peer_addr.as_deref(),
+                    rate_config,
+                    &method,
+                    &path,
+                ) {
+                    // CORS headers will be added by CorsMiddleware
+                    return response;
+                }
+            } else {
+                debug_assert!(false, "rate-limited route missing extracted headers");
             }
         }
     }
 
     // Execute authentication and guards using shared validation logic
-    let auth_ctx = if let Some(route_meta) = route_metadata {
-        match validate_auth_and_guards(&headers, &route_meta.auth_backends, &route_meta.guards) {
-            AuthGuardResult::Allow(ctx) => ctx,
-            AuthGuardResult::Unauthorized => {
-                // CORS headers will be added by CorsMiddleware
-                return responses::error_401();
+    let auth_ctx = if has_route_auth_or_guards {
+        if let Some(route_meta) = route_metadata {
+            let empty_headers = AHashMap::new();
+            let headers_map = headers.as_ref().unwrap_or(&empty_headers);
+            match validate_auth_and_guards(
+                headers_map,
+                &route_meta.auth_backends,
+                &route_meta.guards,
+            ) {
+                AuthGuardResult::Allow(ctx) => ctx,
+                AuthGuardResult::Unauthorized => {
+                    // CORS headers will be added by CorsMiddleware
+                    return responses::error_401();
+                }
+                AuthGuardResult::Forbidden => {
+                    // CORS headers will be added by CorsMiddleware
+                    return responses::error_403();
+                }
             }
-            AuthGuardResult::Forbidden => {
-                // CORS headers will be added by CorsMiddleware
-                return responses::error_403();
-            }
+        } else {
+            None
         }
     } else {
         None
@@ -849,9 +880,13 @@ pub async fn handle_request(
     // Optimization: Only parse cookies if handler needs them
     // Cookie parsing can be expensive for requests with many cookies
     let cookies = if needs_cookies {
-        parse_cookies_inline(headers.get("cookie").map(|s| s.as_str()))
+        Some(parse_cookies_inline(
+            headers
+                .as_ref()
+                .and_then(|h| h.get("cookie").map(|s| s.as_str())),
+        ))
     } else {
-        AHashMap::new()
+        None
     };
 
     // Derive connection info from already-extracted headers (avoids a second header-parse pass).
@@ -859,16 +894,22 @@ pub async fn handle_request(
     // When headers weren't extracted (pure API routes with no auth/cookies/middleware),
     // empty strings are safe because no Django middleware will call META anyway.
     let (conn_host, conn_scheme, conn_remote_addr) = if must_extract_headers {
-        let host = headers.get("host").cloned().unwrap_or_default();
+        let host = headers
+            .as_ref()
+            .and_then(|h| h.get("host"))
+            .cloned()
+            .unwrap_or_default();
         let scheme = headers
-            .get("x-forwarded-proto")
+            .as_ref()
+            .and_then(|h| h.get("x-forwarded-proto"))
             .cloned()
             .unwrap_or_else(|| "http".to_string());
         // X-Forwarded-For: leftmost IP is the original client (RFC 7239 §7.1)
         let remote_addr = headers
-            .get("x-forwarded-for")
+            .as_ref()
+            .and_then(|h| h.get("x-forwarded-for"))
             .and_then(|v| v.split(',').next().map(|s| s.trim().to_string()))
-            .or_else(|| headers.get("x-real-ip").cloned())
+            .or_else(|| headers.as_ref().and_then(|h| h.get("x-real-ip").cloned()))
             .or_else(|| peer_addr.clone())
             .unwrap_or_else(|| "127.0.0.1".to_string());
         (host, scheme, remote_addr)
@@ -879,7 +920,8 @@ pub async fn handle_request(
 
     // Determine if form parsing is needed and get content type
     let content_type = headers
-        .get("content-type")
+        .as_ref()
+        .and_then(|h| h.get("content-type"))
         .map(|s| s.as_str())
         .unwrap_or("");
 
@@ -993,41 +1035,50 @@ pub async fn handle_request(
 
         // OPTIMIZATION: Create typed PyDicts only when non-empty.
         // Saves 1 Python heap alloc per empty source (up to 4 for simple API handlers).
-        let path_params_py: Option<Py<PyDict>> = if path_params.is_empty() {
-            None
-        } else {
+        let path_params_py: Option<Py<PyDict>> = if let Some(path_params) = path_params.as_ref() {
             let dict = PyDict::new(py);
-            for (name, value) in &path_params {
-                if let Some(coerced) = path_coerced.get(name) {
+            for (name, value) in path_params {
+                if let Some(coerced) = path_coerced.as_ref().and_then(|m| m.get(name)) {
                     dict.set_item(name, coerced_value_to_py(py, coerced))?;
                 } else {
                     dict.set_item(name, value)?;
                 }
             }
             Some(dict.unbind())
+        } else {
+            None
         };
 
-        let query_params_py: Option<Py<PyDict>> = if query_params.is_empty() {
-            None
-        } else {
+        let query_params_py: Option<Py<PyDict>> = if let Some(query_params) = query_params.as_ref()
+        {
             let dict = PyDict::new(py);
-            for (name, value) in &query_params {
-                if let Some(coerced) = query_coerced.get(name) {
+            for (name, value) in query_params {
+                if let Some(coerced) = query_coerced.as_ref().and_then(|m| m.get(name)) {
                     dict.set_item(name, coerced_value_to_py(py, coerced))?;
                 } else {
                     dict.set_item(name, value)?;
                 }
             }
             Some(dict.unbind())
+        } else {
+            None
         };
 
         let headers_py: Option<Py<PyDict>> = if needs_headers {
-            Some(params_to_py_dict(py, &headers, param_types)?.unbind())
+            if let Some(headers_map) = headers.as_ref() {
+                Some(params_to_py_dict(py, headers_map, param_types)?.unbind())
+            } else {
+                Some(PyDict::new(py).unbind())
+            }
         } else {
             None
         };
         let cookies_py: Option<Py<PyDict>> = if needs_cookies {
-            Some(params_to_py_dict(py, &cookies, param_types)?.unbind())
+            if let Some(cookies_map) = cookies.as_ref() {
+                Some(params_to_py_dict(py, cookies_map, param_types)?.unbind())
+            } else {
+                Some(PyDict::new(py).unbind())
+            }
         } else {
             None
         };
@@ -1054,14 +1105,9 @@ pub async fn handle_request(
                 Some(d) => d.bind(py),
                 None => &empty_dict,
             };
-            if let Some((pre_args, pre_kwargs)) = build_prebound_args_kwargs(
-                py,
-                bindings,
-                pp_ref,
-                qp_ref,
-                hd_ref,
-                ck_ref,
-            ) {
+            if let Some((pre_args, pre_kwargs)) =
+                build_prebound_args_kwargs(py, bindings, pp_ref, qp_ref, hd_ref, ck_ref)
+            {
                 let state_dict = PyDict::new(py);
                 state_dict.set_item("_bolt_prebound_args", pre_args)?;
                 state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
@@ -1103,10 +1149,9 @@ pub async fn handle_request(
             // SYNC PATH: Call dispatch_sync directly → returns tuple (not coroutine).
             // Parse response wire and build HTTP response in the same GIL block.
             // Eliminates: coroutine creation, into_future_with_locals, asyncio polling.
-            let result_obj =
-                state
-                    .dispatch_sync
-                    .call1(py, (handler, request_obj, handler_id))?;
+            let result_obj = state
+                .dispatch_sync
+                .call1(py, (handler, request_obj, handler_id))?;
             let parsed = parse_response_wire(py, &result_obj)?;
             let meta_ref = parsed.meta.as_ref();
             let response = match parsed.body {
@@ -1156,10 +1201,8 @@ pub async fn handle_request(
                 pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
             })?;
             let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
-            let fut = pyo3_async_runtimes::into_future_with_locals(
-                locals,
-                coroutine.into_bound(py),
-            )?;
+            let fut =
+                pyo3_async_runtimes::into_future_with_locals(locals, coroutine.into_bound(py))?;
             Ok(DispatchOutcome::Pending(Box::pin(fut)))
         }
     });
@@ -1186,10 +1229,7 @@ pub async fn handle_request(
                         error::build_error_response(
                             py,
                             500,
-                            format!(
-                                "Handler returned unsupported response wire format: {}",
-                                e
-                            ),
+                            format!("Handler returned unsupported response wire format: {}", e),
                             vec![],
                             None,
                             state.debug,

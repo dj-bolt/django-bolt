@@ -328,6 +328,11 @@ impl RouteExecutionPlan {
     }
 }
 
+#[inline]
+fn has_enforcing_guards(guards: &[Guard]) -> bool {
+    guards.iter().any(|guard| !matches!(guard, Guard::AllowAny))
+}
+
 /// Dense metadata table keyed by handler_id.
 #[derive(Debug, Clone, Default)]
 pub struct RouteMetadataStore {
@@ -509,7 +514,7 @@ impl RouteMetadata {
 
         let skip_cors = skip.contains("cors");
         let skip_compression = skip.contains("compression");
-        let has_auth_or_guards = !auth_backends.is_empty() || !guards.is_empty();
+        let has_auth_or_guards = !auth_backends.is_empty() || has_enforcing_guards(&guards);
         let has_rate_limit = rate_limit_config.is_some();
         let can_sync_dispatch = py_meta
             .get_item("can_sync_dispatch")
@@ -576,6 +581,25 @@ impl RouteMetadata {
             rust_arg_bindings,
             plan,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_enforcing_guards;
+    use crate::permissions::Guard;
+
+    #[test]
+    fn allow_any_only_is_not_enforcing() {
+        assert!(!has_enforcing_guards(&[Guard::AllowAny]));
+    }
+
+    #[test]
+    fn mixed_guards_are_enforcing() {
+        assert!(has_enforcing_guards(&[
+            Guard::AllowAny,
+            Guard::IsAuthenticated
+        ]));
     }
 }
 

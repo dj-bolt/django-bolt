@@ -21,12 +21,12 @@ impl<'a> RouteMatch<'a> {
         }
     }
 
-    /// Get path params (empty for static routes)
+    /// Get owned path params when present (None for static routes)
     #[inline]
-    pub fn path_params(self) -> AHashMap<String, String> {
+    pub fn path_params(self) -> Option<AHashMap<String, String>> {
         match self {
-            RouteMatch::Static(_) => AHashMap::new(),
-            RouteMatch::Dynamic(_, params) => params,
+            RouteMatch::Static(_) => None,
+            RouteMatch::Dynamic(_, params) => Some(params),
         }
     }
 
