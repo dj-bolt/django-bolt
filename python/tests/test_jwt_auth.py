@@ -8,11 +8,13 @@ Uses pytest-django for proper Django configuration.
 """
 
 import time
+from unittest.mock import AsyncMock, patch
 
 import jwt
 import pytest
 from django.conf import settings  # noqa: PLC0415
 from django.contrib.auth import get_user_model
+from django.db import InterfaceError, OperationalError
 
 from django_bolt import BoltAPI
 from django_bolt.auth import (
@@ -273,6 +275,76 @@ def test_jwt_custom_secret_overrides():
     assert auth.secret == "custom-secret"
     assert auth.secret != settings.SECRET_KEY
     print("✓ Explicit JWT secret overrides Django SECRET_KEY")
+
+
+@pytest.mark.asyncio
+async def test_get_user_reraises_operational_error():
+    """Test that OperationalError propagates instead of being swallowed.
+
+    Regression test for https://github.com/dj-bolt/django-bolt/issues/165
+    OperationalError must propagate so Django's connection pool can detect
+    dead connections and recover.
+    """
+    auth = JWTAuthentication(secret="test-secret")
+
+    with patch.object(
+        auth._get_user_model().objects,
+        "aget",
+        new_callable=AsyncMock,
+        side_effect=OperationalError("connection reset"),
+    ):
+        with pytest.raises(OperationalError):
+            await auth.get_user("1", {})
+
+
+@pytest.mark.asyncio
+async def test_get_user_reraises_interface_error():
+    """Test that InterfaceError propagates instead of being swallowed.
+
+    Regression test for https://github.com/dj-bolt/django-bolt/issues/165
+    """
+    auth = JWTAuthentication(secret="test-secret")
+
+    with patch.object(
+        auth._get_user_model().objects,
+        "aget",
+        new_callable=AsyncMock,
+        side_effect=InterfaceError("connection closed"),
+    ):
+        with pytest.raises(InterfaceError):
+            await auth.get_user("1", {})
+
+
+def test_get_user_sync_reraises_operational_error():
+    """Test that sync get_user reraises OperationalError.
+
+    Regression test for https://github.com/dj-bolt/django-bolt/issues/165
+    """
+    auth = JWTAuthentication(secret="test-secret")
+
+    with patch.object(
+        auth._get_user_model().objects,
+        "get",
+        side_effect=OperationalError("connection reset"),
+    ):
+        with pytest.raises(OperationalError):
+            auth.get_user_sync("1")
+
+
+def test_get_user_sync_reraises_interface_error():
+    """Test that sync get_user reraises InterfaceError.
+
+    Regression test for https://github.com/dj-bolt/django-bolt/issues/165
+    """
+    auth = JWTAuthentication(secret="test-secret")
+
+    with patch.object(
+        auth._get_user_model().objects,
+        "get",
+        side_effect=InterfaceError("connection closed"),
+    ):
+        with pytest.raises(InterfaceError):
+            auth.get_user_sync("1")
 
 
 if __name__ == "__main__":
