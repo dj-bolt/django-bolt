@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib
 import importlib.metadata
+import importlib.util
 import os
 import signal
 import sys
@@ -30,6 +32,69 @@ try:
     from django_bolt.admin.admin_detection import detect_admin_url_prefix
 except ImportError:
     detect_admin_url_prefix = None
+
+
+def find_bolt_api_names(module_name: str) -> list[str]:
+    """Use AST to find variable names assigned to BoltAPI() calls in a module.
+
+    Parses the module source without importing it, so no side effects are triggered.
+    Handles ``BoltAPI()``, import aliases (``from django_bolt.api import BoltAPI as X``),
+    and attribute-style calls (``django_bolt.api.BoltAPI()``).
+    Only top-level assignments are considered.
+    """
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.origin is None:
+        return []
+
+    try:
+        with open(spec.origin) as f:
+            source = f.read()
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    # Track which local names map to BoltAPI via imports
+    bolt_api_aliases: set[str] = {"BoltAPI"}
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and "django_bolt" in node.module:
+            for alias in node.names:
+                if alias.name == "BoltAPI":
+                    bolt_api_aliases.add(alias.asname or alias.name)
+
+    # Find top-level assignments where RHS is a call to a BoltAPI alias
+    names: list[str] = []
+
+    for node in ast.iter_child_nodes(tree):
+        call_node = None
+        targets: list[str] = []
+
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            call_node = node.value
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    targets.append(target.id)
+        elif isinstance(node, ast.AnnAssign) and node.value and isinstance(node.value, ast.Call):
+            call_node = node.value
+            if isinstance(node.target, ast.Name):
+                targets.append(node.target.id)
+
+        if call_node is None:
+            continue
+
+        func = call_node.func
+        is_bolt = (isinstance(func, ast.Name) and func.id in bolt_api_aliases) or (
+            isinstance(func, ast.Attribute) and func.attr == "BoltAPI"
+        )
+
+        if is_bolt:
+            names.extend(targets)
+
+    return names
 
 
 class Command(BaseCommand):
@@ -155,7 +220,7 @@ class Command(BaseCommand):
         apis = self.autodiscover_apis()
         if not apis:
             self.stdout.write(
-                self.style.WARNING("No BoltAPI instances found. Create api.py files with api = BoltAPI()")
+                self.style.WARNING("No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment, e.g., api = BoltAPI()")
             )
             return
 
@@ -233,7 +298,7 @@ class Command(BaseCommand):
 
         if not apis:
             self.stdout.write(
-                self.style.WARNING("No BoltAPI instances found. Create api.py files with api = BoltAPI()")
+                self.style.WARNING("No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment")
             )
             return
 
@@ -464,15 +529,15 @@ class Command(BaseCommand):
 
         # Try project-level API first (common pattern)
         project_name = settings.ROOT_URLCONF.split(".")[0]  # Extract project name from ROOT_URLCONF
-        project_candidates = [
-            f"{project_name}.api:api",
-            f"{project_name}.bolt_api:api",
-        ]
 
-        for candidate in project_candidates:
-            api = self.import_api(candidate)
-            if api:
-                apis.append((candidate, api))
+        for module_suffix in ("api", "bolt_api"):
+            module_name = f"{project_name}.{module_suffix}"
+            attr_names = find_bolt_api_names(module_name)
+            for attr_name in attr_names:
+                candidate = f"{module_name}:{attr_name}"
+                api = self.import_api(candidate)
+                if api:
+                    apis.append((candidate, api))
 
         # Track which apps we've already imported (to avoid duplicates)
         imported_apps = {api_path.split(":")[0].split(".")[0] for api_path, _ in apis}
@@ -495,18 +560,21 @@ class Command(BaseCommand):
                     apis.append((app_config.bolt_api, api))
                 continue
 
-            # Try standard locations
+            # Try standard locations using AST discovery
             app_name = app_config.name
-            candidates = [
-                f"{app_name}.api:api",
-                f"{app_name}.bolt_api:api",
-            ]
-
-            for candidate in candidates:
-                api = self.import_api(candidate)
-                if api:
-                    apis.append((candidate, api))
-                    break  # Only take first match per app
+            found = False
+            for module_suffix in ("api", "bolt_api"):
+                if found:
+                    break
+                module_name = f"{app_name}.{module_suffix}"
+                attr_names = find_bolt_api_names(module_name)
+                for attr_name in attr_names:
+                    candidate = f"{module_name}:{attr_name}"
+                    api = self.import_api(candidate)
+                    if api:
+                        apis.append((candidate, api))
+                        found = True
+                        break  # Only take first match per module
 
         return self._deduplicate_apis(apis)
 
