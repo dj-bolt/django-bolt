@@ -272,8 +272,8 @@ class TestHealthCheckScenarios:
         await hc.run_checks()
         elapsed = time.time() - start_time
 
-        # With concurrent execution, checks should complete faster
-        assert elapsed < 0.3  # Just check it completes reasonably fast
+        # Two 0.1s checks running concurrently should complete in ~0.1s
+        assert elapsed < 0.15
 
 
 if __name__ == "__main__":

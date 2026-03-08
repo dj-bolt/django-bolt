@@ -3,6 +3,7 @@
 Provides standard health check endpoints for monitoring and load balancers.
 """
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
