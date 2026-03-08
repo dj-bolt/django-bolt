@@ -720,6 +720,85 @@ class TestDjangoFileFieldIntegration:
         assert doc.file.read() == file_content
         doc.file.close()
 
+    def test_direct_assign_to_filefield(self, django_db_setup, db, tmp_path, settings):
+        """Test directly assigning UploadFile.file to a FileField (no .save() on field)."""
+        from tests.test_models import Document
+
+        settings.MEDIA_ROOT = str(tmp_path)
+
+        api = BoltAPI()
+
+        @api.post("/documents")
+        def create_document(
+            title: Annotated[str, Form()],
+            file: Annotated[UploadFile, File()],
+        ):
+            doc = Document(title=title)
+            doc.file = file.file
+            doc.save()
+            return {
+                "id": doc.id,
+                "title": doc.title,
+                "filename": doc.file.name,
+            }
+
+        client = TestClient(api)
+        file_content = b"Direct assignment test content"
+        response = client.post(
+            "/documents",
+            data={"title": "Direct Assign"},
+            files={"file": ("direct.txt", file_content, "text/plain")},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["title"] == "Direct Assign"
+        assert "direct" in data["filename"]
+
+        # Verify file was saved to storage
+        doc = Document.objects.get(id=data["id"])
+        assert doc.title == "Direct Assign"
+        assert doc.file.read() == file_content
+        doc.file.close()
+
+    def test_direct_assign_to_filefield_async(self, django_db_setup, db, tmp_path, settings):
+        """Test directly assigning UploadFile.file to a FileField in async handler."""
+        from tests.test_models import Document
+
+        settings.MEDIA_ROOT = str(tmp_path)
+
+        api = BoltAPI()
+
+        @api.post("/documents")
+        async def create_document(
+            title: Annotated[str, Form()],
+            file: Annotated[UploadFile, File()],
+        ):
+            doc = Document(title=title)
+            doc.file = file.file
+            await doc.asave()
+            return {
+                "id": doc.id,
+                "title": doc.title,
+                "filename": doc.file.name,
+            }
+
+        client = TestClient(api)
+        file_content = b"Async direct assignment content"
+        response = client.post(
+            "/documents",
+            data={"title": "Async Direct"},
+            files={"file": ("async_direct.txt", file_content, "text/plain")},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["title"] == "Async Direct"
+
+        doc = Document.objects.get(id=data["id"])
+        assert doc.file.read() == file_content
+        doc.file.close()
+
 
 class TestAutoCleanup:
     """Test framework-level auto-cleanup of UploadFile resources."""

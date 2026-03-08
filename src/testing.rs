@@ -719,23 +719,30 @@ async fn handle_test_request_internal(
         .map(|m| m.plan.needs_query())
         .unwrap_or(true);
     let query_params = if needs_query {
-        if let Some(q) = req.uri().query() {
-            parse_query_string(q)
-        } else {
-            AHashMap::new()
-        }
+        req.uri().query().and_then(|q| {
+            let parsed = parse_query_string(q);
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            }
+        })
     } else {
-        AHashMap::new()
+        None
     };
 
     // Validate typed parameters before GIL acquisition and cache non-string coerced values.
     let (path_coerced, query_coerced) = if let Some(ref meta) = route_meta {
-        match validate_and_cache_typed_params(&path_params, &query_params, &meta.param_types) {
+        match validate_and_cache_typed_params(
+            path_params.as_ref(),
+            query_params.as_ref(),
+            &meta.param_types,
+        ) {
             Ok(cached) => cached,
             Err(response) => return response,
         }
     } else {
-        (AHashMap::new(), AHashMap::new())
+        (None, None)
     };
 
     // Extract headers
@@ -947,23 +954,33 @@ async fn handle_test_request_internal(
             .unwrap_or_default();
 
         // Create typed dicts - reuse pre-coerced path/query values from validation phase.
-        let path_params_dict = PyDict::new(py);
-        for (name, value) in &path_params {
-            if let Some(coerced) = path_coerced.get(name) {
-                path_params_dict.set_item(name, coerced_value_to_py(py, coerced))?;
-            } else {
-                path_params_dict.set_item(name, value)?;
+        let path_params_dict = if let Some(path_params) = path_params.as_ref() {
+            let dict = PyDict::new(py);
+            for (name, value) in path_params {
+                if let Some(coerced) = path_coerced.as_ref().and_then(|m| m.get(name)) {
+                    dict.set_item(name, coerced_value_to_py(py, coerced))?;
+                } else {
+                    dict.set_item(name, value)?;
+                }
             }
-        }
+            Some(dict.unbind())
+        } else {
+            None
+        };
 
-        let query_params_dict = PyDict::new(py);
-        for (name, value) in &query_params {
-            if let Some(coerced) = query_coerced.get(name) {
-                query_params_dict.set_item(name, coerced_value_to_py(py, coerced))?;
-            } else {
-                query_params_dict.set_item(name, value)?;
+        let query_params_dict = if let Some(query_params) = query_params.as_ref() {
+            let dict = PyDict::new(py);
+            for (name, value) in query_params {
+                if let Some(coerced) = query_coerced.as_ref().and_then(|m| m.get(name)) {
+                    dict.set_item(name, coerced_value_to_py(py, coerced))?;
+                } else {
+                    dict.set_item(name, value)?;
+                }
             }
-        }
+            Some(dict.unbind())
+        } else {
+            None
+        };
 
         let headers_dict = params_to_py_dict(py, &headers_for_python, &param_types)?;
         let cookies_dict = params_to_py_dict(py, &cookies, &param_types)?;
@@ -974,11 +991,20 @@ async fn handle_test_request_internal(
             .as_ref()
             .and_then(|m| m.rust_arg_bindings.as_deref())
         {
+            let empty_dict = PyDict::new(py);
+            let pp_ref = match &path_params_dict {
+                Some(d) => d.bind(py),
+                None => &empty_dict,
+            };
+            let qp_ref = match &query_params_dict {
+                Some(d) => d.bind(py),
+                None => &empty_dict,
+            };
             if let Some((pre_args, pre_kwargs)) = build_prebound_args_kwargs(
                 py,
                 bindings,
-                &path_params_dict,
-                &query_params_dict,
+                pp_ref,
+                qp_ref,
                 &headers_dict,
                 &cookies_dict,
             ) {
@@ -1002,10 +1028,10 @@ async fn handle_test_request_internal(
             method: method.to_string(),
             path: path.to_string(),
             body: body.to_vec(),
-            path_params: path_params_dict.unbind(),
-            query_params: query_params_dict.unbind(),
-            headers: headers_dict.unbind(),
-            cookies: cookies_dict.unbind(),
+            path_params: path_params_dict,
+            query_params: query_params_dict,
+            headers: Some(headers_dict.unbind()),
+            cookies: Some(cookies_dict.unbind()),
             context,
             user: None,
             state: state_lock,

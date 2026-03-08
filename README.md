@@ -2,8 +2,10 @@
   <img src="docs/logo.png" alt="Django-Bolt Logo" width="400"/>
 </div>
 
+[![PyPI version](https://img.shields.io/pypi/v/django-bolt.svg)](https://pypi.org/project/django-bolt/)
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/django-bolt?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/django-bolt)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/FarhanAliRaza/django-bolt)
+[![Sponsor](https://img.shields.io/badge/Sponsor-Django%20Bolt-pink)](https://opencollective.com/django-bolt)
 
 # High-Performance Fully Typed API Framework for Django
 

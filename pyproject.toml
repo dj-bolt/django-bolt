@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "django-bolt"
-version = "0.6.5"
+version = "0.6.6"
 description = "High-performance API framework for Django with Rust-powered endpoints delivering 60k+ RPS"
 readme = "README.md"
 requires-python = ">=3.12"

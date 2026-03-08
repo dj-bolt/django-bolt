@@ -8,63 +8,63 @@ Django-Bolt settings are configured in your Django `settings.py` file.
 
 ## CORS settings
 
-### BOLT_CORS_ALLOWED_ORIGINS
+### CORS_ALLOWED_ORIGINS
 
 List of allowed origins for CORS.
 
 ```python
-BOLT_CORS_ALLOWED_ORIGINS = [
+CORS_ALLOWED_ORIGINS = [
     "https://example.com",
     "https://app.example.com",
 ]
 ```
 
-### BOLT_CORS_ALLOW_ALL_ORIGINS
+### CORS_ALLOW_ALL_ORIGINS
 
 Allow all origins (development only).
 
 ```python
-BOLT_CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = True
 ```
 
-### BOLT_CORS_ALLOW_CREDENTIALS
+### CORS_ALLOW_CREDENTIALS
 
 Allow credentials in CORS requests.
 
 ```python
-BOLT_CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_CREDENTIALS = True
 ```
 
-### BOLT_CORS_ALLOW_METHODS
+### CORS_ALLOW_METHODS
 
 Allowed HTTP methods for CORS.
 
 ```python
-BOLT_CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
+CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
 ```
 
-### BOLT_CORS_ALLOW_HEADERS
+### CORS_ALLOW_HEADERS
 
 Allowed headers in CORS requests.
 
 ```python
-BOLT_CORS_ALLOW_HEADERS = ["Content-Type", "Authorization", "X-Requested-With"]
+CORS_ALLOW_HEADERS = ["Content-Type", "Authorization", "X-Requested-With"]
 ```
 
-### BOLT_CORS_EXPOSE_HEADERS
+### CORS_EXPOSE_HEADERS
 
 Headers exposed to the browser.
 
 ```python
-BOLT_CORS_EXPOSE_HEADERS = ["X-Total-Count", "X-Page-Count"]
+CORS_EXPOSE_HEADERS = ["X-Total-Count", "X-Page-Count"]
 ```
 
-### BOLT_CORS_MAX_AGE
+### CORS_MAX_AGE
 
 Preflight cache duration in seconds.
 
 ```python
-BOLT_CORS_MAX_AGE = 86400  # 24 hours
+CORS_MAX_AGE = 86400  # 24 hours
 ```
 
 ## File upload settings
@@ -314,13 +314,13 @@ api = BoltAPI(
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `BOLT_CORS_ALLOWED_ORIGINS` | `list[str]` | `[]` | Allowed CORS origins |
-| `BOLT_CORS_ALLOW_ALL_ORIGINS` | `bool` | `False` | Allow all origins |
-| `BOLT_CORS_ALLOW_CREDENTIALS` | `bool` | `False` | Allow credentials |
-| `BOLT_CORS_ALLOW_METHODS` | `list[str]` | All methods | Allowed methods |
-| `BOLT_CORS_ALLOW_HEADERS` | `list[str]` | `[]` | Allowed headers |
-| `BOLT_CORS_EXPOSE_HEADERS` | `list[str]` | `[]` | Exposed headers |
-| `BOLT_CORS_MAX_AGE` | `int` | `600` | Preflight cache (seconds) |
+| `CORS_ALLOWED_ORIGINS` | `list[str]` | `[]` | Allowed CORS origins |
+| `CORS_ALLOW_ALL_ORIGINS` | `bool` | `False` | Allow all origins |
+| `CORS_ALLOW_CREDENTIALS` | `bool` | `False` | Allow credentials |
+| `CORS_ALLOW_METHODS` | `list[str]` | All methods | Allowed methods |
+| `CORS_ALLOW_HEADERS` | `list[str]` | `[]` | Allowed headers |
+| `CORS_EXPOSE_HEADERS` | `list[str]` | `[]` | Exposed headers |
+| `CORS_MAX_AGE` | `int` | `600` | Preflight cache (seconds) |
 | `BOLT_MAX_UPLOAD_SIZE` | `int` | `1048576` | Max upload size (bytes) |
 | `BOLT_MEMORY_SPOOL_THRESHOLD` | `int` | `1048576` | Memory threshold before disk spooling (bytes) |
 | `BOLT_ALLOWED_FILE_PATHS` | `list[str]` | `None` | File serving whitelist |

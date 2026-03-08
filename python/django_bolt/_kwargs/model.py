@@ -475,6 +475,14 @@ async def build_handler_arguments(
     return args, kwargs
 
 
+# Pre-allocated constant for no-params handlers (zero alloc per request)
+_NO_PARAMS: tuple[tuple[()], dict[str, Any]] = ((), {})
+
+
+def _injector_no_params(request: Any) -> tuple[tuple[()], dict[str, Any]]:
+    return _NO_PARAMS
+
+
 def compile_argument_injector(
     meta: HandlerMetadata,
     handler_meta_dict: dict[int, HandlerMetadata],
@@ -518,13 +526,11 @@ def compile_argument_injector(
 
         return injector_request_only
 
-    # Fast path 2: No parameters
+    # Fast path 2: No parameters — return pre-allocated constant (zero alloc per request)
     if not fields or pattern is HandlerPattern.NO_PARAMS:
+        return _injector_no_params
 
-        def injector_no_params(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
-            return ([], {})
 
-        return injector_no_params
 
     # Fast path 3: Path-only parameters (e.g., GET /users/{id})
     # Uses pre-compiled extractors directly on params_map

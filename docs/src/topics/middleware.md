@@ -39,20 +39,20 @@ Configure CORS for all endpoints in `settings.py`:
 
 ```python
 # Allow specific origins
-BOLT_CORS_ALLOWED_ORIGINS = [
+CORS_ALLOWED_ORIGINS = [
     "https://example.com",
     "https://app.example.com",
 ]
 
 # Allow all origins (development only!)
-BOLT_CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = True
 
 # Additional settings
-BOLT_CORS_ALLOW_CREDENTIALS = True
-BOLT_CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
-BOLT_CORS_ALLOW_HEADERS = ["Content-Type", "Authorization", "X-Requested-With"]
-BOLT_CORS_EXPOSE_HEADERS = ["X-Total-Count", "X-Page-Count"]
-BOLT_CORS_MAX_AGE = 86400  # 24 hours
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
+CORS_ALLOW_HEADERS = ["Content-Type", "Authorization", "X-Requested-With"]
+CORS_EXPOSE_HEADERS = ["X-Total-Count", "X-Page-Count"]
+CORS_MAX_AGE = 86400  # 24 hours
 ```
 
 ## Rate limiting
