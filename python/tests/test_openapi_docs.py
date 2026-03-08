@@ -420,5 +420,57 @@ def test_openapi_security_requirements_for_authenticated_routes():
             f"API key route should have ApiKeyAuth security, got: {api_key_security}"
         )
 
-        # Note: securitySchemes in components are populated based on the auth backends used.
-        # The key fix is that security requirements now appear on routes (tested above).
+        # SecuritySchemes MUST be auto-registered in components for Swagger UI
+        # authorize button to work (clicking padlock should open token modal)
+        components = schema.get("components", {})
+        security_schemes = components.get("securitySchemes", {})
+
+        assert "BearerAuth" in security_schemes, (
+            f"BearerAuth must be auto-registered in components.securitySchemes, got: {security_schemes}"
+        )
+        assert security_schemes["BearerAuth"]["type"] == "http"
+        assert security_schemes["BearerAuth"]["scheme"] == "bearer"
+
+        assert "ApiKeyAuth" in security_schemes, (
+            f"ApiKeyAuth must be auto-registered in components.securitySchemes, got: {security_schemes}"
+        )
+        assert security_schemes["ApiKeyAuth"]["type"] == "apiKey"
+        assert security_schemes["ApiKeyAuth"]["name"] == "x-api-key"
+
+
+def test_openapi_security_schemes_preserve_user_defined():
+    """Test that user-defined security schemes are preserved and not overwritten."""
+    from django_bolt.auth import JWTAuthentication, IsAuthenticated
+    from django_bolt.openapi.spec import Components, SecurityScheme
+
+    custom_scheme = SecurityScheme(
+        type="http",
+        scheme="bearer",
+        bearer_format="CustomJWT",
+        description="My custom JWT scheme",
+    )
+
+    api = BoltAPI(
+        openapi_config=OpenAPIConfig(
+            title="Custom Auth API",
+            version="1.0.0",
+            components=Components(
+                security_schemes={"BearerAuth": custom_scheme},
+            ),
+        )
+    )
+
+    @api.get("/protected", auth=[JWTAuthentication(secret="test")], guards=[IsAuthenticated()])
+    async def protected():
+        return {"ok": True}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get("/docs/openapi.json")
+        schema = response.json()
+        schemes = schema["components"]["securitySchemes"]
+
+        # User-defined scheme should be preserved, not overwritten
+        assert schemes["BearerAuth"]["bearerFormat"] == "CustomJWT"
+        assert schemes["BearerAuth"]["description"] == "My custom JWT scheme"
