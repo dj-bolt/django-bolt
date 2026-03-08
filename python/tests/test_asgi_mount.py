@@ -408,3 +408,32 @@ def test_runbolt_allows_prefix_overlap_without_exact_collision():
 
     # Exact collisions are forbidden; prefix overlap is allowed.
     command.validate_asgi_mount_conflicts(routes, asgi_mounts)
+
+
+class _CustomConfigError(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("exc_class", "exc_msg", "expected_fragments"),
+    [
+        (RuntimeError, "SECRET_KEY must not be empty", ["SECRET_KEY must not be empty"]),
+        (_CustomConfigError, "bad config value", ["_CustomConfigError", "bad config value"]),
+    ],
+    ids=["builtin-exception", "custom-exception-type"],
+)
+def test_mount_asgi_exception_surfaces_in_response(exc_class, exc_msg, expected_fragments):
+    """ASGI app exceptions must appear (type + message) in the HTTP 500 response."""
+    api = BoltAPI()
+
+    async def broken_asgi(scope, receive, send):
+        raise exc_class(exc_msg)
+
+    api.mount_asgi("/broken", broken_asgi)
+
+    with TestClient(api) as client:
+        response = client.get("/broken")
+
+    assert response.status_code == 500
+    for fragment in expected_fragments:
+        assert fragment in response.text
