@@ -41,6 +41,7 @@ class APIView:
     guards: list[Any] | None = None
     auth: list[Any] | None = None
     status_code: int | None = None
+    validate_response: bool | None = None
 
     def __init__(self, **kwargs):
         """
@@ -169,6 +170,11 @@ class APIView:
             view_handler.__bolt_auth__ = cls.auth
         if cls.status_code is not None:
             view_handler.__bolt_status_code__ = cls.status_code
+        if cls.validate_response is not None:
+            view_handler.__bolt_validate_response__ = cls.validate_response
+
+        if getattr(method_handler, "validate_response", None) is not None:
+            view_handler.validate_response = method_handler.validate_response
 
         # Copy pagination attributes from method handler (for @paginate decorator)
         if hasattr(method_handler, "__paginated__"):

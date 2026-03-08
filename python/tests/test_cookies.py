@@ -347,13 +347,15 @@ class TestAsyncSerializationWithCookies:
 
     async def test_json_async_serialization_includes_cookies(self):
         """Test that JSON async serialization includes raw cookie tuples for Rust."""
-        from django_bolt.serialization import serialize_json_response
+        from django_bolt.serialization import compile_response_handlers, serialize_response
 
+        meta = {"response_type": None, "validate_response": False, "default_status_code": 200, "_stream_info": (False, None)}
+        compile_response_handlers(meta)
         response = JSON({"ok": True}).set_cookie("api_token", "secret123", httponly=True)
-        status, meta, body_kind, body = await serialize_json_response(response, None, None)
+        status, meta_out, body_kind, body = await serialize_response(response, meta)
         assert body_kind == 0  # _BODY_BYTES
-        assert isinstance(meta, tuple)
-        response_type, custom_ct, custom_headers, cookies = meta
+        assert isinstance(meta_out, tuple)
+        response_type, custom_ct, custom_headers, cookies = meta_out
         assert response_type == "json"
         assert cookies is not None
         assert len(cookies) == 1
@@ -364,13 +366,15 @@ class TestAsyncSerializationWithCookies:
 
     async def test_response_async_serialization_includes_cookies(self):
         """Test that Response async serialization includes raw cookie tuples for Rust."""
-        from django_bolt.serialization import serialize_generic_response
+        from django_bolt.serialization import compile_response_handlers, serialize_response
 
+        meta = {"response_type": None, "validate_response": False, "default_status_code": 200, "_stream_info": (False, None)}
+        compile_response_handlers(meta)
         response = Response({"status": "logged_in"}).set_cookie("session", "xyz", secure=True)
-        status, meta, body_kind, body = await serialize_generic_response(response, None, None)
+        status, meta_out, body_kind, body = await serialize_response(response, meta)
         assert body_kind == 0  # _BODY_BYTES
-        assert isinstance(meta, tuple)
-        response_type, custom_ct, custom_headers, cookies = meta
+        assert isinstance(meta_out, tuple)
+        response_type, custom_ct, custom_headers, cookies = meta_out
         assert cookies is not None
         assert len(cookies) == 1
         assert cookies[0][0] == "session"

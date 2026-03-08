@@ -390,9 +390,17 @@ async def read_10k():
     """
     return test_data.JSON_10K
 
-
-@api.get("/1k-json")
-async def read_1k():
+class ItemSchema(msgspec.Struct):
+    id: int
+    name: str
+    description: str
+    price: float
+    category: str
+    in_stock: bool
+    tags: list[str]
+    
+@api.get("/1k-json", validate_response=False)
+async def read_1k() -> list[ItemSchema]:
     """
     Endpoint that returns 10k JSON objects.
 

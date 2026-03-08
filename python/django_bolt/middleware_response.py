@@ -17,6 +17,7 @@ from .serialization import (
     _BODY_FILE,
     _BODY_STREAM,
     _RESPONSE_META_EMPTY,
+    _RESPONSE_META_HTML,
     _RESPONSE_META_JSON,
     _RESPONSE_META_OCTETSTREAM,
     _RESPONSE_META_PLAINTEXT,
@@ -28,6 +29,7 @@ _META_TAG_TO_RESPONSE_TYPE = {
     _RESPONSE_META_PLAINTEXT: "plaintext",
     _RESPONSE_META_OCTETSTREAM: "octetstream",
     _RESPONSE_META_EMPTY: "empty",
+    _RESPONSE_META_HTML: "html",
 }
 
 # Raw cookie tuple type (matches serialization.py CookieTuple)

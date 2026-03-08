@@ -1,12 +1,11 @@
 import asyncio
 import time
 
+import test_data
 from django.contrib.auth import authenticate, login, logout
 from django.http import JsonResponse, StreamingHttpResponse
 from django.shortcuts import redirect
 from django.urls import reverse
-
-import test_data
 
 
 async def index(request):

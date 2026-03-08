@@ -21,7 +21,6 @@ from django_bolt.admin.static import find_static_file
 from django_bolt.shortcuts import render
 from django_bolt.testing import TestClient
 
-
 # Create test static files directory
 TEST_STATIC_DIR = tempfile.mkdtemp(prefix="django_bolt_static_")
 
@@ -618,6 +617,7 @@ class TestContentSecurityPolicy:
     def test_csp_header_applied_when_configured(self):
         """Test that CSP header is applied when BOLT_STATIC_CSP is set."""
         from django.conf import settings
+
         from django_bolt.admin.static import register_static_routes
 
         # Configure CSP
@@ -639,6 +639,7 @@ class TestContentSecurityPolicy:
     def test_no_csp_header_when_not_configured(self):
         """Test that no CSP header is added when not configured."""
         from django.conf import settings
+
         from django_bolt.admin.static import register_static_routes
 
         settings.STATIC_ROOT = TEST_STATIC_DIR

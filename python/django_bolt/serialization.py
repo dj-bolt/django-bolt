@@ -7,12 +7,23 @@ import mimetypes
 import types
 from collections.abc import (
     AsyncGenerator as AsyncGeneratorABC,
+)
+from collections.abc import (
     AsyncIterable as AsyncIterableABC,
+)
+from collections.abc import (
     AsyncIterator as AsyncIteratorABC,
+)
+from collections.abc import (
     Generator as GeneratorABC,
+)
+from collections.abc import (
     Iterable as IterableABC,
+)
+from collections.abc import (
     Iterator as IteratorABC,
 )
+from functools import cache
 from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 
 import msgspec
@@ -50,7 +61,7 @@ _BODY_STREAM: int = 1
 _BODY_FILE: int = 2
 
 BodyKind = Literal[0, 1, 2]
-ResponseWireV1 = tuple[int, ResponseMetaTuple, BodyKind, bytes | StreamingResponse | str]
+ResponseWireV1 = tuple[int, ResponseMetaTuple | int, BodyKind, bytes | StreamingResponse | str]
 
 
 def _build_response_meta(
@@ -111,6 +122,7 @@ _RESPONSE_META_JSON: int = 0
 _RESPONSE_META_PLAINTEXT: int = 1
 _RESPONSE_META_OCTETSTREAM: int = 2
 _RESPONSE_META_EMPTY: int = 3
+_RESPONSE_META_HTML: int = 4
 _TYPED_STREAM_MEDIA_TYPE = "application/x-ndjson"
 _RAW_STREAM_CHUNK_TYPES = (bytes, bytearray, memoryview, str)
 _STREAM_ANNOTATION_ORIGINS = {
@@ -151,6 +163,153 @@ def _convert_serializers(result: Any) -> Any:
     return result
 
 
+_RESPONSE_INSTANCE_TYPES = (
+    JSON,
+    PlainText,
+    HTML,
+    Redirect,
+    File,
+    FileResponse,
+    StreamingResponse,
+    ResponseClass,
+    DjangoHttpResponse,
+)
+_STATIC_RESPONSE_META = {
+    "json": _RESPONSE_META_JSON,
+    "plaintext": _RESPONSE_META_PLAINTEXT,
+    "octetstream": _RESPONSE_META_OCTETSTREAM,
+    "html": _RESPONSE_META_HTML,
+}
+_VALIDATION_NOOP_TYPES = {
+    dict,
+    list,
+    str,
+    int,
+    float,
+    bool,
+    bytes,
+    bytearray,
+    type(None),
+}
+
+
+def _response_validation_error(exc: Exception) -> ResponseWireV1:
+    err = f"Response validation error: {exc}"
+    return _wire_bytes(
+        500,
+        _build_response_meta(
+            "plaintext",
+            {"content-type": "text/plain; charset=utf-8"},
+            None,
+        ),
+        err.encode(),
+    )
+
+
+def _build_wire_meta(
+    response_type: str,
+    custom_headers: dict[str, str] | None,
+    cookies: list[Cookie] | None,
+) -> ResponseMetaTuple | int:
+    if not custom_headers and not cookies:
+        static_meta = _STATIC_RESPONSE_META.get(response_type)
+        if static_meta is not None:
+            return static_meta
+    return _build_response_meta(response_type, custom_headers, cookies)
+
+
+@cache
+def _infer_wire_response_type(media_type: str) -> str:
+    normalized = media_type.split(";", 1)[0].strip().lower()
+    if normalized == "application/json" or normalized.endswith("+json"):
+        return "json"
+    if normalized == "text/plain":
+        return "plaintext"
+    if normalized == "text/html":
+        return "html"
+    return "octetstream"
+
+
+@cache
+def _is_json_media_type(media_type: str) -> bool:
+    normalized = media_type.split(";", 1)[0].strip().lower()
+    return normalized == "application/json" or normalized.endswith("+json")
+
+
+def _render_response_body(content: Any, media_type: str) -> bytes:
+    if _is_json_media_type(media_type):
+        return _json.encode(content)
+    if isinstance(content, memoryview):
+        return content.tobytes()
+    if isinstance(content, (bytes, bytearray)):
+        return bytes(content)
+    if isinstance(content, str):
+        return content.encode()
+    return str(content).encode()
+
+
+def _ensure_content_type_header(headers: dict[str, str] | None, media_type: str) -> dict[str, str]:
+    normalized = headers.copy() if headers else {}
+    if not any(k.lower() == "content-type" for k in normalized):
+        normalized["content-type"] = media_type
+    return normalized
+
+
+def _response_validation_is_required(annotation: Any) -> bool:
+    if annotation is None:
+        return False
+    return annotation not in _VALIDATION_NOOP_TYPES
+
+
+def _compile_response_validator(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
+    response_type = meta.get("response_type")
+    if not meta.get("validate_response", True) or not _response_validation_is_required(response_type):
+        return None, None
+
+    def validate_sync(value: Any) -> Any:
+        return coerce_to_response_type(value, response_type, meta=meta)
+
+    async def validate_async(value: Any) -> Any:
+        return await coerce_to_response_type_async(value, response_type, meta=meta)
+
+    return validate_sync, validate_async
+
+
+def _compile_stream_item_validators(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
+    is_stream_annotation, item_type = meta.get("_stream_info", (False, None))
+    if (
+        not is_stream_annotation
+        or item_type is None
+        or item_type in _RAW_STREAM_CHUNK_TYPES
+        or not meta.get("validate_response", True)
+        or not _response_validation_is_required(item_type)
+    ):
+        return None, None
+
+    def validate_sync(value: Any) -> Any:
+        return coerce_to_response_type(value, item_type, meta=meta)
+
+    async def validate_async(value: Any) -> Any:
+        return await coerce_to_response_type_async(value, item_type, meta=meta)
+
+    return validate_sync, validate_async
+
+
+def _compile_queryset_serializers(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
+    field_names = meta.get("response_field_names")
+    if not field_names:
+        return None, None
+
+    def serialize_sync(queryset: QuerySet) -> list[Any]:
+        return list(queryset.values(*field_names))
+
+    async def serialize_async(queryset: QuerySet) -> list[Any]:
+        values_qs = queryset.values(*field_names)
+        return await sync_to_async(list, thread_sensitive=True)(values_qs)
+
+    return serialize_sync, serialize_async
+
+
 def _extract_stream_item_type(annotation: Any) -> tuple[bool, Any | None]:
     """Return (is_stream_annotation, item_type) for streaming return annotations."""
     if annotation is None:
@@ -185,38 +344,42 @@ def _is_stream_protocol_instance(value: Any) -> bool:
     )
 
 
-def _serialize_stream_chunk_sync(chunk: Any, item_type: Any | None, meta: HandlerMetadata) -> bytes | str | bytearray | memoryview:
+def _serialize_stream_chunk_sync(
+    chunk: Any, validator: Any | None,
+) -> bytes | str | bytearray | memoryview:
     """Serialize one stream chunk for sync generators."""
     if isinstance(chunk, _RAW_STREAM_CHUNK_TYPES):
         return chunk
 
     chunk = _convert_serializers(chunk)
-    if item_type is not None:
-        chunk = coerce_to_response_type(chunk, item_type, meta=meta)
+    if validator is not None:
+        chunk = validator(chunk)
     return _json.encode(chunk) + b"\n"
 
 
 async def _serialize_stream_chunk_async(
-    chunk: Any, item_type: Any | None, meta: HandlerMetadata
+    chunk: Any, validator: Any | None,
 ) -> bytes | str | bytearray | memoryview:
     """Serialize one stream chunk for async generators."""
     if isinstance(chunk, _RAW_STREAM_CHUNK_TYPES):
         return chunk
 
     chunk = _convert_serializers(chunk)
-    if item_type is not None:
-        chunk = await coerce_to_response_type_async(chunk, item_type, meta=meta)
+    if validator is not None:
+        chunk = await validator(chunk)
     return _json.encode(chunk) + b"\n"
 
 
 def _wrap_sync_stream_chunks(content: Any, item_type: Any | None, meta: HandlerMetadata):
+    validator = meta.get("_stream_item_validator")
     for chunk in content:
-        yield _serialize_stream_chunk_sync(chunk, item_type, meta)
+        yield _serialize_stream_chunk_sync(chunk, validator)
 
 
 async def _wrap_async_stream_chunks(content: Any, item_type: Any | None, meta: HandlerMetadata):
+    validator = meta.get("_stream_item_validator_async")
     async for chunk in content:
-        yield await _serialize_stream_chunk_async(chunk, item_type, meta)
+        yield await _serialize_stream_chunk_async(chunk, validator)
 
 
 def _to_stream_wire(stream_response: StreamingResponse) -> ResponseWireV1:
@@ -231,7 +394,7 @@ def _to_stream_wire(stream_response: StreamingResponse) -> ResponseWireV1:
 def _build_auto_streaming_response(
     result: Any,
     stream_info: tuple[bool, Any | None],
-    meta: HandlerMetadata,
+    meta: HandlerMetadata | dict[str, Any],
     status_code: int,
 ) -> StreamingResponse | None:
     """Auto-wrap generator/iterator return values into StreamingResponse."""
@@ -255,273 +418,225 @@ def _build_auto_streaming_response(
     return StreamingResponse(result, status_code=status_code)
 
 
-def _resolve_response_type(status_code: int, meta: HandlerMetadata) -> tuple[Any, HandlerMetadata]:
-    """Resolve the response type for a status code in multi-response mode.
+def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
+    validator_sync, validator_async = _compile_response_validator(meta)
+    stream_validator_sync, stream_validator_async = _compile_stream_item_validators(meta)
+    queryset_serializer_sync, queryset_serializer_async = _compile_queryset_serializers(meta)
 
-    Returns a pre-built meta dict with the resolved ``response_type``.
-    """
-    resolved_metas = meta["_resolved_metas"]
-    if status_code in resolved_metas:
-        resolved_meta = resolved_metas[status_code]
-    elif ... in resolved_metas:
-        resolved_meta = resolved_metas[...]
-    else:
-        response_map = meta["response_map"]
+    meta["_response_validator"] = validator_sync
+    meta["_response_validator_async"] = validator_async
+    meta["_stream_item_validator"] = stream_validator_sync
+    meta["_stream_item_validator_async"] = stream_validator_async
+    meta["_queryset_serializer"] = queryset_serializer_sync
+    meta["_queryset_serializer_async"] = queryset_serializer_async
+    meta["_has_response_validation"] = validator_sync is not None or validator_async is not None
+
+    default_status_code = meta["default_status_code"]
+    stream_info = meta.get("_stream_info", (False, None))
+
+    async def data_handler(result: Any, status_code: int | None = None) -> ResponseWireV1:
+        current_status = default_status_code if status_code is None else status_code
+
+        if result is None and current_status == 204:
+            return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
+
+        if isinstance(result, dict):
+            return await _serialize_json_payload_async(result, current_status, validator_async)
+        if isinstance(result, list):
+            return await _serialize_json_payload_async(_convert_serializers(result), current_status, validator_async)
+        if isinstance(result, (bytes, bytearray)):
+            return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
+        if isinstance(result, str):
+            return _wire_bytes(current_status, _RESPONSE_META_PLAINTEXT, result.encode())
+
+        auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status)
+        if auto_stream is not None:
+            return _to_stream_wire(auto_stream)
+
+        original = result
+        result = _convert_serializers(result)
+        if result is not original:
+            return await _serialize_json_payload_async(result, current_status, validator_async)
+
+        if isinstance(result, QuerySet):
+            if queryset_serializer_async is not None:
+                result = await queryset_serializer_async(result)
+            else:
+                result = await sync_to_async(list, thread_sensitive=True)(result)
+            return await _serialize_json_payload_async(result, current_status, validator_async)
+
+        if isinstance(result, msgspec.Struct) or validator_async is not None:
+            return await _serialize_json_payload_async(result, current_status, validator_async)
+
         raise TypeError(
-            f"Status {status_code} has no response schema. "
-            f"Defined: {sorted(c for c in response_map if c is not ...)}"
+            f"Handler returned unsupported type {type(result).__name__!r}. "
+            f"Return dict, list, or a Bolt response type (JSON, PlainText, HTML, Redirect, etc.)"
         )
 
-    return resolved_meta["response_type"], resolved_meta
+    def data_handler_sync(result: Any, status_code: int | None = None) -> ResponseWireV1:
+        current_status = default_status_code if status_code is None else status_code
+
+        if result is None and current_status == 204:
+            return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
+
+        if isinstance(result, dict):
+            return _serialize_json_payload_sync(result, current_status, validator_sync)
+        if isinstance(result, list):
+            return _serialize_json_payload_sync(_convert_serializers(result), current_status, validator_sync)
+        if isinstance(result, (bytes, bytearray)):
+            return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
+        if isinstance(result, str):
+            return _wire_bytes(current_status, _RESPONSE_META_PLAINTEXT, result.encode())
+
+        auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status)
+        if auto_stream is not None:
+            return _to_stream_wire(auto_stream)
+
+        original = result
+        result = _convert_serializers(result)
+        if result is not original:
+            return _serialize_json_payload_sync(result, current_status, validator_sync)
+
+        if isinstance(result, QuerySet):
+            result = queryset_serializer_sync(result) if queryset_serializer_sync is not None else list(result)
+            return _serialize_json_payload_sync(result, current_status, validator_sync)
+
+        if isinstance(result, msgspec.Struct) or validator_sync is not None:
+            return _serialize_json_payload_sync(result, current_status, validator_sync)
+
+        raise TypeError(
+            f"Handler returned unsupported type {type(result).__name__!r}. "
+            f"Return dict, list, or a Bolt response type (JSON, PlainText, HTML, Redirect, etc.)"
+        )
+
+    async def response_type_handler(result: Any) -> ResponseWireV1:
+        if isinstance(result, JSON):
+            if validator_async is not None:
+                try:
+                    data_bytes = _json.encode(await validator_async(result.data))
+                except Exception as exc:
+                    return _response_validation_error(exc)
+            else:
+                data_bytes = result.to_bytes()
+            cookies = getattr(result, "_cookies", None)
+            return _wire_bytes(result.status_code, _build_wire_meta("json", result.headers, cookies), data_bytes)
+        if isinstance(result, StreamingResponse):
+            return _to_stream_wire(result)
+        if isinstance(result, PlainText):
+            return serialize_plaintext_response(result)
+        if isinstance(result, HTML):
+            return serialize_html_response(result)
+        if isinstance(result, Redirect):
+            return serialize_redirect_response(result)
+        if isinstance(result, File):
+            return serialize_file_response(result)
+        if isinstance(result, FileResponse):
+            return serialize_file_streaming_response(result)
+        if isinstance(result, ResponseClass):
+            if validator_async is not None:
+                try:
+                    body = _render_response_body(await validator_async(result.content), result.media_type)
+                except Exception as exc:
+                    return _response_validation_error(exc)
+            else:
+                body = _render_response_body(result.content, result.media_type)
+            rt = _infer_wire_response_type(result.media_type)
+            hdrs = _ensure_content_type_header(result.headers, result.media_type)
+            cookies = getattr(result, "_cookies", None)
+            return _wire_bytes(result.status_code, _build_wire_meta(rt, hdrs, cookies), body)
+        if isinstance(result, DjangoHttpResponse):
+            return serialize_django_response(result)
+        raise TypeError(f"Unsupported response type {type(result).__name__!r}")
+
+    def response_type_handler_sync(result: Any) -> ResponseWireV1:
+        if isinstance(result, JSON):
+            if validator_sync is not None:
+                try:
+                    data_bytes = _json.encode(validator_sync(result.data))
+                except Exception as exc:
+                    return _response_validation_error(exc)
+            else:
+                data_bytes = result.to_bytes()
+            cookies = getattr(result, "_cookies", None)
+            return _wire_bytes(result.status_code, _build_wire_meta("json", result.headers, cookies), data_bytes)
+        if isinstance(result, StreamingResponse):
+            return _to_stream_wire(result)
+        if isinstance(result, PlainText):
+            return serialize_plaintext_response(result)
+        if isinstance(result, HTML):
+            return serialize_html_response(result)
+        if isinstance(result, Redirect):
+            return serialize_redirect_response(result)
+        if isinstance(result, File):
+            return serialize_file_response(result)
+        if isinstance(result, FileResponse):
+            return serialize_file_streaming_response(result)
+        if isinstance(result, ResponseClass):
+            if validator_sync is not None:
+                try:
+                    body = _render_response_body(validator_sync(result.content), result.media_type)
+                except Exception as exc:
+                    return _response_validation_error(exc)
+            else:
+                body = _render_response_body(result.content, result.media_type)
+            rt = _infer_wire_response_type(result.media_type)
+            hdrs = _ensure_content_type_header(result.headers, result.media_type)
+            cookies = getattr(result, "_cookies", None)
+            return _wire_bytes(result.status_code, _build_wire_meta(rt, hdrs, cookies), body)
+        if isinstance(result, DjangoHttpResponse):
+            return serialize_django_response(result)
+        raise TypeError(f"Unsupported response type {type(result).__name__!r}")
+
+    meta["_default_response_handler"] = data_handler
+    meta["_default_response_handler_sync"] = data_handler_sync
+    meta["_response_type_handler"] = response_type_handler
+    meta["_response_type_handler_sync"] = response_type_handler_sync
 
 
-def _dispatch_non_json_type(
-    result: Any, response_type: Any | None, meta: HandlerMetadata, status_code: int
-) -> ResponseWireV1 | None:
-    """Shared type dispatch for non-dict/list response types.
-
-    Returns ResponseWireV1 for handled types, or None if type needs async handling.
-    """
-    # Handle different response types (ordered by frequency for performance)
-    if isinstance(result, JSON):
-        return None  # JSON needs async/sync-specific handling
-    if isinstance(result, StreamingResponse):
-        return _to_stream_wire(result)
-
-    auto_stream = _build_auto_streaming_response(result, meta["_stream_info"], meta, status_code)
-    if auto_stream is not None:
-        return _to_stream_wire(auto_stream)
-
-    if isinstance(result, PlainText):
-        return serialize_plaintext_response(result)
-    if isinstance(result, HTML):
-        return serialize_html_response(result)
-    if isinstance(result, (bytes, bytearray)):
-        return _wire_bytes(status_code, _RESPONSE_META_OCTETSTREAM, bytes(result))
-    if isinstance(result, str):
-        return _wire_bytes(status_code, _RESPONSE_META_PLAINTEXT, result.encode())
-    if isinstance(result, Redirect):
-        return serialize_redirect_response(result)
-    if isinstance(result, File):
-        return serialize_file_response(result)
-    if isinstance(result, FileResponse):
-        return serialize_file_streaming_response(result)
-    if isinstance(result, ResponseClass):
-        return None  # ResponseClass needs async/sync-specific handling
-    if isinstance(result, msgspec.Struct):
-        return None  # Struct needs async/sync-specific JSON handling
-    if isinstance(result, QuerySet):
-        return None  # QuerySet needs async/sync-specific handling
-    if isinstance(result, DjangoHttpResponse):
-        return serialize_django_response(result)
-    return None  # Signal unhandled type
+def is_response_instance(value: Any) -> bool:
+    return isinstance(value, _RESPONSE_INSTANCE_TYPES)
 
 
-async def serialize_response(result: Any, meta: HandlerMetadata) -> ResponseWireV1:
+async def serialize_response(result: Any, meta: HandlerMetadata | dict[str, Any]) -> ResponseWireV1:
     """Serialize handler result to HTTP response."""
-    # Direct access -- keys guaranteed at registration time
-    status_code = meta["default_status_code"]
-    response_type = meta["response_type"]
-
-    # Handle 204 No Content
-    if result is None and status_code == 204:
-        return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
-
-    # Fast path: dict/list are the most common response types (90%+ of handlers)
-    if isinstance(result, dict):
-        return await serialize_json_data(result, response_type, meta)
-    if isinstance(result, list):
-        result = _convert_serializers(result)
-        return await serialize_json_data(result, response_type, meta)
-
-    # Convert Serializer instances to dicts (handles write_only, computed_field)
-    original = result
-    result = _convert_serializers(result)
-
-    # If _convert_serializers changed the value, it IS dict/list -- skip isinstance re-check
-    if result is not original:
-        return await serialize_json_data(result, response_type, meta)
-
-    # Try shared dispatch first (handles most non-JSON types)
-    shared_result = _dispatch_non_json_type(result, response_type, meta, status_code)
-    if shared_result is not None:
-        return shared_result
-
-    # Async-specific handling for types that need await
-    if isinstance(result, JSON):
-        return await serialize_json_response(result, response_type, meta)
-    if isinstance(result, ResponseClass):
-        return await serialize_generic_response(result, response_type, meta)
-    if isinstance(result, msgspec.Struct):
-        return await serialize_json_data(result, response_type, meta)
-    if isinstance(result, QuerySet):
-        result_list = await sync_to_async(list, thread_sensitive=True)(result)
-        return await serialize_json_data(result_list, response_type, meta)
-
-    raise TypeError(
-        f"Handler returned unsupported type {type(result).__name__!r}. "
-        f"Return dict, list, or a Bolt response type (JSON, PlainText, HTML, Redirect, etc.)"
-    )
+    if is_response_instance(result):
+        return await meta["_response_type_handler"](result)
+    return await meta["_default_response_handler"](result)
 
 
-def serialize_response_sync(result: Any, meta: HandlerMetadata) -> ResponseWireV1:
+def serialize_response_sync(result: Any, meta: HandlerMetadata | dict[str, Any]) -> ResponseWireV1:
     """Serialize handler result to HTTP response (sync version for sync handlers)."""
-    # Direct access -- keys guaranteed at registration time
-    status_code = meta["default_status_code"]
-    response_type = meta["response_type"]
-
-    # Handle 204 No Content
-    if result is None and status_code == 204:
-        return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
-
-    # Fast path: dict/list are the most common response types (90%+ of handlers)
-    if isinstance(result, dict):
-        return serialize_json_data_sync(result, response_type, meta)
-    if isinstance(result, list):
-        result = _convert_serializers(result)
-        return serialize_json_data_sync(result, response_type, meta)
-
-    # Convert Serializer instances
-    original = result
-    result = _convert_serializers(result)
-
-    # If _convert_serializers changed the value, skip isinstance re-check
-    if result is not original:
-        return serialize_json_data_sync(result, response_type, meta)
-
-    # Try shared dispatch first (handles most non-JSON types)
-    shared_result = _dispatch_non_json_type(result, response_type, meta, status_code)
-    if shared_result is not None:
-        return shared_result
-
-    # Sync-specific handling
-    if isinstance(result, JSON):
-        if response_type is not None:
-            try:
-                validated = coerce_to_response_type(result.data, response_type, meta=meta)
-                data_bytes = _json.encode(validated)
-            except Exception as e:
-                err = f"Response validation error: {e}"
-                return _wire_bytes(
-                    500,
-                    _build_response_meta(
-                        "plaintext",
-                        {"content-type": "text/plain; charset=utf-8"},
-                        None,
-                    ),
-                    err.encode(),
-                )
-        else:
-            data_bytes = result.to_bytes()
-        cookies = getattr(result, "_cookies", None)
-        resp_meta = _build_response_meta("json", result.headers, cookies)
-        return _wire_bytes(result.status_code, resp_meta, data_bytes)
-    elif isinstance(result, ResponseClass):
-        if response_type is not None:
-            try:
-                validated = coerce_to_response_type(result.content, response_type, meta=meta)
-                data_bytes = _json.encode(validated) if result.media_type == "application/json" else result.to_bytes()
-            except Exception as e:
-                err = f"Response validation error: {e}"
-                return _wire_bytes(
-                    500,
-                    _build_response_meta(
-                        "plaintext",
-                        {"content-type": "text/plain; charset=utf-8"},
-                        None,
-                    ),
-                    err.encode(),
-                )
-        else:
-            data_bytes = result.to_bytes()
-
-        response_type = "json" if result.media_type == "application/json" else "octetstream"
-        headers = result.headers.copy() if result.headers else {}
-        has_custom_content_type = any(k.lower() == "content-type" for k in headers)
-        if not has_custom_content_type:
-            headers["content-type"] = result.media_type
-
-        cookies = getattr(result, "_cookies", None)
-        resp_meta = _build_response_meta(response_type, headers, cookies)
-        return _wire_bytes(result.status_code, resp_meta, data_bytes)
-    elif isinstance(result, msgspec.Struct):
-        return serialize_json_data_sync(result, response_type, meta)
-    elif isinstance(result, QuerySet):
-        return serialize_json_data_sync(list(result), response_type, meta)
-
-    raise TypeError(
-        f"Handler returned unsupported type {type(result).__name__!r}. "
-        f"Return dict, list, or a Bolt response type (JSON, PlainText, HTML, Redirect, etc.)"
-    )
+    if is_response_instance(result):
+        return meta["_response_type_handler_sync"](result)
+    return meta["_default_response_handler_sync"](result)
 
 
-async def serialize_generic_response(
-    result: ResponseClass, response_tp: Any | None, meta: HandlerMetadata | None = None
+async def _serialize_json_payload_async(
+    result: Any,
+    status_code: int,
+    validator: Any = None,
 ) -> ResponseWireV1:
-    """Serialize generic Response object with custom headers.
-
-    Uses the new ResponseMeta tuple format for Rust-side header building.
-    """
-    if response_tp is not None:
+    if validator is not None:
         try:
-            validated = await coerce_to_response_type_async(result.content, response_tp, meta=meta)
-            data_bytes = _json.encode(validated) if result.media_type == "application/json" else result.to_bytes()
-        except Exception as e:
-            err = f"Response validation error: {e}"
-            return _wire_bytes(
-                500,
-                _build_response_meta(
-                    "plaintext",
-                    {"content-type": "text/plain; charset=utf-8"},
-                    None,
-                ),
-                err.encode(),
-            )
-    else:
-        data_bytes = result.to_bytes()
+            result = await validator(result)
+        except Exception as exc:
+            return _response_validation_error(exc)
 
-    # Determine response type based on media_type
-    response_type = "json" if result.media_type == "application/json" else "octetstream"
-
-    # Build headers dict with media_type as content-type if not already provided
-    headers = result.headers.copy() if result.headers else {}
-    has_custom_content_type = any(k.lower() == "content-type" for k in headers)
-    if not has_custom_content_type:
-        headers["content-type"] = result.media_type
-
-    cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_response_meta(response_type, headers, cookies)
-    return _wire_bytes(result.status_code, resp_meta, data_bytes)
+    return _wire_bytes(status_code, _RESPONSE_META_JSON, _json.encode(result))
 
 
-async def serialize_json_response(
-    result: JSON, response_tp: Any | None, meta: HandlerMetadata | None = None
+def _serialize_json_payload_sync(
+    result: Any,
+    status_code: int,
+    validator: Any = None,
 ) -> ResponseWireV1:
-    """Serialize JSON response object.
-
-    Uses the new ResponseMeta tuple format for Rust-side header building.
-    """
-    if response_tp is not None:
+    if validator is not None:
         try:
-            validated = await coerce_to_response_type_async(result.data, response_tp, meta=meta)
-            data_bytes = _json.encode(validated)
-        except Exception as e:
-            err = f"Response validation error: {e}"
-            return _wire_bytes(
-                500,
-                _build_response_meta(
-                    "plaintext",
-                    {"content-type": "text/plain; charset=utf-8"},
-                    None,
-                ),
-                err.encode(),
-            )
-    else:
-        data_bytes = result.to_bytes()
+            result = validator(result)
+        except Exception as exc:
+            return _response_validation_error(exc)
 
-    cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_response_meta("json", result.headers, cookies)
-    return _wire_bytes(result.status_code, resp_meta, data_bytes)
+    return _wire_bytes(status_code, _RESPONSE_META_JSON, _json.encode(result))
 
 
 def serialize_plaintext_response(result: PlainText) -> ResponseWireV1:
@@ -530,7 +645,7 @@ def serialize_plaintext_response(result: PlainText) -> ResponseWireV1:
     Uses the new ResponseMeta tuple format for Rust-side header building.
     """
     cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_response_meta("plaintext", result.headers, cookies)
+    resp_meta = _build_wire_meta("plaintext", result.headers, cookies)
     return _wire_bytes(result.status_code, resp_meta, result.to_bytes())
 
 
@@ -540,7 +655,7 @@ def serialize_html_response(result: HTML) -> ResponseWireV1:
     Uses the new ResponseMeta tuple format for Rust-side header building.
     """
     cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_response_meta("html", result.headers, cookies)
+    resp_meta = _build_wire_meta("html", result.headers, cookies)
     return _wire_bytes(result.status_code, resp_meta, result.to_bytes())
 
 
@@ -555,7 +670,7 @@ def serialize_redirect_response(result: Redirect) -> ResponseWireV1:
         custom_headers.update(result.headers)
 
     cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_response_meta("redirect", custom_headers, cookies)
+    resp_meta = _build_wire_meta("redirect", custom_headers, cookies)
     return _wire_bytes(result.status_code, resp_meta, b"")
 
 
@@ -571,12 +686,12 @@ def serialize_django_response(result: DjangoHttpResponse) -> ResponseWireV1:
         for key, value in result.items():
             if key.lower() != "location":
                 headers[key] = value
-        return _wire_bytes(result.status_code, _build_response_meta("redirect", headers, None), b"")
+        return _wire_bytes(result.status_code, _build_wire_meta("redirect", headers, None), b"")
 
     # Generic Django HttpResponse - extract content and headers
     headers = dict(result.items())
     content = result.content if isinstance(result.content, bytes) else result.content.encode()
-    return _wire_bytes(result.status_code, _build_response_meta("octetstream", headers, None), content)
+    return _wire_bytes(result.status_code, _build_wire_meta("octetstream", headers, None), content)
 
 
 def serialize_file_response(result: File) -> ResponseWireV1:
@@ -595,7 +710,7 @@ def serialize_file_response(result: File) -> ResponseWireV1:
         custom_headers.update(result.headers)
 
     cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_response_meta("file", custom_headers, cookies)
+    resp_meta = _build_wire_meta("file", custom_headers, cookies)
     return _wire_bytes(result.status_code, resp_meta, data)
 
 
@@ -616,63 +731,22 @@ def serialize_file_streaming_response(result: FileResponse) -> ResponseWireV1:
         custom_headers.update(result.headers)
 
     cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_response_meta("file", custom_headers, cookies)
+    resp_meta = _build_wire_meta("file", custom_headers, cookies)
     return _wire_file(result.status_code, resp_meta, result.path)
 
 
 async def serialize_json_data(
-    result: Any, response_tp: Any | None, meta: HandlerMetadata, *, status_code: int | None = None
+    result: Any, meta: HandlerMetadata | dict[str, Any], *, status_code: int | None = None
 ) -> ResponseWireV1:
-    """Serialize dict/list/other data as JSON.
-
-    Uses the new ResponseMeta tuple format for Rust-side header building.
-    """
-    if response_tp is not None:
-        try:
-            validated = await coerce_to_response_type_async(result, response_tp, meta=meta)
-            data = _json.encode(validated)
-        except Exception as e:
-            err = f"Response validation error: {e}"
-            return _wire_bytes(
-                500,
-                _build_response_meta(
-                    "plaintext",
-                    {"content-type": "text/plain; charset=utf-8"},
-                    None,
-                ),
-                err.encode(),
-            )
-    else:
-        data = _json.encode(result)
-
+    """Serialize dict/list/other data as JSON."""
     status = status_code if status_code is not None else meta["default_status_code"]
-    return _wire_bytes(status, _RESPONSE_META_JSON, data)
+    return _wire_bytes(status, _RESPONSE_META_JSON, _json.encode(result))
 
 
 def serialize_json_data_sync(
-    result: Any, response_tp: Any | None, meta: HandlerMetadata, *, status_code: int | None = None
+    result: Any, meta: HandlerMetadata | dict[str, Any], *, status_code: int | None = None
 ) -> ResponseWireV1:
-    """Serialize dict/list/other data as JSON (sync version for sync handlers).
-
-    Uses the new ResponseMeta tuple format for Rust-side header building.
-    """
-    if response_tp is not None:
-        try:
-            validated = coerce_to_response_type(result, response_tp, meta=meta)
-            data = _json.encode(validated)
-        except Exception as e:
-            err = f"Response validation error: {e}"
-            return _wire_bytes(
-                500,
-                _build_response_meta(
-                    "plaintext",
-                    {"content-type": "text/plain; charset=utf-8"},
-                    None,
-                ),
-                err.encode(),
-            )
-    else:
-        data = _json.encode(result)
-
+    """Serialize dict/list/other data as JSON (sync version)."""
     status = status_code if status_code is not None else meta["default_status_code"]
-    return _wire_bytes(status, _RESPONSE_META_JSON, data)
+    return _wire_bytes(status, _RESPONSE_META_JSON, _json.encode(result))
+

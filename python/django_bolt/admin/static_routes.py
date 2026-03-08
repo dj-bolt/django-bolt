@@ -16,6 +16,7 @@ from django_bolt.middleware.compiler import (
     add_optimization_flags_to_metadata,
     compile_middleware_meta,
 )
+from django_bolt.serialization import compile_response_handlers
 from django_bolt.typing import FieldDefinition
 
 if TYPE_CHECKING:
@@ -121,12 +122,16 @@ class StaticRouteRegistrar:
         meta["_stream_info"] = (False, None)
         meta["is_multi_response"] = False
         meta["default_status_code"] = 200
+        meta["validate_response"] = False
         meta["_router_middleware"] = []
         meta["_route_middleware"] = []
         meta["_has_route_python_middleware"] = False
         meta["has_file_uploads"] = False
 
         self.api._handler_meta[handler_id] = meta
+
+        # Compile response handlers (required by serialize_response).
+        compile_response_handlers(meta)
 
         # Compile the handler executor (required by _dispatch for both fast
         # path and middleware path).  Must happen after meta is stored because

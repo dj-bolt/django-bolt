@@ -37,7 +37,7 @@ from .analysis import analyze_handler, warn_blocking_handler
 from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import load_user_sync
 from .concurrency import sync_to_thread
-from .decorators import ActionHandler
+from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
 from .error_handlers import handle_exception
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
@@ -66,10 +66,11 @@ from .serialization import (
     ResponseWireV1,
     _convert_serializers,
     _extract_stream_item_type,
+    _infer_wire_response_type,
     _wire_bytes,
+    compile_response_handlers,
     serialize_json_data,
     serialize_json_data_sync,
-    serialize_json_response,
     serialize_response,
     serialize_response_sync,
 )
@@ -264,18 +265,6 @@ def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: s
 def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: bytes) -> ResponseWireV1:
     """Convert error-handler parts into ResponseWireV1."""
 
-    def _infer_response_type(content_type: str | None) -> str:
-        if not content_type:
-            return "octetstream"
-        normalized = content_type.split(";", 1)[0].strip().lower()
-        if normalized == "application/json" or normalized.endswith("+json"):
-            return "json"
-        if normalized == "text/plain":
-            return "plaintext"
-        if normalized == "text/html":
-            return "html"
-        return "octetstream"
-
     custom_content_type = None
     custom_headers: list[tuple[str, str]] = []
 
@@ -286,7 +275,7 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
             custom_headers.append((key, value))
 
     meta = (
-        _infer_response_type(custom_content_type),
+        _infer_wire_response_type(custom_content_type) if custom_content_type else "octetstream",
         custom_content_type,
         custom_headers or None,
         None,
@@ -305,6 +294,7 @@ class BoltAPI:
         logging_config: Any | None = None,
         compression: Any | None = None,
         openapi_config: Any | None = None,
+        validate_response: bool = True,
     ) -> None:
         """
         Initialize a BoltAPI instance.
@@ -326,6 +316,7 @@ class BoltAPI:
             logging_config: Custom logging configuration
             compression: Compression configuration (CompressionConfig or False to disable)
             openapi_config: OpenAPI documentation configuration
+            validate_response: Default response validation policy for registered routes
         """
         self._routes: list[tuple[str, str, int, Callable]] = []
         self._websocket_routes: list[tuple[str, int, Callable]] = []  # (path, handler_id, handler)
@@ -337,6 +328,7 @@ class BoltAPI:
         self._next_handler_id = 0
         self.prefix = prefix.rstrip("/")  # Remove trailing slash from prefix
         self.trailing_slash = trailing_slash  # Mode: "strip", "append", or "keep"
+        self._validate_response_default = validate_response
 
         # Build middleware list: Django middleware first, then custom middleware
         self._middleware = []
@@ -460,8 +452,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -473,6 +466,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -484,8 +478,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -497,6 +492,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -508,8 +504,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -521,6 +518,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -532,8 +530,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -545,6 +544,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -556,8 +556,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -569,6 +570,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -580,8 +582,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -593,6 +596,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -604,8 +608,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -617,6 +622,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -730,6 +736,7 @@ class BoltAPI:
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         tags: list[str] | None = None,
     ):
         """
@@ -802,12 +809,19 @@ class BoltAPI:
                 if merged_status_code is None and hasattr(handler, "__bolt_status_code__"):
                     merged_status_code = handler.__bolt_status_code__
 
+                merged_validate_response = validate_response
+                if merged_validate_response is None:
+                    merged_validate_response = getattr(handler, "validate_response", None)
+                if merged_validate_response is None and hasattr(handler, "__bolt_validate_response__"):
+                    merged_validate_response = handler.__bolt_validate_response__
+
                 # Register using existing route decorator
                 route_decorator = self._route_decorator(
                     method_upper,
                     path,
-                    response_model=None,  # Use method's return annotation
+                    response_model=_RESPONSE_MODEL_UNSET,  # Use method's return annotation
                     status_code=merged_status_code,
+                    validate_response=merged_validate_response,
                     guards=merged_guards,
                     auth=merged_auth,
                     tags=tags,
@@ -832,6 +846,7 @@ class BoltAPI:
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         lookup_field: str = "pk",
         tags: list[str] | None = None,
     ):
@@ -927,11 +942,21 @@ class BoltAPI:
                     merged_status_code = action_status_code
 
                 # Check for response_model on the method or original handler
-                method_response_model = getattr(action_method, "response_model", None)
-                if method_response_model is None:
+                method_response_model = getattr(action_method, "response_model", _RESPONSE_MODEL_UNSET)
+                if method_response_model is _RESPONSE_MODEL_UNSET:
                     original = getattr(handler, "__original_handler__", None)
                     if original is not None:
-                        method_response_model = getattr(original, "response_model", None)
+                        method_response_model = getattr(original, "response_model", _RESPONSE_MODEL_UNSET)
+
+                merged_validate_response = validate_response
+                if merged_validate_response is None:
+                    merged_validate_response = getattr(action_method, "validate_response", None)
+                if merged_validate_response is None:
+                    original = getattr(handler, "__original_handler__", None)
+                    if original is not None:
+                        merged_validate_response = getattr(original, "validate_response", None)
+                if merged_validate_response is None and hasattr(handler, "__bolt_validate_response__"):
+                    merged_validate_response = handler.__bolt_validate_response__
 
                 # Register the route
                 route_decorator = self._route_decorator(
@@ -939,6 +964,7 @@ class BoltAPI:
                     route_path,
                     response_model=method_response_model,
                     status_code=merged_status_code,
+                    validate_response=merged_validate_response,
                     guards=merged_guards,
                     auth=merged_auth,
                     tags=tags,
@@ -967,6 +993,7 @@ class BoltAPI:
         # Get class-level auth and guards (if any)
         class_auth = getattr(view_cls, "auth", None)
         class_guards = getattr(view_cls, "guards", None)
+        class_validate_response = getattr(view_cls, "validate_response", None)
 
         # Scan all attributes in the class
         for name in dir(view_cls):
@@ -1038,6 +1065,9 @@ class BoltAPI:
                     # Action-specific takes precedence if explicitly set
                     final_auth = attr.auth if attr.auth is not None else class_auth
                     final_guards = attr.guards if attr.guards is not None else class_guards
+                    final_validate_response = (
+                        attr.validate_response if attr.validate_response is not None else class_validate_response
+                    )
 
                     # Register the custom action
                     decorator = self._route_decorator(
@@ -1045,6 +1075,7 @@ class BoltAPI:
                         action_path,
                         response_model=attr.response_model,
                         status_code=attr.status_code,
+                        validate_response=final_validate_response,
                         guards=final_guards,
                         auth=final_auth,
                         tags=attr.tags,
@@ -1058,8 +1089,9 @@ class BoltAPI:
         method: str,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -1120,8 +1152,14 @@ class BoltAPI:
             # assignment below when is_multi_response=True.
             effective_status: int | None = None
             default_code: int = 0
-            if response_model is not None:
-                if isinstance(response_model, dict):
+            route_validate_response = (
+                self._validate_response_default if validate_response is None else validate_response
+            )
+            if response_model is not _RESPONSE_MODEL_UNSET:
+                if response_model is None:
+                    meta["is_multi_response"] = False
+                    final_response_type = None
+                elif isinstance(response_model, dict):
                     # Dict mode: per-status-code response schemas
                     int_codes = sorted(c for c in response_model if isinstance(c, int))
                     if not int_codes:
@@ -1175,6 +1213,7 @@ class BoltAPI:
                 meta.update(response_meta)
             else:
                 meta["response_type"] = None
+            meta["validate_response"] = route_validate_response
             # Pre-compute stream annotation analysis (registration time only)
             meta["_stream_info"] = _extract_stream_item_type(meta["response_type"])
 
@@ -1215,12 +1254,18 @@ class BoltAPI:
                     entry: dict = {
                         "response_type": resp_type,
                         "default_status_code": code if isinstance(code, int) else handler_default_status,
+                        "validate_response": route_validate_response,
                         "_stream_info": _extract_stream_item_type(resp_type),
                     }
                     if code in field_names_map:
                         entry["response_field_names"] = field_names_map[code]
                     resolved_metas[code] = entry
                 meta["_resolved_metas"] = resolved_metas
+
+            compile_response_handlers(meta)
+            if meta["is_multi_response"]:
+                for entry in meta["_resolved_metas"].values():
+                    compile_response_handlers(entry)
 
             # Compile optimized argument injector (once at registration time)
             # This pre-compiles all parameter extraction logic for maximum performance
@@ -1353,20 +1398,17 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        if isinstance(data, (dict, list)):
+                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
-                            return await serialize_json_data(data, response_type, entry, status_code=code)
-                        # Non-dict/list: adjust status code if entry is a shared ellipsis entry.
-                        if entry["default_status_code"] != code:
-                            entry = {**entry, "default_status_code": code}
-                        return await serialize_response(data, entry)
+                            return await serialize_json_data(data, entry, status_code=code)
+                        return await entry["_default_response_handler"](data, status_code=code)
 
                 # JSON() with explicit status: pick schema by its status_code.
                 if isinstance(result, _JSONResponse):
                     entry = resolved_metas.get(result.status_code) or resolved_metas.get(...)
                     if entry is not None:
-                        return await serialize_json_response(result, entry["response_type"], entry)
+                        return await entry["_response_type_handler"](result)
 
                 # Bare dict/list or any other type: use the default status schema.
                 return await serialize_response(result, default_entry)
@@ -1379,19 +1421,17 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        if isinstance(data, (dict, list)):
+                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
-                            return serialize_json_data_sync(data, response_type, entry, status_code=code)
-                        if entry["default_status_code"] != code:
-                            entry = {**entry, "default_status_code": code}
-                        return serialize_response_sync(data, entry)
+                            return serialize_json_data_sync(data, entry, status_code=code)
+                        return entry["_default_response_handler_sync"](data, status_code=code)
 
                 # JSON() with explicit status: pick schema by its status_code.
                 if isinstance(result, _JSONResponse):
                     entry = resolved_metas.get(result.status_code) or resolved_metas.get(...)
                     if entry is not None:
-                        return serialize_response_sync(result, entry)
+                        return entry["_response_type_handler_sync"](result)
 
                 return serialize_response_sync(result, default_entry)
 
@@ -1420,8 +1460,8 @@ class BoltAPI:
         # Fast path: async handler without rust-prebound args (most common pattern).
         # Eliminates: state.setdefault, 2×state.pop, has_prebound check.
         if mode != "request_only" and is_async and not is_blocking and not has_rust_prebound and not injector_is_async:
-            response_type = meta["response_type"]
             default_status = meta["default_status_code"]
+            has_response_validation = meta["_has_response_validation"]
 
             # Detect trivially-async handlers: async def with no await statements.
             # These can be dispatched synchronously by driving the coroutine inline
@@ -1438,13 +1478,13 @@ class BoltAPI:
                 except (AttributeError, TypeError):
                     pass
 
-            # Super-fast path: no response_type validation → inline dict/list serialization
+            # Super-fast path: no compiled response validation → inline dict/list serialization
             # directly into the executor. Eliminates 2 async function call overheads
             # (serialize_response + serialize_json_data are both async but never suspend
             # for dict returns with no response model).
             _is_no_params = meta.get("handler_pattern") is HandlerPattern.NO_PARAMS
 
-            if response_type is None:
+            if not has_response_validation:
                 _encode = _json.encode
                 _meta_json = _RESPONSE_META_JSON
 
@@ -1525,11 +1565,11 @@ class BoltAPI:
 
         # Fast path for sync non-blocking handler without rust-prebound args.
         if mode != "request_only" and not is_async and not is_blocking and not has_rust_prebound and not injector_is_async:
-            response_type = meta["response_type"]
             default_status = meta["default_status_code"]
+            has_response_validation = meta["_has_response_validation"]
             _is_no_params_sync = meta.get("handler_pattern") is HandlerPattern.NO_PARAMS
 
-            if response_type is None:
+            if not has_response_validation:
                 _encode = _json.encode
                 _meta_json = _RESPONSE_META_JSON
 
