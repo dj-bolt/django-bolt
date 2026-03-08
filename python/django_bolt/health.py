@@ -35,24 +35,19 @@ class HealthCheck:
         Returns:
             Dictionary with health check results
         """
-        import asyncio
-        
-        # Run all checks concurrently for better performance
-        check_tasks = [self._execute_single_check(check) for check in self._checks]
-        results_list = await asyncio.gather(*check_tasks, return_exceptions=True)
-        
+        results_list = await asyncio.gather(
+            *(check() for check in self._checks),
+            return_exceptions=True,
+        )
+
         results = {}
         all_healthy = True
-        
-        # Process results
-        for i, check in enumerate(self._checks):
-            result = results_list[i]
-            
+
+        for check, result in zip(self._checks, results_list):
             if isinstance(result, Exception):
-                # Handle exceptions from the gathered tasks
                 results[check.__name__] = {
                     "healthy": False,
-                    "message": f"Check failed: {str(result)}",
+                    "message": f"Check failed: {result!s}",
                 }
                 all_healthy = False
             else:
@@ -68,13 +63,6 @@ class HealthCheck:
             "status": "healthy" if all_healthy else "unhealthy",
             "checks": results,
         }
-    
-    async def _execute_single_check(self, check):
-        """Helper method to execute a single check and handle exceptions."""
-        try:
-            return await check()
-        except Exception as e:
-            raise e
 
 
 # Global health check instance
@@ -91,12 +79,11 @@ async def check_database() -> tuple[bool, str]:
         if sync_to_async is None or connection is None:
             return False, "Django not available"
 
-        # Try a simple query
         await sync_to_async(connection.ensure_connection)()
 
         return True, "Database connection OK"
     except Exception as e:
-        return False, f"Database error: {str(e)}"
+        return False, f"Database error: {e!s}"
 
 
 # Health endpoint handlers

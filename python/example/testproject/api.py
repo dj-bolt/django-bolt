@@ -833,42 +833,6 @@ async def stream_plain():
     return StreamingResponse(gen(), media_type="text/plain")
 
 
-@api.get("/stream-file")
-@no_compress
-async def stream_file(request: Request):
-    """Stream a file response with proper headers and range support."""
-    import os
-    
-    # Get file path from query parameter
-    file_path = request.query_params.get("path", THIS_FILE)
-    
-    # Validate the file path to prevent directory traversal
-    if not os.path.abspath(file_path).startswith(os.path.dirname(THIS_FILE)):
-        raise BadRequest(detail="Invalid file path")
-    
-    if not os.path.exists(file_path):
-        raise NotFound(detail="File not found")
-    
-    # Get file stats
-    file_size = os.path.getsize(file_path)
-    filename = os.path.basename(file_path)
-    
-    # Create file streaming generator
-    async def file_generator():
-        with open(file_path, 'rb') as f:
-            while True:
-                chunk = f.read(8192)  # 8KB chunks
-                if not chunk:
-                    break
-                yield chunk
-    
-    # Create response with proper headers
-    response = StreamingResponse(file_generator(), media_type="application/octet-stream")
-    response.headers["Content-Disposition"] = f"attachment; filename=\"{filename}\""
-    response.headers["Content-Length"] = str(file_size)
-    
-    return response
-
 
 @api.get("/collected")
 async def collected_plain():
