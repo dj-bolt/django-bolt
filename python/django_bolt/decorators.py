@@ -7,6 +7,8 @@ Provides decorators for ViewSet custom actions similar to Django REST Framework'
 from collections.abc import Callable
 from typing import Any
 
+_RESPONSE_MODEL_UNSET = object()
+
 
 class ActionHandler:
     """
@@ -38,6 +40,7 @@ class ActionHandler:
         "guards",
         "response_model",
         "status_code",
+        "validate_response",
         "tags",
         "summary",
         "description",
@@ -51,8 +54,9 @@ class ActionHandler:
         path: str | None = None,
         auth: list[Any] | None = None,
         guards: list[Any] | None = None,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
@@ -65,6 +69,7 @@ class ActionHandler:
         self.guards = guards
         self.response_model = response_model
         self.status_code = status_code
+        self.validate_response = validate_response
         self.tags = tags
         self.summary = summary
         self.description = description
@@ -86,8 +91,9 @@ def action(
     *,
     auth: list[Any] | None = None,
     guards: list[Any] | None = None,
-    response_model: Any | None = None,
+    response_model: Any = _RESPONSE_MODEL_UNSET,
     status_code: int | None = None,
+    validate_response: bool | None = None,
     tags: list[str] | None = None,
     summary: str | None = None,
     description: str | None = None,
@@ -174,6 +180,7 @@ def action(
             guards=guards,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             tags=tags,
             summary=summary,
             description=description,

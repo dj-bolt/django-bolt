@@ -3,6 +3,7 @@
 Provides standard health check endpoints for monitoring and load balancers.
 """
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -34,24 +35,29 @@ class HealthCheck:
         Returns:
             Dictionary with health check results
         """
+        results_list = await asyncio.gather(
+            *(check() for check in self._checks),
+            return_exceptions=True,
+        )
+
         results = {}
         all_healthy = True
 
-        for check in self._checks:
-            try:
-                is_healthy, message = await check()
+        for check, result in zip(self._checks, results_list):
+            if isinstance(result, Exception):
+                results[check.__name__] = {
+                    "healthy": False,
+                    "message": f"Check failed: {result!s}",
+                }
+                all_healthy = False
+            else:
+                is_healthy, message = result
                 results[check.__name__] = {
                     "healthy": is_healthy,
                     "message": message,
                 }
                 if not is_healthy:
                     all_healthy = False
-            except Exception as e:
-                results[check.__name__] = {
-                    "healthy": False,
-                    "message": f"Check failed: {str(e)}",
-                }
-                all_healthy = False
 
         return {
             "status": "healthy" if all_healthy else "unhealthy",
@@ -73,12 +79,11 @@ async def check_database() -> tuple[bool, str]:
         if sync_to_async is None or connection is None:
             return False, "Django not available"
 
-        # Try a simple query
         await sync_to_async(connection.ensure_connection)()
 
         return True, "Database connection OK"
     except Exception as e:
-        return False, f"Database error: {str(e)}"
+        return False, f"Database error: {e!s}"
 
 
 # Health endpoint handlers

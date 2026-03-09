@@ -413,8 +413,8 @@ async def build_handler_arguments(
     # Access PyRequest mappings
     params_map = request["params"]
     query_map = request["query"]
-    headers_map = request.get("headers", {})
-    cookies_map = request.get("cookies", {})
+    headers_map = request.get("headers", _EMPTY_DICT)
+    cookies_map = request.get("cookies", _EMPTY_DICT)
 
     # Form/multipart data is pre-parsed by Rust (type coerced and validated)
     # Use request.form and request.files for pre-typed values
@@ -422,7 +422,7 @@ async def build_handler_arguments(
         form_map = request.form
         files_map = request.files
     else:
-        form_map, files_map = {}, {}
+        form_map, files_map = _EMPTY_FORM_FILES
 
     # Body decode cache
     body_obj: Any = None
@@ -475,8 +475,11 @@ async def build_handler_arguments(
     return args, kwargs
 
 
-# Pre-allocated constant for no-params handlers (zero alloc per request)
+# Pre-allocated constants (zero alloc per request)
 _NO_PARAMS: tuple[tuple[()], dict[str, Any]] = ((), {})
+_EMPTY_DICT: dict[str, Any] = {}
+_EMPTY_FORM_FILES: tuple[dict, dict] = ({}, {})
+_UNRESOLVED = object()  # Sentinel for unresolved parallel dependency slots
 
 
 def _injector_no_params(request: Any) -> tuple[tuple[()], dict[str, Any]]:
@@ -594,22 +597,32 @@ def compile_argument_injector(
 
     # Fast path 6: Simple pattern (path + query, no body/headers/cookies)
     if pattern is HandlerPattern.SIMPLE:
-        # Pre-build a single flat list with source tag resolved at registration time.
-        # Each entry is (source, extractor, kind, name) -- no re-filtering at request time.
-        _simple_fields = [(f.source, f.extractor, f.kind, f.name) for f in fields]
+        # Pre-split fields by source at registration time to eliminate per-field
+        # string comparisons at request time. Each list contains
+        # (extractor, kind, name) tuples — source is implicit from the list.
+        _path_fields = [(f.extractor, f.kind, f.name) for f in fields if f.source == "path"]
+        _query_fields = [(f.extractor, f.kind, f.name) for f in fields if f.source == "query"]
 
         def injector_simple(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
-            params_map = request["params"]
-            query_map = request["query"]
             args: list[Any] = []
             kwargs: dict[str, Any] = {}
 
-            for source, extractor, kind, name in _simple_fields:
-                value = extractor(params_map) if source == "path" else extractor(query_map)
+            params_map = request["params"]
+            for extractor, kind, name in _path_fields:
+                value = extractor(params_map)
                 if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
                     args.append(value)
                 else:
                     kwargs[name] = value
+
+            query_map = request["query"]
+            for extractor, kind, name in _query_fields:
+                value = extractor(query_map)
+                if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                    args.append(value)
+                else:
+                    kwargs[name] = value
+
             return args, kwargs
 
         return injector_simple
@@ -681,16 +694,16 @@ def compile_argument_injector(
 
         async def injector_with_deps(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
             """Optimized argument injector with dependency support."""
-            params_map = request["params"] if needs_path_params else {}
-            query_map = request["query"] if needs_query else {}
-            headers_map = request.get("headers", {}) if needs_headers else {}
-            cookies_map = request.get("cookies", {}) if needs_cookies else {}
+            params_map = request["params"] if needs_path_params else _EMPTY_DICT
+            query_map = request["query"] if needs_query else _EMPTY_DICT
+            headers_map = request.get("headers", _EMPTY_DICT) if needs_headers else _EMPTY_DICT
+            cookies_map = request.get("cookies", _EMPTY_DICT) if needs_cookies else _EMPTY_DICT
 
             if needs_form:
                 form_map = request.form
                 files_map = request.files
             else:
-                form_map, files_map = {}, {}
+                form_map, files_map = _EMPTY_FORM_FILES
 
             body_obj: Any = None
             body_loaded: bool = False
@@ -721,17 +734,23 @@ def compile_argument_injector(
                     dep_coros.append(_resolve_one(dep))
 
                 dep_results = await asyncio.gather(*dep_coros)
-                # Map results back to plan indices
-                _parallel_results = dict(zip(_async_dep_fns, dep_results, strict=True))
+                # Map results back to plan indices — use a pre-sized list indexed
+                # by plan position instead of a dict to avoid per-request dict alloc.
+                # Use _UNRESOLVED sentinel (not None) since deps can legitimately return None.
+                _parallel_results: list[Any] = [_UNRESOLVED] * len(_dep_plan)
+                for idx, result in zip(_async_dep_fns, dep_results, strict=True):
+                    _parallel_results[idx] = result
+                _has_parallel = True
             else:
                 _parallel_results = None
+                _has_parallel = False
 
             args: list[Any] = []
             kwargs: dict[str, Any] = {}
 
             for plan_idx, (src_id, extractor, kind, name, needs_files, dependency) in enumerate(_dep_plan):
                 if src_id == _SRC_DEP:
-                    if _parallel_results is not None and plan_idx in _parallel_results:
+                    if _has_parallel and _parallel_results[plan_idx] is not _UNRESOLVED:
                         value = _parallel_results[plan_idx]
                     else:
                         if dependency is None:
@@ -856,16 +875,16 @@ def compile_argument_injector(
         args: list[Any] = []
         kwargs: dict[str, Any] = {}
 
-        params_map = request["params"] if needs_path_params else {}
-        query_map = request["query"] if needs_query else {}
-        headers_map = request.get("headers", {}) if needs_headers else {}
-        cookies_map = request.get("cookies", {}) if needs_cookies else {}
+        params_map = request["params"] if needs_path_params else _EMPTY_DICT
+        query_map = request["query"] if needs_query else _EMPTY_DICT
+        headers_map = request.get("headers", _EMPTY_DICT) if needs_headers else _EMPTY_DICT
+        cookies_map = request.get("cookies", _EMPTY_DICT) if needs_cookies else _EMPTY_DICT
 
         if needs_form:
             form_map = request.form
             files_map = request.files
         else:
-            form_map, files_map = {}, {}
+            form_map, files_map = _EMPTY_FORM_FILES
 
         body_obj: Any = None
         body_loaded: bool = False

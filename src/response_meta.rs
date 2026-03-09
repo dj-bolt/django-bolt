@@ -110,6 +110,13 @@ pub static STATIC_META_EMPTY: ResponseMeta = ResponseMeta {
     cookies: None,
 };
 
+pub static STATIC_META_HTML: ResponseMeta = ResponseMeta {
+    response_type: ResponseType::Html,
+    custom_content_type: None,
+    custom_headers: None,
+    cookies: None,
+};
+
 impl ResponseMeta {
     /// Fast-path: resolve integer meta tag to static ResponseMeta.
     /// Returns None if the tag is not a known constant.
@@ -120,6 +127,7 @@ impl ResponseMeta {
             1 => Some(&STATIC_META_PLAINTEXT),
             2 => Some(&STATIC_META_OCTETSTREAM),
             3 => Some(&STATIC_META_EMPTY),
+            4 => Some(&STATIC_META_HTML),
             _ => None,
         }
     }

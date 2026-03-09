@@ -25,6 +25,8 @@ struct AsgiSendState {
     /// the coroutine finishes before sending, causing `start_rx` to error.
     response_start_tx: Mutex<Option<oneshot::Sender<AsgiResponseStart>>>,
     body_tx: Mutex<Option<mpsc::Sender<Bytes>>>,
+    /// Exception message from the ASGI coroutine, set by `AsgiDoneCallback`.
+    exception_msg: Mutex<Option<String>>,
 }
 
 const ASGI_MOUNT_BODY_CHANNEL_CAPACITY: usize = 32;
@@ -167,7 +169,6 @@ impl AsgiSend {
 struct AsgiDoneCallback {
     state: Arc<AsgiSendState>,
     response_done: Arc<Notify>,
-    debug: bool,
 }
 
 #[pymethods]
@@ -178,15 +179,21 @@ impl AsgiDoneCallback {
                 log::debug!("ASGI mount: coroutine was cancelled");
             }
             Ok(exc) if !exc.is_none() => {
-                let msg = exc
+                let exc_type = exc
+                    .get_type()
+                    .name()
+                    .ok()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "Exception".to_string());
+                let exc_str = exc
                     .call_method0("__str__")
                     .ok()
                     .and_then(|s| s.extract::<String>().ok())
                     .unwrap_or_default();
-                if self.debug {
-                    log::error!("ASGI mount: coroutine raised an exception: {}", msg);
-                } else {
-                    log::warn!("ASGI mount: coroutine raised an exception: {}", msg);
+                let msg = format!("{}: {}", exc_type, exc_str);
+                log::error!("ASGI mount: coroutine raised an exception: {}", msg);
+                if let Ok(mut guard) = self.state.exception_msg.lock() {
+                    *guard = Some(msg);
                 }
             }
             Ok(_) => {}
@@ -420,6 +427,7 @@ pub async fn handle_asgi_mount_request(
     let send_state = Arc::new(AsgiSendState {
         response_start_tx: Mutex::new(Some(start_tx)),
         body_tx: Mutex::new(Some(body_tx)),
+        exception_msg: Mutex::new(None),
     });
 
     let py_future: Py<PyAny> = match Python::attach(|py| -> PyResult<Py<PyAny>> {
@@ -445,7 +453,6 @@ pub async fn handle_asgi_mount_request(
             AsgiDoneCallback {
                 state: send_state.clone(),
                 response_done: response_done.clone(),
-                debug,
             },
         )?;
         py_future
@@ -467,9 +474,18 @@ pub async fn handle_asgi_mount_request(
             match result {
                 Ok(start) => start,
                 Err(_) => {
+                    let detail = match send_state.exception_msg.lock() {
+                        Ok(guard) if guard.is_some() => {
+                            format!(
+                                "ASGI app raised an exception: {}",
+                                guard.as_ref().unwrap()
+                            )
+                        }
+                        _ => "ASGI app did not send http.response.start".to_string(),
+                    };
                     return HttpResponse::InternalServerError()
                         .content_type("text/plain; charset=utf-8")
-                        .body("ASGI app did not send http.response.start");
+                        .body(detail);
                 }
             }
         }

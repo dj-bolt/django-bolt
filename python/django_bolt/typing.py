@@ -98,6 +98,9 @@ class HandlerMetadata(TypedDict, total=False):
     default_status_code: int
     """Default HTTP status code for successful responses"""
 
+    validate_response: bool
+    """Whether schema-driven response validation/coercion runs at runtime"""
+
     # QuerySet serialization optimization (pre-computed at registration)
     response_field_names: list[str]
     """Pre-computed field names for QuerySet.values() call"""
@@ -116,6 +119,39 @@ class HandlerMetadata(TypedDict, total=False):
     _resolved_metas: dict[int | type, dict]
     """Pre-built per-status-code meta dicts for O(1) lookup at request time.
     Keys mirror ``response_map`` (int codes + optional ``...``)."""
+
+    _response_validator: Callable[[Any], Any] | None
+    """Compiled sync response validator/coercer"""
+
+    _response_validator_async: Callable[[Any], Any] | None
+    """Compiled async response validator/coercer"""
+
+    _stream_item_validator: Callable[[Any], Any] | None
+    """Compiled sync validator for typed stream items"""
+
+    _stream_item_validator_async: Callable[[Any], Any] | None
+    """Compiled async validator for typed stream items"""
+
+    _queryset_serializer: Callable[[Any], Any] | None
+    """Compiled sync queryset projection serializer"""
+
+    _queryset_serializer_async: Callable[[Any], Any] | None
+    """Compiled async queryset projection serializer"""
+
+    _has_response_validation: bool
+    """Whether this route has a compiled response validator"""
+
+    _default_response_handler: Callable[..., Any]
+    """Compiled async data-response handler"""
+
+    _default_response_handler_sync: Callable[..., Any]
+    """Compiled sync data-response handler"""
+
+    _response_type_handler: Callable[..., Any]
+    """Compiled async explicit-response handler"""
+
+    _response_type_handler_sync: Callable[..., Any]
+    """Compiled sync explicit-response handler"""
 
     # Performance optimizations
     needs_form_parsing: bool

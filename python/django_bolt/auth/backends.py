@@ -24,6 +24,7 @@ from typing import Any
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
+from django.db import OperationalError, InterfaceError
 
 from .revocation import create_revocation_handler
 
@@ -204,6 +205,8 @@ class JWTAuthentication(BaseAuthentication):
             return await User.objects.aget(pk=user_id)
         except User.DoesNotExist:
             return None
+        except (OperationalError, InterfaceError):
+            raise
         except Exception as e:
             print(f"Error loading user {user_id} in JWTAuthentication: {type(e).__name__}: {e}", file=sys.stderr)
             return None
@@ -224,6 +227,8 @@ class JWTAuthentication(BaseAuthentication):
             return User.objects.get(pk=user_id)
         except User.DoesNotExist:
             return None
+        except (OperationalError, InterfaceError):
+            raise
         except Exception as e:
             print(f"Error loading user {user_id} in JWTAuthentication: {type(e).__name__}: {e}", file=sys.stderr)
             return None

@@ -17,6 +17,7 @@ from .spec import (
     Reference,
     RequestBody,
     Schema,
+    SecurityScheme,
     Tag,
 )
 
@@ -25,6 +26,12 @@ if TYPE_CHECKING:
     from .config import OpenAPIConfig
 
 __all__ = ("SchemaGenerator",)
+
+# Mapping from auth backend scheme_name to OpenAPI security scheme identifier
+_SCHEME_NAME_MAP: dict[str, str] = {
+    "jwt": "BearerAuth",
+    "api_key": "ApiKeyAuth",
+}
 
 
 class SchemaGenerator:
@@ -48,6 +55,10 @@ class SchemaGenerator:
             OpenAPI schema object.
         """
         openapi = self.config.to_openapi_schema()
+
+        # Track auth schemes seen during _extract_security calls
+        self._seen_schemes: set[str] = set()
+        self._api_key_header: str | None = None
 
         # Generate path items from routes and collect tags
         paths: dict[str, PathItem] = {}
@@ -136,6 +147,9 @@ class SchemaGenerator:
             paths[ws_path].extensions["x-websocket"] = True
 
         openapi.paths = paths
+
+        # Auto-register security schemes from auth backends used on routes
+        self._register_security_schemes(openapi)
 
         # Add component schemas
         if self.schemas:
@@ -593,8 +607,45 @@ class SchemaGenerator:
             required=["detail"],
         )
 
+    def _register_security_schemes(self, openapi: OpenAPI) -> None:
+        """Auto-register SecurityScheme definitions from auth backends collected during generation.
+
+        Uses backend info accumulated by _extract_security calls to register
+        the corresponding SecurityScheme in components.security_schemes,
+        preserving any user-defined schemes.
+        """
+        if not self._seen_schemes:
+            return
+
+        existing = openapi.components.security_schemes or {}
+        needs_jwt = "jwt" in self._seen_schemes and "BearerAuth" not in existing
+        needs_api_key = "api_key" in self._seen_schemes and "ApiKeyAuth" not in existing
+
+        if not needs_jwt and not needs_api_key:
+            return
+
+        schemes = dict(existing)
+
+        if needs_jwt:
+            schemes["BearerAuth"] = SecurityScheme(
+                type="http",
+                scheme="bearer",
+                bearer_format="JWT",
+            )
+
+        if needs_api_key:
+            schemes["ApiKeyAuth"] = SecurityScheme(
+                type="apiKey",
+                name=self._api_key_header,
+                security_scheme_in="header",
+            )
+
+        openapi.components.security_schemes = schemes
+
     def _extract_security(self, handler_id: int) -> list[dict[str, list[str]]] | None:
         """Extract security requirements from handler middleware.
+
+        Also accumulates seen scheme types for _register_security_schemes.
 
         Args:
             handler_id: Handler ID.
@@ -608,15 +659,15 @@ class SchemaGenerator:
         if not auth_config:
             return None
 
-        # Convert auth backends to security requirements
         security: list[dict[str, list[str]]] = []
-        for auth_backend in auth_config:
-            backend_name = auth_backend.__class__.__name__
-
-            if "JWT" in backend_name:
-                security.append({"BearerAuth": []})
-            elif "APIKey" in backend_name:
-                security.append({"ApiKeyAuth": []})
+        for backend in auth_config:
+            scheme = backend.scheme_name
+            openapi_name = _SCHEME_NAME_MAP.get(scheme)
+            if openapi_name:
+                security.append({openapi_name: []})
+                self._seen_schemes.add(scheme)
+                if scheme == "api_key" and self._api_key_header is None:
+                    self._api_key_header = backend.header
 
         return security or None
 

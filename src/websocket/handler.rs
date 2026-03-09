@@ -616,11 +616,10 @@ pub async fn handle_websocket_upgrade_with_handler(
                     let result = inj.call1(py, (request,))?;
                     let (args, kwargs): (Py<PyAny>, Py<PyAny>) = result.extract(py)?;
 
-                    // Prepend websocket to args
-                    let args_list = args.bind(py).cast::<pyo3::types::PyList>()?;
+                    // Prepend websocket to args (accept any iterable: tuple or list)
                     let new_args = pyo3::types::PyList::new(py, std::iter::once(&websocket))?;
-                    for item in args_list.iter() {
-                        new_args.append(item)?;
+                    for item in args.bind(py).try_iter()? {
+                        new_args.append(item?)?;
                     }
                     let args_tuple = PyTuple::new(py, new_args.iter())?;
 

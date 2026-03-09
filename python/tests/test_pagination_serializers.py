@@ -10,13 +10,12 @@ from __future__ import annotations
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI, PageNumberPagination, LimitOffsetPagination, CursorPagination, paginate
+from django_bolt import BoltAPI, CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
 from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
 from django_bolt.views import ViewSet
 
 from .test_models import Article
-
 
 # ============================================================================
 # Serializers for Testing

@@ -12,7 +12,6 @@ from django_bolt.responses import JSON
 from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
 
-
 # ============================================================================
 # Test schemas
 # ============================================================================

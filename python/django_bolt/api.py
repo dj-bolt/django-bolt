@@ -4,12 +4,11 @@ import dis
 import inspect
 import sys
 import threading
-import time
 import types
 from collections.abc import Callable
 from contextlib import suppress
 from functools import partial
-from typing import Any, get_type_hints
+from typing import Any, get_origin, get_type_hints
 
 # Django import - may fail if Django not configured
 try:
@@ -37,7 +36,7 @@ from .analysis import analyze_handler, warn_blocking_handler
 from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import load_user_sync
 from .concurrency import sync_to_thread
-from .decorators import ActionHandler
+from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
 from .error_handlers import handle_exception
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
@@ -66,10 +65,11 @@ from .serialization import (
     ResponseWireV1,
     _convert_serializers,
     _extract_stream_item_type,
+    _infer_wire_response_type,
     _wire_bytes,
+    compile_response_handlers,
     serialize_json_data,
     serialize_json_data_sync,
-    serialize_json_response,
     serialize_response,
     serialize_response_sync,
 )
@@ -264,18 +264,6 @@ def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: s
 def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: bytes) -> ResponseWireV1:
     """Convert error-handler parts into ResponseWireV1."""
 
-    def _infer_response_type(content_type: str | None) -> str:
-        if not content_type:
-            return "octetstream"
-        normalized = content_type.split(";", 1)[0].strip().lower()
-        if normalized == "application/json" or normalized.endswith("+json"):
-            return "json"
-        if normalized == "text/plain":
-            return "plaintext"
-        if normalized == "text/html":
-            return "html"
-        return "octetstream"
-
     custom_content_type = None
     custom_headers: list[tuple[str, str]] = []
 
@@ -286,7 +274,7 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
             custom_headers.append((key, value))
 
     meta = (
-        _infer_response_type(custom_content_type),
+        _infer_wire_response_type(custom_content_type) if custom_content_type else "octetstream",
         custom_content_type,
         custom_headers or None,
         None,
@@ -305,6 +293,7 @@ class BoltAPI:
         logging_config: Any | None = None,
         compression: Any | None = None,
         openapi_config: Any | None = None,
+        validate_response: bool = True,
     ) -> None:
         """
         Initialize a BoltAPI instance.
@@ -326,6 +315,7 @@ class BoltAPI:
             logging_config: Custom logging configuration
             compression: Compression configuration (CompressionConfig or False to disable)
             openapi_config: OpenAPI documentation configuration
+            validate_response: Default response validation policy for registered routes
         """
         self._routes: list[tuple[str, str, int, Callable]] = []
         self._websocket_routes: list[tuple[str, int, Callable]] = []  # (path, handler_id, handler)
@@ -337,6 +327,7 @@ class BoltAPI:
         self._next_handler_id = 0
         self.prefix = prefix.rstrip("/")  # Remove trailing slash from prefix
         self.trailing_slash = trailing_slash  # Mode: "strip", "append", or "keep"
+        self._validate_response_default = validate_response
 
         # Build middleware list: Django middleware first, then custom middleware
         self._middleware = []
@@ -460,8 +451,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -473,6 +465,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -484,8 +477,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -497,6 +491,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -508,8 +503,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -521,6 +517,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -532,8 +529,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -545,6 +543,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -556,8 +555,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -569,6 +569,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -580,8 +581,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -593,6 +595,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -604,8 +607,9 @@ class BoltAPI:
         self,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -617,6 +621,7 @@ class BoltAPI:
             path,
             response_model=response_model,
             status_code=status_code,
+            validate_response=validate_response,
             guards=guards,
             auth=auth,
             tags=tags,
@@ -730,6 +735,7 @@ class BoltAPI:
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         tags: list[str] | None = None,
     ):
         """
@@ -802,12 +808,19 @@ class BoltAPI:
                 if merged_status_code is None and hasattr(handler, "__bolt_status_code__"):
                     merged_status_code = handler.__bolt_status_code__
 
+                merged_validate_response = validate_response
+                if merged_validate_response is None:
+                    merged_validate_response = getattr(handler, "validate_response", None)
+                if merged_validate_response is None and hasattr(handler, "__bolt_validate_response__"):
+                    merged_validate_response = handler.__bolt_validate_response__
+
                 # Register using existing route decorator
                 route_decorator = self._route_decorator(
                     method_upper,
                     path,
-                    response_model=None,  # Use method's return annotation
+                    response_model=_RESPONSE_MODEL_UNSET,  # Use method's return annotation
                     status_code=merged_status_code,
+                    validate_response=merged_validate_response,
                     guards=merged_guards,
                     auth=merged_auth,
                     tags=tags,
@@ -832,6 +845,7 @@ class BoltAPI:
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         lookup_field: str = "pk",
         tags: list[str] | None = None,
     ):
@@ -927,11 +941,21 @@ class BoltAPI:
                     merged_status_code = action_status_code
 
                 # Check for response_model on the method or original handler
-                method_response_model = getattr(action_method, "response_model", None)
-                if method_response_model is None:
+                method_response_model = getattr(action_method, "response_model", _RESPONSE_MODEL_UNSET)
+                if method_response_model is _RESPONSE_MODEL_UNSET:
                     original = getattr(handler, "__original_handler__", None)
                     if original is not None:
-                        method_response_model = getattr(original, "response_model", None)
+                        method_response_model = getattr(original, "response_model", _RESPONSE_MODEL_UNSET)
+
+                merged_validate_response = validate_response
+                if merged_validate_response is None:
+                    merged_validate_response = getattr(action_method, "validate_response", None)
+                if merged_validate_response is None:
+                    original = getattr(handler, "__original_handler__", None)
+                    if original is not None:
+                        merged_validate_response = getattr(original, "validate_response", None)
+                if merged_validate_response is None and hasattr(handler, "__bolt_validate_response__"):
+                    merged_validate_response = handler.__bolt_validate_response__
 
                 # Register the route
                 route_decorator = self._route_decorator(
@@ -939,6 +963,7 @@ class BoltAPI:
                     route_path,
                     response_model=method_response_model,
                     status_code=merged_status_code,
+                    validate_response=merged_validate_response,
                     guards=merged_guards,
                     auth=merged_auth,
                     tags=tags,
@@ -967,6 +992,7 @@ class BoltAPI:
         # Get class-level auth and guards (if any)
         class_auth = getattr(view_cls, "auth", None)
         class_guards = getattr(view_cls, "guards", None)
+        class_validate_response = getattr(view_cls, "validate_response", None)
 
         # Scan all attributes in the class
         for name in dir(view_cls):
@@ -1038,6 +1064,9 @@ class BoltAPI:
                     # Action-specific takes precedence if explicitly set
                     final_auth = attr.auth if attr.auth is not None else class_auth
                     final_guards = attr.guards if attr.guards is not None else class_guards
+                    final_validate_response = (
+                        attr.validate_response if attr.validate_response is not None else class_validate_response
+                    )
 
                     # Register the custom action
                     decorator = self._route_decorator(
@@ -1045,6 +1074,7 @@ class BoltAPI:
                         action_path,
                         response_model=attr.response_model,
                         status_code=attr.status_code,
+                        validate_response=final_validate_response,
                         guards=final_guards,
                         auth=final_auth,
                         tags=attr.tags,
@@ -1058,8 +1088,9 @@ class BoltAPI:
         method: str,
         path: str,
         *,
-        response_model: Any | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
+        validate_response: bool | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
@@ -1120,8 +1151,14 @@ class BoltAPI:
             # assignment below when is_multi_response=True.
             effective_status: int | None = None
             default_code: int = 0
-            if response_model is not None:
-                if isinstance(response_model, dict):
+            route_validate_response = (
+                self._validate_response_default if validate_response is None else validate_response
+            )
+            if response_model is not _RESPONSE_MODEL_UNSET:
+                if response_model is None:
+                    meta["is_multi_response"] = False
+                    final_response_type = None
+                elif isinstance(response_model, dict):
                     # Dict mode: per-status-code response schemas
                     int_codes = sorted(c for c in response_model if isinstance(c, int))
                     if not int_codes:
@@ -1175,6 +1212,7 @@ class BoltAPI:
                 meta.update(response_meta)
             else:
                 meta["response_type"] = None
+            meta["validate_response"] = route_validate_response
             # Pre-compute stream annotation analysis (registration time only)
             meta["_stream_info"] = _extract_stream_item_type(meta["response_type"])
 
@@ -1215,12 +1253,18 @@ class BoltAPI:
                     entry: dict = {
                         "response_type": resp_type,
                         "default_status_code": code if isinstance(code, int) else handler_default_status,
+                        "validate_response": route_validate_response,
                         "_stream_info": _extract_stream_item_type(resp_type),
                     }
                     if code in field_names_map:
                         entry["response_field_names"] = field_names_map[code]
                     resolved_metas[code] = entry
                 meta["_resolved_metas"] = resolved_metas
+
+            compile_response_handlers(meta)
+            if meta["is_multi_response"]:
+                for entry in meta["_resolved_metas"].values():
+                    compile_response_handlers(entry)
 
             # Compile optimized argument injector (once at registration time)
             # This pre-compiles all parameter extraction logic for maximum performance
@@ -1353,20 +1397,17 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        if isinstance(data, (dict, list)):
+                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
-                            return await serialize_json_data(data, response_type, entry, status_code=code)
-                        # Non-dict/list: adjust status code if entry is a shared ellipsis entry.
-                        if entry["default_status_code"] != code:
-                            entry = {**entry, "default_status_code": code}
-                        return await serialize_response(data, entry)
+                            return await serialize_json_data(data, entry, status_code=code)
+                        return await entry["_default_response_handler"](data, status_code=code)
 
                 # JSON() with explicit status: pick schema by its status_code.
                 if isinstance(result, _JSONResponse):
                     entry = resolved_metas.get(result.status_code) or resolved_metas.get(...)
                     if entry is not None:
-                        return await serialize_json_response(result, entry["response_type"], entry)
+                        return await entry["_response_type_handler"](result)
 
                 # Bare dict/list or any other type: use the default status schema.
                 return await serialize_response(result, default_entry)
@@ -1379,19 +1420,17 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        if isinstance(data, (dict, list)):
+                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
-                            return serialize_json_data_sync(data, response_type, entry, status_code=code)
-                        if entry["default_status_code"] != code:
-                            entry = {**entry, "default_status_code": code}
-                        return serialize_response_sync(data, entry)
+                            return serialize_json_data_sync(data, entry, status_code=code)
+                        return entry["_default_response_handler_sync"](data, status_code=code)
 
                 # JSON() with explicit status: pick schema by its status_code.
                 if isinstance(result, _JSONResponse):
                     entry = resolved_metas.get(result.status_code) or resolved_metas.get(...)
                     if entry is not None:
-                        return serialize_response_sync(result, entry)
+                        return entry["_response_type_handler_sync"](result)
 
                 return serialize_response_sync(result, default_entry)
 
@@ -1420,8 +1459,8 @@ class BoltAPI:
         # Fast path: async handler without rust-prebound args (most common pattern).
         # Eliminates: state.setdefault, 2×state.pop, has_prebound check.
         if mode != "request_only" and is_async and not is_blocking and not has_rust_prebound and not injector_is_async:
-            response_type = meta["response_type"]
             default_status = meta["default_status_code"]
+            has_response_validation = meta["_has_response_validation"]
 
             # Detect trivially-async handlers: async def with no await statements.
             # These can be dispatched synchronously by driving the coroutine inline
@@ -1438,76 +1477,117 @@ class BoltAPI:
                 except (AttributeError, TypeError):
                     pass
 
-            # Super-fast path: no response_type validation → inline dict/list serialization
+            # Super-fast path: no compiled response validation → inline dict/list serialization
             # directly into the executor. Eliminates 2 async function call overheads
             # (serialize_response + serialize_json_data are both async but never suspend
             # for dict returns with no response model).
             _is_no_params = meta.get("handler_pattern") is HandlerPattern.NO_PARAMS
 
-            if response_type is None:
-                _encode = _json.encode
+            if not has_response_validation:
+                # Bind encoder method directly — skips the `if serializer is not None`
+                # check in _json.encode() on every call.
+                _encode = _json._ENCODER.encode
                 _meta_json = _RESPONSE_META_JSON
+
+                # Pre-compute at registration time whether _convert_serializers can be
+                # skipped. When the return type is dict, list[Struct], list[dict], etc.
+                # (i.e. NOT a Bolt Serializer), the conversion is always a no-op.
+                _response_type = meta.get("response_type")
+                _resp_origin = get_origin(_response_type) if _response_type else None
+                _skip_convert = _resp_origin is list or _response_type is dict or _resp_origin is dict
 
                 if _trivially_async:
                     # Sync executor for trivially-async handlers: drive coroutine inline.
                     # coro.send(None) immediately raises StopIteration since there are
                     # no await points. This bypasses the entire async bridge (~6-12μs).
                     if _is_no_params:
-                        # No-params: call handler() directly (skip injector + unpacking)
-                        def execute_trivial_async_sync(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-                            coro = handler()
-                            try:
-                                coro.send(None)
-                            except StopIteration as _e:
-                                result = _e.value
-                            else:
-                                coro.close()
-                                raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
-                            if isinstance(result, dict):
-                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                            if isinstance(result, list):
-                                result = _convert_serializers(result)
-                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                            return serialize_response_sync(result, meta)
+                        if _skip_convert:
+                            # Ultra-fast: no params, no validation, result goes directly to encoder.
+                            def execute_trivial_async_sync(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                                coro = handler()
+                                try:
+                                    coro.send(None)
+                                except StopIteration as _e:
+                                    return (default_status, _meta_json, _BODY_BYTES, _encode(_e.value))
+                                else:
+                                    coro.close()
+                                    raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                        else:
+                            def execute_trivial_async_sync(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                                coro = handler()
+                                try:
+                                    coro.send(None)
+                                except StopIteration as _e:
+                                    result = _e.value
+                                else:
+                                    coro.close()
+                                    raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                                if isinstance(result, dict):
+                                    return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                                if isinstance(result, list):
+                                    result = _convert_serializers(result)
+                                    return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                                return serialize_response_sync(result, meta)
                     else:
-                        def execute_trivial_async_sync(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-                            args, kwargs = injector(request)
-                            coro = handler(*args, **kwargs)
-                            try:
-                                coro.send(None)
-                            except StopIteration as _e:
-                                result = _e.value
-                            else:
-                                coro.close()
-                                raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
-                            if isinstance(result, dict):
-                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                            if isinstance(result, list):
-                                result = _convert_serializers(result)
-                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                            return serialize_response_sync(result, meta)
+                        if _skip_convert:
+                            def execute_trivial_async_sync(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                                args, kwargs = injector(request)
+                                coro = handler(*args, **kwargs)
+                                try:
+                                    coro.send(None)
+                                except StopIteration as _e:
+                                    return (default_status, _meta_json, _BODY_BYTES, _encode(_e.value))
+                                else:
+                                    coro.close()
+                                    raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                        else:
+                            def execute_trivial_async_sync(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                                args, kwargs = injector(request)
+                                coro = handler(*args, **kwargs)
+                                try:
+                                    coro.send(None)
+                                except StopIteration as _e:
+                                    result = _e.value
+                                else:
+                                    coro.close()
+                                    raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                                if isinstance(result, dict):
+                                    return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                                if isinstance(result, list):
+                                    result = _convert_serializers(result)
+                                    return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                                return serialize_response_sync(result, meta)
 
                     meta["_sync_executor"] = execute_trivial_async_sync
 
                 if _is_no_params:
-                    async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-                        result = await handler()
-                        if isinstance(result, dict):
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        if isinstance(result, list):
-                            result = _convert_serializers(result)
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        return await serialize_response(result, meta)
+                    if _skip_convert:
+                        async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(await handler()))
+                    else:
+                        async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            result = await handler()
+                            if isinstance(result, dict):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            if isinstance(result, list):
+                                result = _convert_serializers(result)
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return await serialize_response(result, meta)
                 else:
-                    async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-                        args, kwargs = injector(request)
-                        result = await handler(*args, **kwargs)
-                        if isinstance(result, dict):
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        if isinstance(result, list):
-                            result = _convert_serializers(result)
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        return await serialize_response(result, meta)
+                    if _skip_convert:
+                        async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(await handler(*args, **kwargs)))
+                    else:
+                        async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            result = await handler(*args, **kwargs)
+                            if isinstance(result, dict):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            if isinstance(result, list):
+                                result = _convert_serializers(result)
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return await serialize_response(result, meta)
 
                 return execute_async_dict_fast
 
@@ -1525,58 +1605,79 @@ class BoltAPI:
 
         # Fast path for sync non-blocking handler without rust-prebound args.
         if mode != "request_only" and not is_async and not is_blocking and not has_rust_prebound and not injector_is_async:
-            response_type = meta["response_type"]
             default_status = meta["default_status_code"]
+            has_response_validation = meta["_has_response_validation"]
             _is_no_params_sync = meta.get("handler_pattern") is HandlerPattern.NO_PARAMS
 
-            if response_type is None:
-                _encode = _json.encode
+            if not has_response_validation:
+                _encode = _json._ENCODER.encode
                 _meta_json = _RESPONSE_META_JSON
+
+                _response_type = meta.get("response_type")
+                _resp_origin = get_origin(_response_type) if _response_type else None
+                _skip_convert = _resp_origin is list or _response_type is dict or _resp_origin is dict
 
                 # Plain (non-async) sync executor for Rust sync dispatch bypass.
                 # Eliminates coroutine creation + into_future_with_locals overhead.
                 if _is_no_params_sync:
-                    # No-params: call handler() directly (skip injector + unpacking)
-                    def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-                        result = handler()
-                        if isinstance(result, dict):
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        if isinstance(result, list):
-                            result = _convert_serializers(result)
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        return serialize_response_sync(result, meta)
+                    if _skip_convert:
+                        def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(handler()))
+                    else:
+                        def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            result = handler()
+                            if isinstance(result, dict):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            if isinstance(result, list):
+                                result = _convert_serializers(result)
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return serialize_response_sync(result, meta)
                 else:
-                    def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-                        args, kwargs = injector(request)
-                        result = handler(*args, **kwargs)
-                        if isinstance(result, dict):
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        if isinstance(result, list):
-                            result = _convert_serializers(result)
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        return serialize_response_sync(result, meta)
+                    if _skip_convert:
+                        def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(handler(*args, **kwargs)))
+                    else:
+                        def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            result = handler(*args, **kwargs)
+                            if isinstance(result, dict):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            if isinstance(result, list):
+                                result = _convert_serializers(result)
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return serialize_response_sync(result, meta)
 
                 meta["_sync_executor"] = execute_sync_dict_fast_plain
 
                 if _is_no_params_sync:
-                    async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-                        result = handler()
-                        if isinstance(result, dict):
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        if isinstance(result, list):
-                            result = _convert_serializers(result)
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        return serialize_response_sync(result, meta)
+                    if _skip_convert:
+                        async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(handler()))
+                    else:
+                        async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            result = handler()
+                            if isinstance(result, dict):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            if isinstance(result, list):
+                                result = _convert_serializers(result)
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return serialize_response_sync(result, meta)
                 else:
-                    async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-                        args, kwargs = injector(request)
-                        result = handler(*args, **kwargs)
-                        if isinstance(result, dict):
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        if isinstance(result, list):
-                            result = _convert_serializers(result)
-                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
-                        return serialize_response_sync(result, meta)
+                    if _skip_convert:
+                        async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(handler(*args, **kwargs)))
+                    else:
+                        async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            result = handler(*args, **kwargs)
+                            if isinstance(result, dict):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            if isinstance(result, list):
+                                result = _convert_serializers(result)
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return serialize_response_sync(result, meta)
 
                 return execute_sync_dict_fast
 
@@ -1830,30 +1931,18 @@ class BoltAPI:
         - Pre-compiled argument injector (zero parameter binding overhead)
         - Streamlined execution flow (minimal branching)
         - Eliminated hasattr() checks via __init__ initialization
-        - Cached logging decisions to avoid per-request isEnabledFor() calls
+        - Zero logging overhead: access logging moved to Rust (Granian pattern),
+          only exception logging remains here (BlackSheep pattern)
 
         Args:
             handler: The route handler function
             request: The request dictionary
             handler_id: Handler ID to lookup original API (for merged APIs)
         """
-        # For merged APIs, use the original API's logging middleware and middleware chain
-        # This preserves per-API logging, auth, and middleware config (Litestar-style)
+        # For merged APIs, use the original API's middleware chain and logging
+        # This preserves per-API auth, middleware, and logging config (Litestar-style)
         # Note: _handler_api_map is always initialized in __init__ (no hasattr needed)
         original_api = self._handler_api_map.get(handler_id) if handler_id is not None else None
-        logging_middleware = original_api._logging_middleware if original_api else self._logging_middleware
-
-        # Start timing only if we might log
-        # Use cached should_time flag (computed once per logging middleware instance)
-        start_time = None
-        if logging_middleware:
-            # _should_time_cached initialized in LoggingMiddleware.__init__()
-            if logging_middleware._should_time_cached:
-                start_time = time.time()
-
-            # Skip method call when debug-level request logging is disabled.
-            if logging_middleware._request_debug_enabled_cached:
-                logging_middleware.log_request(request)
 
         try:
             # 1. Direct metadata access using handler_id (int key is faster than callable key)
@@ -1886,32 +1975,17 @@ class BoltAPI:
 
             if api_with_middleware:
                 # Execute through middleware chain (Django-style)
-                response = await self._dispatch_with_middleware(handler, request, handler_id, api_with_middleware, meta)
+                return await self._dispatch_with_middleware(handler, request, handler_id, api_with_middleware, meta)
             else:
                 # Fast path: no middleware, execute pre-compiled handler executor directly.
-                response = await meta["_handler_executor"](handler, request)
-
-            # Log response if logging enabled
-            if logging_middleware and start_time is not None:
-                duration = time.time() - start_time
-                # Response is ResponseWireV1 tuple.
-                status_code = response[0] if isinstance(response, tuple) else 200
-                logging_middleware.log_response(request, status_code, duration)
-
-            return response
+                return await meta["_handler_executor"](handler, request)
 
         except HTTPException as he:
-            # Log exception if logging enabled
-            if logging_middleware and start_time is not None:
-                duration = time.time() - start_time
-                logging_middleware.log_response(request, he.status_code, duration)
-
             return self._handle_http_exception(he)
         except Exception as e:
-            # Log exception if logging enabled
-            if logging_middleware:
-                logging_middleware.log_exception(request, e, exc_info=True)
-
+            # BlackSheep pattern: only log unhandled exceptions (rare path)
+            if self._logging_middleware:
+                self._logging_middleware.log_exception(request, e, exc_info=True)
             return self._handle_generic_exception(e, request=request)
         finally:
             # Auto-cleanup UploadFiles to prevent resource leaks
@@ -1931,22 +2005,16 @@ class BoltAPI:
         no into_future_with_locals, no asyncio event loop polling. This eliminates
         ~6-12us of async bridge overhead per request.
 
+        Zero logging overhead: access logging (timing, method/path/status) is handled
+        in Rust via const generic (compiler-eliminated when off). Only unhandled
+        exception logging remains here (BlackSheep pattern — rare path only).
+
         Prerequisites (checked at registration time, stored in can_sync_dispatch flag):
         - Handler has a _sync_executor (sync, non-blocking, simple params)
         - No Python middleware (global or route-level)
         - No Django middleware
         - No signals
         """
-        original_api = self._handler_api_map.get(handler_id) if handler_id is not None else None
-        logging_middleware = original_api._logging_middleware if original_api else self._logging_middleware
-
-        start_time = None
-        if logging_middleware:
-            if logging_middleware._should_time_cached:
-                start_time = time.time()
-            if logging_middleware._request_debug_enabled_cached:
-                logging_middleware.log_request(request)
-
         try:
             meta = self._handler_meta[handler_id]
 
@@ -1962,23 +2030,14 @@ class BoltAPI:
                     )
 
             # Call pre-compiled sync executor directly (no coroutine, no await)
-            response = meta["_sync_executor"](handler, request)
-
-            if logging_middleware and start_time is not None:
-                duration = time.time() - start_time
-                status_code = response[0] if isinstance(response, tuple) else 200
-                logging_middleware.log_response(request, status_code, duration)
-
-            return response
+            return meta["_sync_executor"](handler, request)
 
         except HTTPException as he:
-            if logging_middleware and start_time is not None:
-                duration = time.time() - start_time
-                logging_middleware.log_response(request, he.status_code, duration)
             return self._handle_http_exception(he)
         except Exception as e:
-            if logging_middleware:
-                logging_middleware.log_exception(request, e, exc_info=True)
+            # BlackSheep pattern: only log unhandled exceptions (rare path)
+            if self._logging_middleware:
+                self._logging_middleware.log_exception(request, e, exc_info=True)
             return self._handle_generic_exception(e, request=request)
         finally:
             if meta["has_file_uploads"]:

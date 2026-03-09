@@ -390,9 +390,17 @@ async def read_10k():
     """
     return test_data.JSON_10K
 
-
-@api.get("/1k-json")
-async def read_1k():
+class ItemSchema(msgspec.Struct):
+    id: int
+    name: str
+    description: str
+    price: float
+    category: str
+    in_stock: bool
+    tags: list[str]
+    
+@api.get("/1k-json", validate_response=False)
+async def read_1k() -> list[ItemSchema]:
     """
     Endpoint that returns 10k JSON objects.
 
@@ -823,7 +831,6 @@ async def file_static_nonexistent():
 
 
 # ==== Streaming endpoints for benchmarks ====
-# TODO: Add proper api for streaming files
 @api.get("/stream")
 @no_compress
 async def stream_plain():
@@ -832,6 +839,7 @@ async def stream_plain():
             yield "x"
 
     return StreamingResponse(gen(), media_type="text/plain")
+
 
 
 @api.get("/collected")

@@ -509,24 +509,50 @@ async def upload_multiple(
     }
 ```
 
-### Saving to Django FileField
+### Saving to Django FileField / ImageField
 
-The `UploadFile.file` property returns a Django `File` object that works directly with `FileField`:
+When a multipart request arrives, Django-Bolt parses it in Rust for performance — extracting file content, filename, content type, and size. The result is wrapped in an `UploadFile` object on the Python side, which gives you async read/write methods and automatic cleanup.
+
+However, Django's `FileField` and `ImageField` don't know about `UploadFile` — they expect a `django.core.files.base.File` object. The `.file` property bridges this gap: it wraps the Rust-parsed file data in a Django `File` without an additional memory copy, so you can assign it directly to any model field:
 
 ```python
-from myapp.models import Document
+from myapp.models import Document, UserProfile
 
+# Async handler with FileField
 @api.post("/documents")
 async def create_document(
     title: Annotated[str, Form()],
-    file: Annotated[UploadFile, File(max_size=FileSize.MB_10)],
+    upload: Annotated[UploadFile, File(max_size=FileSize.MB_10)],
 ):
     doc = Document(title=title)
-    doc.file.save(file.filename, file.file, save=False)
+    doc.file = upload.file  # assign Django File to FileField
     await doc.asave()
-
     return {"id": doc.id, "url": doc.file.url}
+
+# ImageField works the same way
+@api.post("/avatar")
+async def upload_avatar(
+    avatar: Annotated[UploadFile, File(
+        max_size=FileSize.MB_5,
+        allowed_types=["image/*"],
+    )],
+    request,
+):
+    profile = await UserProfile.objects.aget(user=request.user)
+    profile.avatar = avatar.file  # assign Django File to ImageField
+    await profile.asave()
+    return {"avatar_url": profile.avatar.url}
+
+# Sync handlers work too
+@api.post("/sync-upload")
+def sync_upload(upload: Annotated[UploadFile, File()]):
+    doc = Document(title="Uploaded doc")
+    doc.file = upload.file
+    doc.save()
+    return {"id": doc.id}
 ```
+
+Since `.file` returns a standard Django `File`, it works transparently with any storage backend you have configured — `FileSystemStorage`, S3 via `django-storages`, Google Cloud Storage, etc.
 
 ### Mixed form and files
 
@@ -589,6 +615,10 @@ Error types:
 | `file_too_small` | Below `min_size` |
 | `file_too_many` | Exceeds `max_files` |
 | `file_invalid_content_type` | Not in `allowed_types` |
+
+### Disk spooling
+
+During multipart parsing, Rust keeps small files (<= `BOLT_MEMORY_SPOOL_THRESHOLD`, default 1 MB) in memory and writes larger files to a temporary file on disk to avoid memory spikes. `UploadFile` handles this transparently — disk-spooled files are lazily opened only when accessed. Temp files are cleaned up automatically after the request.
 
 ### Global upload settings
 
