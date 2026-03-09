@@ -163,6 +163,8 @@ pub fn start_server(
         cors_config_data,
         static_files_data,
         csp_header,
+        access_log_enabled,
+        access_logger_obj,
     ) = Python::attach(|py| {
         let debug = (|| -> PyResult<bool> {
             let django_conf = py.import("django.conf")?;
@@ -344,6 +346,33 @@ pub fn start_server(
             }
         })();
 
+        // Check Django's logging configuration to determine if access logging is enabled.
+        // Uses the standard django.server logger — no extra settings needed.
+        // Decision is made once at startup (Granian pattern: zero cost when off).
+        let (access_log_enabled, access_logger_obj) = (|| -> (bool, Option<Py<PyAny>>) {
+            let logging = match py.import("logging") {
+                Ok(m) => m,
+                Err(_) => return (false, None),
+            };
+            let info_level: i32 = match logging.getattr("INFO").and_then(|v| v.extract()) {
+                Ok(v) => v,
+                Err(_) => return (false, None),
+            };
+            let logger = match logging.call_method1("getLogger", ("django.server",)) {
+                Ok(l) => l,
+                Err(_) => return (false, None),
+            };
+            let enabled = logger
+                .call_method1("isEnabledFor", (info_level,))
+                .and_then(|v| v.extract::<bool>())
+                .unwrap_or(false);
+            if enabled {
+                (true, Some(logger.unbind()))
+            } else {
+                (false, None)
+            }
+        })();
+
         (
             debug,
             max_header_size,
@@ -352,6 +381,8 @@ pub fn start_server(
             cors_data,
             static_data,
             csp_header,
+            access_log_enabled,
+            access_logger_obj,
         )
     });
 
@@ -509,6 +540,7 @@ pub fn start_server(
         route_metadata: None, // Production uses ROUTE_METADATA
         asgi_mounts: None,    // Production uses GLOBAL_ASGI_MOUNTS
         static_files_config: static_files_config.clone(),
+        access_logger: access_logger_obj,
     });
 
     py.detach(|| {
@@ -571,8 +603,14 @@ pub fn start_server(
                                 .route(&static_route, web::get().to(handle_static_file));
                         }
 
-                        // Default service handles all unmatched HTTP requests
-                        app.default_service(web::to(handle_request))
+                        // Default service handles all unmatched HTTP requests.
+                        // Granian pattern: select handler variant at registration time.
+                        // handle_request::<false> has zero access-logging instructions (compiler eliminated).
+                        if access_log_enabled {
+                            app.default_service(web::to(handle_request::<true>))
+                        } else {
+                            app.default_service(web::to(handle_request::<false>))
+                        }
                     })
                     .keep_alive(keep_alive)
                     .client_request_timeout(std::time::Duration::from_secs(0))

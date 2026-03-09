@@ -637,7 +637,7 @@ pub(crate) fn build_prebound_args_kwargs(
     Some((args.unbind(), kwargs.unbind()))
 }
 
-pub async fn handle_request(
+pub async fn handle_request<const ACCESS_LOG: bool>(
     req: HttpRequest,
     mut payload: web::Payload,
     state: web::Data<Arc<AppState>>,
@@ -645,6 +645,13 @@ pub async fn handle_request(
     // Keep as &str - no allocation, only clone on error paths
     let method = req.method().as_str();
     let path = req.path();
+
+    // ACCESS_LOG: compiler eliminates this entirely when ACCESS_LOG=false (const generic)
+    let access_log_start = if ACCESS_LOG {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
 
     let router = GLOBAL_ROUTER.get().expect("Router not initialized");
 
@@ -1201,7 +1208,7 @@ pub async fn handle_request(
         }
     });
 
-    match dispatch_result {
+    let response = match dispatch_result {
         Ok(DispatchOutcome::Ready(response)) => response,
         // Sync dispatch completed but body needs async post-processing (stream/file).
         // Already parsed — no duplicate GIL acquire or wire re-parse.
@@ -1239,5 +1246,23 @@ pub async fn handle_request(
         Err(e) => Python::attach(|py| {
             handle_python_error(py, e, req.path(), req.method().as_str(), state.debug)
         }),
+    };
+
+    // ACCESS_LOG: compiler eliminates this entire block when ACCESS_LOG=false (const generic).
+    // When ACCESS_LOG=true, log method/path/status/duration via Django's logger.
+    if ACCESS_LOG {
+        // access_log_start is always Some when ACCESS_LOG=true; unwrap is safe.
+        let dur_ms = access_log_start.unwrap().elapsed().as_secs_f64() * 1000.0;
+        let status = response.status().as_u16();
+        // access_logger is always Some when ACCESS_LOG=true (guaranteed by server.rs startup).
+        Python::attach(|py| {
+            let _ = state.access_logger.as_ref().unwrap().call_method1(
+                py,
+                "info",
+                (format!("{} {} {} {:.1}ms", method, path, status, dur_ms),),
+            );
+        });
     }
+
+    response
 }

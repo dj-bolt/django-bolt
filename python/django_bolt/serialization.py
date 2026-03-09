@@ -310,6 +310,25 @@ def _compile_queryset_serializers(meta: HandlerMetadata | dict[str, Any]) -> tup
     return serialize_sync, serialize_async
 
 
+def _compile_model_projector(meta: HandlerMetadata | dict[str, Any]) -> Any:
+    """Compile a function that projects model instances to dicts using response field names.
+
+    When validate_response=False and the handler returns a list of Django model
+    instances (not dicts/Structs), we still need to extract the declared fields
+    to produce JSON-serializable dicts. This is compiled once at registration time.
+
+    Returns None if no response_field_names are available (no list[Struct] annotation).
+    """
+    field_names = meta.get("response_field_names")
+    if not field_names:
+        return None
+
+    def project(items: list[Any]) -> list[dict[str, Any]]:
+        return [{name: getattr(item, name, None) for name in field_names} for item in items]
+
+    return project
+
+
 def _extract_stream_item_type(annotation: Any) -> tuple[bool, Any | None]:
     """Return (is_stream_annotation, item_type) for streaming return annotations."""
     if annotation is None:
@@ -422,6 +441,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     validator_sync, validator_async = _compile_response_validator(meta)
     stream_validator_sync, stream_validator_async = _compile_stream_item_validators(meta)
     queryset_serializer_sync, queryset_serializer_async = _compile_queryset_serializers(meta)
+    model_projector = _compile_model_projector(meta)
 
     meta["_response_validator"] = validator_sync
     meta["_response_validator_async"] = validator_async
@@ -443,7 +463,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, dict):
             return await _serialize_json_payload_async(result, current_status, validator_async)
         if isinstance(result, list):
-            return await _serialize_json_payload_async(_convert_serializers(result), current_status, validator_async)
+            result = _convert_serializers(result)
+            # When validate_response=False and list contains model instances (not dicts/Structs),
+            # project them to dicts using pre-compiled field names from the response type annotation.
+            if model_projector is not None and result and not isinstance(result[0], (dict, msgspec.Struct)):
+                result = model_projector(result)
+            return await _serialize_json_payload_async(result, current_status, validator_async)
         if isinstance(result, (bytes, bytearray)):
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
@@ -482,7 +507,10 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, dict):
             return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, list):
-            return _serialize_json_payload_sync(_convert_serializers(result), current_status, validator_sync)
+            result = _convert_serializers(result)
+            if model_projector is not None and result and not isinstance(result[0], (dict, msgspec.Struct)):
+                result = model_projector(result)
+            return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, (bytes, bytearray)):
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
