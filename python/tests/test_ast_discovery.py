@@ -50,13 +50,19 @@ class TestFindBoltApiNames:
         """)
         assert find_bolt_api_names(name) == ["api"]
 
-    def test_ignore_django_ninja_api(self, tmp_path):
-        name = _write_module(tmp_path, "_test_ignore_django_ninja", """
-            from django_bolt.api import BoltAPI
+    def test_ignores_non_bolt_api_from_other_lib(self, tmp_path):
+        name = _write_module(tmp_path, "_test_ignore_other_lib", """
+            from some_other_lib import BoltAPI
             api = BoltAPI()
         """)
-        assert find_bolt_api_names(name) == ["api"]
+        assert find_bolt_api_names(name) == []
 
+    def test_ignores_attribute_call_from_other_lib(self, tmp_path):
+        name = _write_module(tmp_path, "_test_ignore_other_attr", """
+            import some_other_lib.api
+            app = some_other_lib.api.BoltAPI()
+        """)
+        assert find_bolt_api_names(name) == []
 
     def test_import_alias(self, tmp_path):
         name = _write_module(tmp_path, "_test_alias", """
@@ -69,6 +75,13 @@ class TestFindBoltApiNames:
         name = _write_module(tmp_path, "_test_attr", """
             import django_bolt.api
             app = django_bolt.api.BoltAPI()
+        """)
+        assert find_bolt_api_names(name) == ["app"]
+
+    def test_aliased_module_import(self, tmp_path):
+        name = _write_module(tmp_path, "_test_alias_module", """
+            import django_bolt.api as bolt
+            app = bolt.BoltAPI()
         """)
         assert find_bolt_api_names(name) == ["app"]
 
@@ -134,3 +147,16 @@ class TestFindBoltApiNames:
             app = BoltAPI(enable_logging=True, trailing_slash=False)
         """)
         assert find_bolt_api_names(name) == ["app"]
+
+    def test_star_import(self, tmp_path):
+        name = _write_module(tmp_path, "_test_star", """
+            from django_bolt.api import *
+            app = BoltAPI()
+        """)
+        assert find_bolt_api_names(name) == ["app"]
+
+    def test_bare_bolt_api_without_import(self, tmp_path):
+        name = _write_module(tmp_path, "_test_bare", """
+            app = BoltAPI()
+        """)
+        assert find_bolt_api_names(name) == []
