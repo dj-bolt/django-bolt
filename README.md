@@ -170,6 +170,22 @@ Contributions welcome! Here's how:
 
 
 
+## 💖 Sponsors
+
+Support Django-Bolt's development by becoming a sponsor. Your logo will show up here with a link to your website.
+
+### Sponsors
+
+<a href="https://opencollective.com/django-bolt/tiers/sponsor/0/website" target="_blank"><img src="https://opencollective.com/django-bolt/tiers/sponsor/0/avatar.svg" /></a>
+
+### Backers
+
+<a href="https://opencollective.com/django-bolt#backers" target="_blank"><img src="https://opencollective.com/django-bolt/backers.svg?width=890" /></a>
+
+[Become a sponsor](https://opencollective.com/django-bolt)
+
+---
+
 ## 🙏 Acknowledgments & Inspiration
 
 Django-Bolt stands on the shoulders of giants. We're grateful to the following projects and communities that inspired our design and implementation:
