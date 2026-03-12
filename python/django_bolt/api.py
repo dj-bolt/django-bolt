@@ -726,6 +726,20 @@ class BoltAPI:
             return fn
 
         return decorator
+    @property
+    def urls(self):
+        from django.urls import path
+
+        patterns = []
+
+        for path_str, method, handler_id, handler in self._routes:
+            route_path = path_str.lstrip("/")
+
+            patterns.append(
+                path(route_path, handler, name=f"bolt-{handler_id}")
+            )
+
+        return patterns, "django_bolt", "django_bolt"
 
     def view(
         self,
