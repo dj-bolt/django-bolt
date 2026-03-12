@@ -419,6 +419,9 @@ class BoltAPI:
         # Signal emission - disabled by default for performance
         # Enable with BOLT_EMIT_SIGNALS = True in Django settings
         self._emit_signals = getattr(django_settings, "BOLT_EMIT_SIGNALS", False) if django_settings else False
+        # Lifecycle hooks
+        self._startup_hooks: list[Callable] = []
+        self._shutdown_hooks: list[Callable] = []
 
         # Register this instance globally for autodiscovery
         _BOLT_API_REGISTRY.append(self)
@@ -2261,6 +2264,7 @@ class BoltAPI:
             await asgi_app(django_scope, receive, django_send)
 
         self.mount_asgi(path, django_mount_wrapper)
+        
 
     def include_router(self, router: Router, prefix: str = "") -> None:
         """
@@ -2332,3 +2336,21 @@ class BoltAPI:
 
             # Apply decorator to register handler
             decorator(handler)
+    def on_startup(self, func: Callable) -> Callable:
+        """Register a startup lifecycle hook."""
+        self._startup_hooks.append(func)
+        return func
+
+    def on_shutdown(self, func: Callable) -> Callable:
+        """Register a shutdown lifecycle hook."""
+        self._shutdown_hooks.append(func)
+        return func
+
+    async def _run_lifecycle_hooks(self, hooks: list[Callable]) -> None:
+        """Execute lifecycle hooks in order. Supports both sync and async."""
+        import asyncio
+        for hook in hooks:
+            if asyncio.iscoroutinefunction(hook):
+                await hook()
+            else:
+                hook()
