@@ -1,8 +1,5 @@
 """
 JWT utility functions for Django-Bolt.
-
-Provides helper functions to create JWT tokens for Django users and
-extract user information from request context.
 """
 
 from __future__ import annotations
@@ -24,6 +21,7 @@ def create_jwt_for_user(
     expires_in: int = 3600,
     extra_claims: dict[str, Any] | None = None,
 ) -> str:
+    """Create a JWT token for a Django User."""
     if secret is None:
         secret = settings.SECRET_KEY
 
@@ -50,6 +48,7 @@ def create_jwt_for_user(
 
 
 async def get_current_user(request: Request):
+    """Extract and fetch Django User from request context."""
     User = get_user_model()
     context = request.get("context", {})
     user_id = context.get("user_id")
@@ -65,11 +64,13 @@ async def get_current_user(request: Request):
 
 
 def extract_user_id_from_context(request: Request) -> str | None:
+    """Extract user_id from request context."""
     context = request.get("context", {})
     return context.get("user_id")
 
 
 def get_auth_context(request: Request) -> dict[str, Any]:
+    """Get the full authentication context from request."""
     return request.get("context", {})
 
 
