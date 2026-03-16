@@ -405,14 +405,39 @@ class TestClient(httpx.Client):
         self.api = api
 
     def __enter__(self):
-        """Enter context manager."""
-        return super().__enter__()
+        """Enter context manager — runs lifespan startup if configured."""
+        if self.api._has_lifespan:
+            loop = asyncio.new_event_loop()
+            cm = self.api._lifespan_context(self.api)
+            try:
+                loop.run_until_complete(cm.__aenter__())
+            except BaseException:
+                loop.close()
+                raise
+            self._lifespan_loop = loop
+            self._lifespan_cm = cm
+        try:
+            return super().__enter__()
+        except BaseException:
+            if hasattr(self, "_lifespan_cm"):
+                self._lifespan_loop.run_until_complete(
+                    self._lifespan_cm.__aexit__(None, None, None)
+                )
+                self._lifespan_loop.close()
+            raise
 
-    def __exit__(self, *args):
-        """Exit context manager and cleanup test app."""
-        with contextlib.suppress(builtins.BaseException):
-            _core.destroy_test_app(self.app_id)
-        return super().__exit__(*args)
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager — runs lifespan shutdown, then cleans up test app."""
+        try:
+            if hasattr(self, "_lifespan_cm"):
+                self._lifespan_loop.run_until_complete(
+                    self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb)
+                )
+                self._lifespan_loop.close()
+        finally:
+            with contextlib.suppress(builtins.BaseException):
+                _core.destroy_test_app(self.app_id)
+        return super().__exit__(exc_type, exc_val, exc_tb)
 
     # Override HTTP methods to support stream=True
     def _add_streaming_methods(self, response: Response) -> Response:
@@ -633,11 +658,24 @@ class AsyncTestClient(httpx.AsyncClient):
         self.api = api
 
     async def __aenter__(self):
-        """Enter async context manager."""
-        return await super().__aenter__()
+        """Enter async context manager — runs lifespan startup if configured."""
+        if self.api._has_lifespan:
+            cm = self.api._lifespan_context(self.api)
+            await cm.__aenter__()
+            self._lifespan_cm = cm
+        try:
+            return await super().__aenter__()
+        except BaseException:
+            if hasattr(self, "_lifespan_cm"):
+                await self._lifespan_cm.__aexit__(None, None, None)
+            raise
 
-    async def __aexit__(self, *args):
-        """Exit async context manager and cleanup test app."""
-        with contextlib.suppress(builtins.BaseException):
-            _core.destroy_test_app(self.app_id)
-        return await super().__aexit__(*args)
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Exit async context manager — runs lifespan shutdown, then cleans up test app."""
+        try:
+            if hasattr(self, "_lifespan_cm"):
+                await self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb)
+        finally:
+            with contextlib.suppress(builtins.BaseException):
+                _core.destroy_test_app(self.app_id)
+        return await super().__aexit__(exc_type, exc_val, exc_tb)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dis
 import inspect
 import sys
@@ -282,6 +284,23 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
     return int(status), meta, _BODY_BYTES, body
 
 
+async def serve_with_lifespan(
+    source_lifespans: list[tuple[BoltAPI, Callable]],
+    server_fn: Callable,
+) -> None:
+    """Run *server_fn* inside every lifespan context in *source_lifespans*.
+
+    Each ``(api, lifespan_ctx)`` pair is entered in order; teardown runs in
+    reverse order (LIFO) via :class:`contextlib.AsyncExitStack`.
+    *server_fn* is executed in a thread so the async event-loop stays free
+    for lifespan teardown when the server stops.
+    """
+    async with contextlib.AsyncExitStack() as stack:
+        for api, lifespan_ctx in source_lifespans:
+            await stack.enter_async_context(lifespan_ctx(api))
+        await asyncio.to_thread(server_fn)
+
+
 class BoltAPI:
     def __init__(
         self,
@@ -294,6 +313,7 @@ class BoltAPI:
         compression: Any | None = None,
         openapi_config: Any | None = None,
         validate_response: bool = True,
+        lifespan: Callable | None = None,
     ) -> None:
         """
         Initialize a BoltAPI instance.
@@ -316,6 +336,8 @@ class BoltAPI:
             compression: Compression configuration (CompressionConfig or False to disable)
             openapi_config: OpenAPI documentation configuration
             validate_response: Default response validation policy for registered routes
+            lifespan: Async context manager factory for startup/shutdown lifecycle.
+                Receives the BoltAPI instance as argument.
         """
         self._routes: list[tuple[str, str, int, Callable]] = []
         self._websocket_routes: list[tuple[str, int, Callable]] = []  # (path, handler_id, handler)
@@ -419,9 +441,9 @@ class BoltAPI:
         # Signal emission - disabled by default for performance
         # Enable with BOLT_EMIT_SIGNALS = True in Django settings
         self._emit_signals = getattr(django_settings, "BOLT_EMIT_SIGNALS", False) if django_settings else False
-        # Lifecycle hooks
-        self._startup_hooks: list[Callable] = []
-        self._shutdown_hooks: list[Callable] = []
+        # Lifecycle: async context manager for startup/shutdown
+        self._lifespan_context: Callable | None = lifespan
+        self._source_lifespans: list[tuple[BoltAPI, Callable]] | None = None
 
         # Register this instance globally for autodiscovery
         _BOLT_API_REGISTRY.append(self)
@@ -2264,7 +2286,6 @@ class BoltAPI:
             await asgi_app(django_scope, receive, django_send)
 
         self.mount_asgi(path, django_mount_wrapper)
-        
 
     def include_router(self, router: Router, prefix: str = "") -> None:
         """
@@ -2336,21 +2357,8 @@ class BoltAPI:
 
             # Apply decorator to register handler
             decorator(handler)
-    def on_startup(self, func: Callable) -> Callable:
-        """Register a startup lifecycle hook."""
-        self._startup_hooks.append(func)
-        return func
 
-    def on_shutdown(self, func: Callable) -> Callable:
-        """Register a shutdown lifecycle hook."""
-        self._shutdown_hooks.append(func)
-        return func
-
-    async def _run_lifecycle_hooks(self, hooks: list[Callable]) -> None:
-        """Execute lifecycle hooks in order. Supports both sync and async."""
-        import asyncio
-        for hook in hooks:
-            if asyncio.iscoroutinefunction(hook):
-                await hook()
-            else:
-                hook()
+    @property
+    def _has_lifespan(self) -> bool:
+        """Check if this API has a lifespan context manager."""
+        return self._lifespan_context is not None

@@ -513,6 +513,36 @@ The `AsyncTestClient` is useful when:
 - You need to await other async operations in the same test
 - You're using `pytest-asyncio`
 
+## Lifespan support
+
+The `TestClient` automatically runs [lifespan](lifespan.md) events. Startup runs when entering the `with` block, shutdown runs when exiting:
+
+```python
+from contextlib import asynccontextmanager
+from django_bolt import BoltAPI
+from django_bolt.testing import TestClient
+
+@asynccontextmanager
+async def lifespan(app):
+    app._cache = {"ready": True}
+    yield
+    app._cache.clear()
+
+api = BoltAPI(lifespan=lifespan)
+
+@api.get("/status")
+async def status(request):
+    return {"ready": request.app._cache.get("ready", False)}
+
+with TestClient(api) as client:
+    # Lifespan startup has already run
+    response = client.get("/status")
+    assert response.json() == {"ready": True}
+# Lifespan shutdown runs here
+```
+
+If no lifespan is configured, `TestClient` works exactly as before.
+
 ## Test isolation
 
 Each `TestClient` context creates isolated state:

@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Annotated, Protocol
 
 import msgspec
@@ -33,6 +34,17 @@ from django_bolt.serializers import Serializer, field_validator
 from django_bolt.types import Request
 from django_bolt.views import APIView, ViewSet
 
+
+@asynccontextmanager
+async def lifespan(app):
+    """Run startup/shutdown logic for the application."""
+    print("Starting up — warming caches, initializing resources...")
+    app._startup_time = time.time()
+    yield
+    uptime = time.time() - app._startup_time
+    print(f"Shutting down — server was up for {uptime:.1f}s")
+
+
 # OpenAPI is enabled by default at /docs with Swagger UI
 # You can customize it by passing openapi_config:
 #
@@ -40,6 +52,7 @@ from django_bolt.views import APIView, ViewSet
 #
 # 1. Default compression (brotli with gzip fallback):
 api = BoltAPI(
+    lifespan=lifespan,
     openapi_config=OpenAPIConfig(
         title="My API",
         version="1.0.0",

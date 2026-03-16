@@ -70,6 +70,7 @@ nav = [
     { "Dependencies" = "topics/dependencies.md" },
     { "Middleware" = "topics/middleware.md" },
     { "Static Files" = "topics/static-files.md" },
+    { "Lifespan" = "topics/lifespan.md" },
     { "Django Signals" = "topics/signals.md" },
     { "Error Handling" = "topics/error-handling.md" },
     { "Logging" = "topics/logging.md" },

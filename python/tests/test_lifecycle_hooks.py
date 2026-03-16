@@ -1,47 +1,122 @@
-import asyncio
+from contextlib import asynccontextmanager
+
 import pytest
+
 from django_bolt.api import BoltAPI
+from django_bolt.testing import TestClient
 
 
-def test_startup_hook_registered():
+def test_no_lifespan_by_default():
     api = BoltAPI()
-
-    @api.on_startup
-    def my_hook():
-        pass
-
-    assert my_hook in api._startup_hooks
+    assert api._lifespan_context is None
+    assert api._has_lifespan is False
 
 
-def test_shutdown_hook_registered():
-    api = BoltAPI()
+def test_lifespan_stored():
+    @asynccontextmanager
+    async def my_lifespan(app):
+        yield
 
-    @api.on_shutdown
-    def my_hook():
-        pass
-
-    assert my_hook in api._shutdown_hooks
+    api = BoltAPI(lifespan=my_lifespan)
+    assert api._lifespan_context is my_lifespan
+    assert api._has_lifespan is True
 
 
-def test_sync_startup_hook_runs():
-    api = BoltAPI()
+def test_lifespan_runs_on_test_client_enter_exit():
+    """Lifespan startup runs on TestClient enter, shutdown on exit."""
     called = []
 
-    @api.on_startup
-    def my_hook():
-        called.append("started")
+    @asynccontextmanager
+    async def lifespan(app):
+        called.append("startup")
+        yield
+        called.append("shutdown")
 
-    asyncio.run(api._run_lifecycle_hooks(api._startup_hooks))
-    assert called == ["started"]
+    api = BoltAPI(lifespan=lifespan)
+
+    @api.get("/health")
+    async def health():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        assert called == ["startup"]
+        response = client.get("/health")
+        assert response.status_code == 200
+
+    assert called == ["startup", "shutdown"]
 
 
-def test_async_shutdown_hook_runs():
-    api = BoltAPI()
+def test_lifespan_receives_app_instance():
+    received = []
+
+    @asynccontextmanager
+    async def lifespan(app):
+        received.append(app)
+        yield
+
+    api = BoltAPI(lifespan=lifespan)
+
+    @api.get("/ping")
+    async def ping():
+        return "pong"
+
+    with TestClient(api):
+        pass
+
+    assert received[0] is api
+
+
+def test_lifespan_shutdown_runs_on_exception():
     called = []
 
-    @api.on_shutdown
-    async def my_hook():
-        called.append("stopped")
+    @asynccontextmanager
+    async def lifespan(app):
+        called.append("startup")
+        try:
+            yield
+        finally:
+            called.append("shutdown")
 
-    asyncio.run(api._run_lifecycle_hooks(api._shutdown_hooks))
-    assert called == ["stopped"]
+    api = BoltAPI(lifespan=lifespan)
+
+    @api.get("/fail")
+    async def fail():
+        raise RuntimeError("boom")
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        client.get("/fail")
+
+    assert called == ["startup", "shutdown"]
+
+
+def test_no_lifespan_still_works():
+    """TestClient works normally when no lifespan is configured."""
+    api = BoltAPI()
+
+    @api.get("/hello")
+    async def hello():
+        return {"message": "world"}
+
+    with TestClient(api) as client:
+        response = client.get("/hello")
+        assert response.status_code == 200
+        assert response.json() == {"message": "world"}
+
+
+def test_lifespan_startup_failure_prevents_tests():
+    """If startup raises, it propagates out of TestClient.__enter__."""
+
+    @asynccontextmanager
+    async def bad_lifespan(app):
+        raise RuntimeError("startup failed")
+        yield  # noqa: RET503
+
+    api = BoltAPI(lifespan=bad_lifespan)
+
+    @api.get("/x")
+    async def x():
+        return "x"
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        with TestClient(api):
+            pass

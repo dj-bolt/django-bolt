@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import contextlib
 import importlib
 import importlib.metadata
@@ -14,7 +15,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from django_bolt import _core
-from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts
+from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts, serve_with_lifespan
 
 try:
     from django.utils import autoreload
@@ -464,14 +465,27 @@ class Command(BaseCommand):
                 features=features,
             )
 
+        # Collect lifecycle contexts (merged APIs store them, single APIs check directly)
+        source_lifespans = merged_api._source_lifespans
+        if source_lifespans is None and merged_api._has_lifespan:
+            source_lifespans = [(merged_api, merged_api._lifespan_context)]
+
         # Start the server (all handlers go through async dispatch with thread pool for sync)
-        _core.start_server(
-            merged_api._dispatch,
-            options["host"],
-            options["port"],
-            compression_config,
-            merged_api._dispatch_sync,
-        )
+        if source_lifespans:
+
+            def server_fn():
+                _core.start_server(
+                    merged_api._dispatch, options["host"], options["port"],
+                    compression_config, merged_api._dispatch_sync,
+                )
+
+            with contextlib.suppress(KeyboardInterrupt):
+                asyncio.run(serve_with_lifespan(source_lifespans, server_fn))
+        else:
+            _core.start_server(
+                merged_api._dispatch, options["host"], options["port"],
+                compression_config, merged_api._dispatch_sync,
+            )
 
     # ------------------------------------------------------------------
     # Startup banner
@@ -779,6 +793,13 @@ class Command(BaseCommand):
 
         # Update next handler ID
         merged._next_handler_id = next_handler_id
+
+        # Collect lifecycle contexts from source APIs
+        merged._source_lifespans = [
+            (api, api._lifespan_context)
+            for _, api in apis
+            if api._has_lifespan
+        ]
 
         return merged
 
