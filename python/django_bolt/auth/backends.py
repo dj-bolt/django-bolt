@@ -24,7 +24,7 @@ from typing import Any
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
-from django.db import OperationalError, InterfaceError
+from django.db import InterfaceError, OperationalError
 
 from .revocation import create_revocation_handler
 
