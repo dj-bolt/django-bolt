@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import enum
 import http.client
 import inspect
-from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin
+from dataclasses import replace
+from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin
 
 import msgspec
 
@@ -396,8 +398,31 @@ class SchemaGenerator:
                 or (default == inspect.Parameter.empty and not is_optional(annotation))
             )
 
+            # Handle msgspec.Struct in query parameters
+            if source == "query" and is_msgspec_struct(annotation):
+                struct_info = msgspec.inspect.type_info(annotation)
+                for struct_field in struct_info.fields:
+                    field_schema = self._type_to_schema(struct_field.type)
+
+                    # Populate default value in the schema
+                    if struct_field.default is not msgspec.NODEFAULT:
+                        field_schema = replace(field_schema, default=struct_field.default)
+                    field_required = struct_field.required and struct_field.default is msgspec.NODEFAULT
+                    parameters.append(
+                        Parameter(
+                            name=struct_field.encode_name,
+                            param_in="query",
+                            required=field_required,
+                            schema=field_schema,
+                            description=None,
+                        )
+                    )
+                continue
+
             # Get schema for parameter type
             schema = self._type_to_schema(annotation)
+            if default not in (inspect.Parameter.empty, None):
+                schema = replace(schema, default=default)
 
             parameter = Parameter(
                 name=alias,
@@ -739,11 +764,35 @@ class SchemaGenerator:
         # Handle msgspec type info objects (IntType, StrType, BoolType, etc.)
         type_name = type(type_annotation).__name__
         if hasattr(type_annotation, "__class__") and type_name.endswith("Type"):
-            # Map msgspec type objects to OpenAPI schemas
+            # Numeric types with constraint support (ge/gt/le/lt/multiple_of)
+            if type_name == "IntType":
+                return Schema(
+                    type="integer",
+                    minimum=type_annotation.ge,
+                    exclusive_minimum=type_annotation.gt,
+                    maximum=type_annotation.le,
+                    exclusive_maximum=type_annotation.lt,
+                    multiple_of=type_annotation.multiple_of,
+                )
+            if type_name == "FloatType":
+                return Schema(
+                    type="number",
+                    minimum=type_annotation.ge,
+                    exclusive_minimum=type_annotation.gt,
+                    maximum=type_annotation.le,
+                    exclusive_maximum=type_annotation.lt,
+                    multiple_of=type_annotation.multiple_of,
+                )
+            # String type with constraint support (min_length/max_length/pattern)
+            if type_name == "StrType":
+                return Schema(
+                    type="string",
+                    min_length=type_annotation.min_length,
+                    max_length=type_annotation.max_length,
+                    pattern=type_annotation.pattern,
+                )
+            # Types without constraints — static map
             msgspec_type_map = {
-                "IntType": Schema(type="integer"),
-                "StrType": Schema(type="string"),
-                "FloatType": Schema(type="number"),
                 "BoolType": Schema(type="boolean"),
                 "BytesType": Schema(type="string", format="binary"),
                 "DateTimeType": Schema(type="string", format="date-time"),
@@ -787,6 +836,29 @@ class SchemaGenerator:
             # For dict types from msgspec
             if type_name == "DictType":
                 return Schema(type="object", additional_properties=True)
+            # For enum types from msgspec (EnumType for plain enums,
+            # CustomType for Django TextChoices/IntegerChoices which use
+            # a metaclass that msgspec doesn't recognise as a standard enum)
+            if (
+                type_name in ("EnumType", "CustomType")
+                and hasattr(type_annotation, "cls")
+                and issubclass(type_annotation.cls, enum.Enum)
+            ):
+                values = [e.value for e in type_annotation.cls]
+                if all(isinstance(v, str) for v in values):
+                    return Schema(type="string", enum=values)
+                if all(isinstance(v, int) for v in values):
+                    return Schema(type="integer", enum=values)
+                return Schema(enum=values)
+            # For Literal types from msgspec
+            if type_name == "LiteralType":
+                values = type_annotation.values
+                # Infer type from values (all strings, all ints, etc.)
+                if all(isinstance(v, str) for v in values):
+                    return Schema(type="string", enum=list(values))
+                elif all(isinstance(v, int) for v in values):
+                    return Schema(type="integer", enum=list(values))
+                return Schema(enum=list(values))
 
         # Unwrap Optional
         origin = get_origin(type_annotation)
@@ -824,6 +896,14 @@ class SchemaGenerator:
         if origin is dict:
             return Schema(type="object", additional_properties=True)
 
+        # Handle Literal types
+        if origin is Literal:
+            if all(isinstance(v, str) for v in args):
+                return Schema(type="string", enum=list(args))
+            if all(isinstance(v, int) for v in args):
+                return Schema(type="integer", enum=list(args))
+            return Schema(enum=list(args))
+
         # Handle primitive types
         type_map = {
             str: Schema(type="string"),
@@ -859,10 +939,15 @@ class SchemaGenerator:
 
             # Get schema for field type
             field_schema = self._type_to_schema(field_type, register_component=False)
+
+            # Populate default value in the schema (only for Schema, not Reference)
+            if field.default is not msgspec.NODEFAULT and isinstance(field_schema, Schema):
+                field_schema = replace(field_schema, default=field.default)
+
             properties[field_name] = field_schema
 
             # Check if required
-            if field.required and field.default == msgspec.NODEFAULT:
+            if field.required and field.default is msgspec.NODEFAULT:
                 required.append(field_name)
 
         return Schema(
