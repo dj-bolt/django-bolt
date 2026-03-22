@@ -1161,8 +1161,30 @@ class BoltAPI:
             # Django's @csrf_exempt decorator sets handler.csrf_exempt = True
             meta["csrf_exempt"] = getattr(fn, "csrf_exempt", False)
 
-            # Static ORM analysis: Detect blocking operations at registration time
-            handler_analysis = analyze_handler(fn)
+            request_param_names = {
+                field.name for field in meta.get("fields", []) if getattr(field, "source", None) == "request"
+            }
+
+            # Static ORM + request-component analysis at registration time
+            handler_analysis = analyze_handler(fn, request_param_names=request_param_names)
+
+            if request_param_names:
+                if handler_analysis.analysis_failed:
+                    # Preserve correctness when source introspection is unavailable.
+                    meta["needs_body"] = True
+                    meta["needs_query"] = True
+                    meta["needs_headers"] = True
+                    meta["needs_cookies"] = True
+                else:
+                    meta["needs_body"] = meta.get("needs_body", False) or handler_analysis.request_needs_body
+                    meta["needs_query"] = meta.get("needs_query", False) or handler_analysis.request_needs_query
+                    meta["needs_headers"] = (
+                        meta.get("needs_headers", False) or handler_analysis.request_needs_headers
+                    )
+                    meta["needs_cookies"] = (
+                        meta.get("needs_cookies", False) or handler_analysis.request_needs_cookies
+                    )
+
             meta["is_blocking"] = handler_analysis.is_blocking
 
             # Emit warning for sync handlers with ORM (will run in thread pool)

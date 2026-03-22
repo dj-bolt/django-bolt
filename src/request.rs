@@ -68,6 +68,16 @@ pub struct PyRequest {
     pub conn_remote_addr: String,
 }
 
+impl PyRequest {
+    #[inline]
+    fn dict_or_empty<'py>(value: &Option<Py<PyDict>>, py: Python<'py>) -> Py<PyDict> {
+        match value {
+            Some(d) => d.clone_ref(py),
+            None => PyDict::new(py).unbind(),
+        }
+    }
+}
+
 #[pymethods]
 impl PyRequest {
     /// OPTIMIZATION: #[inline] on hot path getters
@@ -124,45 +134,30 @@ impl PyRequest {
     }
 
     /// Get headers as a dict for middleware access.
-    /// Values are pre-typed by Rust (int, float, bool, str).
-    ///
     /// Example:
     ///     auth_header = request.headers.get("authorization")
     #[getter]
     #[inline]
     fn headers<'py>(&self, py: Python<'py>) -> Py<PyDict> {
-        match &self.headers {
-            Some(d) => d.clone_ref(py),
-            None => PyDict::new(py).unbind(),
-        }
+        Self::dict_or_empty(&self.headers, py)
     }
 
     /// Get cookies as a dict for middleware access.
-    /// Values are pre-typed by Rust (int, float, bool, str).
-    ///
     /// Example:
     ///     session_id = request.cookies.get("session_id")
     #[getter]
     #[inline]
     fn cookies<'py>(&self, py: Python<'py>) -> Py<PyDict> {
-        match &self.cookies {
-            Some(d) => d.clone_ref(py),
-            None => PyDict::new(py).unbind(),
-        }
+        Self::dict_or_empty(&self.cookies, py)
     }
 
     /// Get query params as a dict for middleware access.
-    /// Values are pre-typed by Rust (int, float, bool, str).
-    ///
     /// Example:
     ///     page = request.query.get("page", 1)  # Returns int directly
     #[getter]
     #[inline]
     fn query<'py>(&self, py: Python<'py>) -> Py<PyDict> {
-        match &self.query_params {
-            Some(d) => d.clone_ref(py),
-            None => PyDict::new(py).unbind(),
-        }
+        Self::dict_or_empty(&self.query_params, py)
     }
 
     /// Get the state dict for middleware to store arbitrary data.
@@ -265,8 +260,7 @@ impl PyRequest {
         meta.set_item("REQUEST_METHOD", &self.method)?;
         meta.set_item("PATH_INFO", &self.path)?;
 
-        // QUERY_STRING - reconstruct from query_params (empty if none)
-        // Note: Original encoding/ordering not preserved, but sufficient for template rendering
+        // QUERY_STRING - reconstructed from parsed query_params.
         let query_string = match &self.query_params {
             Some(qp) => {
                 let query_dict = qp.bind(py);
@@ -406,7 +400,6 @@ impl PyRequest {
     /// Uses Host header to determine the scheme and host.
     #[pyo3(signature = (location=None))]
     fn build_absolute_uri(&self, py: Python<'_>, location: Option<&str>) -> String {
-        // Helper to extract header value with default
         let (host, scheme) = match &self.headers {
             Some(headers_py) => {
                 let headers_dict = headers_py.bind(py);
@@ -461,18 +454,9 @@ impl PyRequest {
                 Some(d) => d.clone_ref(py).into_any(),
                 None => PyDict::new(py).into_any().unbind(),
             },
-            "query" => match &self.query_params {
-                Some(d) => d.clone_ref(py).into_any(),
-                None => PyDict::new(py).into_any().unbind(),
-            },
-            "headers" => match &self.headers {
-                Some(d) => d.clone_ref(py).into_any(),
-                None => PyDict::new(py).into_any().unbind(),
-            },
-            "cookies" => match &self.cookies {
-                Some(d) => d.clone_ref(py).into_any(),
-                None => PyDict::new(py).into_any().unbind(),
-            },
+            "query" => Self::dict_or_empty(&self.query_params, py).into_any(),
+            "headers" => Self::dict_or_empty(&self.headers, py).into_any(),
+            "cookies" => Self::dict_or_empty(&self.cookies, py).into_any(),
             "state" => self.get_or_init_state(py).into_any(),
             "auth" | "context" => match &self.context {
                 Some(ctx) => ctx.clone_ref(py).into_any(),
@@ -491,18 +475,9 @@ impl PyRequest {
                 Some(d) => d.clone_ref(py).into_any(),
                 None => PyDict::new(py).into_any().unbind(),
             }),
-            "query" => Ok(match &self.query_params {
-                Some(d) => d.clone_ref(py).into_any(),
-                None => PyDict::new(py).into_any().unbind(),
-            }),
-            "headers" => Ok(match &self.headers {
-                Some(d) => d.clone_ref(py).into_any(),
-                None => PyDict::new(py).into_any().unbind(),
-            }),
-            "cookies" => Ok(match &self.cookies {
-                Some(d) => d.clone_ref(py).into_any(),
-                None => PyDict::new(py).into_any().unbind(),
-            }),
+            "query" => Ok(Self::dict_or_empty(&self.query_params, py).into_any()),
+            "headers" => Ok(Self::dict_or_empty(&self.headers, py).into_any()),
+            "cookies" => Ok(Self::dict_or_empty(&self.cookies, py).into_any()),
             "state" => Ok(self.get_or_init_state(py).into_any()),
             "context" => Ok(match &self.context {
                 Some(ctx) => ctx.clone_ref(py).into_any(),

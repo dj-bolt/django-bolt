@@ -540,7 +540,11 @@ async fn build_response_from_parsed(
         ResponseWireBody::FilePath(file_path) => {
             let headers = response_builder::meta_to_headers(meta_ref);
             let mut response = build_file_response(
-                &file_path, parsed.status, headers, skip_compression, is_head_request,
+                &file_path,
+                parsed.status,
+                headers,
+                skip_compression,
+                is_head_request,
             )
             .await;
             mark_skip_cors(&mut response, skip_cors);
@@ -555,7 +559,9 @@ async fn build_response_from_parsed(
             if media_type == "text/event-stream" {
                 if is_head_request {
                     let mut response = response_builder::build_sse_response(
-                        parsed.status, headers, skip_compression,
+                        parsed.status,
+                        headers,
+                        skip_compression,
                     )
                     .body(Vec::<u8>::new());
                     mark_skip_cors(&mut response, skip_cors);

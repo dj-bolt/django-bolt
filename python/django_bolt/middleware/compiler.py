@@ -304,7 +304,6 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     metadata["needs_path_params"] = handler_meta.get("needs_path_params", True)
     metadata["is_static_route"] = handler_meta.get("is_static_route", False)
     metadata["needs_form_parsing"] = handler_meta.get("needs_form_parsing", False)
-
     # Compile a Rust-side argument binding plan for simple handlers.
     # Rust uses this to pre-bind args/kwargs so Python can skip injector work.
     rust_arg_bindings = _compile_rust_arg_bindings(handler_meta)

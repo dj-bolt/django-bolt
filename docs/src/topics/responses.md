@@ -36,6 +36,28 @@ async def create_user():
     )
 ```
 
+### Status code constants and helpers
+
+You can use built-in status code constants for readability:
+
+```python
+from django_bolt import status
+
+@api.post("/users", status_code=status.HTTP_201_CREATED)
+async def create_user():
+    ...
+```
+
+Code classification helpers are also available:
+
+```python
+if status.is_client_error(response.status_code):
+    ...
+
+if status.is_server_error(response.status_code):
+    ...
+```
+
 ## Plain text
 
 Return plain text responses:

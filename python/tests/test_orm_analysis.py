@@ -108,6 +108,93 @@ def sync_handler_with_requests():
     return {"status": response.status_code}
 
 
+def handler_reads_request_headers(request):
+    """Handler that directly reads request.headers."""
+    return request.headers.get("x-test")
+
+
+def handler_reads_request_body(request):
+    """Handler that directly reads request.body."""
+    return request.body
+
+
+def handler_reads_request_query(request):
+    """Handler that directly reads request.query."""
+    return request.query.get("page")
+
+
+def handler_reads_request_cookies(request):
+    """Handler that directly reads request.cookies."""
+    return request.cookies.get("session")
+
+
+def handler_reads_request_meta(request):
+    """Handler that reads Django-compatible META."""
+    return {
+        "host": request.META.get("HTTP_HOST"),
+        "query": request.META.get("QUERY_STRING"),
+    }
+
+
+def handler_reads_request_full_path(request):
+    """Handler that reads request.get_full_path()."""
+    return request.get_full_path()
+
+
+def handler_reads_request_absolute_uri(request):
+    """Handler that reads request.build_absolute_uri()."""
+    return request.build_absolute_uri()
+
+
+def handler_reads_request_get_known_keys(request):
+    """Handler that uses request.get(...) with known component keys."""
+    return {
+        "headers": request.get("headers"),
+        "query": request.get("query"),
+        "body": request.get("body"),
+        "cookies": request.get("cookies"),
+    }
+
+
+def handler_reads_request_subscript_known_keys(request):
+    """Handler that uses request[...] with known component keys."""
+    return {
+        "headers": request["headers"],
+        "query": request["query"],
+        "body": request["body"],
+        "cookies": request["cookies"],
+    }
+
+
+def handler_reads_request_in_local_helper(request):
+    """Handler that reads request components inside a nested helper."""
+
+    def inner():
+        return request.headers.get("x-test"), request.query.get("page")
+
+    return inner()
+
+
+def handler_reads_req_alias(req):
+    """Handler that uses a non-default request parameter name."""
+    return req.headers.get("x-test"), req.cookies.get("session")
+
+
+def handler_reads_request_unknown_keys(request):
+    """Handler that reads request via unknown keys only."""
+    return request.get("state"), request["state"]
+
+
+def external_helper_reads_request_headers(request):
+    """External helper used to document current analysis limits."""
+    return request.headers.get("x-test")
+
+
+def handler_passes_request_to_external_helper(request):
+    """Handler that delegates request usage to an external helper."""
+    return external_helper_reads_request_headers(request)
+
+
 class TestHandlerAnalysis:
     """Tests for analyze_handler function."""
 
@@ -195,6 +282,83 @@ class TestHandlerAnalysis:
 
         assert analysis.has_blocking_io is True
         assert "requests.get" in analysis.blocking_operations
+
+
+class TestRequestComponentAnalysis:
+    """Tests for AST-based request component detection."""
+
+    @staticmethod
+    def assert_request_flags(analysis, *, body=False, query=False, headers=False, cookies=False):
+        """Assert the detected request-component flags."""
+        assert analysis.request_needs_body is body
+        assert analysis.request_needs_query is query
+        assert analysis.request_needs_headers is headers
+        assert analysis.request_needs_cookies is cookies
+
+    def test_direct_request_headers_detection(self):
+        """Direct request.headers access sets only the headers flag."""
+        analysis = analyze_handler(handler_reads_request_headers, request_param_names={"request"})
+        self.assert_request_flags(analysis, headers=True)
+
+    def test_direct_request_body_detection(self):
+        """Direct request.body access sets only the body flag."""
+        analysis = analyze_handler(handler_reads_request_body, request_param_names={"request"})
+        self.assert_request_flags(analysis, body=True)
+
+    def test_direct_request_query_detection(self):
+        """Direct request.query access sets only the query flag."""
+        analysis = analyze_handler(handler_reads_request_query, request_param_names={"request"})
+        self.assert_request_flags(analysis, query=True)
+
+    def test_direct_request_cookies_detection(self):
+        """Direct request.cookies access sets only the cookies flag."""
+        analysis = analyze_handler(handler_reads_request_cookies, request_param_names={"request"})
+        self.assert_request_flags(analysis, cookies=True)
+
+    def test_request_meta_marks_headers_and_query(self):
+        """request.META implies both header and query-string access."""
+        analysis = analyze_handler(handler_reads_request_meta, request_param_names={"request"})
+        self.assert_request_flags(analysis, query=True, headers=True)
+
+    def test_request_get_full_path_marks_query_only(self):
+        """request.get_full_path() requires query-string access only."""
+        analysis = analyze_handler(handler_reads_request_full_path, request_param_names={"request"})
+        self.assert_request_flags(analysis, query=True)
+
+    def test_request_build_absolute_uri_marks_headers_and_query(self):
+        """request.build_absolute_uri() requires headers and query-string access."""
+        analysis = analyze_handler(handler_reads_request_absolute_uri, request_param_names={"request"})
+        self.assert_request_flags(analysis, query=True, headers=True)
+
+    def test_request_get_known_keys_detection(self):
+        """request.get(...) with known keys marks all referenced components."""
+        analysis = analyze_handler(handler_reads_request_get_known_keys, request_param_names={"request"})
+        self.assert_request_flags(analysis, body=True, query=True, headers=True, cookies=True)
+
+    def test_request_subscript_known_keys_detection(self):
+        """request[...] with known keys marks all referenced components."""
+        analysis = analyze_handler(handler_reads_request_subscript_known_keys, request_param_names={"request"})
+        self.assert_request_flags(analysis, body=True, query=True, headers=True, cookies=True)
+
+    def test_nested_local_helper_detection(self):
+        """Nested local helpers are still covered by the AST walk."""
+        analysis = analyze_handler(handler_reads_request_in_local_helper, request_param_names={"request"})
+        self.assert_request_flags(analysis, query=True, headers=True)
+
+    def test_request_alias_name_detection(self):
+        """Custom request parameter names are honored when passed to the analyzer."""
+        analysis = analyze_handler(handler_reads_req_alias, request_param_names={"req"})
+        self.assert_request_flags(analysis, headers=True, cookies=True)
+
+    def test_unknown_request_keys_do_not_mark_components(self):
+        """Unknown request.get/request[...] keys should not trigger component flags."""
+        analysis = analyze_handler(handler_reads_request_unknown_keys, request_param_names={"request"})
+        self.assert_request_flags(analysis)
+
+    def test_external_helper_usage_is_not_currently_inferred(self):
+        """Document current limitation: external helper calls are not analyzed transitively."""
+        analysis = analyze_handler(handler_passes_request_to_external_helper, request_param_names={"request"})
+        self.assert_request_flags(analysis)
 
 
 class TestWarningGeneration:

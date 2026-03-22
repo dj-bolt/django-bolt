@@ -59,6 +59,12 @@ api = BoltAPI(
         enabled=True,
     ),
 )
+@api.get("/", tags=["root"], summary="summary", description="description")
+async def read_root():
+    """
+    Endpoint that returns a simple "Hello World" dictionary.
+    """
+    return {"message": "Hello World"}
 
 #
 # 2. Custom compression with specific settings:
@@ -379,12 +385,6 @@ async def generate_token(token_req: TokenRequest):
     }
 
 
-@api.get("/", tags=["root"], summary="summary", description="description")
-async def read_root():
-    """
-    Endpoint that returns a simple "Hello World" dictionary.
-    """
-    return {"message": "Hello World"}
 
 
 @api.get("/sync", tags=["root"], summary="summary", description="description")

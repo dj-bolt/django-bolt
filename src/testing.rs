@@ -942,9 +942,9 @@ async fn handle_test_request_internal(
         };
 
         let headers_for_python = if needs_headers {
-            headers.clone()
+            Some(headers.clone())
         } else {
-            AHashMap::new()
+            None
         };
 
         // Get param_types from route metadata for typed conversion
@@ -983,8 +983,15 @@ async fn handle_test_request_internal(
             None
         };
 
-        let headers_dict = params_to_py_dict(py, &headers_for_python, &param_types)?;
-        let cookies_dict = params_to_py_dict(py, &cookies, &param_types)?;
+        let headers_dict = match &headers_for_python {
+            Some(h) => Some(params_to_py_dict(py, h, &param_types)?),
+            None => None,
+        };
+        let cookies_dict = if needs_cookies {
+            Some(params_to_py_dict(py, &cookies, &param_types)?)
+        } else {
+            None
+        };
 
         // Only create state dict when Rust-side prebound args exist (matches production).
         let state_lock = std::sync::OnceLock::new();
@@ -1001,14 +1008,17 @@ async fn handle_test_request_internal(
                 Some(d) => d.bind(py),
                 None => &empty_dict,
             };
-            if let Some((pre_args, pre_kwargs)) = build_prebound_args_kwargs(
-                py,
-                bindings,
-                pp_ref,
-                qp_ref,
-                &headers_dict,
-                &cookies_dict,
-            ) {
+            let hd_ref = match &headers_dict {
+                Some(d) => d,
+                None => &empty_dict,
+            };
+            let ck_ref = match &cookies_dict {
+                Some(d) => d,
+                None => &empty_dict,
+            };
+            if let Some((pre_args, pre_kwargs)) =
+                build_prebound_args_kwargs(py, bindings, pp_ref, qp_ref, hd_ref, ck_ref)
+            {
                 let state_dict = PyDict::new(py);
                 state_dict.set_item("_bolt_prebound_args", pre_args)?;
                 state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
@@ -1031,8 +1041,8 @@ async fn handle_test_request_internal(
             body: body.to_vec(),
             path_params: path_params_dict,
             query_params: query_params_dict,
-            headers: Some(headers_dict.unbind()),
-            cookies: Some(cookies_dict.unbind()),
+            headers: headers_dict.map(|d| d.unbind()),
+            cookies: cookies_dict.map(|d| d.unbind()),
             context,
             user: None,
             state: state_lock,

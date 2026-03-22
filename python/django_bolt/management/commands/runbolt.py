@@ -9,6 +9,8 @@ import importlib.util
 import os
 import signal
 import sys
+import warnings
+from pathlib import Path
 
 from django.apps import apps
 from django.conf import settings
@@ -16,11 +18,6 @@ from django.core.management.base import BaseCommand, CommandError
 
 from django_bolt import _core
 from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts, serve_with_lifespan
-
-try:
-    from django.utils import autoreload
-except ImportError:
-    autoreload = None
 
 try:
     from django_bolt.logging.config import setup_django_logging
@@ -33,6 +30,145 @@ try:
     from django_bolt.admin.admin_detection import detect_admin_url_prefix
 except ImportError:
     detect_admin_url_prefix = None
+
+
+_ENV_DEV_WORKER = "DJANGO_BOLT_DEV_WORKER"
+_ENV_DEV_RELOAD_COUNT = "DJANGO_BOLT_DEV_RELOAD_COUNT"
+
+DEV_RELOAD_IGNORE_DIRS = (
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "node_modules",
+    "target",
+)
+
+
+def _get_dev_reload_count() -> int:
+    try:
+        return int(os.environ.get(_ENV_DEV_RELOAD_COUNT, "0"))
+    except ValueError:
+        return 0
+
+
+def _is_dev_reload_restart() -> bool:
+    return os.environ.get(_ENV_DEV_WORKER) == "1" and _get_dev_reload_count() > 0
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _collapse_watch_paths(paths: set[Path]) -> list[Path]:
+    collapsed: list[Path] = []
+
+    for path in sorted(paths, key=lambda item: (len(item.parts), str(item))):
+        if any(_path_within(path, existing) for existing in collapsed):
+            continue
+        collapsed.append(path)
+
+    return collapsed
+
+
+def _build_dev_worker_command(argv: list[str] | None = None, executable: str | None = None) -> list[str]:
+    argv = sys.argv if argv is None else argv
+    executable = sys.executable if executable is None else executable
+
+    command = [executable]
+    saw_processes = False
+    it = iter(argv)
+
+    for arg in it:
+        if arg == "--dev" or arg.startswith("--dev="):
+            continue
+
+        if arg == "--processes":
+            next(it, None)
+            saw_processes = True
+            command.extend(["--processes", "1"])
+            continue
+
+        if arg.startswith("--processes="):
+            saw_processes = True
+            command.append("--processes=1")
+            continue
+
+        command.append(arg)
+
+    if not saw_processes:
+        command.extend(["--processes", "1"])
+
+    return command
+
+
+def _coerce_path(value) -> Path | None:
+    try:
+        return Path(os.fspath(value)).resolve()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _venv_prefix_paths() -> set[Path]:
+    paths: set[Path] = set()
+    for prefix in {sys.prefix, sys.base_prefix, sys.exec_prefix}:
+        if not prefix:
+            continue
+        path = _coerce_path(prefix)
+        if path is not None and path.exists():
+            paths.add(path)
+    return paths
+
+
+def _collect_dev_watch_paths() -> list[str]:
+    watch_paths: set[Path] = {Path.cwd().resolve()}
+
+    base_dir = _coerce_path(getattr(settings, "BASE_DIR", None))
+    if base_dir is not None and base_dir.exists():
+        watch_paths.add(base_dir)
+
+    template_configs = getattr(settings, "TEMPLATES", [])
+    for config in template_configs:
+        for template_dir in config.get("DIRS", []):
+            path = _coerce_path(template_dir)
+            if path is not None and path.exists():
+                watch_paths.add(path)
+
+    static_dirs = getattr(settings, "STATICFILES_DIRS", [])
+    for static_dir in static_dirs:
+        if isinstance(static_dir, tuple):
+            static_dir = static_dir[1]
+        path = _coerce_path(static_dir)
+        if path is not None and path.exists():
+            watch_paths.add(path)
+
+    prefix_roots = _venv_prefix_paths()
+
+    if apps.ready:
+        for app_config in apps.get_app_configs():
+            app_path = _coerce_path(app_config.path)
+            if app_path is None or not app_path.exists():
+                continue
+
+            if any(_path_within(app_path, prefix_root) for prefix_root in prefix_roots):
+                continue
+
+            watch_paths.add(app_path)
+
+    return [str(path) for path in _collapse_watch_paths(watch_paths)]
+
+
+def _collect_dev_ignore_paths() -> list[str]:
+    return [str(path) for path in sorted(_venv_prefix_paths(), key=str)]
 
 
 def _is_django_bolt_attribute(node: ast.Attribute) -> bool:
@@ -152,9 +288,11 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         processes = options["processes"]
         dev_mode = options.get("dev", False)
+        dev_worker_mode = os.environ.get(_ENV_DEV_WORKER) == "1"
+        effective_dev_mode = dev_mode or dev_worker_mode
 
         # Dev mode: force single process + enable auto-reload
-        if dev_mode:
+        if dev_mode and not dev_worker_mode:
             if processes > 1:
                 self.stdout.write(self.style.WARNING("  Warning: dev mode forces --processes=1 for auto-reload"))
                 options["processes"] = 1
@@ -165,23 +303,23 @@ class Command(BaseCommand):
             if processes > 1:
                 self.start_multiprocess(options)
             else:
-                self.start_single_process(options)
+                self.start_single_process(options, dev_mode=effective_dev_mode)
 
     def run_with_autoreload(self, options):
-        """Run server with auto-reload using Django's autoreload system"""
-        if autoreload is None:
-            self.stdout.write(
-                self.style.ERROR("  Error: Django autoreload not available. Upgrade Django or use --no-dev mode.")
-            )
-            sys.exit(1)
+        """Run the server behind the native dev supervisor."""
+        worker_command = _build_dev_worker_command()
+        watch_paths = _collect_dev_watch_paths()
+        ignore_paths = _collect_dev_ignore_paths()
 
-        # Use Django's autoreload system which is optimized
-        # It only restarts the Python interpreter when necessary
-        # and reuses the same process for faster reloads
-        def run_server():
-            self.start_single_process(options, dev_mode=True)
+        exit_code = _core.run_dev_reloader(
+            worker_command,
+            watch_paths,
+            list(DEV_RELOAD_IGNORE_DIRS),
+            ignore_paths,
+        )
 
-        autoreload.run_with_reloader(run_server)
+        if exit_code:
+            sys.exit(exit_code)
 
     def start_multiprocess(self, options):
         """Start multiple processes with SO_REUSEPORT.
@@ -319,6 +457,15 @@ class Command(BaseCommand):
 
     def start_single_process(self, options, process_id=None, dev_mode=False):
         """Start a single process server"""
+        is_dev_reload_restart = _is_dev_reload_restart()
+
+        if is_dev_reload_restart:
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Sync handler '.*' at .* uses ORM operations .*Running in thread pool\.",
+                category=UserWarning,
+            )
+
         # Setup Django logging once at server startup (one-shot, respects existing LOGGING)
         if setup_django_logging is not None:
             setup_django_logging()
@@ -453,16 +600,19 @@ class Command(BaseCommand):
 
         # Print structured startup banner (only for main process or single-process mode)
         if process_id is None:
-            self._print_startup_banner(
-                options=options,
-                dev_mode=dev_mode,
-                api_routes=_user_route_count,
-                framework_routes=_framework_route_count,
-                ws_routes=len(ws_routes),
-                asgi_mounts=len(merged_api._asgi_mounts),
-                api_count=len(apis),
-                features=features,
-            )
+            if is_dev_reload_restart:
+                self.stdout.write(f"  ✨ Reloaded on http://{options['host']}:{options['port']}")
+            else:
+                self._print_startup_banner(
+                    options=options,
+                    dev_mode=dev_mode,
+                    api_routes=_user_route_count,
+                    framework_routes=_framework_route_count,
+                    ws_routes=len(ws_routes),
+                    asgi_mounts=len(merged_api._asgi_mounts),
+                    api_count=len(apis),
+                    features=features,
+                )
 
         # Collect lifecycle contexts (merged APIs store them, single APIs check directly)
         source_lifespans = merged_api._source_lifespans

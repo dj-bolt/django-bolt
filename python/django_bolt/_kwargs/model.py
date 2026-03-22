@@ -254,8 +254,9 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
     # Check both direct File() params and Form() structs with UploadFile fields
     meta["has_file_uploads"] = any(f.source == "file" or field_has_upload_file(f) for f in field_definitions)
 
-    # Static analysis: Determine which request components are actually used
-    # This allows skipping unused parsing at request time
+    # Static analysis: Determine which request components are actually used.
+    # These start with typed-param requirements; api.py augments them with
+    # AST-detected request.body/query/headers/cookies usage when needed.
     meta["needs_body"] = any(f.source in ("body", "form", "file") for f in field_definitions)
     meta["needs_query"] = any(f.source == "query" for f in field_definitions)
     # Note: Form/File parsing depends on Content-Type header, so needs_headers must include form handlers

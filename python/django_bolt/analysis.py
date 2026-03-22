@@ -194,6 +194,19 @@ class HandlerAnalysis:
     blocking_operations: set[str] = field(default_factory=set)
     """Set of blocking operations detected"""
 
+    # Request component access detection
+    request_needs_body: bool = False
+    """Whether the handler reads request.body"""
+
+    request_needs_query: bool = False
+    """Whether the handler reads request.query or query-derived helpers"""
+
+    request_needs_headers: bool = False
+    """Whether the handler reads request.headers or header-derived helpers"""
+
+    request_needs_cookies: bool = False
+    """Whether the handler reads request.cookies"""
+
     # Analysis metadata
     analysis_failed: bool = False
     """Whether AST analysis failed (e.g., couldn't get source)"""
@@ -250,9 +263,35 @@ class OrmVisitor(ast.NodeVisitor):
     2. The method is called directly on .objects (e.g., User.objects.get())
     """
 
-    def __init__(self) -> None:
+    def __init__(self, request_param_names: set[str] | None = None) -> None:
         self.analysis = HandlerAnalysis()
         self._in_objects_chain = False
+        self.request_param_names = request_param_names or set()
+
+    def _is_request_name(self, node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and node.id in self.request_param_names
+
+    def _mark_request_component_attr(self, attr_name: str) -> None:
+        if attr_name == "body":
+            self.analysis.request_needs_body = True
+        elif attr_name == "query":
+            self.analysis.request_needs_query = True
+        elif attr_name == "headers":
+            self.analysis.request_needs_headers = True
+        elif attr_name == "cookies":
+            self.analysis.request_needs_cookies = True
+        elif attr_name == "META":
+            self.analysis.request_needs_headers = True
+            self.analysis.request_needs_query = True
+        elif attr_name == "get_full_path":
+            self.analysis.request_needs_query = True
+        elif attr_name == "build_absolute_uri":
+            self.analysis.request_needs_headers = True
+            self.analysis.request_needs_query = True
+
+    def _mark_request_component_key(self, key: str) -> None:
+        if key in {"body", "query", "headers", "cookies", "META", "get_full_path", "build_absolute_uri"}:
+            self._mark_request_component_attr(key)
 
     def _check_for_objects_chain(self, node: ast.AST) -> bool:
         """
@@ -286,6 +325,9 @@ class OrmVisitor(ast.NodeVisitor):
         """Detect attribute access patterns like Model.objects.filter()."""
         attr_name = node.attr
 
+        if self._is_request_name(node.value):
+            self._mark_request_component_attr(attr_name)
+
         # Check for .objects manager access
         if attr_name in ORM_MANAGER_ATTRS:
             self.analysis.uses_orm = True
@@ -318,6 +360,16 @@ class OrmVisitor(ast.NodeVisitor):
 
         # Check for method calls on blocking modules
         elif isinstance(node.func, ast.Attribute):
+            if self._is_request_name(node.func.value):
+                self._mark_request_component_attr(node.func.attr)
+                if (
+                    node.func.attr == "get"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
+                    self._mark_request_component_key(node.args[0].value)
+
             # e.g., requests.get(), time.sleep()
             if isinstance(node.func.value, ast.Name):
                 module_name = node.func.value.id
@@ -326,6 +378,14 @@ class OrmVisitor(ast.NodeVisitor):
                 if module_name in BLOCKING_IO_MODULES:
                     self.analysis.has_blocking_io = True
                     self.analysis.blocking_operations.add(f"{module_name}.{method_name}")
+
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        """Detect request['headers'] style access."""
+        if self._is_request_name(node.value) and isinstance(node.slice, ast.Constant):
+            if isinstance(node.slice.value, str):
+                self._mark_request_component_key(node.slice.value)
 
         self.generic_visit(node)
 
@@ -354,7 +414,10 @@ class OrmVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def analyze_handler(fn: Callable[..., Any]) -> HandlerAnalysis:
+def analyze_handler(
+    fn: Callable[..., Any],
+    request_param_names: set[str] | None = None,
+) -> HandlerAnalysis:
     """
     Analyze a handler function for ORM usage and blocking operations.
 
@@ -392,7 +455,7 @@ def analyze_handler(fn: Callable[..., Any]) -> HandlerAnalysis:
 
     # Find the function definition and analyze only its body (not decorators)
     # This prevents false positives from decorator names like @api.delete("/m")
-    visitor = OrmVisitor()
+    visitor = OrmVisitor(request_param_names=request_param_names)
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

@@ -192,6 +192,31 @@ HTTP_511_NETWORK_AUTHENTICATION_REQUIRED: Final = 511
 """HTTP status code 'Network Authentication Required'"""
 
 
+# HTTP Status Code Helpers
+def is_informational(status_code: int) -> bool:
+    return 100 <= status_code < 200
+
+
+def is_success(status_code: int) -> bool:
+    return 200 <= status_code < 300
+
+
+def is_redirect(status_code: int) -> bool:
+    return 300 <= status_code < 400
+
+
+def is_client_error(status_code: int) -> bool:
+    return 400 <= status_code < 500
+
+
+def is_server_error(status_code: int) -> bool:
+    return 500 <= status_code < 600
+
+
+def is_error(status_code: int) -> bool:
+    return 400 <= status_code < 600
+
+
 # # Websocket Codes
 # WS_1000_NORMAL_CLOSURE: Final = 1000
 # """WebSocket status code 'Normal Closure'"""
@@ -303,6 +328,12 @@ __all__ = (
     "HTTP_508_LOOP_DETECTED",
     "HTTP_510_NOT_EXTENDED",
     "HTTP_511_NETWORK_AUTHENTICATION_REQUIRED",
+    "is_informational",
+    "is_success",
+    "is_redirect",
+    "is_client_error",
+    "is_server_error",
+    "is_error",
     # "WS_1000_NORMAL_CLOSURE",
     # "WS_1001_GOING_AWAY",
     # "WS_1002_PROTOCOL_ERROR",

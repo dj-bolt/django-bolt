@@ -44,6 +44,8 @@ Middleware:
     )
 """
 
+# Status codes module
+from . import status_codes as status
 from .api import BoltAPI
 
 # Auth module
@@ -254,6 +256,8 @@ __all__ = [
     "StoplightRenderPlugin",
     "JsonRenderPlugin",
     "YamlRenderPlugin",
+    # Status codes
+    "status",
     # WebSocket
     "WebSocket",
     "WebSocketState",

@@ -1,392 +1,391 @@
 # Django-Bolt Benchmark
-Generated: Mon 16 Mar 2026 01:55:21 PM PKT
+Generated: Sun Mar 22 01:43:26 PM PKT 2026
 Config: 8 processes × 1 workers | C=100 N=10000
 
 ## Root Endpoint Performance
-  Reqs/sec    171169.55   16056.50  185896.20
-  Latency      564.00us   303.04us     5.43ms
+  Reqs/sec    188142.52   19527.81  206542.66
+  Latency      506.47us   292.01us     9.03ms
   Latency Distribution
-     50%   470.00us
-     75%   674.00us
-     90%     0.95ms
-     99%     1.94ms
+     50%   436.00us
+     75%   610.00us
+     90%   759.00us
+     99%     1.68ms
 
 ## 10kb JSON Response Performance
 ### 10kb JSON (Async) (/10k-json)
-  Reqs/sec    116400.10   12126.23  128467.12
-  Latency      818.78us   331.64us     5.50ms
+  Reqs/sec    128386.49   10015.64  134061.57
+  Latency      754.09us   291.12us     6.95ms
   Latency Distribution
-     50%   735.00us
-     75%     1.00ms
-     90%     1.28ms
-     99%     2.25ms
+     50%   691.00us
+     75%     0.90ms
+     90%     1.14ms
+     99%     1.96ms
 ### 10kb JSON (Sync) (/sync-10k-json)
-  Reqs/sec    121763.55   10057.24  131016.21
-  Latency      799.02us   337.57us     5.27ms
+  Reqs/sec    132045.31   10702.94  140543.54
+  Latency      738.72us   289.08us     5.47ms
   Latency Distribution
-     50%   709.00us
-     75%     0.97ms
-     90%     1.29ms
-     99%     2.26ms
+     50%   676.00us
+     75%     0.86ms
+     90%     1.05ms
+     99%     1.71ms
 
 ## Response Type Endpoints
 ### Header Endpoint (/header)
-  Reqs/sec    100342.30    8413.64  106140.17
-  Latency        0.98ms   353.02us     5.02ms
+  Reqs/sec    106786.24    9062.58  113960.62
+  Latency        0.92ms   293.21us     4.45ms
   Latency Distribution
-     50%     0.92ms
-     75%     1.19ms
-     90%     1.47ms
-     99%     2.36ms
+     50%     0.85ms
+     75%     1.12ms
+     90%     1.41ms
+     99%     2.15ms
 ### Cookie Endpoint (/cookie)
-  Reqs/sec     94216.40    6879.64  102200.52
-  Latency        1.05ms   376.90us     5.04ms
+  Reqs/sec    107418.67    9791.34  113081.90
+  Latency        0.92ms   262.24us     4.18ms
   Latency Distribution
-     50%     0.97ms
-     75%     1.30ms
-     90%     1.66ms
-     99%     2.71ms
+     50%     0.86ms
+     75%     1.13ms
+     90%     1.42ms
+     99%     2.04ms
 ### Exception Endpoint (/exc)
-  Reqs/sec    135710.25   12626.48  143277.56
-  Latency      721.08us   304.87us     6.46ms
+  Reqs/sec    146224.81    9776.33  153505.69
+  Latency      661.96us   267.92us     4.86ms
   Latency Distribution
-     50%   658.00us
-     75%     0.88ms
-     90%     1.14ms
-     99%     1.99ms
+     50%   597.00us
+     75%   794.00us
+     90%     1.02ms
+     99%     1.82ms
 ### HTML Response (/html)
-  Reqs/sec    150435.91   14115.04  161285.26
-  Latency      643.31us   411.33us     6.22ms
+  Reqs/sec    164108.20   15852.47  175556.92
+  Latency      586.36us   216.90us     4.76ms
   Latency Distribution
-     50%   539.00us
-     75%   735.00us
-     90%     1.13ms
-     99%     3.02ms
+     50%   562.00us
+     75%   700.00us
+     90%     0.95ms
+     99%     1.50ms
 ### Redirect Response (/redirect)
 ### File Static via FileResponse (/file-static)
-  Reqs/sec     35232.17    7367.40   39461.79
-  Latency        2.84ms     1.45ms    21.66ms
+  Reqs/sec     40413.03    8084.94   45948.44
+  Latency        2.48ms     1.23ms    16.67ms
   Latency Distribution
-     50%     2.55ms
-     75%     3.42ms
-     90%     4.44ms
-     99%     8.55ms
+     50%     2.23ms
+     75%     2.94ms
+     90%     3.73ms
+     99%     8.28ms
 
 ## Authentication & Authorization Performance
 ### Auth NO User Access (/auth/no-user-access) - lazy loading, no DB query
-  Reqs/sec     72795.59    5057.83   77449.33
-  Latency        1.35ms   415.92us     5.21ms
+  Reqs/sec     78754.30    5449.49   83259.84
+  Latency        1.25ms   403.27us     6.16ms
   Latency Distribution
-     50%     1.26ms
-     75%     1.63ms
-     90%     2.06ms
-     99%     3.19ms
-### Get Authenticated User (/auth/me) - accesses request.user, triggers DB query
-  Reqs/sec     16906.09    1443.31   19166.16
-  Latency        5.90ms     1.25ms    13.77ms
-  Latency Distribution
-     50%     5.82ms
-     75%     6.84ms
-     90%     7.70ms
-     99%    10.07ms
-### Get User via Dependency (/auth/me-dependency)
- 2975 / 10000 [========================>---------------------------------------------------------]  29.75% 14830/s
- 9075 / 10000 [==========================================================================>-------]  90.75% 15090/s
-  Reqs/sec     15160.46     834.21   16563.58
-  Latency        6.56ms     1.67ms    14.27ms
-  Latency Distribution
-     50%     6.64ms
-     75%     7.92ms
-     90%     9.05ms
-     99%    11.19ms
-### Get Auth Context (/auth/context) validated jwt no db
-  Reqs/sec     79429.55    5639.93   86334.60
-  Latency        1.22ms   429.22us     5.35ms
-  Latency Distribution
-     50%     1.09ms
+     50%     1.16ms
      75%     1.56ms
-     90%     2.07ms
-     99%     3.09ms
+     90%     1.96ms
+     99%     2.90ms
+### Get Authenticated User (/auth/me) - accesses request.user, triggers DB query
+  Reqs/sec     17408.05    1497.48   20088.66
+  Latency        5.73ms     1.42ms    13.61ms
+  Latency Distribution
+     50%     5.80ms
+     75%     6.78ms
+     90%     7.68ms
+     99%     9.84ms
+### Get User via Dependency (/auth/me-dependency)
+  Reqs/sec     15258.55     818.18   16761.40
+  Latency        6.51ms     2.22ms    16.20ms
+  Latency Distribution
+     50%     6.51ms
+     75%     8.15ms
+     90%     9.76ms
+     99%    12.56ms
+### Get Auth Context (/auth/context) validated jwt no db
+  Reqs/sec     79723.26    5713.10   85642.14
+  Latency        1.21ms   377.50us     5.20ms
+  Latency Distribution
+     50%     1.13ms
+     75%     1.49ms
+     90%     1.90ms
+     99%     2.79ms
 
 ## Items GET Performance (/items/1?q=hello)
-  Reqs/sec    148366.29   18693.95  167775.79
-  Latency      622.61us   322.11us     5.99ms
+  Reqs/sec    164729.82   16182.72  182562.24
+  Latency      606.22us   232.31us     4.64ms
   Latency Distribution
-     50%   576.00us
-     75%   682.00us
-     90%   820.00us
-     99%     2.27ms
+     50%   569.00us
+     75%   749.00us
+     90%     0.88ms
+     99%     1.43ms
 
 ## Items PUT JSON Performance (/items/1)
-  Reqs/sec    142994.39   12642.19  154517.37
-  Latency      665.90us   252.83us     5.18ms
+  Reqs/sec    146124.35   11093.25  153198.33
+  Latency      665.28us   326.18us     6.40ms
   Latency Distribution
-     50%   615.00us
-     75%   758.00us
-     90%     1.02ms
-     99%     1.81ms
+     50%   657.00us
+     75%   793.00us
+     90%     0.99ms
+     99%     1.84ms
 
 ## ORM Performance
 Seeding 1000 users for benchmark...
 Successfully seeded users
 Validated: 10 users exist in database
 ### Users Full10 (Async) (/users/full10)
-  Reqs/sec     14801.05    1923.87   23929.10
-  Latency        6.83ms     1.56ms    20.71ms
+  Reqs/sec     14849.82    2091.92   25403.51
+  Latency        6.83ms     1.07ms    16.43ms
   Latency Distribution
-     50%     6.98ms
-     75%     8.07ms
-     90%     8.94ms
-     99%    11.32ms
+     50%     6.83ms
+     75%     7.64ms
+     90%     8.29ms
+     99%     9.49ms
 ### Users Full10 (Sync) (/users/sync-full10)
-  Reqs/sec     10317.50    1098.58   13189.40
-  Latency        9.60ms     4.06ms    30.53ms
+  Reqs/sec     10213.84    1027.19   12614.43
+  Latency        9.74ms     4.08ms    28.09ms
   Latency Distribution
-     50%     8.75ms
-     75%    12.03ms
-     90%    15.76ms
-     99%    22.38ms
+     50%     8.91ms
+     75%    12.30ms
+     90%    16.16ms
+     99%    22.47ms
 ### Users Mini10 (Async) (/users/mini10)
-  Reqs/sec     17433.32    2291.05   20092.78
-  Latency        5.58ms     1.51ms    12.77ms
+  Reqs/sec     18132.41    2503.98   30504.24
+  Latency        5.62ms     1.11ms    11.16ms
   Latency Distribution
-     50%     5.43ms
-     75%     7.04ms
-     90%     8.06ms
-     99%     9.80ms
+     50%     5.50ms
+     75%     6.49ms
+     90%     7.51ms
+     99%     9.05ms
 ### Users Mini10 (Sync) (/users/sync-mini10)
-  Reqs/sec     11989.54     679.38   13447.85
-  Latency        8.31ms     3.56ms    30.98ms
+  Reqs/sec     12046.33     927.57   15270.57
+  Latency        8.29ms     3.77ms    26.61ms
   Latency Distribution
-     50%     7.66ms
-     75%    10.21ms
-     90%    13.18ms
-     99%    20.89ms
+     50%     7.17ms
+     75%    10.62ms
+     90%    14.53ms
+     99%    20.08ms
 Cleaning up test users...
 
 ## Class-Based Views (CBV) Performance
 ### Simple APIView GET (/cbv-simple)
-  Reqs/sec     98740.96    8391.17  109218.61
-  Latency        0.99ms   321.48us     4.86ms
+  Reqs/sec    109713.93    7517.57  115934.72
+  Latency        0.89ms   289.91us     4.78ms
   Latency Distribution
-     50%     0.93ms
-     75%     1.23ms
-     90%     1.54ms
-     99%     2.36ms
+     50%   832.00us
+     75%     1.08ms
+     90%     1.37ms
+     99%     2.10ms
 ### Simple APIView POST (/cbv-simple)
-  Reqs/sec    101381.91    6864.73  108580.08
-  Latency        0.97ms   311.64us     4.44ms
+  Reqs/sec    107807.68    8409.69  112780.70
+  Latency        0.91ms   319.51us     4.66ms
   Latency Distribution
-     50%     0.91ms
-     75%     1.20ms
-     90%     1.54ms
-     99%     2.25ms
+     50%   839.00us
+     75%     1.16ms
+     90%     1.47ms
+     99%     2.19ms
 ### Items100 ViewSet GET (/cbv-items100)
-  Reqs/sec     62061.14    8083.23   68264.80
-  Latency        1.55ms   465.53us     5.87ms
+  Reqs/sec     69295.89    5175.31   77800.43
+  Latency        1.44ms   498.52us     6.29ms
   Latency Distribution
-     50%     1.47ms
-     75%     1.86ms
-     90%     2.32ms
-     99%     3.55ms
+     50%     1.30ms
+     75%     1.73ms
+     90%     2.25ms
+     99%     3.72ms
 
 ## CBV Items - Basic Operations
 ### CBV Items GET (Retrieve) (/cbv-items/1)
-  Reqs/sec     94215.98    8078.48  100194.58
-  Latency        1.05ms   342.78us     4.75ms
+  Reqs/sec    108755.52    7478.97  114249.86
+  Latency        0.91ms   301.32us     3.99ms
   Latency Distribution
-     50%     0.97ms
-     75%     1.32ms
-     90%     1.67ms
-     99%     2.47ms
+     50%   834.00us
+     75%     1.13ms
+     90%     1.45ms
+     99%     2.29ms
 ### CBV Items PUT (Update) (/cbv-items/1)
-  Reqs/sec    100325.56    7556.51  105825.67
-  Latency        0.98ms   347.79us     6.95ms
+  Reqs/sec    105192.29    6223.29  109249.96
+  Latency        0.93ms   310.52us     4.99ms
   Latency Distribution
-     50%     0.91ms
-     75%     1.20ms
-     90%     1.52ms
-     99%     2.50ms
+     50%     0.87ms
+     75%     1.14ms
+     90%     1.44ms
+     99%     2.17ms
 
 ## CBV Additional Benchmarks
 ### CBV Bench Parse (POST /cbv-bench-parse)
-  Reqs/sec    100307.91    8934.32  105465.80
-  Latency        0.98ms   336.91us     4.84ms
+  Reqs/sec    107721.35    8298.46  113980.02
+  Latency        0.91ms   292.84us     5.19ms
   Latency Distribution
-     50%     0.90ms
-     75%     1.23ms
-     90%     1.56ms
-     99%     2.47ms
+     50%     0.86ms
+     75%     1.10ms
+     90%     1.36ms
+     99%     1.97ms
 ### CBV Response Types (/cbv-response)
-  Reqs/sec    109983.00    8781.15  116353.84
-  Latency        0.89ms   269.22us     4.97ms
+  Reqs/sec    112218.78    7203.91  119891.78
+  Latency        0.87ms   273.33us     5.55ms
   Latency Distribution
-     50%     0.85ms
-     75%     1.08ms
-     90%     1.34ms
-     99%     1.91ms
+     50%   816.00us
+     75%     1.05ms
+     90%     1.33ms
+     99%     1.92ms
 
 ## ORM Performance with CBV
 Seeding 1000 users for CBV benchmark...
 Successfully seeded users
 Validated: 10 users exist in database
 ### Users CBV Mini10 (List) (/users/cbv-mini10)
-  Reqs/sec     16329.43    1265.38   17812.83
-  Latency        6.08ms     1.89ms    19.04ms
+  Reqs/sec     16291.93    1102.13   17783.94
+  Latency        6.11ms     2.10ms    15.56ms
   Latency Distribution
-     50%     5.83ms
-     75%     7.21ms
-     90%     9.07ms
-     99%    12.28ms
+     50%     5.96ms
+     75%     8.17ms
+     90%     9.47ms
+     99%    11.25ms
 Cleaning up test users...
 
 
 ## Form and File Upload Performance
 ### Form Data (POST /form)
-  Reqs/sec    132183.23   13325.76  145831.82
-  Latency      735.06us   336.77us     5.75ms
+  Reqs/sec    143913.17   12617.86  152821.46
+  Latency      680.46us   250.63us     7.01ms
   Latency Distribution
-     50%   659.00us
-     75%     0.92ms
-     90%     1.15ms
-     99%     2.14ms
+     50%   641.00us
+     75%   809.00us
+     90%     1.03ms
+     99%     1.74ms
 ### File Upload (POST /upload)
-  Reqs/sec    114217.72    7874.02  123498.49
-  Latency        0.85ms   389.74us     7.59ms
+  Reqs/sec    124701.66   17597.24  154302.52
+  Latency      826.90us   246.70us     5.54ms
   Latency Distribution
-     50%   768.00us
-     75%     1.03ms
-     90%     1.32ms
-     99%     2.31ms
-### Mixed Form with Files (POST /mixed-form)
-  Reqs/sec    115074.67   12009.75  129253.02
-  Latency        0.87ms   347.61us     5.62ms
-  Latency Distribution
-     50%   802.00us
+     50%   829.00us
      75%     0.98ms
-     90%     1.31ms
-     99%     2.30ms
+     90%     1.18ms
+     99%     1.93ms
+### Mixed Form with Files (POST /mixed-form)
+  Reqs/sec    115185.91    9201.18  122897.25
+  Latency      831.11us   313.69us     7.60ms
+  Latency Distribution
+     50%   803.00us
+     75%     0.99ms
+     90%     1.19ms
+     99%     2.03ms
 
 ## Django Middleware Performance
 ### Django Middleware + Messages Framework (/middleware/demo)
 Tests: SessionMiddleware, AuthenticationMiddleware, MessageMiddleware, custom middleware, template rendering
-  Reqs/sec      9304.35     956.13   10764.53
-  Latency       10.72ms     2.58ms    25.52ms
+ 3799 / 10000 [==================>------------------------------]  37.99% 9475/s
+  Reqs/sec      9661.69     849.58   10879.90
+  Latency       10.31ms     2.59ms    25.64ms
   Latency Distribution
-     50%    10.71ms
-     75%    12.44ms
-     90%    14.11ms
-     99%    18.67ms
+     50%    10.32ms
+     75%    12.00ms
+     90%    14.04ms
+     99%    17.98ms
 
 ## Django Ninja-style Benchmarks
 ### JSON Parse/Validate (POST /bench/parse)
-  Reqs/sec    146012.25   11713.84  157582.73
-  Latency      650.73us   383.23us     6.11ms
+  Reqs/sec    155736.55   11640.23  162865.07
+  Latency      628.01us   275.06us     5.06ms
   Latency Distribution
-     50%   582.00us
-     75%   754.00us
-     90%     0.96ms
-     99%     2.23ms
+     50%   586.00us
+     75%   709.00us
+     90%     0.91ms
+     99%     2.04ms
 
 ## Serializer Performance Benchmarks
 ### Raw msgspec Serializer (POST /bench/serializer-raw)
-  Reqs/sec     99654.01   10749.75  116292.59
-  Latency        1.02ms   310.02us     4.97ms
+  Reqs/sec    101720.76    9406.80  108852.33
+  Latency        0.96ms   341.77us     6.53ms
   Latency Distribution
-     50%     0.95ms
-     75%     1.25ms
-     90%     1.56ms
-     99%     2.31ms
+     50%     0.89ms
+     75%     1.17ms
+     90%     1.48ms
+     99%     2.22ms
 ### Django-Bolt Serializer with Validators (POST /bench/serializer-validated)
-  Reqs/sec     86046.42    4837.14   91699.58
-  Latency        1.14ms   371.29us     4.74ms
+  Reqs/sec     91739.65    9084.50   97908.50
+  Latency        1.07ms   393.38us     5.73ms
   Latency Distribution
-     50%     1.07ms
-     75%     1.39ms
-     90%     1.76ms
-     99%     2.81ms
+     50%     1.00ms
+     75%     1.27ms
+     90%     1.56ms
+     99%     2.46ms
 ### Users msgspec Serializer (POST /users/bench/msgspec)
-  Reqs/sec     98333.01    8485.81  103738.50
-  Latency        0.99ms   316.39us     5.03ms
+  Reqs/sec    102182.73    7691.34  109261.16
+  Latency        0.96ms   293.59us     4.85ms
   Latency Distribution
-     50%     0.94ms
-     75%     1.21ms
-     90%     1.52ms
-     99%     2.30ms
+     50%     0.91ms
+     75%     1.18ms
+     90%     1.45ms
+     99%     2.11ms
 
 ## Multi-Response Performance
 
 ### Multi-response tuple return (/bench/multi/tuple)
-  Reqs/sec     99671.12    8316.88  107173.43
-  Latency        0.99ms   345.26us     5.08ms
+  Reqs/sec    110875.66    7104.28  115256.28
+  Latency        0.89ms   249.92us     4.64ms
   Latency Distribution
-     50%     0.92ms
-     75%     1.22ms
-     90%     1.53ms
-     99%     2.38ms
+     50%   846.00us
+     75%     1.08ms
+     90%     1.32ms
+     99%     1.84ms
 
 ### Multi-response bare dict (/bench/multi/dict)
-  Reqs/sec    104526.13    8500.09  109440.41
-  Latency        0.94ms   307.44us     4.54ms
+  Reqs/sec    108282.01    9221.68  114297.78
+  Latency        0.91ms   326.10us     6.13ms
   Latency Distribution
-     50%     0.87ms
-     75%     1.16ms
-     90%     1.45ms
-     99%     2.18ms
+     50%   833.00us
+     75%     1.11ms
+     90%     1.39ms
+     99%     2.10ms
 
 ## Latency Percentile Benchmarks
 Measures p50/p75/p90/p99 latency for type coercion overhead analysis
 
 ### Baseline - No Parameters (/)
-  Reqs/sec    175552.68   17023.98  185573.53
-  Latency      556.40us   311.83us     5.34ms
+  Reqs/sec    186946.26   21829.03  202829.01
+  Latency      521.42us   270.71us    11.35ms
   Latency Distribution
-     50%   476.00us
-     75%   666.00us
-     90%     0.92ms
-     99%     2.01ms
+     50%   452.00us
+     75%   610.00us
+     90%   807.00us
+     99%     1.56ms
 
 ### Path Parameter - int (/items/12345)
-  Reqs/sec    158351.48   14701.02  168321.28
-  Latency      614.65us   361.51us     5.47ms
+  Reqs/sec    164955.00   12526.79  173173.15
+  Latency      586.05us   226.22us     4.67ms
   Latency Distribution
-     50%   553.00us
-     75%   687.00us
-     90%     0.88ms
-     99%     2.16ms
+     50%   537.00us
+     75%   702.00us
+     90%   848.00us
+     99%     1.64ms
 
 ### Path + Query Parameters (/items/12345?q=hello)
-  Reqs/sec    153661.65   13872.43  167005.27
-  Latency      629.98us   308.63us     6.19ms
+  Reqs/sec    163231.04   14321.41  173199.88
+  Latency      590.67us   320.59us     5.81ms
   Latency Distribution
-     50%   549.00us
-     75%   754.00us
-     90%     0.99ms
+     50%   551.00us
+     75%   702.00us
+     90%     0.86ms
      99%     1.88ms
 
 ### Header Parameter (/header)
-  Reqs/sec    101234.71    8477.51  107710.37
-  Latency        0.97ms   343.10us     6.07ms
+  Reqs/sec    107260.34    9672.17  112064.18
+  Latency        0.92ms   299.14us     4.72ms
   Latency Distribution
-     50%     0.90ms
-     75%     1.17ms
-     90%     1.50ms
-     99%     2.28ms
+     50%     0.85ms
+     75%     1.12ms
+     90%     1.42ms
+     99%     2.10ms
 
 ### Cookie Parameter (/cookie)
-  Reqs/sec    103889.79    9328.12  110016.31
-  Latency        0.94ms   308.42us     4.72ms
+  Reqs/sec    105996.76    8828.37  112115.61
+  Latency        0.93ms   288.26us     4.23ms
   Latency Distribution
-     50%     0.89ms
-     75%     1.17ms
+     50%     0.86ms
+     75%     1.15ms
      90%     1.46ms
-     99%     2.24ms
+     99%     2.20ms
 
 ### Auth Context - JWT validated, no DB (/auth/context)
-  Reqs/sec     83544.84    5808.34   87354.81
-  Latency        1.17ms   501.73us     6.02ms
+  Reqs/sec     85454.39    5622.54   89839.04
+  Latency        1.15ms   341.13us     4.06ms
   Latency Distribution
-     50%     1.02ms
-     75%     1.40ms
-     90%     1.99ms
-     99%     3.56ms
+     50%     1.07ms
+     75%     1.41ms
+     90%     1.77ms
+     99%     2.64ms
