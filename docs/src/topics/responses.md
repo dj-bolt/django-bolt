@@ -44,7 +44,7 @@ You can use built-in status code constants for readability:
 from django_bolt import status
 
 @api.post("/users", status_code=status.HTTP_201_CREATED)
-async def create_user()
+async def create_user():
     ...
 ```
 

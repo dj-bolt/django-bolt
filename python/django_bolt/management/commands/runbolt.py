@@ -90,9 +90,7 @@ def find_bolt_api_names(module_name: str) -> list[str]:
                     bolt_api_aliases.add("BoltAPI")
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                if "django_bolt" in alias.name:
-                    # `import django_bolt.api as bolt` → track the alias
-                    if alias.asname:
+                if "django_bolt" in alias.name and alias.asname:
                         module_aliases.add(alias.asname)
 
     # Find top-level assignments where RHS is a call to a BoltAPI alias
