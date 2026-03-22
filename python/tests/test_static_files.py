@@ -15,11 +15,23 @@ import os
 import tempfile
 
 import pytest
+from django.core.exceptions import SuspiciousFileOperation
+from django.contrib.staticfiles.finders import get_finder
 
 from django_bolt import BoltAPI
-from django_bolt.admin.static import find_static_file
+from django_bolt.admin.static import find_static_file, serve_static_file
+from django_bolt.exceptions import HTTPException
 from django_bolt.shortcuts import render
 from django_bolt.testing import TestClient
+
+
+@pytest.fixture(autouse=True)
+def clear_staticfiles_finder_cache():
+    """Reset Django's cached static finders between tests that mutate settings."""
+    get_finder.cache_clear()
+    yield
+    get_finder.cache_clear()
+
 
 # Create test static files directory
 TEST_STATIC_DIR = tempfile.mkdtemp(prefix="django_bolt_static_")
@@ -123,23 +135,26 @@ class TestFindStaticFile:
     """Tests for the find_static_file function used by Django finders fallback."""
 
     def test_find_file_in_static_root(self, monkeypatch):
-        """Test finding a file in STATIC_ROOT."""
+        """Test that finder-only lookup does not search STATIC_ROOT."""
         from django.conf import settings
 
-        # Temporarily set STATIC_ROOT
         original_root = getattr(settings, "STATIC_ROOT", None)
+        original_dirs = getattr(settings, "STATICFILES_DIRS", None)
         settings.STATIC_ROOT = TEST_STATIC_DIR
+        settings.STATICFILES_DIRS = []
 
         try:
             result = find_static_file("css/style.css")
-            assert result is not None
-            assert result.endswith("css/style.css")
-            assert os.path.isfile(result)
+            assert result is None
         finally:
-            if original_root:
+            if original_root is not None:
                 settings.STATIC_ROOT = original_root
-            else:
+            elif hasattr(settings, "STATIC_ROOT"):
                 delattr(settings, "STATIC_ROOT")
+            if original_dirs is not None:
+                settings.STATICFILES_DIRS = original_dirs
+            elif hasattr(settings, "STATICFILES_DIRS"):
+                delattr(settings, "STATICFILES_DIRS")
 
     def test_find_file_in_staticfiles_dirs(self, monkeypatch):
         """Test finding a file in STATICFILES_DIRS."""
@@ -161,9 +176,9 @@ class TestFindStaticFile:
             assert result is not None
             assert result.endswith("custom.css")
         finally:
-            if original_dirs:
+            if original_dirs is not None:
                 settings.STATICFILES_DIRS = original_dirs
-            else:
+            elif hasattr(settings, "STATICFILES_DIRS"):
                 delattr(settings, "STATICFILES_DIRS")
 
     def test_find_nonexistent_file(self):
@@ -172,12 +187,33 @@ class TestFindStaticFile:
         assert result is None
 
     def test_directory_traversal_blocked(self):
-        """Test that directory traversal attempts are blocked."""
-        result = find_static_file("../etc/passwd")
-        assert result is None
+        """Test that traversal attempts are blocked by the finder."""
+        with pytest.raises(SuspiciousFileOperation):
+            find_static_file("../etc/passwd")
 
         result = find_static_file("..\\windows\\system32")
         assert result is None
+
+    def test_windows_absolute_paths_return_none(self):
+        """Test that Windows absolute paths are not resolved by the finder."""
+        assert find_static_file("C:/Windows/win.ini") is None
+        assert find_static_file("D:/secret.txt") is None
+        assert find_static_file("C:temp/file.txt") is None
+        assert find_static_file("\\\\server\\share\\file.txt") is None
+
+    @pytest.mark.asyncio
+    async def test_serve_static_file_returns_not_found_for_windows_absolute_paths(self):
+        """Test that Windows absolute paths fall through to not found."""
+        with pytest.raises(HTTPException) as exc_info:
+            await serve_static_file("C:/Windows/win.ini")
+
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_serve_static_file_rejects_traversal_paths(self):
+        """Test that traversal paths raise Django's original error."""
+        with pytest.raises(SuspiciousFileOperation):
+            await serve_static_file("../etc/passwd")
 
 
 class TestStaticFileServing:
@@ -200,6 +236,10 @@ class TestStaticFileServing:
     @pytest.fixture(scope="class")
     def client(self, api_with_static):
         """Create test client."""
+        from django.conf import settings
+
+        settings.STATIC_ROOT = TEST_STATIC_DIR
+        settings.STATIC_URL = "/static/"
         return TestClient(api_with_static, use_http_layer=True)
 
     def test_serve_css_file(self, client, monkeypatch):
@@ -329,9 +369,8 @@ class TestMultipleDirectories:
         with open(os.path.join(dir2, "test.txt"), "w") as f:
             f.write("FROM_DIR2")
 
-        # Set STATIC_ROOT as first priority
-        settings.STATIC_ROOT = dir1
-        settings.STATICFILES_DIRS = [dir2]
+        settings.STATIC_ROOT = None
+        settings.STATICFILES_DIRS = [dir1, dir2]
 
         result = find_static_file("test.txt")
         assert result is not None
@@ -339,7 +378,7 @@ class TestMultipleDirectories:
         with open(result) as f:
             content = f.read()
 
-        # STATIC_ROOT should take priority
+        # STATICFILES_DIRS should preserve order
         assert content == "FROM_DIR1"
 
     def test_fallback_to_second_directory(self, monkeypatch):
@@ -353,8 +392,8 @@ class TestMultipleDirectories:
         with open(os.path.join(dir2, "only_in_dir2.txt"), "w") as f:
             f.write("FOUND")
 
-        settings.STATIC_ROOT = dir1
-        settings.STATICFILES_DIRS = [dir2]
+        settings.STATIC_ROOT = None
+        settings.STATICFILES_DIRS = [dir1, dir2]
 
         result = find_static_file("only_in_dir2.txt")
         assert result is not None
@@ -551,7 +590,8 @@ class TestSymlinkSecurity:
 
         from django.conf import settings
 
-        settings.STATIC_ROOT = setup_symlink_test["safe_dir"]
+        settings.STATIC_ROOT = None
+        settings.STATICFILES_DIRS = [setup_symlink_test["safe_dir"]]
         settings.STATIC_URL = "/static/"
 
         # Test the security check that Rust uses: canonicalize + starts_with
@@ -573,7 +613,8 @@ class TestSymlinkSecurity:
         """Test that regular files within the directory are still accessible."""
         from django.conf import settings
 
-        settings.STATIC_ROOT = setup_symlink_test["safe_dir"]
+        settings.STATIC_ROOT = None
+        settings.STATICFILES_DIRS = [setup_symlink_test["safe_dir"]]
         settings.STATIC_URL = "/static/"
 
         result = find_static_file("safe.txt")
@@ -598,7 +639,8 @@ class TestSymlinkSecurity:
             pytest.skip("Symlink creation failed")
 
         try:
-            settings.STATIC_ROOT = safe_dir
+            settings.STATIC_ROOT = None
+            settings.STATICFILES_DIRS = [safe_dir]
             settings.STATIC_URL = "/static/"
 
             result = find_static_file("internal_link.txt")
@@ -622,6 +664,7 @@ class TestContentSecurityPolicy:
 
         # Configure CSP
         settings.STATIC_ROOT = TEST_STATIC_DIR
+        settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
         settings.STATIC_URL = "/static/"
         settings.BOLT_STATIC_CSP = "default-src 'self'; script-src 'self'"
 
@@ -643,6 +686,7 @@ class TestContentSecurityPolicy:
         from django_bolt.admin.static import register_static_routes
 
         settings.STATIC_ROOT = TEST_STATIC_DIR
+        settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
         settings.STATIC_URL = "/static/"
 
         # Ensure CSP is not configured
@@ -702,6 +746,7 @@ class TestEdgeCases:
         from django.conf import settings
 
         settings.STATIC_ROOT = TEST_STATIC_DIR
+        settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
         settings.STATIC_URL = "/static/"
 
     def test_file_with_spaces_in_name(self):
@@ -817,7 +862,8 @@ class TestDebugModeFinders:
         """Test that explicitly configured directories always work."""
         from django.conf import settings
 
-        settings.STATIC_ROOT = TEST_STATIC_DIR
+        settings.STATIC_ROOT = None
+        settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
         settings.STATIC_URL = "/static/"
 
         # Should work in both debug and non-debug modes

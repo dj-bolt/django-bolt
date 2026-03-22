@@ -71,7 +71,7 @@ pub struct AppState {
     pub route_metadata: Option<Arc<RouteMetadataStore>>, // Route metadata (used by test infrastructure)
     pub asgi_mounts: Option<Arc<Vec<AsgiMount>>>, // ASGI mounts (tests). Production uses GLOBAL_ASGI_MOUNTS.
     pub static_files_config: Option<StaticFilesConfig>, // Static files configuration from Django settings
-    pub access_logger: Option<Py<PyAny>>,       // Python logger instance for access logging (django.server). None when disabled.
+    pub access_logger: Option<Py<PyAny>>, // Python logger instance for access logging (django.server). None when disabled.
 }
 
 pub static GLOBAL_ROUTER: OnceCell<Arc<Router>> = OnceCell::new();

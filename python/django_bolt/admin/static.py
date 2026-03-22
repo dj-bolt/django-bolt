@@ -6,8 +6,6 @@ Provides static file serving for Django admin and other static assets.
 
 import mimetypes
 import os
-import sys
-from pathlib import Path
 
 from django.conf import settings
 
@@ -30,31 +28,10 @@ def find_static_file(path: str) -> str | None:
     Returns:
         Absolute path to file if found, None otherwise
     """
-    try:
-        # First try STATIC_ROOT (collected static files in production)
-        if hasattr(settings, "STATIC_ROOT") and settings.STATIC_ROOT:
-            static_root = Path(settings.STATIC_ROOT)
-            file_path = static_root / path
-            if file_path.exists() and file_path.is_file():
-                return str(file_path)
-
-        # Try using Django's static file finders (development mode)
-        if find is not None:
-            found_path = find(path)
-            if found_path:
-                return found_path
-
-        # Fallback: check STATICFILES_DIRS
-        if hasattr(settings, "STATICFILES_DIRS"):
-            for static_dir in settings.STATICFILES_DIRS:
-                if isinstance(static_dir, tuple):
-                    static_dir = static_dir[1]  # (prefix, path) tuple
-                file_path = Path(static_dir) / path
-                if file_path.exists() and file_path.is_file():
-                    return str(file_path)
-
-    except Exception as e:
-        print(f"[django-bolt] Warning: Error finding static file {path}: {e}", file=sys.stderr)
+    if find is not None:
+        found_path = find(path)
+        if found_path:
+            return found_path
 
     return None
 
@@ -104,10 +81,6 @@ async def serve_static_file(path: str) -> tuple[int, list[tuple[str, str]], byte
     Returns:
         Response tuple: (status_code, headers, body)
     """
-    # Security: prevent directory traversal
-    if ".." in path or path.startswith("/"):
-        raise HTTPException(400, "Invalid static file path")
-
     # Find the static file
     file_path = find_static_file(path)
 
