@@ -383,9 +383,12 @@ class OrmVisitor(ast.NodeVisitor):
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         """Detect request['headers'] style access."""
-        if self._is_request_name(node.value) and isinstance(node.slice, ast.Constant):
-            if isinstance(node.slice.value, str):
-                self._mark_request_component_key(node.slice.value)
+        if (
+            self._is_request_name(node.value)
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            self._mark_request_component_key(node.slice.value)
 
         self.generic_visit(node)
 

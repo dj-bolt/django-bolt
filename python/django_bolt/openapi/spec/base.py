@@ -59,9 +59,13 @@ class BaseSchemaObject:
         for field in self._iter_fields():
             if field.name in exclude:
                 continue
-            value = _normalize_value(getattr(self, field.name, None))
+            raw_value = getattr(self, field.name, None)
+            if "omit_if" in field.metadata and raw_value is field.metadata["omit_if"]:
+                continue
 
-            if value is not None:
+            value = _normalize_value(raw_value)
+
+            if value is not None or field.metadata.get("allow_none", False):
                 if "alias" in field.metadata:
                     if not isinstance(field.metadata["alias"], str):
                         raise TypeError('metadata["alias"] must be a str')

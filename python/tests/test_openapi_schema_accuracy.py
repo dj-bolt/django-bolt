@@ -42,7 +42,7 @@ class NoDefaultsResponse(msgspec.Struct):
     name: str
 
 
-class RegularEnum(str, enum.Enum):
+class RegularEnum(enum.StrEnum):
     ACTIVE = "active"
     INACTIVE = "inactive"
 
@@ -83,237 +83,165 @@ def _get_param(params: list[dict], name: str) -> dict:
     raise AssertionError(f"Parameter '{name}' not found in {[p['name'] for p in params]}")
 
 
-def test_int_ge_constraint():
-    """Test that an annotated int with a ge constraint produces the correct schema."""
+def _get_query_param_schema(query_type: type, param_name: str) -> dict:
+    """Build an API with a query struct and return one OpenAPI parameter schema."""
     api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
 
     @api.get("/items")
-    async def get_items(query: Annotated[ConstrainedFilters, Query()]) -> dict:
+    async def get_items(query: Annotated[query_type, Query()]) -> dict:
         pass
 
     schema = _get_schema(api)
     params = schema["paths"]["/items"]["get"]["parameters"]
-    page = _get_param(params, "page")
-    assert page["schema"]["type"] == "integer"
-    assert page["schema"]["minimum"] == 1
-    assert "exclusiveMinimum" not in page["schema"]
+    return _get_param(params, param_name)["schema"]
+
+
+def _get_response_component_schema(response_type: type, path: str = "/item") -> dict:
+    """Build an API with a response struct and return its component schema."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get(path)
+    async def get_item() -> response_type:
+        pass
+
+    schema = _get_schema(api)
+    return schema["components"]["schemas"][response_type.__name__]
+
+
+def test_int_ge_constraint():
+    """Test that an annotated int with a ge constraint produces the correct schema."""
+    page_schema = _get_query_param_schema(ConstrainedFilters, "page")
+    assert page_schema["type"] == "integer"
+    assert page_schema["minimum"] == 1
+    assert "exclusiveMinimum" not in page_schema
 
 
 def test_int_ge_le_constraints():
     """Test that an annotated int with a ge and le constraint produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
-    @api.get("/items")
-    async def get_items(query: Annotated[ConstrainedFilters, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    size = _get_param(params, "size")
-    assert size["schema"]["minimum"] == 1
-    assert size["schema"]["maximum"] == 100
+    size_schema = _get_query_param_schema(ConstrainedFilters, "size")
+    assert size_schema["minimum"] == 1
+    assert size_schema["maximum"] == 100
 
 
 def test_float_gt_lt_constraints():
     """Test that an annotated float with a gt and lt constraint produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
-    @api.get("/items")
-    async def get_items(query: Annotated[ConstrainedFilters, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    ratio = _get_param(params, "ratio")
-    assert ratio["schema"]["exclusiveMinimum"] == 0.0
-    assert ratio["schema"]["exclusiveMaximum"] == 1.0
-    assert "minimum" not in ratio["schema"]
-    assert "maximum" not in ratio["schema"]
+    ratio_schema = _get_query_param_schema(ConstrainedFilters, "ratio")
+    assert ratio_schema["exclusiveMinimum"] == 0.0
+    assert ratio_schema["exclusiveMaximum"] == 1.0
+    assert "minimum" not in ratio_schema
+    assert "maximum" not in ratio_schema
 
 
 def test_int_multiple_of_constraint():
     """Test that an annotated int with a multiple_of constraint produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
-    @api.get("/items")
-    async def get_items(query: Annotated[ConstrainedFilters, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    step = _get_param(params, "step")
-    assert step["schema"]["multipleOf"] == 5
+    step_schema = _get_query_param_schema(ConstrainedFilters, "step")
+    assert step_schema["multipleOf"] == 5
 
 
 def test_unconstrained_int_has_no_constraint_fields():
     """Test that an unconstrained int produces no constraint fields."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
     class SimpleQuery(msgspec.Struct):
         page: int = 1
 
-    @api.get("/items")
-    async def get_items(query: Annotated[SimpleQuery, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    page = _get_param(params, "page")
-    assert page["schema"]["type"] == "integer"
+    page_schema = _get_query_param_schema(SimpleQuery, "page")
+    assert page_schema["type"] == "integer"
     for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"):
-        assert key not in page["schema"], f"Unexpected constraint '{key}' on unconstrained int"
+        assert key not in page_schema, f"Unexpected constraint '{key}' on unconstrained int"
 
 
-def str_min_max_length_constraints():
+def test_str_min_max_length_constraints():
     """Test that an annotated str with a min_length and max_length constraint produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
-    @api.get("/items")
-    async def get_items(query: Annotated[StringConstrainedQuery, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    name = _get_param(params, "name")
-    assert name["schema"]["type"] == "string"
-    assert name["schema"]["minLength"] == 1
-    assert name["schema"]["maxLength"] == 50
+    name_schema = _get_query_param_schema(StringConstrainedQuery, "name")
+    assert name_schema["type"] == "string"
+    assert name_schema["minLength"] == 1
+    assert name_schema["maxLength"] == 50
 
 
 def test_str_pattern_constraint():
     """Test that an annotated str with a pattern constraint produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
-    @api.get("/items")
-    async def get_items(query: Annotated[StringConstrainedQuery, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    code = _get_param(params, "code")
-    assert code["schema"]["type"] == "string"
-    assert code["schema"]["pattern"] == r"^[A-Z]{3}$"
+    code_schema = _get_query_param_schema(StringConstrainedQuery, "code")
+    assert code_schema["type"] == "string"
+    assert code_schema["pattern"] == r"^[A-Z]{3}$"
 
 
 def test_str_enum_produces_string_enum_schema():
     """Test that an annotated str with an enum constraint produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
     class FilterQuery(msgspec.Struct):
         status: RegularEnum | None = None
 
-    @api.get("/items")
-    async def get_items(query: Annotated[FilterQuery, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    status = _get_param(params, "status")
-    assert status["schema"]["type"] == "string"
-    assert set(status["schema"]["enum"]) == {"active", "inactive"}
+    status_schema = _get_query_param_schema(FilterQuery, "status")
+    assert status_schema["type"] == "string"
+    assert set(status_schema["enum"]) == {"active", "inactive"}
 
 
 def test_int_enum_produces_integer_enum_schema():
     """Test that an annotated int with an enum constraint produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
     class FilterQuery(msgspec.Struct):
         priority: IntEnum | None = None
 
-    @api.get("/items")
-    async def get_items(query: Annotated[FilterQuery, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    priority = _get_param(params, "priority")
-    assert priority["schema"]["type"] == "integer"
-    assert set(priority["schema"]["enum"]) == {1, 2, 3}
+    priority_schema = _get_query_param_schema(FilterQuery, "priority")
+    assert priority_schema["type"] == "integer"
+    assert set(priority_schema["enum"]) == {1, 2, 3}
 
 
 def test_django_text_choices_produces_string_enum():
     """Test that a Django TextChoices enum produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
     class FilterQuery(msgspec.Struct):
         status: DjangoStatus | None = None
 
-    @api.get("/items")
-    async def get_items(query: Annotated[FilterQuery, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    status = _get_param(params, "status")
-    assert status["schema"]["type"] == "string"
-    assert set(status["schema"]["enum"]) == {"planned", "active", "completed"}
+    status_schema = _get_query_param_schema(FilterQuery, "status")
+    assert status_schema["type"] == "string"
+    assert set(status_schema["enum"]) == {"planned", "active", "completed"}
 
 
 def test_django_integer_choices_produces_integer_enum():
     """Test that a Django IntegerChoices enum produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
     class FilterQuery(msgspec.Struct):
         priority: DjangoPriority | None = None
 
-    @api.get("/items")
-    async def get_items(query: Annotated[FilterQuery, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    priority = _get_param(params, "priority")
-    assert priority["schema"]["type"] == "integer"
-    assert set(priority["schema"]["enum"]) == {1, 2, 3}
+    priority_schema = _get_query_param_schema(FilterQuery, "priority")
+    assert priority_schema["type"] == "integer"
+    assert set(priority_schema["enum"]) == {1, 2, 3}
 
 
 def test_literal_string_query_param():
     """Test that a literal string query param produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
     class SortQuery(msgspec.Struct):
         order: Literal["asc", "desc"] = "asc"
 
-    @api.get("/items")
-    async def get_items(query: Annotated[SortQuery, Query()]) -> dict:
-        pass
-
-    schema = _get_schema(api)
-    params = schema["paths"]["/items"]["get"]["parameters"]
-    order = _get_param(params, "order")
-    assert order["schema"]["type"] == "string"
-    assert set(order["schema"]["enum"]) == {"asc", "desc"}
+    order_schema = _get_query_param_schema(SortQuery, "order")
+    assert order_schema["type"] == "string"
+    assert set(order_schema["enum"]) == {"asc", "desc"}
 
 
 def test_literal_integers_produces_integer_type():
     """Test that a literal integer query param produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
     class PageQuery(msgspec.Struct):
         size: Literal[10, 25, 50, 100] = 10
 
+    size_schema = _get_query_param_schema(PageQuery, "size")
+    assert size_schema["type"] == "integer"
+    assert set(size_schema["enum"]) == {10, 25, 50, 100}
+
+
+def test_bare_mixed_literal_query_param_has_enum_without_type():
+    """Test that a bare mixed-type Literal produces an enum schema with no inferred type."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
     @api.get("/items")
-    async def get_items(query: Annotated[PageQuery, Query()]) -> dict:
+    async def get_items(value: Literal["asc", 1] = "asc") -> dict:
         pass
 
     schema = _get_schema(api)
     params = schema["paths"]["/items"]["get"]["parameters"]
-    size = _get_param(params, "size")
-    assert size["schema"]["type"] == "integer"
-    assert set(size["schema"]["enum"]) == {10, 25, 50, 100}
+    value = _get_param(params, "value")
+    assert set(value["schema"]["enum"]) == {"asc", 1}
+    assert "type" not in value["schema"]
 
 
 def test_response_struct_fields_have_defaults():
     """Test that a struct field with a default produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
-    @api.get("/status")
-    async def get_status() -> ResponseWithDefaults:
-        pass
-
-    schema = _get_schema(api)
-    schemas = schema["components"]["schemas"]
-    props = schemas["ResponseWithDefaults"]["properties"]
+    props = _get_response_component_schema(ResponseWithDefaults, path="/status")["properties"]
     assert props["message"]["default"] == "hello"
     assert props["count"]["default"] == 0
     assert props["active"]["default"] is True
@@ -321,25 +249,16 @@ def test_response_struct_fields_have_defaults():
 
 def test_response_struct_required_fields_have_no_default():
     """Test that a required struct field with no default produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
-    @api.get("/item")
-    async def get_item() -> NoDefaultsResponse:
-        pass
-
-    schema = _get_schema(api)
-    schemas = schema["components"]["schemas"]
-    props = schemas["NoDefaultsResponse"]["properties"]
+    no_defaults_schema = _get_response_component_schema(NoDefaultsResponse)
+    props = no_defaults_schema["properties"]
 
     assert "default" not in props["id"]
     assert "default" not in props["name"]
-    assert set(schemas["NoDefaultsResponse"]["required"]) == {"id", "name"}
+    assert set(no_defaults_schema["required"]) == {"id", "name"}
 
 
 def test_response_struct_reference_field_with_default_none():
     """Test that a reference field with a default of None produces the correct schema."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
-
     class Inner(msgspec.Struct):
         value: str
 
@@ -347,11 +266,8 @@ def test_response_struct_reference_field_with_default_none():
         name: str
         inner: Inner | None = None
 
-    @api.get("/item")
-    async def get_item() -> Outer:
-        pass
-
-    schema = _get_schema(api)
-    schemas = schema["components"]["schemas"]
-    assert "Outer" in schemas
-    assert "Inner" in schemas
+    outer = _get_response_component_schema(Outer)
+    assert outer["required"] == ["name"]
+    inner = outer["properties"]["inner"]
+    assert inner["default"] is None
+    assert inner["allOf"] == [{"$ref": "#/components/schemas/Inner"}]

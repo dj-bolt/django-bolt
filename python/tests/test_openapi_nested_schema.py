@@ -208,8 +208,10 @@ def test_self_referential_struct_does_not_recurse():
     assert "TreeNode" in schemas
     tree_schema = schemas["TreeNode"]
     assert "value" in tree_schema["properties"]
-    # parent should be a $ref back to itself
-    assert tree_schema["properties"]["parent"]["$ref"] == "#/components/schemas/TreeNode"
+    # Optional self-references are wrapped so the schema can carry default: null.
+    parent = tree_schema["properties"]["parent"]
+    assert parent["default"] is None
+    assert parent["allOf"] == [{"$ref": "#/components/schemas/TreeNode"}]
 
 
 def test_multi_type_union_produces_any_of():

@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 __all__ = ("Schema", "SchemaDataContainer")
 
+_DEFAULT_UNSET = object()
+
 
 def _recursive_hash(value: Hashable | Sequence | Mapping | DataclassProtocol | type[DataclassProtocol]) -> int:
     if isinstance(value, Mapping):
@@ -559,7 +561,7 @@ class Schema(BaseSchemaObject):
     interface. A description will provide explanation about the purpose of the instance described by this schema.
     """
 
-    default: Any | None = None
+    default: Any = field(default=_DEFAULT_UNSET, metadata={"allow_none": True, "omit_if": _DEFAULT_UNSET})
     """There are no restrictions placed on the value of this keyword.  When multiple occurrences of this keyword are
     applicable to a single sub-instance, implementations SHOULD remove duplicates.
 
