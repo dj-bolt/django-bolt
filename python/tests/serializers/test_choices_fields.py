@@ -4,12 +4,65 @@ from __future__ import annotations
 
 from typing import Literal, get_args, get_origin
 
+import msgspec
 import pytest
-from django.db import models
+from django.db import connection, models
 
 from django_bolt.exceptions import RequestValidationError
 from django_bolt.serializers import Serializer, create_serializer
 from django_bolt.serializers.fields import get_msgspec_type_for_django_field
+
+
+class StatusEnum(models.TextChoices):
+    """TextChoices enum used to test in-memory Django choice serialization."""
+
+    DRAFT = "DRAFT"
+    PUBLISHED = "PUBLISHED"
+
+
+class PriorityEnum(models.IntegerChoices):
+    """IntegerChoices enum used to test in-memory Django choice serialization."""
+
+    LOW = 1
+    HIGH = 2
+
+
+class EnumChoiceArticle(models.Model):
+    """Temporary model for testing enum-backed Django choices."""
+
+    title = models.CharField(max_length=200)
+    status = models.CharField(max_length=20, choices=StatusEnum, default=StatusEnum.DRAFT)
+    priority = models.IntegerField(choices=PriorityEnum, default=PriorityEnum.LOW)
+
+    class Meta:
+        app_label = "django_bolt"
+        db_table = "django_bolt_enum_choice_article"
+
+
+class EnumChoiceArticleSerializer(Serializer):
+    """Serializer for enum-backed Django choice model tests."""
+
+    id: int
+    title: str
+    status: str
+    priority: int
+
+
+@pytest.fixture
+def enum_choice_article_table():
+    """Create the temporary enum choice model table for this test."""
+    table_name = EnumChoiceArticle._meta.db_table
+
+    with connection.schema_editor() as schema_editor:
+        if table_name not in connection.introspection.table_names():
+            schema_editor.create_model(EnumChoiceArticle)
+
+    try:
+        yield EnumChoiceArticle
+    finally:
+        with connection.schema_editor() as schema_editor:
+            if table_name in connection.introspection.table_names():
+                schema_editor.delete_model(EnumChoiceArticle)
 
 
 class TestChoicesFieldDetection:
@@ -264,3 +317,58 @@ class TestChoicesValidation:
         # Actual number should not work (type mismatch)
         with pytest.raises(RequestValidationError):
             NumericStringChoice(code=2)  # int instead of str
+
+
+class TestChoicesFromModelSerialization:
+    """Test from_model()/afrom_model() with Django enum choice values."""
+
+    @pytest.mark.django_db(transaction=True)
+    def test_from_model_coerces_choice_members_from_created_instance(self, enum_choice_article_table):
+        """create() should not require refresh_from_db() before serialization."""
+        article = enum_choice_article_table.objects.create(
+            title="Hello",
+            status=StatusEnum.PUBLISHED,
+            priority=PriorityEnum.HIGH,
+        )
+
+        assert isinstance(article.status, StatusEnum)
+        assert isinstance(article.priority, PriorityEnum)
+
+        serializer = EnumChoiceArticleSerializer.from_model(article)
+        dumped = serializer.dump()
+
+        assert serializer.status == StatusEnum.PUBLISHED.value
+        assert serializer.priority == PriorityEnum.HIGH.value
+        assert dumped == {
+            "id": article.id,
+            "title": "Hello",
+            "status": StatusEnum.PUBLISHED.value,
+            "priority": PriorityEnum.HIGH.value,
+        }
+        assert msgspec.json.decode(serializer.dump_json()) == dumped
+
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    async def test_afrom_model_coerces_choice_members_from_acreated_instance(self, enum_choice_article_table):
+        """acreate() should keep working without a refresh round-trip too."""
+        article = await enum_choice_article_table.objects.acreate(
+            title="Async Hello",
+            status=StatusEnum.PUBLISHED,
+            priority=PriorityEnum.HIGH,
+        )
+
+        assert isinstance(article.status, StatusEnum)
+        assert isinstance(article.priority, PriorityEnum)
+
+        serializer = await EnumChoiceArticleSerializer.afrom_model(article)
+        dumped = serializer.dump()
+
+        assert serializer.status == StatusEnum.PUBLISHED.value
+        assert serializer.priority == PriorityEnum.HIGH.value
+        assert dumped == {
+            "id": article.id,
+            "title": "Async Hello",
+            "status": StatusEnum.PUBLISHED.value,
+            "priority": PriorityEnum.HIGH.value,
+        }
+        assert msgspec.json.decode(serializer.dump_json()) == dumped

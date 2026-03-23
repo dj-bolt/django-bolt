@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from types import SimpleNamespace
 
 from django_bolt.management.commands import runbolt as runbolt_module
+
+
+def _clear_modules(monkeypatch, *module_names: str) -> None:
+    for module_name in module_names:
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+    importlib.invalidate_caches()
 
 
 def test_build_dev_worker_command_removes_dev_and_forces_single_process():
@@ -80,3 +88,33 @@ def test_collect_dev_watch_paths_prefers_project_paths(settings, tmp_path, monke
     assert str(static_root) in watch_paths
     assert str(external_app) in watch_paths
     assert str(venv_app) not in watch_paths
+
+
+def test_autodiscover_apis_uses_top_level_api_for_plain_root_urlconf(settings, tmp_path, monkeypatch):
+    (tmp_path / "urls.py").write_text("urlpatterns = []\n")
+    (tmp_path / "api.py").write_text("from django_bolt.api import BoltAPI\napi = BoltAPI()\n")
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_modules(monkeypatch, "urls", "api", "urls.api")
+    monkeypatch.setattr(runbolt_module, "apps", SimpleNamespace(get_app_configs=lambda: []))
+    settings.ROOT_URLCONF = "urls"
+
+    apis = runbolt_module.Command().autodiscover_apis()
+
+    assert [api_path for api_path, _ in apis] == ["api:api"]
+
+
+def test_autodiscover_apis_prefers_package_api_for_package_root_urlconf(settings, tmp_path, monkeypatch):
+    urls_package = tmp_path / "urls"
+    urls_package.mkdir()
+    (urls_package / "__init__.py").write_text("urlpatterns = []\n")
+    (urls_package / "api.py").write_text("from django_bolt.api import BoltAPI\napi = BoltAPI()\n")
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_modules(monkeypatch, "urls", "api", "urls.api")
+    monkeypatch.setattr(runbolt_module, "apps", SimpleNamespace(get_app_configs=lambda: []))
+    settings.ROOT_URLCONF = "urls"
+
+    apis = runbolt_module.Command().autodiscover_apis()
+
+    assert [api_path for api_path, _ in apis] == ["urls.api:api"]

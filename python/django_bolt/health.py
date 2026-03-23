@@ -43,7 +43,7 @@ class HealthCheck:
         results = {}
         all_healthy = True
 
-        for check, result in zip(self._checks, results_list, strict=False):
+        for check, result in zip(self._checks, results_list, strict=True):
             if isinstance(result, Exception):
                 results[check.__name__] = {
                     "healthy": False,

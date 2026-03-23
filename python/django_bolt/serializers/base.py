@@ -30,12 +30,14 @@ from weakref import WeakKeyDictionary
 
 import msgspec
 from django.core.exceptions import FieldDoesNotExist
+from django.db.models import Choices
 from django.db.models import Model as DjangoModel
 from django.db.models.manager import BaseManager
 from django.db.models.query import QuerySet
 from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
 
+from django_bolt import _json
 from django_bolt.exceptions import RequestValidationError, SerializationError
 
 from .decorators import (
@@ -1405,6 +1407,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     @classmethod
     def _convert_regular_from_model_value(cls, value: Any, *, field_name: str) -> Any:
         """Convert ORM-ish values into regular serializer output values."""
+        if isinstance(value, Choices):
+            # Django keeps create()/acreate() choices as enum members in memory until
+            # the instance is reloaded from the database. Normalize them here so
+            # dump()/dump_json() emit the primitive value without refresh_from_db().
+            return value.value
         if isinstance(value, DjangoModel):
             return value.pk
         if isinstance(value, (BaseManager, QuerySet)):
@@ -2245,7 +2252,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_defaults=exclude_defaults,
             by_alias=by_alias,
         )
-        return msgspec.json.encode(data)
+        return _json.encode(data)
 
     @classmethod
     def dump_many(
@@ -2329,7 +2336,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_defaults=exclude_defaults,
             by_alias=by_alias,
         )
-        return msgspec.json.encode(data)
+        return _json.encode(data)
 
     # -------------------------------------------------------------------------
     # Helper for getting value from source path

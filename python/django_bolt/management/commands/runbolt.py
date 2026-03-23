@@ -227,7 +227,8 @@ def find_bolt_api_names(module_name: str) -> list[str]:
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if "django_bolt" in alias.name and alias.asname:
-                        module_aliases.add(alias.asname)
+                    # `import django_bolt.api as bolt` → track the alias
+                    module_aliases.add(alias.asname)
 
     # Find top-level assignments where RHS is a call to a BoltAPI alias
     names: list[str] = []
@@ -264,6 +265,26 @@ def find_bolt_api_names(module_name: str) -> list[str]:
             names.extend(targets)
 
     return names
+
+
+def _project_api_module_names(root_urlconf: str) -> list[str]:
+    """Return project-level API module candidates for a Django URL config."""
+    project_name = root_urlconf.split(".")[0]
+    package_module_names = [f"{project_name}.{suffix}" for suffix in ("api", "bolt_api")]
+
+    # Dotted URLConfs already imply a containing project package.
+    if "." in root_urlconf:
+        return package_module_names
+
+    spec = importlib.util.find_spec(root_urlconf)
+
+    # A bare ROOT_URLCONF like "urls" can refer to either:
+    # - a package (`urls/__init__.py`), where the project API lives at `urls.api`
+    # - a plain module (`urls.py`), where the sibling API lives at top-level `api`
+    if spec is not None and spec.submodule_search_locations is None:
+        return ["api", "bolt_api"]
+
+    return package_module_names
 
 
 class Command(BaseCommand):
@@ -724,20 +745,16 @@ class Command(BaseCommand):
             return self._deduplicate_apis(apis)
 
         # Try project-level API first (common pattern)
-        project_name = settings.ROOT_URLCONF.split(".")[0]  # Extract project name from ROOT_URLCONF
-
         # Autodiscovery takes the first BoltAPI instance found.
         # Sub-APIs intended for mounting (e.g. files_api mounted via
         # api.mount("/files", files_api)) must not be discovered as
         # standalone instances.  Place the primary BoltAPI assignment
         # before any sub-API assignments in your api.py file.
-        # To register multiple BoltAPI instances explicitly, use the
-        # BOLT_API setting instead.
         project_found = False
-        for module_suffix in ("api", "bolt_api"):
+
+        for module_name in _project_api_module_names(settings.ROOT_URLCONF):
             if project_found:
                 break
-            module_name = f"{project_name}.{module_suffix}"
             attr_names = find_bolt_api_names(module_name)
             for attr_name in attr_names:
                 candidate = f"{module_name}:{attr_name}"

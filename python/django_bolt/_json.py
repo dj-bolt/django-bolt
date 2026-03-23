@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import date, datetime, time
 from decimal import Decimal
+from enum import Enum
 from ipaddress import (
     IPv4Address,
     IPv4Interface,
@@ -34,6 +35,8 @@ T = TypeVar("T")
 # Default type encoders for non-JSON-native types
 # Maps type -> encoder function
 DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
+    # Enum members -> primitive value
+    Enum: lambda v: v.value,
     # Paths
     Path: str,
     PurePath: str,
