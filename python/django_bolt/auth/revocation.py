@@ -164,7 +164,7 @@ class DjangoCacheRevocation(RevocationStore):
     async def revoke(self, jti: str, ttl: int | None = None) -> None:
         key = f"{self.key_prefix}{jti}"
         # TTL defaults to 30 days (longer than most refresh tokens)
-        timeout = ttl or (86400 * 30)
+        timeout = ttl if ttl is not None else (86400 * 30)
         self.cache.set(key, "1", timeout=timeout)
 
 
@@ -236,7 +236,12 @@ class DjangoORMRevocation(RevocationStore):
     def model(self):
         """Lazy-load model to avoid import issues."""
         if self._model is None:
-            app_label, model_name = self.model_path.split(".")
+            parts = self.model_path.split(".")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"model must be 'app_label.ModelName', got '{self.model_path}'"
+                )
+            app_label, model_name = parts
             self._model = apps.get_model(app_label, model_name)
         return self._model
 
@@ -244,7 +249,7 @@ class DjangoORMRevocation(RevocationStore):
         return await self.model.objects.filter(jti=jti).aexists()
 
     async def revoke(self, jti: str, ttl: int | None = None) -> None:
-        expires_at = datetime.now(UTC) + timedelta(seconds=ttl or 86400 * 30)
+        expires_at = datetime.now(UTC) + timedelta(seconds=ttl if ttl is not None else 86400 * 30)
 
         await self.model.objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
 
