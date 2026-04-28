@@ -12,6 +12,7 @@ from ..serializers.fields import _FieldMarker
 from ..typing import is_msgspec_struct, is_optional
 from .spec import (
     OpenAPI,
+    OpenAPIHeader,
     OpenAPIMediaType,
     OpenAPIResponse,
     Operation,
@@ -365,19 +366,20 @@ class SchemaGenerator:
         parameters.extend(upgrade_headers)
 
         # WebSocket endpoints don't have traditional HTTP responses
-        # Document the 101 Switching Protocols response
+        # Document the 101 Switching Protocols response.
+        # Per OpenAPI 3.1 the Header Object MUST NOT specify `name` or
+        # `in` — both are derived from the `headers` map key + the
+        # implicit `header` location — so use `OpenAPIHeader` (which
+        # excludes those fields on serialization) rather than
+        # `Parameter`. Validators reject the latter.
         responses = {
             "101": OpenAPIResponse(
                 description="Switching Protocols - WebSocket connection established",
                 headers={
-                    "Upgrade": Parameter(
-                        name="Upgrade",
-                        param_in="header",
+                    "Upgrade": OpenAPIHeader(
                         schema=Schema(type="string", enum=["websocket"]),
                     ),
-                    "Connection": Parameter(
-                        name="Connection",
-                        param_in="header",
+                    "Connection": OpenAPIHeader(
                         schema=Schema(type="string", enum=["Upgrade"]),
                     ),
                 },

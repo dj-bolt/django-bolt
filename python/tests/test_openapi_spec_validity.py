@@ -27,6 +27,7 @@ from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.param_functions import Query
 from django_bolt.testing import TestClient
+from django_bolt.websocket.types import WebSocket
 
 
 # --- Fixture types covering the surface area the generator handles ---
@@ -96,6 +97,15 @@ def _build_full_api() -> BoltAPI:
     @api.delete("/items/{item_id}")
     async def delete_item(item_id: str) -> dict:
         pass
+
+    @api.websocket("/items/stream")
+    async def stream_items(websocket: WebSocket) -> None:
+        # Real-time stream — no message handling needed for the test;
+        # the value here is exercising the WebSocket → OpenAPI path
+        # (response headers under `101 Switching Protocols`, which
+        # caught a real Header-vs-Parameter bug under the validator).
+        await websocket.accept()
+        await websocket.close()
 
     return api
 
