@@ -71,6 +71,7 @@ dev = [
     "django==6.0.2",
     "ruff>=0.8",
     "vulture>=2.11", #for dead code detection
+    "openapi-spec-validator>=0.8.5",
 ]
 docs = [
     "zensical",
