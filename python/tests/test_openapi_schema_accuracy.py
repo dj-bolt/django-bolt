@@ -124,12 +124,18 @@ def test_int_ge_le_constraints():
 
 
 def test_float_gt_lt_constraints():
-    """Test that an annotated float with a gt and lt constraint produces the correct schema."""
+    """Test that an annotated float with a gt and lt constraint produces the correct schema.
+
+    `ratio` is `Annotated[float, ...] | None = None` — under OpenAPI 3.1
+    nullability is expressed via `null` in the type union, so the
+    constrained float schema is the first arm of `anyOf`.
+    """
     ratio_schema = _get_query_param_schema(ConstrainedFilters, "ratio")
-    assert ratio_schema["exclusiveMinimum"] == 0.0
-    assert ratio_schema["exclusiveMaximum"] == 1.0
-    assert "minimum" not in ratio_schema
-    assert "maximum" not in ratio_schema
+    inner = ratio_schema["anyOf"][0]
+    assert inner["exclusiveMinimum"] == 0.0
+    assert inner["exclusiveMaximum"] == 1.0
+    assert "minimum" not in inner
+    assert "maximum" not in inner
 
 
 def test_int_multiple_of_constraint():
@@ -159,21 +165,32 @@ def test_str_min_max_length_constraints():
 
 
 def test_str_pattern_constraint():
-    """Test that an annotated str with a pattern constraint produces the correct schema."""
+    """Test that an annotated str with a pattern constraint produces the correct schema.
+
+    `code` is `Annotated[str, ...] | None = None` — OpenAPI 3.1 emits
+    null in the type union via `anyOf`, so the constrained string is
+    the first arm.
+    """
     code_schema = _get_query_param_schema(StringConstrainedQuery, "code")
-    assert code_schema["type"] == "string"
-    assert code_schema["pattern"] == r"^[A-Z]{3}$"
+    inner = code_schema["anyOf"][0]
+    assert inner["type"] == "string"
+    assert inner["pattern"] == r"^[A-Z]{3}$"
 
 
 def test_str_enum_produces_string_enum_schema():
-    """Test that an annotated str with an enum constraint produces the correct schema."""
+    """Test that an annotated str with an enum constraint produces the correct schema.
+
+    All four enum-as-nullable tests below use `Foo | None = None`. Under
+    OpenAPI 3.1 the null arm appears in `anyOf` alongside the enum.
+    """
 
     class FilterQuery(msgspec.Struct):
         status: RegularEnum | None = None
 
     status_schema = _get_query_param_schema(FilterQuery, "status")
-    assert status_schema["type"] == "string"
-    assert set(status_schema["enum"]) == {"active", "inactive"}
+    inner = status_schema["anyOf"][0]
+    assert inner["type"] == "string"
+    assert set(inner["enum"]) == {"active", "inactive"}
 
 
 def test_int_enum_produces_integer_enum_schema():
@@ -183,8 +200,9 @@ def test_int_enum_produces_integer_enum_schema():
         priority: IntEnum | None = None
 
     priority_schema = _get_query_param_schema(FilterQuery, "priority")
-    assert priority_schema["type"] == "integer"
-    assert set(priority_schema["enum"]) == {1, 2, 3}
+    inner = priority_schema["anyOf"][0]
+    assert inner["type"] == "integer"
+    assert set(inner["enum"]) == {1, 2, 3}
 
 
 def test_django_text_choices_produces_string_enum():
@@ -194,8 +212,9 @@ def test_django_text_choices_produces_string_enum():
         status: DjangoStatus | None = None
 
     status_schema = _get_query_param_schema(FilterQuery, "status")
-    assert status_schema["type"] == "string"
-    assert set(status_schema["enum"]) == {"planned", "active", "completed"}
+    inner = status_schema["anyOf"][0]
+    assert inner["type"] == "string"
+    assert set(inner["enum"]) == {"planned", "active", "completed"}
 
 
 def test_django_integer_choices_produces_integer_enum():
@@ -205,8 +224,9 @@ def test_django_integer_choices_produces_integer_enum():
         priority: DjangoPriority | None = None
 
     priority_schema = _get_query_param_schema(FilterQuery, "priority")
-    assert priority_schema["type"] == "integer"
-    assert set(priority_schema["enum"]) == {1, 2, 3}
+    inner = priority_schema["anyOf"][0]
+    assert inner["type"] == "integer"
+    assert set(inner["enum"]) == {1, 2, 3}
 
 
 def test_literal_string_query_param():
@@ -265,7 +285,12 @@ def test_response_struct_required_fields_have_no_default():
 
 
 def test_response_struct_reference_field_with_default_none():
-    """Test that a reference field with a default of None produces the correct schema."""
+    """Test that a reference field with a default of None produces the correct schema.
+
+    Under OpenAPI 3.1 the nullability is expressed via `null` in the
+    type union via `anyOf` rather than the legacy 3.0 `allOf` + ref
+    workaround.
+    """
 
     class Inner(msgspec.Struct):
         value: str
@@ -278,4 +303,7 @@ def test_response_struct_reference_field_with_default_none():
     assert outer["required"] == ["name"]
     inner = outer["properties"]["inner"]
     assert inner["default"] is None
-    assert inner["allOf"] == [{"$ref": "#/components/schemas/Inner"}]
+    assert inner["anyOf"] == [
+        {"$ref": "#/components/schemas/Inner"},
+        {"type": "null"},
+    ]
