@@ -190,24 +190,25 @@ class TestFindStaticFile:
         """Test that traversal attempts are blocked by the finder."""
         with pytest.raises(SuspiciousFileOperation):
             find_static_file("../etc/passwd")
-
-        result = find_static_file("..\\windows\\system32")
-        assert result is None
+        with pytest.raises(SuspiciousFileOperation):
+            result = find_static_file("..\\windows\\system32")
+            assert result is None
 
     def test_windows_absolute_paths_return_none(self):
         """Test that Windows absolute paths are not resolved by the finder."""
-        assert find_static_file("C:/Windows/win.ini") is None
-        assert find_static_file("D:/secret.txt") is None
+        with pytest.raises(SuspiciousFileOperation):
+            find_static_file("C:/Windows/win.ini")
+        with pytest.raises(SuspiciousFileOperation):
+            find_static_file("D:/secret.txt")
         assert find_static_file("C:temp/file.txt") is None
-        assert find_static_file("\\\\server\\share\\file.txt") is None
+        with pytest.raises(SuspiciousFileOperation):
+            find_static_file("\\\\server\\share\\file.txt")
 
     @pytest.mark.asyncio
     async def test_serve_static_file_returns_not_found_for_windows_absolute_paths(self):
         """Test that Windows absolute paths fall through to not found."""
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(SuspiciousFileOperation):
             await serve_static_file("C:/Windows/win.ini")
-
-        assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
     async def test_serve_static_file_rejects_traversal_paths(self):

@@ -1,4 +1,4 @@
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use pyo3::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -230,6 +230,7 @@ fn run_dev_reloader_inner(
     ignore_dir_names: Vec<String>,
     ignore_paths: Vec<String>,
     debounce_ms: u64,
+    force_polling: bool,
 ) -> PyResult<i32> {
     if watch_paths.is_empty() {
         return Err(py_runtime_error(
@@ -254,13 +255,29 @@ fn run_dev_reloader_inner(
     })?;
 
     let (tx, rx) = mpsc::channel();
-    let mut watcher = RecommendedWatcher::new(
-        move |result| {
-            let _ = tx.send(result);
-        },
-        Config::default(),
-    )
-    .map_err(|err| py_runtime_error(format!("Failed to initialize dev reload watcher: {}", err)))?;
+
+    // Swap RecommendedWatcher for PollWatcher when force_polling is set.
+    // PollWatcher uses os.stat() checks, which cross Docker bind-mount boundaries
+    // on Windows where inotify events are not propagated.
+    let mut watcher: Box<dyn Watcher> = if force_polling {
+        let tx2 = tx;
+        Box::new(
+            PollWatcher::new(
+                move |result| { let _ = tx2.send(result); },
+                Config::default().with_poll_interval(Duration::from_millis(500)),
+            )
+            .map_err(|err| py_runtime_error(format!("Failed to initialize poll watcher: {}", err)))?,
+        )
+    } else {
+        let tx2 = tx;
+        Box::new(
+            RecommendedWatcher::new(
+                move |result| { let _ = tx2.send(result); },
+                Config::default(),
+            )
+            .map_err(|err| py_runtime_error(format!("Failed to initialize dev reload watcher: {}", err)))?,
+        )
+    };
 
     let mut watched = 0usize;
     for path in watch_paths {
@@ -345,6 +362,7 @@ pub fn run_dev_reloader(
     ignore_dir_names: Vec<String>,
     ignore_paths: Vec<String>,
     debounce_ms: Option<u64>,
+    force_polling: Option<bool>,
 ) -> PyResult<i32> {
     py.detach(|| {
         run_dev_reloader_inner(
@@ -353,6 +371,7 @@ pub fn run_dev_reloader(
             ignore_dir_names,
             ignore_paths,
             debounce_ms.unwrap_or(125),
+            force_polling.unwrap_or(false),
         )
     })
 }
