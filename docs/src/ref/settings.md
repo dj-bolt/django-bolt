@@ -226,6 +226,30 @@ Django-Bolt disables signals by default for maximum performance. Enable this set
 
 See [Django Signals](../topics/signals.md) for detailed documentation.
 
+## Dev reload settings
+
+### BOLT_DEV_FORCE_POLLING
+
+Force the `--dev` auto-reloader to use file-system polling instead of native OS file events.
+
+```python
+BOLT_DEV_FORCE_POLLING = True
+```
+
+**Default:** `False`
+
+Django-Bolt's dev reloader uses the `notify` crate's recommended watcher (inotify on Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows). These backends are fast but rely on kernel events, which do not propagate across some bind-mount boundaries — most notably a Linux container running on a Windows host where the source tree is mounted from the host filesystem.
+
+Enable polling when:
+
+- Running `runbolt --dev` inside a Docker container on a Windows host with the project bind-mounted from the host
+- Working on a remote / network filesystem that does not deliver native change events
+- Native file events appear to fire inconsistently for your editor or sync tool
+
+Polling is checked every 500 ms. It uses more CPU than native events on large source trees but is the only reliable option when kernel events are unavailable.
+
+This setting only affects `runbolt --dev`; production servers do not watch files.
+
 ## runbolt command options
 
 The `runbolt` management command accepts these options:
@@ -327,6 +351,7 @@ api = BoltAPI(
 | `BOLT_MEMORY_SPOOL_THRESHOLD` | `int` | `1048576` | Memory threshold before disk spooling (bytes) |
 | `BOLT_ALLOWED_FILE_PATHS` | `list[str]` | `None` | File serving whitelist |
 | `BOLT_EMIT_SIGNALS` | `bool` | `False` | Enable Django request signals |
+| `BOLT_DEV_FORCE_POLLING` | `bool` | `False` | Force `--dev` reloader to use polling instead of native file events |
 | `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |
 | `BOLT_AUTHENTICATION_CLASSES` | `list` | `[]` | Default authentication backends |
 | `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |

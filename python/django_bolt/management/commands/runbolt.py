@@ -412,6 +412,7 @@ class Command(BaseCommand):
         worker_command = _build_dev_worker_command()
         watch_paths = _collect_dev_watch_paths()
         ignore_paths = _collect_dev_ignore_paths()
+        force_polling = getattr(settings, "BOLT_DEV_FORCE_POLLING", False)
 
         exit_code = _core.run_dev_reloader(
             worker_command,
@@ -419,6 +420,7 @@ class Command(BaseCommand):
             list(DEV_RELOAD_IGNORE_DIRS),
             ignore_paths,
             DEV_RELOAD_DEBOUNCE_MS,
+            force_polling,
         )
 
         if exit_code:

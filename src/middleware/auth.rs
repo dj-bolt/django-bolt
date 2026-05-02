@@ -1,5 +1,6 @@
 use ahash::AHashMap;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::IntoPyObjectExt;
@@ -216,49 +217,56 @@ fn try_api_key_auth(
     }
 }
 
-/// Store authentication context in PyRequest context
+/// Insert `key -> value` into a PyDict only if `value` is `Some`.
+///
+/// `key` must be a string literal so we can hand it to `pyo3::intern!` —
+/// the resulting `PyString` is built once per interpreter and reused
+/// across requests (skipping the per-call `&str → PyString` conversion
+/// and rehashing).
+macro_rules! set_if_some {
+    ($dict:expr, $py:expr, $key:literal, $value:expr) => {
+        if let Some(v) = $value {
+            let _ = $dict.set_item(intern!($py, $key), v);
+        }
+    };
+}
+
+/// Store authentication context in PyRequest context.
+///
+/// All static dict keys go through `pyo3::intern!` (via `set_if_some!` for
+/// the optional ones) so the underlying `PyString` is built once per
+/// interpreter and reused — saves the per-request `&str → PyString`
+/// conversion plus rehashing.
 pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: Python) {
     let dict = context.bind(py);
 
-    // Store user_id
-    if let Some(user_id) = &auth_ctx.user_id {
-        let _ = dict.set_item("user_id", user_id);
-    }
+    set_if_some!(dict, py, "user_id", &auth_ctx.user_id);
 
-    // Store is_staff and is_superuser
-    let _ = dict.set_item("is_staff", auth_ctx.is_staff);
-    let _ = dict.set_item("is_superuser", auth_ctx.is_superuser);
+    let _ = dict.set_item(intern!(py, "is_staff"), auth_ctx.is_staff);
+    let _ = dict.set_item(intern!(py, "is_superuser"), auth_ctx.is_superuser);
+    let _ = dict.set_item(intern!(py, "auth_backend"), &auth_ctx.backend);
 
-    // Store backend name
-    let _ = dict.set_item("auth_backend", &auth_ctx.backend);
-
-    // Store permissions if present
     if !auth_ctx.permissions.is_empty() {
         let perms: Vec<&String> = auth_ctx.permissions.iter().collect();
-        let _ = dict.set_item("permissions", perms);
+        let _ = dict.set_item(intern!(py, "permissions"), perms);
     }
 
     // Store JWT claims if present
     if let Some(claims) = &auth_ctx.claims {
         let claims_dict = PyDict::new(py);
 
-        if let Some(sub) = &claims.sub {
-            let _ = claims_dict.set_item("sub", sub);
-        }
-        if let Some(exp) = claims.exp {
-            let _ = claims_dict.set_item("exp", exp);
-        }
-        if let Some(iat) = claims.iat {
-            let _ = claims_dict.set_item("iat", iat);
-        }
-        if let Some(is_staff) = claims.is_staff {
-            let _ = claims_dict.set_item("is_staff", is_staff);
-        }
-        if let Some(is_superuser) = claims.is_superuser {
-            let _ = claims_dict.set_item("is_superuser", is_superuser);
-        }
+        set_if_some!(claims_dict, py, "sub", &claims.sub);
+        set_if_some!(claims_dict, py, "exp", claims.exp);
+        set_if_some!(claims_dict, py, "iat", claims.iat);
+        set_if_some!(claims_dict, py, "is_staff", claims.is_staff);
+        set_if_some!(claims_dict, py, "is_superuser", claims.is_superuser);
+        set_if_some!(claims_dict, py, "nbf", claims.nbf);
+        set_if_some!(claims_dict, py, "aud", &claims.aud);
+        set_if_some!(claims_dict, py, "iss", &claims.iss);
+        set_if_some!(claims_dict, py, "jti", &claims.jti);
 
-        // Store extra claims
+        // Extra claims keys come from the JWT payload — can't be interned
+        // statically since the set is open. set_item(&str, ...) handles them.
         for (key, value) in &claims.extra {
             let py_value = match value {
                 serde_json::Value::String(s) => {
@@ -279,6 +287,6 @@ pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: P
             let _ = claims_dict.set_item(key, py_value);
         }
 
-        let _ = dict.set_item("auth_claims", claims_dict);
+        let _ = dict.set_item(intern!(py, "auth_claims"), claims_dict);
     }
 }

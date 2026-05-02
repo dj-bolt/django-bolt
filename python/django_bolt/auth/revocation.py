@@ -5,11 +5,29 @@ Provides flexible revocation strategies that users can choose based on their nee
 Revocation is OPTIONAL - only checked if user provides a handler.
 """
 
+import time
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, timedelta
 
 from django.apps import apps
 from django.core.cache import caches
+
+_DEFAULT_TTL_SECONDS = 86400 * 7  # 7 days — fallback when caller doesn't pass `exp`
+
+
+def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS) -> int:
+    """
+    Seconds a revocation entry should live.
+
+    Prefers the token's own ``exp`` (so the entry expires exactly when the
+    token would have anyway). A past ``exp`` clamps to 0 — we never hand a
+    negative duration to ``timedelta``, which would silently subtract from
+    now. When ``exp`` is ``None``, ``default`` is used — typically the
+    store's ``default_ttl`` instance attribute.
+    """
+    if exp is None:
+        return default
+    return max(0, int(exp) - int(time.time()))
 
 
 class RevocationStore(ABC):
@@ -33,13 +51,23 @@ class RevocationStore(ABC):
         pass
 
     @abstractmethod
-    async def revoke(self, jti: str, ttl: int | None = None) -> None:
+    async def revoke(self, jti: str, *, exp: int | None = None) -> None:
         """
-        Revoke a token by its JTI.
+        Revoke a token.
+
+        The revocation entry must outlive the token, otherwise an attacker
+        could replay a still-valid JWT after the entry is cleaned up. Pass
+        the token's ``exp`` claim so the entry expires exactly when the
+        token would have anyway:
+
+            await store.revoke(claims["jti"], exp=claims.get("exp"))
 
         Args:
-            jti: JWT ID to revoke
-            ttl: Time-to-live in seconds (optional, for cleanup)
+            jti: JWT ID to revoke.
+            exp: The token's ``exp`` claim (epoch seconds). Strongly
+                recommended. If omitted, falls back to a 30-day retention —
+                safe for most refresh-token windows but wasteful for short
+                access tokens.
         """
         pass
 
@@ -80,8 +108,8 @@ class InMemoryRevocation(RevocationStore):
         # In logout endpoint
         @api.post("/logout")
         async def logout(request):
-            jti = request["context"]["auth_claims"]["jti"]
-            await revocation.revoke(jti)
+            claims = request["context"]["auth_claims"]
+            await revocation.revoke(claims["jti"], exp=claims.get("exp"))
             return {"message": "Logged out"}
         ```
     """
@@ -92,9 +120,8 @@ class InMemoryRevocation(RevocationStore):
     async def is_revoked(self, jti: str) -> bool:
         return jti in self._revoked
 
-    async def revoke(self, jti: str, ttl: int | None = None) -> None:
+    async def revoke(self, jti: str, *, exp: int | None = None) -> None:
         self._revoked.add(jti)
-        # TTL not supported in memory (would need background cleanup)
 
     def clear(self) -> None:
         """Clear all revoked tokens (useful for testing)."""
@@ -130,23 +157,43 @@ class DjangoCacheRevocation(RevocationStore):
         from django_bolt.auth import JWTAuthentication
         from django_bolt.auth.revocation import DjangoCacheRevocation
 
+        revocation = DjangoCacheRevocation(cache_alias='default')
+
         auth = JWTAuthentication(
             secret=settings.SECRET_KEY,
-            revocation_store=DjangoCacheRevocation(cache_alias='default'),
+            revocation_store=revocation,
         )
+
+        # In logout endpoint — pass `exp` so the cache entry expires
+        # exactly when the token would have anyway.
+        @api.post("/logout")
+        async def logout(request):
+            claims = request["context"]["auth_claims"]
+            await revocation.revoke(claims["jti"], exp=claims.get("exp"))
+            return {"message": "Logged out"}
         ```
     """
 
-    def __init__(self, cache_alias: str = "default", key_prefix: str = "revoked:"):
+    def __init__(
+        self,
+        cache_alias: str = "default",
+        key_prefix: str = "revoked:",
+        *,
+        default_ttl: int = _DEFAULT_TTL_SECONDS,
+    ):
         """
         Initialize Django cache-based revocation.
 
         Args:
-            cache_alias: Django cache alias to use (default: 'default')
-            key_prefix: Prefix for cache keys (default: 'revoked:')
+            cache_alias: Django cache alias to use (default: 'default').
+            key_prefix: Prefix for cache keys (default: 'revoked:').
+            default_ttl: Fallback retention (in seconds) used when a caller
+                invokes ``revoke(jti)`` without passing ``exp``. Defaults to
+                7 days. Per-call ``exp`` always wins over this.
         """
         self.cache_alias = cache_alias
         self.key_prefix = key_prefix
+        self.default_ttl = default_ttl
         self._cache = None
 
     @property
@@ -161,11 +208,21 @@ class DjangoCacheRevocation(RevocationStore):
         # Django cache get is sync, but fast
         return self.cache.get(key) is not None
 
-    async def revoke(self, jti: str, ttl: int | None = None) -> None:
+    async def revoke(self, jti: str, *, exp: int | None = None) -> None:
+        """
+        Revoke a token by storing its JTI in the cache.
+
+        Pass ``exp`` (the token's ``exp`` claim) so the cache entry expires
+        exactly when the token would have — no security gap, no wasted
+        storage.
+
+            await store.revoke(claims["jti"], exp=claims.get("exp"))
+
+        If ``exp`` is omitted, the entry lives for ``self.default_ttl``
+        seconds (set on the constructor).
+        """
         key = f"{self.key_prefix}{jti}"
-        # TTL defaults to 30 days (longer than most refresh tokens)
-        timeout = ttl or (86400 * 30)
-        self.cache.set(key, "1", timeout=timeout)
+        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl))
 
 
 class DjangoORMRevocation(RevocationStore):
@@ -208,6 +265,14 @@ class DjangoORMRevocation(RevocationStore):
         secret=settings.SECRET_KEY,
         revocation_store=revocation,
     )
+
+    # In logout endpoint — pass `exp` so the row's expires_at aligns
+    # with the token's own expiry.
+    @api.post("/logout")
+    async def logout(request):
+        claims = request["context"]["auth_claims"]
+        await revocation.revoke(claims["jti"], exp=claims.get("exp"))
+        return {"message": "Logged out"}
     ```
 
     ⚠️  Remember to add a cleanup task to delete expired tokens:
@@ -222,30 +287,49 @@ class DjangoORMRevocation(RevocationStore):
     ```
     """
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, *, default_ttl: int = _DEFAULT_TTL_SECONDS):
         """
         Initialize ORM-based revocation.
 
         Args:
-            model: String path to model (e.g., 'myapp.RevokedToken')
+            model: Two-part model path ``'app_label.ModelName'``
+                (e.g., ``'myapp.RevokedToken'``).
+            default_ttl: Fallback retention (in seconds) used when a caller
+                invokes ``revoke(jti)`` without passing ``exp``. Defaults to
+                7 days. Per-call ``exp`` always wins over this.
         """
         self.model_path = model
+        self.default_ttl = default_ttl
         self._model = None
 
     @property
     def model(self):
         """Lazy-load model to avoid import issues."""
         if self._model is None:
-            app_label, model_name = self.model_path.split(".")
+            parts = self.model_path.split(".")
+            if len(parts) != 2 or not all(parts):
+                raise ValueError(f"model must be 'app_label.ModelName', got '{self.model_path}'")
+            app_label, model_name = parts
             self._model = apps.get_model(app_label, model_name)
         return self._model
 
     async def is_revoked(self, jti: str) -> bool:
         return await self.model.objects.filter(jti=jti).aexists()
 
-    async def revoke(self, jti: str, ttl: int | None = None) -> None:
-        expires_at = datetime.now(UTC) + timedelta(seconds=ttl or 86400 * 30)
+    async def revoke(self, jti: str, *, exp: int | None = None) -> None:
+        """
+        Revoke a token by upserting a row keyed on its JTI.
 
+        Pass ``exp`` (the token's ``exp`` claim) so ``expires_at`` aligns
+        with the token's own expiry — your cleanup task can drop the row
+        exactly when the token would have stopped being honored anyway.
+
+            await store.revoke(claims["jti"], exp=claims.get("exp"))
+
+        If ``exp`` is omitted, ``expires_at`` is set to ``now +
+        self.default_ttl`` (set on the constructor).
+        """
+        expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl))
         await self.model.objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
 
 

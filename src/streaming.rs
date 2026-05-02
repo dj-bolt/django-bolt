@@ -218,9 +218,7 @@ pub fn create_sse_stream(
     let inner = create_python_stream_with_config(content, 1, 1, is_async_generator);
 
     match ping_interval {
-        Some(interval) if interval > 0.0 => {
-            Box::pin(keepalive_stream(inner, interval))
-        }
+        Some(interval) if interval > 0.0 => Box::pin(keepalive_stream(inner, interval)),
         _ => inner,
     }
 }

@@ -27,8 +27,8 @@ DEBUG = False
 
 ALLOWED_HOSTS = ["*"]
 
-# BOLT_EMIT_SIGNALS =True
-
+# BOLT_EMIT_SIGNALS = True
+# BOLT_DEV_FORCE_POLLING = True
 
 # Application definition
 

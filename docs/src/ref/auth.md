@@ -207,16 +207,26 @@ async def me(user=Depends(get_current_user)):
 
 ## Revocation stores
 
+When passed as `JWTAuthentication(revocation_store=store)`, the framework
+checks every authenticated request against the store and rejects revoked
+tokens with `401`. You don't call `is_revoked()` from your handlers.
+
+All `revoke()` calls accept an `exp` keyword: pass the token's own `exp`
+claim so the entry expires exactly when the token would have. Call
+sites without `exp` fall back to `default_ttl` (set per instance) or to
+the module-level `_DEFAULT_TTL_SECONDS` (7 days).
+
 ### InMemoryRevocation
 
-In-memory token revocation (development only).
+In-memory token revocation (development only — single process, no
+persistence).
 
 ```python
 from django_bolt.auth import InMemoryRevocation
 
 store = InMemoryRevocation()
-store.revoke("token-jti")
-store.is_revoked("token-jti")  # True
+await store.revoke("token-jti", exp=1234567890)
+await store.is_revoked("token-jti")  # True
 ```
 
 ### DjangoCacheRevocation
@@ -229,6 +239,7 @@ from django_bolt.auth import DjangoCacheRevocation
 store = DjangoCacheRevocation(
     cache_alias="default",
     key_prefix="revoked:",
+    default_ttl=86400 * 7,  # fallback when revoke() is called without exp
 )
 ```
 
@@ -240,11 +251,14 @@ Database-backed revocation.
 from django_bolt.auth import DjangoORMRevocation
 
 store = DjangoORMRevocation(
-    model_path="myapp.models.RevokedToken"
+    model="myapp.RevokedToken",  # 'app_label.ModelName' — exactly two parts
+    default_ttl=86400 * 7,
 )
 ```
 
-Requires a model with a `jti` field.
+Requires a model with `jti` (unique, indexed) and `expires_at`
+(indexed) fields, plus a periodic cleanup task that deletes rows where
+`expires_at < now()`.
 
 ## Authentication context
 

@@ -1450,14 +1450,28 @@ class BoltAPI:
             # These are parsed by Rust's RouteMetadata::from_python() to skip unused parsing
             middleware_meta = add_optimization_flags_to_metadata(middleware_meta, meta)
 
-            # Sync dispatch bypass: Rust calls Python synchronously (no coroutine/async bridge).
-            # Eligible when handler has a plain sync executor and no middleware/signals overhead.
+            # Resolve effective auth backends once (explicit > defaults) — reused
+            # below for revocation precomputation and _auth_backend_instances.
+            effective_auth_backends = auth if auth is not None else (get_default_authentication_classes() or [])
+
+            # scheme_name → handler. Lookup at dispatch is O(1) via the
+            # matched backend's name. None when no backend has revocation.
+            revocation_handlers: dict[str, Callable] = {
+                b.scheme_name: b.revoked_token_handler
+                for b in effective_auth_backends
+                if getattr(b, "revoked_token_handler", None) is not None
+            }
+            meta["_revocation_handlers"] = revocation_handlers or None
+
+            # Sync dispatch bypass requires no awaits in the request flow.
+            # Revocation handlers are awaited, so opt out when configured.
             can_sync_dispatch = (
                 "_sync_executor" in meta
                 and not meta["_has_route_python_middleware"]
                 and not self._has_python_global_middleware
                 and not self._has_django_middleware
                 and not self._emit_signals
+                and not revocation_handlers
             )
             middleware_meta["can_sync_dispatch"] = can_sync_dispatch
 
@@ -1474,15 +1488,10 @@ class BoltAPI:
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
-                # Also store actual auth backend instances for user resolution
-                # (not just metadata) so we can call their get_user() methods
-                if auth is not None:
-                    middleware_meta["_auth_backend_instances"] = auth
-                else:
-                    # Store default auth backends if not explicitly set
-                    default_backends = get_default_authentication_classes()
-                    if default_backends:
-                        middleware_meta["_auth_backend_instances"] = default_backends
+                # Backend instances (not metadata) are kept so user resolution
+                # can call their get_user() methods.
+                if effective_auth_backends:
+                    middleware_meta["_auth_backend_instances"] = effective_auth_backends
 
             return fn
 
@@ -2092,6 +2101,30 @@ class BoltAPI:
             if request_state:
                 request_state.pop("_bolt_route_executor", None)
 
+    async def _check_revocation(
+        self,
+        auth_context: dict[str, Any],
+        revocation_handlers: dict[str, Callable],
+    ) -> None:
+        """Reject the request if the authenticated token's JTI is revoked."""
+        handler = revocation_handlers.get(auth_context["auth_backend"])
+        if handler is None:
+            # Matched backend has no revocation (e.g., API-key auth on a
+            # route where only JWT configured one).
+            return
+
+        # When auth_context is set, Rust guarantees auth_claims is too.
+        jti = auth_context["auth_claims"].get("jti")
+        if not jti:
+            # Without a JTI we cannot identify which token to check.
+            # Rejecting is safer than silently honoring.
+            raise HTTPException(
+                status_code=401,
+                detail="Token missing 'jti' claim required for revocation",
+            )
+        if await handler(jti):
+            raise HTTPException(status_code=401, detail="Token has been revoked")
+
     async def _dispatch(self, handler: Callable, request: dict[str, Any], handler_id: int = None) -> Response:
         """
         Optimized async dispatch that calls the handler and returns response tuple.
@@ -2125,6 +2158,10 @@ class BoltAPI:
             # Skip setting user=None — PyRequest.user getter already returns None.
             auth_context = request.get("auth")
             if auth_context:
+                revocation_handlers = meta["_revocation_handlers"]
+                if revocation_handlers is not None:
+                    await self._check_revocation(auth_context, revocation_handlers)
+
                 user_id = auth_context.get("user_id")
                 if user_id:
                     backend_name = auth_context.get("auth_backend")

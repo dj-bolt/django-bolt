@@ -208,10 +208,14 @@ def test_self_referential_struct_does_not_recurse():
     assert "TreeNode" in schemas
     tree_schema = schemas["TreeNode"]
     assert "value" in tree_schema["properties"]
-    # Optional self-references are wrapped so the schema can carry default: null.
+    # Optional self-references emit `null` in the type union via
+    # `anyOf` per OpenAPI 3.1, alongside `default: null`.
     parent = tree_schema["properties"]["parent"]
     assert parent["default"] is None
-    assert parent["allOf"] == [{"$ref": "#/components/schemas/TreeNode"}]
+    assert parent["anyOf"] == [
+        {"$ref": "#/components/schemas/TreeNode"},
+        {"type": "null"},
+    ]
 
 
 def test_multi_type_union_produces_any_of():
@@ -260,3 +264,83 @@ def test_shared_nested_struct_registered_once():
     assert shared["first"]["$ref"] == "#/components/schemas/Child"
     assert shared["second"]["$ref"] == "#/components/schemas/Child"
     assert shared["others"]["items"]["$ref"] == "#/components/schemas/Child"
+
+
+# --- Union nullability ----------------------------------------------------
+# Regression: `_type_to_schema` used to strip `None` from msgspec UnionType
+# annotations, so `str | None` became `{"type": "string"}` instead of
+# `{"anyOf": [{"type": "string"}, {"type": "null"}]}`. That violated OpenAPI
+# 3.1 (the version the generator declares) and caused downstream tooling
+# like `openapi-typescript` to drop the `| null` arm of generated TS types.
+
+
+class HasNullableScalar(msgspec.Struct):
+    required_nullable: str | None
+    optional_nullable: str | None = None
+
+
+class HasMixedUnion(msgspec.Struct):
+    value: int | str | None
+
+
+class IntOrStr(msgspec.Struct):
+    value: int | str
+
+
+def _null_in(schema: dict) -> bool:
+    """True if the schema is a `null` type or has `null` in its anyOf."""
+    if schema.get("type") == "null":
+        return True
+    return any(s.get("type") == "null" for s in schema.get("anyOf", []))
+
+
+def test_nullable_scalar_emits_null_in_union():
+    """`str | None` must include `{"type": "null"}` in the type union per
+    OpenAPI 3.1, otherwise generated TS types lose the `| null` arm."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test", version="1.0.0"))
+
+    @api.post("/nullable")
+    async def post_nullable(request, data: HasNullableScalar) -> dict:
+        pass
+
+    schema = _get_schema(api)
+    props = schema["components"]["schemas"]["HasNullableScalar"]["properties"]
+
+    assert _null_in(props["required_nullable"]), f"Expected null in type union, got: {props['required_nullable']}"
+    assert _null_in(props["optional_nullable"]), f"Expected null in type union, got: {props['optional_nullable']}"
+
+
+def test_multi_type_union_with_none_keeps_all_arms():
+    """`int | str | None` must emit all three arms in `anyOf`, not drop None."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test", version="1.0.0"))
+
+    @api.post("/mixed")
+    async def post_mixed(request, data: HasMixedUnion) -> dict:
+        pass
+
+    schema = _get_schema(api)
+    field = schema["components"]["schemas"]["HasMixedUnion"]["properties"]["value"]
+
+    assert "anyOf" in field, f"Expected anyOf for multi-type union, got: {field}"
+    types_in_anyof = {s.get("type") for s in field["anyOf"] if "type" in s}
+    assert "null" in types_in_anyof
+    assert "integer" in types_in_anyof
+    assert "string" in types_in_anyof
+
+
+def test_union_without_none_is_unchanged():
+    """A union that doesn't include `None` must not pick up a spurious
+    `null` arm — the fix only affects unions that originally had `None`."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test", version="1.0.0"))
+
+    @api.post("/intorstr")
+    async def post_intorstr(request, data: IntOrStr) -> dict:
+        pass
+
+    schema = _get_schema(api)
+    field = schema["components"]["schemas"]["IntOrStr"]["properties"]["value"]
+
+    assert "anyOf" in field
+    types_in_anyof = {s.get("type") for s in field["anyOf"] if "type" in s}
+    assert "null" not in types_in_anyof
+    assert types_in_anyof == {"integer", "string"}

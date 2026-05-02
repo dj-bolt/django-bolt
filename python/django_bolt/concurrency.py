@@ -11,17 +11,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import TypeVar
-
-from typing_extensions import ParamSpec
 
 __all__ = ("sync_to_thread",)
 
-P = ParamSpec("P")
-T = TypeVar("T")
 
-
-async def sync_to_thread(fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
     """Run the synchronous callable ``fn`` asynchronously in a worker thread.
 
     This function uses :meth:`asyncio.loop.run_in_executor` to run the callable
