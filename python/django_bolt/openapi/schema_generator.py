@@ -12,6 +12,7 @@ from ..serializers.fields import _FieldMarker
 from ..typing import is_msgspec_struct, is_optional
 from .spec import (
     OpenAPI,
+    OpenAPIHeader,
     OpenAPIMediaType,
     OpenAPIResponse,
     Operation,
@@ -365,19 +366,20 @@ class SchemaGenerator:
         parameters.extend(upgrade_headers)
 
         # WebSocket endpoints don't have traditional HTTP responses
-        # Document the 101 Switching Protocols response
+        # Document the 101 Switching Protocols response.
+        # Per OpenAPI 3.1 the Header Object MUST NOT specify `name` or
+        # `in` — both are derived from the `headers` map key + the
+        # implicit `header` location — so use `OpenAPIHeader` (which
+        # excludes those fields on serialization) rather than
+        # `Parameter`. Validators reject the latter.
         responses = {
             "101": OpenAPIResponse(
                 description="Switching Protocols - WebSocket connection established",
                 headers={
-                    "Upgrade": Parameter(
-                        name="Upgrade",
-                        param_in="header",
+                    "Upgrade": OpenAPIHeader(
                         schema=Schema(type="string", enum=["websocket"]),
                     ),
-                    "Connection": Parameter(
-                        name="Connection",
-                        param_in="header",
+                    "Connection": OpenAPIHeader(
                         schema=Schema(type="string", enum=["Upgrade"]),
                     ),
                 },
@@ -859,20 +861,31 @@ class SchemaGenerator:
                 # msgspec.inspect UnionType — the .types attr distinguishes
                 # this from Python's built-in types.UnionType (which uses
                 # .__args__ instead).
-                non_none_types = [
-                    t
-                    for t in type_annotation.types
-                    # String comparison because msgspec.inspect.NoneType is
-                    # not the same object as builtins.NoneType.
-                    if type(t).__name__ != "NoneType"
-                ]
-                if len(non_none_types) == 1:
-                    return self._type_to_schema(non_none_types[0], register_component=register_component)
-                if len(non_none_types) > 1:
-                    return Schema(
-                        any_of=[self._type_to_schema(t, register_component=register_component) for t in non_none_types]
-                    )
-                return Schema(type="object")
+                #
+                # String comparison: msgspec.inspect.NoneType is not the
+                # same object as builtins.NoneType.
+                types = list(type_annotation.types)
+                non_none_types = [t for t in types if type(t).__name__ != "NoneType"]
+                has_none = len(non_none_types) != len(types)
+
+                if not non_none_types:
+                    # `None`-only union (rare; e.g. Optional[NoneType])
+                    return Schema(type="null") if has_none else Schema(type="object")
+
+                inner_schemas = [self._type_to_schema(t, register_component=register_component) for t in non_none_types]
+                # Per OpenAPI 3.1 (the version this generator declares),
+                # nullable fields are expressed via `null` in the type
+                # union — not the legacy 3.0 `nullable: true`. Preserving
+                # None here means generated specs round-trip correctly
+                # through tooling like openapi-typescript, which uses the
+                # spec verbatim and would otherwise lose the `| null` arm
+                # of the generated TS type.
+                if has_none:
+                    inner_schemas.append(Schema(type="null"))
+
+                if len(inner_schemas) == 1:
+                    return inner_schemas[0]
+                return Schema(any_of=inner_schemas)
             if type_name == "ListType":
                 item_type = getattr(type_annotation, "item_type", None)
                 if item_type:

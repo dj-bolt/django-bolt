@@ -1124,6 +1124,7 @@ class BoltAPI:
                     # sets the ContextVar-based request/action, and forwards.
                     is_async_method = inspect.iscoroutinefunction(unbound_fn)
                     if is_async_method:
+
                         async def custom_action_handler(
                             *args,
                             __unbound_fn=unbound_fn,
@@ -1137,6 +1138,7 @@ class BoltAPI:
                             view_instance = __view_cls()
                             return await __unbound_fn(view_instance, *args, **kwargs)
                     else:
+
                         def custom_action_handler(
                             *args,
                             __unbound_fn=unbound_fn,

@@ -34,12 +34,15 @@ def _make_websocket_project(make_server_project):
 def test_websocket_handshake_auth_and_close(make_server_project):
     project = _make_websocket_project(make_server_project)
 
-    with project.start() as server, SimpleWebSocketClient(
-        server.host,
-        server.port,
-        "/ws/protected",
-        headers={"Authorization": "Bearer secret-token"},
-    ) as websocket:
+    with (
+        project.start() as server,
+        SimpleWebSocketClient(
+            server.host,
+            server.port,
+            "/ws/protected",
+            headers={"Authorization": "Bearer secret-token"},
+        ) as websocket,
+    ):
         assert websocket.receive_text() == "authorized"
         websocket.send_text("hello")
         assert websocket.receive_text() == "echo:hello"

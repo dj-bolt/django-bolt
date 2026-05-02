@@ -30,7 +30,15 @@ from django_bolt.health import add_health_check
 from django_bolt.middleware import no_compress
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.param_functions import Cookie, Depends, File, Form, Header
-from django_bolt.responses import HTML, EventSourceResponse, FileResponse, PlainText, Redirect, ServerSentEvent, StreamingResponse
+from django_bolt.responses import (
+    HTML,
+    EventSourceResponse,
+    FileResponse,
+    PlainText,
+    Redirect,
+    ServerSentEvent,
+    StreamingResponse,
+)
 from django_bolt.serializers import Serializer, field_validator
 from django_bolt.types import Request
 from django_bolt.views import APIView, ViewSet
@@ -889,6 +897,7 @@ def sse_sync():
 
 
 # ==== EventSourceResponse (new SSE syntax) ====
+
 
 class TimestampEvent(msgspec.Struct):
     timestamp: float
