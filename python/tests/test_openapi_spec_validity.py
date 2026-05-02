@@ -1,15 +1,18 @@
-"""Structural sanity checks on generated OpenAPI specs.
+"""Validate generated OpenAPI specs against the official OpenAPI 3.1 schema.
 
-The generator declares `"openapi": "3.1.0"`. The tests here exercise a
-representative slice of the surface area (body+response, query params,
-path params, nested structs, unions, enums, WebSocket) and assert
-basic well-formedness — the document declares 3.1 and every `$ref`
-resolves to a registered component.
+The generator declares `"openapi": "3.1.0"`. `openapi-spec-validator`
+runs the generated document through the official OpenAPI 3.1 JSON
+Schema, catching structural problems (broken `$ref` paths, malformed
+component shapes, invalid `type` values, missing required fields,
+bad parameter `in` values, etc.) that targeted contract tests
+wouldn't necessarily notice — this is in fact how the WebSocket
+`Parameter`-vs-`OpenAPIHeader` bug fixed in this PR was found.
 
-These are *structural* checks, not *fidelity* checks — they don't
-tell us whether `str | None` was rendered with the right nullability
-arms. Pair with the contract tests in `test_openapi_nested_schema.py`
-and `test_openapi_schema_accuracy.py` for the field-level assertions.
+This is a *validity* check, not a *fidelity* check — it can't tell
+us whether `str | None` was rendered with the right nullability arms,
+only that whatever was rendered is well-formed OpenAPI 3.1. Pair
+with the contract tests in `test_openapi_nested_schema.py` and
+`test_openapi_schema_accuracy.py` for the field-level assertions.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from typing import Annotated, Literal
 
 import msgspec
 import pytest
+from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
@@ -116,11 +120,17 @@ def full_spec() -> dict:
         return response.json()
 
 
+def test_generated_spec_is_valid_openapi_3_1(full_spec: dict) -> None:
+    """The generated spec must validate against the official OpenAPI
+    3.1 JSON Schema. `validate()` raises with a precise pointer when
+    a constraint is violated."""
+    validate(full_spec)
+
+
 def test_generated_spec_declares_openapi_3_1(full_spec: dict) -> None:
-    """Pin the declared OpenAPI version. Downstream tooling and the
-    contract tests assume 3.1 semantics (e.g. `null` in type unions
-    rather than `nullable: true`); a silent version bump would change
-    those semantics."""
+    """Sanity check: the validator above only enforces 3.1 if the
+    document declares 3.1. If the generator ever switches versions,
+    the validator's strictness changes, so pin the version here."""
     assert full_spec.get("openapi", "").startswith("3.1.")
 
 
