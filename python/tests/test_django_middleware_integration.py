@@ -1458,6 +1458,98 @@ class TestMultipleCookieHeaders:
 
 
 # =============================================================================
+# Test Handler-Set Cookies Survive django_middleware
+# =============================================================================
+
+
+class TestHandlerCookiesWithDjangoMiddleware:
+    """
+    Cookies set by the handler (e.g. JSON(...).set_cookie(...)) must survive
+    when django_middleware is configured. Previously they were silently
+    dropped because _to_django_response() built a fresh HttpResponse without
+    carrying _raw_cookies onto it, so Django middleware never saw them and
+    _to_bolt_response() harvested an empty cookie jar.
+    """
+
+    def test_handler_cookies_preserved_through_locale_middleware(self):
+        from django_bolt.responses import JSON
+
+        api = BoltAPI(
+            django_middleware=[
+                "django.middleware.locale.LocaleMiddleware",
+                "django.middleware.common.CommonMiddleware",
+            ]
+        )
+
+        @api.post("/login")
+        async def login():
+            return (
+                JSON({"ok": True})
+                .set_cookie(
+                    name="access_token",
+                    value="access-abc",
+                    max_age=3600,
+                    secure=True,
+                    httponly=True,
+                )
+                .set_cookie(
+                    name="refresh_token",
+                    value="refresh-xyz",
+                    max_age=86400,
+                    secure=True,
+                    httponly=True,
+                )
+            )
+
+        with TestClient(api) as client:
+            response = client.post("/login")
+            assert response.status_code == 200
+
+            set_cookie_headers = [
+                value for key, value in response.headers.multi_items() if key.lower() == "set-cookie"
+            ]
+            joined = "\n".join(set_cookie_headers)
+
+            assert len(set_cookie_headers) >= 2, (
+                f"Expected at least 2 Set-Cookie headers from handler, got {len(set_cookie_headers)}: {set_cookie_headers}"
+            )
+            assert "access_token=access-abc" in joined, (
+                f"access_token cookie missing. Set-Cookie headers: {set_cookie_headers}"
+            )
+            assert "refresh_token=refresh-xyz" in joined, (
+                f"refresh_token cookie missing. Set-Cookie headers: {set_cookie_headers}"
+            )
+
+    def test_handler_cookies_preserved_with_single_django_middleware(self):
+        from django_bolt.responses import JSON
+
+        api = BoltAPI(
+            middleware=[DjangoMiddleware("django.middleware.common.CommonMiddleware")],
+        )
+
+        @api.post("/login")
+        async def login():
+            return JSON({"ok": True}).set_cookie(
+                name="session",
+                value="single-mw-cookie",
+                httponly=True,
+            )
+
+        with TestClient(api) as client:
+            response = client.post("/login")
+            assert response.status_code == 200
+
+            set_cookie_headers = [
+                value for key, value in response.headers.multi_items() if key.lower() == "set-cookie"
+            ]
+            joined = "\n".join(set_cookie_headers)
+
+            assert "session=single-mw-cookie" in joined, (
+                f"Handler-set cookie missing through DjangoMiddleware. Set-Cookie headers: {set_cookie_headers}"
+            )
+
+
+# =============================================================================
 # Test auser Setter for Django alogin() Compatibility
 # =============================================================================
 
