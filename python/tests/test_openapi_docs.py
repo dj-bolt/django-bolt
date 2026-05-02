@@ -506,3 +506,52 @@ def test_openapi_security_schemes_preserve_user_defined():
         # User-defined scheme should be preserved, not overwritten
         assert schemes["BearerAuth"]["bearerFormat"] == "CustomJWT"
         assert schemes["BearerAuth"]["description"] == "My custom JWT scheme"
+
+
+def test_openapi_form_serializer_flattens_struct_fields():
+    """Regression: when a Form() parameter is annotated with a Struct/Serializer,
+    the runtime extractor reads each struct field as a top-level form key, so the
+    multipart schema must mirror that — *not* nest the struct under the param name.
+    Also covers UploadFile / list[UploadFile] schema shape inside and outside the
+    struct.
+    """
+    from typing import Annotated
+
+    from django_bolt.datastructures import UploadFile
+    from django_bolt.params import File, Form
+    from django_bolt.serializers import Serializer
+
+    class RegisterForm(Serializer):
+        username: str
+        age: int
+        email: str
+        attachments: list[UploadFile]
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.post("/register")
+    async def register(
+        payload: Annotated[RegisterForm, Form()],
+        profile_picture: Annotated[UploadFile, File()],
+    ):
+        return {"ok": True}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get("/docs/openapi.json")
+        assert response.status_code == 200, response.text
+
+        schema = response.json()
+        media = schema["paths"]["/register"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+        props = media["properties"]
+
+        assert "payload" not in props, f"Struct should be flattened, got {list(props)}"
+        assert {"username", "age", "email", "attachments", "profile_picture"} <= set(props)
+
+        assert props["username"]["type"] == "string"
+        assert props["age"]["type"] == "integer"
+        assert props["profile_picture"] == {"type": "string", "format": "binary"}
+        assert props["attachments"] == {"type": "array", "items": {"type": "string", "format": "binary"}}
+
+        assert set(media["required"]) == {"username", "age", "email", "attachments", "profile_picture"}

@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin
 
 import msgspec
 
+from ..datastructures import UploadFile
 from ..serializers.fields import _FieldMarker
-from ..typing import is_msgspec_struct, is_optional
+from ..typing import is_msgspec_struct, is_optional, unwrap_optional
 from .spec import (
     OpenAPI,
     OpenAPIMediaType,
@@ -512,23 +513,31 @@ class SchemaGenerator:
 
             if form_fields:
                 # Multipart form data
-                properties = {}
-                required = []
+                properties: dict[str, Schema | Reference] = {}
+                required: list[str] = []
                 for field in form_fields:
-                    # Access FieldDefinition attributes directly
                     name = field.alias or field.name
                     annotation = field.annotation
                     default = field.default
-                    source = field.source
 
-                    if source == "file":
-                        # File upload
-                        schema = Schema(type="string", format="binary")
-                    else:
-                        schema = self._type_to_schema(annotation)
+                    # Form fields annotated with a Struct/Serializer are flattened:
+                    # the runtime form extractor reads each struct field as a
+                    # top-level form key, so the schema must mirror that shape.
+                    # Use msgspec.structs.fields (raw Python types) rather than
+                    # msgspec.inspect.type_info (CustomType-wrapped) so the
+                    # UploadFile branch in _type_to_schema fires for file fields.
+                    unwrapped = unwrap_optional(annotation)
+                    if is_msgspec_struct(unwrapped):
+                        for struct_field in msgspec.structs.fields(unwrapped):
+                            sub_name, sub_schema, sub_required = self._msgspec_field_schema(
+                                struct_field, register_component=False
+                            )
+                            properties[sub_name] = sub_schema
+                            if sub_required:
+                                required.append(sub_name)
+                        continue
 
-                    properties[name] = schema
-
+                    properties[name] = self._type_to_schema(annotation)
                     if default == inspect.Parameter.empty and not is_optional(annotation):
                         required.append(name)
 
@@ -916,6 +925,11 @@ class SchemaGenerator:
                 type_annotation = non_none_args[0]
                 origin = get_origin(type_annotation)
                 args = get_args(type_annotation)
+
+        # Handle UploadFile — list[UploadFile] flows through the list branch
+        # below and recurses back into this check for the item type.
+        if type_annotation is UploadFile:
+            return Schema(type="string", format="binary")
 
         # Handle msgspec.Struct
         if is_msgspec_struct(type_annotation):
