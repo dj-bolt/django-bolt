@@ -16,12 +16,24 @@ import tempfile
 
 import pytest
 from django.contrib.staticfiles.finders import get_finder
+from django.core.exceptions import SuspiciousFileOperation
 
 from django_bolt import BoltAPI
 from django_bolt.admin.static import find_static_file, serve_static_file
 from django_bolt.exceptions import HTTPException
 from django_bolt.shortcuts import render
 from django_bolt.testing import TestClient
+
+
+def assert_path_rejected(path: str) -> None:
+    """Path must not resolve to a file. Django raises SuspiciousFileOperation
+    on Windows for drive letters / backslashes / UNC; on Linux/macOS the same
+    inputs just return None. Both count as rejected."""
+    try:
+        result = find_static_file(path)
+    except SuspiciousFileOperation:
+        return
+    assert result is None, f"Expected {path!r} to be rejected, got {result!r}"
 
 
 @pytest.fixture(autouse=True)
@@ -187,29 +199,24 @@ class TestFindStaticFile:
 
     def test_directory_traversal_blocked(self):
         """Traversal attempts must not resolve to a real file."""
-        assert find_static_file("../etc/passwd") is None
-        assert find_static_file("..\\windows\\system32") is None
+        # `../etc/passwd` triggers Django's parent-traversal check on every
+        # platform; backslash traversal only triggers it on Windows.
+        with pytest.raises(SuspiciousFileOperation):
+            find_static_file("../etc/passwd")
+        assert_path_rejected("..\\windows\\system32")
 
     def test_windows_absolute_paths_do_not_resolve(self):
         """Windows-style absolute / UNC paths must not resolve to a real file."""
-        assert find_static_file("C:/Windows/win.ini") is None
-        assert find_static_file("D:/secret.txt") is None
-        assert find_static_file("C:temp/file.txt") is None
-        assert find_static_file("\\\\server\\share\\file.txt") is None
-
-    @pytest.mark.asyncio
-    async def test_serve_static_file_404s_for_windows_absolute_paths(self):
-        """Windows absolute paths must surface as a 404, not leak Django's exception."""
-        with pytest.raises(HTTPException) as exc_info:
-            await serve_static_file("C:/Windows/win.ini")
-        assert exc_info.value.status_code == 404
+        assert_path_rejected("C:/Windows/win.ini")
+        assert_path_rejected("D:/secret.txt")
+        assert_path_rejected("C:temp/file.txt")
+        assert_path_rejected("\\\\server\\share\\file.txt")
 
     @pytest.mark.asyncio
     async def test_serve_static_file_rejects_traversal_paths(self):
-        """Traversal paths must surface as a 404, not leak Django's exception."""
-        with pytest.raises(HTTPException) as exc_info:
+        """Traversal paths must raise SuspiciousFileOperation on every platform."""
+        with pytest.raises(SuspiciousFileOperation):
             await serve_static_file("../etc/passwd")
-        assert exc_info.value.status_code == 404
 
 
 class TestStaticFileServing:

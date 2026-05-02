@@ -8,7 +8,6 @@ import mimetypes
 import os
 
 from django.conf import settings
-from django.core.exceptions import SuspiciousFileOperation
 
 try:
     from django.contrib.staticfiles.finders import find
@@ -29,16 +28,8 @@ def find_static_file(path: str) -> str | None:
     Returns:
         Absolute path to file if found, None otherwise
     """
-    # Django's finder raises SuspiciousFileOperation on Windows for paths it
-    # treats as absolute or as parent traversal (drive letters, backslashes,
-    # UNC). On Linux/macOS the same strings are just unusual filenames that
-    # don't match. Normalize both outcomes to None so callers can map a single
-    # "not found" response.
     if find is not None:
-        try:
-            found_path = find(path)
-        except SuspiciousFileOperation:
-            return None
+        found_path = find(path)
         if found_path:
             return found_path
 
