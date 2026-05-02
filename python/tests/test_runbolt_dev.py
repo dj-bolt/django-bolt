@@ -119,7 +119,9 @@ def test_execute_from_command_line_dev_calls_reloader_with_debounce(monkeypatch)
         "4",
     ]
 
-    def fake_run_dev_reloader(command, watch_paths, ignore_dir_names, ignore_paths, debounce_ms):
+    def fake_run_dev_reloader(
+        command, watch_paths, ignore_dir_names, ignore_paths, debounce_ms, force_polling
+    ):
         recorded["command"] = command
         recorded["watch_paths"] = watch_paths
         recorded["ignore_dir_names"] = ignore_dir_names

@@ -256,28 +256,38 @@ fn run_dev_reloader_inner(
 
     let (tx, rx) = mpsc::channel();
 
-    // Swap RecommendedWatcher for PollWatcher when force_polling is set.
-    // PollWatcher uses os.stat() checks, which cross Docker bind-mount boundaries
-    // on Windows where inotify events are not propagated.
+    // PollWatcher uses os.stat() polling instead of OS file events. This is
+    // needed inside Docker containers bind-mounted from a Windows host, where
+    // inotify never sees changes made on the host side.
     let mut watcher: Box<dyn Watcher> = if force_polling {
-        let tx2 = tx;
         Box::new(
             PollWatcher::new(
-                move |result| { let _ = tx2.send(result); },
+                move |result| {
+                    let _ = tx.send(result);
+                },
                 Config::default().with_poll_interval(Duration::from_millis(500)),
             )
-            .map_err(|err| py_runtime_error(format!("Failed to initialize poll watcher: {}", err)))?,
+            .map_err(|err| {
+                py_runtime_error(format!("Failed to initialize poll watcher: {}", err))
+            })?,
         )
     } else {
-        let tx2 = tx;
         Box::new(
             RecommendedWatcher::new(
-                move |result| { let _ = tx2.send(result); },
+                move |result| {
+                    let _ = tx.send(result);
+                },
                 Config::default(),
             )
-            .map_err(|err| py_runtime_error(format!("Failed to initialize dev reload watcher: {}", err)))?,
+            .map_err(|err| {
+                py_runtime_error(format!("Failed to initialize dev reload watcher: {}", err))
+            })?,
         )
     };
+
+    if force_polling {
+        eprintln!("[django-bolt] Dev reload using PollWatcher (interval=500ms)");
+    }
 
     let mut watched = 0usize;
     for path in watch_paths {
