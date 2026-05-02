@@ -872,10 +872,7 @@ class SchemaGenerator:
                     # `None`-only union (rare; e.g. Optional[NoneType])
                     return Schema(type="null") if has_none else Schema(type="object")
 
-                inner_schemas = [
-                    self._type_to_schema(t, register_component=register_component)
-                    for t in non_none_types
-                ]
+                inner_schemas = [self._type_to_schema(t, register_component=register_component) for t in non_none_types]
                 # Per OpenAPI 3.1 (the version this generator declares),
                 # nullable fields are expressed via `null` in the type
                 # union — not the legacy 3.0 `nullable: true`. Preserving

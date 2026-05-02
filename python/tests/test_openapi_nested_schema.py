@@ -306,12 +306,8 @@ def test_nullable_scalar_emits_null_in_union():
     schema = _get_schema(api)
     props = schema["components"]["schemas"]["HasNullableScalar"]["properties"]
 
-    assert _null_in(props["required_nullable"]), (
-        f"Expected null in type union, got: {props['required_nullable']}"
-    )
-    assert _null_in(props["optional_nullable"]), (
-        f"Expected null in type union, got: {props['optional_nullable']}"
-    )
+    assert _null_in(props["required_nullable"]), f"Expected null in type union, got: {props['required_nullable']}"
+    assert _null_in(props["optional_nullable"]), f"Expected null in type union, got: {props['optional_nullable']}"
 
 
 def test_multi_type_union_with_none_keeps_all_arms():

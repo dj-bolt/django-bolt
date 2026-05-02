@@ -148,8 +148,7 @@ def test_no_dangling_refs_in_components(full_spec: dict) -> None:
             if isinstance(ref, str) and ref.startswith("#/components/schemas/"):
                 name = ref[len("#/components/schemas/") :]
                 assert name in schemas, (
-                    f"$ref to {name!r} but no such component schema. "
-                    f"Available: {sorted(schemas.keys())}"
+                    f"$ref to {name!r} but no such component schema. Available: {sorted(schemas.keys())}"
                 )
             for value in node.values():
                 walk(value)
