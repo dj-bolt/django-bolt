@@ -579,8 +579,7 @@ async fn build_response_from_parsed(
                     mark_skip_cors(&mut response, skip_cors);
                     return response;
                 }
-                let stream =
-                    create_sse_stream(content_obj, is_async_generator, ping_interval);
+                let stream = create_sse_stream(content_obj, is_async_generator, ping_interval);
                 let mut response =
                     response_builder::build_sse_response(parsed.status, headers, skip_compression)
                         .streaming(stream);
