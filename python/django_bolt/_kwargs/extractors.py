@@ -223,9 +223,7 @@ def _upload_file_dec_hook(typ: type, obj: Any) -> Any:
         return obj
     if typ is UploadFile:
         if not isinstance(obj, dict):
-            raise msgspec.ValidationError(
-                f"Expected uploaded file, got {type(obj).__name__}"
-            )
+            raise msgspec.ValidationError(f"Expected uploaded file, got {type(obj).__name__}")
         return UploadFile.from_file_info(obj)
     raise NotImplementedError(f"Unsupported type: {typ}")
 

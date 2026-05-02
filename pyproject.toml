@@ -45,6 +45,7 @@ dependencies = [
 
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
+nanodjango = ["nanodjango>=0.16"]
 
 [project.urls]
 Homepage = "https://github.com/FarhanAliRaza/django-bolt"
@@ -53,6 +54,10 @@ Documentation = "https://github.com/FarhanAliRaza/django-bolt#readme"
 "Bug Tracker" = "https://github.com/FarhanAliRaza/django-bolt/issues"
 [project.scripts]
 django-bolt = "django_bolt.cli:main"
+
+[project.entry-points."nanodjango"]
+django-bolt = "django_bolt.nanodjango"
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "django_bolt._core"
@@ -71,6 +76,7 @@ dev = [
     "django==6.0.2",
     "ruff>=0.8",
     "vulture>=2.11", #for dead code detection
+    "nanodjango>=0.16",
 ]
 docs = [
     "zensical",

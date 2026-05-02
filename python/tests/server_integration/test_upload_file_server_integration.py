@@ -106,10 +106,7 @@ def test_multiple_files_upload_preserves_each_payload(make_server_project):
         response = server.request(
             "POST",
             "/upload/multiple",
-            files=[
-                ("files", (name, data, "application/octet-stream"))
-                for name, data in files_payload
-            ],
+            files=[("files", (name, data, "application/octet-stream")) for name, data in files_payload],
         )
 
     assert response.status_code == 200, response.text

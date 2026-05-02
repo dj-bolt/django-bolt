@@ -85,17 +85,17 @@ def _spawn_process(command: list[str], cwd: Path, env: dict[str, str]) -> subpro
 
 def _raise_process_failure(process: subprocess.Popen[str], message: str) -> None:
     stdout, stderr = _terminate_process(process)
-    raise AssertionError(
-        f"{message}\n"
-        f"exit_code={process.returncode}\n"
-        f"stdout:\n{stdout}\n"
-        f"stderr:\n{stderr}"
-    )
+    raise AssertionError(f"{message}\nexit_code={process.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}")
 
 
 @dataclass
 class RunningServer:
-    project: ServerProject
+    # ``project`` is optional so callers that spawn the server outside
+    # ``create_server_project``/``ServerProject.start`` (e.g. single-file
+    # nanodjango apps spawned via ``python myapp.py runbolt``) can still
+    # reuse the wait-and-poll machinery. ``RunningServer`` itself never
+    # accesses ``project``.
+    project: ServerProject | None
     process: subprocess.Popen[str]
     host: str
     port: int
