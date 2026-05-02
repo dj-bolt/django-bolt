@@ -430,7 +430,9 @@ def _serialize_sse_chunk(chunk: Any) -> bytes:
         return chunk.encode("utf-8")
     if isinstance(chunk, ServerSentEvent):
         if chunk.raw_data is not None:
-            return format_sse_event(data_str=chunk.raw_data, event=chunk.event, id=chunk.id, retry=chunk.retry, comment=chunk.comment)
+            return format_sse_event(
+                data_str=chunk.raw_data, event=chunk.event, id=chunk.id, retry=chunk.retry, comment=chunk.comment
+            )
         return format_sse_event(
             data_bytes=_json.encode(chunk.data) if chunk.data is not None else None,
             event=chunk.event,

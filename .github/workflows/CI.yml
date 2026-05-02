@@ -80,7 +80,7 @@ jobs:
         run: uv run maturin develop --release
 
       - name: Run platform smoke tests
-        run: uv run pytest python/tests/server_integration -m platform_smoke -s -vv
+        run: uv run pytest python/tests/integration -m platform_smoke -s -vv
 
   server_integration_linux:
     name: Server Integration Linux Python ${{ matrix.python-version }}
@@ -117,7 +117,7 @@ jobs:
         run: uv run maturin develop --release
 
       - name: Run server integration tests
-        run: uv run pytest python/tests/server_integration -m "server_integration and not artifact_smoke" -s -vv
+        run: uv run pytest python/tests/integration -m "server_integration and not artifact_smoke" -s -vv
 
   platform_smoke:
     name: Platform Smoke ${{ matrix.os }}
@@ -154,7 +154,7 @@ jobs:
         run: uv run maturin develop --release
 
       - name: Run platform smoke tests
-        run: uv run pytest python/tests/server_integration -m platform_smoke -s -vv
+        run: uv run pytest python/tests/integration -m platform_smoke -s -vv
 
   # Build wheels for Linux x86_64 (covers most Linux users including Arch)
   linux:
@@ -340,7 +340,7 @@ jobs:
       - name: Run artifact smoke tests
         env:
           DJANGO_BOLT_ARTIFACT_PATH: ${{ steps.artifact.outputs.path }}
-        run: uv run pytest python/tests/server_integration/test_artifact_smoke.py -m artifact_smoke -s -vv
+        run: uv run pytest python/tests/integration/test_artifact_smoke.py -m artifact_smoke -s -vv
 
   # Release to PyPI
   release:

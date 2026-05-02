@@ -382,13 +382,7 @@ def format_sse_event(
     encoded (e.g. from msgspec) to avoid a decode/encode round-trip.
     """
     # Fast path: data-only event with pre-encoded bytes (most common from auto-framing)
-    if (
-        data_bytes is not None
-        and event is None
-        and id is None
-        and retry is None
-        and comment is None
-    ):
+    if data_bytes is not None and event is None and id is None and retry is None and comment is None:
         return b"data: " + data_bytes + b"\n\n"
 
     lines: list[str] = []

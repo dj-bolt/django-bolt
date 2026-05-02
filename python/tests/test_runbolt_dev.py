@@ -119,12 +119,13 @@ def test_execute_from_command_line_dev_calls_reloader_with_debounce(monkeypatch)
         "4",
     ]
 
-    def fake_run_dev_reloader(command, watch_paths, ignore_dir_names, ignore_paths, debounce_ms):
+    def fake_run_dev_reloader(command, watch_paths, ignore_dir_names, ignore_paths, debounce_ms, force_polling):
         recorded["command"] = command
         recorded["watch_paths"] = watch_paths
         recorded["ignore_dir_names"] = ignore_dir_names
         recorded["ignore_paths"] = ignore_paths
         recorded["debounce_ms"] = debounce_ms
+        recorded["force_polling"] = force_polling
         return 0
 
     monkeypatch.setattr(sys, "argv", argv)
@@ -152,6 +153,7 @@ def test_execute_from_command_line_dev_calls_reloader_with_debounce(monkeypatch)
         "ignore_dir_names": list(runbolt_module.DEV_RELOAD_IGNORE_DIRS),
         "ignore_paths": ["/tmp/venv"],
         "debounce_ms": runbolt_module.DEV_RELOAD_DEBOUNCE_MS,
+        "force_polling": False,
     }
 
 
