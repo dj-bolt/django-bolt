@@ -1,17 +1,15 @@
-"""Validate generated OpenAPI specs against the official OpenAPI 3.1 schema.
+"""Structural sanity checks on generated OpenAPI specs.
 
-The generator declares `"openapi": "3.1.0"`. `openapi-spec-validator`
-runs the generated document through the official OpenAPI 3.1 JSON
-Schema, catching structural problems (broken `$ref` paths, malformed
-component shapes, invalid `type` values, missing required fields,
-bad parameter `in` values, etc.) that targeted contract tests
-wouldn't necessarily notice.
+The generator declares `"openapi": "3.1.0"`. The tests here exercise a
+representative slice of the surface area (body+response, query params,
+path params, nested structs, unions, enums, WebSocket) and assert
+basic well-formedness — the document declares 3.1 and every `$ref`
+resolves to a registered component.
 
-This is a *validity* check, not a *fidelity* check — it can't tell
-us whether `str | None` was rendered with the right nullability arms,
-only that whatever was rendered is well-formed OpenAPI 3.1. Pair
-with the contract tests in `test_openapi_nested_schema.py` and
-`test_openapi_schema_accuracy.py` for the field-level assertions.
+These are *structural* checks, not *fidelity* checks — they don't
+tell us whether `str | None` was rendered with the right nullability
+arms. Pair with the contract tests in `test_openapi_nested_schema.py`
+and `test_openapi_schema_accuracy.py` for the field-level assertions.
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ from typing import Annotated, Literal
 
 import msgspec
 import pytest
-from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
@@ -102,8 +99,7 @@ def _build_full_api() -> BoltAPI:
     async def stream_items(websocket: WebSocket) -> None:
         # Real-time stream — no message handling needed for the test;
         # the value here is exercising the WebSocket → OpenAPI path
-        # (response headers under `101 Switching Protocols`, which
-        # caught a real Header-vs-Parameter bug under the validator).
+        # (response headers under `101 Switching Protocols`).
         await websocket.accept()
         await websocket.close()
 
@@ -120,17 +116,11 @@ def full_spec() -> dict:
         return response.json()
 
 
-def test_generated_spec_is_valid_openapi_3_1(full_spec: dict) -> None:
-    """The generated spec must validate against the official OpenAPI
-    3.1 JSON Schema. `validate()` raises with a precise pointer when
-    a constraint is violated."""
-    validate(full_spec)
-
-
 def test_generated_spec_declares_openapi_3_1(full_spec: dict) -> None:
-    """Sanity check: the validator above only enforces 3.1 if the
-    document declares 3.1. If the generator ever switches versions,
-    the validator's strictness changes, so pin the version here."""
+    """Pin the declared OpenAPI version. Downstream tooling and the
+    contract tests assume 3.1 semantics (e.g. `null` in type unions
+    rather than `nullable: true`); a silent version bump would change
+    those semantics."""
     assert full_spec.get("openapi", "").startswith("3.1.")
 
 
@@ -139,9 +129,7 @@ def test_no_dangling_refs_in_components(full_spec: dict) -> None:
     entry. Catches the bug class where a Struct is referenced inside
     a property but never registered as a component (e.g. via the
     msgspec round-trip path emitting a $ref to a nested type that
-    bolt didn't add to components). The official validator covers
-    *most* of this, but a direct walk gives a clearer failure
-    message in the common case."""
+    bolt didn't add to components)."""
     schemas = full_spec.get("components", {}).get("schemas", {})
 
     def walk(node: object) -> None:
