@@ -413,23 +413,51 @@ async def show_context(request):
 ## Token revocation
 
 For logout functionality, Django-Bolt supports token revocation stores.
+When you pass `revocation_store=` to `JWTAuthentication`, every authenticated
+request is checked against the store before reaching your handler — revoked
+tokens are automatically rejected with `401 Unauthorized`. You don't need
+to call `is_revoked()` manually.
+
+!!! note "JTI is required"
+
+    Configuring a `revocation_store` auto-enables `require_jti=True` on the
+    backend. Tokens without a `jti` claim are rejected at auth time. Make
+    sure your token issuer adds one — `create_jwt_for_user(...,
+    extra_claims={"jti": uuid.uuid4().hex})` is the simplest way.
+
+!!! tip "Always pass the token's `exp`"
+
+    `revoke()` accepts an `exp` keyword argument. Pass the token's own
+    `exp` claim so the revocation entry expires exactly when the token
+    would have anyway — no security gap, no wasted storage. Without
+    `exp`, the entry falls back to the store's `default_ttl` (7 days
+    by default).
 
 ### In-memory revocation (development)
 
 ```python
-from django_bolt.auth import JWTAuthentication, InMemoryRevocation
+from django_bolt.auth import JWTAuthentication, InMemoryRevocation, IsAuthenticated
 
 store = InMemoryRevocation()
-
 jwt_auth = JWTAuthentication(revocation_store=store)
 
 @api.post("/logout", auth=[jwt_auth], guards=[IsAuthenticated()])
 async def logout(request):
-    token_jti = request.context.get("auth_claims", {}).get("jti")
-    if token_jti:
-        store.revoke(token_jti)
+    claims = request["context"]["auth_claims"]
+    await store.revoke(claims["jti"], exp=claims.get("exp"))
     return {"status": "logged out"}
 ```
+
+After this handler runs, any further request carrying the same token
+will be rejected with `401 Unauthorized` — automatically, no per-handler
+check needed.
+
+!!! warning "Single process only"
+
+    `InMemoryRevocation` keeps state in process memory and does not
+    survive restarts or share state across workers. Use it for
+    development and tests only. Pick `DjangoCacheRevocation` or
+    `DjangoORMRevocation` in production.
 
 ### Django cache revocation (production)
 
@@ -438,19 +466,41 @@ from django_bolt.auth import DjangoCacheRevocation
 
 store = DjangoCacheRevocation(
     cache_alias="default",
-    key_prefix="revoked_tokens:"
+    key_prefix="revoked_tokens:",
+    default_ttl=86400 * 7,  # 7 days — fallback when revoke() is called without `exp`
 )
 ```
+
+Works with any Django cache backend (Redis, Memcached, locmem, etc.).
+Recommended for multi-process deployments — entries are visible to all
+workers via the shared cache.
 
 ### Django ORM revocation
 
 ```python
 from django_bolt.auth import DjangoORMRevocation
 
-store = DjangoORMRevocation(model_path="myapp.models.RevokedToken")
+store = DjangoORMRevocation(
+    model="myapp.RevokedToken",  # 'app_label.ModelName' — exactly two parts
+    default_ttl=86400 * 7,
+)
 ```
 
-Requires a model with a `jti` field.
+Requires a model with `jti` (unique, indexed) and `expires_at`
+(indexed) fields. A periodic cleanup task should delete rows where
+`expires_at < now()`. Slower than cache-based stores; only use when you
+don't have a cache layer.
+
+### Per-call vs per-instance TTL
+
+`revoke()` resolves the entry's lifetime in this order:
+
+1. **`exp` keyword arg** — derived as `max(0, exp - now)`. Use this whenever
+   you have the token's full claims (i.e. always, in a logout handler).
+2. **`store.default_ttl`** — set on the constructor. Used when `revoke()`
+   is called without `exp` (e.g. an admin action that revokes by JTI).
+3. **`_DEFAULT_TTL_SECONDS`** — module-level fallback (7 days) if neither
+   of the above is supplied.
 
 ## Endpoints without authentication
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,9 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import InterfaceError, OperationalError
 
 from .revocation import create_revocation_handler
+
+# (jti) -> True if the token is revoked, False otherwise.
+RevokedTokenHandler = Callable[[str], Awaitable[bool]]
 
 
 @dataclass
@@ -124,7 +128,7 @@ class JWTAuthentication(BaseAuthentication):
         header: str = "authorization",
         audience: str | None = None,
         issuer: str | None = None,
-        revoked_token_handler: callable | None = None,
+        revoked_token_handler: RevokedTokenHandler | None = None,
         revocation_store: Any | None = None,
         require_jti: bool = False,
     ):
