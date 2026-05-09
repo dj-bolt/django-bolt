@@ -307,3 +307,66 @@ def test_response_struct_reference_field_with_default_none():
         {"$ref": "#/components/schemas/Inner"},
         {"type": "null"},
     ]
+
+
+# ---------- title / description on component schemas -----------------
+#
+# `_struct_to_schema` carries the struct's `__name__` and `__doc__`
+# through to the OpenAPI Schema so that downstream codegen (notably
+# `openapi-typescript`) renders type labels and JSDoc on the generated
+# types. Mirrors the shape `msgspec.json.schema_components` produces.
+
+
+def test_component_schema_carries_title_from_struct_name():
+    """The component schema's `title` field equals the struct's class name."""
+
+    class TitledStruct(msgspec.Struct):
+        name: str
+
+    schema = _get_response_component_schema(TitledStruct)
+    assert schema["title"] == "TitledStruct"
+
+
+def test_component_schema_carries_description_from_docstring():
+    """The component schema's `description` field equals the struct's docstring."""
+
+    class DocumentedStruct(msgspec.Struct):
+        """Concise summary of the struct."""
+
+        name: str
+
+    schema = _get_response_component_schema(DocumentedStruct)
+    assert schema["description"] == "Concise summary of the struct."
+
+
+def test_component_schema_strips_docstring_indentation():
+    """Multi-line docstrings have uniform leading indentation removed
+    (the same `inspect.cleandoc` behavior `msgspec.json.schema_components`
+    applies), so the rendered JSDoc isn't wrapped in stray spaces."""
+
+    class MultiLineStruct(msgspec.Struct):
+        """Summary line.
+
+        Continuation paragraph that explains the struct in more detail.
+        """
+
+        name: str
+
+    schema = _get_response_component_schema(MultiLineStruct)
+    assert schema["description"] == (
+        "Summary line.\n\n"
+        "Continuation paragraph that explains the struct in more detail."
+    )
+
+
+def test_component_schema_omits_description_when_no_docstring():
+    """Structs without a docstring don't carry an empty `description` —
+    the field is dropped from the emitted JSON entirely."""
+
+    class BareStruct(msgspec.Struct):
+        name: str
+
+    schema = _get_response_component_schema(BareStruct)
+    assert "description" not in schema
+    # title is unconditional
+    assert schema["title"] == "BareStruct"

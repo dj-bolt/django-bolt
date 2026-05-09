@@ -1015,6 +1015,13 @@ class SchemaGenerator:
     def _struct_to_schema(self, struct_type: type) -> Schema:
         """Convert msgspec.Struct to inline OpenAPI Schema.
 
+        Carries the struct's `__name__` through as the schema `title`
+        and its (cleaned) `__doc__` through as `description`, matching
+        the shape `msgspec.json.schema_components` produces. This is
+        what `openapi-typescript` and similar codegen tools surface as
+        JSDoc on generated types — without it every consumer-side type
+        loses its hover-documentation.
+
         Args:
             struct_type: msgspec.Struct type.
 
@@ -1033,8 +1040,21 @@ class SchemaGenerator:
             if field_required:
                 required.append(field_name)
 
+        # Pull `description` from the struct's *own* docstring only —
+        # `inspect.getdoc` walks the MRO and would inherit `msgspec.Struct`'s
+        # multi-page base-class docstring onto every undocumented user
+        # struct. `__dict__.get("__doc__")` returns None when the class
+        # didn't define its own, which leaves Schema.description at its
+        # default and the field is dropped from the emitted JSON.
+        # `cleandoc` strips uniform indentation so multi-line docstrings
+        # render correctly as JSDoc. Matches `msgspec.json.schema_components`
+        # behavior.
+        own_doc = struct_type.__dict__.get("__doc__")
+        description = inspect.cleandoc(own_doc) if own_doc else None
         return Schema(
             type="object",
+            title=struct_type.__name__,
+            description=description,
             properties=properties,
             required=required or None,
         )
