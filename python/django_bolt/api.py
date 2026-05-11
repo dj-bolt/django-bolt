@@ -482,6 +482,7 @@ class BoltAPI:
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
+        name: str | None = None,
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
@@ -495,6 +496,7 @@ class BoltAPI:
             guards=guards,
             auth=auth,
             tags=tags,
+            name=name,
             summary=summary,
             description=description,
             response_class=response_class,
@@ -1197,6 +1199,7 @@ class BoltAPI:
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         tags: list[str] | None = None,
+        name: str | None = None,
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
@@ -1232,6 +1235,8 @@ class BoltAPI:
 
             # Pre-compile parameter binder (handles parameter binding only)
             meta = self._compile_binder(fn, method, full_path)
+
+            meta["name"] = name if name is not None else fn.__name__
 
             # Store sync/async metadata
             meta["is_async"] = is_async
