@@ -4,8 +4,9 @@ import enum
 import http.client
 import inspect
 import re
+from types import UnionType
 from dataclasses import replace
-from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin, Union
 
 import msgspec
 
@@ -980,6 +981,13 @@ class SchemaGenerator:
                 return self._struct_to_component_schema(type_annotation)
             else:
                 return self._struct_to_schema(type_annotation)
+
+        if origin is Union or origin is UnionType:
+            inner = []
+            for arg in args:
+                item_schema = self._type_to_schema(arg, register_component=register_component)
+                inner += [item_schema]
+            return Schema(one_of=inner)
 
         # Handle list
         if origin is list:

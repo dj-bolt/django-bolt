@@ -73,6 +73,16 @@ class Filters(msgspec.Struct):
     status: Status | None = None
 
 
+class Cat(msgspec.Struct, tag=True, tag_field="_type"):
+    name: str
+    meows: bool = True
+
+
+class Dog(msgspec.Struct, tag=True, tag_field="_type"):
+    name: str
+    barks: bool = True
+
+
 def _build_full_api() -> BoltAPI:
     """Wire up a representative slice of the generator's surface area
     so the validator exercises body+response, query params, path
@@ -106,6 +116,10 @@ def _build_full_api() -> BoltAPI:
         # (response headers under `101 Switching Protocols`).
         await websocket.accept()
         await websocket.close()
+
+    @api.get("/items/cat_or_dog")
+    async def union_items(request) -> Cat | Dog:
+        pass
 
     return api
 
