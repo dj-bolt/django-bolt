@@ -120,6 +120,21 @@ async def items100() -> list[Item]:
     return [Item(name=f"item{i}", price=float(i), is_offer=(i % 2 == 0)) for i in range(100)]
 
 
+class Cat(msgspec.Struct, tag="cat"):
+    meow: str
+
+
+class Dog(msgspec.Struct, tag="dog"):
+    bark: str
+
+
+@api.get("/cat_or_dog/", response_model=Cat | Dog)
+async def cat_or_dog(request, meow: bool = False) -> Cat | Dog:
+    if meow:
+        return Cat("meow")
+    return Dog("wuff")
+
+
 # ============================================================================
 # Middleware Demo - Separate API with Django + Custom Middleware
 # ============================================================================
