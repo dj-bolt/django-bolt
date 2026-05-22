@@ -345,6 +345,19 @@ class _SerializerMeta(_STRUCT_META):
         # Fast boolean flag avoids dict truthiness check on every dump()
         cls.__has_rename__ = bool(rename_map)
 
+        # Capture tag configuration from msgspec
+        struct_config = getattr(cls, "__struct_config__", None)
+        tag_val = None
+        tag_field = "type"
+        if struct_config is not None:
+            tag = getattr(struct_config, "tag", None)
+            if tag is not None and tag is not False:
+                tag_val = cls.__name__ if tag is True else tag
+                tag_field = getattr(struct_config, "tag_field", None) or "type"
+
+        cls.__tag_value__ = tag_val
+        cls.__tag_field__ = tag_field
+
         return cls
 
 
@@ -441,8 +454,35 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     # Fast boolean flag for rename check (avoids dict truthiness check on every dump)
     __has_rename__: ClassVar[bool] = False
 
+    # Tag tracking properties
+    __tag_value__: ClassVar[Any | None] = None
+    __tag_field__: ClassVar[str] = "type"
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Collect validators and cache type hints when a subclass is created."""
+
+        # msgspec configuration is handled by the metaclass __new__, but kwargs
+        # are still passed to __init_subclass__. We pop them here to avoid
+        # TypeError from object.__init_subclass__.
+        for key in (
+            "kw_only",
+            "tag",
+            "tag_field",
+            "rename",
+            "dict",
+            "gc",
+            "weakref",
+            "omit_defaults",
+            "forbid_unknown_fields",
+            "frozen",
+            "eq",
+            "order",
+            "repr",
+            "match_args",
+            "array_like",
+        ):
+            kwargs.pop(key, None)
+
         super().__init_subclass__(**kwargs)
         # Collect validators for this class
         cls.__field_validators__ = collect_field_validators(cls)
@@ -1928,8 +1968,13 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 Config.read_only = parent_meta.read_only & fields_set  # type: ignore
             class_dict["Config"] = Config
 
+        kwargs = {"kw_only": True}
+        if cls.__tag_value__ is not None:
+            kwargs["tag"] = cls.__tag_value__
+            kwargs["tag_field"] = cls.__tag_field__
+
         # Create the new Serializer subclass
-        new_cls: type[T] = type(class_name, (Serializer,), class_dict)  # type: ignore
+        new_cls: type[T] = type(class_name, (Serializer,), class_dict, **kwargs)  # type: ignore
 
         # Add from_parent class method
         @classmethod
@@ -2132,7 +2177,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 self._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
             if cls.__has_rename__:
                 return msgspec.to_builtins(self)
-            return msgspec_structs.asdict(self)
+
+            data = msgspec_structs.asdict(self)
+            if cls.__tag_value__ is not None:
+                data[cls.__tag_field__] = cls.__tag_value__
+            return data
 
         # SLOW PATH: Need special handling.
         return self._dump_impl(
@@ -2171,6 +2220,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         )
 
         result: dict[str, Any] = {}
+
+        # Add msgspec tag field if configured
+        if cls.__tag_value__ is not None:
+            result[cls.__tag_field__] = cls.__tag_value__
 
         # Local reference to getattr for micro-optimization
         _getattr = getattr
@@ -2312,7 +2365,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if cls.__has_rename__:
                 _to_builtins = msgspec.to_builtins
                 return [_to_builtins(instance) for instance in instances_list]
+
             _asdict = msgspec_structs.asdict
+            if cls.__tag_value__ is not None:
+                tag_f = cls.__tag_field__
+                tag_v = cls.__tag_value__
+                return [{**_asdict(instance), tag_f: tag_v} for instance in instances_list]
             return [_asdict(instance) for instance in instances_list]
 
         # SLOW PATH: Need special handling (computed fields, write_only, exclude_*, etc.)
