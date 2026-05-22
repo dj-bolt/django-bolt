@@ -4,9 +4,9 @@ import enum
 import http.client
 import inspect
 import re
-from types import UnionType
 from dataclasses import replace
-from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin, Union
+from types import UnionType
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_origin
 
 import msgspec
 
