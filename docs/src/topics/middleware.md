@@ -118,38 +118,26 @@ async def internal():
 
 ## Compression
 
-Django-Bolt automatically compresses responses. Disable for specific endpoints:
+Django-Bolt compresses both buffered and streaming responses on by
+default (brotli with gzip fallback). Opt out per-route with
+`@no_compress`, or tune the backend, levels, and per-stream memory via
+`CompressionConfig`:
 
 ```python
-from django_bolt.middleware import no_compress
+from django_bolt import BoltAPI
+from django_bolt.middleware import CompressionConfig, no_compress
 
-@api.get("/stream")
+api = BoltAPI(compression=CompressionConfig(backend="brotli"))
+
+@api.get("/raw")
 @no_compress
-async def stream():
-    # Streaming responses should not be compressed
-    return StreamingResponse(generate())
+async def raw():
+    return {"plain": True}
 ```
 
-!!! note
-    `EventSourceResponse` and all SSE streams (`text/event-stream`) skip compression
-    automatically. You only need `@no_compress` for non-SSE streaming.
-
-### Compression settings
-
-Configure in `settings.py`:
-
-```python
-from django_bolt import CompressionConfig
-
-# In your api.py
-api = BoltAPI(
-    compression=CompressionConfig(
-        backend="brotli",     # "brotli", "gzip", or "zstd"
-        minimum_size=1000,    # Only compress responses > 1KB
-        gzip_fallback=True,   # Fall back to gzip if client doesn't support brotli
-    )
-)
-```
+See [Compression](compression.md) for the full configuration, per-chunk
+streaming flush behavior, `lgwin` memory tradeoffs, and CRIME/BREACH
+guidance.
 
 ## Custom middleware
 

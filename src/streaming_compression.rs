@@ -84,7 +84,7 @@ pub fn select_stream_encoding(
 fn codec_for_backend(backend: &str, cfg: &CompressionConfig) -> Option<StreamCodec> {
     match backend {
         "brotli" => Some(StreamCodec::Brotli {
-            quality: cfg.brotli_quality,
+            quality: cfg.brotli_level,
             lgwin: cfg.brotli_lgwin,
         }),
         "gzip" => Some(StreamCodec::Gzip { level: cfg.gzip_level }),

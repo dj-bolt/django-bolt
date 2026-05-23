@@ -120,7 +120,7 @@ pub struct TestAppState {
     pub global_cors_config: Option<CorsConfig>,
     /// Global compression config (mirrors production server). Drives the
     /// streaming-compression codec selection in `handler.rs`.
-    pub global_compression_config: Option<crate::metadata::CompressionConfig>,
+    pub global_compression_config: Option<Arc<crate::metadata::CompressionConfig>>,
     pub debug: bool,
     pub max_payload_size: usize,
     pub asgi_mount_timeout: Duration,
@@ -233,7 +233,6 @@ fn parse_cors_config_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<CorsConfig>
     })
 }
 
-
 /// Create a test app instance and return its ID
 #[pyfunction]
 #[pyo3(signature = (dispatch, debug, cors_config=None, trailing_slash=None, static_files_config=None, dispatch_sync=None, compression_config=None))]
@@ -253,8 +252,10 @@ pub fn create_test_app(
         None
     };
 
-    let global_compression_config = compression_config
-        .and_then(|d| crate::metadata::CompressionConfig::from_python_dict(d.as_any()));
+    let global_compression_config = match compression_config {
+        Some(d) => Some(Arc::new(crate::metadata::CompressionConfig::from_python_dict(d.as_any())?)),
+        None => None,
+    };
 
     // Parse static files config from Python dict
     let static_config = if let Some(static_dict) = static_files_config {

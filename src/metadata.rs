@@ -200,7 +200,7 @@ pub struct CompressionConfig {
     pub backend: String,     // "gzip", "brotli", "zstd"
     pub minimum_size: usize, // Minimum response size to compress (bytes)
     pub gzip_fallback: bool, // Fall back to gzip if backend not supported
-    pub brotli_quality: u32, // 0..=11
+    pub brotli_level: u32,   // 0..=11
     pub brotli_lgwin: u32,   // 10..=24
     pub gzip_level: u32,     // 0..=9
     pub zstd_level: u32,     // 1..=22
@@ -212,7 +212,7 @@ impl Default for CompressionConfig {
             backend: "brotli".to_string(),
             minimum_size: 500,
             gzip_fallback: true,
-            brotli_quality: 5,
+            brotli_level: 5,
             brotli_lgwin: 14,
             gzip_level: 6,
             zstd_level: 3,
@@ -222,29 +222,48 @@ impl Default for CompressionConfig {
 
 impl CompressionConfig {
     /// Parse a `CompressionConfig.to_rust_config()` dict from Python.
-    /// Required fields (`backend`, `minimum_size`, `gzip_fallback`) return
-    /// `None` if missing or malformed. Optional tuning fields fall back to
-    /// defaults so older config dicts still load.
+    ///
+    /// Required fields (`backend`, `minimum_size`, `gzip_fallback`) raise a
+    /// Python `ValueError` if missing or malformed — silently disabling
+    /// compression on a typo'd config dict is hard to debug. Optional tuning
+    /// fields fall back to defaults so older config dicts still load.
     ///
     /// Takes `&Bound<PyAny>` (not `&Bound<PyDict>`) so the same call shape
     /// works for both `server.rs` (Python dict bound as `Py<PyAny>`) and
     /// `testing.rs` (typed `Bound<PyDict>` — `as_any()` for the same shape).
-    pub fn from_python_dict(dict: &pyo3::Bound<'_, pyo3::PyAny>) -> Option<Self> {
+    pub fn from_python_dict(dict: &pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        use pyo3::exceptions::PyValueError;
+
         let defaults = Self::default();
-        let backend: String = dict.get_item("backend").ok()?.extract().ok()?;
-        let minimum_size: usize = dict.get_item("minimum_size").ok()?.extract().ok()?;
-        let gzip_fallback: bool = dict.get_item("gzip_fallback").ok()?.extract().ok()?;
+        let require = |key: &str| -> pyo3::PyResult<pyo3::Bound<'_, pyo3::PyAny>> {
+            dict.get_item(key).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "CompressionConfig: failed to read required field '{}': {}",
+                    key, e
+                ))
+            })
+        };
+        let backend: String = require("backend")?
+            .extract()
+            .map_err(|_| PyValueError::new_err("CompressionConfig: 'backend' must be a string"))?;
+        let minimum_size: usize = require("minimum_size")?.extract().map_err(|_| {
+            PyValueError::new_err("CompressionConfig: 'minimum_size' must be a non-negative int")
+        })?;
+        let gzip_fallback: bool = require("gzip_fallback")?.extract().map_err(|_| {
+            PyValueError::new_err("CompressionConfig: 'gzip_fallback' must be a bool")
+        })?;
+
         let extract_u32 = |key: &str, fallback: u32| -> u32 {
             dict.get_item(key)
                 .ok()
                 .and_then(|v| v.extract::<u32>().ok())
                 .unwrap_or(fallback)
         };
-        Some(CompressionConfig {
+        Ok(CompressionConfig {
             backend,
             minimum_size,
             gzip_fallback,
-            brotli_quality: extract_u32("brotli_quality", defaults.brotli_quality),
+            brotli_level: extract_u32("brotli_level", defaults.brotli_level),
             brotli_lgwin: extract_u32("brotli_lgwin", defaults.brotli_lgwin),
             gzip_level: extract_u32("gzip_level", defaults.gzip_level),
             zstd_level: extract_u32("zstd_level", defaults.zstd_level),

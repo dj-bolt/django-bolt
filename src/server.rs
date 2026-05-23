@@ -473,9 +473,12 @@ pub fn start_server(
         )));
     }
 
-    let global_compression_config = compression_config.and_then(|config_py| {
-        Python::attach(|py| CompressionConfig::from_python_dict(config_py.bind(py)))
-    });
+    let global_compression_config = match compression_config {
+        Some(config_py) => Some(Arc::new(Python::attach(|py| {
+            CompressionConfig::from_python_dict(config_py.bind(py))
+        })?)),
+        None => None,
+    };
 
     // Build static files configuration
     let static_files_config = static_files_data.and_then(|(url_prefix, directories)| {

@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use crate::metadata::CompressionConfig;
 use crate::state::AppState;
+use crate::streaming_compression::accepts_encoding;
 
 /// Compression middleware factory
 pub struct CompressionMiddleware;
@@ -105,51 +106,49 @@ where
                 ));
             }
 
-            {
-                // Apply compression based on CompressionConfig and Accept-Encoding
-                let (req, mut response) = res.into_parts();
+            // Apply compression based on CompressionConfig and Accept-Encoding
+            let (req, mut response) = res.into_parts();
 
-                // Select encoding based on config and client support
-                let encoding =
-                    select_encoding(accept_encoding.as_deref(), compression_config.as_ref());
+            // Select encoding based on config and client support
+            let encoding =
+                select_encoding(accept_encoding.as_deref(), compression_config.as_deref());
 
-                // Get minimum size from config or use default
-                let minimum_size = compression_config
-                    .as_ref()
-                    .map(|c| c.minimum_size)
-                    .unwrap_or(500);
+            // Get minimum size from config or use default
+            let minimum_size = compression_config
+                .as_ref()
+                .map(|c| c.minimum_size)
+                .unwrap_or(500);
 
-                // Check if response size warrants compression (skip small responses)
-                let should_compress = match response.body().size() {
-                    BodySize::None => encoding != ContentEncoding::Identity,
-                    BodySize::Sized(size) => {
-                        size >= minimum_size as u64 && encoding != ContentEncoding::Identity
-                    }
-                    _ => encoding != ContentEncoding::Identity,
-                };
-
-                if should_compress {
-                    // Add Vary header to indicate content varies by Accept-Encoding
-                    // Use append (not insert) to preserve existing Vary headers like CORS's Vary: Origin
-                    response.headers_mut().append(
-                        VARY,
-                        actix_web::http::header::HeaderValue::from_static("accept-encoding"),
-                    );
-
-                    // Create encoder with selected encoding
-                    Ok(ServiceResponse::new(
-                        req,
-                        response.map_body(|head, body| Encoder::response(encoding, head, body)),
-                    ))
-                } else {
-                    // No compression needed
-                    Ok(ServiceResponse::new(
-                        req,
-                        response.map_body(|head, body| {
-                            Encoder::response(ContentEncoding::Identity, head, body)
-                        }),
-                    ))
+            // Check if response size warrants compression (skip small responses)
+            let should_compress = match response.body().size() {
+                BodySize::None => encoding != ContentEncoding::Identity,
+                BodySize::Sized(size) => {
+                    size >= minimum_size as u64 && encoding != ContentEncoding::Identity
                 }
+                _ => encoding != ContentEncoding::Identity,
+            };
+
+            if should_compress {
+                // Add Vary header to indicate content varies by Accept-Encoding
+                // Use append (not insert) to preserve existing Vary headers like CORS's Vary: Origin
+                response.headers_mut().append(
+                    VARY,
+                    actix_web::http::header::HeaderValue::from_static("accept-encoding"),
+                );
+
+                // Create encoder with selected encoding
+                Ok(ServiceResponse::new(
+                    req,
+                    response.map_body(|head, body| Encoder::response(encoding, head, body)),
+                ))
+            } else {
+                // No compression needed
+                Ok(ServiceResponse::new(
+                    req,
+                    response.map_body(|head, body| {
+                        Encoder::response(ContentEncoding::Identity, head, body)
+                    }),
+                ))
             }
         })
     }
@@ -228,7 +227,16 @@ mod bypass_tests {
     }
 }
 
-/// Select best compression encoding based on config and client support
+/// Select best compression encoding based on config and client support.
+///
+/// Mirrors `select_stream_encoding` in `streaming_compression.rs` so buffered
+/// and streaming responses honor the same RFC 7231 §5.3.4 Accept-Encoding
+/// rules (q-values, `*` wildcard, case-insensitive coding names).
+///
+/// Returns `Identity` when:
+/// - the request omitted `Accept-Encoding`,
+/// - `compression=None` (no `CompressionConfig` on the app),
+/// - the client rejects every supported coding.
 fn select_encoding(
     accept_encoding: Option<&str>,
     config: Option<&CompressionConfig>,
@@ -237,33 +245,176 @@ fn select_encoding(
         Some(ae) => ae,
         None => return ContentEncoding::Identity,
     };
-
-    // Get preferred backend from config or use default (brotli)
-    let preferred_backend = config.map(|c| c.backend.as_str()).unwrap_or("brotli");
-
-    let gzip_fallback = config.map(|c| c.gzip_fallback).unwrap_or(true);
-
-    // Check if client supports preferred backend
-    let client_supports_preferred = match preferred_backend {
-        "brotli" => ae.contains("br"),
-        "gzip" => ae.contains("gzip"),
-        "zstd" => ae.contains("zstd"),
-        _ => false,
+    let cfg = match config {
+        Some(c) => c,
+        None => return ContentEncoding::Identity,
     };
 
-    if client_supports_preferred {
-        // Use preferred backend if client supports it
-        match preferred_backend {
-            "brotli" => ContentEncoding::Brotli,
-            "gzip" => ContentEncoding::Gzip,
-            "zstd" => ContentEncoding::Zstd,
-            _ => ContentEncoding::Identity,
-        }
-    } else if gzip_fallback && ae.contains("gzip") {
-        // Fall back to gzip if enabled and client supports it
-        ContentEncoding::Gzip
-    } else {
-        // No compression
-        ContentEncoding::Identity
+    let (preferred_token, preferred_encoding) = match cfg.backend.as_str() {
+        "brotli" => ("br", ContentEncoding::Brotli),
+        "gzip" => ("gzip", ContentEncoding::Gzip),
+        "zstd" => ("zstd", ContentEncoding::Zstd),
+        _ => return ContentEncoding::Identity,
+    };
+
+    if accepts_encoding(ae, preferred_token) {
+        return preferred_encoding;
+    }
+    if cfg.gzip_fallback && accepts_encoding(ae, "gzip") {
+        return ContentEncoding::Gzip;
+    }
+    ContentEncoding::Identity
+}
+
+#[cfg(test)]
+mod select_encoding_tests {
+    //! Buffered `select_encoding` mirrors the streaming
+    //! `select_stream_encoding` parser, so its negotiation contract should
+    //! match: q-values honored, `*` wildcard handled, no config → identity.
+    use super::*;
+
+    fn cfg_brotli() -> CompressionConfig {
+        CompressionConfig::default()
+    }
+
+    fn cfg_gzip() -> CompressionConfig {
+        let mut c = CompressionConfig::default();
+        c.backend = "gzip".to_string();
+        c
+    }
+
+    fn cfg_zstd() -> CompressionConfig {
+        let mut c = CompressionConfig::default();
+        c.backend = "zstd".to_string();
+        c
+    }
+
+    #[test]
+    fn missing_accept_encoding_returns_identity() {
+        assert_eq!(select_encoding(None, Some(&cfg_brotli())), ContentEncoding::Identity);
+    }
+
+    #[test]
+    fn missing_config_returns_identity() {
+        // `compression=None` on BoltAPI → AppState.global_compression_config = None.
+        // Buffered middleware must not silently compress in that case.
+        assert_eq!(select_encoding(Some("br, gzip"), None), ContentEncoding::Identity);
+    }
+
+    #[test]
+    fn picks_preferred_backend_when_accepted() {
+        assert_eq!(
+            select_encoding(Some("br, gzip"), Some(&cfg_brotli())),
+            ContentEncoding::Brotli
+        );
+        assert_eq!(
+            select_encoding(Some("gzip, br"), Some(&cfg_gzip())),
+            ContentEncoding::Gzip
+        );
+        assert_eq!(
+            select_encoding(Some("zstd, gzip"), Some(&cfg_zstd())),
+            ContentEncoding::Zstd
+        );
+    }
+
+    #[test]
+    fn falls_back_to_gzip_when_backend_rejected() {
+        // Brotli configured, client only accepts gzip.
+        assert_eq!(
+            select_encoding(Some("gzip"), Some(&cfg_brotli())),
+            ContentEncoding::Gzip
+        );
+    }
+
+    #[test]
+    fn skips_fallback_when_disabled() {
+        let mut cfg = cfg_brotli();
+        cfg.gzip_fallback = false;
+        assert_eq!(
+            select_encoding(Some("gzip"), Some(&cfg)),
+            ContentEncoding::Identity
+        );
+    }
+
+    #[test]
+    fn no_negotiable_coding_returns_identity() {
+        assert_eq!(
+            select_encoding(Some("deflate, identity"), Some(&cfg_brotli())),
+            ContentEncoding::Identity
+        );
+    }
+
+    // ─── RFC 7231 §5.3.4 conformance (regressions vs. old substring matcher)
+
+    #[test]
+    fn q0_rejects_preferred_and_falls_back() {
+        // `br;q=0` explicitly rejects brotli; old substring matcher missed
+        // this and still picked Brotli because the string contained "br".
+        assert_eq!(
+            select_encoding(Some("br;q=0, gzip"), Some(&cfg_brotli())),
+            ContentEncoding::Gzip
+        );
+    }
+
+    #[test]
+    fn q0_on_all_returns_identity() {
+        assert_eq!(
+            select_encoding(Some("br;q=0, gzip;q=0"), Some(&cfg_brotli())),
+            ContentEncoding::Identity
+        );
+    }
+
+    #[test]
+    fn star_accepts_preferred_backend() {
+        // Plain `*` accepts any unmentioned coding.
+        assert_eq!(
+            select_encoding(Some("*"), Some(&cfg_brotli())),
+            ContentEncoding::Brotli
+        );
+    }
+
+    #[test]
+    fn star_q0_rejects_unmentioned_codings() {
+        // `gzip, *;q=0` means: gzip only, everything else rejected.
+        assert_eq!(
+            select_encoding(Some("gzip, *;q=0"), Some(&cfg_brotli())),
+            ContentEncoding::Gzip
+        );
+    }
+
+    #[test]
+    fn explicit_q0_overrides_generous_star() {
+        // `br;q=0, *` — brotli is explicitly rejected even though `*` is generous.
+        assert_eq!(
+            select_encoding(Some("br;q=0, *"), Some(&cfg_brotli())),
+            // `*` allows gzip → fallback kicks in.
+            ContentEncoding::Gzip
+        );
+    }
+
+    #[test]
+    fn case_insensitive_coding_names() {
+        assert_eq!(
+            select_encoding(Some("BR"), Some(&cfg_brotli())),
+            ContentEncoding::Brotli
+        );
+        assert_eq!(
+            select_encoding(Some("GZip;Q=0.5"), Some(&cfg_gzip())),
+            ContentEncoding::Gzip
+        );
+    }
+
+    #[test]
+    fn substring_false_positive_no_longer_matches() {
+        // `x-gzip-old` contains "gzip" as a substring but is NOT the gzip
+        // coding token. The old substring matcher would have falsely picked
+        // gzip; the RFC parser correctly returns identity (no fallback either,
+        // since `x-gzip-old` ≠ `gzip`).
+        let mut cfg = cfg_brotli();
+        cfg.gzip_fallback = false;
+        assert_eq!(
+            select_encoding(Some("x-gzip-old"), Some(&cfg)),
+            ContentEncoding::Identity
+        );
     }
 }

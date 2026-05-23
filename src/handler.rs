@@ -503,7 +503,7 @@ fn compression_config_from_req(
     req: &HttpRequest,
 ) -> Option<&crate::metadata::CompressionConfig> {
     req.app_data::<actix_web::web::Data<std::sync::Arc<crate::state::AppState>>>()
-        .and_then(|s| s.global_compression_config.as_ref())
+        .and_then(|s| s.global_compression_config.as_deref())
 }
 
 #[inline]
