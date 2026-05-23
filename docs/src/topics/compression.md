@@ -44,11 +44,14 @@ async def raw():
     return {"plain": True}
 ```
 
-Disable compression entirely by passing `compression=None`:
+Disable compression entirely by passing `compression=False`:
 
 ```python
-api = BoltAPI(compression=None)
+api = BoltAPI(compression=False)
 ```
+
+(`compression=None` and omitting the kwarg both mean "use the default
+`CompressionConfig()`".)
 
 `StreamingResponse` / `EventSourceResponse` don't take a `compress=`
 kwarg — the decision is always made per-request from the global
@@ -83,11 +86,15 @@ api = BoltAPI(compression=CompressionConfig(
 
 For every response (buffered or streaming) the same algorithm runs:
 
-1. `@no_compress` on the route → `Content-Encoding: identity`.
-2. `BoltAPI(compression=None)` → identity.
+1. `@no_compress` on the route → no compression.
+2. `BoltAPI(compression=False)` → no compression.
 3. Client accepts `cfg.backend` → wrap with that codec.
 4. Else `gzip_fallback=True` and client accepts `gzip` → wrap with gzip.
-5. Else → identity.
+5. Else → no compression.
+
+When no compression is applied, `Content-Encoding` is absent on the
+wire (the framework uses `identity` as an internal "skip" marker that
+the middleware strips before sending).
 
 `Accept-Encoding: *` accepts any unmentioned coding; `*;q=0` rejects
 them. An explicit `br;q=0` rejects brotli even when `*` is generous.
@@ -118,19 +125,21 @@ Window size = `2^lgwin` bytes **per active connection**. The default of
 `14` gives a 16 KiB window — enough for SSE event vocabulary reuse,
 cheap enough for high-fanout servers.
 
-| `lgwin`              | Window      | Marginal / conn (≈) | 1k conns | 10k conns |
-|----------------------|-------------|---------------------|----------|-----------|
-| 10 (min)             | 1 KiB       | ~10 KiB             | 10 MiB   | 100 MiB   |
-| 14 (**default**)     | 16 KiB      | ~24 KiB             | 24 MiB   | 240 MiB   |
-| 16                   | 64 KiB      | ~72 KiB             | 72 MiB   | 720 MiB   |
-| 18                   | 256 KiB     | ~270 KiB            | 270 MiB  | 2.7 GiB   |
-| 20                   | 1 MiB       | ~1 MiB              | 1 GiB    | 10 GiB    |
-| 22 (brotli "normal") | 4 MiB       | ~4 MiB              | 4 GiB    | 40 GiB    |
-| 24 (max)             | 16 MiB      | ~16 MiB             | 16 GiB   | 160 GiB   |
+| `lgwin`              | Window  |
+|----------------------|---------|
+| 10 (min)             | 1 KiB   |
+| 14 (**default**)     | 16 KiB  |
+| 16                   | 64 KiB  |
+| 18                   | 256 KiB |
+| 20                   | 1 MiB   |
+| 22 (brotli "normal") | 4 MiB   |
+| 24 (max)             | 16 MiB  |
 
-Drop `lgwin` for high-fanout SSE; raise it for large, repetitive
-buffered bodies where the per-request cost is amortized over a single
-response.
+Memory cost scales with `2^lgwin` per active connection (plus encoder
+overhead), so the window choice dominates resident memory under high
+fanout. Drop `lgwin` for high-fanout SSE; raise it for large,
+repetitive buffered bodies where the per-request cost is amortized
+over a single response.
 
 ## Compression levels
 
@@ -138,11 +147,10 @@ Level fields trade CPU for ratio. Defaults are tuned for the streaming
 case (per-chunk flush caps achievable ratio, so spending CPU on level
 11 buys little).
 
-- **`brotli_level`** (0..=11) — `5` is balanced. Level 11 can be
-  10–100× slower than 5 for a marginal size win; only worth it for
-  static/precompressed assets.
+- **`brotli_level`** (0..=11) — `5` is balanced. The highest levels
+  trade significant CPU for a small ratio win and are typically only
+  worth it for static/precompressed assets.
 - **`gzip_level`** (0..=9) — `6` matches zlib's `Z_DEFAULT_COMPRESSION`.
-  Returns diminish sharply past 6.
 - **`zstd_level`** (1..=22) — `3` is balanced. Levels above 19 enable
   "ultra" mode and are very memory- and CPU-heavy.
 
