@@ -579,11 +579,23 @@ async fn build_response_from_parsed(
         } => {
             let headers = response_builder::meta_to_headers(meta_ref);
 
-            let codec = crate::streaming_compression::select_stream_encoding(
-                req,
-                compression_config_from_req(req),
-                skip_compression,
-            );
+            // If the user passed `Content-Encoding` via StreamingResponse
+            // headers they have already encoded the body (or are claiming
+            // identity); skip the framework codec in that case so we don't
+            // double-encode or clobber the caller's intent.
+            let user_set_content_encoding = headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"));
+
+            let codec = if user_set_content_encoding {
+                None
+            } else {
+                crate::streaming_compression::select_stream_encoding(
+                    req,
+                    compression_config_from_req(req),
+                    skip_compression,
+                )
+            };
             let encoding_name = codec.map_or("identity", |c| c.header_name());
 
             if media_type == "text/event-stream" {
@@ -592,6 +604,7 @@ async fn build_response_from_parsed(
                         parsed.status,
                         headers,
                         encoding_name,
+                        user_set_content_encoding,
                     )
                     .body(Vec::<u8>::new());
                     mark_skip_cors(&mut response, skip_cors);
@@ -607,6 +620,7 @@ async fn build_response_from_parsed(
                     parsed.status,
                     headers,
                     encoding_name,
+                    user_set_content_encoding,
                 )
                 .streaming(stream);
                 mark_skip_cors(&mut response, skip_cors);
@@ -617,13 +631,21 @@ async fn build_response_from_parsed(
             for (k, v) in headers {
                 builder.append_header((k, v));
             }
-            if codec.is_some() {
-                builder.insert_header(("Content-Encoding", encoding_name));
-                builder.insert_header(("Vary", "Accept-Encoding"));
-            } else {
-                // Identity marker tells the global compression middleware to
-                // skip — buffering compressors would defeat streaming.
-                builder.insert_header(("Content-Encoding", "identity"));
+            if !user_set_content_encoding {
+                if codec.is_some() {
+                    builder.insert_header(("Content-Encoding", encoding_name));
+                } else {
+                    // Identity marker tells the global compression middleware to
+                    // skip — buffering compressors would defeat streaming.
+                    builder.insert_header(("Content-Encoding", "identity"));
+                }
+                // Whether or not we picked a codec, the *body* we send was
+                // chosen based on Accept-Encoding (a brotli-capable client
+                // would have gotten brotli). Advertise that so shared
+                // caches don't serve the identity payload to a client that
+                // accepts compression. `append` not `insert` to preserve
+                // any Vary the caller set (e.g. CORS's `Vary: Origin`).
+                builder.append_header(("Vary", "Accept-Encoding"));
             }
             if is_head_request {
                 let mut response = builder.body(Vec::<u8>::new());

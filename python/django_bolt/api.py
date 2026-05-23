@@ -333,7 +333,11 @@ class BoltAPI:
                 - Dict with "include"/"exclude" keys for fine control
             enable_logging: Enable request/response logging
             logging_config: Custom logging configuration
-            compression: Compression configuration (CompressionConfig or False to disable)
+            compression: Compression configuration. Pass a `CompressionConfig`
+                to override defaults. Omit (or pass `None`) to apply the default
+                config. Pass `False` to disable compression entirely on this
+                `BoltAPI`. `settings.BOLT_COMPRESSION` takes precedence over
+                this argument in production.
             openapi_config: OpenAPI documentation configuration
             validate_response: Default response validation policy for registered routes
             lifespan: Async context manager factory for startup/shutdown lifecycle.
@@ -377,16 +381,19 @@ class BoltAPI:
                 # Use default logging configuration
                 self._logging_middleware = create_logging_middleware()
 
-        # Compression configuration
-        # compression=None means disabled, not providing compression arg means default enabled
+        # Compression configuration.
+        # - `compression=False` → explicitly disabled (no buffered or streaming
+        #   compression on this BoltAPI instance)
+        # - `compression=None` (also the default when the kwarg is omitted) →
+        #   default `CompressionConfig()` enabled
+        # - `compression=CompressionConfig(...)` → caller-provided config
+        # `settings.BOLT_COMPRESSION` overrides this at server startup
+        # (see `runbolt.py`) and is mirrored by `_rust_compression_config`.
         if compression is False:
-            # Explicitly disabled
             self._compression = None
         elif compression is None:
-            # Not provided, use default
             self._compression = CompressionConfig()
         else:
-            # Custom config provided
             self._compression = compression
 
         # OpenAPI configuration - enabled by default with sensible defaults
@@ -474,8 +481,25 @@ class BoltAPI:
 
     def _rust_compression_config(self) -> dict | None:
         """Compression config dict for Rust startup, or `None` when disabled.
-        Used by the production server and `TestClient` / `WebSocketTestClient`
-        setup paths."""
+
+        Resolution mirrors `runbolt.py` so `TestClient` / `AsyncTestClient` /
+        `WebSocketTestClient` see the same compression behavior as production:
+
+        1. If `settings.BOLT_COMPRESSION` is defined and truthy, it wins.
+        2. If `settings.BOLT_COMPRESSION` is defined and `None`/`False`, that
+           explicitly disables compression.
+        3. Otherwise fall back to this `BoltAPI`'s own `_compression`.
+        """
+        try:
+            from django.conf import settings as _settings
+        except Exception:
+            _settings = None
+
+        if _settings is not None and hasattr(_settings, "BOLT_COMPRESSION"):
+            bolt_compression = _settings.BOLT_COMPRESSION
+            if bolt_compression is None or bolt_compression is False:
+                return None
+            return bolt_compression.to_rust_config()
         return self._compression.to_rust_config() if self._compression else None
 
     def get(

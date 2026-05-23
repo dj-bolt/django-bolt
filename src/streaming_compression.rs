@@ -39,11 +39,17 @@ impl StreamCodec {
         }
     }
 
-    fn build_encoder(self) -> Box<dyn PerChunkEncoder> {
+    /// Construct the per-chunk encoder. Returns `Err` if the codec library
+    /// rejects the configured tuning (e.g. zstd refusing an out-of-range
+    /// level); callers should surface this as a stream-level `io::Error`
+    /// rather than panicking the worker.
+    fn build_encoder(self) -> std::io::Result<Box<dyn PerChunkEncoder>> {
         match self {
-            StreamCodec::Brotli { quality, lgwin } => Box::new(BrotliEncoder::new(quality, lgwin)),
-            StreamCodec::Gzip { level } => Box::new(GzipEncoder::new(level)),
-            StreamCodec::Zstd { level } => Box::new(ZstdEncoder::new(level)),
+            StreamCodec::Brotli { quality, lgwin } => {
+                Ok(Box::new(BrotliEncoder::new(quality, lgwin)))
+            }
+            StreamCodec::Gzip { level } => Ok(Box::new(GzipEncoder::new(level))),
+            StreamCodec::Zstd { level } => Ok(Box::new(ZstdEncoder::new(level)?)),
         }
     }
 }
@@ -98,6 +104,8 @@ fn codec_for_backend(backend: &str, cfg: &CompressionConfig) -> Option<StreamCod
 /// unmentioned codings). Case-insensitive on the coding name.
 ///
 /// Per RFC 7231 §5.3.4: weight defaults to 1.0; q=0 means "not acceptable."
+/// Non-finite parsed weights (NaN/Inf) and out-of-range values are clamped
+/// to the [0.0, 1.0] range, then values <= 0.0 reject the coding.
 pub fn accepts_encoding(header: &str, name: &str) -> bool {
     let mut star_q: Option<f32> = None;
     let mut explicit_q: Option<f32> = None;
@@ -110,10 +118,21 @@ pub fn accepts_encoding(header: &str, name: &str) -> bool {
         let coding = pieces.next().unwrap_or("").trim();
         let mut q: f32 = 1.0;
         for piece in pieces {
+            // Tolerate OWS around `=` per RFC 7230 §3.2.3 (e.g. `q = 0.5`).
             let piece = piece.trim();
-            if let Some(rest) = piece.strip_prefix("q=").or_else(|| piece.strip_prefix("Q=")) {
-                if let Ok(parsed) = rest.parse::<f32>() {
-                    q = parsed;
+            let lower_piece = piece.to_ascii_lowercase();
+            if let Some(rest) = lower_piece.strip_prefix("q") {
+                let rest = rest.trim_start();
+                if let Some(value) = rest.strip_prefix('=') {
+                    let value = value.trim();
+                    if let Ok(parsed) = value.parse::<f32>() {
+                        // Reject NaN; clamp to [0, 1] per RFC 7231 §5.3.1.
+                        if parsed.is_nan() {
+                            q = 0.0;
+                        } else {
+                            q = parsed.clamp(0.0, 1.0);
+                        }
+                    }
                 }
             }
         }
@@ -179,19 +198,32 @@ impl Write for SinkWriter {
 /// Stream adapter that runs `inner` chunks through a per-chunk encoder.
 ///
 /// `encoder` doubles as a "is the stream still alive?" flag: it's `take()`-en
-/// at finalization, and any subsequent poll short-circuits to `Ready(None)`.
-/// This matters because the upstream Python SSE path uses
-/// `futures_util::stream::unfold`, which panics if polled after exhaustion.
+/// at finalization (and cleared on any error), and any subsequent poll
+/// short-circuits to `Ready(None)`. This matters because the upstream
+/// Python SSE path uses `futures_util::stream::unfold`, which panics if
+/// polled after exhaustion.
+///
+/// `init_error` holds a build-time codec init failure (e.g. zstd rejecting
+/// the level); it is yielded on the first poll, then the stream ends.
 pub struct EncoderStream<S> {
     inner: S,
     encoder: Option<Box<dyn PerChunkEncoder>>,
+    init_error: Option<std::io::Error>,
 }
 
 impl<S> EncoderStream<S> {
     pub fn new(inner: S, codec: StreamCodec) -> Self {
-        EncoderStream {
-            inner,
-            encoder: Some(codec.build_encoder()),
+        match codec.build_encoder() {
+            Ok(encoder) => EncoderStream {
+                inner,
+                encoder: Some(encoder),
+                init_error: None,
+            },
+            Err(e) => EncoderStream {
+                inner,
+                encoder: None,
+                init_error: Some(e),
+            },
         }
     }
 }
@@ -203,6 +235,10 @@ where
     type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Surface build-time codec init failure on first poll, then end.
+        if let Some(err) = self.init_error.take() {
+            return Poll::Ready(Some(Err(err)));
+        }
         if self.encoder.is_none() {
             return Poll::Ready(None);
         }
@@ -212,7 +248,13 @@ where
                     let enc = self.encoder.as_mut().expect("encoder present");
                     let out = match enc.write_chunk(&chunk) {
                         Ok(b) => b,
-                        Err(e) => return Poll::Ready(Some(Err(e))),
+                        Err(e) => {
+                            // Drop the encoder so subsequent polls short-
+                            // circuit to Ready(None) instead of re-entering
+                            // the (possibly exhausted) inner stream.
+                            self.encoder = None;
+                            return Poll::Ready(Some(Err(e)));
+                        }
                     };
                     if out.is_empty() {
                         // Encoder consumed input without producing output —
@@ -222,7 +264,12 @@ where
                     }
                     return Poll::Ready(Some(Ok(Bytes::from(out))));
                 }
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Err(e))) => {
+                    // Same reason as the write_chunk error arm: prevent
+                    // any future poll from re-entering the inner stream.
+                    self.encoder = None;
+                    return Poll::Ready(Some(Err(e)));
+                }
                 Poll::Ready(None) => {
                     let enc = self.encoder.take().expect("encoder present");
                     match enc.finish() {
@@ -305,10 +352,12 @@ struct ZstdEncoder {
 }
 
 impl ZstdEncoder {
-    fn new(level: u32) -> Self {
-        let enc = zstd::stream::write::Encoder::new(SinkWriter::new(), level as i32)
-            .expect("zstd encoder init");
-        ZstdEncoder { inner: enc }
+    fn new(level: u32) -> std::io::Result<Self> {
+        // u32::MAX cast to i32 would silently become -1; clamp to i32::MAX
+        // so the zstd library produces a real Err we can surface.
+        let level_i32 = i32::try_from(level).unwrap_or(i32::MAX);
+        let enc = zstd::stream::write::Encoder::new(SinkWriter::new(), level_i32)?;
+        Ok(ZstdEncoder { inner: enc })
     }
 }
 
@@ -489,6 +538,28 @@ mod tests {
     fn malformed_qvalue_falls_back_to_one() {
         // Unparseable q= ⇒ q stays at the default 1.0 ⇒ coding is accepted.
         assert!(accepts_encoding("br;q=abc", "br"));
+    }
+
+    #[test]
+    fn rejects_nan_qvalue() {
+        // f32 parses "NaN", but RFC 7231 requires q in [0, 1]; treat as 0.
+        assert!(!accepts_encoding("br;q=NaN", "br"));
+        assert!(!accepts_encoding("br;q=nan", "br"));
+    }
+
+    #[test]
+    fn clamps_inf_qvalue() {
+        // f32 parses "inf" as +∞; per RFC clamp to 1.0 ⇒ accepted, but no
+        // higher-priority than a legitimate q=1.0 offer.
+        assert!(accepts_encoding("br;q=inf", "br"));
+    }
+
+    #[test]
+    fn tolerates_ows_around_equals() {
+        // RFC 7230 §3.2.3 — OWS may surround any structural character.
+        assert!(!accepts_encoding("br;q = 0", "br"));
+        assert!(accepts_encoding("br;q = 0.5", "br"));
+        assert!(accepts_encoding("br ;  q=0.5", "br"));
     }
 
     // ─── select_stream_encoding ────────────────────────────────────────

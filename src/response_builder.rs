@@ -16,13 +16,21 @@ use crate::response_meta::ResponseMeta;
 /// - `"identity"` → handler owns "no compression"; the global compression
 ///   middleware bypasses (and strips) the marker.
 /// - `"br" | "gzip" | "zstd"` → handler already compressed the body
-///   per-chunk; sets `Content-Encoding` + `Vary: Accept-Encoding` so the
-///   client decodes correctly and intermediaries cache per encoding.
+///   per-chunk; sets `Content-Encoding` so the client decodes correctly.
+///
+/// `user_set_content_encoding` means the caller passed an explicit
+/// `Content-Encoding` header on the response; in that case we don't touch
+/// `Content-Encoding` or `Vary: Accept-Encoding` — the handler is in
+/// charge of the encoding contract.
+///
+/// `Vary: Accept-Encoding` is APPENDED (not inserted) so it composes with
+/// any `Vary` the caller set (e.g. `Vary: Origin` for CORS-keyed caches).
 #[inline]
 pub fn build_sse_response(
     status: StatusCode,
     custom_headers: Vec<(String, String)>,
     encoding_name: &str,
+    user_set_content_encoding: bool,
 ) -> HttpResponseBuilder {
     let mut builder = HttpResponse::build(status);
 
@@ -36,9 +44,13 @@ pub fn build_sse_response(
     builder.insert_header(("Pragma", "no-cache"));
     builder.insert_header(("Expires", "0"));
 
-    builder.insert_header(("Content-Encoding", encoding_name));
-    if encoding_name != "identity" {
-        builder.insert_header(("Vary", "Accept-Encoding"));
+    if !user_set_content_encoding {
+        builder.insert_header(("Content-Encoding", encoding_name));
+        // Even on the identity path, body choice depended on Accept-Encoding
+        // (a brotli-capable client would have gotten brotli), so advertise
+        // the Vary qualifier unconditionally. Use append to preserve any
+        // caller-set Vary tokens (Origin, Cookie, …).
+        builder.append_header(("Vary", "Accept-Encoding"));
     }
 
     builder

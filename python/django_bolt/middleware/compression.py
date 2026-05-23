@@ -116,8 +116,8 @@ class CompressionConfig:
             gzip_level=6,
         ))
 
-        # Disable compression entirely
-        api = BoltAPI(compression=None)
+        # Disable compression entirely on this BoltAPI
+        api = BoltAPI(compression=False)
     """
 
     backend: Literal["gzip", "brotli", "zstd"] = "brotli"

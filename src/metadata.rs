@@ -224,9 +224,11 @@ impl CompressionConfig {
     /// Parse a `CompressionConfig.to_rust_config()` dict from Python.
     ///
     /// Required fields (`backend`, `minimum_size`, `gzip_fallback`) raise a
-    /// Python `ValueError` if missing or malformed — silently disabling
-    /// compression on a typo'd config dict is hard to debug. Optional tuning
-    /// fields fall back to defaults so older config dicts still load.
+    /// Python `ValueError` if missing or malformed. Optional tuning fields
+    /// fall back to defaults when absent, but a *present-but-malformed*
+    /// value (wrong type or out-of-range) also raises — silently coercing a
+    /// typo'd `brotli_level=99` to the default would make tuning regressions
+    /// invisible.
     ///
     /// Takes `&Bound<PyAny>` (not `&Bound<PyDict>`) so the same call shape
     /// works for both `server.rs` (Python dict bound as `Py<PyAny>`) and
@@ -236,11 +238,15 @@ impl CompressionConfig {
 
         let defaults = Self::default();
         let require = |key: &str| -> pyo3::PyResult<pyo3::Bound<'_, pyo3::PyAny>> {
-            dict.get_item(key).map_err(|e| {
-                PyValueError::new_err(format!(
-                    "CompressionConfig: failed to read required field '{}': {}",
-                    key, e
-                ))
+            dict.get_item(key).and_then(|v| {
+                if v.is_none() {
+                    Err(PyValueError::new_err(format!(
+                        "CompressionConfig: required field '{}' is missing",
+                        key
+                    )))
+                } else {
+                    Ok(v)
+                }
             })
         };
         let backend: String = require("backend")?
@@ -253,20 +259,36 @@ impl CompressionConfig {
             PyValueError::new_err("CompressionConfig: 'gzip_fallback' must be a bool")
         })?;
 
-        let extract_u32 = |key: &str, fallback: u32| -> u32 {
-            dict.get_item(key)
-                .ok()
-                .and_then(|v| v.extract::<u32>().ok())
-                .unwrap_or(fallback)
+        // Optional tuning field: missing → fallback to default; present but
+        // unparseable / out-of-range → raise so the user notices the typo.
+        let parse_u32 = |key: &str, fallback: u32, lo: u32, hi: u32| -> pyo3::PyResult<u32> {
+            match dict.get_item(key) {
+                Ok(v) if !v.is_none() => {
+                    let value = v.extract::<u32>().map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "CompressionConfig: '{}' must be an int in [{}, {}]",
+                            key, lo, hi
+                        ))
+                    })?;
+                    if value < lo || value > hi {
+                        return Err(PyValueError::new_err(format!(
+                            "CompressionConfig: '{}'={} out of range [{}, {}]",
+                            key, value, lo, hi
+                        )));
+                    }
+                    Ok(value)
+                }
+                _ => Ok(fallback),
+            }
         };
         Ok(CompressionConfig {
             backend,
             minimum_size,
             gzip_fallback,
-            brotli_level: extract_u32("brotli_level", defaults.brotli_level),
-            brotli_lgwin: extract_u32("brotli_lgwin", defaults.brotli_lgwin),
-            gzip_level: extract_u32("gzip_level", defaults.gzip_level),
-            zstd_level: extract_u32("zstd_level", defaults.zstd_level),
+            brotli_level: parse_u32("brotli_level", defaults.brotli_level, 0, 11)?,
+            brotli_lgwin: parse_u32("brotli_lgwin", defaults.brotli_lgwin, 10, 24)?,
+            gzip_level: parse_u32("gzip_level", defaults.gzip_level, 0, 9)?,
+            zstd_level: parse_u32("zstd_level", defaults.zstd_level, 1, 22)?,
         })
     }
 }

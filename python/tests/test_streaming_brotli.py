@@ -229,3 +229,89 @@ def test_streaming_brotli_octet_stream():
         resp = client.get("/bin", headers={"Accept-Encoding": "br"})
         assert resp.headers.get("content-encoding", "").lower() == "br"
         assert resp.content == b"".join(payload)
+
+
+# ─── Regression: header preservation ────────────────────────────────────
+
+
+def test_streaming_preserves_caller_vary_when_compressed():
+    """Caller-supplied `Vary` tokens must survive the compression path —
+    the framework appends `Accept-Encoding` to the existing `Vary` set
+    rather than replacing it (regression: `insert_header` would clobber).
+    """
+    api = BoltAPI()  # default brotli on
+
+    @api.get("/stream")
+    async def stream():
+        async def gen():
+            yield "hello"
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/plain",
+            headers={"Vary": "Origin, Cookie"},
+        )
+
+    with TestClient(api) as client:
+        resp = client.get("/stream", headers={"Accept-Encoding": "br"})
+        assert resp.headers.get("content-encoding", "").lower() == "br"
+        vary = resp.headers.get("vary", "").lower()
+        assert "origin" in vary, f"caller Vary token lost: {vary!r}"
+        assert "cookie" in vary, f"caller Vary token lost: {vary!r}"
+        assert "accept-encoding" in vary, f"compression Vary missing: {vary!r}"
+
+
+def test_streaming_preserves_caller_content_encoding_skip_codec():
+    """When the caller pre-set `Content-Encoding`, the framework must NOT
+    overwrite it nor re-encode the body (regression: would double-compress
+    pre-compressed bytes and stomp the caller's header).
+    """
+    pre_encoded = brotli.compress(b"already-brotli'd-payload")
+    api = BoltAPI()  # default brotli on
+
+    @api.get("/cached")
+    async def cached():
+        async def gen():
+            yield pre_encoded
+
+        return StreamingResponse(
+            gen(),
+            media_type="application/octet-stream",
+            headers={"Content-Encoding": "br"},
+        )
+
+    with TestClient(api) as client:
+        resp = client.get("/cached", headers={"Accept-Encoding": "br"})
+        assert resp.status_code == 200
+        assert resp.headers.get("content-encoding", "").lower() == "br"
+        # httpx auto-decodes brotli once → original payload.
+        assert resp.content == b"already-brotli'd-payload"
+
+
+def test_streaming_identity_path_advertises_accept_encoding_vary():
+    """Even on the identity path (client rejects every supported codec),
+    the body choice still depended on Accept-Encoding (a brotli-capable
+    client would have gotten brotli). Advertise that via `Vary` so shared
+    caches don't serve the identity payload to a compression-capable
+    client. (Regression: previously no Vary on identity path.)
+    """
+    api = BoltAPI(compression=CompressionConfig(gzip_fallback=False))  # brotli only
+
+    @api.get("/stream")
+    async def stream():
+        async def gen():
+            yield "plain"
+
+        return StreamingResponse(gen(), media_type="text/plain")
+
+    with TestClient(api) as client:
+        # Client accepts neither brotli nor gzip → server must serve identity.
+        resp = client.get("/stream", headers={"Accept-Encoding": "deflate"})
+        assert resp.status_code == 200
+        ce = resp.headers.get("content-encoding")
+        # `Content-Encoding: identity` is stripped by the middleware.
+        assert ce is None or ce.lower() == "identity"
+        vary = resp.headers.get("vary", "").lower()
+        assert "accept-encoding" in vary, (
+            f"identity path missing Vary: Accept-Encoding (cache poisoning risk): {vary!r}"
+        )

@@ -16,7 +16,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **`BoltAPI(compression=None)` now actually disables buffered compression** - Previously, when no `CompressionConfig` was provided, the buffered middleware fell back to its hardcoded defaults (brotli with gzip fallback) and compressed responses anyway. The negotiator now correctly returns `identity` when no config is present, matching the documented behavior.
+- **`BoltAPI(compression=False)` now actually disables buffered compression** - Previously, when compression was explicitly disabled, the buffered middleware still fell back to its hardcoded defaults (brotli with gzip fallback) and compressed responses anyway. The negotiator now correctly returns `identity` when no config is attached to the app state, matching the documented behavior. (`compression=None`, or omitting the kwarg, continues to apply the default `CompressionConfig()`.)
 
 ### Documentation
 
