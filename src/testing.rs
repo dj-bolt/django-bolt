@@ -118,6 +118,9 @@ pub struct TestAppState {
     pub dispatch: Py<PyAny>,
     pub dispatch_sync: Py<PyAny>,
     pub global_cors_config: Option<CorsConfig>,
+    /// Global compression config (mirrors production server). Drives the
+    /// streaming-compression codec selection in `handler.rs`.
+    pub global_compression_config: Option<Arc<crate::metadata::CompressionConfig>>,
     pub debug: bool,
     pub max_payload_size: usize,
     pub asgi_mount_timeout: Duration,
@@ -232,7 +235,7 @@ fn parse_cors_config_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<CorsConfig>
 
 /// Create a test app instance and return its ID
 #[pyfunction]
-#[pyo3(signature = (dispatch, debug, cors_config=None, trailing_slash=None, static_files_config=None, dispatch_sync=None))]
+#[pyo3(signature = (dispatch, debug, cors_config=None, trailing_slash=None, static_files_config=None, dispatch_sync=None, compression_config=None))]
 pub fn create_test_app(
     py: Python<'_>,
     dispatch: Py<PyAny>,
@@ -241,11 +244,17 @@ pub fn create_test_app(
     trailing_slash: Option<String>,
     static_files_config: Option<&Bound<'_, PyDict>>,
     dispatch_sync: Option<Py<PyAny>>,
+    compression_config: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<u64> {
     let global_cors_config = if let Some(cors_dict) = cors_config {
         Some(parse_cors_config_from_dict(cors_dict)?)
     } else {
         None
+    };
+
+    let global_compression_config = match compression_config {
+        Some(d) => Some(Arc::new(crate::metadata::CompressionConfig::from_python_dict(d.as_any())?)),
+        None => None,
     };
 
     // Parse static files config from Python dict
@@ -308,6 +317,7 @@ pub fn create_test_app(
             .map(|ds| ds.clone_ref(py))
             .unwrap_or_else(|| dispatch.clone_ref(py)),
         global_cors_config,
+        global_compression_config,
         debug,
         max_payload_size,
         asgi_mount_timeout,
@@ -470,6 +480,7 @@ pub fn test_request(
                 dispatch,
                 dispatch_sync,
                 global_cors_config,
+                global_compression_config,
                 debug,
                 max_payload_size,
                 asgi_mount_timeout,
@@ -484,6 +495,7 @@ pub fn test_request(
                     Python::attach(|py| state.dispatch.clone_ref(py)),
                     Python::attach(|py| state.dispatch_sync.clone_ref(py)),
                     state.global_cors_config.clone(),
+                    state.global_compression_config.clone(),
                     state.debug,
                     state.max_payload_size,
                     state.asgi_mount_timeout,
@@ -503,7 +515,7 @@ pub fn test_request(
                 asgi_mount_timeout,
                 global_cors_config: global_cors_config.clone(),
                 cors_origin_regexes: vec![],
-                global_compression_config: None,
+                global_compression_config,
                 router: Some(router.clone()),
                 route_metadata: Some(route_metadata.clone()),
                 asgi_mounts: Some(asgi_mounts.clone()),
@@ -1079,7 +1091,14 @@ async fn handle_test_request_internal(
         }
     };
 
-    match response_from_wire_result(result_obj, skip_compression, skip_cors, is_head_request).await
+    match response_from_wire_result(
+        result_obj,
+        skip_compression,
+        skip_cors,
+        is_head_request,
+        &req,
+    )
+    .await
     {
         Ok(response) => response,
         Err(e) => Python::attach(|py| {

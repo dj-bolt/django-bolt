@@ -880,11 +880,13 @@ dependencies = [
  "actix-web",
  "actix-web-actors",
  "ahash 0.8.12",
+ "brotli",
  "bytes",
  "chrono",
  "cookie 0.18.1",
  "ctrlc",
  "dashmap",
+ "flate2",
  "futures-util",
  "governor",
  "jsonwebtoken",
@@ -908,6 +910,7 @@ dependencies = [
  "tokio",
  "urlencoding",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

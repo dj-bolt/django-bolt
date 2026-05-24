@@ -44,6 +44,9 @@ urlencoding = "2"
 once_cell = "1"
 futures-util = "0.3"
 bytes = "1"
+brotli = "8"
+flate2 = "1"
+zstd = "0.13"
 regex = "1"
 # Type coercion dependencies (for path/query param parsing)
 chrono = { version = "0.4", features = ["serde"] }

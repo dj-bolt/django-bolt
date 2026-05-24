@@ -209,17 +209,35 @@ pub fn create_python_stream(
 }
 
 /// Create a stream for SSE that sends items immediately (batch_size=1)
-/// with optional keep-alive pings when idle.
+/// with optional keep-alive pings when idle and optional per-event
+/// compression (any codec from [`StreamCodec`]).
 pub fn create_sse_stream(
     content: Py<PyAny>,
     is_async_generator: bool,
     ping_interval: Option<f64>,
+    codec: Option<crate::streaming_compression::StreamCodec>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let inner = create_python_stream_with_config(content, 1, 1, is_async_generator);
 
-    match ping_interval {
-        Some(interval) if interval > 0.0 => Box::pin(keepalive_stream(inner, interval)),
-        _ => inner,
+    let with_keepalive: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+        match ping_interval {
+            Some(interval) if interval > 0.0 => Box::pin(keepalive_stream(inner, interval)),
+            _ => inner,
+        };
+
+    maybe_wrap_codec(with_keepalive, codec)
+}
+
+/// Wrap a chunk stream with per-chunk compression when a codec is provided.
+/// Pass-through when `codec` is `None`. Compression runs **after** any
+/// keep-alive injection so ping frames are also flushed.
+pub fn maybe_wrap_codec(
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    codec: Option<crate::streaming_compression::StreamCodec>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+    match codec {
+        Some(c) => Box::pin(crate::streaming_compression::EncoderStream::new(inner, c)),
+        None => inner,
     }
 }
 

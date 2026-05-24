@@ -9,32 +9,49 @@ use actix_web::{http::StatusCode, HttpResponse, HttpResponseBuilder};
 use crate::cookies::format_cookie;
 use crate::response_meta::ResponseMeta;
 
-/// Build a streaming response with SSE headers
-/// Pre-bundles common SSE headers to avoid multiple mutations
+/// Build a streaming response with SSE headers.
+/// Pre-bundles common SSE headers to avoid multiple mutations.
+///
+/// `encoding_name` is the `Content-Encoding` token to set:
+/// - `"identity"` → handler owns "no compression"; the global compression
+///   middleware bypasses (and strips) the marker.
+/// - `"br" | "gzip" | "zstd"` → handler already compressed the body
+///   per-chunk; sets `Content-Encoding` so the client decodes correctly.
+///
+/// `user_set_content_encoding` means the caller passed an explicit
+/// `Content-Encoding` header on the response; in that case we don't touch
+/// `Content-Encoding` or `Vary: Accept-Encoding` — the handler is in
+/// charge of the encoding contract.
+///
+/// `Vary: Accept-Encoding` is APPENDED (not inserted) so it composes with
+/// any `Vary` the caller set (e.g. `Vary: Origin` for CORS-keyed caches).
 #[inline]
 pub fn build_sse_response(
     status: StatusCode,
     custom_headers: Vec<(String, String)>,
-    _skip_compression: bool,
+    encoding_name: &str,
+    user_set_content_encoding: bool,
 ) -> HttpResponseBuilder {
     let mut builder = HttpResponse::build(status);
 
-    // Add custom headers first
-    // Use append_header to support multiple headers with the same name
     for (k, v) in custom_headers {
         builder.append_header((k, v));
     }
 
-    // Batch SSE headers (avoid 5 separate mutations)
     builder.content_type("text/event-stream");
     builder.insert_header(("X-Accel-Buffering", "no"));
     builder.insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"));
     builder.insert_header(("Pragma", "no-cache"));
     builder.insert_header(("Expires", "0"));
 
-    // Always skip compression for SSE — buffering defeats streaming.
-    // The compression middleware checks for Content-Encoding: identity and skips.
-    builder.insert_header(("Content-Encoding", "identity"));
+    if !user_set_content_encoding {
+        builder.insert_header(("Content-Encoding", encoding_name));
+        // Even on the identity path, body choice depended on Accept-Encoding
+        // (a brotli-capable client would have gotten brotli), so advertise
+        // the Vary qualifier unconditionally. Use append to preserve any
+        // caller-set Vary tokens (Origin, Cookie, …).
+        builder.append_header(("Vary", "Accept-Encoding"));
+    }
 
     builder
 }

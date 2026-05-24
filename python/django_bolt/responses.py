@@ -312,7 +312,7 @@ class StreamingResponse(CookieMixin):
         self.content = content
         self.status_code = status_code
         self.media_type = media_type or "application/octet-stream"
-        self.headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
         # Detect generator type at instantiation time (once per request, not per chunk)
         # This avoids repeated Python inspect calls in Rust streaming loop

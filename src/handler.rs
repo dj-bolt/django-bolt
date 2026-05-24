@@ -497,6 +497,15 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
     Ok(ParsedResponseWire { status, meta, body })
 }
 
+/// Borrow the global `CompressionConfig` from `AppState` attached to the
+/// request. Returns `None` when no `BoltAPI(compression=...)` was configured.
+fn compression_config_from_req(
+    req: &HttpRequest,
+) -> Option<&crate::metadata::CompressionConfig> {
+    req.app_data::<actix_web::web::Data<std::sync::Arc<crate::state::AppState>>>()
+        .and_then(|s| s.global_compression_config.as_deref())
+}
+
 #[inline]
 fn mark_skip_cors(response: &mut HttpResponse, skip_cors: bool) {
     if skip_cors {
@@ -513,6 +522,7 @@ async fn build_response_from_parsed(
     skip_compression: bool,
     skip_cors: bool,
     is_head_request: bool,
+    req: &HttpRequest,
 ) -> HttpResponse {
     let meta_ref = parsed.meta.as_ref();
 
@@ -568,21 +578,51 @@ async fn build_response_from_parsed(
             ping_interval,
         } => {
             let headers = response_builder::meta_to_headers(meta_ref);
+
+            // If the user passed `Content-Encoding` via StreamingResponse
+            // headers they have already encoded the body (or are claiming
+            // identity); skip the framework codec in that case so we don't
+            // double-encode or clobber the caller's intent.
+            let user_set_content_encoding = headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"));
+
+            let codec = if user_set_content_encoding {
+                None
+            } else {
+                crate::streaming_compression::select_stream_encoding(
+                    req,
+                    compression_config_from_req(req),
+                    skip_compression,
+                )
+            };
+            let encoding_name = codec.map_or("identity", |c| c.header_name());
+
             if media_type == "text/event-stream" {
                 if is_head_request {
                     let mut response = response_builder::build_sse_response(
                         parsed.status,
                         headers,
-                        skip_compression,
+                        encoding_name,
+                        user_set_content_encoding,
                     )
                     .body(Vec::<u8>::new());
                     mark_skip_cors(&mut response, skip_cors);
                     return response;
                 }
-                let stream = create_sse_stream(content_obj, is_async_generator, ping_interval);
-                let mut response =
-                    response_builder::build_sse_response(parsed.status, headers, skip_compression)
-                        .streaming(stream);
+                let stream = create_sse_stream(
+                    content_obj,
+                    is_async_generator,
+                    ping_interval,
+                    codec,
+                );
+                let mut response = response_builder::build_sse_response(
+                    parsed.status,
+                    headers,
+                    encoding_name,
+                    user_set_content_encoding,
+                )
+                .streaming(stream);
                 mark_skip_cors(&mut response, skip_cors);
                 return response;
             }
@@ -591,18 +631,29 @@ async fn build_response_from_parsed(
             for (k, v) in headers {
                 builder.append_header((k, v));
             }
-            if is_head_request {
-                if skip_compression {
-                    builder.append_header(("Content-Encoding", "identity"));
+            if !user_set_content_encoding {
+                if codec.is_some() {
+                    builder.insert_header(("Content-Encoding", encoding_name));
+                } else {
+                    // Identity marker tells the global compression middleware to
+                    // skip — buffering compressors would defeat streaming.
+                    builder.insert_header(("Content-Encoding", "identity"));
                 }
+                // Whether or not we picked a codec, the *body* we send was
+                // chosen based on Accept-Encoding (a brotli-capable client
+                // would have gotten brotli). Advertise that so shared
+                // caches don't serve the identity payload to a client that
+                // accepts compression. `append` not `insert` to preserve
+                // any Vary the caller set (e.g. CORS's `Vary: Origin`).
+                builder.append_header(("Vary", "Accept-Encoding"));
+            }
+            if is_head_request {
                 let mut response = builder.body(Vec::<u8>::new());
                 mark_skip_cors(&mut response, skip_cors);
                 return response;
             }
-            if skip_compression {
-                builder.append_header(("Content-Encoding", "identity"));
-            }
-            let stream = create_python_stream(content_obj, is_async_generator);
+            let inner = create_python_stream(content_obj, is_async_generator);
+            let stream = crate::streaming::maybe_wrap_codec(inner, codec);
             let mut response = builder.streaming(stream);
             mark_skip_cors(&mut response, skip_cors);
             response
@@ -615,9 +666,10 @@ pub async fn response_from_wire_result(
     skip_compression: bool,
     skip_cors: bool,
     is_head_request: bool,
+    req: &HttpRequest,
 ) -> PyResult<HttpResponse> {
     let parsed = Python::attach(|py| parse_response_wire(py, &result_obj))?;
-    Ok(build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request).await)
+    Ok(build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request, req).await)
 }
 
 /// Build prebound Python args/kwargs from Rust binding metadata.
@@ -1231,7 +1283,8 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         // Sync dispatch completed but body needs async post-processing (stream/file).
         // Already parsed — no duplicate GIL acquire or wire re-parse.
         Ok(DispatchOutcome::SyncResult(parsed)) => {
-            build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request).await
+            build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request, &req)
+                .await
         }
         Ok(DispatchOutcome::Pending(fut)) => match fut.await {
             Ok(result_obj) => {
@@ -1240,6 +1293,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                     skip_compression,
                     skip_cors,
                     is_head_request,
+                    &req,
                 )
                 .await
                 {

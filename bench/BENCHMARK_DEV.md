@@ -253,7 +253,7 @@ Cleaning up test users...
   Reqs/sec    104047.87    5417.94  108854.94
   Latency        0.94ms   297.64us     4.96ms
   Latency Distribution
-     50%     0.86ms
+     50%     0.87ms
      75%     1.14ms
      90%     1.43ms
      99%     2.20ms

@@ -1007,7 +1007,6 @@ async def collected_plain():
 
 
 @api.get("/sse")
-@no_compress
 async def sse():
     async def gen():
         while True:
