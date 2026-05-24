@@ -345,18 +345,12 @@ class _SerializerMeta(_STRUCT_META):
         # Fast boolean flag avoids dict truthiness check on every dump()
         cls.__has_rename__ = bool(rename_map)
 
-        # Capture tag configuration from msgspec
+        # Capture tag configuration from msgspec. msgspec resolves tag=True
+        # and tag=<callable> to the final tag string at class creation time,
+        # so __struct_config__.tag is always None or the resolved value.
         struct_config = getattr(cls, "__struct_config__", None)
-        tag_val = None
-        tag_field = "type"
-        if struct_config is not None:
-            tag = getattr(struct_config, "tag", None)
-            if tag is not None and tag is not False:
-                tag_val = cls.__name__ if tag is True else tag
-                tag_field = getattr(struct_config, "tag_field", None) or "type"
-
-        cls.__tag_value__ = tag_val
-        cls.__tag_field__ = tag_field
+        cls.__tag_value__ = getattr(struct_config, "tag", None)
+        cls.__tag_field__ = getattr(struct_config, "tag_field", None) or "type"
 
         return cls
 
@@ -461,29 +455,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Collect validators and cache type hints when a subclass is created."""
 
-        # msgspec configuration is handled by the metaclass __new__, but kwargs
-        # are still passed to __init_subclass__. We pop them here to avoid
-        # TypeError from object.__init_subclass__.
-        for key in (
-            "kw_only",
-            "tag",
-            "tag_field",
-            "rename",
-            "dict",
-            "gc",
-            "weakref",
-            "omit_defaults",
-            "forbid_unknown_fields",
-            "frozen",
-            "eq",
-            "order",
-            "repr",
-            "match_args",
-            "array_like",
-        ):
-            kwargs.pop(key, None)
-
-        super().__init_subclass__(**kwargs)
+        # msgspec.Struct kwargs (kw_only, tag, rename, etc.) are consumed by
+        # _SerializerMeta.__new__ and validated there, but Python still forwards
+        # them to __init_subclass__. object.__init_subclass__ rejects any kwargs,
+        # so swallow them here instead of maintaining a hand-rolled allowlist
+        # that would silently break each time msgspec adds a new struct option.
+        super().__init_subclass__()
         # Collect validators for this class
         cls.__field_validators__ = collect_field_validators(cls)
         cls.__model_validators__ = collect_model_validators(cls)
@@ -1968,13 +1945,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 Config.read_only = parent_meta.read_only & fields_set  # type: ignore
             class_dict["Config"] = Config
 
-        kwargs = {"kw_only": True}
-        if cls.__tag_value__ is not None:
-            kwargs["tag"] = cls.__tag_value__
-            kwargs["tag_field"] = cls.__tag_field__
-
-        # Create the new Serializer subclass
-        new_cls: type[T] = type(class_name, (Serializer,), class_dict, **kwargs)  # type: ignore
+        # Create the new Serializer subclass. We intentionally do NOT inherit
+        # the parent's tag — a subset is a distinct schema (different fields)
+        # and reusing the parent's tag would create duplicate-tag collisions
+        # in any tagged union containing both. Callers who need a tagged
+        # subset can subclass with an explicit `tag=...`.
+        new_cls: type[T] = type(class_name, (Serializer,), class_dict, kw_only=True)  # type: ignore
 
         # Add from_parent class method
         @classmethod
@@ -2175,13 +2151,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
             if cls.__orm_state_check_fields__:
                 self._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
-            if cls.__has_rename__:
+            # to_builtins handles rename and tag injection natively; asdict is
+            # cheaper when neither applies, so keep the split for the common case.
+            if cls.__has_rename__ or cls.__tag_value__ is not None:
                 return msgspec.to_builtins(self)
-
-            data = msgspec_structs.asdict(self)
-            if cls.__tag_value__ is not None:
-                data[cls.__tag_field__] = cls.__tag_value__
-            return data
+            return msgspec_structs.asdict(self)
 
         # SLOW PATH: Need special handling.
         return self._dump_impl(
@@ -2362,15 +2336,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if cls.__orm_state_check_fields__:
                 for instance in instances_list:
                     instance._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
-            if cls.__has_rename__:
+            if cls.__has_rename__ or cls.__tag_value__ is not None:
                 _to_builtins = msgspec.to_builtins
                 return [_to_builtins(instance) for instance in instances_list]
-
             _asdict = msgspec_structs.asdict
-            if cls.__tag_value__ is not None:
-                tag_f = cls.__tag_field__
-                tag_v = cls.__tag_value__
-                return [{**_asdict(instance), tag_f: tag_v} for instance in instances_list]
             return [_asdict(instance) for instance in instances_list]
 
         # SLOW PATH: Need special handling (computed fields, write_only, exclude_*, etc.)

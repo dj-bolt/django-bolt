@@ -19,6 +19,7 @@ except ImportError:
 
 
 # Import local modules
+import msgspec
 from django.core.asgi import get_asgi_application
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
@@ -68,6 +69,7 @@ from .serialization import (
     _convert_serializers,
     _extract_stream_item_type,
     _infer_wire_response_type,
+    _raise_response_validation_error,
     _wire_bytes,
     compile_response_handlers,
     serialize_json_data,
@@ -1766,6 +1768,190 @@ class BoltAPI:
 
                 return execute_async_dict_fast
 
+            # Inline-encoding fast path: response_type is a plain msgspec.Struct,
+            # Union of plain Structs, or list[Struct]/list[Union[Struct,...]].
+            # When the handler returns an instance that already matches the
+            # declared type we encode it directly via the module msgspec
+            # encoder, skipping the serialize_response → data_handler →
+            # validator → coerce_to_response_type chain. Anything else
+            # (Response objects, QuerySets, generators, dicts, None,
+            # Serializers, response_class overrides, ...) is delegated to
+            # serialize_response so the slow path handles every edge case
+            # uniformly.
+            _inline_spec = meta.get("_inline_response_validator")
+            if _inline_spec is not None:
+                _encode = _json._ENCODER.encode
+                _meta_json = _RESPONSE_META_JSON
+                _inline_kind, _inline_match = _inline_spec
+                _convert = msgspec.convert
+
+                if _inline_kind == "struct":
+                    _match_types = _inline_match
+
+                    if _trivially_async:
+                        # Sync executor for trivially-async handlers — drives
+                        # the coroutine inline so Rust can use its sync
+                        # dispatch bypass.
+                        if _is_no_params:
+
+                            def execute_trivial_async_sync_validated(
+                                handler: Callable, request: dict[str, Any]
+                            ) -> ResponseWireV1:
+                                coro = handler()
+                                try:
+                                    coro.send(None)
+                                except StopIteration as _e:
+                                    result = _e.value
+                                else:
+                                    coro.close()
+                                    raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                                if isinstance(result, _match_types):
+                                    return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                                return serialize_response_sync(result, meta)
+                        else:
+
+                            def execute_trivial_async_sync_validated(
+                                handler: Callable, request: dict[str, Any]
+                            ) -> ResponseWireV1:
+                                args, kwargs = injector(request)
+                                coro = handler(*args, **kwargs)
+                                try:
+                                    coro.send(None)
+                                except StopIteration as _e:
+                                    result = _e.value
+                                else:
+                                    coro.close()
+                                    raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                                if isinstance(result, _match_types):
+                                    return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                                return serialize_response_sync(result, meta)
+
+                        meta["_sync_executor"] = execute_trivial_async_sync_validated
+
+                    if _is_no_params:
+
+                        async def execute_async_inline_validated(
+                            handler: Callable, request: dict[str, Any]
+                        ) -> ResponseWireV1:
+                            result = await handler()
+                            if isinstance(result, _match_types):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return await serialize_response(result, meta)
+                    else:
+
+                        async def execute_async_inline_validated(
+                            handler: Callable, request: dict[str, Any]
+                        ) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            result = await handler(*args, **kwargs)
+                            if isinstance(result, _match_types):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return await serialize_response(result, meta)
+
+                    return execute_async_inline_validated
+
+                # _inline_kind == "list" — bare `list` (exact type) is the only
+                # shape we encode inline; QuerySets, generators, custom
+                # list-like containers all fall through to serialize_response
+                # so the slow path applies projection, async DB I/O wrapping,
+                # auto-streaming, etc.
+                _list_ann = _inline_match
+
+                if _trivially_async:
+                    if _is_no_params:
+
+                        def execute_trivial_async_sync_validated(
+                            handler: Callable, request: dict[str, Any]
+                        ) -> ResponseWireV1:
+                            coro = handler()
+                            try:
+                                coro.send(None)
+                            except StopIteration as _e:
+                                result = _e.value
+                            else:
+                                coro.close()
+                                raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                            if type(result) is list:
+                                # Attr-bag elements (e.g. Django models) need
+                                # the slow path's response_field_names
+                                # projection; msgspec.convert can't bridge them.
+                                if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                                    return serialize_response_sync(result, meta)
+                                try:
+                                    validated = _convert(result, _list_ann)
+                                except msgspec.ValidationError as exc:
+                                    _raise_response_validation_error(exc)
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
+                            return serialize_response_sync(result, meta)
+                    else:
+
+                        def execute_trivial_async_sync_validated(
+                            handler: Callable, request: dict[str, Any]
+                        ) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            coro = handler(*args, **kwargs)
+                            try:
+                                coro.send(None)
+                            except StopIteration as _e:
+                                result = _e.value
+                            else:
+                                coro.close()
+                                raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                            if type(result) is list:
+                                # Attr-bag elements (e.g. Django models) need
+                                # the slow path's response_field_names
+                                # projection; msgspec.convert can't bridge them.
+                                if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                                    return serialize_response_sync(result, meta)
+                                try:
+                                    validated = _convert(result, _list_ann)
+                                except msgspec.ValidationError as exc:
+                                    _raise_response_validation_error(exc)
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
+                            return serialize_response_sync(result, meta)
+
+                    meta["_sync_executor"] = execute_trivial_async_sync_validated
+
+                if _is_no_params:
+
+                    async def execute_async_inline_validated(
+                        handler: Callable, request: dict[str, Any]
+                    ) -> ResponseWireV1:
+                        result = await handler()
+                        if type(result) is list:
+                            # Attr-bag elements (e.g. Django models) need the
+                            # slow path's response_field_names projection;
+                            # msgspec.convert can't bridge them.
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                                return await serialize_response(result, meta)
+                            try:
+                                validated = _convert(result, _list_ann)
+                            except msgspec.ValidationError as exc:
+                                _raise_response_validation_error(exc)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
+                        return await serialize_response(result, meta)
+                else:
+
+                    async def execute_async_inline_validated(
+                        handler: Callable, request: dict[str, Any]
+                    ) -> ResponseWireV1:
+                        args, kwargs = injector(request)
+                        result = await handler(*args, **kwargs)
+                        if type(result) is list:
+                            # Attr-bag elements (e.g. Django models) need the
+                            # slow path's response_field_names projection;
+                            # msgspec.convert can't bridge them.
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                                return await serialize_response(result, meta)
+                            try:
+                                validated = _convert(result, _list_ann)
+                            except msgspec.ValidationError as exc:
+                                _raise_response_validation_error(exc)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
+                        return await serialize_response(result, meta)
+
+                return execute_async_inline_validated
+
             if _is_no_params:
 
                 async def execute_async_no_prebound(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -1871,6 +2057,144 @@ class BoltAPI:
                             return serialize_response_sync(result, meta)
 
                 return execute_sync_dict_fast
+
+            # Sync-handler inline-encoding fast path (mirrors async branch above).
+            _inline_spec = meta.get("_inline_response_validator")
+            if _inline_spec is not None:
+                _encode = _json._ENCODER.encode
+                _meta_json = _RESPONSE_META_JSON
+                _inline_kind, _inline_match = _inline_spec
+                _convert = msgspec.convert
+
+                if _inline_kind == "struct":
+                    _match_types = _inline_match
+
+                    if _is_no_params_sync:
+
+                        def execute_sync_inline_validated_plain(
+                            handler: Callable, request: dict[str, Any]
+                        ) -> ResponseWireV1:
+                            result = handler()
+                            if isinstance(result, _match_types):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return serialize_response_sync(result, meta)
+                    else:
+
+                        def execute_sync_inline_validated_plain(
+                            handler: Callable, request: dict[str, Any]
+                        ) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            result = handler(*args, **kwargs)
+                            if isinstance(result, _match_types):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return serialize_response_sync(result, meta)
+
+                    meta["_sync_executor"] = execute_sync_inline_validated_plain
+
+                    if _is_no_params_sync:
+
+                        async def execute_sync_inline_validated(
+                            handler: Callable, request: dict[str, Any]
+                        ) -> ResponseWireV1:
+                            result = handler()
+                            if isinstance(result, _match_types):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return serialize_response_sync(result, meta)
+                    else:
+
+                        async def execute_sync_inline_validated(
+                            handler: Callable, request: dict[str, Any]
+                        ) -> ResponseWireV1:
+                            args, kwargs = injector(request)
+                            result = handler(*args, **kwargs)
+                            if isinstance(result, _match_types):
+                                return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                            return serialize_response_sync(result, meta)
+
+                    return execute_sync_inline_validated
+
+                # _inline_kind == "list"
+                _list_ann = _inline_match
+
+                if _is_no_params_sync:
+
+                    def execute_sync_inline_validated_plain(
+                        handler: Callable, request: dict[str, Any]
+                    ) -> ResponseWireV1:
+                        result = handler()
+                        if type(result) is list:
+                            # Attr-bag elements (e.g. Django models) need the
+                            # slow path's response_field_names projection;
+                            # msgspec.convert can't bridge them.
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                                return serialize_response_sync(result, meta)
+                            try:
+                                validated = _convert(result, _list_ann)
+                            except msgspec.ValidationError as exc:
+                                _raise_response_validation_error(exc)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
+                        return serialize_response_sync(result, meta)
+                else:
+
+                    def execute_sync_inline_validated_plain(
+                        handler: Callable, request: dict[str, Any]
+                    ) -> ResponseWireV1:
+                        args, kwargs = injector(request)
+                        result = handler(*args, **kwargs)
+                        if type(result) is list:
+                            # Attr-bag elements (e.g. Django models) need the
+                            # slow path's response_field_names projection;
+                            # msgspec.convert can't bridge them.
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                                return serialize_response_sync(result, meta)
+                            try:
+                                validated = _convert(result, _list_ann)
+                            except msgspec.ValidationError as exc:
+                                _raise_response_validation_error(exc)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
+                        return serialize_response_sync(result, meta)
+
+                meta["_sync_executor"] = execute_sync_inline_validated_plain
+
+                if _is_no_params_sync:
+
+                    async def execute_sync_inline_validated(
+                        handler: Callable, request: dict[str, Any]
+                    ) -> ResponseWireV1:
+                        result = handler()
+                        if type(result) is list:
+                            # Attr-bag elements (e.g. Django models) need the
+                            # slow path's response_field_names projection;
+                            # msgspec.convert can't bridge them.
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                                return serialize_response_sync(result, meta)
+                            try:
+                                validated = _convert(result, _list_ann)
+                            except msgspec.ValidationError as exc:
+                                _raise_response_validation_error(exc)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
+                        return serialize_response_sync(result, meta)
+                else:
+
+                    async def execute_sync_inline_validated(
+                        handler: Callable, request: dict[str, Any]
+                    ) -> ResponseWireV1:
+                        args, kwargs = injector(request)
+                        result = handler(*args, **kwargs)
+                        if type(result) is list:
+                            # Attr-bag elements (e.g. Django models) need the
+                            # slow path's response_field_names projection;
+                            # msgspec.convert can't bridge them.
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                                return serialize_response_sync(result, meta)
+                            try:
+                                validated = _convert(result, _list_ann)
+                            except msgspec.ValidationError as exc:
+                                _raise_response_validation_error(exc)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
+                        return serialize_response_sync(result, meta)
+
+                return execute_sync_inline_validated
 
         async def execute(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
             request_state = request.setdefault("state", {})

@@ -120,19 +120,138 @@ async def items100() -> list[Item]:
     return [Item(name=f"item{i}", price=float(i), is_offer=(i % 2 == 0)) for i in range(100)]
 
 
-class Cat(msgspec.Struct, tag="cat"):
-    meow: str
+class PostActivity(msgspec.Struct, tag="post"):
+    id: int
+    actor: str
+    title: str
+    body: str
+    created_at: str
 
 
-class Dog(msgspec.Struct, tag="dog"):
-    bark: str
+class CommentActivity(msgspec.Struct, tag="comment"):
+    id: int
+    actor: str
+    post_id: int
+    text: str
+    created_at: str
 
 
-@api.get("/cat_or_dog/", response_model=Cat | Dog)
-async def cat_or_dog(request, meow: bool = False) -> Cat | Dog:
-    if meow:
-        return Cat("meow")
-    return Dog("wuff")
+class LikeActivity(msgspec.Struct, tag="like"):
+    id: int
+    actor: str
+    target_id: int
+    target_kind: str
+    created_at: str
+
+
+FeedItem = PostActivity | CommentActivity | LikeActivity
+
+
+@api.get("/feed/{item_id}", response_model=FeedItem)
+async def feed_item(item_id: int) -> FeedItem:
+    kind = item_id % 3
+    if kind == 0:
+        return PostActivity(
+            id=item_id,
+            actor="alice",
+            title="Shipping a new feature",
+            body="Today we rolled out polymorphic feed responses.",
+            created_at="2026-05-24T10:00:00Z",
+        )
+    if kind == 1:
+        return CommentActivity(
+            id=item_id,
+            actor="bob",
+            post_id=item_id - 1,
+            text="Nice work — the tagged union serialization is fast.",
+            created_at="2026-05-24T10:05:00Z",
+        )
+    return LikeActivity(
+        id=item_id,
+        actor="carol",
+        target_id=item_id - 2,
+        target_kind="post",
+        created_at="2026-05-24T10:10:00Z",
+    )
+
+
+@api.get("/feed", response_model=list[FeedItem])
+async def feed() -> list[FeedItem]:
+    out: list[FeedItem] = []
+    for i in range(100):
+        kind = i % 3
+        if kind == 0:
+            out.append(
+                PostActivity(
+                    id=i,
+                    actor=f"user{i}",
+                    title=f"Post {i}",
+                    body="Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+                    created_at="2026-05-24T10:00:00Z",
+                )
+            )
+        elif kind == 1:
+            out.append(
+                CommentActivity(
+                    id=i,
+                    actor=f"user{i}",
+                    post_id=i - 1,
+                    text="Great post, thanks for sharing!",
+                    created_at="2026-05-24T10:05:00Z",
+                )
+            )
+        else:
+            out.append(
+                LikeActivity(
+                    id=i,
+                    actor=f"user{i}",
+                    target_id=i - 2,
+                    target_kind="post",
+                    created_at="2026-05-24T10:10:00Z",
+                )
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Union response overhead bench
+# ---------------------------------------------------------------------------
+# Paired endpoints that build identical PostActivity instances and emit
+# byte-identical JSON. The only difference is the declared response_model:
+# the `union` variants advertise a tagged union, the matched variants
+# advertise the concrete PostActivity type. Diffing RPS between each pair
+# isolates the union dispatch / response-validation overhead from
+# everything else (struct construction, msgspec encoding, IO).
+
+
+def _post_activity(i: int) -> PostActivity:
+    return PostActivity(
+        id=i,
+        actor=f"user{i}",
+        title=f"Post {i}",
+        body="Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+        created_at="2026-05-24T10:00:00Z",
+    )
+
+
+@api.get("/bench/union-single", response_model=FeedItem)
+async def bench_union_single() -> FeedItem:
+    return _post_activity(1)
+
+
+@api.get("/bench/single", response_model=PostActivity)
+async def bench_single() -> PostActivity:
+    return _post_activity(1)
+
+
+@api.get("/bench/union-list", response_model=list[FeedItem])
+async def bench_union_list() -> list[FeedItem]:
+    return [_post_activity(i) for i in range(100)]
+
+
+@api.get("/bench/list", response_model=list[PostActivity])
+async def bench_list() -> list[PostActivity]:
+    return [_post_activity(i) for i in range(100)]
 
 
 # ============================================================================
