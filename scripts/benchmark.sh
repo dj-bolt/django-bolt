@@ -428,6 +428,7 @@ rm -f "$FORM_LIST_FILE"
 echo "### Form Repeated Keys multipart (POST /form-list)"
 FORM_LIST_MULTI=$(mktemp)
 BOUNDARY="----BoltFormList$(date +%s)"
+# emit_part appends a multipart/form-data part for the given field name and value to the multipart body file `$FORM_LIST_MULTI`, using the current `BOUNDARY` and CRLF line endings.
 emit_part() {
     printf -- "--%s\r\n" "$BOUNDARY" >> "$FORM_LIST_MULTI"
     printf "Content-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" "$1" "$2" >> "$FORM_LIST_MULTI"

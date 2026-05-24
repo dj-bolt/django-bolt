@@ -316,7 +316,26 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
     }
 }
 
-/// Convert FileInfo to Python dict
+/// Convert a FileInfo into an unbound Python dict for use in Python code.
+///
+/// The returned dict contains the following keys:
+/// - `filename` (str)
+/// - `content_type` (str)
+/// - `size` (int)
+/// - `content` (`bytes` when the file is memory-backed, `None` when spooled to disk)
+/// - `temp_path` (str path when spooled to disk, `None` when memory-backed)
+///
+/// # Examples
+///
+/// ```
+/// use pyo3::prelude::*;
+/// // Assume `FileInfo` and `FileContent` are in scope:
+/// // let file = FileInfo { filename: "a.txt".into(), content_type: "text/plain".into(), size: 3, content: FileContent::Memory(vec![97,98,99]) };
+/// Python::with_gil(|py| {
+///     // let py_dict = file_info_to_py(py, &file).unwrap();
+///     // assert_eq!(py_dict.get_item("filename").unwrap().extract::<String>().unwrap(), "a.txt");
+/// });
+/// ```
 pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("filename", &file.filename)?;
@@ -338,11 +357,25 @@ pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> 
     Ok(dict.unbind())
 }
 
-/// Convert FormParseResult to Python dicts.
+/// Convert a parsed multipart/form result into two Python dictionaries: one for form fields and one for uploaded files.
 ///
-/// Single-value fields pass through as scalar Python objects (hot path —
-/// one Py object per key). Repeated keys become a `PyList` so msgspec sees
-/// a `list` for `list[T]` struct fields.
+/// Single-value form fields are converted to scalar Python objects. Repeated form fields are converted to Python `list`s so consumers (e.g., msgspec) see `list[T]` for repeated keys. For files, a single uploaded file for a field becomes a single Python dict describing that file; multiple uploaded files for the same field become a Python `list` of file dicts. Returned dicts are unbound `PyDict`s ready to be attached to Python objects.
+///
+/// # Examples
+///
+/// ```no_run
+/// use pyo3::prelude::*;
+///
+/// // Assume `result` is a FormParseResult obtained from multipart parsing.
+/// # let result: crate::forms::FormParseResult = unimplemented!();
+/// Python::with_gil(|py| {
+///     let (form_dict, files_dict) = crate::handler::form_result_to_py(py, &result).unwrap();
+///     // `form_dict` maps field names -> scalar Python objects or lists
+///     // `files_dict` maps field names -> file dict or list of file dicts
+///     let _ = form_dict;
+///     let _ = files_dict;
+/// });
+/// ```
 pub fn form_result_to_py(
     py: Python<'_>,
     result: &FormParseResult,

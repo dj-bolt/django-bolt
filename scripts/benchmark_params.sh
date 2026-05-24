@@ -190,6 +190,7 @@ rm -f "$MULTI_FILE"
 REPEATED_MULTI=$(mktemp)
 BOUNDARY="----BoltRepeated$(date +%s)"
 : > "$REPEATED_MULTI"
+# emit_multi_part appends a multipart/form-data part using BOUNDARY to the file referenced by REPEATED_MULTI with field name $1 and value $2.
 emit_multi_part() {
     printf -- "--%s\r\n" "$BOUNDARY" >> "$REPEATED_MULTI"
     printf "Content-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" "$1" "$2" >> "$REPEATED_MULTI"
