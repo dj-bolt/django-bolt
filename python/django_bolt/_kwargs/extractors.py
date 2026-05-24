@@ -270,6 +270,34 @@ def _collect_struct_errors(
     return errors
 
 
+_SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
+
+
+def _is_sequence_field(field_type: Any) -> bool:
+    """True when the field is list[T] / set[T] / frozenset[T] / tuple[T, ...].
+
+    Used at registration time only — zero per-request cost.
+    """
+    inner = unwrap_optional(field_type)
+    return get_origin(inner) in _SEQUENCE_ORIGINS
+
+
+def _collect_sequence_field_names(struct_type: type) -> tuple[str, ...]:
+    """Return the wire-side names of fields whose target type is a sequence.
+
+    Form data is a multi-value mapping: a key may appear once (scalar) or many
+    times (list). Once Rust hands the form to Python, repeated keys are already
+    lists, but a single occurrence of a key bound to `list[T]` arrives as a
+    scalar and would fail msgspec.convert. We pre-compute the field names here
+    so the runtime wrap is a small O(k) scan with no introspection cost.
+    """
+    names: list[str] = []
+    for f in msgspec.structs.fields(struct_type):
+        if _is_sequence_field(f.type):
+            names.append(getattr(f, "encode_name", f.name))
+    return tuple(names)
+
+
 def _create_param_struct_extractor(struct_type: type, default: Any, param_type: str) -> Callable:
     """Create an extractor that builds a Struct/Serializer from parameter data.
 
@@ -280,6 +308,8 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
     """
     # Check at registration time if any fields need file handling
     has_upload_file_fields = any(is_upload_file_type(f.type) for f in msgspec.structs.fields(struct_type))
+    # Pre-compute sequence field names — empty tuple means zero runtime overhead.
+    _seq_field_names = _collect_sequence_field_names(struct_type)
 
     if has_upload_file_fields:
         _upload_field_names = [f.name for f in msgspec.structs.fields(struct_type) if is_upload_file_type(f.type)]
@@ -290,6 +320,13 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
             for k, v in files_map.items():
                 if k != "_upload_files":
                     merged[k] = v
+
+            # Wrap scalar values for list[T]-typed fields so a single
+            # form occurrence still produces a one-element list.
+            for name in _seq_field_names:
+                value = merged.get(name)
+                if value is not None and not isinstance(value, list):
+                    merged[name] = [value]
 
             try:
                 result = msgspec.convert(merged, struct_type, strict=False, dec_hook=_upload_file_dec_hook)
@@ -316,6 +353,17 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
     else:
         # Extractor without file support (query params, cookies, non-file forms)
         def extract(param_map: dict[str, Any]) -> Any:
+            if _seq_field_names:
+                # Only allocate a copy when there's actual wrapping to do.
+                wrapped: dict[str, Any] | None = None
+                for name in _seq_field_names:
+                    value = param_map.get(name)
+                    if value is not None and not isinstance(value, list):
+                        if wrapped is None:
+                            wrapped = dict(param_map)
+                        wrapped[name] = [value]
+                param_map = wrapped if wrapped is not None else param_map
+
             try:
                 return msgspec.convert(param_map, struct_type, strict=False)
             except msgspec.ValidationError as e:

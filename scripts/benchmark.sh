@@ -417,6 +417,34 @@ printf -- "--%s--\r\n" "$BOUNDARY" >> "$MIXED_FILE"
 $BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$MIXED_FILE" http://$HOST:$PORT/mixed-form 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$MIXED_FILE"
 
+# Repeated-key form: exercises the multi-value form path (e.g. multi-select,
+# multiple checkboxes with the same name). Validates list[T] struct binding.
+echo "### Form Repeated Keys urlencoded (POST /form-list)"
+FORM_LIST_FILE=$(mktemp)
+echo "name=Bench&tags=red&tags=green&tags=blue&tags=yellow&counts=1&counts=2&counts=3" > "$FORM_LIST_FILE"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/x-www-form-urlencoded' -f "$FORM_LIST_FILE" http://$HOST:$PORT/form-list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+rm -f "$FORM_LIST_FILE"
+
+echo "### Form Repeated Keys multipart (POST /form-list)"
+FORM_LIST_MULTI=$(mktemp)
+BOUNDARY="----BoltFormList$(date +%s)"
+emit_part() {
+    printf -- "--%s\r\n" "$BOUNDARY" >> "$FORM_LIST_MULTI"
+    printf "Content-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" "$1" "$2" >> "$FORM_LIST_MULTI"
+}
+: > "$FORM_LIST_MULTI"
+emit_part "name" "Bench"
+emit_part "tags" "red"
+emit_part "tags" "green"
+emit_part "tags" "blue"
+emit_part "tags" "yellow"
+emit_part "counts" "1"
+emit_part "counts" "2"
+emit_part "counts" "3"
+printf -- "--%s--\r\n" "$BOUNDARY" >> "$FORM_LIST_MULTI"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$FORM_LIST_MULTI" http://$HOST:$PORT/form-list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+rm -f "$FORM_LIST_MULTI"
+
 kill -TERM -$SERVER_PID 2>/dev/null || true
 pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
 

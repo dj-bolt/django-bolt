@@ -975,6 +975,17 @@ async def handle_mixed(
     return result
 
 
+class FormRepeatedKeys(msgspec.Struct):
+    name: str
+    tags: list[str] = []
+    counts: list[int] = []
+
+
+@api.post("/form-list")
+async def handle_form_list(data: Annotated[FormRepeatedKeys, Form()]):
+    return {"name": data.name, "tag_count": len(data.tags), "count_sum": sum(data.counts)}
+
+
 # ==== File serving endpoint for benchmarks ====
 THIS_FILE = os.path.abspath(__file__)
 

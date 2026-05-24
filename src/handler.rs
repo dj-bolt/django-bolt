@@ -19,7 +19,7 @@ use crate::asgi_http;
 use crate::error;
 use crate::form_parsing::{
     parse_multipart, parse_urlencoded, FileContent, FileFieldConstraints, FileInfo,
-    FormParseResult, ValidationError, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
+    FormParseResult, FormValue, ValidationError, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
 };
 use crate::metadata::{RustArgBinding, RustArgSource};
 use crate::middleware;
@@ -338,15 +338,29 @@ pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> 
     Ok(dict.unbind())
 }
 
-/// Convert FormParseResult to Python dicts
+/// Convert FormParseResult to Python dicts.
+///
+/// Single-value fields pass through as scalar Python objects (hot path —
+/// one Py object per key). Repeated keys become a `PyList` so msgspec sees
+/// a `list` for `list[T]` struct fields.
 pub fn form_result_to_py(
     py: Python<'_>,
     result: &FormParseResult,
 ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-    // Convert form_map
     let form_dict = PyDict::new(py);
     for (key, value) in &result.form_map {
-        form_dict.set_item(key, coerced_value_to_py(py, value))?;
+        match value {
+            FormValue::Single(v) => {
+                form_dict.set_item(key, coerced_value_to_py(py, v))?;
+            }
+            FormValue::Multi(vs) => {
+                let list = PyList::empty(py);
+                for v in vs {
+                    list.append(coerced_value_to_py(py, v))?;
+                }
+                form_dict.set_item(key, list)?;
+            }
+        }
     }
 
     // Convert files_map - each field can have multiple files
