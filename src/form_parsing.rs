@@ -574,4 +574,182 @@ mod tests {
         assert_eq!(json["ctx"]["max_size"], 1024);
         assert_eq!(json["ctx"]["actual_size"], 2048);
     }
+
+    // ------------------------------------------------------------------
+    // FormValue::append — Single → Multi promotion
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_form_value_append_single_to_multi() {
+        // Starting from Single, the first append must promote to Multi(2).
+        let mut fv = FormValue::Single(CoercedValue::String("first".to_string()));
+        fv.append(CoercedValue::String("second".to_string()));
+
+        match fv {
+            FormValue::Multi(v) => {
+                assert_eq!(v.len(), 2);
+                assert!(matches!(&v[0], CoercedValue::String(s) if s == "first"));
+                assert!(matches!(&v[1], CoercedValue::String(s) if s == "second"));
+            }
+            other => panic!("expected Multi after append, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_form_value_append_multi_grows() {
+        // A Multi that receives a third value must grow to len 3.
+        let mut fv = FormValue::Single(CoercedValue::String("a".to_string()));
+        fv.append(CoercedValue::String("b".to_string()));
+        fv.append(CoercedValue::String("c".to_string()));
+
+        match fv {
+            FormValue::Multi(v) => {
+                assert_eq!(v.len(), 3);
+                assert!(matches!(&v[0], CoercedValue::String(s) if s == "a"));
+                assert!(matches!(&v[1], CoercedValue::String(s) if s == "b"));
+                assert!(matches!(&v[2], CoercedValue::String(s) if s == "c"));
+            }
+            other => panic!("expected Multi, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_form_value_append_int_values() {
+        // append works for non-String CoercedValues too.
+        let mut fv = FormValue::Single(CoercedValue::Int(1));
+        fv.append(CoercedValue::Int(2));
+
+        match fv {
+            FormValue::Multi(v) => {
+                assert_eq!(v.len(), 2);
+                assert!(matches!(&v[0], CoercedValue::Int(1)));
+                assert!(matches!(&v[1], CoercedValue::Int(2)));
+            }
+            other => panic!("expected Multi, got {:?}", other),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // parse_urlencoded — edge cases with repeated keys
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_urlencoded_two_repeated_keys_is_multi() {
+        // Exactly two occurrences must produce Multi(2), not Single.
+        let body = Bytes::from("color=red&color=blue");
+        let result = parse_urlencoded(&body, &HashMap::new()).unwrap();
+
+        match result.get("color") {
+            Some(FormValue::Multi(v)) => {
+                assert_eq!(v.len(), 2);
+                assert!(matches!(&v[0], CoercedValue::String(s) if s == "red"));
+                assert!(matches!(&v[1], CoercedValue::String(s) if s == "blue"));
+            }
+            other => panic!("expected Multi(2), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_urlencoded_repeated_int_key() {
+        // Repeated keys with TYPE_INT hints should all coerce to Int.
+        let body = Bytes::from("count=1&count=2&count=3");
+        let mut type_hints = HashMap::new();
+        type_hints.insert("count".to_string(), crate::type_coercion::TYPE_INT);
+
+        let result = parse_urlencoded(&body, &type_hints).unwrap();
+
+        match result.get("count") {
+            Some(FormValue::Multi(v)) => {
+                assert_eq!(v.len(), 3);
+                assert!(matches!(&v[0], CoercedValue::Int(1)));
+                assert!(matches!(&v[1], CoercedValue::Int(2)));
+                assert!(matches!(&v[2], CoercedValue::Int(3)));
+            }
+            other => panic!("expected Multi of ints, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_urlencoded_empty_body() {
+        // Empty body → empty result map, no error.
+        let body = Bytes::from("");
+        let result = parse_urlencoded(&body, &HashMap::new()).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_urlencoded_single_key_stays_single() {
+        // A key that appears only once must remain FormValue::Single.
+        let body = Bytes::from("name=Alice");
+        let result = parse_urlencoded(&body, &HashMap::new()).unwrap();
+
+        assert!(matches!(
+            result.get("name"),
+            Some(FormValue::Single(CoercedValue::String(s))) if s == "Alice"
+        ));
+    }
+
+    #[test]
+    fn test_parse_urlencoded_mixed_single_and_repeated_keys() {
+        // Mix: 'tag' repeated (Multi) while 'name' appears once (Single).
+        let body = Bytes::from("name=Bob&tag=x&tag=y");
+        let result = parse_urlencoded(&body, &HashMap::new()).unwrap();
+
+        // 'name' → Single
+        assert!(matches!(
+            result.get("name"),
+            Some(FormValue::Single(CoercedValue::String(s))) if s == "Bob"
+        ));
+
+        // 'tag' → Multi with 2 elements
+        match result.get("tag") {
+            Some(FormValue::Multi(v)) => {
+                assert_eq!(v.len(), 2);
+                assert!(matches!(&v[0], CoercedValue::String(s) if s == "x"));
+                assert!(matches!(&v[1], CoercedValue::String(s) if s == "y"));
+            }
+            other => panic!("expected Multi for 'tag', got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_urlencoded_preserves_insertion_order_for_multi() {
+        // Values for a repeated key must be stored in document order.
+        let body = Bytes::from("v=alpha&v=beta&v=gamma&v=delta");
+        let result = parse_urlencoded(&body, &HashMap::new()).unwrap();
+
+        match result.get("v") {
+            Some(FormValue::Multi(v)) => {
+                assert_eq!(v.len(), 4);
+                let strings: Vec<&str> = v
+                    .iter()
+                    .map(|c| match c {
+                        CoercedValue::String(s) => s.as_str(),
+                        _ => panic!("expected String"),
+                    })
+                    .collect();
+                assert_eq!(strings, vec!["alpha", "beta", "gamma", "delta"]);
+            }
+            other => panic!("expected Multi(4), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_urlencoded_bool_repeated_key() {
+        // Repeated bool-typed keys — each coerced individually.
+        let body = Bytes::from("flag=true&flag=false");
+        let mut type_hints = HashMap::new();
+        type_hints.insert("flag".to_string(), crate::type_coercion::TYPE_BOOL);
+
+        let result = parse_urlencoded(&body, &type_hints).unwrap();
+
+        match result.get("flag") {
+            Some(FormValue::Multi(v)) => {
+                assert_eq!(v.len(), 2);
+                assert!(matches!(&v[0], CoercedValue::Bool(true)));
+                assert!(matches!(&v[1], CoercedValue::Bool(false)));
+            }
+            other => panic!("expected Multi of bools, got {:?}", other),
+        }
+    }
 }
