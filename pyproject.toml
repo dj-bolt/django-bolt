@@ -78,6 +78,7 @@ dev = [
     "vulture>=2.11", #for dead code detection
     "nanodjango>=0.16",
     "openapi-spec-validator>=0.8.5",
+    "zstandard>=0.25.0", # for testing with zstd-compressed payloads
 ]
 docs = [
     "zensical",

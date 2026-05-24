@@ -24,7 +24,7 @@ from collections.abc import (
     Iterator as IteratorABC,
 )
 from functools import cache
-from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Union, get_args, get_origin
 
 import msgspec
 from asgiref.sync import sync_to_async
@@ -35,6 +35,7 @@ from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 from . import _json
 from ._kwargs import coerce_to_response_type, coerce_to_response_type_async
 from .cookies import Cookie
+from .exceptions import ResponseValidationError
 from .responses import (
     HTML,
     JSON,
@@ -204,17 +205,17 @@ _VALIDATION_NOOP_TYPES = {
 }
 
 
-def _response_validation_error(exc: Exception) -> ResponseWireV1:
-    err = f"Response validation error: {exc}"
-    return _wire_bytes(
-        500,
-        _build_response_meta(
-            "plaintext",
-            {"content-type": "text/plain; charset=utf-8"},
-            None,
-        ),
-        err.encode(),
-    )
+def _raise_response_validation_error(exc: Exception) -> NoReturn:
+    """Convert a low-level validation failure into ResponseValidationError.
+
+    Handler returned data that doesn't match its declared response_model.
+    Raising ResponseValidationError lets the central exception handler
+    (`error_handlers.response_validation_error_handler`) emit a structured 500
+    JSON response, log the bug, and apply debug/prod policy uniformly.
+    """
+    if isinstance(exc, msgspec.ValidationError):
+        raise ResponseValidationError([exc]) from exc
+    raise ResponseValidationError([{"loc": ["response"], "msg": str(exc), "type": "validation_error"}]) from exc
 
 
 def _build_wire_meta(
@@ -506,11 +507,89 @@ def _build_auto_streaming_response(
     return StreamingResponse(result, status_code=status_code)
 
 
+def _is_bolt_serializer(t: Any) -> bool:
+    """True if t opts into Bolt Serializer behaviour via __is_bolt_serializer__."""
+    return getattr(t, "__is_bolt_serializer__", False)
+
+
+def _is_plain_struct(t: Any) -> bool:
+    """msgspec.Struct subclass, but NOT a Bolt Serializer."""
+    try:
+        return isinstance(t, type) and issubclass(t, msgspec.Struct) and not _is_bolt_serializer(t)
+    except (TypeError, AttributeError):
+        return False
+
+
+def _union_of_plain_structs(t: Any) -> tuple[type, ...] | None:
+    """If t is a Union of plain msgspec.Structs (optional None allowed), return the struct tuple."""
+    origin = get_origin(t)
+    if origin not in (Union, types.UnionType):
+        return None
+    args = [a for a in get_args(t) if a is not type(None)]
+    if not args or not all(_is_plain_struct(a) for a in args):
+        return None
+    return tuple(args)
+
+
+def _compile_inline_response_validator(
+    meta: HandlerMetadata | dict[str, Any],
+) -> tuple[str, Any] | None:
+    """Pre-classify the response annotation for the inline-encoding fast path.
+
+    Returns a descriptor consumed by the dispatcher in ``api.py``:
+      - ``("struct", types_tuple)`` — runtime ``isinstance`` against ``types_tuple``;
+        on match, encode directly via ``msgspec.json.Encoder``.
+      - ``("list", annotation)`` — when the handler returns a Python list,
+        ``msgspec.convert(result, annotation)`` then encode.
+      - ``None`` — no inline path; the dispatcher falls back to
+        ``serialize_response[_sync]``.
+
+    The dispatcher always delegates non-matching runtime values (Response
+    objects, QuerySets, generators, ``None``, dicts, Serializers, ...) to
+    ``serialize_response`` so the slow path handles every edge case uniformly.
+
+    Bails out at registration time for setups that need the slow path
+    end-to-end:
+      - ``validate_response=False``
+      - ``response_class`` set (SSE/FileResponse/etc. need slow-path wrapping)
+      - ``default_status_code == 204`` (None-body shortcut lives in the slow path)
+      - ``is_multi_response`` (multi-status routes have their own dispatcher)
+    """
+    if not meta.get("validate_response", True):
+        return None
+    if meta.get("response_class") is not None:
+        return None
+    if meta.get("default_status_code") == 204:
+        return None
+    if meta.get("is_multi_response"):
+        return None
+    response_type = meta.get("response_type")
+    if response_type is None or response_type in _VALIDATION_NOOP_TYPES:
+        return None
+
+    if _is_plain_struct(response_type):
+        return ("struct", (response_type,))
+
+    union_structs = _union_of_plain_structs(response_type)
+    if union_structs is not None:
+        return ("struct", union_structs)
+
+    if get_origin(response_type) is list:
+        args = get_args(response_type)
+        if args:
+            item_type = args[0]
+            if _is_plain_struct(item_type) or _union_of_plain_structs(item_type) is not None:
+                return ("list", response_type)
+
+    return None
+
+
 def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     validator_sync, validator_async = _compile_response_validator(meta)
     stream_validator_sync, stream_validator_async = _compile_stream_item_validators(meta)
     queryset_serializer_sync, queryset_serializer_async = _compile_queryset_serializers(meta)
     model_projector = _compile_model_projector(meta)
+    inline_validator = _compile_inline_response_validator(meta)
 
     meta["_response_validator"] = validator_sync
     meta["_response_validator_async"] = validator_async
@@ -518,6 +597,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     meta["_stream_item_validator_async"] = stream_validator_async
     meta["_queryset_serializer"] = queryset_serializer_sync
     meta["_queryset_serializer_async"] = queryset_serializer_async
+    meta["_inline_response_validator"] = inline_validator
     meta["_has_response_validation"] = validator_sync is not None or validator_async is not None
 
     default_status_code = meta["default_status_code"]
@@ -611,9 +691,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, JSON):
             if validator_async is not None:
                 try:
-                    data_bytes = _json.encode(await validator_async(result.data))
+                    validated = await validator_async(result.data)
+                except ResponseValidationError:
+                    raise
                 except Exception as exc:
-                    return _response_validation_error(exc)
+                    _raise_response_validation_error(exc)
+                data_bytes = _json.encode(validated)
             else:
                 data_bytes = result.to_bytes()
             cookies = getattr(result, "_cookies", None)
@@ -633,9 +716,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, ResponseClass):
             if validator_async is not None:
                 try:
-                    body = _render_response_body(await validator_async(result.content), result.media_type)
+                    validated = await validator_async(result.content)
+                except ResponseValidationError:
+                    raise
                 except Exception as exc:
-                    return _response_validation_error(exc)
+                    _raise_response_validation_error(exc)
+                body = _render_response_body(validated, result.media_type)
             else:
                 body = _render_response_body(result.content, result.media_type)
             rt = _infer_wire_response_type(result.media_type)
@@ -650,9 +736,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, JSON):
             if validator_sync is not None:
                 try:
-                    data_bytes = _json.encode(validator_sync(result.data))
+                    validated = validator_sync(result.data)
+                except ResponseValidationError:
+                    raise
                 except Exception as exc:
-                    return _response_validation_error(exc)
+                    _raise_response_validation_error(exc)
+                data_bytes = _json.encode(validated)
             else:
                 data_bytes = result.to_bytes()
             cookies = getattr(result, "_cookies", None)
@@ -672,9 +761,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, ResponseClass):
             if validator_sync is not None:
                 try:
-                    body = _render_response_body(validator_sync(result.content), result.media_type)
+                    validated = validator_sync(result.content)
+                except ResponseValidationError:
+                    raise
                 except Exception as exc:
-                    return _response_validation_error(exc)
+                    _raise_response_validation_error(exc)
+                body = _render_response_body(validated, result.media_type)
             else:
                 body = _render_response_body(result.content, result.media_type)
             rt = _infer_wire_response_type(result.media_type)
@@ -717,9 +809,10 @@ async def _serialize_json_payload_async(
     if validator is not None:
         try:
             result = await validator(result)
+        except ResponseValidationError:
+            raise
         except Exception as exc:
-            return _response_validation_error(exc)
-
+            _raise_response_validation_error(exc)
     return _wire_bytes(status_code, _RESPONSE_META_JSON, _json.encode(result))
 
 
@@ -731,9 +824,10 @@ def _serialize_json_payload_sync(
     if validator is not None:
         try:
             result = validator(result)
+        except ResponseValidationError:
+            raise
         except Exception as exc:
-            return _response_validation_error(exc)
-
+            _raise_response_validation_error(exc)
     return _wire_bytes(status_code, _RESPONSE_META_JSON, _json.encode(result))
 
 

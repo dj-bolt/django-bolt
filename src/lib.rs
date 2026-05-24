@@ -24,6 +24,7 @@ mod server;
 mod state;
 mod static_files;
 mod streaming;
+mod streaming_compression;
 mod testing;
 mod type_coercion;
 mod validation;

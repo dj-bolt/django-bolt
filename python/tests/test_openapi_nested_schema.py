@@ -218,8 +218,14 @@ def test_self_referential_struct_does_not_recurse():
     ]
 
 
-def test_multi_type_union_produces_any_of():
-    """Union[A, B] (tagged) should produce anyOf with refs to both schemas."""
+def test_multi_type_union_produces_one_of():
+    """Tagged ``Union[A, B]`` produces ``oneOf`` (matches Litestar).
+
+    Tagged Struct unions get ``oneOf`` so Swagger UI renders a per-branch
+    dropdown (and the OpenAPI 3.1 discriminator semantics — exactly one
+    arm matches via the tag field — are spec-accurate). Untagged or
+    primitive unions stay on ``anyOf``; see other tests in this module.
+    """
     api = BoltAPI(openapi_config=OpenAPIConfig(title="Test", version="1.0.0"))
 
     @api.get("/owner")
@@ -235,10 +241,22 @@ def test_multi_type_union_produces_any_of():
     assert "Dog" in schemas
     assert "bark" in schemas["Dog"]["properties"]
 
-    # pet field should use anyOf
+    # Tag field is surfaced as enum=[<tag>] on each struct so generated
+    # clients can use it as a discriminator and Swagger UI renders it
+    # in the example value.
+    assert schemas["Cat"]["properties"]["type"] == {"type": "string", "enum": ["cat"]}
+    assert "type" in schemas["Cat"]["required"]
+    assert schemas["Dog"]["properties"]["type"] == {"type": "string", "enum": ["dog"]}
+    assert "type" in schemas["Dog"]["required"]
+
+    # Top-level component `title` lets Swagger UI render oneOf arms as
+    # "Cat" / "Dog" instead of "#0" / "#1".
+    assert schemas["Cat"]["title"] == "Cat"
+    assert schemas["Dog"]["title"] == "Dog"
+
     pet_field = schemas["PetOwner"]["properties"]["pet"]
-    assert "anyOf" in pet_field, f"Expected anyOf for union field, got: {pet_field}"
-    refs = {item["$ref"] for item in pet_field["anyOf"]}
+    assert "oneOf" in pet_field, f"Expected oneOf for tagged union, got: {pet_field}"
+    refs = {item["$ref"] for item in pet_field["oneOf"]}
     assert refs == {"#/components/schemas/Cat", "#/components/schemas/Dog"}
 
 

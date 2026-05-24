@@ -5,7 +5,8 @@ import http.client
 import inspect
 import re
 from dataclasses import replace
-from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin
+from types import UnionType
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_origin
 
 import msgspec
 
@@ -13,6 +14,7 @@ from ..datastructures import UploadFile
 from ..serializers.fields import _FieldMarker
 from ..typing import is_msgspec_struct, is_optional, unwrap_optional
 from .spec import (
+    Example,
     OpenAPI,
     OpenAPIHeader,
     OpenAPIMediaType,
@@ -46,6 +48,139 @@ _PATH_PARAM_RE = re.compile(r"{([^{}]+)}")
 def _extract_path_param_names(path: str) -> list[str]:
     """Return path parameter names declared in a route path (e.g. {pk} → "pk")."""
     return _PATH_PARAM_RE.findall(path)
+
+
+def _is_tagged_struct_union(arms: list[Any]) -> bool:
+    """True when every union arm is a tagged ``msgspec.Struct`` subclass.
+
+    Accepts both raw classes (``typing.Union`` / PEP 604) and
+    ``msgspec.inspect.StructType`` wrappers (the inspect-path branch).
+    A "tagged" Struct is one whose ``__struct_config__.tag`` is set
+    (msgspec resolves ``tag=True`` to the class name at class creation),
+    which is the only case where Swagger UI's ``oneOf`` discriminator
+    rendering buys us anything over ``anyOf``.
+    """
+    if not arms:
+        return False
+    for arm in arms:
+        # msgspec.inspect.StructType wraps the actual struct class on .cls
+        cls = getattr(arm, "cls", arm)
+        if not isinstance(cls, type) or not issubclass(cls, msgspec.Struct):
+            return False
+        struct_config = getattr(cls, "__struct_config__", None)
+        if struct_config is None or getattr(struct_config, "tag", None) is None:
+            return False
+    return True
+
+
+# Placeholder values used when synthesising response examples per Struct field.
+# Picked to match what Swagger UI would render itself for unspecified examples,
+# so users see consistent ``"string"``/``0`` placeholders across all arms.
+_PLACEHOLDER_BY_MSGSPEC_TYPE: dict[str, Any] = {
+    "IntType": 0,
+    "FloatType": 0.0,
+    "StrType": "string",
+    "BoolType": True,
+    "BytesType": "",
+    "DateTimeType": "2024-01-01T00:00:00Z",
+    "DateType": "2024-01-01",
+    "TimeType": "00:00:00",
+    "UUIDType": "00000000-0000-0000-0000-000000000000",
+    "DecimalType": "0",
+    "NoneType": None,
+}
+
+
+def _synthesize_example(field_type: Any, depth: int = 0) -> Any:
+    """Build a Swagger-style placeholder value for a ``msgspec.inspect.*Type``.
+
+    Used only for OpenAPI ``examples:`` rendering. Bounded recursion depth
+    prevents infinite loops on self-referential Structs.
+    """
+    if depth > 5:
+        return None
+    type_name = type(field_type).__name__
+    placeholder = _PLACEHOLDER_BY_MSGSPEC_TYPE.get(type_name)
+    if placeholder is not None or type_name == "NoneType":
+        return placeholder
+    if type_name == "StructType":
+        return _synthesize_struct_example(field_type.cls, depth + 1)
+    if type_name == "ListType":
+        item_type = getattr(field_type, "item_type", None)
+        return [_synthesize_example(item_type, depth + 1)] if item_type is not None else []
+    if type_name == "DictType":
+        return {}
+    if type_name == "UnionType":
+        for arm in field_type.types:
+            if type(arm).__name__ != "NoneType":
+                return _synthesize_example(arm, depth + 1)
+        return None
+    if type_name == "LiteralType":
+        values = getattr(field_type, "values", None)
+        return values[0] if values else None
+    if type_name == "EnumType":
+        cls = getattr(field_type, "cls", None)
+        members = list(cls) if cls is not None else []
+        return members[0].value if members else None
+    return None
+
+
+def _synthesize_struct_example(struct_cls: type, depth: int = 0) -> dict[str, Any]:
+    """Build a placeholder dict for a tagged ``msgspec.Struct`` subclass.
+
+    Includes the resolved tag field so each example clearly identifies its
+    variant — that's the whole point of emitting per-arm examples.
+    """
+    struct_info = msgspec.inspect.type_info(struct_cls)
+    value: dict[str, Any] = {}
+    for field in struct_info.fields:
+        value[field.encode_name] = _synthesize_example(field.type, depth + 1)
+    tag_field = getattr(struct_info, "tag_field", None)
+    tag = getattr(struct_info, "tag", None)
+    if tag_field and tag is not None:
+        value[tag_field] = tag
+    return value
+
+
+def _build_union_examples(response_type: Any) -> dict[str, Example] | None:
+    """Emit per-arm examples for a tagged Struct union *single-object* response.
+
+    Returns a mapping ``{tag → Example}`` that Swagger UI renders as an
+    example-picker dropdown — one example per branch of the tagged union.
+    Only fires for the single-object shape ``Union[A, B, ...]``.
+
+    Explicitly skips ``list[Union[A, B, ...]]`` because a runtime list can
+    contain a mix of arms; collapsing it to per-arm dropdowns of
+    homogeneous lists ("here are 10 Cats" / "here are 10 Dogs")
+    misrepresents the schema. Swagger's default rendering of
+    ``items.oneOf`` already produces a heterogeneous example array (one
+    of each variant intermixed), which is the truthful representation.
+
+    Returns ``None`` for anything else (untagged unions, primitives,
+    nested unions, etc.) so Swagger's default rendering takes over.
+    """
+    if response_type is None:
+        return None
+    origin = get_origin(response_type)
+    if origin is Annotated:
+        response_type = get_args(response_type)[0]
+        origin = get_origin(response_type)
+    if origin not in (Union, UnionType):
+        return None
+    arms = [a for a in get_args(response_type) if a is not type(None)]
+    if not _is_tagged_struct_union(arms):
+        return None
+    examples: dict[str, Example] = {}
+    for arm in arms:
+        struct_info = msgspec.inspect.type_info(arm)
+        tag = getattr(struct_info, "tag", None)
+        if tag is None:
+            continue
+        examples[str(tag)] = Example(
+            summary=f"{arm.__name__} variant",
+            value=_synthesize_struct_example(arm),
+        )
+    return examples or None
 
 
 class SchemaGenerator:
@@ -625,7 +760,12 @@ class SchemaGenerator:
                     schema = self._type_to_schema(resp_type, register_component=True)
                     responses[str(code)] = OpenAPIResponse(
                         description=desc,
-                        content={"application/json": OpenAPIMediaType(schema=schema)},
+                        content={
+                            "application/json": OpenAPIMediaType(
+                                schema=schema,
+                                examples=_build_union_examples(resp_type),
+                            )
+                        },
                     )
             # Ellipsis catch-all → OpenAPI "default" response
             if ... in response_map:
@@ -636,7 +776,12 @@ class SchemaGenerator:
                     schema = self._type_to_schema(ellipsis_type, register_component=True)
                     responses["default"] = OpenAPIResponse(
                         description="Default response",
-                        content={"application/json": OpenAPIMediaType(schema=schema)},
+                        content={
+                            "application/json": OpenAPIMediaType(
+                                schema=schema,
+                                examples=_build_union_examples(ellipsis_type),
+                            )
+                        },
                     )
             # fall through to error response logic below
         else:
@@ -652,7 +797,10 @@ class SchemaGenerator:
                 responses[str(default_status)] = OpenAPIResponse(
                     description="Successful response",
                     content={
-                        "application/json": OpenAPIMediaType(schema=schema),
+                        "application/json": OpenAPIMediaType(
+                            schema=schema,
+                            examples=_build_union_examples(response_type),
+                        ),
                     },
                 )
             else:
@@ -924,6 +1072,12 @@ class SchemaGenerator:
 
                 if len(inner_schemas) == 1:
                     return inner_schemas[0]
+                if _is_tagged_struct_union(non_none_types):
+                    # Tagged Struct union — `one_of` makes Swagger UI
+                    # render a dropdown showing each variant's example,
+                    # and matches the OpenAPI 3.1 discriminator semantics
+                    # (exactly one branch matches via the tag field).
+                    return Schema(one_of=inner_schemas)
                 return Schema(any_of=inner_schemas)
             if type_name == "ListType":
                 item_type = getattr(type_annotation, "item_type", None)
@@ -960,11 +1114,12 @@ class SchemaGenerator:
             origin = get_origin(type_annotation)
             args = get_args(type_annotation)
 
-        # Handle Optional[T] -> T
+        # Handle Optional[T] -> T (single non-None arg only; multi-arm unions
+        # like `A | B | None` fall through to the Union branch below so every
+        # arm is preserved).
         if is_optional(type_annotation):
-            # Get the non-None type
             non_none_args = [arg for arg in args if arg is not type(None)]
-            if non_none_args:
+            if len(non_none_args) == 1:
                 type_annotation = non_none_args[0]
                 origin = get_origin(type_annotation)
                 args = get_args(type_annotation)
@@ -980,6 +1135,22 @@ class SchemaGenerator:
                 return self._struct_to_component_schema(type_annotation)
             else:
                 return self._struct_to_schema(type_annotation)
+
+        if origin is Union or origin is UnionType:
+            # Split out `None` into a `null` arm (OpenAPI 3.1 nullable
+            # encoding). Use `one_of` for tagged Struct unions so Swagger
+            # UI renders a per-branch dropdown; `any_of` for everything
+            # else (primitive nullable, mixed unions) for spec accuracy.
+            non_none_args = [arg for arg in args if arg is not type(None)]
+            has_none = len(non_none_args) != len(args)
+            inner = [self._type_to_schema(arg, register_component=register_component) for arg in non_none_args]
+            if has_none:
+                inner.append(Schema(type="null"))
+            if len(inner) == 1:
+                return inner[0]
+            if _is_tagged_struct_union(non_none_args):
+                return Schema(one_of=inner)
+            return Schema(any_of=inner)
 
         # Handle list
         if origin is list:
@@ -1052,6 +1223,7 @@ class SchemaGenerator:
         own_doc = struct_type.__dict__.get("__doc__")
         description = inspect.cleandoc(own_doc) if own_doc else None
         return Schema(
+            title=struct_type.__name__,
             type="object",
             title=struct_type.__name__,
             description=description,

@@ -366,7 +366,13 @@ class TestClient(httpx.Client):
         debug = getattr(settings, "DEBUG", False) if settings else False
         dispatch_sync = getattr(api, "_dispatch_sync", None)
         self.app_id = _core.create_test_app(
-            api._dispatch, debug, cors_config, trailing_slash, static_config, dispatch_sync
+            api._dispatch,
+            debug,
+            cors_config,
+            trailing_slash,
+            static_config,
+            dispatch_sync,
+            api._rust_compression_config(),
         )
 
         # Validate mount collisions to mirror production startup behavior.
@@ -619,7 +625,13 @@ class AsyncTestClient(httpx.AsyncClient):
         debug = getattr(settings, "DEBUG", False) if settings else False
         dispatch_sync = getattr(api, "_dispatch_sync", None)
         self.app_id = _core.create_test_app(
-            api._dispatch, debug, cors_config, trailing_slash, static_config, dispatch_sync
+            api._dispatch,
+            debug,
+            cors_config,
+            trailing_slash,
+            static_config,
+            dispatch_sync,
+            api._rust_compression_config(),
         )
 
         # Validate mount collisions to mirror production startup behavior.

@@ -102,6 +102,24 @@ printf "### File Static via FileResponse (/file-static)\n"
 $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/file-static 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
+echo "## Union Response Overhead"
+# Paired endpoints — identical Python work and byte-identical JSON output.
+# The only difference is response_model: union vs the concrete struct. Diffing
+# RPS between each pair isolates union dispatch / response-validation cost.
+
+printf "### Single struct, no union (/bench/single)\n"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/single 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+printf "### Single struct via tagged union (/bench/union-single)\n"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/union-single 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+printf "### List of 100 structs, no union (/bench/list)\n"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+printf "### List of 100 structs via tagged union (/bench/union-list)\n"
+$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/union-list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+echo ""
 echo "## Authentication & Authorization Performance"
 
 # Create a Django user and JWT token for testing
@@ -517,6 +535,31 @@ $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/tuple 2>&1 | tr '\
 echo ""
 echo "### Multi-response bare dict (/bench/multi/dict)"
 $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/dict 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+echo ""
+echo "## Union Response Performance"
+echo "Polymorphic feed with tagged msgspec Struct union (PostActivity | CommentActivity | LikeActivity)"
+
+echo ""
+echo "### Single union item — Post branch (/feed/0)"
+UCODE=$(curl -s -o /dev/null -w '%{http_code}' "http://$HOST:$PORT/feed/0")
+if [ "$UCODE" = "200" ]; then
+  $BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/feed/0" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+else
+  echo "Skipped: /feed/0 returned $UCODE" >&2
+fi
+
+echo ""
+echo "### Single union item — Comment branch (/feed/1)"
+$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/feed/1" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+echo ""
+echo "### Single union item — Like branch (/feed/2)"
+$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/feed/2" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+echo ""
+echo "### Feed of 100 mixed union items (/feed)"
+$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/feed" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 kill -TERM -$SERVER_PID 2>/dev/null || true
 pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true

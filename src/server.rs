@@ -473,35 +473,12 @@ pub fn start_server(
         )));
     }
 
-    // Parse compression configuration from Python
-    let global_compression_config = compression_config.and_then(|config_py| {
-        Python::attach(|py| {
-            let config_obj = config_py.bind(py);
-
-            // Extract compression settings from Python dict
-            let backend = config_obj
-                .get_item("backend")
-                .ok()?
-                .extract::<String>()
-                .ok()?;
-            let minimum_size = config_obj
-                .get_item("minimum_size")
-                .ok()?
-                .extract::<usize>()
-                .ok()?;
-            let gzip_fallback = config_obj
-                .get_item("gzip_fallback")
-                .ok()?
-                .extract::<bool>()
-                .ok()?;
-
-            Some(CompressionConfig {
-                backend,
-                minimum_size,
-                gzip_fallback,
-            })
-        })
-    });
+    let global_compression_config = match compression_config {
+        Some(config_py) => Some(Arc::new(Python::attach(|py| {
+            CompressionConfig::from_python_dict(config_py.bind(py))
+        })?)),
+        None => None,
+    };
 
     // Build static files configuration
     let static_files_config = static_files_data.and_then(|(url_prefix, directories)| {

@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.1]
+
+### Added
+
+- **Per-chunk streaming compression for SSE and async generators** - `StreamingResponse` and `EventSourceResponse` are now compressed on a per-chunk basis with a sync flush, so individual events still reach the client immediately. One encoder runs per connection so cross-chunk dictionary reuse still helps the ratio. Supports brotli, gzip, and zstd. Opt out per-route with `@no_compress` (same decorator as buffered).
+- **Unified `CompressionConfig` across buffered and streaming responses** - A single `CompressionConfig` now drives both the global buffered compression middleware and the streaming codec. Same `@no_compress` decorator opts a route out of both paths; same `Accept-Encoding` negotiation picks the encoding for both.
+
+### Changed
+
+- **Default `brotli_lgwin` lowered from 18 to 14** - The sliding-window log size now defaults to `14` (16 KiB window per active connection) instead of `18` (256 KiB). This is the dominant per-connection memory knob for streaming compression; the new default cuts memory per active SSE/WebSocket stream by ~16× at minimal cost to compression ratio for typical event payloads. Tune up for large repetitive bodies; tune down for high-fanout streams.
+- **Buffered Accept-Encoding negotiation aligned with RFC 7231 §5.3.4** - The buffered `select_encoding` now uses the same RFC-compliant parser as the streaming path. Q-values (`br;q=0`), the `*` wildcard (`*` accepts unmentioned codings; `*;q=0` rejects them), case-insensitive coding tokens, and explicit overrides of `*` are now honored on both paths. The prior substring-based matcher accepted `br;q=0` as brotli, ignored `*` entirely, and false-matched non-standard tokens like `x-gzip-old`.
+
+### Fixed
+
+- **`BoltAPI(compression=False)` now actually disables buffered compression** - Previously, when compression was explicitly disabled, the buffered middleware still fell back to its hardcoded defaults (brotli with gzip fallback) and compressed responses anyway. The negotiator now correctly returns `identity` when no config is attached to the app state, matching the documented behavior. (`compression=None`, or omitting the kwarg, continues to apply the default `CompressionConfig()`.)
+
+### Documentation
+
+- **New dedicated `Compression` topic page** - Buffered and streaming compression are now documented together at `docs/src/topics/compression.md`, replacing the orphaned `streaming_compression.md` page. Covers `CompressionConfig`, negotiation, per-chunk flush mechanics, the `lgwin` per-connection memory table, level/ratio tradeoffs, and CRIME/BREACH guidance. The `middleware.md` Compression subsection shortened to a brief overview that links to the new page.
+
 ## [0.7.5]
 
 ### Added
