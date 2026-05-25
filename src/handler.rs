@@ -367,7 +367,7 @@ pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> 
 /// use pyo3::prelude::*;
 ///
 /// // Assume `result` is a FormParseResult obtained from multipart parsing.
-/// # let result: crate::forms::FormParseResult = unimplemented!();
+/// # let result: crate::form_parsing::FormParseResult = unimplemented!();
 /// Python::with_gil(|py| {
 ///     let (form_dict, files_dict) = crate::handler::form_result_to_py(py, &result).unwrap();
 ///     // `form_dict` maps field names -> scalar Python objects or lists
