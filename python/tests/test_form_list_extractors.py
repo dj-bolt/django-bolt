@@ -284,6 +284,17 @@ class TestCreateParamStructExtractorScalarWrapping:
 
         assert result.counts == [42]
 
+    def test_empty_list_preserved(self):
+        """An explicit empty list must not be replaced by the struct default."""
+
+        class Form(msgspec.Struct):
+            tags: list[str] = msgspec.field(default_factory=lambda: ["default"])
+
+        extractor = self._make_extractor(Form)
+        result = extractor({"tags": []})
+
+        assert result.tags == []
+
     def test_extractor_has_needs_files_map_false(self):
         """Non-file extractors expose needs_files_map=False for dispatcher."""
 
