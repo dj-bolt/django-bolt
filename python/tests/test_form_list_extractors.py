@@ -17,6 +17,7 @@ from django_bolt._kwargs.extractors import (
     _create_param_struct_extractor,
     _is_sequence_field,
 )
+from django_bolt.datastructures import UploadFile
 
 
 # ---------------------------------------------------------------------------
@@ -291,3 +292,25 @@ class TestCreateParamStructExtractorScalarWrapping:
 
         extractor = self._make_extractor(Form)
         assert extractor.needs_files_map is False
+
+    def test_scalar_wrapping_with_upload_file_field(self):
+        """needs_files_map=True branch still applies sequence scalar wrapping."""
+
+        class Form(msgspec.Struct):
+            tags: list[str] = []
+            upload: Optional[UploadFile] = None
+
+        extractor = self._make_extractor(Form)
+        assert extractor.needs_files_map is True
+
+        file_info = {
+            "filename": "note.txt",
+            "content": b"hello",
+            "content_type": "text/plain",
+            "size": 5,
+        }
+        result = extractor({"tags": "solo"}, {"upload": file_info})
+
+        assert result.tags == ["solo"]
+        assert isinstance(result.upload, UploadFile)
+        assert result.upload.filename == "note.txt"
