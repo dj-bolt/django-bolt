@@ -1040,7 +1040,13 @@ async fn handle_test_request_internal(
 
         // Only create form/files dicts when form data is present (matches production).
         let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {
-            let (fm, fi) = form_result_to_py(py, result)
+            static EMPTY_SEQ: std::sync::OnceLock<std::collections::HashSet<String>> =
+                std::sync::OnceLock::new();
+            let seq_fields = route_meta
+                .as_ref()
+                .map(|m| &m.form_seq_fields)
+                .unwrap_or_else(|| EMPTY_SEQ.get_or_init(std::collections::HashSet::new));
+            let (fm, fi) = form_result_to_py(py, result, seq_fields)
                 .unwrap_or_else(|_| (PyDict::new(py).unbind(), PyDict::new(py).unbind()));
             (Some(fm), Some(fi))
         } else {

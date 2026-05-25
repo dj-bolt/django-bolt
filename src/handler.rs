@@ -379,37 +379,42 @@ pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> 
 pub fn form_result_to_py(
     py: Python<'_>,
     result: &FormParseResult,
+    seq_fields: &std::collections::HashSet<String>,
 ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
     let form_dict = PyDict::new(py);
     for (key, value) in &result.form_map {
         match value {
             FormValue::Single(v) => {
-                form_dict.set_item(key, coerced_value_to_py(py, v))?;
+                let py_val = coerced_value_to_py(py, v);
+                if seq_fields.contains(key) {
+                    // Always emit list[T] for fields annotated as list/set/tuple.
+                    // The Python form-struct extractor skips its isinstance wrap-check.
+                    let list = PyList::new(py, [py_val])?;
+                    form_dict.set_item(key, list)?;
+                } else {
+                    form_dict.set_item(key, py_val)?;
+                }
             }
             FormValue::Multi(vs) => {
-                let list = PyList::empty(py);
-                for v in vs {
-                    list.append(coerced_value_to_py(py, v))?;
-                }
+                let items: Vec<Py<PyAny>> =
+                    vs.iter().map(|v| coerced_value_to_py(py, v)).collect();
+                let list = PyList::new(py, items)?;
                 form_dict.set_item(key, list)?;
             }
         }
     }
 
-    // Convert files_map - each field can have multiple files
     let files_dict = PyDict::new(py);
     for (field_name, files) in &result.files_map {
         if files.len() == 1 {
-            // Single file - store directly
             let file_dict = file_info_to_py(py, &files[0])?;
             files_dict.set_item(field_name, file_dict)?;
         } else {
-            // Multiple files - store as list
-            let file_list = PyList::empty(py);
+            let mut items: Vec<Py<PyAny>> = Vec::with_capacity(files.len());
             for file in files {
-                let file_dict = file_info_to_py(py, file)?;
-                file_list.append(file_dict)?;
+                items.push(file_info_to_py(py, file)?.into_any());
             }
+            let file_list = PyList::new(py, items)?;
             files_dict.set_item(field_name, file_list)?;
         }
     }
@@ -1235,7 +1240,12 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
         // Only create form/files dicts when form data is present (saves 2 allocs per request).
         let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {
-            let (fm, fi) = form_result_to_py(py, result)?;
+            static EMPTY_SEQ: std::sync::OnceLock<std::collections::HashSet<String>> =
+                std::sync::OnceLock::new();
+            let seq_fields = route_metadata
+                .map(|m| &m.form_seq_fields)
+                .unwrap_or_else(|| EMPTY_SEQ.get_or_init(std::collections::HashSet::new));
+            let (fm, fi) = form_result_to_py(py, result, seq_fields)?;
             (Some(fm), Some(fi))
         } else {
             (None, None)

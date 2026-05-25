@@ -462,6 +462,10 @@ pub struct RouteMetadata {
 
     // Form-related metadata for Rust-side form parsing
     pub form_type_hints: HashMap<String, u8>,
+    // Field names whose annotated type is a sequence (list/set/tuple/frozenset).
+    // Rust always emits a Python list for these keys so the Python extractor never
+    // has to wrap a single occurrence — eliminates a per-request loop.
+    pub form_seq_fields: HashSet<String>,
     pub file_constraints: HashMap<String, FileFieldConstraints>,
     pub max_upload_size: usize,
     pub memory_spool_threshold: usize,
@@ -624,6 +628,14 @@ impl RouteMetadata {
             .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
             .unwrap_or_default();
 
+        let form_seq_fields: HashSet<String> = py_meta
+            .get_item("form_seq_fields")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<Vec<String>>().ok())
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+
         // File field constraints
         let file_constraints = parse_file_constraints(py_meta, py);
 
@@ -656,6 +668,7 @@ impl RouteMetadata {
             is_static_route,
             param_types,
             form_type_hints,
+            form_seq_fields,
             file_constraints,
             max_upload_size,
             memory_spool_threshold,

@@ -372,7 +372,7 @@ wait_for_server
 echo "### Form Data (POST /form)"
 # Create form data
 FORM_FILE=$(mktemp)
-echo "name=TestUser&age=25&email=test%40example.com" > "$FORM_FILE"
+printf '%s' "name=TestUser&age=25&email=test%40example.com" > "$FORM_FILE"
 $BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/x-www-form-urlencoded' -f "$FORM_FILE" http://$HOST:$PORT/form 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$FORM_FILE"
 
@@ -421,7 +421,7 @@ rm -f "$MIXED_FILE"
 # multiple checkboxes with the same name). Validates list[T] struct binding.
 echo "### Form Repeated Keys urlencoded (POST /form-list)"
 FORM_LIST_FILE=$(mktemp)
-echo "name=Bench&tags=red&tags=green&tags=blue&tags=yellow&counts=1&counts=2&counts=3" > "$FORM_LIST_FILE"
+printf '%s' "name=Bench&tags=red&tags=green&tags=blue&tags=yellow&counts=1&counts=2&counts=3" > "$FORM_LIST_FILE"
 $BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/x-www-form-urlencoded' -f "$FORM_LIST_FILE" http://$HOST:$PORT/form-list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$FORM_LIST_FILE"
 
