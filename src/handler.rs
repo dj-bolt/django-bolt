@@ -368,8 +368,10 @@ pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> 
 ///
 /// // Assume `result` is a FormParseResult obtained from multipart parsing.
 /// # let result: crate::form_parsing::FormParseResult = unimplemented!();
+/// let seq_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
 /// Python::with_gil(|py| {
-///     let (form_dict, files_dict) = crate::handler::form_result_to_py(py, &result).unwrap();
+///     let (form_dict, files_dict) =
+///         crate::handler::form_result_to_py(py, &result, &seq_fields).unwrap();
 ///     // `form_dict` maps field names -> scalar Python objects or lists
 ///     // `files_dict` maps field names -> file dict or list of file dicts
 ///     let _ = form_dict;
