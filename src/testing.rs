@@ -520,6 +520,7 @@ pub fn test_request(
                 route_metadata: Some(route_metadata.clone()),
                 asgi_mounts: Some(asgi_mounts.clone()),
                 static_files_config: static_files_config.clone(),
+                media_files_config: None,
                 access_logger: None,
             });
 

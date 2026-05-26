@@ -20,8 +20,8 @@ use crate::middleware::compression::CompressionMiddleware;
 use crate::middleware::cors::CorsMiddleware;
 use crate::router::Router;
 use crate::state::{
-    AppState, StaticFilesConfig, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, GLOBAL_WEBSOCKET_ROUTER,
-    ROUTE_METADATA, ROUTE_METADATA_TEMP, TASK_LOCALS,
+    AppState, MediaFilesConfig, StaticFilesConfig, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
+    GLOBAL_WEBSOCKET_ROUTER, ROUTE_METADATA, ROUTE_METADATA_TEMP, TASK_LOCALS,
 };
 use crate::static_files::handle_static_file;
 use crate::websocket::{
@@ -162,6 +162,7 @@ pub fn start_server(
         asgi_mount_timeout,
         cors_config_data,
         static_files_data,
+        media_files_data,
         csp_header,
         access_log_enabled,
         access_logger_obj,
@@ -304,6 +305,56 @@ pub fn start_server(
         })()
         .unwrap_or(None);
 
+        // Read media files configuration from Django settings
+        // MEDIA_URL: URL prefix for media files (e.g., "/media/")
+        // MEDIA_ROOT: Local directory for user uploaded files
+        let media_data = (|| -> PyResult<Option<(String, String)>> {
+            let django_conf = py.import("django.conf")?;
+            let settings = django_conf.getattr("settings")?;
+
+            // Get MEDIA_URL (required for media serving)
+            let media_url = match settings.getattr("MEDIA_URL") {
+                Ok(url) => url.extract::<String>().ok(),
+                Err(_) => None,
+            };
+
+            let media_url = match media_url {
+                Some(url) => url,
+                None => return Ok(None), // No media URL configured
+            };
+
+            // Normalize URL prefix (remove trailing slash for actix-files)
+            let url_prefix = media_url.trim_end_matches('/').to_string();
+            if url_prefix.is_empty() {
+                return Ok(None); // Invalid media URL
+            }
+
+            // Get MEDIA_ROOT (local directory for uploaded files)
+            // MEDIA_ROOT can be a Path object, so convert via str()
+            // Skip if unset/None to avoid converting it to the string "None".
+            let media_root = match settings.getattr("MEDIA_ROOT") {
+                Ok(r) if !r.is_none() => r,
+                _ => return Ok(None),
+            };
+
+            let root_str = media_root
+                .extract::<String>()
+                .or_else(|_| {
+                    media_root
+                        .call_method0("__str__")
+                        .and_then(|s| s.extract::<String>())
+                })
+                .ok();
+
+            let root_str = match root_str {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(None),
+            };
+
+            Ok(Some((url_prefix, root_str)))
+        })()
+        .unwrap_or(None);
+
         // Read CSP configuration from Django settings (Django 6.0+ SECURE_CSP)
         // CSP header is built once at startup for static files (no nonce support for static files)
         // See: https://docs.djangoproject.com/en/6.0/ref/csp/
@@ -380,6 +431,7 @@ pub fn start_server(
             asgi_mount_timeout,
             cors_data,
             static_data,
+            media_data,
             csp_header,
             access_log_enabled,
             access_logger_obj,
@@ -503,6 +555,23 @@ pub fn start_server(
         }
     });
 
+    // Build media files configuration
+    let media_files_config = media_files_data.and_then(|(url_prefix, directory)| {
+        if !Path::new(&directory).is_dir() {
+            eprintln!(
+                "[django-bolt] Warning: Media files: directory does not exist for {}: {}",
+                url_prefix, directory
+            );
+            None
+        } else {
+            Some(MediaFilesConfig {
+                url_prefix,
+                directory,
+                csp_header: csp_header.clone(),
+            })
+        }
+    });
+
     let app_state = Arc::new(AppState {
         dispatch: dispatch.into(),
         dispatch_sync: dispatch_sync.into(),
@@ -517,6 +586,7 @@ pub fn start_server(
         route_metadata: None, // Production uses ROUTE_METADATA
         asgi_mounts: None,    // Production uses GLOBAL_ASGI_MOUNTS
         static_files_config: static_files_config.clone(),
+        media_files_config: media_files_config.clone(),
         access_logger: access_logger_obj,
     });
 
@@ -578,6 +648,18 @@ pub fn start_server(
                                 .app_data(static_dirs)
                                 .app_data(static_csp)
                                 .route(&static_route, web::get().to(handle_static_file));
+                        }
+
+                        // Register media files handler (if configured via Django settings).
+                        // Serves a single MEDIA_ROOT via the same handler as static.
+                        if let Some(ref config) = app_state.media_files_config {
+                            let media_dirs = web::Data::new(vec![config.directory.clone()]);
+                            let media_csp = web::Data::new(config.csp_header.clone());
+                            let media_route = format!("{}{{path:.*}}", config.url_prefix);
+                            app = app
+                                .app_data(media_dirs)
+                                .app_data(media_csp)
+                                .route(&media_route, web::get().to(handle_static_file));
                         }
 
                         // Default service handles all unmatched HTTP requests.
