@@ -635,31 +635,35 @@ pub fn start_server(
                                 .to(websocket_not_found_handler),
                         );
 
-                        // Register static files handler (if configured via Django settings)
-                        // Uses a custom handler that:
-                        // 1. Searches configured directories in order (fast path)
-                        // 2. Falls back to Django's staticfiles finders (for app static files like admin)
-                        // 3. Applies CSP headers from Django settings (if configured)
+                        // Register static & media handlers (if configured via Django settings).
+                        // Each is mounted under its own `web::scope` so that:
+                        //  1. Their `web::Data<Vec<String>>` / `web::Data<Option<String>>`
+                        //     do not collide at App scope (app_data is type-keyed, so later
+                        //     registrations would otherwise overwrite earlier ones).
+                        //  2. The route only matches at a `/` segment boundary —
+                        //     `/static/foo` matches, `/staticx/foo` does not.
+                        // Static also falls back to Django's staticfiles finders (debug only)
+                        // for app static files like admin; media only serves MEDIA_ROOT.
                         if let Some(ref config) = app_state.static_files_config {
                             let static_dirs = web::Data::new(config.directories.clone());
                             let static_csp = web::Data::new(config.csp_header.clone());
-                            let static_route = format!("{}{{path:.*}}", config.url_prefix);
-                            app = app
-                                .app_data(static_dirs)
-                                .app_data(static_csp)
-                                .route(&static_route, web::get().to(handle_static_file));
+                            app = app.service(
+                                web::scope(&config.url_prefix)
+                                    .app_data(static_dirs)
+                                    .app_data(static_csp)
+                                    .route("/{path:.*}", web::get().to(handle_static_file)),
+                            );
                         }
 
-                        // Register media files handler (if configured via Django settings).
-                        // Serves a single MEDIA_ROOT via the same handler as static.
                         if let Some(ref config) = app_state.media_files_config {
                             let media_dirs = web::Data::new(vec![config.directory.clone()]);
                             let media_csp = web::Data::new(config.csp_header.clone());
-                            let media_route = format!("{}{{path:.*}}", config.url_prefix);
-                            app = app
-                                .app_data(media_dirs)
-                                .app_data(media_csp)
-                                .route(&media_route, web::get().to(handle_static_file));
+                            app = app.service(
+                                web::scope(&config.url_prefix)
+                                    .app_data(media_dirs)
+                                    .app_data(media_csp)
+                                    .route("/{path:.*}", web::get().to(handle_static_file)),
+                            );
                         }
 
                         // Default service handles all unmatched HTTP requests.
