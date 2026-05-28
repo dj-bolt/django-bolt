@@ -63,3 +63,47 @@ def test_static_files_include_csp_header(make_server_project):
     csp = response.headers.get("content-security-policy", "")
     assert "default-src 'self'" in csp
     assert "script-src 'self'" in csp
+
+
+def test_static_cache_control_header_from_max_age_setting(make_server_project):
+    """BOLT_STATIC_MAX_AGE = N sends `Cache-Control: public, max-age=N` on /static/."""
+    project = make_server_project(
+        installed_apps=["django.contrib.staticfiles"],
+        settings_extra="""
+        STATIC_URL = "/static/"
+        STATICFILES_DIRS = [str(BASE_DIR / "staticassets")]
+        BOLT_STATIC_MAX_AGE = 31536000
+        """,
+        extra_files={
+            "staticassets/app.js": "console.log(1);\n",
+        },
+    )
+
+    with project.start() as server:
+        response = server.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert response.headers.get("cache-control") == "public, max-age=31536000"
+
+
+def test_static_supports_head_requests(make_server_project):
+    """HEAD on static must return GET's headers with an empty body."""
+    project = make_server_project(
+        installed_apps=["django.contrib.staticfiles"],
+        settings_extra="""
+        STATIC_URL = "/static/"
+        STATICFILES_DIRS = [str(BASE_DIR / "staticassets")]
+        """,
+        extra_files={
+            "staticassets/test.css": "body { color: blue; }\n",
+        },
+    )
+
+    with project.start() as server:
+        head = server.request("HEAD", "/static/test.css")
+        get = server.get("/static/test.css")
+
+    assert head.status_code == 200
+    assert head.content == b""
+    assert head.headers.get("content-length") == get.headers.get("content-length")
+    assert head.headers.get("etag") == get.headers.get("etag")

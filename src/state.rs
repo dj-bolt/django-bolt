@@ -1,3 +1,4 @@
+use actix_web::http::header::HeaderValue;
 use ahash::AHashMap;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
@@ -52,17 +53,19 @@ fn find_mount_in_slice<'a>(mounts: &'a [AsgiMount], path: &str) -> Option<&'a As
 /// Configuration for serving static files via Actix
 #[derive(Clone, Debug)]
 pub struct StaticFilesConfig {
-    pub url_prefix: String,         // URL prefix (e.g., "/static")
-    pub directories: Vec<String>,   // List of directories to serve from
-    pub csp_header: Option<String>, // Pre-built Content-Security-Policy header from Django settings
+    pub url_prefix: String,                  // URL prefix (e.g., "/static")
+    pub directories: Vec<String>,            // List of directories to serve from
+    pub csp_header: Option<String>,          // Pre-built Content-Security-Policy header from Django settings
+    pub cache_control: Option<HeaderValue>,  // Pre-built Cache-Control header from BOLT_STATIC_MAX_AGE
 }
 
-/// Configuration for serving static files via Actix
+/// Configuration for serving user-uploaded media files via Actix
 #[derive(Clone, Debug)]
 pub struct MediaFilesConfig {
-    pub url_prefix: String,         // URL prefix (e.g., "/media")
-    pub directory: String,          // Media root
-    pub csp_header: Option<String>, // Pre-built Content-Security-Policy header from Django settings
+    pub url_prefix: String,                  // URL prefix (e.g., "/media")
+    pub directory: String,                   // Media root
+    pub csp_header: Option<String>,          // Pre-built Content-Security-Policy header from Django settings
+    pub cache_control: Option<HeaderValue>,  // Pre-built Cache-Control header from BOLT_MEDIA_MAX_AGE
 }
 
 pub struct AppState {

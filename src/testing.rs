@@ -43,7 +43,7 @@ use crate::handler::{
     build_prebound_args_kwargs, coerced_value_to_py, form_result_to_py, response_from_wire_result,
 };
 use crate::request_pipeline::validate_and_cache_typed_params;
-use crate::static_files::handle_static_file;
+use crate::static_files::{handle_static_file, CacheControlHeader};
 use crate::type_coercion::{coerce_param, params_to_py_dict, TYPE_STRING};
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
@@ -273,11 +273,17 @@ pub fn create_test_app(
             .get_item("csp_header")?
             .and_then(|v| v.extract().ok());
 
+        let cache_control: Option<HeaderValue> = static_dict
+            .get_item("cache_control")?
+            .and_then(|v| v.extract::<String>().ok())
+            .and_then(|s| HeaderValue::from_str(&s).ok());
+
         if !directories.is_empty() {
             Some(StaticFilesConfig {
                 url_prefix,
                 directories,
                 csp_header,
+                cache_control,
             })
         } else {
             None
@@ -544,6 +550,8 @@ pub fn test_request(
                 // With static files: register static file handler before default service
                 let static_dirs = web::Data::new(config.directories.clone());
                 let static_csp = web::Data::new(config.csp_header.clone());
+                let static_cc =
+                    web::Data::new(CacheControlHeader(config.cache_control.clone()));
                 let static_route = format!("{}{{path:.*}}", config.url_prefix);
 
                 test::init_service(
@@ -552,10 +560,15 @@ pub fn test_request(
                         .app_data(web::PayloadConfig::new(max_payload_size))
                         .app_data(static_dirs)
                         .app_data(static_csp)
+                        .app_data(static_cc)
                         .wrap(NormalizePath::new(TrailingSlash::MergeOnly))
                         .wrap(CorsMiddleware::new())
                         .wrap(CompressionMiddleware::new())
-                        .route(&static_route, web::get().to(handle_static_file))
+                        .service(
+                            web::resource(&static_route)
+                                .route(web::get().to(handle_static_file))
+                                .route(web::head().to(handle_static_file)),
+                        )
                         .default_service(web::to(handler)),
                 )
                 .await

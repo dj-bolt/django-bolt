@@ -19,6 +19,13 @@ use std::sync::Arc;
 
 use crate::state::AppState;
 
+/// Per-scope Cache-Control header, pre-validated as a `HeaderValue` at startup
+/// from `BOLT_STATIC_MAX_AGE` / `BOLT_MEDIA_MAX_AGE`. Wrapped in a newtype so
+/// the inner `Option<HeaderValue>` doesn't type-collide with other extractors
+/// in the same scope.
+#[derive(Clone, Debug)]
+pub struct CacheControlHeader(pub Option<header::HeaderValue>);
+
 /// Find a static file in the configured directories (fast path)
 fn find_in_directories(relative_path: &str, directories: &[String]) -> Option<PathBuf> {
     // Security: prevent directory traversal
@@ -81,58 +88,114 @@ pub async fn handle_static_file(
     path: web::Path<String>,
     directories: web::Data<Vec<String>>,
     csp_header: web::Data<Option<String>>,
+    cache_control: web::Data<CacheControlHeader>,
     app_state: web::Data<Arc<AppState>>,
-) -> actix_web::Result<HttpResponse> {
+) -> HttpResponse {
+    serve_request(
+        req,
+        path,
+        directories,
+        csp_header,
+        cache_control,
+        false, // nosniff
+        Some(app_state),
+    )
+    .await
+}
+
+/// Handler for media file requests.
+///
+/// Same as `handle_static_file` but without the Django staticfiles finders
+/// fallback — finders only know about STATICFILES_DIRS / app `static/` dirs,
+/// never `MEDIA_ROOT`, so falling through would leak static assets under /media/.
+/// Always emits `X-Content-Type-Options: nosniff` so user-uploaded HTML/SVG
+/// can't be coerced into being rendered as HTML/JS by the browser.
+pub async fn handle_media_file(
+    req: HttpRequest,
+    path: web::Path<String>,
+    directories: web::Data<Vec<String>>,
+    csp_header: web::Data<Option<String>>,
+    cache_control: web::Data<CacheControlHeader>,
+) -> HttpResponse {
+    serve_request(req, path, directories, csp_header, cache_control, true, None).await
+}
+
+async fn serve_request(
+    req: HttpRequest,
+    path: web::Path<String>,
+    directories: web::Data<Vec<String>>,
+    csp_header: web::Data<Option<String>>,
+    cache_control: web::Data<CacheControlHeader>,
+    nosniff: bool,
+    static_app_state: Option<web::Data<Arc<AppState>>>,
+) -> HttpResponse {
     // Strip leading slash if present (route captures include it)
     let relative_path = path.into_inner();
     let relative_path = relative_path.trim_start_matches('/');
 
-    // Security check
-    if relative_path.contains("..") {
-        return Err(actix_web::error::ErrorBadRequest("Invalid path"));
-    }
-
-    // Try to find the file in configured directories (fast path)
-    let mut file_path = find_in_directories(&relative_path, directories.as_ref());
-
-    // Only fall back to Django finders in debug mode (development)
-    // In production, only serve files from explicitly configured directories
-    // This prevents potential path exposure from Django app finders
-    if file_path.is_none() && app_state.debug {
-        file_path = find_with_django_finders(&relative_path);
-    }
-
-    let file_path = match file_path {
-        Some(p) => p,
-        None => {
-            return Err(actix_web::error::ErrorNotFound(format!(
-                "Static file not found: {}",
-                relative_path
-            )));
+    // Headers are applied uniformly to success AND error responses so a 404
+    // for /media/<crafted> can't be MIME-sniffed into HTML/JS execution.
+    let apply_headers = |response: &mut HttpResponse| {
+        if nosniff {
+            response.headers_mut().insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                header::HeaderValue::from_static("nosniff"),
+            );
+        }
+        if let Some(ref csp) = **csp_header {
+            if let Ok(value) = header::HeaderValue::from_str(csp) {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_SECURITY_POLICY, value);
+            }
+        }
+        if let Some(ref cc) = cache_control.0 {
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, cc.clone());
         }
     };
 
-    // Open the file using NamedFile for proper HTTP semantics
-    // Use sync reads for files under 256KB (faster for typical static assets)
-    // See: https://github.com/actix/actix-web/pull/3706
-    let named_file = NamedFile::open_async(&file_path)
-        .await
-        .map_err(|_| actix_web::error::ErrorNotFound("File not found"))?
-        .read_mode_threshold(256 * 1024); // 256KB threshold for sync reads
-
-    // Convert NamedFile to HttpResponse and add CSP header if configured
-    let mut response = named_file.into_response(&req);
-
-    // Apply CSP header from Django settings (pre-built at server startup)
-    if let Some(ref csp) = csp_header.as_ref() {
-        response.headers_mut().insert(
-            header::CONTENT_SECURITY_POLICY,
-            header::HeaderValue::from_str(csp)
-                .unwrap_or_else(|_| header::HeaderValue::from_static("default-src 'self'")),
-        );
+    if relative_path.contains("..") {
+        let mut response = HttpResponse::BadRequest()
+            .content_type("text/plain; charset=utf-8")
+            .body("Invalid path");
+        apply_headers(&mut response);
+        return response;
     }
 
-    Ok(response)
+    let mut file_path = find_in_directories(relative_path, directories.as_ref());
+
+    // Static-only: fall back to Django finders in debug mode for app static
+    // files like admin. Media intentionally skips this — finders only know
+    // about STATICFILES_DIRS / app static dirs, never MEDIA_ROOT.
+    if let Some(app_state) = static_app_state {
+        if file_path.is_none() && app_state.debug {
+            file_path = find_with_django_finders(relative_path);
+        }
+    }
+
+    let mut response = match file_path {
+        Some(path) => serve_file(&req, &path).await,
+        None => not_found_response(),
+    };
+    apply_headers(&mut response);
+    response
+}
+
+async fn serve_file(req: &HttpRequest, file_path: &Path) -> HttpResponse {
+    // Use sync reads for files under 256KB (faster for typical static assets)
+    // See: https://github.com/actix/actix-web/pull/3706
+    match NamedFile::open_async(file_path).await {
+        Ok(named) => named.read_mode_threshold(256 * 1024).into_response(req),
+        Err(_) => not_found_response(),
+    }
+}
+
+fn not_found_response() -> HttpResponse {
+    HttpResponse::NotFound()
+        .content_type("text/plain; charset=utf-8")
+        .body("File not found")
 }
 
 #[cfg(test)]

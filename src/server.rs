@@ -1,12 +1,13 @@
 use actix_http::KeepAlive;
 use actix_web::{
     self as aw,
+    http::header::HeaderValue,
     middleware::{NormalizePath, TrailingSlash},
     web, App, HttpRequest, HttpResponse, HttpServer,
 };
 use ahash::AHashMap;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBool, PyDict};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -23,10 +24,65 @@ use crate::state::{
     AppState, MediaFilesConfig, StaticFilesConfig, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
     GLOBAL_WEBSOCKET_ROUTER, ROUTE_METADATA, ROUTE_METADATA_TEMP, TASK_LOCALS,
 };
-use crate::static_files::handle_static_file;
+use crate::static_files::{handle_media_file, handle_static_file, CacheControlHeader};
 use crate::websocket::{
     handle_websocket_upgrade_with_handler, is_websocket_upgrade, WebSocketRouter,
 };
+
+/// Read a `BOLT_*_MAX_AGE` Django setting and return a pre-built `Cache-Control`
+/// `HeaderValue` (e.g. `"public, max-age=31536000"`).
+///
+/// Validation (all at startup so the request path stays a plain header clone):
+/// - Missing / None → no header
+/// - Booleans, non-integers, negatives → warn, no header
+/// - Non-negative integer → `Some(HeaderValue)`
+fn read_max_age_setting(py: Python<'_>, name: &str) -> Option<HeaderValue> {
+    let django_conf = py.import("django.conf").ok()?;
+    let settings = django_conf.getattr("settings").ok()?;
+    let value = settings.getattr(name).ok()?;
+    if value.is_none() {
+        return None;
+    }
+    // bool is a subclass of int in Python; extract::<i64> would happily turn
+    // True/False into 1/0 and silently produce `max-age=1`.
+    if value.cast::<PyBool>().is_ok() {
+        eprintln!(
+            "[django-bolt] Warning: {} must be an integer (got bool); ignoring.",
+            name
+        );
+        return None;
+    }
+    let max_age = match value.extract::<i64>() {
+        Ok(n) if n >= 0 => n,
+        Ok(n) => {
+            eprintln!(
+                "[django-bolt] Warning: {} must be non-negative (got {}); ignoring.",
+                name, n
+            );
+            return None;
+        }
+        Err(_) => {
+            eprintln!(
+                "[django-bolt] Warning: {} must be an integer; ignoring.",
+                name
+            );
+            return None;
+        }
+    };
+    // Validate once: format always produces ASCII so from_str cannot fail in
+    // practice, but if it ever does we want a startup warning, not a silent
+    // per-request drop.
+    match HeaderValue::from_str(&format!("public, max-age={}", max_age)) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!(
+                "[django-bolt] Warning: failed to build Cache-Control from {}: {}",
+                name, e
+            );
+            None
+        }
+    }
+}
 
 #[pyfunction]
 pub fn register_routes(
@@ -164,6 +220,8 @@ pub fn start_server(
         static_files_data,
         media_files_data,
         csp_header,
+        static_cache_control,
+        media_cache_control,
         access_log_enabled,
         access_logger_obj,
     ) = Python::attach(|py| {
@@ -323,10 +381,18 @@ pub fn start_server(
                 None => return Ok(None), // No media URL configured
             };
 
-            // Normalize URL prefix (remove trailing slash for actix-files)
+            // MEDIA_URL must be a path-style prefix (e.g. "/media/") — CDN-style
+            // full URLs and missing leading slash produce malformed scope prefixes.
+            if !media_url.starts_with('/') {
+                eprintln!(
+                    "[django-bolt] Warning: MEDIA_URL must start with '/' for in-process serving (got {:?}); ignoring.",
+                    media_url
+                );
+                return Ok(None);
+            }
             let url_prefix = media_url.trim_end_matches('/').to_string();
             if url_prefix.is_empty() {
-                return Ok(None); // Invalid media URL
+                return Ok(None); // MEDIA_URL = "/"; would shadow every route
             }
 
             // Get MEDIA_ROOT (local directory for uploaded files)
@@ -350,6 +416,17 @@ pub fn start_server(
                 Some(s) if !s.is_empty() => s,
                 _ => return Ok(None),
             };
+
+            // MEDIA_ROOT must be an absolute path. A relative root (including
+            // Path('') which str()s to ".") would canonicalize to the server's
+            // CWD on every request — exposing source files at /media/*.
+            if !Path::new(&root_str).is_absolute() {
+                eprintln!(
+                    "[django-bolt] Warning: MEDIA_ROOT must be an absolute path (got {:?}); ignoring.",
+                    root_str
+                );
+                return Ok(None);
+            }
 
             Ok(Some((url_prefix, root_str)))
         })()
@@ -397,6 +474,16 @@ pub fn start_server(
             }
         })();
 
+        // Read & validate cache-control max-age settings (integer seconds).
+        // Built once here so the per-request hot path is a plain header insert.
+        // Rules:
+        //   - missing / None: no Cache-Control header sent (current behavior)
+        //   - non-integer:     warn, no header
+        //   - negative:        warn, no header
+        //   - >= 0:            "public, max-age=N"
+        let static_cache_control = read_max_age_setting(py, "BOLT_STATIC_MAX_AGE");
+        let media_cache_control = read_max_age_setting(py, "BOLT_MEDIA_MAX_AGE");
+
         // Check Django's logging configuration to determine if access logging is enabled.
         // Uses the standard django.server logger — no extra settings needed.
         // Decision is made once at startup (Granian pattern: zero cost when off).
@@ -433,6 +520,8 @@ pub fn start_server(
             static_data,
             media_data,
             csp_header,
+            static_cache_control,
+            media_cache_control,
             access_log_enabled,
             access_logger_obj,
         )
@@ -551,6 +640,7 @@ pub fn start_server(
                 url_prefix,
                 directories: valid_dirs,
                 csp_header: csp_header.clone(),
+                cache_control: static_cache_control.clone(),
             })
         }
     });
@@ -568,6 +658,7 @@ pub fn start_server(
                 url_prefix,
                 directory,
                 csp_header: csp_header.clone(),
+                cache_control: media_cache_control.clone(),
             })
         }
     });
@@ -647,22 +738,36 @@ pub fn start_server(
                         if let Some(ref config) = app_state.static_files_config {
                             let static_dirs = web::Data::new(config.directories.clone());
                             let static_csp = web::Data::new(config.csp_header.clone());
+                            let static_cc =
+                                web::Data::new(CacheControlHeader(config.cache_control.clone()));
                             app = app.service(
                                 web::scope(&config.url_prefix)
                                     .app_data(static_dirs)
                                     .app_data(static_csp)
-                                    .route("/{path:.*}", web::get().to(handle_static_file)),
+                                    .app_data(static_cc)
+                                    .service(
+                                        web::resource("/{path:.*}")
+                                            .route(web::get().to(handle_static_file))
+                                            .route(web::head().to(handle_static_file)),
+                                    ),
                             );
                         }
 
                         if let Some(ref config) = app_state.media_files_config {
                             let media_dirs = web::Data::new(vec![config.directory.clone()]);
                             let media_csp = web::Data::new(config.csp_header.clone());
+                            let media_cc =
+                                web::Data::new(CacheControlHeader(config.cache_control.clone()));
                             app = app.service(
                                 web::scope(&config.url_prefix)
                                     .app_data(media_dirs)
                                     .app_data(media_csp)
-                                    .route("/{path:.*}", web::get().to(handle_static_file)),
+                                    .app_data(media_cc)
+                                    .service(
+                                        web::resource("/{path:.*}")
+                                            .route(web::get().to(handle_media_file))
+                                            .route(web::head().to(handle_media_file)),
+                                    ),
                             );
                         }
 
