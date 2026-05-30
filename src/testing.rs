@@ -20,6 +20,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +34,7 @@ use crate::metadata::{CorsConfig, RouteMetadata, RouteMetadataStore};
 use crate::middleware::compression::CompressionMiddleware;
 use crate::middleware::cors::CorsMiddleware;
 use crate::router::Router;
-use crate::state::{find_asgi_mount, AppState, AsgiMount, StaticFilesConfig, TASK_LOCALS};
+use crate::state::{find_asgi_mount, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS};
 use crate::websocket::WebSocketRouter;
 use actix_multipart::Multipart;
 use futures_util::StreamExt;
@@ -43,7 +44,7 @@ use crate::handler::{
     build_prebound_args_kwargs, coerced_value_to_py, form_result_to_py, response_from_wire_result,
 };
 use crate::request_pipeline::validate_and_cache_typed_params;
-use crate::static_files::{handle_static_file, CacheControlHeader};
+use crate::static_files::handle_file;
 use crate::type_coercion::{coerce_param, params_to_py_dict, TYPE_STRING};
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
@@ -127,7 +128,7 @@ pub struct TestAppState {
     /// Trailing slash handling mode: "strip", "append", or "keep"
     pub trailing_slash: String,
     /// Static files configuration for testing static file serving
-    pub static_files_config: Option<StaticFilesConfig>,
+    pub static_files_config: Option<Arc<ScopeConfig>>,
 }
 
 /// Registry for test app instances
@@ -269,22 +270,35 @@ pub fn create_test_app(
             .map(|v| v.extract().unwrap_or_default())
             .unwrap_or_default();
 
-        let csp_header: Option<String> = static_dict
+        // Mirror the production hot-path contract: store pre-canonicalized
+        // absolute roots so `find_in_directories` never canonicalizes the dir.
+        let directories: Vec<PathBuf> = directories
+            .iter()
+            .filter_map(|dir| Path::new(dir).canonicalize().ok())
+            .filter(|p| p.is_dir())
+            .collect();
+
+        let csp_header: Option<HeaderValue> = static_dict
             .get_item("csp_header")?
-            .and_then(|v| v.extract().ok());
+            .and_then(|v| v.extract::<String>().ok())
+            .and_then(|s| HeaderValue::from_str(&s).ok());
 
         let cache_control: Option<HeaderValue> = static_dict
             .get_item("cache_control")?
             .and_then(|v| v.extract::<String>().ok())
             .and_then(|s| HeaderValue::from_str(&s).ok());
 
-        if !directories.is_empty() {
-            Some(StaticFilesConfig {
+        // Mirror production: register when we have real dirs OR in DEBUG (where
+        // the staticfiles-finders fallback serves admin/app static).
+        if !directories.is_empty() || debug {
+            Some(Arc::new(ScopeConfig {
                 url_prefix,
                 directories,
                 csp_header,
                 cache_control,
-            })
+                mode: ServeMode::Static,
+                allow_django_finders: debug,
+            }))
         } else {
             None
         }
@@ -547,27 +561,24 @@ pub fn test_request(
             // Use MergeOnly for NormalizePath (only normalizes // -> /)
             // Trailing slash handling is done via Starlette-style redirect in handler
             let app = if let Some(ref config) = static_files_config {
-                // With static files: register static file handler before default service
-                let static_dirs = web::Data::new(config.directories.clone());
-                let static_csp = web::Data::new(config.csp_header.clone());
-                let static_cc =
-                    web::Data::new(CacheControlHeader(config.cache_control.clone()));
+                // With static files: register static file handler before default service.
+                // One `web::Data<Arc<ScopeConfig>>` carries all per-scope state,
+                // matching the production handler signature.
+                let scope_data = web::Data::new(config.clone());
                 let static_route = format!("{}{{path:.*}}", config.url_prefix);
 
                 test::init_service(
                     App::new()
                         .app_data(web::Data::new(app_state_arc.clone()))
                         .app_data(web::PayloadConfig::new(max_payload_size))
-                        .app_data(static_dirs)
-                        .app_data(static_csp)
-                        .app_data(static_cc)
+                        .app_data(scope_data)
                         .wrap(NormalizePath::new(TrailingSlash::MergeOnly))
                         .wrap(CorsMiddleware::new())
                         .wrap(CompressionMiddleware::new())
                         .service(
                             web::resource(&static_route)
-                                .route(web::get().to(handle_static_file))
-                                .route(web::head().to(handle_static_file)),
+                                .route(web::get().to(handle_file))
+                                .route(web::head().to(handle_file)),
                         )
                         .default_service(web::to(handler)),
                 )

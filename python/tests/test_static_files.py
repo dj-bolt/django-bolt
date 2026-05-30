@@ -19,8 +19,7 @@ from django.contrib.staticfiles.finders import get_finder
 from django.core.exceptions import SuspiciousFileOperation
 
 from django_bolt import BoltAPI
-from django_bolt.admin.static import find_static_file, serve_static_file
-from django_bolt.exceptions import HTTPException
+from django_bolt.admin.static import find_static_file
 from django_bolt.shortcuts import render
 from django_bolt.testing import TestClient
 
@@ -212,23 +211,13 @@ class TestFindStaticFile:
         assert_path_rejected("C:temp/file.txt")
         assert_path_rejected("\\\\server\\share\\file.txt")
 
-    @pytest.mark.asyncio
-    async def test_serve_static_file_rejects_traversal_paths(self):
-        """Traversal paths must raise SuspiciousFileOperation on every platform."""
-        with pytest.raises(SuspiciousFileOperation):
-            await serve_static_file("../etc/passwd")
-
-
 class TestStaticFileServing:
     """Tests for static file serving via the test client."""
 
     @pytest.fixture(scope="class")
     def api_with_static(self):
-        """Create API with static file routes."""
-        from django_bolt.admin.static import register_static_routes
-
+        """Create an API (static is served by the native /static scope, not a route)."""
         api = BoltAPI()
-        register_static_routes(api)
 
         @api.get("/health")
         async def health():
@@ -238,12 +227,13 @@ class TestStaticFileServing:
 
     @pytest.fixture(scope="class")
     def client(self, api_with_static):
-        """Create test client."""
-        from django.conf import settings
-
-        settings.STATIC_ROOT = TEST_STATIC_DIR
-        settings.STATIC_URL = "/static/"
-        return TestClient(api_with_static, use_http_layer=True)
+        """Test client whose native /static scope serves from TEST_STATIC_DIR."""
+        static_config = {
+            "url_prefix": "/static",
+            "directories": [TEST_STATIC_DIR],
+            "csp_header": None,
+        }
+        return TestClient(api_with_static, static_files_config=static_config)
 
     def test_serve_css_file(self, client, monkeypatch):
         """Test serving a CSS file."""
@@ -323,20 +313,37 @@ class TestDjangoAdminStaticFiles:
 
 
 @pytest.mark.django_db
-def test_admin_static_served_with_django_middleware_enabled():
-    """Admin static files should stay as file responses through Django middleware."""
-    api = BoltAPI(django_middleware=True)
-    api._register_admin_routes("127.0.0.1", 8000)
-    api._register_static_routes()
+def test_admin_static_served_via_native_finder_fallback():
+    """Admin static is served by the native /static scope's finders fallback in
+    DEBUG even when NO static directory is configured (`directories: []`).
 
-    with TestClient(api, use_http_layer=True) as client:
-        response = client.get("/static/admin/css/base.css")
+    This is the fresh-install-with-admin scenario that replaced the old Python
+    admin static route: the scope still registers in DEBUG (mirroring Django
+    runserver) so finders resolve admin assets. pytest-django forces
+    DEBUG=False during tests, so we opt back in explicitly and restore.
+    """
+    from django.conf import settings
+
+    original_debug = settings.DEBUG
+    try:
+        settings.DEBUG = True
+
+        api = BoltAPI(django_middleware=True)
+        api._register_admin_routes("127.0.0.1", 8000)
+
+        static_config = {"url_prefix": "/static", "directories": [], "csp_header": None}
+        with TestClient(api, static_files_config=static_config) as client:
+            response = client.get("/static/admin/css/base.css")
+    finally:
+        settings.DEBUG = original_debug
 
     assert response.status_code == 200
     assert response.headers.get("content-type", "").startswith("text/css")
     assert response.content.startswith(b"/*")
     assert b"DJANGO Admin styles" in response.content
     assert not response.content.startswith(b"/home/")
+    # Native handler always sets nosniff — confirms it's serving, not a fallback.
+    assert response.headers.get("x-content-type-options") == "nosniff"
 
 
 class TestStaticTemplateTag:
@@ -427,12 +434,8 @@ class TestCachingHeaders:
 
     @pytest.fixture(scope="class")
     def api(self):
-        """Create API with static routes."""
-        from django_bolt.admin.static import register_static_routes
-
-        api = BoltAPI()
-        register_static_routes(api)
-        return api
+        """Create API (static served by the native /static scope)."""
+        return BoltAPI()
 
     @pytest.fixture(scope="class")
     def client(self, api):
@@ -472,12 +475,8 @@ class TestDirectoryTraversalSecurity:
 
     @pytest.fixture(scope="class")
     def api_with_static(self):
-        """Create API with static file routes."""
-        from django_bolt.admin.static import register_static_routes
-
-        api = BoltAPI()
-        register_static_routes(api)
-        return api
+        """Create API (static served by the native /static scope)."""
+        return BoltAPI()
 
     @pytest.fixture(scope="class")
     def client(self, api_with_static):
@@ -680,8 +679,6 @@ class TestContentSecurityPolicy:
         """Test that CSP header is applied when BOLT_STATIC_CSP is set."""
         from django.conf import settings
 
-        from django_bolt.admin.static import register_static_routes
-
         # Configure CSP
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
@@ -689,7 +686,6 @@ class TestContentSecurityPolicy:
         settings.BOLT_STATIC_CSP = "default-src 'self'; script-src 'self'"
 
         api = BoltAPI()
-        register_static_routes(api)
 
         client = TestClient(api, use_http_layer=True)
         response = client.get("/static/css/style.css")
@@ -703,8 +699,6 @@ class TestContentSecurityPolicy:
         """Test that no CSP header is added when not configured."""
         from django.conf import settings
 
-        from django_bolt.admin.static import register_static_routes
-
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
         settings.STATIC_URL = "/static/"
@@ -714,7 +708,6 @@ class TestContentSecurityPolicy:
             delattr(settings, "BOLT_STATIC_CSP")
 
         api = BoltAPI()
-        register_static_routes(api)
 
         client = TestClient(api, use_http_layer=True)
         response = client.get("/static/css/style.css")
@@ -748,16 +741,12 @@ class TestEdgeCases:
 
     @pytest.fixture(scope="class")
     def api_with_static(self):
-        """Create API with static file routes."""
-        from django_bolt.admin.static import register_static_routes
-
-        api = BoltAPI()
-        register_static_routes(api)
-        return api
+        """Create API (static served by the native /static scope)."""
+        return BoltAPI()
 
     @pytest.fixture(scope="class")
     def client(self, api_with_static):
-        """Create test client."""
+        """Test client; the autouse fixture sets STATIC_ROOT/STATICFILES_DIRS."""
         return TestClient(api_with_static, use_http_layer=True)
 
     @pytest.fixture(autouse=True)
@@ -823,16 +812,20 @@ class TestEdgeCases:
             os.unlink(empty_file)
 
     def test_hidden_file(self, client):
-        """Test serving hidden files (starting with .)."""
+        """Hidden / dotfile paths must not be served.
+
+        Matches the nginx/Apache default deny for dotfiles. Stops stray
+        `.env`, `.git/config`, `.htaccess`, editor backups, etc. from leaking
+        if they end up in STATIC_ROOT.
+        """
         hidden_file = os.path.join(TEST_STATIC_DIR, ".hidden")
         with open(hidden_file, "w") as f:
             f.write("HIDDEN_CONTENT")
 
         try:
             response = client.get("/static/.hidden")
-            # Hidden files should be servable (Django doesn't block them by default)
-            assert response.status_code == 200
-            assert b"HIDDEN_CONTENT" in response.content
+            assert response.status_code == 404
+            assert b"HIDDEN_CONTENT" not in response.content
         finally:
             os.unlink(hidden_file)
 

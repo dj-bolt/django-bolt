@@ -527,7 +527,6 @@ class Command(BaseCommand):
             if merged_api._admin_routes_registered:
                 admin_prefix = detect_admin_url_prefix() or "admin"
                 features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
-                merged_api._register_static_routes()
 
         _total_route_count = len(merged_api._routes)
         _framework_route_count = _total_route_count - _user_route_count
@@ -625,7 +624,6 @@ class Command(BaseCommand):
         # Register Django admin routes if not disabled
         # Admin is controlled solely by --no-admin command-line flag
         admin_enabled = not options.get("no_admin", False)
-        admin_prefix = None
 
         if admin_enabled and detect_admin_url_prefix is not None:
             # Register admin routes
@@ -634,9 +632,6 @@ class Command(BaseCommand):
             if merged_api._admin_routes_registered:
                 admin_prefix = detect_admin_url_prefix() or "admin"
                 features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
-
-                # Also register static file routes for admin
-                merged_api._register_static_routes()
 
         # Compute route counts
         _total_route_count = len(merged_api._routes)
@@ -813,7 +808,7 @@ class Command(BaseCommand):
         if asgi_mounts:
             lines.append(_line("ASGI", f"{asgi_mounts} mounts"))
         if framework_routes:
-            lines.append(_line("Framework", f"+{framework_routes} (admin, docs, static)"))
+            lines.append(_line("Framework", f"+{framework_routes} (admin, docs)"))
         lines.append("")
 
         # Features section (only if there are features)

@@ -65,6 +65,11 @@ echo ""
 
 echo "## Root Endpoint Performance"
 cd python/example
+# Collect static into STATIC_ROOT so the native Rust static scope serves admin
+# AND the benchmark fixtures (static/bench/*) from one canonical directory —
+# the production flow. Without this, STATIC_ROOT is empty and the static
+# scope won't register.
+uv run python manage.py collectstatic --noinput >/dev/null 2>&1 || echo "Warning: collectstatic failed; native static benchmarks may be skipped" >&2
 DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
 SERVER_PID=$!
 wait_for_server
@@ -100,6 +105,45 @@ $BOMBARDIER_BIN -c $C -n $N -l --no-redirect http://$HOST:$PORT/redirect 2>&1 | 
 
 printf "### File Static via FileResponse (/file-static)\n"
 $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/file-static 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+echo ""
+echo "## Native Static & Media File Serving"
+# Served entirely by the Rust handler (src/static_files.rs) — no Python in the
+# request path. Small (1KB) files isolate per-request fixed overhead (path
+# canonicalization, header building, app_data lookups); large (100KB) files
+# show streaming throughput. Static emits `public` Cache-Control + nosniff;
+# media emits `private` Cache-Control + nosniff (+ dangerous-ext disarm check).
+
+# Static config only registers if STATICFILES_DIRS / STATIC_ROOT exist; media
+# only if MEDIA_ROOT exists. Sanity-check each so a 404 (misconfig) doesn't
+# silently report bogus "fast" numbers.
+SCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/static/bench/asset_1k.css)
+if [ "$SCODE" = "200" ]; then
+  printf "### Static 1KB CSS (GET /static/bench/asset_1k.css)\n"
+  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/static/bench/asset_1k.css 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+  printf "### Static 1KB CSS (HEAD /static/bench/asset_1k.css)\n"
+  $BOMBARDIER_BIN -c $C -n $N -l -m HEAD http://$HOST:$PORT/static/bench/asset_1k.css 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+  printf "### Static 100KB JS (GET /static/bench/asset_100k.js)\n"
+  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/static/bench/asset_100k.js 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+  printf "### Static 404 miss (GET /static/bench/missing.css)\n"
+  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/static/bench/missing.css 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+else
+  echo "Skipped static file benchmarks: /static/bench/asset_1k.css returned $SCODE" >&2
+fi
+
+MCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/media/bench/upload_1k.bin)
+if [ "$MCODE" = "200" ]; then
+  printf "### Media 1KB (GET /media/bench/upload_1k.bin)\n"
+  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/media/bench/upload_1k.bin 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+
+  printf "### Media 100KB (GET /media/bench/upload_100k.bin)\n"
+  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/media/bench/upload_100k.bin 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+else
+  echo "Skipped media file benchmarks: /media/bench/upload_1k.bin returned $MCODE" >&2
+fi
 
 echo ""
 echo "## Union Response Overhead"

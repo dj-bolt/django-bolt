@@ -71,6 +71,7 @@ nav = [
     { "Middleware" = "topics/middleware.md" },
     { "Compression" = "topics/compression.md" },
     { "Static Files" = "topics/static-files.md" },
+    { "Media Files" = "topics/media-files.md" },
     { "Lifespan" = "topics/lifespan.md" },
     { "Django Signals" = "topics/signals.md" },
     { "Error Handling" = "topics/error-handling.md" },

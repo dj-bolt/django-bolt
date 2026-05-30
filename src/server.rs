@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,22 +21,100 @@ use crate::middleware::compression::CompressionMiddleware;
 use crate::middleware::cors::CorsMiddleware;
 use crate::router::Router;
 use crate::state::{
-    AppState, MediaFilesConfig, StaticFilesConfig, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
-    GLOBAL_WEBSOCKET_ROUTER, ROUTE_METADATA, ROUTE_METADATA_TEMP, TASK_LOCALS,
+    AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, GLOBAL_WEBSOCKET_ROUTER,
+    ROUTE_METADATA, ROUTE_METADATA_TEMP, TASK_LOCALS,
 };
-use crate::static_files::{handle_media_file, handle_static_file, CacheControlHeader};
+use crate::static_files::handle_file;
 use crate::websocket::{
     handle_websocket_upgrade_with_handler, is_websocket_upgrade, WebSocketRouter,
 };
 
+/// Reject URL prefixes containing actix scope path-param syntax.
+///
+/// `web::scope("/media/{tenant}")` silently compiles into a parameterized
+/// scope: the `{tenant}` segment becomes a wildcard, not the literal four
+/// characters the operator wrote. We refuse to mount in that case so the
+/// misconfig surfaces at startup rather than as a confusing routing bug.
+fn is_literal_prefix(prefix: &str) -> bool {
+    !prefix.contains(['{', '}'])
+}
+
+/// Coerce a Django settings value to a path string. STATIC_ROOT / MEDIA_ROOT /
+/// STATICFILES_DIRS entries are commonly `Path` objects (`BASE_DIR / "static"`),
+/// so fall back to `str()` rather than failing the `String` extraction.
+fn settings_path_to_string(obj: &Bound<'_, PyAny>) -> Option<String> {
+    obj.extract::<String>()
+        .or_else(|_| {
+            obj.call_method0("__str__")
+                .and_then(|s| s.extract::<String>())
+        })
+        .ok()
+}
+
+/// Canonicalize the configured serve directories once, at startup.
+///
+/// The request hot path joins the user-supplied relative path onto these
+/// roots and canonicalizes the *result* to enforce the no-escape boundary.
+/// Canonicalizing the root here (rather than per request) removes a
+/// multi-syscall `realpath(3)` from every single static/media request.
+///
+/// A directory that doesn't exist or can't be resolved is dropped with a
+/// warning — same effect as the old per-request `is_dir()` filter, just
+/// evaluated once.
+fn canonicalize_serve_dirs(dirs: &[String], url_prefix: &str, label: &str) -> Vec<PathBuf> {
+    dirs.iter()
+        .filter_map(|dir| match Path::new(dir).canonicalize() {
+            Ok(canonical) if canonical.is_dir() => Some(canonical),
+            Ok(_) => {
+                eprintln!(
+                    "[django-bolt] Warning: {}: not a directory for {}: {}",
+                    label, url_prefix, dir
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "[django-bolt] Warning: {}: cannot resolve directory for {}: {} ({})",
+                    label, url_prefix, dir, e
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Cache visibility for the `Cache-Control` directive. Picked per-source:
+/// static assets are admin-curated and identical for every user, so `public`
+/// is correct for CDN/proxy caching. Media is per-user content where the URL
+/// is often the only access gate — `public` would let shared caches hand one
+/// user's uploads to another.
+#[derive(Clone, Copy, Debug)]
+enum CacheVisibility {
+    Public,
+    Private,
+}
+
+impl CacheVisibility {
+    fn directive(self) -> &'static str {
+        match self {
+            CacheVisibility::Public => "public",
+            CacheVisibility::Private => "private",
+        }
+    }
+}
+
 /// Read a `BOLT_*_MAX_AGE` Django setting and return a pre-built `Cache-Control`
-/// `HeaderValue` (e.g. `"public, max-age=31536000"`).
+/// `HeaderValue` (e.g. `"public, max-age=31536000"` or `"private, max-age=300"`).
 ///
 /// Validation (all at startup so the request path stays a plain header clone):
 /// - Missing / None → no header
 /// - Booleans, non-integers, negatives → warn, no header
 /// - Non-negative integer → `Some(HeaderValue)`
-fn read_max_age_setting(py: Python<'_>, name: &str) -> Option<HeaderValue> {
+fn read_max_age_setting(
+    py: Python<'_>,
+    name: &str,
+    visibility: CacheVisibility,
+) -> Option<HeaderValue> {
     let django_conf = py.import("django.conf").ok()?;
     let settings = django_conf.getattr("settings").ok()?;
     let value = settings.getattr(name).ok()?;
@@ -72,7 +150,7 @@ fn read_max_age_setting(py: Python<'_>, name: &str) -> Option<HeaderValue> {
     // Validate once: format always produces ASCII so from_str cannot fail in
     // practice, but if it ever does we want a startup warning, not a silent
     // per-request drop.
-    match HeaderValue::from_str(&format!("public, max-age={}", max_age)) {
+    match HeaderValue::from_str(&format!("{}, max-age={}", visibility.directive(), max_age)) {
         Ok(v) => Some(v),
         Err(e) => {
             eprintln!(
@@ -322,21 +400,23 @@ pub fn start_server(
             if url_prefix.is_empty() {
                 return Ok(None); // Invalid static URL
             }
+            if !is_literal_prefix(&url_prefix) {
+                eprintln!(
+                    "[django-bolt] Warning: STATIC_URL contains scope-param chars \
+                     (got {:?}); refusing to mount. Use a literal prefix like \"/static/\".",
+                    static_url
+                );
+                return Ok(None);
+            }
 
             let mut directories: Vec<String> = Vec::new();
 
-            // Get STATIC_ROOT (primary location for collected static files)
-            // STATIC_ROOT can be a Path object, so convert via str()
-            // STATIC_ROOT defaults to None in Django when not configured --
-            // we must skip None to avoid converting it to the string "None".
+            // Get STATIC_ROOT (primary location for collected static files).
+            // Defaults to None in Django when not configured -- skip None so we
+            // don't push the literal string "None".
             if let Ok(static_root) = settings.getattr("STATIC_ROOT") {
                 if !static_root.is_none() {
-                    let root_str = static_root.extract::<String>().or_else(|_| {
-                        static_root
-                            .call_method0("__str__")
-                            .and_then(|s| s.extract::<String>())
-                    });
-                    if let Ok(root_str) = root_str {
+                    if let Some(root_str) = settings_path_to_string(&static_root) {
                         if !root_str.is_empty() {
                             directories.push(root_str);
                         }
@@ -344,21 +424,25 @@ pub fn start_server(
                 }
             }
 
-            // Get STATICFILES_DIRS (additional directories)
+            // Get STATICFILES_DIRS (additional directories). Convert element-wise
+            // rather than `extract::<Vec<String>>`, which would fail the whole
+            // list on the first Path entry.
             if let Ok(static_dirs) = settings.getattr("STATICFILES_DIRS") {
-                if let Ok(dirs) = static_dirs.extract::<Vec<String>>() {
-                    for dir in dirs {
-                        if !dir.is_empty() && !directories.contains(&dir) {
-                            directories.push(dir);
+                if let Ok(iter) = static_dirs.try_iter() {
+                    for entry in iter.flatten() {
+                        if let Some(dir) = settings_path_to_string(&entry) {
+                            if !dir.is_empty() && dir != "None" && !directories.contains(&dir) {
+                                directories.push(dir);
+                            }
                         }
                     }
                 }
             }
 
-            if directories.is_empty() {
-                return Ok(None); // No static directories configured
-            }
-
+            // Note: empty `directories` is NOT bailed on here. In DEBUG the
+            // scope still registers so its staticfiles-finders fallback can
+            // serve admin/app static (mirrors Django runserver). The
+            // register-or-not decision is made where DEBUG is known.
             Ok(Some((url_prefix, directories)))
         })()
         .unwrap_or(None);
@@ -394,6 +478,14 @@ pub fn start_server(
             if url_prefix.is_empty() {
                 return Ok(None); // MEDIA_URL = "/"; would shadow every route
             }
+            if !is_literal_prefix(&url_prefix) {
+                eprintln!(
+                    "[django-bolt] Warning: MEDIA_URL contains scope-param chars \
+                     (got {:?}); refusing to mount. Use a literal prefix like \"/media/\".",
+                    media_url
+                );
+                return Ok(None);
+            }
 
             // Get MEDIA_ROOT (local directory for uploaded files)
             // MEDIA_ROOT can be a Path object, so convert via str()
@@ -403,16 +495,7 @@ pub fn start_server(
                 _ => return Ok(None),
             };
 
-            let root_str = media_root
-                .extract::<String>()
-                .or_else(|_| {
-                    media_root
-                        .call_method0("__str__")
-                        .and_then(|s| s.extract::<String>())
-                })
-                .ok();
-
-            let root_str = match root_str {
+            let root_str = match settings_path_to_string(&media_root) {
                 Some(s) if !s.is_empty() => s,
                 _ => return Ok(None),
             };
@@ -432,10 +515,13 @@ pub fn start_server(
         })()
         .unwrap_or(None);
 
-        // Read CSP configuration from Django settings (Django 6.0+ SECURE_CSP)
-        // CSP header is built once at startup for static files (no nonce support for static files)
+        // Read CSP configuration from Django settings (Django 6.0+ SECURE_CSP).
+        // The header is built and *parsed into a HeaderValue once* at startup,
+        // so the request hot path becomes a `clone()` (Bytes-backed, ~1ns)
+        // rather than a fresh `HeaderValue::from_str` validation pass per
+        // response. Same pattern as `BOLT_*_MAX_AGE` cache-control headers.
         // See: https://docs.djangoproject.com/en/6.0/ref/csp/
-        let csp_header: Option<String> = (|| -> Option<String> {
+        let csp_header: Option<HeaderValue> = (|| -> Option<HeaderValue> {
             use std::collections::HashMap;
 
             let django_conf = py.import("django.conf").ok()?;
@@ -468,9 +554,19 @@ pub fn start_server(
             }
 
             if csp_parts.is_empty() {
-                None
-            } else {
-                Some(csp_parts.join("; "))
+                return None;
+            }
+            let csp_string = csp_parts.join("; ");
+            match HeaderValue::from_str(&csp_string) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!(
+                        "[django-bolt] Warning: SECURE_CSP produced an invalid \
+                         HTTP header value ({}); ignoring. CSP string was {:?}.",
+                        e, csp_string
+                    );
+                    None
+                }
             }
         })();
 
@@ -481,8 +577,14 @@ pub fn start_server(
         //   - non-integer:     warn, no header
         //   - negative:        warn, no header
         //   - >= 0:            "public, max-age=N"
-        let static_cache_control = read_max_age_setting(py, "BOLT_STATIC_MAX_AGE");
-        let media_cache_control = read_max_age_setting(py, "BOLT_MEDIA_MAX_AGE");
+        // Static is admin-curated and identical for every user — `public` lets
+        // CDNs cache aggressively. Media is per-user content where the URL is
+        // often the only access gate; `private` keeps shared caches from
+        // serving one user's uploads to another.
+        let static_cache_control =
+            read_max_age_setting(py, "BOLT_STATIC_MAX_AGE", CacheVisibility::Public);
+        let media_cache_control =
+            read_max_age_setting(py, "BOLT_MEDIA_MAX_AGE", CacheVisibility::Private);
 
         // Check Django's logging configuration to determine if access logging is enabled.
         // Uses the standard django.server logger — no extra settings needed.
@@ -621,45 +723,54 @@ pub fn start_server(
         None => None,
     };
 
-    // Build static files configuration
+    // Build static files configuration.
+    // Directories are canonicalized ONCE here so the request hot path never
+    // runs `canonicalize()` (a multi-syscall realpath) on the directory root.
     let static_files_config = static_files_data.and_then(|(url_prefix, directories)| {
-        // Filter to only existing directories
-        let valid_dirs: Vec<String> = directories
-            .into_iter()
-            .filter(|dir| Path::new(dir).is_dir())
-            .collect();
-
-        if valid_dirs.is_empty() {
+        let valid_dirs = canonicalize_serve_dirs(&directories, &url_prefix, "Static files");
+        // Register the scope when we have real directories to serve OR we're in
+        // DEBUG. In DEBUG the staticfiles-finders fallback resolves admin/app
+        // static (the dev equivalent of Django runserver), so an empty
+        // STATIC_ROOT is fine. In production with no valid dirs we do NOT
+        // register: finders are disabled there by design, so the scope would
+        // only 404 — run collectstatic to populate STATIC_ROOT.
+        if valid_dirs.is_empty() && !debug {
             eprintln!(
-                "[django-bolt] Warning: Static files: No valid directories found for {}",
+                "[django-bolt] Warning: Static files: No valid directories found for {} \
+                 and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.",
                 url_prefix
             );
             None
         } else {
-            Some(StaticFilesConfig {
+            Some(Arc::new(ScopeConfig {
                 url_prefix,
                 directories: valid_dirs,
                 csp_header: csp_header.clone(),
                 cache_control: static_cache_control.clone(),
-            })
+                mode: ServeMode::Static,
+                // Finders only resolve STATICFILES_DIRS / app static dirs and
+                // only in development; never used in production or for media.
+                allow_django_finders: debug,
+            }))
         }
     });
 
-    // Build media files configuration
+    // Build media files configuration (single directory: MEDIA_ROOT).
     let media_files_config = media_files_data.and_then(|(url_prefix, directory)| {
-        if !Path::new(&directory).is_dir() {
-            eprintln!(
-                "[django-bolt] Warning: Media files: directory does not exist for {}: {}",
-                url_prefix, directory
-            );
+        let valid_dirs =
+            canonicalize_serve_dirs(std::slice::from_ref(&directory), &url_prefix, "Media files");
+        if valid_dirs.is_empty() {
+            // canonicalize_serve_dirs already warned with the specific path.
             None
         } else {
-            Some(MediaFilesConfig {
+            Some(Arc::new(ScopeConfig {
                 url_prefix,
-                directory,
+                directories: valid_dirs,
                 csp_header: csp_header.clone(),
                 cache_control: media_cache_control.clone(),
-            })
+                mode: ServeMode::Media,
+                allow_django_finders: false,
+            }))
         }
     });
 
@@ -728,47 +839,30 @@ pub fn start_server(
 
                         // Register static & media handlers (if configured via Django settings).
                         // Each is mounted under its own `web::scope` so that:
-                        //  1. Their `web::Data<Vec<String>>` / `web::Data<Option<String>>`
-                        //     do not collide at App scope (app_data is type-keyed, so later
-                        //     registrations would otherwise overwrite earlier ones).
+                        //  1. A single `web::Data<Arc<ScopeConfig>>` per scope carries all
+                        //     per-scope state. One TypeId-keyed app_data lookup per request
+                        //     instead of three, and the two scopes don't collide.
                         //  2. The route only matches at a `/` segment boundary —
                         //     `/static/foo` matches, `/staticx/foo` does not.
                         // Static also falls back to Django's staticfiles finders (debug only)
                         // for app static files like admin; media only serves MEDIA_ROOT.
-                        if let Some(ref config) = app_state.static_files_config {
-                            let static_dirs = web::Data::new(config.directories.clone());
-                            let static_csp = web::Data::new(config.csp_header.clone());
-                            let static_cc =
-                                web::Data::new(CacheControlHeader(config.cache_control.clone()));
-                            app = app.service(
-                                web::scope(&config.url_prefix)
-                                    .app_data(static_dirs)
-                                    .app_data(static_csp)
-                                    .app_data(static_cc)
-                                    .service(
+                        // Both scopes route to the same `handle_file`; per-scope
+                        // behaviour (finders fallback, media XSS-disarm, cache
+                        // visibility) is data on each `ScopeConfig`.
+                        for cfg in [
+                            &app_state.static_files_config,
+                            &app_state.media_files_config,
+                        ] {
+                            if let Some(config) = cfg {
+                                let scope_data = web::Data::new(config.clone());
+                                app = app.service(
+                                    web::scope(&config.url_prefix).app_data(scope_data).service(
                                         web::resource("/{path:.*}")
-                                            .route(web::get().to(handle_static_file))
-                                            .route(web::head().to(handle_static_file)),
+                                            .route(web::get().to(handle_file))
+                                            .route(web::head().to(handle_file)),
                                     ),
-                            );
-                        }
-
-                        if let Some(ref config) = app_state.media_files_config {
-                            let media_dirs = web::Data::new(vec![config.directory.clone()]);
-                            let media_csp = web::Data::new(config.csp_header.clone());
-                            let media_cc =
-                                web::Data::new(CacheControlHeader(config.cache_control.clone()));
-                            app = app.service(
-                                web::scope(&config.url_prefix)
-                                    .app_data(media_dirs)
-                                    .app_data(media_csp)
-                                    .app_data(media_cc)
-                                    .service(
-                                        web::resource("/{path:.*}")
-                                            .route(web::get().to(handle_media_file))
-                                            .route(web::head().to(handle_media_file)),
-                                    ),
-                            );
+                                );
+                            }
                         }
 
                         // Default service handles all unmatched HTTP requests.

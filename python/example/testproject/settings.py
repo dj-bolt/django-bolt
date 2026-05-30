@@ -124,10 +124,19 @@ USE_TZ = True
 
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+# Source assets served directly by the Rust static handler (e.g. /static/bench/asset_1k.css).
+# Django-Bolt serves STATIC_ROOT first, then STATICFILES_DIRS.
+STATICFILES_DIRS = [BASE_DIR / "static"]
 
 # Media files (User uploads)
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+# Cache-Control for in-process static/media serving (seconds). Static is
+# admin-curated → emitted as `public`; media is per-user → emitted as `private`.
+# Set here so benchmarks exercise the header-emitting hot path.
+BOLT_STATIC_MAX_AGE = 31536000  # 1 year (content-hashed assets)
+BOLT_MEDIA_MAX_AGE = 3600  # 1 hour
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

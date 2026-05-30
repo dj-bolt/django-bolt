@@ -34,7 +34,6 @@ from ._kwargs import (
 )
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
-from .admin.static_routes import StaticRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler, warn_blocking_handler
 from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import load_user_sync
@@ -433,7 +432,6 @@ class BoltAPI:
 
         # Django admin configuration (controlled by --no-admin flag)
         self._admin_routes_registered = False
-        self._static_routes_registered = False
         self._asgi_mounts: list[tuple[str, Callable[..., Any]]] = []
         self._asgi_mount_prefixes: set[str] = set()
 
@@ -2647,15 +2645,6 @@ class BoltAPI:
 
         registrar = AdminRouteRegistrar(self)
         registrar.register_routes(host, port)
-
-    def _register_static_routes(self) -> None:
-        """Register static file serving routes for Django admin.
-
-        Delegates to StaticRouteRegistrar for cleaner separation of concerns.
-        """
-
-        registrar = StaticRouteRegistrar(self)
-        registrar.register_routes()
 
     def _register_auth_backends(self) -> None:
         """

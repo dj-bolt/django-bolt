@@ -150,6 +150,35 @@ BOLT_ALLOWED_FILE_PATHS = [
 
 When set, `FileResponse` only serves files within these directories.
 
+## Static and media file serving
+
+Django-Bolt serves static and media files from Rust based on your standard Django settings — `STATIC_URL` / `STATIC_ROOT` / `STATICFILES_DIRS` for static, and `MEDIA_URL` / `MEDIA_ROOT` for media. The scopes mount automatically when those settings are configured.
+
+See [Static Files](../topics/static-files.md) and [Media Files](../topics/media-files.md) for full documentation.
+
+### BOLT_STATIC_MAX_AGE
+
+`Cache-Control` max-age (seconds) for successful static responses. Emits `Cache-Control: public, max-age=N` (static assets are identical for every user, so shared caches can cache them).
+
+```python
+BOLT_STATIC_MAX_AGE = 31536000  # 1 year — safe for content-hashed assets
+```
+
+**Default:** unset (no `Cache-Control` header)
+
+### BOLT_MEDIA_MAX_AGE
+
+`Cache-Control` max-age (seconds) for successful media responses. Emits `Cache-Control: private, max-age=N` — **`private`** so shared caches don't serve one user's upload to another.
+
+```python
+BOLT_MEDIA_MAX_AGE = 3600  # 1 hour
+```
+
+**Default:** unset (no `Cache-Control` header)
+
+!!! note "Validation"
+    Both settings only emit a header on `2xx` responses. Missing, non-integer, boolean, or negative values are ignored with a startup warning. `STATIC_URL` / `MEDIA_URL` must be literal prefixes — values containing `{`/`}` are refused at startup.
+
 ## Authentication settings
 
 Django-Bolt uses Django's `SECRET_KEY` for JWT signing by default.
@@ -350,6 +379,8 @@ api = BoltAPI(
 | `BOLT_MAX_UPLOAD_SIZE` | `int` | `1048576` | Max upload size (bytes) |
 | `BOLT_MEMORY_SPOOL_THRESHOLD` | `int` | `1048576` | Memory threshold before disk spooling (bytes) |
 | `BOLT_ALLOWED_FILE_PATHS` | `list[str]` | `None` | File serving whitelist |
+| `BOLT_STATIC_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for static (`public`) |
+| `BOLT_MEDIA_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for media (`private`) |
 | `BOLT_EMIT_SIGNALS` | `bool` | `False` | Enable Django request signals |
 | `BOLT_DEV_FORCE_POLLING` | `bool` | `False` | Force `--dev` reloader to use polling instead of native file events |
 | `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |

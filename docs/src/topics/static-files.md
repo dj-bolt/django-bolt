@@ -6,6 +6,9 @@ icon: lucide/file-image
 
 For production deployments, we recommend letting **Nginx** handle static files at the reverse proxy layer — this offloads static traffic entirely so Django-Bolt focuses on API requests. That said, Django-Bolt also serves static files directly from Rust using Actix-files, delivering high-performance static file serving without Python overhead — a solid option when you want a simpler setup without configuring static file handling in your reverse proxy.
 
+!!! tip "Serving user uploads?"
+    This page covers **static assets** (CSS, JS, admin) from `STATIC_ROOT` / `STATICFILES_DIRS`. For user-uploaded media (`MEDIA_ROOT`), see [Media Files](media-files.md) — it shares this handler but applies stricter, upload-specific defaults.
+
 ## Overview
 
 Static files are served with:
@@ -74,9 +77,20 @@ INSTALLED_APPS = [
 
 Django-Bolt blocks directory traversal attacks:
 
-- Paths containing `..` are rejected
+- Paths containing `..` are rejected with `400`
 - Symlink targets are verified to stay within allowed directories
 - Only files (not directories) are served
+
+### Dotfile deny
+
+Any request whose path has a leading-dot component — `.env`, `.git/config`, `.htaccess`, `.ssh/id_rsa` — returns `404`, matching the nginx/Apache default. This keeps stray dotfiles left in `STATIC_ROOT` from being reachable over HTTP. Backslash-separated components (`foo\.env`) are caught as well.
+
+### nosniff
+
+`X-Content-Type-Options: nosniff` is applied to **every** response, including 404s, so a crafted miss can't be MIME-sniffed into HTML/JS execution.
+
+!!! note "User uploads need more"
+    Static files keep their native content types because they're admin-curated. **Media** uploads are untrusted, so the media handler additionally force-downloads script-bearing files (`.html`, `.svg`, `.js`, …). See [Media Files — Security model](media-files.md#security-model).
 
 ### Content Security Policy (CSP)
 
@@ -159,6 +173,21 @@ The Django `{% static %}` template tag works as expected:
 </body>
 </html>
 ```
+
+## Caching
+
+Set `BOLT_STATIC_MAX_AGE` (seconds) to emit a `Cache-Control` header on successful static responses:
+
+```python
+# settings.py
+BOLT_STATIC_MAX_AGE = 31536000  # 1 year — safe for content-hashed assets
+```
+
+This produces `Cache-Control: public, max-age=31536000`. Static uses **`public`** (unlike media's `private`) because assets are identical for every user, so CDNs and shared proxies can cache them aggressively.
+
+- The header is only set on `2xx` responses — a `404` is never cached with a long `max-age`.
+- Missing, non-integer, boolean, or negative values are ignored with a startup warning.
+- This is independent of the ETag / Last-Modified validators, which are always sent.
 
 ## Performance
 

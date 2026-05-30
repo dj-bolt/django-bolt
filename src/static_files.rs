@@ -17,31 +17,71 @@ use pyo3::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::state::AppState;
+use crate::state::{ScopeConfig, ServeMode};
 
-/// Per-scope Cache-Control header, pre-validated as a `HeaderValue` at startup
-/// from `BOLT_STATIC_MAX_AGE` / `BOLT_MEDIA_MAX_AGE`. Wrapped in a newtype so
-/// the inner `Option<HeaderValue>` doesn't type-collide with other extractors
-/// in the same scope.
-#[derive(Clone, Debug)]
-pub struct CacheControlHeader(pub Option<header::HeaderValue>);
+/// Extensions that can carry executable script in a browser context.
+/// For media (user uploads), these are rewritten to `application/octet-stream`
+/// + `Content-Disposition: attachment` so they cannot run in the site's origin.
+///
+/// Picked for what *actually executes JS in your origin* when fetched directly:
+/// HTML-family (rendered), SVG-family (script-capable), XML/XSLT (XHTML
+/// rendering, XSLT can JS), JS-family (loaded as `<script>`), WASM (loaded by
+/// JS, but a known origin-confused-deputy vector). CSS is omitted: it can
+/// exfiltrate but cannot execute, and forcing CSS to download would be
+/// gratuitous for the common "let users upload theme overrides" case.
+const DANGEROUS_MEDIA_EXTS: &[&str] = &[
+    "html", "htm", "xhtml", "xhtm", "shtml", "shtm", "htc", "hta",
+    "svg", "svgz",
+    "xml", "xsl", "xslt",
+    "js", "mjs", "cjs",
+    "wasm",
+];
 
-/// Find a static file in the configured directories (fast path)
-fn find_in_directories(relative_path: &str, directories: &[String]) -> Option<PathBuf> {
+fn is_dangerous_media_ext(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    // Hot path: zero-allocation comparison. `to_ascii_lowercase()` would
+    // heap-allocate a String for every media request.
+    DANGEROUS_MEDIA_EXTS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+}
+
+/// Rejects any path with a leading-dot component. Matches the nginx/Apache
+/// default deny for dotfiles, so stray `.env`, `.git/config`, `.htaccess`,
+/// `.ssh/...` left in STATIC_ROOT or MEDIA_ROOT aren't reachable over HTTP.
+///
+/// Operates on the URL-decoded path string. Splits on both `/` and `\` so a
+/// Windows-style backslash component (`foo\.env`) is caught as well.
+fn has_dotfile_component(relative_path: &str) -> bool {
+    relative_path
+        .split(['/', '\\'])
+        .any(|segment| segment.starts_with('.'))
+}
+
+/// Find a static file in the configured directories (fast path).
+///
+/// `directories` must hold pre-canonicalized absolute paths (server-startup
+/// canonicalization is in `start_server`). This keeps `canonicalize()` — a
+/// multi-syscall `realpath(3)` — off the per-request directory lookup; it
+/// runs only on the resolved file path, where it must (to follow symlinks
+/// in the user-supplied portion).
+fn find_in_directories(relative_path: &str, directories: &[PathBuf]) -> Option<PathBuf> {
     // Security: prevent directory traversal
     if relative_path.contains("..") || relative_path.starts_with('/') {
         return None;
     }
 
-    for dir in directories {
-        let full_path = Path::new(dir).join(relative_path);
+    for dir_canonical in directories {
+        let full_path = dir_canonical.join(relative_path);
 
-        // Verify the resolved path is still within the directory (prevent symlink attacks)
+        // Canonicalize the *file* (not the dir) to resolve any symlinks in
+        // the relative portion, then verify the result is still inside the
+        // canonical root. Stops a symlink-out-of-root from escaping.
         if let Ok(canonical) = full_path.canonicalize() {
-            if let Ok(dir_canonical) = Path::new(dir).canonicalize() {
-                if canonical.starts_with(&dir_canonical) && canonical.is_file() {
-                    return Some(canonical);
-                }
+            if canonical.starts_with(dir_canonical) && canonical.is_file() {
+                return Some(canonical);
             }
         }
     }
@@ -68,91 +108,62 @@ fn find_with_django_finders(relative_path: &str) -> Option<PathBuf> {
     })
 }
 
-/// Handler for static file requests
+/// Unified static/media file handler. Behaviour is driven entirely by
+/// `config` (`ScopeConfig`), so both the `/static` and `/media` scopes route
+/// here — there is no per-scope code path.
 ///
-/// Uses actix-files NamedFile which provides:
-/// - Streaming responses (memory efficient)
-/// - Automatic ETag generation
-/// - Last-Modified headers
-/// - Conditional request handling (304 Not Modified)
-/// - Range request support
-/// - Content-Type detection
-/// - CSP headers from Django settings (pre-built at server startup)
+/// Uses actix-files `NamedFile` for streaming, ETag/Last-Modified, conditional
+/// requests (304), range support, and content-type detection. Every response
+/// carries `X-Content-Type-Options: nosniff` and (if configured) the startup-
+/// built CSP header; dotfile components (`.env`, `.git/...`, …) are 404'd.
 ///
-/// Security note:
-/// - Django finders fallback (for app static files like admin) is only enabled in debug mode
-/// - In production (DEBUG=False), only configured directories (STATIC_ROOT, STATICFILES_DIRS) are served
-/// - This prevents potential path exposure from Django app finders in production
-pub async fn handle_static_file(
+/// Scope-specific behaviour, all keyed off `config`:
+/// - Static (`allow_django_finders`, debug only): falls back to Django's
+///   staticfiles finders for app static like admin. In production only the
+///   configured dirs (STATIC_ROOT, STATICFILES_DIRS) are served.
+/// - Media (`ServeMode::Media`): never uses finders (they don't know
+///   MEDIA_ROOT), and any upload whose extension can carry script
+///   (`.html`, `.svg`, `.js`, `.wasm`, …) is force-downloaded as
+///   `application/octet-stream` — `nosniff` alone won't stop a browser from
+///   honouring a `text/html`/`image/svg+xml` type and running its scripts.
+pub async fn handle_file(
     req: HttpRequest,
     path: web::Path<String>,
-    directories: web::Data<Vec<String>>,
-    csp_header: web::Data<Option<String>>,
-    cache_control: web::Data<CacheControlHeader>,
-    app_state: web::Data<Arc<AppState>>,
-) -> HttpResponse {
-    serve_request(
-        req,
-        path,
-        directories,
-        csp_header,
-        cache_control,
-        false, // nosniff
-        Some(app_state),
-    )
-    .await
-}
-
-/// Handler for media file requests.
-///
-/// Same as `handle_static_file` but without the Django staticfiles finders
-/// fallback — finders only know about STATICFILES_DIRS / app `static/` dirs,
-/// never `MEDIA_ROOT`, so falling through would leak static assets under /media/.
-/// Always emits `X-Content-Type-Options: nosniff` so user-uploaded HTML/SVG
-/// can't be coerced into being rendered as HTML/JS by the browser.
-pub async fn handle_media_file(
-    req: HttpRequest,
-    path: web::Path<String>,
-    directories: web::Data<Vec<String>>,
-    csp_header: web::Data<Option<String>>,
-    cache_control: web::Data<CacheControlHeader>,
-) -> HttpResponse {
-    serve_request(req, path, directories, csp_header, cache_control, true, None).await
-}
-
-async fn serve_request(
-    req: HttpRequest,
-    path: web::Path<String>,
-    directories: web::Data<Vec<String>>,
-    csp_header: web::Data<Option<String>>,
-    cache_control: web::Data<CacheControlHeader>,
-    nosniff: bool,
-    static_app_state: Option<web::Data<Arc<AppState>>>,
+    config: web::Data<Arc<ScopeConfig>>,
 ) -> HttpResponse {
     // Strip leading slash if present (route captures include it)
     let relative_path = path.into_inner();
     let relative_path = relative_path.trim_start_matches('/');
 
-    // Headers are applied uniformly to success AND error responses so a 404
-    // for /media/<crafted> can't be MIME-sniffed into HTML/JS execution.
-    let apply_headers = |response: &mut HttpResponse| {
-        if nosniff {
-            response.headers_mut().insert(
-                header::X_CONTENT_TYPE_OPTIONS,
-                header::HeaderValue::from_static("nosniff"),
-            );
+    // Security headers (nosniff, CSP) attach to ALL responses so a 404 for
+    // /media/<crafted> can't be MIME-sniffed into HTML/JS execution.
+    //
+    // Cache-Control is gated separately on success status (see
+    // `apply_freshness_header`) — caching a 404 with a long max-age would
+    // make a missing file invisible for the cache lifetime even after upload.
+    let apply_security_headers = |response: &mut HttpResponse| {
+        let headers = response.headers_mut();
+        headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::HeaderValue::from_static("nosniff"),
+        );
+        if let Some(ref csp) = config.csp_header {
+            // `csp` is a pre-validated HeaderValue from startup; clone is
+            // Bytes-backed and ~1ns.
+            headers.insert(header::CONTENT_SECURITY_POLICY, csp.clone());
         }
-        if let Some(ref csp) = **csp_header {
-            if let Ok(value) = header::HeaderValue::from_str(csp) {
+    };
+    let apply_freshness_header = |response: &mut HttpResponse| {
+        // nginx's `expires` directive only fires on 200. We do the same —
+        // 404/4xx caching forces a stale view of the resource long after the
+        // file finally lands. 304 already carries the original 200's
+        // Cache-Control via the client's cached entry, so no action needed.
+        if response.status().is_success() {
+            if let Some(ref cc) = config.cache_control {
                 response
                     .headers_mut()
-                    .insert(header::CONTENT_SECURITY_POLICY, value);
+                    .insert(header::CACHE_CONTROL, cc.clone());
             }
-        }
-        if let Some(ref cc) = cache_control.0 {
-            response
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, cc.clone());
         }
     };
 
@@ -160,26 +171,41 @@ async fn serve_request(
         let mut response = HttpResponse::BadRequest()
             .content_type("text/plain; charset=utf-8")
             .body("Invalid path");
-        apply_headers(&mut response);
+        apply_security_headers(&mut response);
         return response;
     }
 
-    let mut file_path = find_in_directories(relative_path, directories.as_ref());
+    // Dotfile deny: return 404 (not 400) so probing /static/.env doesn't
+    // confirm the prefix is configured. Same shape as a missing file.
+    if has_dotfile_component(relative_path) {
+        let mut response = not_found_response();
+        apply_security_headers(&mut response);
+        return response;
+    }
+
+    let mut file_path = find_in_directories(relative_path, &config.directories);
 
     // Static-only: fall back to Django finders in debug mode for app static
     // files like admin. Media intentionally skips this — finders only know
     // about STATICFILES_DIRS / app static dirs, never MEDIA_ROOT.
-    if let Some(app_state) = static_app_state {
-        if file_path.is_none() && app_state.debug {
-            file_path = find_with_django_finders(relative_path);
-        }
+    if config.allow_django_finders && file_path.is_none() {
+        file_path = find_with_django_finders(relative_path);
     }
 
-    let mut response = match file_path {
-        Some(path) => serve_file(&req, &path).await,
-        None => not_found_response(),
+    let mut response = if let Some(ref resolved) = file_path {
+        let mut r = serve_file(&req, resolved).await;
+        // XSS disarm: rewrite Content-Type and force download for any media
+        // upload whose extension can carry JS. Static keeps native types — a
+        // CMS-served `theme.html` is admin-curated.
+        if matches!(config.mode, ServeMode::Media) && is_dangerous_media_ext(resolved) {
+            disarm_scripting_response(&mut r);
+        }
+        r
+    } else {
+        not_found_response()
     };
-    apply_headers(&mut response);
+    apply_security_headers(&mut response);
+    apply_freshness_header(&mut response);
     response
 }
 
@@ -190,6 +216,27 @@ async fn serve_file(req: &HttpRequest, file_path: &Path) -> HttpResponse {
         Ok(named) => named.read_mode_threshold(256 * 1024).into_response(req),
         Err(_) => not_found_response(),
     }
+}
+
+/// Replace the response's Content-Type with `application/octet-stream` and
+/// force `Content-Disposition: attachment`. Together these tell every modern
+/// browser to download the bytes rather than render them, which neutralises
+/// stored XSS via user-uploaded HTML/SVG/JS in MEDIA_ROOT.
+///
+/// We deliberately do NOT include a `filename=` parameter to avoid feeding
+/// attacker-controlled bytes (the URL path) into header construction. The
+/// browser falls back to the last path segment of the URL for the saved
+/// filename, which is fine.
+fn disarm_scripting_response(response: &mut HttpResponse) {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_static("attachment"),
+    );
 }
 
 fn not_found_response() -> HttpResponse {
@@ -205,6 +252,13 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    /// Canonicalize as the server does at startup. The tests pass
+    /// pre-canonicalized roots so they exercise the same fast path
+    /// production uses (no per-request canonicalize() on the directory).
+    fn canon(dir: &Path) -> PathBuf {
+        dir.canonicalize().expect("test dir must canonicalize")
+    }
+
     #[test]
     fn test_find_in_directories() {
         let temp_dir = TempDir::new().unwrap();
@@ -216,7 +270,7 @@ mod tests {
         let mut file = File::create(css_dir.join("style.css")).unwrap();
         file.write_all(b"body { color: red; }").unwrap();
 
-        let directories = vec![temp_path.to_string_lossy().to_string()];
+        let directories = vec![canon(temp_path)];
 
         // Should find existing file
         let result = find_in_directories("css/style.css", &directories);
@@ -248,10 +302,7 @@ mod tests {
         let mut file2 = File::create(dir2.path().join("file2.txt")).unwrap();
         file2.write_all(b"content2").unwrap();
 
-        let directories = vec![
-            dir1.path().to_string_lossy().to_string(),
-            dir2.path().to_string_lossy().to_string(),
-        ];
+        let directories = vec![canon(dir1.path()), canon(dir2.path())];
 
         // Should find file1 in dir1
         let result = find_in_directories("file1.txt", &directories);
@@ -262,6 +313,59 @@ mod tests {
         let result = find_in_directories("file2.txt", &directories);
         assert!(result.is_some());
         assert!(result.unwrap().to_string_lossy().contains("file2.txt"));
+    }
+
+    #[test]
+    fn test_is_dangerous_media_ext() {
+        // Script-bearing extensions must be flagged regardless of case.
+        for ext in &[
+            "html", "HTM", "xhtml", "xhtm", "shtml", "shtm", "htc", "hta",
+            "svg", "SVGZ",
+            "xml", "xsl", "xslt",
+            "js", "MJS", "cjs",
+            "wasm",
+        ] {
+            let p = Path::new(&format!("upload.{}", ext)).to_path_buf();
+            assert!(
+                is_dangerous_media_ext(&p),
+                "{} must be flagged dangerous (case-insensitive)",
+                ext
+            );
+        }
+        // Inert types stay inline so legitimate avatars/images keep working.
+        for ext in &["png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "json", "css"] {
+            let p = Path::new(&format!("upload.{}", ext)).to_path_buf();
+            assert!(
+                !is_dangerous_media_ext(&p),
+                "{} must NOT be flagged dangerous",
+                ext
+            );
+        }
+        // No extension at all: don't rewrite. Browsers default to octet-stream
+        // for unknown types anyway via nosniff, so this is safe.
+        assert!(!is_dangerous_media_ext(Path::new("Makefile")));
+        assert!(!is_dangerous_media_ext(Path::new("")));
+    }
+
+    #[test]
+    fn test_has_dotfile_component() {
+        // Leaf dotfile.
+        assert!(has_dotfile_component(".env"));
+        assert!(has_dotfile_component(".htaccess"));
+        // Nested dotfile or dot-directory.
+        assert!(has_dotfile_component("subdir/.env"));
+        assert!(has_dotfile_component(".git/config"));
+        assert!(has_dotfile_component(".ssh/id_rsa"));
+        // Backslash separator (Windows-style traversal/component).
+        assert!(has_dotfile_component("foo\\.env"));
+        assert!(has_dotfile_component(".git\\config"));
+        // Normal paths must not be flagged.
+        assert!(!has_dotfile_component("css/style.css"));
+        assert!(!has_dotfile_component("photos/img.png"));
+        assert!(!has_dotfile_component("a/b/c.txt"));
+        // A `.` in the middle of a filename is fine — only leading dot counts.
+        assert!(!has_dotfile_component("file.name.txt"));
+        assert!(!has_dotfile_component("v1.2.3/build"));
     }
 
     #[test]
@@ -277,10 +381,7 @@ mod tests {
         file2.write_all(b"from_dir2").unwrap();
 
         // dir1 should take priority (listed first)
-        let directories = vec![
-            dir1.path().to_string_lossy().to_string(),
-            dir2.path().to_string_lossy().to_string(),
-        ];
+        let directories = vec![canon(dir1.path()), canon(dir2.path())];
 
         let result = find_in_directories("shared.txt", &directories);
         assert!(result.is_some());

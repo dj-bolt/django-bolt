@@ -4,6 +4,7 @@ use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
 use regex::Regex;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,22 +51,35 @@ fn find_mount_in_slice<'a>(mounts: &'a [AsgiMount], path: &str) -> Option<&'a As
     mounts.iter().find(|mount| mount.matches_path(path))
 }
 
-/// Configuration for serving static files via Actix
-#[derive(Clone, Debug)]
-pub struct StaticFilesConfig {
-    pub url_prefix: String,                  // URL prefix (e.g., "/static")
-    pub directories: Vec<String>,            // List of directories to serve from
-    pub csp_header: Option<String>,          // Pre-built Content-Security-Policy header from Django settings
-    pub cache_control: Option<HeaderValue>,  // Pre-built Cache-Control header from BOLT_STATIC_MAX_AGE
+/// Which security policy a file-serving scope uses.
+///
+/// Branch points: dangerous-content-type rewrite (media only) and
+/// Django staticfiles finders fallback (static only, in debug).
+#[derive(Clone, Copy, Debug)]
+pub enum ServeMode {
+    Static,
+    Media,
 }
 
-/// Configuration for serving user-uploaded media files via Actix
+/// Runtime configuration for a static or media files scope.
+///
+/// Built once at startup and shared across workers via `Arc<ScopeConfig>`.
+/// Everything here is pre-validated / pre-canonicalized so the request hot
+/// path is allocation-free:
+/// - `directories`: canonical, absolute paths — no per-request `canonicalize()`
+///   on the directory.
+/// - `csp_header` / `cache_control`: pre-parsed `HeaderValue`, cloned (cheap,
+///   Bytes-backed) per response — no per-request `from_str` validation.
 #[derive(Clone, Debug)]
-pub struct MediaFilesConfig {
-    pub url_prefix: String,                  // URL prefix (e.g., "/media")
-    pub directory: String,                   // Media root
-    pub csp_header: Option<String>,          // Pre-built Content-Security-Policy header from Django settings
-    pub cache_control: Option<HeaderValue>,  // Pre-built Cache-Control header from BOLT_MEDIA_MAX_AGE
+pub struct ScopeConfig {
+    pub url_prefix: String,
+    pub directories: Vec<PathBuf>,
+    pub csp_header: Option<HeaderValue>,
+    pub cache_control: Option<HeaderValue>,
+    pub mode: ServeMode,
+    /// Permits the Django staticfiles-finders fallback inside `handle_file`.
+    /// Only ever true for `ServeMode::Static` AND `DEBUG=True`.
+    pub allow_django_finders: bool,
 }
 
 pub struct AppState {
@@ -81,8 +95,8 @@ pub struct AppState {
     pub router: Option<Arc<Router>>, // Router (used by test infrastructure, optional in production)
     pub route_metadata: Option<Arc<RouteMetadataStore>>, // Route metadata (used by test infrastructure)
     pub asgi_mounts: Option<Arc<Vec<AsgiMount>>>, // ASGI mounts (tests). Production uses GLOBAL_ASGI_MOUNTS.
-    pub static_files_config: Option<StaticFilesConfig>, // Static files configuration from Django settings
-    pub media_files_config: Option<MediaFilesConfig>, // Media files configuration from Django settings
+    pub static_files_config: Option<Arc<ScopeConfig>>,
+    pub media_files_config: Option<Arc<ScopeConfig>>,
     pub access_logger: Option<Py<PyAny>>, // Python logger instance for access logging (django.server). None when disabled.
 }
 
