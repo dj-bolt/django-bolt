@@ -416,7 +416,7 @@ wait_for_server
 echo "### Form Data (POST /form)"
 # Create form data
 FORM_FILE=$(mktemp)
-echo "name=TestUser&age=25&email=test%40example.com" > "$FORM_FILE"
+printf '%s' "name=TestUser&age=25&email=test%40example.com" > "$FORM_FILE"
 $BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/x-www-form-urlencoded' -f "$FORM_FILE" http://$HOST:$PORT/form 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$FORM_FILE"
 
@@ -460,6 +460,35 @@ printf "File attachment content\r\n" >> "$MIXED_FILE"
 printf -- "--%s--\r\n" "$BOUNDARY" >> "$MIXED_FILE"
 $BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$MIXED_FILE" http://$HOST:$PORT/mixed-form 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$MIXED_FILE"
+
+# Repeated-key form: exercises the multi-value form path (e.g. multi-select,
+# multiple checkboxes with the same name). Validates list[T] struct binding.
+echo "### Form Repeated Keys urlencoded (POST /form-list)"
+FORM_LIST_FILE=$(mktemp)
+printf '%s' "name=Bench&tags=red&tags=green&tags=blue&tags=yellow&counts=1&counts=2&counts=3" > "$FORM_LIST_FILE"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/x-www-form-urlencoded' -f "$FORM_LIST_FILE" http://$HOST:$PORT/form-list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+rm -f "$FORM_LIST_FILE"
+
+echo "### Form Repeated Keys multipart (POST /form-list)"
+FORM_LIST_MULTI=$(mktemp)
+BOUNDARY="----BoltFormList$(date +%s)"
+# emit_part appends a multipart/form-data part for the given field name and value to the multipart body file `$FORM_LIST_MULTI`, using the current `BOUNDARY` and CRLF line endings.
+emit_part() {
+    printf -- "--%s\r\n" "$BOUNDARY" >> "$FORM_LIST_MULTI"
+    printf "Content-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" "$1" "$2" >> "$FORM_LIST_MULTI"
+}
+: > "$FORM_LIST_MULTI"
+emit_part "name" "Bench"
+emit_part "tags" "red"
+emit_part "tags" "green"
+emit_part "tags" "blue"
+emit_part "tags" "yellow"
+emit_part "counts" "1"
+emit_part "counts" "2"
+emit_part "counts" "3"
+printf -- "--%s--\r\n" "$BOUNDARY" >> "$FORM_LIST_MULTI"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$FORM_LIST_MULTI" http://$HOST:$PORT/form-list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+rm -f "$FORM_LIST_MULTI"
 
 kill -TERM -$SERVER_PID 2>/dev/null || true
 pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true

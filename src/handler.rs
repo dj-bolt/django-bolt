@@ -19,7 +19,7 @@ use crate::asgi_http;
 use crate::error;
 use crate::form_parsing::{
     parse_multipart, parse_urlencoded, FileContent, FileFieldConstraints, FileInfo,
-    FormParseResult, ValidationError, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
+    FormParseResult, FormValue, ValidationError, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
 };
 use crate::metadata::{RustArgBinding, RustArgSource};
 use crate::middleware;
@@ -316,7 +316,26 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
     }
 }
 
-/// Convert FileInfo to Python dict
+/// Convert a FileInfo into an unbound Python dict for use in Python code.
+///
+/// The returned dict contains the following keys:
+/// - `filename` (str)
+/// - `content_type` (str)
+/// - `size` (int)
+/// - `content` (`bytes` when the file is memory-backed, `None` when spooled to disk)
+/// - `temp_path` (str path when spooled to disk, `None` when memory-backed)
+///
+/// # Examples
+///
+/// ```
+/// use pyo3::prelude::*;
+/// // Assume `FileInfo` and `FileContent` are in scope:
+/// // let file = FileInfo { filename: "a.txt".into(), content_type: "text/plain".into(), size: 3, content: FileContent::Memory(vec![97,98,99]) };
+/// Python::with_gil(|py| {
+///     // let py_dict = file_info_to_py(py, &file).unwrap();
+///     // assert_eq!(py_dict.get_item("filename").unwrap().extract::<String>().unwrap(), "a.txt");
+/// });
+/// ```
 pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("filename", &file.filename)?;
@@ -338,31 +357,66 @@ pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> 
     Ok(dict.unbind())
 }
 
-/// Convert FormParseResult to Python dicts
+/// Convert a parsed multipart/form result into two Python dictionaries: one for form fields and one for uploaded files.
+///
+/// Single-value form fields are converted to scalar Python objects. Repeated form fields are converted to Python `list`s so consumers (e.g., msgspec) see `list[T]` for repeated keys. For files, a single uploaded file for a field becomes a single Python dict describing that file; multiple uploaded files for the same field become a Python `list` of file dicts. Returned dicts are unbound `PyDict`s ready to be attached to Python objects.
+///
+/// # Examples
+///
+/// ```no_run
+/// use pyo3::prelude::*;
+///
+/// // Assume `result` is a FormParseResult obtained from multipart parsing.
+/// # let result: crate::form_parsing::FormParseResult = unimplemented!();
+/// let seq_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+/// Python::with_gil(|py| {
+///     let (form_dict, files_dict) =
+///         crate::handler::form_result_to_py(py, &result, &seq_fields).unwrap();
+///     // `form_dict` maps field names -> scalar Python objects or lists
+///     // `files_dict` maps field names -> file dict or list of file dicts
+///     let _ = form_dict;
+///     let _ = files_dict;
+/// });
+/// ```
 pub fn form_result_to_py(
     py: Python<'_>,
     result: &FormParseResult,
+    seq_fields: &std::collections::HashSet<String>,
 ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-    // Convert form_map
     let form_dict = PyDict::new(py);
     for (key, value) in &result.form_map {
-        form_dict.set_item(key, coerced_value_to_py(py, value))?;
+        match value {
+            FormValue::Single(v) => {
+                let py_val = coerced_value_to_py(py, v);
+                if seq_fields.contains(key) {
+                    // Always emit list[T] for fields annotated as list/set/tuple.
+                    // The Python form-struct extractor skips its isinstance wrap-check.
+                    let list = PyList::new(py, [py_val])?;
+                    form_dict.set_item(key, list)?;
+                } else {
+                    form_dict.set_item(key, py_val)?;
+                }
+            }
+            FormValue::Multi(vs) => {
+                let items: Vec<Py<PyAny>> =
+                    vs.iter().map(|v| coerced_value_to_py(py, v)).collect();
+                let list = PyList::new(py, items)?;
+                form_dict.set_item(key, list)?;
+            }
+        }
     }
 
-    // Convert files_map - each field can have multiple files
     let files_dict = PyDict::new(py);
     for (field_name, files) in &result.files_map {
         if files.len() == 1 {
-            // Single file - store directly
             let file_dict = file_info_to_py(py, &files[0])?;
             files_dict.set_item(field_name, file_dict)?;
         } else {
-            // Multiple files - store as list
-            let file_list = PyList::empty(py);
+            let mut items: Vec<Py<PyAny>> = Vec::with_capacity(files.len());
             for file in files {
-                let file_dict = file_info_to_py(py, file)?;
-                file_list.append(file_dict)?;
+                items.push(file_info_to_py(py, file)?.into_any());
             }
+            let file_list = PyList::new(py, items)?;
             files_dict.set_item(field_name, file_list)?;
         }
     }
@@ -1188,7 +1242,12 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
         // Only create form/files dicts when form data is present (saves 2 allocs per request).
         let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {
-            let (fm, fi) = form_result_to_py(py, result)?;
+            static EMPTY_SEQ: std::sync::OnceLock<std::collections::HashSet<String>> =
+                std::sync::OnceLock::new();
+            let seq_fields = route_metadata
+                .map(|m| &m.form_seq_fields)
+                .unwrap_or_else(|| EMPTY_SEQ.get_or_init(std::collections::HashSet::new));
+            let (fm, fi) = form_result_to_py(py, result, seq_fields)?;
             (Some(fm), Some(fi))
         } else {
             (None, None)
