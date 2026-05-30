@@ -221,6 +221,31 @@ def _extract_type_hints_from_field(field: Any, target: dict[str, int], skip_stri
         target[field.name] = type_hint
 
 
+_SEQUENCE_ORIGINS_FOR_FORM = (list, set, frozenset, tuple)
+
+
+def _collect_form_seq_field_names(field: Any, target: set[str]) -> None:
+    """Collect wire-side field names whose declared type is a sequence (list/set/tuple/frozenset).
+
+    Rust uses this set to always emit a Python list for those keys, even when the
+    form contained only a single occurrence — eliminating a scalar→list wrap step
+    on the Python hot path.
+    """
+    unwrapped = unwrap_optional(field.annotation)
+    if is_msgspec_struct(unwrapped):
+        for struct_field in msgspec.structs.fields(unwrapped):
+            inner = unwrap_optional(struct_field.type)
+            if get_origin(inner) in _SEQUENCE_ORIGINS_FOR_FORM:
+                target.add(struct_field.name)
+                encoded_name = getattr(struct_field, "encode_name", struct_field.name)
+                if encoded_name != struct_field.name:
+                    target.add(encoded_name)
+    else:
+        inner = unwrap_optional(field.annotation)
+        if get_origin(inner) in _SEQUENCE_ORIGINS_FOR_FORM:
+            target.add(field.alias or field.name)
+
+
 def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, str]] | None:
     """Build a Rust-side argument binding plan for simple non-body handlers.
 
@@ -315,6 +340,7 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     # Format: {"param_name": type_hint_id, ...}
     param_types: dict[str, int] = {}
     form_type_hints: dict[str, int] = {}
+    form_seq_fields: set[str] = set()
     file_constraints: dict[str, dict[str, Any]] = {}
 
     fields = handler_meta.get("fields", [])
@@ -326,6 +352,7 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
         # Form fields - extract type hints for Rust-side form parsing
         elif field.source == "form":
             _extract_type_hints_from_field(field, form_type_hints, skip_string=False)
+            _collect_form_seq_field_names(field, form_seq_fields)
 
         # File fields - extract constraints for Rust-side validation
         elif field.source == "file":
@@ -348,6 +375,9 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
 
     if form_type_hints:
         metadata["form_type_hints"] = form_type_hints
+
+    if form_seq_fields:
+        metadata["form_seq_fields"] = sorted(form_seq_fields)
 
     if file_constraints:
         metadata["file_constraints"] = file_constraints

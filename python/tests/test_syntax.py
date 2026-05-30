@@ -18,7 +18,17 @@ from django_bolt.testing import TestClient
 
 @pytest.fixture(scope="module")
 def api():
-    """Create the test API with all routes"""
+    """
+    Create and return a BoltAPI instance configured with a comprehensive set of test routes.
+    
+    The returned API registers routes that exercise parameter binding (path, query, header, cookie, form, file),
+    response typing and conversion (plain text, bytes, JSON, HTML, file, redirect), streaming (sync and async generators,
+    SSE, typed async iterables), error handling, method handling (HEAD/OPTIONS), multipart uploads with size limits,
+    CORS behavior, and response model validation/coercion.
+    
+    Returns:
+        api (BoltAPI): A BoltAPI configured with the test endpoints used throughout the test suite.
+    """
     api = BoltAPI()
 
     class Item(msgspec.Struct):
@@ -262,7 +272,39 @@ def api():
 
     @api.post("/form-struct")
     async def form_struct(data: Annotated[FormDataStruct, Form()]):
+        """
+        Return selected fields extracted from the parsed form data.
+        
+        Parameters:
+            data (FormDataStruct): Parsed form data populated from the request body via Form().
+        
+        Returns:
+            dict: A dictionary with keys `username`, `age`, and `active` taken from `data`.
+        """
         return {"username": data.username, "age": data.age, "active": data.active}
+
+    # Form data with repeated keys (list[T]) — multipart/urlencoded send the
+    # same name multiple times; framework must preserve all values as a list.
+    class FormDataWithList(msgspec.Struct):
+        name: str
+        tags: list[str] = []
+        counts: list[int] = []
+
+    @api.post("/form-with-list")
+    async def form_with_list(data: Annotated[FormDataWithList, Form()]):
+        """
+        Handle a multipart or urlencoded form that may contain repeated keys for list fields.
+        
+        Parameters:
+            data (FormDataWithList): Parsed form data with fields:
+                - name (str): Username or identifier from the form.
+                - tags (list[str]): Zero-or-more tag values collected from repeated `tags` keys; defaults to an empty list when absent.
+                - counts (list[int]): Zero-or-more integer values collected from repeated `counts` keys; defaults to an empty list when absent.
+        
+        Returns:
+            dict: A dictionary with keys `"name"`, `"tags"`, and `"counts"` containing the parsed values.
+        """
+        return {"name": data.name, "tags": data.tags, "counts": data.counts}
 
     # Form data with Serializer and field_validator
     class FormDataSerializer(Serializer):
@@ -883,6 +925,59 @@ def test_form_struct_missing_required(client):
         data={"username": "john"},  # missing age
     )
     assert response.status_code == 422
+
+
+def test_form_list_field_urlencoded_multiple_values(client):
+    """Repeated urlencoded keys must bind to a list[T] struct field."""
+    body = "name=alice&tags=red&tags=green&tags=blue&counts=1&counts=2"
+    response = client.post(
+        "/form-with-list",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["name"] == "alice"
+    assert data["tags"] == ["red", "green", "blue"]
+    assert data["counts"] == [1, 2]
+
+
+def test_form_list_field_multipart_multiple_values(client):
+    """Repeated multipart keys must bind to a list[T] struct field."""
+    response = client.post(
+        "/form-with-list",
+        files=[
+            ("name", (None, "bob")),
+            ("tags", (None, "x")),
+            ("tags", (None, "y")),
+        ],
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["name"] == "bob"
+    assert data["tags"] == ["x", "y"]
+    assert data["counts"] == []
+
+
+def test_form_list_field_single_value_wraps_to_list(client):
+    """A list[T] field receiving a single occurrence becomes a one-element list."""
+    response = client.post(
+        "/form-with-list",
+        data={"name": "carol", "tags": "solo"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["name"] == "carol"
+    assert data["tags"] == ["solo"]
+
+
+def test_form_list_field_missing_uses_default(client):
+    """Missing list field falls back to the struct default."""
+    response = client.post("/form-with-list", data={"name": "dave"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["tags"] == []
+    assert data["counts"] == []
 
 
 def test_form_serializer(client):

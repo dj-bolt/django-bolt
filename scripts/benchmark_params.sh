@@ -114,6 +114,16 @@ run_bench_post "URL-Encoded Form - 10 fields (/bench/form/large)" \
     "$FORM_LARGE"
 rm -f "$FORM_LARGE"
 
+# Repeated-key form: exercises the multi-value path (Single → Multi promotion
+# in the Rust parser, list[T] struct binding in Python).
+FORM_REPEATED=$(mktemp)
+printf '%s' "name=Bench&tags=red&tags=green&tags=blue&tags=yellow&counts=1&counts=2&counts=3" > "$FORM_REPEATED"
+run_bench_post "URL-Encoded Form - Repeated Keys → list[T] (/form-list)" \
+    "http://$HOST:$PORT/form-list" \
+    "application/x-www-form-urlencoded" \
+    "$FORM_REPEATED"
+rm -f "$FORM_REPEATED"
+
 echo "## Multipart Form Parsing Performance"
 echo ""
 
@@ -174,6 +184,31 @@ printf "### Multipart - Multiple Files (/upload)\n"
 $BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$MULTI_FILE" http://$HOST:$PORT/upload 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 echo ""
 rm -f "$MULTI_FILE"
+
+# Multipart with repeated form keys: same field name appears multiple times
+# (mimics multi-select / checkbox lists). Tests FormValue::Single → Multi promotion.
+REPEATED_MULTI=$(mktemp)
+BOUNDARY="----BoltRepeated$(date +%s)"
+: > "$REPEATED_MULTI"
+# emit_multi_part appends a multipart/form-data part using BOUNDARY to the file referenced by REPEATED_MULTI with field name $1 and value $2.
+emit_multi_part() {
+    printf -- "--%s\r\n" "$BOUNDARY" >> "$REPEATED_MULTI"
+    printf "Content-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" "$1" "$2" >> "$REPEATED_MULTI"
+}
+emit_multi_part "name" "Bench"
+emit_multi_part "tags" "red"
+emit_multi_part "tags" "green"
+emit_multi_part "tags" "blue"
+emit_multi_part "tags" "yellow"
+emit_multi_part "counts" "1"
+emit_multi_part "counts" "2"
+emit_multi_part "counts" "3"
+printf -- "--%s--\r\n" "$BOUNDARY" >> "$REPEATED_MULTI"
+
+printf "### Multipart - Repeated Keys → list[T] (/form-list)\n"
+$BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$REPEATED_MULTI" http://$HOST:$PORT/form-list 2>&1 | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
+echo ""
+rm -f "$REPEATED_MULTI"
 
 # Cleanup
 kill -TERM -$SERVER_PID 2>/dev/null || true

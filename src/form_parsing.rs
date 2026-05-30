@@ -120,7 +120,23 @@ impl ValidationError {
         }
     }
 
-    /// Convert to JSON for HTTP 422 response
+    /// Convert the validation error into a JSON object shaped for HTTP 422 responses.
+    ///
+    /// The resulting JSON contains the keys `"type"`, `"loc"`, `"msg"`, and `"ctx"` describing the error.
+    ///
+    /// # Returns
+    ///
+    /// A `serde_json::Value` object with the error fields.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let err = ValidationError::file_too_large("avatar", 1024, 2048);
+    /// let json = err.to_json();
+    /// assert_eq!(json["type"], "file_too_large");
+    /// assert_eq!(json["loc"][0], "body");
+    /// assert!(json["ctx"].is_object());
+    /// ```
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "type": self.error_type,
@@ -131,20 +147,79 @@ impl ValidationError {
     }
 }
 
+/// A form field value. Most form keys appear once (Single — zero extra alloc).
+/// Only when a key appears multiple times do we promote to Multi (one Vec alloc
+/// at the moment of collision).
+#[derive(Debug)]
+pub enum FormValue {
+    Single(CoercedValue),
+    Multi(Vec<CoercedValue>),
+}
+
+impl FormValue {
+    /// Appends a coerced form value to this `FormValue`, promoting a `Single` into a `Multi` when a second value is inserted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Constructing examples assumes a `CoercedValue` variant `String` exists.
+    /// let mut fv = FormValue::Single(CoercedValue::String("first".into()));
+    /// fv.append(CoercedValue::String("second".into()));
+    /// match fv {
+    ///     FormValue::Multi(vals) => {
+    ///         assert_eq!(vals.len(), 2);
+    ///     }
+    ///     _ => panic!("expected Multi after append"),
+    /// }
+    /// ```
+    #[inline]
+    fn append(&mut self, value: CoercedValue) {
+        match self {
+            FormValue::Single(_) => {
+                // Take the existing Single, build a 2-element Vec.
+                let prev = std::mem::replace(self, FormValue::Multi(Vec::with_capacity(2)));
+                if let (FormValue::Single(prev_val), FormValue::Multi(v)) = (prev, &mut *self) {
+                    v.push(prev_val);
+                    v.push(value);
+                }
+            }
+            FormValue::Multi(v) => v.push(value),
+        }
+    }
+}
+
 /// Result of form parsing
 pub struct FormParseResult {
-    pub form_map: HashMap<String, CoercedValue>,
+    pub form_map: HashMap<String, FormValue>,
     pub files_map: HashMap<String, Vec<FileInfo>>,
 }
 
-/// Parse URL-encoded form data (application/x-www-form-urlencoded)
+/// Parse URL-encoded form data into a map of form fields.
+///
+/// Fields are coerced according to `type_hints` (a map from field name to numeric type hint).
+/// A key that appears once is stored as `FormValue::Single(coerced_value)`; repeated keys are
+/// accumulated and promoted to `FormValue::Multi(vec_of_coerced_values)` without allocating a
+/// `Vec` for the single-occurrence case.
+///
+/// Errors:
+/// - Returns a `ValidationError` with `error_type = "parse_error"` if the body cannot be parsed.
+/// - Returns a `ValidationError` produced by `ValidationError::type_coercion_error` if coercion
+///   of any field value fails.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// let result = parse_urlencoded(b"name=alice&age=30", &HashMap::new()).unwrap();
+/// assert!(matches!(result.get("name").unwrap(), FormValue::Single(_)));
+/// assert!(matches!(result.get("age").unwrap(), FormValue::Single(_)));
+/// ```
 pub fn parse_urlencoded(
     body: &[u8],
     type_hints: &HashMap<String, u8>,
-) -> Result<HashMap<String, CoercedValue>, ValidationError> {
-    let mut result = HashMap::new();
+) -> Result<HashMap<String, FormValue>, ValidationError> {
+    let mut result: HashMap<String, FormValue> = HashMap::new();
 
-    // Parse URL-encoded body
     let parsed: Vec<(String, String)> =
         serde_urlencoded::from_bytes(body).map_err(|e| ValidationError {
             error_type: "parse_error".to_string(),
@@ -153,30 +228,18 @@ pub fn parse_urlencoded(
             ctx: HashMap::new(),
         })?;
 
-    // Group values by key (handle multiple values for same key)
-    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for (key, value) in parsed {
-        grouped.entry(key).or_default().push(value);
-    }
-
-    // Coerce values based on type hints
-    for (key, values) in grouped {
         let type_hint = type_hints.get(&key).copied().unwrap_or(TYPE_STRING);
+        let coerced = coerce_param(&value, type_hint).map_err(|e| {
+            ValidationError::type_coercion_error(&key, type_hint_name(type_hint), &e)
+        })?;
 
-        // For single values, coerce directly
-        // For multiple values, use first value (matching Python behavior)
-        let value = values.first().map(|s| s.as_str()).unwrap_or("");
-
-        match coerce_param(value, type_hint) {
-            Ok(coerced) => {
-                result.insert(key, coerced);
+        match result.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(FormValue::Single(coerced));
             }
-            Err(error_msg) => {
-                return Err(ValidationError::type_coercion_error(
-                    &key,
-                    type_hint_name(type_hint),
-                    &error_msg,
-                ));
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().append(coerced);
             }
         }
     }
@@ -184,7 +247,47 @@ pub fn parse_urlencoded(
     Ok(result)
 }
 
-/// Parse multipart form data with disk spooling for large files
+/// Parse a multipart/form-data payload into form fields and uploaded files, spooling large file parts to disk and enforcing per-field constraints.
+///
+/// This returns a FormParseResult containing:
+/// - `form_map`: non-file fields keyed by field name, preserving repeated keys as `FormValue::Multi`.
+/// - `files_map`: uploaded files keyed by field name, each as `FileInfo` with filename, content storage, content type, and size.
+///
+/// Errors are returned as `ValidationError` for parse/read errors, size/type/count violations, or coercion failures.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::collections::HashMap;
+/// use actix_multipart::Multipart;
+/// use tokio_test::block_on;
+///
+/// // `multipart` would normally come from an Actix request (e.g., HttpRequest payload).
+/// let multipart: Multipart = /* obtain Multipart from request */ unimplemented!();
+/// let type_hints: HashMap<String, u8> = HashMap::new();
+/// let file_constraints: HashMap<String, crate::FileFieldConstraints> = HashMap::new();
+///
+/// // Run in an async context
+/// block_on(async {
+///     let result = crate::parse_multipart(
+///         multipart,
+///         &type_hints,
+///         &file_constraints,
+///         /* max_upload_size */ 10 * 1024 * 1024,
+///         /* memory_limit */ 1024 * 1024,
+///         /* max_parts */ 1000,
+///     ).await;
+///
+///     match result {
+///         Ok(parsed) => {
+///             // inspect parsed.form_map and parsed.files_map
+///         }
+///         Err(e) => {
+///             // handle validation error
+///         }
+///     }
+/// });
+/// ```
 pub async fn parse_multipart(
     mut payload: Multipart,
     type_hints: &HashMap<String, u8>,
@@ -193,7 +296,7 @@ pub async fn parse_multipart(
     memory_limit: usize,
     max_parts: usize,
 ) -> Result<FormParseResult, ValidationError> {
-    let mut form_map: HashMap<String, CoercedValue> = HashMap::new();
+    let mut form_map: HashMap<String, FormValue> = HashMap::new();
     let mut files_map: HashMap<String, Vec<FileInfo>> = HashMap::new();
     let mut part_count = 0;
 
@@ -286,16 +389,22 @@ pub async fn parse_multipart(
 
             // Type coercion
             let type_hint = type_hints.get(&field_name).copied().unwrap_or(TYPE_STRING);
-            match coerce_param(&value, type_hint) {
-                Ok(coerced) => {
-                    form_map.insert(field_name, coerced);
+            let coerced = coerce_param(&value, type_hint).map_err(|e| {
+                ValidationError::type_coercion_error(
+                    &field_name,
+                    type_hint_name(type_hint),
+                    &e,
+                )
+            })?;
+
+            // Preserve duplicate keys (e.g. multi-select) as FormValue::Multi.
+            // First occurrence is Single — zero extra alloc for the common case.
+            match form_map.entry(field_name) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(FormValue::Single(coerced));
                 }
-                Err(error_msg) => {
-                    return Err(ValidationError::type_coercion_error(
-                        &field_name,
-                        type_hint_name(type_hint),
-                        &error_msg,
-                    ));
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.get_mut().append(coerced);
                 }
             }
         }
@@ -504,12 +613,67 @@ mod tests {
 
         assert!(matches!(
             result.get("name"),
-            Some(CoercedValue::String(s)) if s == "John"
+            Some(FormValue::Single(CoercedValue::String(s))) if s == "John"
         ));
-        assert!(matches!(result.get("age"), Some(CoercedValue::Int(30))));
+        assert!(matches!(
+            result.get("age"),
+            Some(FormValue::Single(CoercedValue::Int(30)))
+        ));
         assert!(matches!(
             result.get("active"),
-            Some(CoercedValue::Bool(true))
+            Some(FormValue::Single(CoercedValue::Bool(true)))
+        ));
+    }
+
+    /// Ensures repeated URL-encoded form keys are accumulated as `FormValue::Multi` and single-occurrence keys remain `FormValue::Single`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Repeated keys should accumulate into FormValue::Multi
+    /// let body = Bytes::from("tag=a&tag=b&tag=c&name=John");
+    /// let type_hints = HashMap::new();
+    ///
+    /// let result = parse_urlencoded(&body, &type_hints).unwrap();
+    ///
+    /// match result.get("tag") {
+    ///     Some(FormValue::Multi(v)) => {
+    ///         assert_eq!(v.len(), 3);
+    ///         assert!(matches!(&v[0], CoercedValue::String(s) if s == "a"));
+    ///         assert!(matches!(&v[1], CoercedValue::String(s) if s == "b"));
+    ///         assert!(matches!(&v[2], CoercedValue::String(s) if s == "c"));
+    ///     }
+    ///     other => panic!("expected Multi, got {:?}", other),
+    /// }
+    ///
+    /// // Single-occurrence key stays as Single (no Vec alloc)
+    /// assert!(matches!(
+    ///     result.get("name"),
+    ///     Some(FormValue::Single(CoercedValue::String(s))) if s == "John"
+    /// ));
+    /// ```
+    #[test]
+    fn test_parse_urlencoded_repeated_key() {
+        // Repeated keys should accumulate into FormValue::Multi
+        let body = Bytes::from("tag=a&tag=b&tag=c&name=John");
+        let type_hints = HashMap::new();
+
+        let result = parse_urlencoded(&body, &type_hints).unwrap();
+
+        match result.get("tag") {
+            Some(FormValue::Multi(v)) => {
+                assert_eq!(v.len(), 3);
+                assert!(matches!(&v[0], CoercedValue::String(s) if s == "a"));
+                assert!(matches!(&v[1], CoercedValue::String(s) if s == "b"));
+                assert!(matches!(&v[2], CoercedValue::String(s) if s == "c"));
+            }
+            other => panic!("expected Multi, got {:?}", other),
+        }
+
+        // Single-occurrence key stays as Single (no Vec alloc)
+        assert!(matches!(
+            result.get("name"),
+            Some(FormValue::Single(CoercedValue::String(s))) if s == "John"
         ));
     }
 

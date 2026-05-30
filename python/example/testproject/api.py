@@ -969,10 +969,47 @@ async def handle_mixed(
     description: Annotated[str, Form()],
     attachments: Annotated[list[dict], File(alias="file")] = None,
 ):
+    """
+    Handle a multipart form submission containing a title, description, and optional file attachments.
+    
+    Parameters:
+        title (str): Form field for the item's title.
+        description (str): Form field for the item's description.
+        attachments (list[dict] | None): Uploaded files (each represented as a dict with file metadata); may be omitted.
+    
+    Returns:
+        dict: A summary containing `title`, `description`, `has_attachments` (`true` if any attachments were provided, `false` otherwise), and `attachment_count` when attachments are present.
+    """
     result = {"title": title, "description": description, "has_attachments": bool(attachments)}
     if attachments:
         result["attachment_count"] = len(attachments)
     return result
+
+
+class FormRepeatedKeys(msgspec.Struct):
+    name: str
+    tags: list[str] = []
+    counts: list[int] = []
+
+
+@api.post("/form-list")
+async def handle_form_list(data: Annotated[FormRepeatedKeys, Form()]):
+    """
+    Handle a submitted form containing repeated keys and return summary statistics.
+    
+    Parameters:
+        data (FormRepeatedKeys): Parsed form payload with fields:
+            - name: submitted name string
+            - tags: list of submitted tag strings (may be empty)
+            - counts: list of submitted integers corresponding to counts (may be empty)
+    
+    Returns:
+        dict: Summary with keys:
+            - name (str): the submitted name
+            - tag_count (int): number of submitted tags
+            - count_sum (int): sum of submitted counts
+    """
+    return {"name": data.name, "tag_count": len(data.tags), "count_sum": sum(data.counts)}
 
 
 # ==== File serving endpoint for benchmarks ====
