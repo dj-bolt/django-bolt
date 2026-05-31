@@ -236,7 +236,9 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
     global _QUEUE_LISTENER, _QUEUE  # noqa: PLW0603
 
     if _QUEUE is None:
-        _QUEUE = Queue(-1)
+        # Bounded queue prevents OOM under extreme load spikes.
+        # Once full, log records are silently dropped (better than crashing).
+        _QUEUE = Queue(maxsize=10000)
 
     queue_handler = QueueHandler(_QUEUE)
     queue_handler.setLevel(logging.DEBUG)
