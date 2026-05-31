@@ -1095,7 +1095,18 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             }
         } else {
             // Read payload as bytes (for non-multipart requests)
-            let mut body_vec = Vec::new();
+            // Pre-allocate body buffer using Content-Length to avoid repeated Vec
+            // reallocations during extend_from_slice. For chunked encoding or missing
+            // Content-Length, Vec::new() starts at 0 capacity (geometric growth).
+            let content_length: Option<usize> = req
+                .headers()
+                .get(actix_web::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok());
+            let mut body_vec = match content_length {
+                Some(len) if len > 0 => Vec::with_capacity(len),
+                _ => Vec::new(),
+            };
             while let Some(chunk) = payload.next().await {
                 match chunk {
                     Ok(data) => body_vec.extend_from_slice(&data),
