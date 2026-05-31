@@ -310,6 +310,7 @@ impl RouteExecutionPlan {
     const HAS_AUTH_OR_GUARDS: u16 = 1 << 7;
     const HAS_RATE_LIMIT: u16 = 1 << 8;
     const CAN_SYNC_DISPATCH: u16 = 1 << 9;
+    const NEEDS_META: u16 = 1 << 10;
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
@@ -323,6 +324,7 @@ impl RouteExecutionPlan {
         has_auth_or_guards: bool,
         has_rate_limit: bool,
         can_sync_dispatch: bool,
+        needs_meta: bool,
     ) -> Self {
         let mut bits = 0u16;
         if needs_body {
@@ -354,6 +356,9 @@ impl RouteExecutionPlan {
         }
         if can_sync_dispatch {
             bits |= Self::CAN_SYNC_DISPATCH;
+        }
+        if needs_meta {
+            bits |= Self::NEEDS_META;
         }
         Self { bits }
     }
@@ -406,6 +411,11 @@ impl RouteExecutionPlan {
     #[inline]
     pub const fn can_sync_dispatch(self) -> bool {
         (self.bits & Self::CAN_SYNC_DISPATCH) != 0
+    }
+
+    #[inline]
+    pub const fn needs_meta(self) -> bool {
+        (self.bits & Self::NEEDS_META) != 0
     }
 }
 
@@ -607,6 +617,12 @@ impl RouteMetadata {
             .flatten()
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false);
+        let needs_meta = py_meta
+            .get_item("needs_meta")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(true);
         let plan = RouteExecutionPlan::from_parts(
             needs_body,
             needs_query,
@@ -618,6 +634,7 @@ impl RouteMetadata {
             has_auth_or_guards,
             has_rate_limit,
             can_sync_dispatch,
+            needs_meta,
         );
 
         // Form field type hints (same format as param_types)

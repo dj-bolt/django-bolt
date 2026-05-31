@@ -937,6 +937,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     let skip_cors = plan.map_or(false, |p| p.skip_cors());
     let skip_compression = plan.map_or(false, |p| p.skip_compression());
     let can_sync_dispatch = plan.map_or(false, |p| p.can_sync_dispatch());
+    let needs_meta = plan.map_or(true, |p| p.needs_meta());
 
     // Extract and validate headers
     let headers = if must_extract_headers {
@@ -1018,9 +1019,12 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
     // Derive connection info from already-extracted headers (avoids a second header-parse pass).
     // conn_info is only used for request.META (Django templates) and build_absolute_uri().
-    // When headers weren't extracted (pure API routes with no auth/cookies/middleware),
-    // empty strings are safe because no Django middleware will call META anyway.
-    let (conn_host, conn_scheme, conn_remote_addr) = if must_extract_headers {
+    // OPTIMIZATION: Only allocate conn_* strings when needs_meta is true.
+    // Most pure API handlers never access META/get_full_path/build_absolute_uri,
+    // so these three heap allocations (host, scheme, remote_addr) are wasted.
+    // The needs_meta flag is set to false for can_sync_dispatch handlers with
+    // no Django middleware or template access.
+    let (conn_host, conn_scheme, conn_remote_addr) = if needs_meta && must_extract_headers {
         let host = headers
             .as_ref()
             .and_then(|h| h.get("host"))
@@ -1041,7 +1045,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             .unwrap_or_else(|| "127.0.0.1".to_string());
         (host, scheme, remote_addr)
     } else {
-        // No headers extracted → no Django middleware → META won't be accessed
+        // No META needed → empty strings (META getter will return defaults)
         (String::new(), String::new(), String::new())
     };
 
