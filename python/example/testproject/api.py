@@ -971,12 +971,12 @@ async def handle_mixed(
 ):
     """
     Handle a multipart form submission containing a title, description, and optional file attachments.
-    
+
     Parameters:
         title (str): Form field for the item's title.
         description (str): Form field for the item's description.
         attachments (list[dict] | None): Uploaded files (each represented as a dict with file metadata); may be omitted.
-    
+
     Returns:
         dict: A summary containing `title`, `description`, `has_attachments` (`true` if any attachments were provided, `false` otherwise), and `attachment_count` when attachments are present.
     """
@@ -996,13 +996,13 @@ class FormRepeatedKeys(msgspec.Struct):
 async def handle_form_list(data: Annotated[FormRepeatedKeys, Form()]):
     """
     Handle a submitted form containing repeated keys and return summary statistics.
-    
+
     Parameters:
         data (FormRepeatedKeys): Parsed form payload with fields:
             - name: submitted name string
             - tags: list of submitted tag strings (may be empty)
             - counts: list of submitted integers corresponding to counts (may be empty)
-    
+
     Returns:
         dict: Summary with keys:
             - name (str): the submitted name

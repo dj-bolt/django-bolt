@@ -2854,8 +2854,7 @@ class BoltAPI:
             from bolt_mcp import mount_mcp  # noqa: PLC0415
         except ImportError as exc:
             raise ImportError(
-                "api.mount_mcp(...) requires the optional 'bolt-mcp' package. "
-                "Install it with `pip install bolt-mcp`."
+                "api.mount_mcp(...) requires the optional 'bolt-mcp' package. Install it with `pip install bolt-mcp`."
             ) from exc
         mount_mcp(self, mcp, path, auth=auth, guards=guards, oauth=oauth, expose=expose)
 

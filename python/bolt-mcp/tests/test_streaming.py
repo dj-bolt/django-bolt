@@ -16,7 +16,7 @@ def _parse_all_sse(body: bytes) -> list[dict]:
     text = body.decode("utf-8").replace("\r\n", "\n")
     out: list[dict] = []
     for block in text.split("\n\n"):
-        data = [line[len("data:"):].lstrip() for line in block.split("\n") if line.startswith("data:")]
+        data = [line[len("data:") :].lstrip() for line in block.split("\n") if line.startswith("data:")]
         if data:
             out.append(msgspec.json.decode("\n".join(data).encode()))
     return out

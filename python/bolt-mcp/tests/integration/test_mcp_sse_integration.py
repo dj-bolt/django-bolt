@@ -90,7 +90,5 @@ def test_get_listen_channel_single_stream_and_delete(make_server_project):
             assert second.status_code == 409
 
             # Terminating the session is accepted and unblocks the listener.
-            deleted = server.client.request(
-                "DELETE", server.url("/mcp"), headers={"Mcp-Session-Id": session_id}
-            )
+            deleted = server.client.request("DELETE", server.url("/mcp"), headers={"Mcp-Session-Id": session_id})
             assert deleted.status_code == 200

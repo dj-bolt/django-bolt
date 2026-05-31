@@ -80,7 +80,7 @@ def _round_trip(server, session_id, *, tool, arguments, expect_method, client_re
         for line in r.iter_lines():
             if not line.startswith("data:"):
                 continue
-            msg = json.loads(line[len("data:"):].strip())
+            msg = json.loads(line[len("data:") :].strip())
             if msg.get("method") == expect_method:
                 server_request_id = msg["id"]
                 # The client replies on a *separate* connection.

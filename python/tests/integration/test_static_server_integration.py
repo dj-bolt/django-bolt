@@ -112,8 +112,7 @@ def test_static_dirs_as_path_objects_are_served(make_server_project):
         response = server.get("/static/app.css")
 
     assert response.status_code == 200, (
-        "Path-object STATICFILES_DIRS must register the static scope, "
-        f"got {response.status_code}"
+        f"Path-object STATICFILES_DIRS must register the static scope, got {response.status_code}"
     )
     assert "color: green" in response.text
     # Confirms it's the native handler (it adds nosniff), not a fallback.
@@ -191,9 +190,7 @@ def test_static_dotfile_paths_return_404(make_server_project, dotfile_path):
     with project.start() as server:
         response = server.get(f"/static/{dotfile_path}")
 
-    assert response.status_code == 404, (
-        f"/static/{dotfile_path} must not be served, got {response.status_code}"
-    )
+    assert response.status_code == 404, f"/static/{dotfile_path} must not be served, got {response.status_code}"
     assert b"SECRET=do-not-leak" not in response.content
 
 

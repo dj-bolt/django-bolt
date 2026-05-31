@@ -202,9 +202,7 @@ async def mint_token(body: TokenRequest) -> dict:
     """
     principal = _DEMO_PRINCIPALS.get(body.username)
     if principal is None:
-        raise HTTPException(
-            404, f"unknown demo user {body.username!r}; try one of {sorted(_DEMO_PRINCIPALS)}"
-        )
+        raise HTTPException(404, f"unknown demo user {body.username!r}; try one of {sorted(_DEMO_PRINCIPALS)}")
     now = int(time.time())
     claims = {"sub": body.username, "iat": now, "exp": now + 3600, **principal}
     return {"token": jwt.encode(claims, settings.SECRET_KEY, algorithm="HS256")}

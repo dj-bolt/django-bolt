@@ -66,10 +66,9 @@ def test_default_on_brotli_sse_end_to_end(make_server_project):
 
     decoded = resp.content
     for i in range(5):
-        assert (
-            f'data: {{"i": {i}}}\n\n'.encode() in decoded
-            or f'data: {{"i":{i}}}\n\n'.encode() in decoded
-        ), f"event i={i} not found in decoded SSE stream"
+        assert f'data: {{"i": {i}}}\n\n'.encode() in decoded or f'data: {{"i":{i}}}\n\n'.encode() in decoded, (
+            f"event i={i} not found in decoded SSE stream"
+        )
 
 
 def test_default_on_gzip_fallback_sse(make_server_project):
@@ -83,10 +82,7 @@ def test_default_on_gzip_fallback_sse(make_server_project):
 
     decoded = resp.content
     for i in range(5):
-        assert (
-            f'data: {{"i": {i}}}\n\n'.encode() in decoded
-            or f'data: {{"i":{i}}}\n\n'.encode() in decoded
-        )
+        assert f'data: {{"i": {i}}}\n\n'.encode() in decoded or f'data: {{"i":{i}}}\n\n'.encode() in decoded
 
 
 def test_no_compress_decorator_opts_out(make_server_project):

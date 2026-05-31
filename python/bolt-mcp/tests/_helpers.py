@@ -94,7 +94,7 @@ def _parse_sse(body: bytes) -> dict:
     """Extract the single JSON-RPC message from a finite SSE response body."""
     text = body.decode("utf-8").replace("\r\n", "\n")
     for block in text.split("\n\n"):
-        data = [line[len("data:"):].lstrip() for line in block.split("\n") if line.startswith("data:")]
+        data = [line[len("data:") :].lstrip() for line in block.split("\n") if line.startswith("data:")]
         if data:
             return msgspec.json.decode("\n".join(data).encode())
     raise AssertionError(f"no SSE data frame found in response: {text!r}")

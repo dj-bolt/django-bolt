@@ -109,9 +109,7 @@ class MCP:
         self._resources: dict[str, ResourceDef] = {}
         self._resource_templates: dict[str, ResourceTemplateDef] = {}
         self._prompts: dict[str, PromptDef] = {}
-        self.sessions: SessionManager | StatelessSessions = (
-            StatelessSessions() if stateless else SessionManager()
-        )
+        self.sessions: SessionManager | StatelessSessions = StatelessSessions() if stateless else SessionManager()
 
     # ── Registration decorators ──────────────────────────────────────────────
     def tool(

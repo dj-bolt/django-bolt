@@ -6,6 +6,7 @@ list[T] Form() struct fields":
   - _collect_sequence_field_names
   - Scalar-to-list wrapping logic inside _create_param_struct_extractor
 """
+
 from __future__ import annotations
 
 from typing import Optional
@@ -182,6 +183,7 @@ class TestCreateParamStructExtractorScalarWrapping:
     def _make_extractor(self, struct_type):
         """Helper: build the extractor for struct_type."""
         import inspect
+
         return _create_param_struct_extractor(struct_type, inspect.Parameter.empty, "form")
 
     def test_scalar_value_wrapped_to_list(self):
