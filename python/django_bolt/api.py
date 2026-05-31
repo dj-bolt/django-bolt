@@ -2455,7 +2455,7 @@ class BoltAPI:
             if isinstance(middleware_response, MiddlewareResponse):
                 return middleware_response.to_tuple()
             if isinstance(middleware_response, tuple):
-                return MiddlewareResponse.from_tuple(middleware_response).to_tuple()
+                return middleware_response
             raise TypeError(
                 f"Middleware chain returned unsupported response type: {type(middleware_response).__name__}. "
                 "Expected MiddlewareResponse or ResponseWireV1 tuple."
