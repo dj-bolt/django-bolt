@@ -13,6 +13,12 @@ pub static ERROR_BODY_401: &[u8] = br#"{"detail":"Authentication required"}"#;
 pub static ERROR_BODY_403: &[u8] = br#"{"detail":"Permission denied"}"#;
 pub static ERROR_BODY_404: &[u8] = br#"{"detail":"Not Found"}"#;
 pub static ERROR_BODY_400_HEADERS: &[u8] = br#"{"detail":"Too many headers"}"#;
+#[allow(dead_code)]
+pub static ERROR_BODY_400: &[u8] = br#"{"detail":"Bad request"}"#;
+#[allow(dead_code)]
+pub static ERROR_BODY_413: &[u8] = br#"{"detail":"Payload too large"}"#;
+#[allow(dead_code)]
+pub static ERROR_BODY_500: &[u8] = br#"{"detail":"Internal Server Error"}"#;
 
 /// Cache for pre-formatted rate limit error bodies (keyed by retry_after seconds)
 /// This avoids allocating the same error message repeatedly
@@ -79,6 +85,33 @@ pub fn error_400_too_many_headers() -> HttpResponse {
         .body(ERROR_BODY_400_HEADERS)
 }
 
+/// Generic 400 Bad Request with static body
+#[allow(dead_code)]
+#[inline]
+pub fn error_400() -> HttpResponse {
+    HttpResponse::BadRequest()
+        .content_type("application/json")
+        .body(ERROR_BODY_400)
+}
+
+/// 413 Payload Too Large with static body
+#[allow(dead_code)]
+#[inline]
+pub fn error_413() -> HttpResponse {
+    HttpResponse::PayloadTooLarge()
+        .content_type("application/json")
+        .body(ERROR_BODY_413)
+}
+
+/// Generic 500 Internal Server Error with static body
+#[allow(dead_code)]
+#[inline]
+pub fn error_500() -> HttpResponse {
+    HttpResponse::InternalServerError()
+        .content_type("application/json")
+        .body(ERROR_BODY_500)
+}
+
 /// For errors that need dynamic content, we provide a fast formatter
 #[inline]
 pub fn error_400_header_too_large(max_size: usize) -> HttpResponse {
@@ -128,6 +161,27 @@ mod tests {
         assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_403).is_ok());
         assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_404).is_ok());
         assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_400_HEADERS).is_ok());
+        assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_400).is_ok());
+        assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_413).is_ok());
+        assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_500).is_ok());
+    }
+
+    #[test]
+    fn test_error_400_static() {
+        let response = error_400();
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_error_413_static() {
+        let response = error_413();
+        assert_eq!(response.status(), actix_web::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn test_error_500_static() {
+        let response = error_500();
+        assert_eq!(response.status(), actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

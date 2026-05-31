@@ -262,13 +262,13 @@ pub fn extract_headers(
 }
 
 /// Build HTTP 422 response for validation errors
+/// Avoids serde_json::json!() macro to prevent intermediate Value allocation
 pub fn build_validation_error_response(error: &ValidationError) -> HttpResponse {
-    let body = serde_json::json!({
-        "detail": [error.to_json()]
-    });
+    let detail_json = error.to_json().to_string();
+    let body = format!(r#"{{"detail":[{}]}}"#, detail_json);
     HttpResponse::UnprocessableEntity()
         .content_type("application/json")
-        .body(body.to_string())
+        .body(body)
 }
 
 /// Convert CoercedValue to Python object
