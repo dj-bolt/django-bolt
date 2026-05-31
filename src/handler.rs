@@ -1109,6 +1109,9 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 .get(actix_web::http::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<usize>().ok());
+            if matches!(content_length, Some(len) if len > state.max_payload_size) {
+                return responses::error_413();
+            }
             let mut body_vec = match content_length {
                 Some(len) if len > 0 => Vec::with_capacity(len),
                 _ => Vec::new(),

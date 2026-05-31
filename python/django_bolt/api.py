@@ -1516,11 +1516,11 @@ class BoltAPI:
             )
             middleware_meta["can_sync_dispatch"] = can_sync_dispatch
 
-            # META info (conn_host, conn_scheme, conn_remote_addr) is only needed
-            # when Django middleware or handlers access request.META/get_full_path etc.
-            # Sync-dispatch handlers with no middleware never access META,
-            # so we skip these three heap allocations (~60 bytes per request).
-            middleware_meta["needs_meta"] = not can_sync_dispatch
+            # Sync-dispatch eligibility does NOT imply request.META/URI helpers
+            # are unused. A sync-dispatch handler can still access request.META,
+            # get_full_path(), or build_absolute_uri(). Keep this conservative
+            # until registration-time analysis can prove otherwise.
+            middleware_meta["needs_meta"] = True
 
             # Python middleware requires cookies and headers regardless of handler params
             # Django middleware needs cookies/headers (CSRF, session, auth, etc.)
