@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "django-bolt": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsImlhdCI6MTc4MDI1MjA2MSwiZXhwIjoxNzgwMjU1NjYxLCJpc19zdGFmZiI6dHJ1ZSwiaXNfc3VwZXJ1c2VyIjp0cnVlLCJwZXJtaXNzaW9ucyI6WyJyZXBvcnRzOnJlYWQiXX0.oReCCD_F91E0av2tn8bkTBmbRhCKABtQbWhMp-KGC_A"
+      }
+    }
+  }
+}

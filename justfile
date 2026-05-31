@@ -164,6 +164,40 @@ release version dry_run="":
         ./scripts/release.sh {{version}}
     fi
 
+# Release the bolt-mcp add-on (pure-python, separate PyPI project).
+# Version is derived from the git tag (hatch-vcs) — nothing to bump in pyproject.
+# No version arg → auto-bump the patch from the last bolt-mcp tag.
+# Usage: just release-mcp              (auto patch bump, e.g. 0.1.0 -> 0.1.1)
+# Usage: just release-mcp 0.2.0        (explicit, e.g. for a minor/major)
+# Usage: just release-mcp "" --dry-run (show the computed version, don't tag/push)
+release-mcp version="" dry_run="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">> Running bolt-mcp tests"
+    uv run pytest python/bolt-mcp/tests -q
+    if [ -n "{{version}}" ]; then
+        NEW="{{version}}"
+    else
+        LAST=$(git tag --list 'bolt-mcp-v*' --sort=-v:refname | head -n1)
+        if [ -z "$LAST" ]; then
+            NEW="0.1.0"
+        else
+            BASE=${LAST#bolt-mcp-v}
+            IFS=. read -r MAJOR MINOR PATCH <<< "$BASE"
+            NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
+        fi
+        echo ">> Last tag: ${LAST:-none} → auto-bumped to $NEW (pass a version to override)"
+    fi
+    TAG="bolt-mcp-v$NEW"
+    if git rev-parse "$TAG" >/dev/null 2>&1; then echo "Error: tag $TAG already exists"; exit 1; fi
+    if [ "{{dry_run}}" = "--dry-run" ]; then
+        echo "[dry-run] would tag $TAG and push (CI then builds version $NEW from the tag)"
+        exit 0
+    fi
+    git tag -a "$TAG" -m "bolt-mcp v$NEW"
+    git push --follow-tags
+    echo ">> Pushed $TAG — the 'bolt-mcp' workflow will build (version $NEW, from the tag) & publish to PyPI."
+
 # Delete git tag locally and remotely
 # Usage: just delete-tag v0.2.2
 delete-tag tag:

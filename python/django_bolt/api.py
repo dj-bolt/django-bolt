@@ -2824,6 +2824,41 @@ class BoltAPI:
 
         self.mount_asgi(path, django_mount_wrapper)
 
+    def mount_mcp(
+        self,
+        mcp: Any,
+        path: str = "/mcp",
+        *,
+        auth: list[Any] | None = None,
+        guards: list[Any] | None = None,
+        oauth: Any | None = None,
+        expose: Any | None = None,
+    ) -> None:
+        """Serve an MCP (Model Context Protocol) server over Streamable HTTP on this API.
+
+        Registers the MCP endpoint (POST/GET/DELETE) at ``path`` (default ``/mcp``)::
+
+            from bolt_mcp import MCP
+
+            mcp = MCP("my-server")
+            api.mount_mcp(mcp, expose=[get_item])
+
+        Requires the optional ``bolt-mcp`` package. ``auth``/``guards`` enforce
+        django-bolt auth in Rust before the handler; ``oauth`` enables the OAuth 2.1
+        Resource Server flow; ``expose`` is an explicit allowlist of existing route
+        handlers to surface as tools. See :func:`bolt_mcp.mount_mcp` for details.
+        """
+        # Lazy import keeps bolt-mcp an optional dependency: django-bolt core never
+        # imports it at module load, only when mount_mcp is actually called.
+        try:
+            from bolt_mcp import mount_mcp  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "api.mount_mcp(...) requires the optional 'bolt-mcp' package. "
+                "Install it with `pip install bolt-mcp`."
+            ) from exc
+        mount_mcp(self, mcp, path, auth=auth, guards=guards, oauth=oauth, expose=expose)
+
     def include_router(self, router: Router, prefix: str = "") -> None:
         """
         Include a Router's routes into this API.

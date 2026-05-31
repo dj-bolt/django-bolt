@@ -80,6 +80,7 @@ nav = [
     { "Testing" = "topics/testing.md" },
     { "Server-Sent Events" = "topics/sse.md" },
     { "WebSocket" = "topics/websocket.md" },
+    { "MCP Server (bolt-mcp)" = "topics/mcp.md" },
     { "OpenAPI" = "topics/openapi.md" },
     { "ASGI Mounts" = "topics/asgi-mounts.md" },
 

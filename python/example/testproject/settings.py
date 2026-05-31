@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     "bench",
     "core",
     "missions",
+    "mcp_demo",
 ]
 
 MIDDLEWARE = [

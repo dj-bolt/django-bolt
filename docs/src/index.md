@@ -112,6 +112,20 @@ async def profile(request):
     return {"user_id": request.user.id}
 ```
 
+**MCP servers** - Expose tools, resources, and prompts to LLM clients over the MCP Streamable HTTP transport via the optional [`bolt-mcp`](topics/mcp.md) package:
+
+```python
+from bolt_mcp import MCP
+
+mcp = MCP("my-server")
+
+@mcp.tool
+async def add(a: int, b: int) -> dict:
+    return {"sum": a + b}
+
+api.mount_mcp(mcp)
+```
+
 ## Next steps
 
 - **[Quick Start](getting-started/quickstart.md)** - Build your first API

@@ -2,6 +2,12 @@ version = 1
 revision = 3
 requires-python = ">=3.12"
 
+[manifest]
+members = [
+    "bolt-mcp",
+    "django-bolt",
+]
+
 [[package]]
 name = "annotated-types"
 version = "0.7.0"
@@ -72,6 +78,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ac/94/2424338fb2d1875e9e83eed4c8e9c67f6905ec25afd826a911aea2b02535/black-26.3.1-cp314-cp314-win_amd64.whl", hash = "sha256:0126ae5b7c09957da2bdbd91a9ba1207453feada9e9fe51992848658c6c8e01c", size = 1445855, upload-time = "2026-03-12T03:40:35.442Z" },
     { url = "https://files.pythonhosted.org/packages/86/43/0c3338bd928afb8ee7471f1a4eec3bdbe2245ccb4a646092a222e8669840/black-26.3.1-cp314-cp314-win_arm64.whl", hash = "sha256:92c0ec1f2cc149551a2b7b47efc32c866406b6891b0ee4625e95967c8f4acfb1", size = 1258109, upload-time = "2026-03-12T03:40:36.832Z" },
     { url = "https://files.pythonhosted.org/packages/8e/0d/52d98722666d6fc6c3dd4c76df339501d6efd40e0ff95e6186a7b7f0befd/black-26.3.1-py3-none-any.whl", hash = "sha256:2bd5aa94fc267d38bb21a70d7410a89f1a1d318841855f698746f8e7f51acd1b", size = 207542, upload-time = "2026-03-12T03:36:01.668Z" },
+]
+
+[[package]]
+name = "bolt-mcp"
+source = { editable = "python/bolt-mcp" }
+dependencies = [
+    { name = "django-bolt" },
+    { name = "msgspec" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "django-bolt", editable = "." },
+    { name = "msgspec", specifier = ">=0.20" },
 ]
 
 [[package]]
@@ -152,6 +172,7 @@ yaml = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "bolt-mcp" },
     { name = "django" },
     { name = "maturin" },
     { name = "nanodjango" },
@@ -185,6 +206,7 @@ provides-extras = ["yaml", "nanodjango"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "bolt-mcp", editable = "python/bolt-mcp" },
     { name = "django", specifier = "==6.0.2" },
     { name = "maturin", specifier = ">=1.9.6" },
     { name = "nanodjango", specifier = ">=0.16" },
