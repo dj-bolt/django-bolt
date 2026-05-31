@@ -24,7 +24,7 @@ use crate::form_parsing::{
 use crate::metadata::{RustArgBinding, RustArgSource};
 use crate::middleware;
 use crate::middleware::auth::populate_auth_context;
-use crate::request::PyRequest;
+use crate::request::{HttpMethod, PyRequest};
 use crate::request_pipeline::validate_and_cache_typed_params;
 use crate::response_builder;
 use crate::response_meta::ResponseMeta;
@@ -877,9 +877,11 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         }
     };
 
-    // Store method/path as owned for Python (needed after route_match is dropped)
-    // OPTIMIZATION: Use compact strings to reduce allocation overhead
-    let method_owned = method.to_string();
+    // Store method/path for Python (needed after route_match is dropped)
+    // Method is stored as a compact 1-byte HttpMethod enum instead of a heap-allocated
+    // String. HTTP methods are from a fixed set so a heap allocation per request is
+    // unnecessary — the getter returns &'static str with zero allocation.
+    let method_owned = HttpMethod::from_str(method);
     let path_owned = path.to_string();
 
     // Get parsed route metadata (Rust-native) by reference.

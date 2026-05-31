@@ -3,6 +3,58 @@ use pyo3::types::{PyBytes, PyDict, PyString};
 
 use std::sync::OnceLock;
 
+/// HTTP method stored as a single byte to avoid heap allocation.
+/// HTTP methods are from a fixed set (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS),
+/// so a String (24 bytes + heap data) is wasteful when a 1-byte enum suffices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HttpMethod {
+    GET = 0,
+    POST = 1,
+    PUT = 2,
+    PATCH = 3,
+    DELETE = 4,
+    HEAD = 5,
+    OPTIONS = 6,
+    Unknown = 7,
+}
+
+impl HttpMethod {
+    #[inline]
+    pub fn from_str(method: &str) -> Self {
+        match method {
+            "GET" => Self::GET,
+            "POST" => Self::POST,
+            "PUT" => Self::PUT,
+            "PATCH" => Self::PATCH,
+            "DELETE" => Self::DELETE,
+            "HEAD" => Self::HEAD,
+            "OPTIONS" => Self::OPTIONS,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[inline]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::GET => "GET",
+            Self::POST => "POST",
+            Self::PUT => "PUT",
+            Self::PATCH => "PATCH",
+            Self::DELETE => "DELETE",
+            Self::HEAD => "HEAD",
+            Self::OPTIONS => "OPTIONS",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+impl Default for HttpMethod {
+    fn default() -> Self {
+        Self::GET
+    }
+}
+
 /// Parse host:port from Actix's connection_info().host()
 /// Returns (hostname, port_string) - port defaults to "443" for HTTPS, else "80"
 #[inline]
@@ -35,7 +87,10 @@ fn parse_host_port<'a>(host: &'a str, scheme: &str) -> (&'a str, u16) {
 
 #[pyclass]
 pub struct PyRequest {
-    pub method: String,
+    /// HTTP method stored as a compact 1-byte enum instead of a heap-allocated String.
+    /// HTTP methods are from a fixed set (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS),
+    /// so a heap allocation per request is unnecessary. The getter returns &'static str.
+    pub method: HttpMethod,
     pub path: String,
     pub body: Vec<u8>,
     /// Path parameters - None when no path params (saves 1 PyDict alloc per request)
@@ -83,8 +138,8 @@ impl PyRequest {
     /// OPTIMIZATION: #[inline] on hot path getters
     #[getter]
     #[inline]
-    fn method(&self) -> &str {
-        &self.method
+    fn method(&self) -> &'static str {
+        self.method.as_str()
     }
 
     #[getter]
@@ -268,7 +323,7 @@ impl PyRequest {
         let meta = PyDict::new(py);
 
         // Standard META keys (Django HttpRequest compatible)
-        meta.set_item("REQUEST_METHOD", &self.method)?;
+        meta.set_item("REQUEST_METHOD", self.method.as_str())?;
         meta.set_item("PATH_INFO", &self.path)?;
 
         // QUERY_STRING - reconstructed from parsed query_params.
@@ -458,7 +513,7 @@ impl PyRequest {
     #[pyo3(signature = (key, /, default=None))]
     fn get<'py>(&self, py: Python<'py>, key: &str, default: Option<Py<PyAny>>) -> Py<PyAny> {
         match key {
-            "method" => PyString::new(py, &self.method).into_any().unbind(),
+            "method" => PyString::new(py, self.method.as_str()).into_any().unbind(),
             "path" => PyString::new(py, &self.path).into_any().unbind(),
             "body" => PyBytes::new(py, &self.body).into_any().unbind(),
             "params" => match &self.path_params {
@@ -479,7 +534,7 @@ impl PyRequest {
 
     fn __getitem__<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Py<PyAny>> {
         match key {
-            "method" => Ok(PyString::new(py, &self.method).into_any().unbind()),
+            "method" => Ok(PyString::new(py, self.method.as_str()).into_any().unbind()),
             "path" => Ok(PyString::new(py, &self.path).into_any().unbind()),
             "body" => Ok(PyBytes::new(py, &self.body).into_any().unbind()),
             "params" => Ok(match &self.path_params {
