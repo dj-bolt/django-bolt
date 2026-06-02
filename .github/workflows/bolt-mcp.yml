@@ -14,6 +14,11 @@ on:
 permissions:
   contents: read
 
+# One publish at a time — never let two tag pushes race to upload the same version.
+concurrency:
+  group: publish-bolt-mcp
+  cancel-in-progress: false
+
 jobs:
   publish:
     name: Build & publish bolt-mcp to PyPI
@@ -27,6 +32,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0 # full history + tags so hatch-vcs can derive the version
+          persist-credentials: false # don't leave the token in .git/config (OIDC handles publishing)
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7

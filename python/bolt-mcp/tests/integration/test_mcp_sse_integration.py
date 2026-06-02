@@ -37,7 +37,7 @@ def _json_headers(session_id=None):
     return h
 
 
-def _encode(method, params=None, *, id=1, session_id=None):
+def _encode(method, params=None, *, id=1):
     body = {"jsonrpc": "2.0", "method": method}
     if id is not None:
         body["id"] = id
@@ -66,7 +66,7 @@ def test_tool_call_streams_sse_response(make_server_project):
         with server.client.stream(
             "POST",
             server.url("/mcp"),
-            content=_encode("tools/call", {"name": "add", "arguments": {"a": 2, "b": 3}}, session_id=session_id),
+            content=_encode("tools/call", {"name": "add", "arguments": {"a": 2, "b": 3}}),
             headers=_json_headers(session_id),
         ) as resp:
             assert resp.status_code == 200

@@ -9,6 +9,7 @@ list[T] Form() struct fields":
 
 from __future__ import annotations
 
+import inspect
 from typing import Optional
 
 import msgspec
@@ -182,8 +183,6 @@ class TestCreateParamStructExtractorScalarWrapping:
 
     def _make_extractor(self, struct_type):
         """Helper: build the extractor for struct_type."""
-        import inspect
-
         return _create_param_struct_extractor(struct_type, inspect.Parameter.empty, "form")
 
     def test_scalar_value_wrapped_to_list(self):

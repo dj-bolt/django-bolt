@@ -5,23 +5,13 @@ from __future__ import annotations
 import asyncio
 
 import msgspec
-from _helpers import initialize, mcp_headers
+from _helpers import _parse_all_sse, initialize, mcp_headers
 from bolt_mcp import MCP, Context, mount_mcp
 from bolt_mcp.context import Context as CtxClass
-from bolt_mcp.sessions import Session
+from bolt_mcp.sessions import Session, SessionManager
 
 from django_bolt import BoltAPI
 from django_bolt.testing import TestClient
-
-
-def _parse_all_sse(body: bytes) -> list[dict]:
-    text = body.decode("utf-8").replace("\r\n", "\n")
-    out: list[dict] = []
-    for block in text.split("\n\n"):
-        data = [line[len("data:") :].lstrip() for line in block.split("\n") if line.startswith("data:")]
-        if data:
-            out.append(msgspec.json.decode("\n".join(data).encode()))
-    return out
 
 
 def _build(**mcp_kwargs):
@@ -164,5 +154,44 @@ def test_context_sample_mechanism():
         session.pending[req_id].set_result({"role": "assistant", "content": {"type": "text", "text": "ok"}})
         result = await asyncio.wait_for(task, 1.0)
         assert result["content"]["text"] == "ok"
+
+    asyncio.run(scenario())
+
+
+def test_stream_call_aclose_does_not_hang_on_blocked_tool():
+    """Client disconnect (aclose) must cancel a tool still awaiting a sample reply."""
+
+    async def scenario():
+        mcp = MCP("disconnect")  # stateful → sample is allowed
+
+        @mcp.tool
+        async def ask(ctx: Context) -> dict:
+            return {"reply": await ctx.sample("hi")}
+
+        session = mcp.sessions.create()
+        session.client_capabilities = {"sampling": {}}
+        gen = mcp.stream_call({"name": "ask", "arguments": {}}, request=None, session=session, request_id=1)
+
+        # The tool's ctx.sample emits a server→client request, then blocks on the reply.
+        item = await asyncio.wait_for(gen.__anext__(), 1.0)
+        assert item[0] == "request"
+
+        # The reply never comes; aclose must return promptly instead of awaiting forever.
+        await asyncio.wait_for(gen.aclose(), 1.0)
+
+    asyncio.run(scenario())
+
+
+def test_terminate_cancels_pending_requests():
+    """Terminating a session unblocks tools awaiting a sample/elicit reply."""
+
+    async def scenario():
+        manager = SessionManager()
+        session = manager.create()
+        future = asyncio.get_running_loop().create_future()
+        session.pending[1] = future
+
+        assert manager.terminate(session.id) is True
+        assert future.cancelled()
 
     asyncio.run(scenario())

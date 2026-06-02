@@ -5,6 +5,8 @@ Provides configuration options for response compression (gzip, brotli, zstd).
 Compression levels are handled automatically by Actix Web with optimized defaults.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Literal
 

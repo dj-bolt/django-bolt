@@ -100,6 +100,17 @@ def _parse_sse(body: bytes) -> dict:
     raise AssertionError(f"no SSE data frame found in response: {text!r}")
 
 
+def _parse_all_sse(body: bytes) -> list[dict]:
+    """Return every JSON-RPC message carried by a (finite) SSE response body."""
+    text = body.decode("utf-8").replace("\r\n", "\n")
+    out: list[dict] = []
+    for block in text.split("\n\n"):
+        data = [line[len("data:") :].lstrip() for line in block.split("\n") if line.startswith("data:")]
+        if data:
+            out.append(msgspec.json.decode("\n".join(data).encode()))
+    return out
+
+
 def parse_rpc(resp) -> dict:
     """Decode a JSON-RPC message from a /mcp 200 response.
 

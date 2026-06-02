@@ -52,6 +52,12 @@ class SessionManager:
         session = self._sessions.pop(session_id, None)
         if session is None:
             return False
+        # Cancel any server→client requests still awaiting a reply — the session is
+        # gone, so the reply can never arrive; unblock the tools awaiting them.
+        for future in session.pending.values():
+            if not future.done():
+                future.cancel()
+        session.pending.clear()
         # Unblock a waiting GET listener so its stream closes.
         session.queue.put_nowait(SESSION_CLOSE)
         return True

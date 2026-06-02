@@ -291,7 +291,8 @@ def test_media_directory_request_does_not_list_or_500(make_server_project):
     assert response.status_code == 404, f"/media/photos must 404, got {response.status_code}"
     assert trailing.status_code == 404, f"/media/photos/ must 404 (not list), got {trailing.status_code}"
     for body in (response.content, trailing.content):
-        assert b"a.txt" not in body and b"b.txt" not in body, "directory listing must not appear in the response body"
+        assert b"a.txt" not in body, "directory listing must not appear in the response body"
+        assert b"b.txt" not in body, "directory listing must not appear in the response body"
 
 
 def test_media_root_path_returns_404(make_server_project):

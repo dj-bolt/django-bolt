@@ -17,17 +17,21 @@ _AUTOEXPOSE_SOURCES = frozenset({"path", "query", "body", "header", "cookie"})
 
 
 def _signature_fields(fn: Callable, exclude: frozenset[str]) -> list[tuple]:
+    # Keyword-only params let a required field follow a defaulted one (e.g.
+    # `def f(a=1, *, b)`); defstruct rejects that ordering, so split as
+    # struct_from_fields does — required first, optional after, order preserved.
     hints = get_type_hints(fn, include_extras=True)
-    fields: list[tuple] = []
+    required: list[tuple] = []
+    optional: list[tuple] = []
     for p in inspect.signature(fn).parameters.values():
         if p.name in exclude or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
             continue
         annotation = hints.get(p.name, Any)
         if p.default is inspect.Parameter.empty:
-            fields.append((p.name, annotation))
+            required.append((p.name, annotation))
         else:
-            fields.append((p.name, annotation, p.default))
-    return fields
+            optional.append((p.name, annotation, p.default))
+    return required + optional
 
 
 def struct_from_signature(fn: Callable, *, exclude: frozenset[str] = INJECTED_PARAMS) -> type[msgspec.Struct]:

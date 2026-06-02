@@ -4,25 +4,14 @@ from __future__ import annotations
 
 import msgspec
 import pytest
-from _helpers import initialize, mcp_headers
+from _helpers import _parse_all_sse, initialize, mcp_headers
 from bolt_mcp import MCP, Context, mount_mcp
 
 from django_bolt import BoltAPI
 from django_bolt.testing import TestClient
 
 
-def _parse_all_sse(body: bytes) -> list[dict]:
-    """Return every JSON-RPC message carried by a (finite) SSE response body."""
-    text = body.decode("utf-8").replace("\r\n", "\n")
-    out: list[dict] = []
-    for block in text.split("\n\n"):
-        data = [line[len("data:") :].lstrip() for line in block.split("\n") if line.startswith("data:")]
-        if data:
-            out.append(msgspec.json.decode("\n".join(data).encode()))
-    return out
-
-
-def _call_crunch(client, session_id, *, json_response=False):
+def _call_crunch(client, session_id):
     body = {
         "jsonrpc": "2.0",
         "id": 5,

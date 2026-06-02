@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import re
 from collections.abc import AsyncIterator, Callable
@@ -392,7 +393,13 @@ class MCP:
                     return
                 yield item
         finally:
-            await task
+            # On normal completion the task is already done; on client disconnect
+            # (GeneratorExit) it may be blocked awaiting a sample/elicit reply that
+            # will never come — cancel it so cleanup can't hang.
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     # ── Resources ───────────────────────────────────────────────────────────--
     def _list_resources(self) -> dict:

@@ -67,7 +67,10 @@ def expose_routes(
     rather than being silently skipped.
     """
     explicit = handlers is not None
-    allow = {id(h) for h in handlers} if explicit else None
+    # Materialize once — `handlers` may be a generator, and we iterate it twice
+    # (to build `allow` here, and to compute `missing` after the route walk).
+    handler_list = list(handlers) if handlers is not None else []
+    allow = {id(h) for h in handler_list}
     matched: set[int] = set()
     wanted = {m.upper() for m in methods}
 
@@ -129,7 +132,7 @@ def expose_routes(
         )
 
     if explicit:
-        missing = [h for h in handlers if id(h) not in matched]
+        missing = [h for h in handler_list if id(h) not in matched]
         if missing:
             names = ", ".join(_name(h) for h in missing)
             raise ValueError(f"Handler(s) not registered as a route on this BoltAPI: {names}")
