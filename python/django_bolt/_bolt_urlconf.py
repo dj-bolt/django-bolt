@@ -74,17 +74,20 @@ def _build_urlpatterns(merged) -> list:
         # else: keep the existing (explicit, or first-seen derived)
 
     by_namespace: dict[str, list] = {}
+    bare: list = []
     for (namespace, name), (route, _explicit) in chosen.items():
-        by_namespace.setdefault(namespace, []).append(
-            _django_path(route, _reverse_only_view, name=name)
-        )
-
-    urlpatterns: list = []
-    for namespace, patterns in by_namespace.items():
+        # Bare (root) name so {% url 'name' %} works without a prefix, like a
+        # non-namespaced Django include. Every route also gets a namespaced alias.
+        bare.append(_django_path(route, _reverse_only_view, name=name))
         if namespace:
-            urlpatterns.append(_django_path("", include((patterns, namespace))))
-        else:
-            urlpatterns.extend(patterns)
+            by_namespace.setdefault(namespace, []).append(
+                _django_path(route, _reverse_only_view, name=name)
+            )
+
+    # Bare names first; namespaced aliases follow for disambiguation.
+    urlpatterns: list = list(bare)
+    for namespace, patterns in by_namespace.items():
+        urlpatterns.append(_django_path("", include((patterns, namespace))))
     return urlpatterns
 
 
