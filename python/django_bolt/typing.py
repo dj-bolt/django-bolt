@@ -161,6 +161,16 @@ class HandlerMetadata(TypedDict, total=False):
     is_async: bool
     """Whether handler is async (coroutine function)"""
 
+    # URL reversing
+    name: str | None
+    """Slugified route name for URL reversing (django_bolt.urls.reverse)"""
+
+    name_explicit: bool
+    """True if the user set the name directly; False if derived (fn name / viewset action)"""
+
+    namespace: str
+    """Module-based reverse namespace, e.g. "missions" for reverse("missions:get-mission")"""
+
     # OpenAPI documentation metadata
     openapi_tags: list[str]
     """OpenAPI tags for grouping endpoints"""
