@@ -33,6 +33,7 @@ _BOLT_URLCONF = "django_bolt._bolt_urlconf"
 # from the resolved value ("" when there's no Django mount).
 _UNRESOLVED = object()
 _django_mount_prefix = _UNRESOLVED
+_has_bolt_routes = _UNRESOLVED
 
 
 def reverse(
@@ -54,8 +55,11 @@ def reverse(
 
     Differs from Django: Bolt paths are untyped (matchit ``{x}``), so params are
     not converter-validated - a mismatch surfaces as ``NoReverseMatch``.
+
+    Short-circuits to plain Django when there are no Bolt routes, so the global
+    patch is a transparent no-op for projects (or tests) without a Bolt API.
     """
-    if urlconf is None:
+    if urlconf is None and _bolt_routes_present():
         try:
             return _django_reverse(
                 viewname, _BOLT_URLCONF, args, kwargs, current_app, query=query, fragment=fragment
@@ -72,6 +76,17 @@ def reverse(
     )
 
 
+reverse_lazy = lazy(reverse, str)
+
+
+def _bolt_routes_present() -> bool:
+    """Whether the synthetic urlconf has any Bolt routes (cached, built on first use)."""
+    global _has_bolt_routes
+    if _has_bolt_routes is _UNRESOLVED:
+        _has_bolt_routes = bool(importlib.import_module(_BOLT_URLCONF).urlpatterns)
+    return _has_bolt_routes
+
+
 def _mount_prefix() -> str:
     """Cached prefix the mounted Django app is served under ("" if none)."""
     global _django_mount_prefix
@@ -80,9 +95,6 @@ def _mount_prefix() -> str:
             getattr(importlib.import_module(_BOLT_URLCONF), "django_mount_prefix", None) or ""
         )
     return _django_mount_prefix
-
-
-reverse_lazy = lazy(reverse, str)
 
 
 def patch_django_reverse() -> None:

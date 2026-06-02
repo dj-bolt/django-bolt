@@ -107,6 +107,12 @@ def _find_django_mount_prefix(merged) -> str | None:
 
 
 _runbolt = _Runbolt()
-_merged = _runbolt.merge_apis(_runbolt.autodiscover_apis())
-urlpatterns = _build_urlpatterns(_merged)
-django_mount_prefix = _find_django_mount_prefix(_merged)
+_apis = _runbolt.autodiscover_apis()
+if _apis:
+    _merged = _runbolt.merge_apis(_apis)
+    urlpatterns = _build_urlpatterns(_merged)
+    django_mount_prefix = _find_django_mount_prefix(_merged)
+else:
+    # No Bolt APIs discovered: empty urlconf short-circuits patch (no-op)
+    urlpatterns = []
+    django_mount_prefix = None
