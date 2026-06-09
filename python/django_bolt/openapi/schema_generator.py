@@ -1186,12 +1186,22 @@ class SchemaGenerator:
     def _struct_to_schema(self, struct_type: type) -> Schema:
         """Convert msgspec.Struct to inline OpenAPI Schema.
 
-        Carries the struct's `__name__` through as the schema `title`
-        and its (cleaned) `__doc__` through as `description`, matching
-        the shape `msgspec.json.schema_components` produces. This is
-        what `openapi-typescript` and similar codegen tools surface as
-        JSDoc on generated types — without it every consumer-side type
-        loses its hover-documentation.
+        For tagged unions (``msgspec.Struct, tag=...``), msgspec injects the
+        tag/tag_field on the wire but they're not in ``struct_info.fields``.
+        We surface them here as an ``enum=[tag]`` property so the schema
+        round-trips correctly through Swagger UI examples and generated
+        clients can use the field as a discriminator. Matches Litestar's
+        ``StructSchemaPlugin`` behaviour.
+
+        ``title`` is set to the struct class name so Swagger UI labels
+        ``oneOf`` arms with the variant name (e.g. ``PostActivity``)
+        instead of the positional fallback (``#0``, ``#1``, ``#2``).
+
+        ``description`` is carried from the struct's (cleaned) ``__doc__``,
+        matching the shape ``msgspec.json.schema_components`` produces. This
+        is what ``openapi-typescript`` and similar codegen tools surface as
+        JSDoc on generated types — without it every consumer-side type loses
+        its hover-documentation.
 
         Args:
             struct_type: msgspec.Struct type.
@@ -1211,6 +1221,12 @@ class SchemaGenerator:
             if field_required:
                 required.append(field_name)
 
+        tag_field = getattr(struct_info, "tag_field", None)
+        tag = getattr(struct_info, "tag", None)
+        if tag_field and tag is not None:
+            properties[tag_field] = self._enum_values_schema([tag])
+            required.append(tag_field)
+
         # Pull `description` from the struct's *own* docstring only —
         # `inspect.getdoc` walks the MRO and would inherit `msgspec.Struct`'s
         # multi-page base-class docstring onto every undocumented user
@@ -1225,7 +1241,6 @@ class SchemaGenerator:
         return Schema(
             title=struct_type.__name__,
             type="object",
-            title=struct_type.__name__,
             description=description,
             properties=properties,
             required=required or None,
