@@ -59,6 +59,25 @@ class McpError(Exception):
         self.message = message
 
 
+def principal(request: Any) -> dict:
+    """Return the authenticated principal dict for ``request``, regardless of auth tier.
+
+    Tier-1 (Rust) auth populates ``request.context``; the Python OAuth path populates
+    ``request.state["context"]`` (``request.context`` is read-only from Python). Tools and
+    guards should use this helper instead of reading ``request.context`` directly so they
+    work under both. Returns ``{}`` when unauthenticated.
+    """
+    ctx = getattr(request, "context", None)
+    if isinstance(ctx, dict):
+        return ctx
+    state = getattr(request, "state", None)
+    if isinstance(state, dict):
+        stashed = state.get("context")
+        if isinstance(stashed, dict):
+            return stashed
+    return {}
+
+
 class _GuardAuthContext:
     """Adapts the request's auth-context dict to the attribute shape guards expect."""
 
@@ -296,8 +315,7 @@ class MCP:
     def _guards_pass(self, guards: list[Any], request: Any) -> bool:
         if not guards:
             return True
-        ctx = getattr(request, "context", None)
-        adapter = _GuardAuthContext(ctx if isinstance(ctx, dict) else None)
+        adapter = _GuardAuthContext(principal(request))
         return all(g.has_permission(adapter) for g in guards)
 
     # ── Tools ─────────────────────────────────────────────────────────────────

@@ -1,57 +1,31 @@
-"""MCP (Model Context Protocol) server example for django-bolt.
+"""MCP server example for django-bolt, served over Streamable HTTP at ``/mcp`` via bolt-mcp.
 
-Served over the MCP Streamable HTTP transport at ``/mcp`` via ``bolt-mcp``.
-This module is autodiscovered by ``runbolt`` (top-level ``api = BoltAPI()``), so just
-run the example server and point an MCP client at it:
+Autodiscovered by ``runbolt`` (top-level ``api = BoltAPI()``):
 
-    python manage.py runbolt
+    python manage.py migrate                 # once: creates the bolt_mcp.oauth tables
+    python manage.py runbolt --processes 1    # single worker: sample/elicit need a session
 
-    # MCP Inspector / Claude Desktop:  http://localhost:8000/mcp
+``/mcp`` is protected by a built-in OAuth 2.1 Authorization Server (see the mount at the
+bottom). Connect any MCP client that speaks OAuth — it registers itself, sends you to
+``/oauth/authorize`` to sign in with your Django credentials, and uses the issued token:
 
-NOTE: ``/mcp`` is NOT a browsable URL. It's a JSON-RPC endpoint driven by HTTP POST;
-opening it in a browser issues a GET and will return an error (GET is reserved for the
-server→client SSE listen channel). Test it with an MCP client (MCP Inspector, Claude
-Desktop) pointed at http://localhost:8000/mcp, or with a curl POST:
+    npx @modelcontextprotocol/inspector       # Streamable HTTP → http://localhost:8000/mcp
 
-    curl -s http://localhost:8000/mcp \\
-      -H 'Content-Type: application/json' \\
-      -H 'Accept: application/json, text/event-stream' \\
-      -d '{"jsonrpc":"2.0","id":1,"method":"initialize",
-           "params":{"protocolVersion":"2025-06-18","capabilities":{},
-                     "clientInfo":{"name":"curl","version":"1"}}}'
+or run the headless end-to-end demo: ``python mcp_oauth_client_demo.py``.
 
-    # then list tools:
-    curl -s http://localhost:8000/mcp \\
-      -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \\
-      -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-
-All tools/resources/prompts are served at ``/mcp``. This server is **stateful** (sessions
-live in process memory) because the Context's bidirectional features — ``sample`` (use the
-client's LLM) and ``elicit`` (ask the user) — require a session and the GET listen channel.
-Run a single worker (``runbolt --processes 1``); for ``sample``/``elicit`` use a client that
-advertises those capabilities (e.g. MCP Inspector).
+``/mcp`` is a JSON-RPC POST endpoint, not a browsable URL — opening it in a browser
+issues a GET (reserved for the server→client SSE channel) and returns an error.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 
-import jwt
 import msgspec
-from bolt_mcp import MCP, Context
-from django.conf import settings
+from bolt_mcp import MCP, AuthorizationServer, Context, principal
 from users.models import User
 
-from django_bolt import (
-    BoltAPI,
-    HasPermission,
-    IsAdminUser,
-    IsAuthenticated,
-    JWTAuthentication,
-    Request,
-)
-from django_bolt.exceptions import HTTPException
+from django_bolt import BoltAPI, HasPermission, IsAdminUser, IsAuthenticated, Request
 
 api = BoltAPI()
 # Stateful (the default): required by the sample/elicit tools below. Run --processes 1.
@@ -156,62 +130,19 @@ async def show_settings(ctx: Context) -> dict:
     return {"settings": await ctx.read_resource("config://settings")}
 
 
-# ── Auth: token minting + guarded tools ─────────────────────────────────────
-# The /mcp endpoint below mounts with auth=[JWTAuthentication()] (no blanket guard),
-# so anonymous clients still reach the open tools above, but any Bearer token is
-# validated in Rust and its claims land in request.context. Per-tool guards then
-# gate individual tools: they're hidden from tools/list and rejected on tools/call
-# for principals that fail the guard.
+# ── Guarded tools ────────────────────────────────────────────────────────────
+# After the OAuth login, the access token's claims land on the request. Per-tool guards
+# gate individual tools by those claims: a tool whose guard fails is hidden from
+# tools/list and rejected on tools/call. The claims come from the Django user via the
+# get_extra_claims override below (here: staff users get the "reports:read" permission).
 #
-# Try it (mint a token, then call a guarded tool):
-#
-#     TOKEN=$(curl -s http://localhost:8000/mcp-demo/token \
-#       -H 'Content-Type: application/json' -d '{"username":"analyst"}' \
-#       | python -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-#
-#     curl -s http://localhost:8000/mcp \
-#       -H "Authorization: Bearer $TOKEN" \
-#       -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-#       -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-#            "params":{"name":"read_report","arguments":{}}}'
-#
-# "analyst" has reports:read (read_report works, purge_users is denied); "admin" is a
-# superuser (everything works); "guest" only passes IsAuthenticated (whoami works).
-
-# A tiny demo directory standing in for a real user store. The claims here are exactly
-# the ones django-bolt's Rust auth reads: sub, is_staff, is_superuser, permissions.
-_DEMO_PRINCIPALS = {
-    "admin": {"is_staff": True, "is_superuser": True, "permissions": ["reports:read"]},
-    "analyst": {"is_staff": False, "is_superuser": False, "permissions": ["reports:read"]},
-    "guest": {"is_staff": False, "is_superuser": False, "permissions": []},
-}
-
-
-class TokenRequest(msgspec.Struct):
-    username: str
-
-
-@api.post("/mcp-demo/token", tags=["mcp"])
-async def mint_token(body: TokenRequest) -> dict:
-    """DEMO ONLY: mint a JWT for one of the demo principals (admin/analyst/guest).
-
-    A real app would verify a password and load claims from its user store. Here we
-    just sign the demo principal's claims with Django's SECRET_KEY — the same key
-    ``JWTAuthentication()`` validates against — and hand back a Bearer token. Send it
-    as ``Authorization: Bearer <token>`` on /mcp to authenticate to the guarded tools.
-    """
-    principal = _DEMO_PRINCIPALS.get(body.username)
-    if principal is None:
-        raise HTTPException(404, f"unknown demo user {body.username!r}; try one of {sorted(_DEMO_PRINCIPALS)}")
-    now = int(time.time())
-    claims = {"sub": body.username, "iat": now, "exp": now + 3600, **principal}
-    return {"token": jwt.encode(claims, settings.SECRET_KEY, algorithm="HS256")}
-
-
+#   whoami       — any signed-in user (IsAuthenticated)
+#   read_report  — needs the "reports:read" permission  → make the user is_staff
+#   purge_users  — needs a superuser (IsAdminUser)       → make the user is_superuser
 @mcp.tool(guards=[IsAuthenticated()])
 async def whoami(request: Request) -> dict:
-    """Return the authenticated principal — requires any valid token (IsAuthenticated)."""
-    ctx = request.context or {}
+    """Return the authenticated principal — requires any signed-in user (IsAuthenticated)."""
+    ctx = principal(request)
     return {
         "user_id": ctx.get("user_id"),
         "is_staff": ctx.get("is_staff"),
@@ -228,12 +159,28 @@ async def read_report() -> dict:
 
 @mcp.tool(guards=[IsAdminUser()])
 async def purge_users() -> dict:
-    """Admin-only tool — requires a superuser token (IsAdminUser)."""
+    """Admin-only tool — requires a superuser (IsAdminUser)."""
     return {"purged": 0, "note": "demo: no users were harmed"}
 
 
-# Everything is served at /mcp. Native @mcp.* components are always served; REST
-# routes are exposed only when listed explicitly (no implicit exposure).
-# auth=[JWTAuthentication()] validates Bearer tokens (when present) without rejecting
-# anonymous callers — per-tool guards above do the gating.
-api.mount_mcp(mcp, expose=[echo, mint_token], auth=[JWTAuthentication()])
+# Serve everything at /mcp behind a built-in OAuth 2.1 Authorization Server. MCP clients
+# register dynamically, the user signs in with their Django credentials at /oauth/authorize,
+# and the issued token authenticates to /mcp. Native @mcp.* components are always served;
+# REST routes (echo) are exposed only when listed explicitly.
+#
+# Customize it the Django way — subclass and override methods (get_extra_claims,
+# render_consent, authenticate, redirect_uri_allowed, …). Config is class attributes
+# (or AuthorizationServer(issuer=...) kwargs).
+#
+# Setup: "bolt_mcp.oauth" in INSTALLED_APPS + `manage.py migrate`, and a Django user to log
+# in as. `issuer` must equal the public origin clients reach (it is baked into the tokens
+# and discovery documents) — change the port here if you don't run on 8000.
+class ExampleMcpAuth(AuthorizationServer):
+    issuer = "http://localhost:8000"
+
+    def get_extra_claims(self, user, *, scopes, client_id):
+        # Map the signed-in Django user to the permissions the guarded tools check.
+        return {"permissions": ["reports:read"] if user.is_staff else []}
+
+
+api.mount_mcp(mcp, expose=[echo], oauth=ExampleMcpAuth())

@@ -36,3 +36,22 @@ def make_server_project(tmp_path_factory):
         return create_server_project(root, **kwargs)
 
     return factory
+
+
+@pytest.fixture(scope="module")
+def feature_server(request, tmp_path_factory):
+    """One started ``runbolt`` server shared by a whole test module.
+
+    Reads the module's ``MCP_API_BODY`` (and optional ``INSTALLED_APPS_EXTRA``) and starts a
+    single process for the module, so feature tests that only issue read-only MCP calls can
+    share it instead of paying a fresh server start each. Tests that mutate process/session
+    state should use ``make_server_project`` for an isolated server instead.
+    """
+    root = tmp_path_factory.mktemp("mcp_feature_server")
+    project = create_server_project(
+        root,
+        project_api_body=request.module.MCP_API_BODY,
+        installed_apps=getattr(request.module, "INSTALLED_APPS_EXTRA", None) or [],
+    )
+    with project.start() as server:
+        yield server

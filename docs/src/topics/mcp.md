@@ -117,7 +117,7 @@ async def add(a: int, b: int) -> dict:
 
 **Errors are in-band.** A `raise` inside a tool becomes a `CallToolResult` with `isError: true` (the MCP convention), not a transport-level error — so the client sees a normal tool failure it can reason about.
 
-**Accessing the request.** Declare a `request` (or `req`) parameter to receive the Django-Bolt `Request` — useful for reading the authenticated principal via `request.context`. It is injected automatically and excluded from the tool's input schema.
+**Accessing the request.** Declare a `request` (or `req`) parameter to receive the Django-Bolt `Request` — injected automatically and excluded from the tool's input schema. Read the authenticated principal with `bolt_mcp.principal(request)`, which returns `{user_id, is_staff, is_superuser, permissions, auth_claims}` and works under **every** auth tier (Tier 1 fills `request.context`; the OAuth tiers stash it on `request.state` — `principal()` reads both, so prefer it over `request.context` directly).
 
 ## Resources
 
@@ -250,6 +250,12 @@ api.mount_mcp(mcp)
 
 ## Authentication
 
+bolt-mcp offers three layers, smallest to largest:
+
+- **Tier 1** reuses Django-Bolt's own authentication + per-tool guards (you mint tokens).
+- **Tier 2** turns the server into an OAuth 2.1 *Resource Server* that validates tokens issued by an external IdP.
+- **Tier 3** makes it a full OAuth 2.1 *Authorization Server* that issues its own tokens — so OAuth-native clients (Claude.ai, ChatGPT, the Claude Code CLI) link once and refresh silently.
+
 ### Tier 1 — reuse Django-Bolt auth
 
 Pass `auth` / `guards` to `mount_mcp` — the same authentication and permission classes you use on any route (see [Authentication](authentication.md) and [Permissions](permissions.md)), enforced in Rust before the handler.
@@ -295,6 +301,151 @@ api.mount_mcp(mcp, oauth=ProtectedResource(
     token_verifier=my_verifier,   # (token: str) -> claims | None
 ))
 ```
+
+### Tier 3 — built-in OAuth 2.1 Authorization Server
+
+Tiers 1 and 2 still leave token *issuance* to you. Tier 3 makes Django-Bolt the **Authorization Server** itself, so OAuth-native clients can link your server, run the OAuth flow **once**, and refresh silently — no pasting tokens, no re-adding the connector. It implements the full MCP authorization handshake end to end:
+
+1. Client hits `/mcp` with no token → `401` + `WWW-Authenticate: Bearer resource_metadata="…"`
+2. Client fetches **Protected Resource Metadata** ([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)) → discovers the authorization server
+3. Client fetches **Authorization Server Metadata** ([RFC 8414](https://www.rfc-editor.org/rfc/rfc8414)) → discovers the endpoints
+4. Client **registers itself** via Dynamic Client Registration ([RFC 7591](https://www.rfc-editor.org/rfc/rfc7591))
+5. **Authorization Code + PKCE** (S256): the user signs in with their Django credentials and consents
+6. Client exchanges the code for an **access token + refresh token**, then refreshes silently
+
+Issued tokens are `HS256` JWTs signed with Django's `SECRET_KEY`, carrying the exact claims Django-Bolt's auth already reads (`sub`, `is_staff`, `is_superuser`, `permissions`, plus `scope`/`iss`/`aud`/`jti`). So they validate on `/mcp` and drive the same per-tool `guards` as Tier 1 — no extra verifier code.
+
+#### Setup
+
+`bolt_mcp.oauth` is a Django app (it persists registered clients, authorization codes, and refresh tokens). Add it to `INSTALLED_APPS` and migrate:
+
+```python
+# settings.py
+INSTALLED_APPS = [..., "bolt_mcp.oauth"]
+```
+
+```bash
+python manage.py migrate
+```
+
+Then mount with an `AuthorizationServer`:
+
+```python
+from bolt_mcp.oauth import AuthorizationServer
+
+api.mount_mcp(mcp, oauth=AuthorizationServer(issuer="https://api.example.com"))
+```
+
+Users sign in at `/oauth/authorize` with their **Django credentials** (Django's own session framework + password hashing). Because the `401` challenge is what triggers OAuth discovery, the **entire `/mcp` endpoint requires a valid token** under Tier 3 — there are no anonymous tools (unlike Tier 1). Read the principal in a tool with `principal(request)`:
+
+```python
+from bolt_mcp import principal
+
+@mcp.tool(guards=[IsAuthenticated()])
+async def whoami(request: Request) -> dict:
+    return principal(request)   # {user_id, is_staff, is_superuser, permissions, auth_claims}
+```
+
+!!! warning "`issuer` must match the public URL exactly"
+
+    The `issuer` is baked into every token (`iss`/`aud`) and into the discovery documents, and clients compare it byte-for-byte. It must equal the scheme + host (+ port) clients actually reach. If unset it defaults to `http://localhost:8000` (dev only, with a warning) — set it explicitly anywhere else, including behind a reverse proxy.
+
+#### Customizing — subclass and override (Django CBV style)
+
+`AuthorizationServer` is configured like a Django class-based view: **class attributes** for config, **method overrides** for behavior.
+
+```python
+class MyMcpAuth(AuthorizationServer):
+    issuer = "https://api.example.com"
+    access_token_ttl = 1800
+
+    # add claims to every token — sees the requested scopes + the calling client
+    def get_extra_claims(self, user, *, scopes, client_id):
+        return {"tenant_id": user.profile.tenant_id, "roles": [g.name for g in user.groups.all()]}
+
+    # render your own login / consent pages
+    def render_consent(self, params, *, client_name, username):
+        return my_template.render(...)
+
+    # swap the credential check (MFA, an external user store, …)
+    async def authenticate(self, username, password):
+        ...
+
+api.mount_mcp(mcp, oauth=MyMcpAuth())
+```
+
+For trivial cases set attributes inline instead of subclassing: `AuthorizationServer(issuer="…", access_token_ttl=1800)`.
+
+**Configuration attributes**
+
+| Attribute | Default | Purpose |
+| --- | --- | --- |
+| `issuer` | `http://localhost:8000` (dev) | Public origin; token `iss`/`aud` + discovery base. Set in prod. |
+| `resource_url` | `issuer` | OAuth resource identifier / token audience. |
+| `scopes_supported` | `("mcp",)` | Scopes advertised in metadata. |
+| `required_scopes` | `()` | Scopes a token must carry to call `/mcp`. |
+| `access_token_ttl` | `3600` | Access-token lifetime (seconds). |
+| `refresh_token_ttl` | `2592000` | Refresh-token lifetime (30 days). |
+| `auth_code_ttl` | `300` | Authorization-code lifetime. |
+| `jwt_secret` / `jwt_algorithm` | `SECRET_KEY` / `HS256` | Signing key & algorithm. |
+| `auto_consent` | `False` | Skip the consent screen once signed in. |
+| `allow_dynamic_registration` | `True` | Enable `/oauth/register` (DCR). |
+| `endpoint_prefix` | `/oauth` | Path prefix for authorize / token / register / revoke. |
+
+**Overridable methods**
+
+| Method | Called | Override to |
+| --- | --- | --- |
+| `get_extra_claims(user, *, scopes, client_id)` | minting a token | add tenant / role / plan claims |
+| `authenticate(username, password)` *(async)* | login POST | change credential checking / add MFA |
+| `resolve_user(request)` *(async)* | every `/authorize` | change how the session maps to a user |
+| `load_user(user_id)` *(async)* | minting a token | change how the user is loaded |
+| `render_login(params, *, error=None)` | no session | custom sign-in HTML |
+| `render_consent(params, *, client_name, username)` | signed in | custom consent HTML |
+| `redirect_uri_allowed(registered, redirect_uri)` | `/authorize` | change redirect-URI matching |
+
+#### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/.well-known/oauth-authorization-server` | AS metadata (RFC 8414) |
+| `GET` | `/.well-known/oauth-protected-resource` | resource metadata (RFC 9728) |
+| `POST` | `/oauth/register` | Dynamic Client Registration (RFC 7591) |
+| `GET` / `POST` | `/oauth/authorize` | login + consent (Authorization Code + PKCE) |
+| `POST` | `/oauth/token` | `authorization_code` and `refresh_token` grants |
+| `POST` | `/oauth/revoke` | token revocation (RFC 7009) |
+
+#### Security
+
+Secure by default: **PKCE S256 required** (`plain` rejected), **exact redirect-URI matching** (no open redirect), **single-use** authorization codes (atomic consume), **refresh-token rotation with reuse detection** (replaying a rotated token revokes the whole chain), authorization codes and refresh tokens **stored only as SHA-256 hashes**, an **Origin-header CSRF check** on the browser consent POST, and Django's own password hashing + session framework for login. All state lives in the database, so client registrations and refresh tokens survive restarts and are shared across worker processes.
+
+#### Connecting an OAuth client
+
+=== "Claude Code CLI"
+
+    The CLI speaks OAuth and can reach `localhost`:
+
+    ```bash
+    claude mcp add --transport http my-server http://localhost:8000/mcp
+    ```
+
+    Then run `/mcp` in the TUI → **Authenticate**. A browser opens at `/oauth/authorize`; sign in and click **Allow**. Tokens are stored and refreshed automatically.
+
+=== "Claude.ai / ChatGPT"
+
+    Add a **custom connector** pointing at `https://your-domain.com/mcp`. These run server-side and **cannot reach `localhost`** — expose a public HTTPS URL (e.g. a `cloudflared`/`ngrok` tunnel) and set `issuer` to that exact URL.
+
+=== "MCP Inspector"
+
+    ```bash
+    npx @modelcontextprotocol/inspector
+    ```
+
+    Transport **Streamable HTTP**, URL `http://localhost:8000/mcp`, **Connect** → it registers itself and runs the OAuth flow.
+
+#### Prefer an external IdP?
+
+If you don't want to be the authorization server, stay a pure Resource Server (Tier 2): point `ProtectedResource(authorization_servers=[...], token_verifier=...)` at Auth0 / WorkOS / Keycloak / Entra and let it issue the tokens.
 
 ## Deployment modes
 
@@ -345,6 +496,6 @@ See the [Testing guide](testing.md) for more on `TestClient`.
 
 ## Supported MCP methods
 
-`initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, `prompts/get`, and the Streamable HTTP transport (`POST`/`GET`/`DELETE`) with sessions, both auth tiers, route auto-exposure, and streaming tools (progress / logging / sampling / elicitation) via a tool `Context`.
+`initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, `prompts/get`, and the Streamable HTTP transport (`POST`/`GET`/`DELETE`) with sessions, all three auth tiers, route auto-exposure, and streaming tools (progress / logging / sampling / elicitation) via a tool `Context`. With the built-in Authorization Server (Tier 3) it additionally serves `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, and `/oauth/{register,authorize,token,revoke}`.
 
 The server advertises protocol version `2025-06-18` and negotiates with clients on several recent versions.

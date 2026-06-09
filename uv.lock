@@ -86,12 +86,14 @@ source = { editable = "python/bolt-mcp" }
 dependencies = [
     { name = "django-bolt" },
     { name = "msgspec" },
+    { name = "pyjwt" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "django-bolt", editable = "." },
     { name = "msgspec", specifier = ">=0.20" },
+    { name = "pyjwt", specifier = ">=2.8" },
 ]
 
 [[package]]

@@ -20,13 +20,16 @@ from __future__ import annotations
 
 from .autoexpose import expose_as_tool, expose_routes
 from .context import Context
-from .server import MCP
+from .oauth import AuthorizationServer
+from .server import MCP, principal
 from .transport import ProtectedResource, mount_mcp
 
 __all__ = [
     "MCP",
     "mount_mcp",
     "ProtectedResource",
+    "AuthorizationServer",
+    "principal",
     "expose_routes",
     "expose_as_tool",
     "Context",

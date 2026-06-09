@@ -6,6 +6,7 @@ with ``MCP(json_response=True)`` return a single ``application/json`` object.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -273,7 +274,47 @@ def _check_oauth(oauth: ProtectedResource, request: Request) -> JSON | None:
     claims = oauth.token_verifier(token) if (token and oauth.token_verifier) else None
     if claims is None:
         return _oauth_challenge(oauth)
+    if oauth.required_scopes:
+        granted = set((claims.get("scope") or "").split())
+        if not set(oauth.required_scopes).issubset(granted):
+            return _oauth_challenge(oauth)
+    # No Rust auth ran on this path, so request.context is empty. Stash the verified
+    # principal on the mutable request.state so per-tool guards (and tools via
+    # bolt_mcp.principal) can read it — see server._guards_pass. Best-effort.
+    with contextlib.suppress(Exception):
+        request.state["context"] = {
+            "user_id": claims.get("sub"),
+            "is_staff": bool(claims.get("is_staff")),
+            "is_superuser": bool(claims.get("is_superuser")),
+            "permissions": claims.get("permissions") or [],
+            "auth_claims": claims,
+        }
     return None
+
+
+def _resolve_oauth(api: BoltAPI, oauth: Any) -> ProtectedResource | None:
+    """Normalize the ``oauth=`` argument to a ``ProtectedResource`` for the /mcp guard.
+
+    A built-in ``AuthorizationServer`` additionally registers the AS discovery/DCR/
+    authorize/token endpoints and yields a ProtectedResource that validates the JWTs it
+    issues. A plain ``ProtectedResource`` (external IdP) is returned unchanged.
+    """
+    if oauth is None:
+        return None
+    from .oauth.config import AuthorizationServer  # noqa: PLC0415 — keep OAuth deps optional/lazy
+
+    if isinstance(oauth, AuthorizationServer):
+        from .oauth.endpoints import register_oauth_endpoints  # noqa: PLC0415
+        from .oauth.tokens import make_token_verifier  # noqa: PLC0415
+
+        register_oauth_endpoints(api, oauth)
+        return ProtectedResource(
+            resource_url=oauth.effective_resource_url(),
+            authorization_servers=[oauth.effective_issuer()],
+            required_scopes=oauth.required_scopes,
+            token_verifier=make_token_verifier(oauth),
+        )
+    return oauth
 
 
 # ── mount ─────────────────────────────────────────────────────────────────────
@@ -284,7 +325,7 @@ def mount_mcp(
     *,
     auth: list[Any] | None = None,
     guards: list[Any] | None = None,
-    oauth: ProtectedResource | None = None,
+    oauth: Any | None = None,
     expose: Sequence[Callable] | None = None,
 ) -> None:
     """Register the MCP Streamable HTTP endpoint (POST/GET/DELETE) on ``api``.
@@ -302,8 +343,11 @@ def mount_mcp(
     bulk selection, call :func:`expose_routes` directly before mounting.
 
     Tier 1 auth: pass ``auth=``/``guards=`` — enforced in Rust before the handler.
-    Tier 2 auth: pass ``oauth=ProtectedResource(...)`` — Python-side token check +
-    RFC 9728 metadata route + ``WWW-Authenticate`` challenge.
+    Tier 2 auth: pass ``oauth=...`` — Python-side token check + RFC 9728 metadata route +
+    ``WWW-Authenticate`` challenge. ``oauth`` accepts either a ``ProtectedResource``
+    (validate tokens from an external IdP) or an ``oauth.AuthorizationServer`` (a built-in
+    Django-backed OAuth 2.1 server that also serves the discovery/DCR/authorize/token
+    endpoints). ``oauth`` and ``auth``/``guards`` are mutually exclusive.
     """
     if expose is True:
         raise TypeError(
@@ -315,12 +359,13 @@ def mount_mcp(
     if expose:
         expose_routes(mcp, api, handlers=expose)  # explicit handler allowlist
 
-    route_auth = None if oauth is not None else auth
-    route_guards = None if oauth is not None else guards
+    oauth_resource = _resolve_oauth(api, oauth)
+    route_auth = None if oauth_resource is not None else auth
+    route_guards = None if oauth_resource is not None else guards
 
     async def _serve(handler: Callable, request: Request) -> Any:
         """Optional Tier-2 OAuth check, then delegate to the transport handler."""
-        if oauth is not None and (denied := _check_oauth(oauth, request)) is not None:
+        if oauth_resource is not None and (denied := _check_oauth(oauth_resource, request)) is not None:
             return denied
         return await handler(mcp, request)
 
@@ -336,8 +381,10 @@ def mount_mcp(
     async def _mcp_delete(request: Request):
         return await _serve(handle_delete, request)
 
-    if oauth is not None:
+    if oauth_resource is not None:
+        # Static discovery document: resource config is fixed at mount, so build it once.
+        protected_resource_doc = _protected_resource_metadata(oauth_resource)
 
         @api.get(WELL_KNOWN_PROTECTED_RESOURCE)
         async def _mcp_protected_resource_metadata(request: Request):
-            return JSON(_protected_resource_metadata(oauth))
+            return JSON(protected_resource_doc)

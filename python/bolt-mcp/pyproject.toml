@@ -21,6 +21,9 @@ dependencies = [
     # version-coupled — keep this floor in lockstep with django-bolt releases.
     "django-bolt>=0.8.1",
     "msgspec>=0.20",
+    # The built-in OAuth Authorization Server (bolt_mcp.oauth) signs/validates JWTs with
+    # PyJWT. django-bolt already imports it transitively; declared here for hygiene.
+    "pyjwt>=2.8",
 ]
 
 [project.urls]
