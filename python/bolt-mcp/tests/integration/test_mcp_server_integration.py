@@ -22,9 +22,9 @@ mount_mcp(api, mcp)
 """
 
 
-def _post(server, method, params=None, *, id=1, session_id=None):
+def _post(server, method, params=None, *, request_id=1, session_id=None):
     return server.client.post(
-        server.url("/mcp"), content=rpc_body(method, params, id=id), headers=mcp_headers(session_id=session_id)
+        server.url("/mcp"), content=rpc_body(method, params, id=request_id), headers=mcp_headers(session_id=session_id)
     )
 
 
