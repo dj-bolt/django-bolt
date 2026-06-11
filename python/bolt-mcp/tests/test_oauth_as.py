@@ -16,7 +16,7 @@ from _helpers import initialize, parse_rpc, post_rpc
 from bolt_mcp import MCP, AuthorizationServer, mount_mcp
 from bolt_mcp.oauth import sessions as oauth_sessions
 from bolt_mcp.oauth.models import RefreshToken
-from bolt_mcp.oauth.pkce import compute_s256
+from bolt_mcp.oauth.pkce import compute_s256, verify_s256
 from bolt_mcp.oauth.tokens import sha256_hex
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -197,6 +197,12 @@ def test_authorize_unregistered_redirect_uri_is_not_redirected():
     # Open-redirect guard: a bad redirect_uri yields an inline error, never a 3xx redirect.
     assert r.status_code == 400
     assert "redirect_uri" in r.text
+
+
+def test_verify_s256_rejects_non_ascii_verifier():
+    """A non-ASCII verifier is invalid per RFC 7636 — must return False, never raise."""
+    _, challenge = _pkce()
+    assert verify_s256("üñïcode-verifier-é", challenge) is False
 
 
 def test_authorize_rejects_plain_pkce():

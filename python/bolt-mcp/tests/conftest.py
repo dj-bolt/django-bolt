@@ -8,6 +8,7 @@ import tempfile
 import django
 import pytest
 from django.conf import settings
+from django.core.management import call_command
 
 # A temp *file* DB (not ``:memory:``): the OAuth Authorization Server tests touch the DB
 # from request handlers, which run ORM through ``sync_to_async`` on a worker thread with
@@ -43,8 +44,6 @@ if not settings.configured:
     django.setup()
 
     # Create the OAuth + auth + session tables in the shared file DB once per session.
-    from django.core.management import call_command
-
     call_command("migrate", run_syncdb=True, verbosity=0)
 
 
@@ -59,7 +58,7 @@ def _allow_db_access(request):
     """
     try:
         blocker = request.getfixturevalue("django_db_blocker")
-    except Exception:
+    except pytest.FixtureLookupError:
         yield
         return
     with blocker.unblock():

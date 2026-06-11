@@ -54,7 +54,7 @@ def origin_ok(request: Any, issuer: str) -> bool:
     and cannot be spoofed by page script, so an exact origin match is a robust check.
     Missing Origin is rejected (state-changing request).
     """
-    origin = {k.lower(): v for k, v in request.headers.items()}.get("origin")
+    origin = request.headers.get("origin")  # header keys arrive lowercase (canonicalized in Rust)
     if not origin:
         return False
     want = urlsplit(issuer)

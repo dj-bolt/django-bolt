@@ -20,4 +20,8 @@ def verify_s256(code_verifier: str, code_challenge: str) -> bool:
     """Constant-time check that ``code_verifier`` matches the stored S256 challenge."""
     if not code_verifier or not code_challenge:
         return False
-    return hmac.compare_digest(compute_s256(code_verifier), code_challenge)
+    try:
+        computed = compute_s256(code_verifier)
+    except UnicodeEncodeError:
+        return False  # a non-ASCII verifier can never match an S256 challenge
+    return hmac.compare_digest(computed, code_challenge)

@@ -44,6 +44,9 @@ class AuthorizationCode(models.Model):
     expires_at = models.DateTimeField(db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    def __str__(self) -> str:
+        return f"code {self.code_hash[:8]}… for user {self.user_id} (expires {self.expires_at})"
+
 
 class RefreshToken(models.Model):
     """A refresh token (opaque, stored hashed) with rotation + reuse detection.
@@ -61,3 +64,6 @@ class RefreshToken(models.Model):
     expires_at = models.DateTimeField(db_index=True)
     rotated = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self) -> str:
+        return f"refresh token {self.token_hash[:8]}… for user {self.user_id} (expires {self.expires_at})"

@@ -12,10 +12,9 @@ import json
 import httpx
 import msgspec
 import pytest
+from _helpers import PROTOCOL, mcp_headers, rpc_body
 
 pytestmark = pytest.mark.server_integration
-
-DUAL_ACCEPT = "application/json, text/event-stream"
 
 MCP_API_BODY = """
 from bolt_mcp import MCP, Context, mount_mcp
@@ -39,29 +38,18 @@ mount_mcp(api, mcp)
 """
 
 
-def _headers(session_id=None):
-    h = {"Accept": DUAL_ACCEPT, "Content-Type": "application/json", "MCP-Protocol-Version": "2025-06-18"}
-    if session_id:
-        h["Mcp-Session-Id"] = session_id
-    return h
-
-
 def _initialize(server):
     resp = server.client.post(
         server.url("/mcp"),
-        content=msgspec.json.encode(
+        content=rpc_body(
+            "initialize",
             {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {"sampling": {}, "elicitation": {}},
-                    "clientInfo": {"name": "it", "version": "1"},
-                },
-            }
+                "protocolVersion": PROTOCOL,
+                "capabilities": {"sampling": {}, "elicitation": {}},
+                "clientInfo": {"name": "it", "version": "1"},
+            },
         ),
-        headers={"Accept": DUAL_ACCEPT, "Content-Type": "application/json"},
+        headers=mcp_headers(protocol=None),
     )
     assert resp.status_code == 200
     return resp.headers["mcp-session-id"]
@@ -69,12 +57,12 @@ def _initialize(server):
 
 def _round_trip(server, session_id, *, tool, arguments, expect_method, client_result):
     """Call a bidirectional tool; answer the server's request; return the final result."""
-    call = msgspec.json.encode(
-        {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}
-    )
+    call = rpc_body("tools/call", {"name": tool, "arguments": arguments}, id=7)
     server_request_id = None
     final = None
-    with server.client.stream("POST", server.url("/mcp"), content=call, headers=_headers(session_id)) as r:
+    with server.client.stream(
+        "POST", server.url("/mcp"), content=call, headers=mcp_headers(session_id=session_id)
+    ) as r:
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/event-stream")
         for line in r.iter_lines():
@@ -85,7 +73,9 @@ def _round_trip(server, session_id, *, tool, arguments, expect_method, client_re
                 server_request_id = msg["id"]
                 # The client replies on a *separate* connection.
                 reply = msgspec.json.encode({"jsonrpc": "2.0", "id": server_request_id, "result": client_result})
-                ack = httpx.post(server.url("/mcp"), content=reply, headers=_headers(session_id), timeout=10.0)
+                ack = httpx.post(
+                    server.url("/mcp"), content=reply, headers=mcp_headers(session_id=session_id), timeout=10.0
+                )
                 assert ack.status_code == 202
             elif "result" in msg:
                 final = msg

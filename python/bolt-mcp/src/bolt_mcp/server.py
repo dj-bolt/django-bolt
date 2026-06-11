@@ -100,6 +100,11 @@ def _arguments_from_signature(fn: Callable) -> list[dict[str, Any]]:
     return args
 
 
+async def _invoke(fn: Callable, is_async: bool, /, **kwargs: Any) -> Any:
+    """Call a registered resource/prompt handler, awaiting it when registered async."""
+    return await fn(**kwargs) if is_async else fn(**kwargs)
+
+
 def _find_context_param(fn: Callable) -> str | None:
     """Return the name of a parameter annotated ``Context``, if any."""
     try:
@@ -359,16 +364,13 @@ class MCP:
             kwargs["request"] = request
         return tool, kwargs
 
-    def _progress_token(self, params: dict) -> Any:
-        return (params.get("_meta") or {}).get("progressToken")
-
     def _make_context(self, params: dict, request: Any, session: Any, request_id: Any, outgoing: Any) -> Context:
         return Context(
             mcp=self,
             request=request,
             session=session,
             request_id=request_id,
-            progress_token=self._progress_token(params),
+            progress_token=(params.get("_meta") or {}).get("progressToken"),
             outgoing=outgoing,
         )
 
@@ -447,16 +449,14 @@ class MCP:
         """
         resource = self._resources.get(uri)
         if resource is not None:
-            text = await resource.fn() if resource.is_async else resource.fn()
-            return text, resource.mime_type
+            return await _invoke(resource.fn, resource.is_async), resource.mime_type
         for tmpl in self._resource_templates.values():
             match = tmpl.pattern.match(uri)
             if match is None:
                 continue
             raw = {k: unquote(v) for k, v in match.groupdict().items()}
             kwargs = msgspec.structs.asdict(msgspec.convert(raw, tmpl.args_struct, strict=False))
-            text = await tmpl.fn(**kwargs) if tmpl.is_async else tmpl.fn(**kwargs)
-            return text, tmpl.mime_type
+            return await _invoke(tmpl.fn, tmpl.is_async, **kwargs), tmpl.mime_type
         return None
 
     async def _read_resource(self, params: dict) -> dict:
@@ -490,7 +490,7 @@ class MCP:
         except msgspec.ValidationError as exc:
             raise McpError(INVALID_PARAMS, f"Invalid arguments: {exc}") from exc
         kwargs = msgspec.structs.asdict(args)
-        rendered = await prompt.fn(**kwargs) if prompt.is_async else prompt.fn(**kwargs)
+        rendered = await _invoke(prompt.fn, prompt.is_async, **kwargs)
         if isinstance(rendered, str):
             messages = [{"role": "user", "content": {"type": "text", "text": rendered}}]
         else:

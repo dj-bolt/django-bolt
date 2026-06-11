@@ -15,6 +15,7 @@ from html import escape
 from typing import Any
 from urllib.parse import parse_qs, urlencode
 
+import msgspec
 from asgiref.sync import sync_to_async
 
 from django_bolt import BoltAPI, Request
@@ -104,7 +105,9 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
         if not server.redirect_uri_allowed(client.get("redirect_uris"), redirect_uri):
             return _html_error("redirect_uri does not match a registered value")
         if p.get("code_challenge_method") != "S256" or not p.get("code_challenge"):
-            return _redirect_error(redirect_uri, p.get("state"), "invalid_request", "PKCE with S256 code_challenge is required")
+            return _redirect_error(
+                redirect_uri, p.get("state"), "invalid_request", "PKCE with S256 code_challenge is required"
+            )
         return client
 
     async def _issue_code_redirect(p: dict[str, str], client: dict, user: dict, *, session_key: str | None) -> Redirect:
@@ -121,14 +124,6 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
         if p.get("state"):
             params["state"] = p["state"]
         resp = Redirect(_append_query(p["redirect_uri"], params), status_code=302)
-        if session_key:
-            _apply_session_cookie(resp, session_key)
-        return resp
-
-    async def _grant_or_consent(p: dict, client: dict, user: dict, *, session_key: str | None):
-        if server.auto_consent:
-            return await _issue_code_redirect(p, client, user, session_key=session_key)
-        resp = HTML(server.render_consent(p, client_name=client.get("client_name", ""), username=user["username"]))
         if session_key:
             _apply_session_cookie(resp, session_key)
         return resp
@@ -171,7 +166,10 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
             if login is None:
                 return HTML(server.render_login(p, error="Invalid username or password"))
             user = {"user_id": login["user_id"], "username": login["username"]}
-            return await _grant_or_consent(p, client, user, session_key=login["session_key"])
+            if server.auto_consent:
+                return await _issue_code_redirect(p, client, user, session_key=login["session_key"])
+            resp = HTML(server.render_consent(p, client_name=client.get("client_name", ""), username=user["username"]))
+            return _apply_session_cookie(resp, login["session_key"])
 
         decision = form.get("decision")
         if decision is not None:  # consent submission
@@ -243,7 +241,7 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
     async def _register(request: Request):
         try:
             body = json_decode(request.body or b"{}")
-        except Exception:
+        except msgspec.DecodeError:
             return _json_error("invalid_client_metadata", "request body must be valid JSON")
         if not isinstance(body, dict):
             return _json_error("invalid_client_metadata", "client metadata must be a JSON object")

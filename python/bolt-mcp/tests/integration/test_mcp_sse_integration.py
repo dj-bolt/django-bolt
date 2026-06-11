@@ -7,12 +7,10 @@ response framing, the long-lived GET listen channel, single-stream-per-session
 
 from __future__ import annotations
 
-import msgspec
 import pytest
+from _helpers import INITIALIZE_PARAMS, mcp_headers, rpc_body
 
 pytestmark = pytest.mark.server_integration
-
-DUAL_ACCEPT = "application/json, text/event-stream"
 
 MCP_API_BODY = """
 from bolt_mcp import MCP, mount_mcp
@@ -30,30 +28,11 @@ mount_mcp(api, mcp)
 """
 
 
-def _json_headers(session_id=None):
-    h = {"Accept": DUAL_ACCEPT, "Content-Type": "application/json", "MCP-Protocol-Version": "2025-06-18"}
-    if session_id:
-        h["Mcp-Session-Id"] = session_id
-    return h
-
-
-def _encode(method, params=None, *, id=1):
-    body = {"jsonrpc": "2.0", "method": method}
-    if id is not None:
-        body["id"] = id
-    if params is not None:
-        body["params"] = params
-    return msgspec.json.encode(body)
-
-
 def _initialize(server):
     resp = server.client.post(
         server.url("/mcp"),
-        content=_encode(
-            "initialize",
-            {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "it", "version": "1"}},
-        ),
-        headers=_json_headers(),
+        content=rpc_body("initialize", INITIALIZE_PARAMS),
+        headers=mcp_headers(),
     )
     assert resp.status_code == 200
     return resp.headers["mcp-session-id"]
@@ -66,8 +45,8 @@ def test_tool_call_streams_sse_response(make_server_project):
         with server.client.stream(
             "POST",
             server.url("/mcp"),
-            content=_encode("tools/call", {"name": "add", "arguments": {"a": 2, "b": 3}}),
-            headers=_json_headers(session_id),
+            content=rpc_body("tools/call", {"name": "add", "arguments": {"a": 2, "b": 3}}),
+            headers=mcp_headers(session_id=session_id),
         ) as resp:
             assert resp.status_code == 200
             assert resp.headers["content-type"].startswith("text/event-stream")

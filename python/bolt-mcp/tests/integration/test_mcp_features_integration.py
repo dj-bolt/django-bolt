@@ -14,12 +14,9 @@ read-only MCP calls; the mode tests spin up their own server with a different ``
 from __future__ import annotations
 
 import pytest
-from _helpers import _parse_all_sse, parse_rpc, rpc_body
+from _helpers import PROTOCOL, _parse_all_sse, mcp_headers, parse_rpc, rpc_body
 
 pytestmark = pytest.mark.server_integration
-
-ACCEPT = "application/json, text/event-stream"
-PROTOCOL = "2025-06-18"
 
 # Picked up by the module-scoped ``feature_server`` fixture (see integration/conftest.py).
 MCP_API_BODY = """
@@ -78,16 +75,9 @@ mount_mcp(api, mcp, expose=[double])
 """
 
 
-def _headers(session_id=None):
-    h = {"Accept": ACCEPT, "Content-Type": "application/json", "MCP-Protocol-Version": PROTOCOL}
-    if session_id:
-        h["Mcp-Session-Id"] = session_id
-    return h
-
-
-def _post(server, method, params=None, *, session_id=None, id=1):
+def _post(server, method, params=None, *, session_id=None, request_id=1):
     return server.client.post(
-        server.url("/mcp"), content=rpc_body(method, params, id=id), headers=_headers(session_id)
+        server.url("/mcp"), content=rpc_body(method, params, id=request_id), headers=mcp_headers(session_id=session_id)
     )
 
 
@@ -154,8 +144,10 @@ def test_context_tool_streams_progress_then_result(feature_server):
     sid, _ = _init(feature_server)
     resp = feature_server.client.post(
         feature_server.url("/mcp"),
-        content=rpc_body("tools/call", {"name": "crunch", "arguments": {"n": 3}, "_meta": {"progressToken": "tok1"}}, id=9),
-        headers=_headers(sid),
+        content=rpc_body(
+            "tools/call", {"name": "crunch", "arguments": {"n": 3}, "_meta": {"progressToken": "tok1"}}, id=9
+        ),
+        headers=mcp_headers(session_id=sid),
     )
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")

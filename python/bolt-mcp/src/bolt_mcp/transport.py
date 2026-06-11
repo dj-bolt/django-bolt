@@ -47,10 +47,8 @@ class ProtectedResource:
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────
-def _headers(request: Request) -> dict[str, str]:
-    return {k.lower(): v for k, v in request.headers.items()}
-
-
+# Note: request.headers keys are always lowercase (canonicalized in Rust — see
+# src/handler.rs), so handlers read them directly without re-normalizing.
 def _accept_types(accept: str) -> set[str]:
     return {part.split(";", 1)[0].strip() for part in accept.split(",") if part.strip()}
 
@@ -132,7 +130,7 @@ async def _frame_tool_stream(items: Any, request_id: Any):
 
 # ── POST ────────────────────────────────────────────────────────────────────--
 async def handle_post(mcp: MCP, request: Request) -> Any:
-    headers = _headers(request)
+    headers = request.headers
     accept_types = _accept_types(headers.get("accept", ""))
     has_json = _admits(accept_types, _JSON_CT)
     has_sse = _admits(accept_types, _SSE_CT)
@@ -215,7 +213,7 @@ async def handle_get(mcp: MCP, request: Request) -> Any:
     if mcp.stateless or mcp.json_response:
         return _status(405, INVALID_REQUEST, "SSE stream not supported", headers={"Allow": "POST, DELETE"})
 
-    headers = _headers(request)
+    headers = request.headers
     if not _accepts(headers.get("accept", ""), _SSE_CT):
         return _status(406, INVALID_REQUEST, "Client must accept text/event-stream")
 
@@ -242,7 +240,7 @@ async def handle_get(mcp: MCP, request: Request) -> Any:
 
 # ── DELETE (terminate session) ─────────────────────────────────────────────────
 async def handle_delete(mcp: MCP, request: Request) -> Any:
-    sid = _headers(request).get("mcp-session-id")
+    sid = request.headers.get("mcp-session-id")
     if mcp.stateless or not sid:
         return _status(405, INVALID_REQUEST, "Session termination not supported", headers={"Allow": "POST"})
     if not mcp.sessions.terminate(sid):
@@ -270,13 +268,13 @@ def _oauth_challenge(oauth: ProtectedResource) -> JSON:
 
 
 def _check_oauth(oauth: ProtectedResource, request: Request) -> JSON | None:
-    token = _bearer(_headers(request))
+    token = _bearer(request.headers)
     claims = oauth.token_verifier(token) if (token and oauth.token_verifier) else None
     if claims is None:
         return _oauth_challenge(oauth)
     if oauth.required_scopes:
         granted = set((claims.get("scope") or "").split())
-        if not set(oauth.required_scopes).issubset(granted):
+        if not granted.issuperset(oauth.required_scopes):
             return _oauth_challenge(oauth)
     # No Rust auth ran on this path, so request.context is empty. Stash the verified
     # principal on the mutable request.state so per-tool guards (and tools via
@@ -314,7 +312,9 @@ def _resolve_oauth(api: BoltAPI, oauth: Any) -> ProtectedResource | None:
             required_scopes=oauth.required_scopes,
             token_verifier=make_token_verifier(oauth),
         )
-    return oauth
+    if isinstance(oauth, ProtectedResource):
+        return oauth
+    raise TypeError(f"oauth must be a ProtectedResource or an oauth.AuthorizationServer, got {type(oauth).__name__}")
 
 
 # ── mount ─────────────────────────────────────────────────────────────────────

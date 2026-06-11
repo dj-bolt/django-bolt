@@ -81,6 +81,7 @@ def _manage(project, *args: str) -> None:
         env=env,
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         raise AssertionError(f"manage.py {args} failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")

@@ -58,3 +58,12 @@ def test_expose_false_serves_native_only():
     tools = _tools(_build(False))
     assert "add" in tools
     assert "get_item" not in tools
+
+
+def test_unsupported_oauth_value_is_rejected_at_mount_time():
+    """``oauth=`` accepts only AuthorizationServer/ProtectedResource — anything else
+    must fail at mount time, not on the first request."""
+    api = BoltAPI()
+    mcp = MCP("mount-method-server")
+    with pytest.raises(TypeError, match="ProtectedResource"):
+        api.mount_mcp(mcp, oauth=object())
