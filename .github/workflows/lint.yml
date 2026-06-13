@@ -23,9 +23,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
-      # Provide `cargo`/`rustfmt` for the local cargo-fmt hook in .pre-commit-config.yaml.
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          toolchain: stable
-          components: rustfmt
+      # The cargo-fmt hook (.pre-commit-config.yaml) runs via the runner's
+      # preinstalled rustup, which auto-installs the toolchain + rustfmt pinned
+      # in rust-toolchain.toml — so CI and local formatting never drift.
       - uses: j178/prek-action@bdca6f102f98e2b4c7029491a53dfd366469e33d # v2.0.4

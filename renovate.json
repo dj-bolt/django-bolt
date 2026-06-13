@@ -22,7 +22,8 @@
     {
       "description": "Group all Rust dependencies",
       "matchManagers": [
-        "cargo"
+        "cargo",
+        "rust-toolchain"
       ],
       "groupName": "rust dependencies"
     },
