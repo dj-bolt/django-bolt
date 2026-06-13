@@ -47,7 +47,8 @@
       "matchManagers": [
         "pre-commit"
       ],
-      "groupName": "pre-commit hooks"
+      "groupName": "pre-commit hooks",
+      "automerge": true
     },
     {
       "description": "Core framework deps - never automerge",
