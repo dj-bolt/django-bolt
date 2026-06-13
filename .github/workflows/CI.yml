@@ -40,10 +40,10 @@ jobs:
 
       - name: Install Rust
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
-        # `toolchain` so the action reads the file instead of defaulting to stable.
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
-        with:
-          cache: false
 
       - name: Install dependencies
         run: |
@@ -80,10 +80,10 @@ jobs:
 
       - name: Install Rust
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
-        # `toolchain` so the action reads the file instead of defaulting to stable.
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
-        with:
-          cache: false
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -122,10 +122,10 @@ jobs:
 
       - name: Install Rust
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
-        # `toolchain` so the action reads the file instead of defaulting to stable.
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
-        with:
-          cache: false
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -165,10 +165,10 @@ jobs:
 
       - name: Install Rust
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
-        # `toolchain` so the action reads the file instead of defaulting to stable.
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
-        with:
-          cache: false
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -339,10 +339,10 @@ jobs:
 
       - name: Install Rust
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
-        # `toolchain` so the action reads the file instead of defaulting to stable.
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
-        with:
-          cache: false
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
