@@ -30,11 +30,8 @@ use crate::state::{ScopeConfig, ServeMode};
 /// exfiltrate but cannot execute, and forcing CSS to download would be
 /// gratuitous for the common "let users upload theme overrides" case.
 const DANGEROUS_MEDIA_EXTS: &[&str] = &[
-    "html", "htm", "xhtml", "xhtm", "shtml", "shtm", "htc", "hta",
-    "svg", "svgz",
-    "xml", "xsl", "xslt",
-    "js", "mjs", "cjs",
-    "wasm",
+    "html", "htm", "xhtml", "xhtm", "shtml", "shtm", "htc", "hta", "svg", "svgz", "xml", "xsl",
+    "xslt", "js", "mjs", "cjs", "wasm",
 ];
 
 fn is_dangerous_media_ext(path: &Path) -> bool {
@@ -319,11 +316,8 @@ mod tests {
     fn test_is_dangerous_media_ext() {
         // Script-bearing extensions must be flagged regardless of case.
         for ext in &[
-            "html", "HTM", "xhtml", "xhtm", "shtml", "shtm", "htc", "hta",
-            "svg", "SVGZ",
-            "xml", "xsl", "xslt",
-            "js", "MJS", "cjs",
-            "wasm",
+            "html", "HTM", "xhtml", "xhtm", "shtml", "shtm", "htc", "hta", "svg", "SVGZ", "xml",
+            "xsl", "xslt", "js", "MJS", "cjs", "wasm",
         ] {
             let p = Path::new(&format!("upload.{}", ext)).to_path_buf();
             assert!(
@@ -333,7 +327,9 @@ mod tests {
             );
         }
         // Inert types stay inline so legitimate avatars/images keep working.
-        for ext in &["png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "json", "css"] {
+        for ext in &[
+            "png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "json", "css",
+        ] {
             let p = Path::new(&format!("upload.{}", ext)).to_path_buf();
             assert!(
                 !is_dangerous_media_ext(&p),
