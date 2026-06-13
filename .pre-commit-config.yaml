@@ -7,7 +7,7 @@
 # CI runs `prek run --all-files` via .github/workflows/lint.yml.
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
     hooks:
       # Strip trailing whitespace, but keep hard line breaks in Markdown.
       # Exclude size-sensitive benchmark/upload fixtures (e.g. test_data/100B.txt
@@ -20,7 +20,7 @@ repos:
         exclude: '^python/example/(test_data|media|static)/'
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.17
+    rev: 3b3f7c3f57fe9925356faf5fe6230835138be230  # frozen: v0.15.17
     hooks:
       # Lint (autofix what is safe). Keep before the formatter per ruff guidance.
       - id: ruff-check
