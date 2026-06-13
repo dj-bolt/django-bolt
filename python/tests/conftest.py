@@ -179,12 +179,8 @@ def kill_process(process):
         with contextlib.suppress(builtins.BaseException):
             process.kill()
     else:
-        try:
+        with contextlib.suppress(Exception):
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except Exception:
-            pass
 
 
 def wait_for_server(host, port, timeout=15):

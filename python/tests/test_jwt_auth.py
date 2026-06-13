@@ -292,9 +292,8 @@ async def test_get_user_reraises_operational_error():
         "aget",
         new_callable=AsyncMock,
         side_effect=OperationalError("connection reset"),
-    ):
-        with pytest.raises(OperationalError):
-            await auth.get_user("1", {})
+    ), pytest.raises(OperationalError):
+        await auth.get_user("1", {})
 
 
 @pytest.mark.asyncio
@@ -310,9 +309,8 @@ async def test_get_user_reraises_interface_error():
         "aget",
         new_callable=AsyncMock,
         side_effect=InterfaceError("connection closed"),
-    ):
-        with pytest.raises(InterfaceError):
-            await auth.get_user("1", {})
+    ), pytest.raises(InterfaceError):
+        await auth.get_user("1", {})
 
 
 def test_get_user_sync_reraises_operational_error():
@@ -326,9 +324,8 @@ def test_get_user_sync_reraises_operational_error():
         auth._get_user_model().objects,
         "get",
         side_effect=OperationalError("connection reset"),
-    ):
-        with pytest.raises(OperationalError):
-            auth.get_user_sync("1")
+    ), pytest.raises(OperationalError):
+        auth.get_user_sync("1")
 
 
 def test_get_user_sync_reraises_interface_error():
@@ -342,9 +339,8 @@ def test_get_user_sync_reraises_interface_error():
         auth._get_user_model().objects,
         "get",
         side_effect=InterfaceError("connection closed"),
-    ):
-        with pytest.raises(InterfaceError):
-            auth.get_user_sync("1")
+    ), pytest.raises(InterfaceError):
+        auth.get_user_sync("1")
 
 
 if __name__ == "__main__":

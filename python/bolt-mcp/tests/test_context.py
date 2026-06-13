@@ -137,7 +137,7 @@ def test_sample_without_client_capability_is_clear_in_band_error():
 def test_context_sample_mechanism():
     """Unit-level: sample emits a server→client request and resolves on the reply."""
 
-    async def scenario():
+    async def scenario() -> None:
         session = Session(id="s1", client_capabilities={"sampling": {}})
         outgoing: asyncio.Queue = asyncio.Queue()
         ctx = CtxClass(mcp=None, session=session, request_id=1, outgoing=outgoing)
@@ -161,7 +161,7 @@ def test_context_sample_mechanism():
 def test_stream_call_aclose_does_not_hang_on_blocked_tool():
     """Client disconnect (aclose) must cancel a tool still awaiting a sample reply."""
 
-    async def scenario():
+    async def scenario() -> None:
         mcp = MCP("disconnect")  # stateful → sample is allowed
 
         @mcp.tool
@@ -185,7 +185,7 @@ def test_stream_call_aclose_does_not_hang_on_blocked_tool():
 def test_terminate_cancels_pending_requests():
     """Terminating a session unblocks tools awaiting a sample/elicit reply."""
 
-    async def scenario():
+    async def scenario() -> None:
         manager = SessionManager()
         session = manager.create()
         future = asyncio.get_running_loop().create_future()

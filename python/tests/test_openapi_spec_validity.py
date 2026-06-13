@@ -30,7 +30,6 @@ from django_bolt.param_functions import Query
 from django_bolt.testing import TestClient
 from django_bolt.websocket.types import WebSocket
 
-
 # --- Fixture types covering the surface area the generator handles ---
 
 

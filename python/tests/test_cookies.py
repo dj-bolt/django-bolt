@@ -6,14 +6,17 @@ from datetime import UTC, datetime
 
 import pytest
 
-from django_bolt import JSON, Cookie, Response, StreamingResponse
+from django_bolt import JSON, BoltAPI, Cookie, Response, StreamingResponse
 from django_bolt.cookies import make_delete_cookie
 from django_bolt.responses import HTML, PlainText, Redirect
 from django_bolt.serialization import (
+    compile_response_handlers,
     serialize_html_response,
     serialize_plaintext_response,
     serialize_redirect_response,
+    serialize_response,
 )
+from django_bolt.testing import TestClient
 
 
 class TestCookieSerialization:
@@ -334,8 +337,6 @@ class TestCookieImport:
 
     def test_cookie_import(self):
         """Test that Cookie can be imported from django_bolt."""
-        from django_bolt import Cookie
-
         cookie = Cookie("test", "value")
         assert cookie.name == "test"
         assert cookie.value == "value"
@@ -347,8 +348,6 @@ class TestAsyncSerializationWithCookies:
 
     async def test_json_async_serialization_includes_cookies(self):
         """Test that JSON async serialization includes raw cookie tuples for Rust."""
-        from django_bolt.serialization import compile_response_handlers, serialize_response
-
         meta = {
             "response_type": None,
             "validate_response": False,
@@ -371,8 +370,6 @@ class TestAsyncSerializationWithCookies:
 
     async def test_response_async_serialization_includes_cookies(self):
         """Test that Response async serialization includes raw cookie tuples for Rust."""
-        from django_bolt.serialization import compile_response_handlers, serialize_response
-
         meta = {
             "response_type": None,
             "validate_response": False,
@@ -401,9 +398,6 @@ class TestCookieSecurityValidation:
 
     def test_valid_cookie_passes(self):
         """Test that valid cookies are properly serialized."""
-        from django_bolt import BoltAPI
-        from django_bolt.testing import TestClient
-
         api = BoltAPI()
 
         @api.get("/set-cookie")
@@ -414,9 +408,9 @@ class TestCookieSecurityValidation:
         response = client.get("/set-cookie")
         assert response.status_code == 200
         # Check Set-Cookie header is present
-        set_cookie = response.headers.get("set-cookie", "")
-        assert "session=" in set_cookie
-        assert "HttpOnly" in set_cookie
+        set_cookie_header = response.headers.get("set-cookie", "")
+        assert "session=" in set_cookie_header
+        assert "HttpOnly" in set_cookie_header
 
     def test_invalid_cookie_name_rejected(self):
         """Test that cookie names with injection characters are rejected.
@@ -424,9 +418,6 @@ class TestCookieSecurityValidation:
         Rust should reject cookie names containing separators like ; which
         could be used for injection attacks. A warning is logged to stderr.
         """
-        from django_bolt import BoltAPI
-        from django_bolt.testing import TestClient
-
         api = BoltAPI()
 
         @api.get("/bad-cookie-name")
@@ -447,9 +438,6 @@ class TestCookieSecurityValidation:
         Control characters like CR/LF could enable header injection attacks.
         A warning is logged to stderr.
         """
-        from django_bolt import BoltAPI
-        from django_bolt.testing import TestClient
-
         api = BoltAPI()
 
         @api.get("/bad-cookie-value")
@@ -466,9 +454,6 @@ class TestCookieSecurityValidation:
 
     def test_empty_cookie_name_rejected(self):
         """Test that empty cookie names are rejected. A warning is logged to stderr."""
-        from django_bolt import BoltAPI
-        from django_bolt.testing import TestClient
-
         api = BoltAPI()
 
         @api.get("/empty-name")
@@ -484,9 +469,6 @@ class TestCookieSecurityValidation:
 
     def test_special_chars_in_value_escaped(self):
         """Test that special characters in cookie values are properly escaped."""
-        from django_bolt import BoltAPI
-        from django_bolt.testing import TestClient
-
         api = BoltAPI()
 
         @api.get("/special-value")
@@ -502,9 +484,6 @@ class TestCookieSecurityValidation:
 
     def test_multiple_valid_cookies(self):
         """Test that multiple valid cookies all get set."""
-        from django_bolt import BoltAPI
-        from django_bolt.testing import TestClient
-
         api = BoltAPI()
 
         @api.get("/multi-cookie")
@@ -526,9 +505,6 @@ class TestCookieSecurityValidation:
         capture Rust's eprintln! from Python tests. Check server logs manually
         for: [django-bolt] WARNING: Invalid cookie name 'bad; injection'
         """
-        from django_bolt import BoltAPI
-        from django_bolt.testing import TestClient
-
         api = BoltAPI()
 
         @api.get("/mixed-cookies")

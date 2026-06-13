@@ -6,7 +6,6 @@ from django_bolt.serializers import (
     URL,
     Email,
     Meta,
-    Nested,
     NonEmptyStr,
     Percentage,
     PositiveInt,

@@ -2,8 +2,7 @@
 Tests for the status_codes module.
 """
 
-from django_bolt import status
-from django_bolt import status_codes
+from django_bolt import status, status_codes
 
 
 def test_status_alias_import():

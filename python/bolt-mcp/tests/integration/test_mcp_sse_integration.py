@@ -28,7 +28,7 @@ mount_mcp(api, mcp)
 """
 
 
-def _initialize(server):
+def _initialize(server) -> str:
     resp = server.client.post(
         server.url("/mcp"),
         content=rpc_body("initialize", INITIALIZE_PARAMS),

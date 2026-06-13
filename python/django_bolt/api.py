@@ -20,6 +20,7 @@ except ImportError:
 
 # Import local modules
 import msgspec
+from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
@@ -490,13 +491,8 @@ class BoltAPI:
            explicitly disables compression.
         3. Otherwise fall back to this `BoltAPI`'s own `_compression`.
         """
-        try:
-            from django.conf import settings as _settings
-        except Exception:
-            _settings = None
-
-        if _settings is not None and hasattr(_settings, "BOLT_COMPRESSION"):
-            bolt_compression = _settings.BOLT_COMPRESSION
+        if hasattr(django_settings, "BOLT_COMPRESSION"):
+            bolt_compression = django_settings.BOLT_COMPRESSION
             if bolt_compression is None or bolt_compression is False:
                 return None
             return bolt_compression.to_rust_config()

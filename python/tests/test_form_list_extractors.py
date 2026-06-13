@@ -10,7 +10,6 @@ list[T] Form() struct fields":
 from __future__ import annotations
 
 import inspect
-from typing import Optional
 
 import msgspec
 
@@ -20,7 +19,6 @@ from django_bolt._kwargs.extractors import (
     _is_sequence_field,
 )
 from django_bolt.datastructures import UploadFile
-
 
 # ---------------------------------------------------------------------------
 # _is_sequence_field
@@ -47,10 +45,10 @@ class TestIsSequenceField:
 
     def test_optional_list_str(self):
         """Optional[list[T]] should still be recognised after unwrapping."""
-        assert _is_sequence_field(Optional[list[str]]) is True
+        assert _is_sequence_field(list[str] | None) is True
 
     def test_optional_list_int(self):
-        assert _is_sequence_field(Optional[list[int]]) is True
+        assert _is_sequence_field(list[int] | None) is True
 
     def test_plain_str_is_not_sequence(self):
         assert _is_sequence_field(str) is False
@@ -66,10 +64,10 @@ class TestIsSequenceField:
         assert _is_sequence_field(dict[str, str]) is False
 
     def test_optional_str_is_not_sequence(self):
-        assert _is_sequence_field(Optional[str]) is False
+        assert _is_sequence_field(str | None) is False
 
     def test_optional_int_is_not_sequence(self):
-        assert _is_sequence_field(Optional[int]) is False
+        assert _is_sequence_field(int | None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +130,7 @@ class TestCollectSequenceFieldNames:
 
         class Params(msgspec.Struct):
             name: str
-            tags: Optional[list[str]] = None
+            tags: list[str] | None = None
 
         names = _collect_sequence_field_names(Params)
         assert "tags" in names
@@ -226,7 +224,7 @@ class TestCreateParamStructExtractorScalarWrapping:
 
         class Form(msgspec.Struct):
             name: str
-            tags: Optional[list[str]] = None
+            tags: list[str] | None = None
 
         extractor = self._make_extractor(Form)
         result = extractor({"name": "eve", "tags": None})
@@ -310,7 +308,7 @@ class TestCreateParamStructExtractorScalarWrapping:
 
         class Form(msgspec.Struct):
             tags: list[str] = []
-            upload: Optional[UploadFile] = None
+            upload: UploadFile | None = None
 
         extractor = self._make_extractor(Form)
         assert extractor.needs_files_map is True

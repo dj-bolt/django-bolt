@@ -1,3 +1,5 @@
+import contextlib
+
 import msgspec
 from users.api import UserMini
 from users.models import User
@@ -158,11 +160,10 @@ api.mount("/middleware", middleware_api)
 @api.websocket("/ws/room/{room_id}")
 async def websocket_room(websocket: WebSocket, room_id: str):
     await websocket.accept()
-    try:
+    # Client disconnected
+    with contextlib.suppress(Exception):
         async for message in websocket.iter_text():
             await websocket.send_text(f"[{room_id}] {message}")
-    except Exception:
-        pass  # Client disconnected
 
 
 @api.get("/users")
