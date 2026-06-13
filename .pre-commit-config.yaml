@@ -33,3 +33,16 @@ repos:
         args: [--fix]
       # Format.
       - id: ruff-format
+
+  # Rust formatting gate. System hook — needs `cargo` on PATH: contributors
+  # have it locally, and the Lint workflow installs the stable toolchain
+  # (with rustfmt) before running prek. Runs once over the whole workspace
+  # whenever any .rs file changes.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
