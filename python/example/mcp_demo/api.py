@@ -176,7 +176,11 @@ async def purge_users() -> dict:
 # in as. `issuer` must equal the public origin clients reach (it is baked into the tokens
 # and discovery documents) — change the port here if you don't run on 8000.
 class ExampleMcpAuth(AuthorizationServer):
-    issuer = "http://localhost:8000"
+    # Must equal the exact origin (scheme + host + port) the MCP client connects to —
+    # it is baked into every issued token and discovery document, and the client follows
+    # it byte-for-byte through the OAuth handshake. This demo is run with
+    # `runbolt --port 8001`, so the issuer is 127.0.0.1:8001; change it if you change either.
+    issuer = "http://127.0.0.1:8001"
 
     def get_extra_claims(self, user, *, scopes, client_id):
         # Map the signed-in Django user to the permissions the guarded tools check.
