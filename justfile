@@ -14,7 +14,7 @@ default:
 
 # Build Rust extension in release mode
 build:
-    uv run maturin develop 
+    uv run maturin develop
 
 # Build Rust extension in release mode
 build-release:

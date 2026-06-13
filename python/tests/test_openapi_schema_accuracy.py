@@ -353,10 +353,7 @@ def test_component_schema_strips_docstring_indentation():
         name: str
 
     schema = _get_response_component_schema(MultiLineStruct)
-    assert schema["description"] == (
-        "Summary line.\n\n"
-        "Continuation paragraph that explains the struct in more detail."
-    )
+    assert schema["description"] == ("Summary line.\n\nContinuation paragraph that explains the struct in more detail.")
 
 
 def test_component_schema_omits_description_when_no_docstring():

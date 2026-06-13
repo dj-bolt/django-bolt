@@ -1,7 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    ":enablePreCommit"
   ],
   "labels": [
     "dependencies"
@@ -40,6 +41,13 @@
       ],
       "groupName": "github actions",
       "automerge": true
+    },
+    {
+      "description": "Group pre-commit hooks (ruff, pre-commit-hooks)",
+      "matchManagers": [
+        "pre-commit"
+      ],
+      "groupName": "pre-commit hooks"
     },
     {
       "description": "Core framework deps - never automerge",
