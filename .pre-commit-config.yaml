@@ -18,6 +18,12 @@ repos:
       # Ensure every file ends with exactly one newline.
       - id: end-of-file-fixer
         exclude: '^python/example/(test_data|media|static)/'
+      # Validate config-file syntax (Cargo.toml, pyproject.toml, workflows, etc.).
+      - id: check-toml
+      - id: check-yaml
+      # Block accidental commits of conflict markers and private keys.
+      - id: check-merge-conflict
+      - id: detect-private-key
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: 3b3f7c3f57fe9925356faf5fe6230835138be230  # frozen: v0.15.17
