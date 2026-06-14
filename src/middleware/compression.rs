@@ -291,14 +291,20 @@ mod select_encoding_tests {
 
     #[test]
     fn missing_accept_encoding_returns_identity() {
-        assert_eq!(select_encoding(None, Some(&cfg_brotli())), ContentEncoding::Identity);
+        assert_eq!(
+            select_encoding(None, Some(&cfg_brotli())),
+            ContentEncoding::Identity
+        );
     }
 
     #[test]
     fn missing_config_returns_identity() {
         // `compression=None` on BoltAPI → AppState.global_compression_config = None.
         // Buffered middleware must not silently compress in that case.
-        assert_eq!(select_encoding(Some("br, gzip"), None), ContentEncoding::Identity);
+        assert_eq!(
+            select_encoding(Some("br, gzip"), None),
+            ContentEncoding::Identity
+        );
     }
 
     #[test]

@@ -256,7 +256,7 @@ def test_action_metadata_passed_to_route():
 
     assert deactivate_route is not None
     # Find the handler_id from routes
-    for _method, path, handler_id, handler in api._routes:
+    for _method, path, handler_id, _handler in api._routes:
         if path == "/users/{pk}/deactivate":
             meta = api._handler_meta.get(handler_id, {})
             assert meta != {}

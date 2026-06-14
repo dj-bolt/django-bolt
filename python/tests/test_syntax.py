@@ -765,8 +765,6 @@ def test_large_file_upload_with_increased_limit(api):
     The default max_upload_size is 1MB, set in middleware/compiler.py.
     Testing dynamic BOLT_MAX_UPLOAD_SIZE changes requires server restart.
     """
-    import pytest
-
     # This test is skipped because max_upload_size is now compiled at route registration time
     # and cannot be changed dynamically. To test increased limits, need to configure
     # max_upload_size in route metadata before server starts.

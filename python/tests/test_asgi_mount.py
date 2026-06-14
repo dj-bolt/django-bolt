@@ -394,7 +394,7 @@ def test_runbolt_rejects_exact_route_mount_collision():
     command = Command()
 
     routes = [("GET", "/django", 1, lambda: None)]
-    asgi_mounts = [("/django", lambda scope, receive, send: None)]
+    asgi_mounts = [("/django", lambda _scope, _receive, _send: None)]
 
     with pytest.raises(CommandError, match="exact collision"):
         command.validate_asgi_mount_conflicts(routes, asgi_mounts)
@@ -404,7 +404,7 @@ def test_runbolt_allows_prefix_overlap_without_exact_collision():
     command = Command()
 
     routes = [("GET", "/api/items", 1, lambda: None)]
-    asgi_mounts = [("/api", lambda scope, receive, send: None)]
+    asgi_mounts = [("/api", lambda _scope, _receive, _send: None)]
 
     # Exact collisions are forbidden; prefix overlap is allowed.
     command.validate_asgi_mount_conflicts(routes, asgi_mounts)

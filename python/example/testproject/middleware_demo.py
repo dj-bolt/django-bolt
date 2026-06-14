@@ -1,6 +1,7 @@
 from typing import Annotated
 
 import msgspec
+from django.conf import settings
 from django.contrib import messages  # noqa: PLC0415
 from django.contrib.auth import alogin, alogout
 from django.contrib.auth.models import User
@@ -206,7 +207,7 @@ async def middleware_demo(request: Request):
 
 @middleware_api.post("/demo")
 # @csrf_exempt
-async def middleware_demo(request: Request, test: Annotated[str, Form("test")]):
+async def middleware_demo_post(request: Request, test: Annotated[str, Form("test")]):
     """
     Demonstrates Django middleware + messages framework with Django-Bolt.
 
@@ -547,8 +548,6 @@ async def static_files_demo(request: Request):
 
     Test in browser: http://localhost:8000/middleware/static-demo
     """
-    from django.conf import settings
-
     return render(
         request,
         "static_demo.html",

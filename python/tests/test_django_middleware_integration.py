@@ -11,15 +11,23 @@ import re
 
 import msgspec
 import pytest
+from django.contrib.auth import alogin, alogout
+from django.contrib.auth.decorators import login_required
 from django.contrib.auth.middleware import AuthenticationMiddleware
+from django.contrib.auth.models import User
 from django.contrib.messages.middleware import MessageMiddleware
 from django.contrib.sessions.middleware import SessionMiddleware
+from django.core.exceptions import PermissionDenied
 from django.http import HttpResponse
 from django.middleware.common import CommonMiddleware
+from django.middleware.csrf import _does_token_match
+from django.template import RequestContext, Template
+from django.views.decorators.csrf import csrf_exempt
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, TimingMiddleware
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
+from django_bolt.responses import HTML, JSON
 from django_bolt.testing import TestClient
 
 
@@ -979,8 +987,6 @@ class TestLoginRequiredBehavior:
         When an anonymous user tries to access a protected view,
         Django should redirect to LOGIN_URL (default: /accounts/login/).
         """
-        from django.contrib.auth.decorators import login_required
-
         api = BoltAPI(
             django_middleware=[
                 "django.contrib.sessions.middleware.SessionMiddleware",
@@ -1044,8 +1050,6 @@ class TestPermissionDenied:
         When a view raises PermissionDenied, Django should return
         a 403 Forbidden response.
         """
-        from django.core.exceptions import PermissionDenied
-
         api = BoltAPI(
             django_middleware=[
                 "django.contrib.sessions.middleware.SessionMiddleware",
@@ -1169,8 +1173,6 @@ class TestCSRFMiddleware:
         Note: Django's @csrf_exempt wraps the function to expect a `request`
         parameter (Django view signature), so the handler must accept it.
         """
-        from django.views.decorators.csrf import csrf_exempt
-
         api = BoltAPI(
             django_middleware=[
                 "django.contrib.sessions.middleware.SessionMiddleware",
@@ -1239,11 +1241,6 @@ class TestCSRFMiddleware:
         This guards the middleware bridge contract: handlers/templates must see the
         same META dict that CSRF middleware uses for validation/cookie updates.
         """
-        from django.middleware.csrf import _does_token_match
-        from django.template import RequestContext, Template
-
-        from django_bolt.responses import HTML
-
         api = BoltAPI(
             django_middleware=[
                 "django.contrib.sessions.middleware.SessionMiddleware",
@@ -1472,8 +1469,6 @@ class TestHandlerCookiesWithDjangoMiddleware:
     """
 
     def test_handler_cookies_preserved_through_locale_middleware(self):
-        from django_bolt.responses import JSON
-
         api = BoltAPI(
             django_middleware=[
                 "django.middleware.locale.LocaleMiddleware",
@@ -1519,8 +1514,6 @@ class TestHandlerCookiesWithDjangoMiddleware:
             )
 
     def test_handler_cookies_preserved_with_single_django_middleware(self):
-        from django_bolt.responses import JSON
-
         api = BoltAPI(
             middleware=[DjangoMiddleware("django.middleware.common.CommonMiddleware")],
         )
@@ -1599,9 +1592,6 @@ class TestAuserSetter:
         Before fix: AttributeError: attribute 'auser' is not writable
         After fix: alogin() works correctly
         """
-        from django.contrib.auth import alogin, alogout
-        from django.contrib.auth.models import User
-
         api = BoltAPI(
             django_middleware=[
                 "django.contrib.sessions.middleware.SessionMiddleware",

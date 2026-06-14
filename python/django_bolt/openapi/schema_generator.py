@@ -1197,6 +1197,12 @@ class SchemaGenerator:
         ``oneOf`` arms with the variant name (e.g. ``PostActivity``)
         instead of the positional fallback (``#0``, ``#1``, ``#2``).
 
+        ``description`` is carried from the struct's (cleaned) ``__doc__``,
+        matching the shape ``msgspec.json.schema_components`` produces. This
+        is what ``openapi-typescript`` and similar codegen tools surface as
+        JSDoc on generated types — without it every consumer-side type loses
+        its hover-documentation.
+
         Args:
             struct_type: msgspec.Struct type.
 
@@ -1221,9 +1227,21 @@ class SchemaGenerator:
             properties[tag_field] = self._enum_values_schema([tag])
             required.append(tag_field)
 
+        # Pull `description` from the struct's *own* docstring only —
+        # `inspect.getdoc` walks the MRO and would inherit `msgspec.Struct`'s
+        # multi-page base-class docstring onto every undocumented user
+        # struct. `__dict__.get("__doc__")` returns None when the class
+        # didn't define its own, which leaves Schema.description at its
+        # default and the field is dropped from the emitted JSON.
+        # `cleandoc` strips uniform indentation so multi-line docstrings
+        # render correctly as JSDoc. Matches `msgspec.json.schema_components`
+        # behavior.
+        own_doc = struct_type.__dict__.get("__doc__")
+        description = inspect.cleandoc(own_doc) if own_doc else None
         return Schema(
             title=struct_type.__name__,
             type="object",
+            description=description,
             properties=properties,
             required=required or None,
         )

@@ -20,6 +20,7 @@ except ImportError:
 
 # Import local modules
 import msgspec
+from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
@@ -496,13 +497,8 @@ class BoltAPI:
            explicitly disables compression.
         3. Otherwise fall back to this `BoltAPI`'s own `_compression`.
         """
-        try:
-            from django.conf import settings as _settings
-        except Exception:
-            _settings = None
-
-        if _settings is not None and hasattr(_settings, "BOLT_COMPRESSION"):
-            bolt_compression = _settings.BOLT_COMPRESSION
+        if hasattr(django_settings, "BOLT_COMPRESSION"):
+            bolt_compression = django_settings.BOLT_COMPRESSION
             if bolt_compression is None or bolt_compression is False:
                 return None
             return bolt_compression.to_rust_config()
@@ -2904,6 +2900,40 @@ class BoltAPI:
             await asgi_app(django_scope, receive, django_send)
 
         self.mount_asgi(path, django_mount_wrapper)
+
+    def mount_mcp(
+        self,
+        mcp: Any,
+        path: str = "/mcp",
+        *,
+        auth: list[Any] | None = None,
+        guards: list[Any] | None = None,
+        oauth: Any | None = None,
+        expose: Any | None = None,
+    ) -> None:
+        """Serve an MCP (Model Context Protocol) server over Streamable HTTP on this API.
+
+        Registers the MCP endpoint (POST/GET/DELETE) at ``path`` (default ``/mcp``)::
+
+            from bolt_mcp import MCP
+
+            mcp = MCP("my-server")
+            api.mount_mcp(mcp, expose=[get_item])
+
+        Requires the optional ``bolt-mcp`` package. ``auth``/``guards`` enforce
+        django-bolt auth in Rust before the handler; ``oauth`` enables the OAuth 2.1
+        Resource Server flow; ``expose`` is an explicit allowlist of existing route
+        handlers to surface as tools. See :func:`bolt_mcp.mount_mcp` for details.
+        """
+        # Lazy import keeps bolt-mcp an optional dependency: django-bolt core never
+        # imports it at module load, only when mount_mcp is actually called.
+        try:
+            from bolt_mcp import mount_mcp  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "api.mount_mcp(...) requires the optional 'bolt-mcp' package. Install it with `pip install bolt-mcp`."
+            ) from exc
+        mount_mcp(self, mcp, path, auth=auth, guards=guards, oauth=oauth, expose=expose)
 
     def include_router(self, router: Router, prefix: str = "") -> None:
         """

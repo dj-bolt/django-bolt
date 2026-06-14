@@ -1,0 +1,50 @@
+[project]
+name = "bolt-mcp"
+dynamic = ["version"]  # derived from the `bolt-mcp-v*` git tag (see [tool.hatch.version])
+description = "Build MCP (Model Context Protocol) servers on django-bolt with native Streamable HTTP transport"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Farhan", email = "farhanalirazaazeemi@gmail.com" }]
+keywords = ["django", "mcp", "model-context-protocol", "django-bolt", "llm", "agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: Django",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    # bolt-mcp reads django-bolt internals (FieldDefinition, handler metadata), so it is
+    # version-coupled — keep this floor in lockstep with django-bolt releases.
+    "django-bolt>=0.8.1",
+    "msgspec>=0.20",
+    # The built-in OAuth Authorization Server (bolt_mcp.oauth) signs/validates JWTs with
+    # PyJWT. django-bolt already imports it transitively; declared here for hygiene.
+    "pyjwt>=2.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/FarhanAliRaza/django-bolt"
+Repository = "https://github.com/FarhanAliRaza/django-bolt"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+# Version comes from git tags — no hardcoded version, nothing to bump by hand.
+# `--match "bolt-mcp-v*"` restricts to this package's tags so django-bolt's `v*`
+# tags are ignored; the default tag regex strips the `bolt-mcp-` prefix
+# (bolt-mcp-v0.1.0 -> 0.1.0). Builds with no matching tag get a dev version.
+[tool.hatch.version]
+source = "vcs"
+# root = "../.." → the git repo is two levels up (python/bolt-mcp is a subdir package).
+raw-options = { root = "../..", git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "bolt-mcp-v*"] }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bolt_mcp"]
+
+[tool.uv.sources]
+django-bolt = { workspace = true }

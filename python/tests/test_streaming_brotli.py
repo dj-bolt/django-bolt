@@ -17,12 +17,12 @@ import asyncio
 
 import pytest
 
-brotli = pytest.importorskip("brotli", reason="brotli or brotlicffi package not installed")
-
 from django_bolt import BoltAPI
 from django_bolt.middleware import CompressionConfig, no_compress
 from django_bolt.responses import EventSourceResponse, StreamingResponse
 from django_bolt.testing import TestClient
+
+brotli = pytest.importorskip("brotli", reason="brotli or brotlicffi package not installed")
 
 
 def _make_text_api(chunks: list[str], *, compression=None) -> BoltAPI:

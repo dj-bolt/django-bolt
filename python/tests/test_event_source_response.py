@@ -10,7 +10,6 @@ import pytest
 from django_bolt import BoltAPI, EventSourceResponse, ServerSentEvent, format_sse_event
 from django_bolt.testing import TestClient
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Unit tests: format_sse_event
 # ═══════════════════════════════════════════════════════════════════════════

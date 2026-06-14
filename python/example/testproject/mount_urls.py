@@ -1,3 +1,5 @@
+import contextlib
+
 from django.urls import include, path
 
 from . import views
@@ -18,7 +20,5 @@ urlpatterns = [
 
 # Optional allauth URLs for mounted-Django integration testing.
 # If allauth is not installed/configured, skip silently.
-try:
+with contextlib.suppress(Exception):
     urlpatterns.append(path("allauth/", include("allauth.urls")))
-except Exception:
-    pass

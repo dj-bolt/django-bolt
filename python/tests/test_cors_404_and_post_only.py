@@ -9,9 +9,13 @@ These tests verify fixes for:
 These tests would FAIL without the fixes in handler.rs.
 """
 
+import time
+
+import jwt
 import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.auth import IsAdminUser, IsAuthenticated, JWTAuthentication
 from django_bolt.middleware import cors
 from django_bolt.testing import TestClient
 
@@ -384,8 +388,6 @@ class TestCorsOnErrorResponses:
 
         Without CORS headers, browsers block JS from reading the 401 error.
         """
-        from django_bolt.auth import IsAuthenticated, JWTAuthentication
-
         api = BoltAPI()
 
         @api.get(
@@ -421,12 +423,6 @@ class TestCorsOnErrorResponses:
         - Before: 403 response had no CORS headers
         - After:  403 response includes Access-Control-Allow-Origin
         """
-        import time
-
-        import jwt
-
-        from django_bolt.auth import IsAdminUser, JWTAuthentication
-
         api = BoltAPI()
 
         @api.get(
@@ -471,8 +467,6 @@ class TestCorsOnErrorResponses:
         """
         Test that 401 response uses route-level CORS config when available.
         """
-        from django_bolt.auth import IsAuthenticated, JWTAuthentication
-
         api = BoltAPI()
 
         @api.get(
@@ -501,12 +495,6 @@ class TestCorsOnErrorResponses:
         """
         Test that 403 response uses route-level CORS config when available.
         """
-        import time
-
-        import jwt
-
-        from django_bolt.auth import IsAdminUser, JWTAuthentication
-
         api = BoltAPI()
 
         @api.get(
@@ -548,8 +536,6 @@ class TestCorsOnErrorResponses:
         """
         Test that 401 response does NOT include CORS headers for disallowed origin.
         """
-        from django_bolt.auth import IsAuthenticated, JWTAuthentication
-
         api = BoltAPI()
 
         @api.get(

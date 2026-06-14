@@ -1,7 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    ":enablePreCommit"
   ],
   "labels": [
     "dependencies"
@@ -11,6 +12,7 @@
   ],
   "timezone": "UTC",
   "dependencyDashboard": true,
+  "automerge": false,
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": [
@@ -21,7 +23,8 @@
     {
       "description": "Group all Rust dependencies",
       "matchManagers": [
-        "cargo"
+        "cargo",
+        "rust-toolchain"
       ],
       "groupName": "rust dependencies"
     },
@@ -38,8 +41,14 @@
       "matchManagers": [
         "github-actions"
       ],
-      "groupName": "github actions",
-      "automerge": true
+      "groupName": "github actions"
+    },
+    {
+      "description": "Group pre-commit hooks (ruff, pre-commit-hooks)",
+      "matchManagers": [
+        "pre-commit"
+      ],
+      "groupName": "pre-commit hooks"
     },
     {
       "description": "Core framework deps - never automerge",
@@ -69,24 +78,6 @@
         "breaking"
       ],
       "automerge": false
-    },
-    {
-      "description": "Minor and patch can automerge (except core)",
-      "matchUpdateTypes": [
-        "minor",
-        "patch"
-      ],
-      "automerge": true,
-      "matchPackageNames": [
-        "!pyo3",
-        "!pyo3-async-runtimes",
-        "!actix-web",
-        "!actix-http",
-        "!tokio",
-        "!Django",
-        "!msgspec",
-        "!maturin"
-      ]
     }
   ]
 }

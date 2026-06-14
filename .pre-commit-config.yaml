@@ -1,0 +1,48 @@
+# Pre-commit hooks, run with prek (https://github.com/j178/prek) — a fast,
+# drop-in replacement for pre-commit that reads this same config file.
+#
+#   prek install          # enable the git pre-commit hook locally
+#   prek run --all-files   # run every hook against the whole repo
+#
+# CI runs `prek run --all-files` via .github/workflows/lint.yml.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
+    hooks:
+      # Strip trailing whitespace, but keep hard line breaks in Markdown.
+      # Exclude size-sensitive benchmark/upload fixtures (e.g. test_data/100B.txt
+      # must stay exactly 100 bytes); the .py files there are still covered by ruff.
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+        exclude: '^python/example/(test_data|media|static)/'
+      # Ensure every file ends with exactly one newline.
+      - id: end-of-file-fixer
+        exclude: '^python/example/(test_data|media|static)/'
+      # Validate config-file syntax (Cargo.toml, pyproject.toml, workflows, etc.).
+      - id: check-toml
+      - id: check-yaml
+      # Block accidental commits of conflict markers and private keys.
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 3b3f7c3f57fe9925356faf5fe6230835138be230  # frozen: v0.15.17
+    hooks:
+      # Lint (autofix what is safe). Keep before the formatter per ruff guidance.
+      - id: ruff-check
+        args: [--fix]
+      # Format.
+      - id: ruff-format
+
+  # Rust formatting gate. System hook — needs `cargo` on PATH: contributors
+  # have it locally, and the Lint workflow installs the stable toolchain
+  # (with rustfmt) before running prek. Runs once over the whole workspace
+  # whenever any .rs file changes.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
