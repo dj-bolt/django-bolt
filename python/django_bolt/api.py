@@ -496,13 +496,8 @@ class BoltAPI:
            explicitly disables compression.
         3. Otherwise fall back to this `BoltAPI`'s own `_compression`.
         """
-        try:
-            from django.conf import settings as _settings
-        except Exception:
-            _settings = None
-
-        if _settings is not None and hasattr(_settings, "BOLT_COMPRESSION"):
-            bolt_compression = _settings.BOLT_COMPRESSION
+        if django_settings is not None and hasattr(django_settings, "BOLT_COMPRESSION"):
+            bolt_compression = django_settings.BOLT_COMPRESSION
             if bolt_compression is None or bolt_compression is False:
                 return None
             return bolt_compression.to_rust_config()

@@ -8,7 +8,6 @@ Compression levels are handled automatically by Actix Web with optimized default
 from dataclasses import dataclass
 from typing import Literal
 
-
 # Static type aliases for the per-codec tuning fields. The `Literal` types
 # are checker-only: mypy/pyright will flag obvious out-of-range literals at
 # author time, but Python does not enforce them at runtime. `_check_int_range`
