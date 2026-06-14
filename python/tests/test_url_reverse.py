@@ -44,6 +44,26 @@ def _route_metas(api: BoltAPI) -> list[dict]:
     return [api._handler_meta[handler_id] for _method, _path, handler_id, _fn in api._routes]
 
 
+@pytest.fixture
+def urlconf_factory():
+    """Yield a ``_make_urlconf`` wrapper that cleans up its synthetic modules.
+
+    Each call injects a module into ``sys.modules``; without teardown those
+    accumulate for the whole session. This tracks every module it creates and
+    pops them when the test finishes.
+    """
+    created: list[str] = []
+
+    def make(api: BoltAPI) -> str:
+        name = _make_urlconf(api)
+        created.append(name)
+        return name
+
+    yield make
+    for name in created:
+        sys.modules.pop(name, None)
+
+
 # --- Pure helpers ---------------------------------------------------------
 
 
@@ -206,18 +226,18 @@ def test_explicit_action_name_is_explicit_on_unnamed_viewset():
 # --- reverse() against the contributed urlpatterns ------------------------
 
 
-def test_reverse_bare_name():
+def test_reverse_bare_name(urlconf_factory):
     api = BoltAPI()
 
     @api.get("/missions/{id}", name="get_mission")
     def get_mission(id: int):
         return {}
 
-    urlconf = _make_urlconf(api)
+    urlconf = urlconf_factory(api)
     assert django_reverse("get_mission", urlconf=urlconf, kwargs={"id": 5}) == "/missions/5"
 
 
-def test_reverse_namespaced():
+def test_reverse_namespaced(urlconf_factory):
     """A namespaced API is reversed as namespace:name, and only that way."""
     api = BoltAPI(namespace="missions")
 
@@ -225,13 +245,13 @@ def test_reverse_namespaced():
     def get_mission(id: int):
         return {}
 
-    urlconf = _make_urlconf(api)
+    urlconf = urlconf_factory(api)
     assert django_reverse("missions:get_mission", urlconf=urlconf, kwargs={"id": 5}) == "/missions/5"
     with pytest.raises(NoReverseMatch):
         django_reverse("get_mission", urlconf=urlconf, kwargs={"id": 5})
 
 
-def test_reverse_catch_all_allows_slashes():
+def test_reverse_catch_all_allows_slashes(urlconf_factory):
     """The path converter must accept slashes, matching Bolt's {*name} catch-all."""
     api = BoltAPI()
 
@@ -239,23 +259,23 @@ def test_reverse_catch_all_allows_slashes():
     def serve_file(path: str):
         return {}
 
-    urlconf = _make_urlconf(api)
+    urlconf = urlconf_factory(api)
     assert django_reverse("serve_file", urlconf=urlconf, kwargs={"path": "a/b/c.txt"}) == "/files/a/b/c.txt"
 
 
-def test_reverse_unknown_name_raises():
+def test_reverse_unknown_name_raises(urlconf_factory):
     api = BoltAPI()
 
     @api.get("/ping", name="ping")
     def ping():
         return {}
 
-    urlconf = _make_urlconf(api)
+    urlconf = urlconf_factory(api)
     with pytest.raises(NoReverseMatch):
         django_reverse("does_not_exist", urlconf=urlconf)
 
 
-def test_same_path_multiple_methods_dedupes():
+def test_same_path_multiple_methods_dedupes(urlconf_factory):
     """Two methods on one path share a name and must not collide-error."""
     api = BoltAPI()
 
@@ -267,7 +287,7 @@ def test_same_path_multiple_methods_dedupes():
     def write():
         return {}
 
-    urlconf = _make_urlconf(api)
+    urlconf = urlconf_factory(api)
     assert django_reverse("thing", urlconf=urlconf) == "/thing"
 
 
@@ -286,7 +306,7 @@ def test_duplicate_explicit_names_on_different_paths_raise():
         build_urlpatterns(api)
 
 
-def test_explicit_name_overrides_derived_collision():
+def test_explicit_name_overrides_derived_collision(urlconf_factory):
     """An explicit name wins over a derived name that resolves to the same key."""
     api = BoltAPI()
 
@@ -300,5 +320,5 @@ def test_explicit_name_overrides_derived_collision():
     def other():
         return {}
 
-    urlconf = _make_urlconf(api)
+    urlconf = urlconf_factory(api)
     assert django_reverse("thing", urlconf=urlconf) == "/explicit"
