@@ -105,6 +105,100 @@ async def get_user(user_id: int):
     return {"user_id": user_id}
 ```
 
+## URL names and reversing
+
+Bolt routes live in Rust's router, not Django's URLconf, so Django can't see them by default. Wire them up once and Django's native `reverse()`, `reverse_lazy()`, and the `{% url %}` template tag resolve Bolt route names like any other view.
+
+### Wiring it up
+
+Include `django_bolt.urls` in your project's `ROOT_URLCONF`:
+
+```python
+# urls.py
+from django.urls import include, path
+
+urlpatterns = [
+    path("", include("django_bolt.urls")),
+    # ... your other patterns
+]
+```
+
+This contributes a **reverse-only** entry for every named Bolt route. The registered views never run (Bolt still serves these paths in Rust) — they exist purely so Django can reverse the names.
+
+### Naming a route
+
+Pass `name=` to any route decorator:
+
+```python
+@api.get("/missions/{mission_id}", name="mission-detail")
+async def get_mission(mission_id: int):
+    return {"id": mission_id}
+```
+
+```python
+from django.urls import reverse
+
+reverse("mission-detail", kwargs={"mission_id": 42})  # "/missions/42"
+```
+
+```html
+{% url "mission-detail" mission_id=42 %}
+```
+
+Path converters and catch-alls come from Django's own resolver, so `args`/`kwargs`, `query`, and `fragment` all work. A Bolt `{name:path}` catch-all reverses through Django's `<path:name>` converter (accepts slashes); other `{name:type}` hints are untyped on reverse, matching the router.
+
+### Derived names
+
+If you omit `name=`, the name is the **verbatim Python identifier** — the function name for routes, the class name for class-based views — with no transformation:
+
+```python
+@api.get("/y")
+async def get_mission():   # name == "get_mission"
+    return {}
+```
+
+Reversing against a derived name that no longer exists raises Django's usual `NoReverseMatch`, so renames surface immediately. Name a route explicitly whenever you intend to reverse it.
+
+### Namespaces
+
+Namespaces are **opt-in**, like Django's `app_name`. Pass `namespace=` to a `BoltAPI` and its routes reverse as `namespace:name`:
+
+```python
+api = BoltAPI(namespace="missions")
+
+@api.get("/missions/{mission_id}", name="detail")
+async def get_mission(mission_id: int):
+    return {}
+
+reverse("missions:detail", kwargs={"mission_id": 42})  # "/missions/42"
+```
+
+A namespaced route reverses **only** under its namespace; the bare name won't resolve.
+
+### Class-based views and viewsets
+
+`view()`, `viewset()`, and `@action` all accept `name=`. A viewset names each route `{base}-{action}`:
+
+```python
+@api.viewset("/users", name="user")
+class UserViewSet(ViewSet):
+    async def list(self, request): ...           # name == "user-list"
+    async def partial_update(self, request): ...  # name == "user-partial_update"
+
+    @action(["GET"], detail=False)
+    async def recent(self, request): ...          # name == "user-recent"
+```
+
+Without `name=`, the base falls back to the verbatim class name (`UserViewSet-list`), so set `name=` on viewsets you intend to reverse.
+
+### Collisions
+
+Names are resolved when the urlpatterns are built:
+
+- Several methods on one path share a name and are deduped (no error).
+- An explicit `name=` wins over a derived name with the same key.
+- Two **explicit** names mapping to different paths raise `ImproperlyConfigured`.
+
 ## Sync handlers
 
 While async handlers are recommended, you can also use synchronous functions:
