@@ -67,7 +67,6 @@ class ActionHandler:
         self.methods = [m.upper() for m in methods]  # Normalize to uppercase
         self.detail = detail
         self.path = path or fn.__name__  # Default to function name
-        # URL-reverse suffix override. None -> derive from path (i.e. fn name).
         self.name = name
         self.auth = auth
         self.guards = guards

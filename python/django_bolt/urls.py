@@ -1,145 +1,116 @@
-"""URL reversing for Django-Bolt routes.
+"""Reverse-only URLconf for Django-Bolt routes.
 
-Bolt routes live in the Rust matchit router, not in Django's ``ROOT_URLCONF``, so
-Django's native ``reverse()`` can't see them. A synthetic urlconf built from the
-merged Bolt routes lives in ``django_bolt._bolt_urlconf`` (referenced here by
-name); Django's own resolver reverses against it, giving us converters,
-namespaces, ``args``/``kwargs``, and ``query``/``fragment`` for free.
+Bolt routes live in the Rust matchit router, not in Django's URLconf, so
+Django's ``reverse()`` can't see them. Include this module in your project's
+``ROOT_URLCONF`` to register a reverse-only entry for every named Bolt route::
 
-``reverse``/``reverse_lazy`` are the public, explicit entry points
-(``from django_bolt.urls import reverse``) and are also what the optional
-monkeypatch installs over ``django.urls.reverse`` so ``{% url %}`` resolves Bolt
-routes. When invoked that way ``urlconf`` is ``None``; we try the Bolt urlconf
-first and fall through to the original Django reverse (``ROOT_URLCONF``) on miss.
+    # urls.py
+    from django.urls import include, path
+
+    urlpatterns = [
+        path("", include("django_bolt.urls")),
+        ...
+    ]
+
+With that in place, ``django.urls.reverse``/``reverse_lazy`` and the ``{% url %}``
+template tag resolve Bolt route names natively -- converters, namespaces,
+``args``/``kwargs`` and ``query``/``fragment`` all come from Django's own
+resolver. The registered views never run (Bolt serves these paths in Rust);
+they exist solely so Django can reverse the names.
+
+Namespaces are opt-in, like Django's ``app_name``: pass ``namespace=`` to a
+``BoltAPI`` and its routes reverse as ``reverse("<namespace>:<name>")``.
 """
 
 from __future__ import annotations
 
-import importlib
-import sys
+import re
 
-import django.urls
-import django.urls.base
-from django.urls import reverse as _django_reverse
-from django.urls.exceptions import NoReverseMatch
-from django.utils.functional import lazy
+from django.core.exceptions import ImproperlyConfigured
+from django.urls import include
+from django.urls import path as _path
 
-# Importable name of the synthetic urlconf module. Passing the name (not a fresh
-# module object) lets get_resolver's lru_cache key on it and reuse the resolver.
-_BOLT_URLCONF = "django_bolt._bolt_urlconf"
+from django_bolt.management.commands.runbolt import Command as _Runbolt
 
-# Prefix a mounted Django app is served under, resolved once on first use (it's a
-# build-time constant on _bolt_urlconf). Sentinel distinguishes "not resolved yet"
-# from the resolved value ("" when there's no Django mount).
-_UNRESOLVED = object()
-_django_mount_prefix = _UNRESOLVED
-_has_bolt_routes = _UNRESOLVED
+# Bolt path params use matchit ``{name}`` syntax. Only ``{name:path}`` is special
+# (a catch-all that matches ``/``); the router ignores every other ``:type``, so we
+# map catch-alls to Django's ``path`` converter and leave the rest untyped.
+_PARAM_RE = re.compile(r"\{([^}:]+)(?::([^}]+))?\}")
 
 
-def reverse(
-    viewname,
-    urlconf=None,
-    args=None,
-    kwargs=None,
-    current_app=None,
-    *,
-    query=None,
-    fragment=None,
-):
-    """Reverse a Bolt (or Django) route name to a URL.
+def _to_django_route(bolt_path: str) -> str:
+    """Convert a Bolt path to a Django route: ``/files/{p:path}`` -> ``files/<path:p>``."""
 
-    Drop-in replacement for ``django.urls.reverse``. When ``urlconf`` is ``None``
-    (the case for ``{% url %}`` and direct calls), the Bolt urlconf is tried
-    first; on ``NoReverseMatch`` we fall through to the original Django reverse so
-    plain Django names keep working unchanged.
+    def _convert(match: re.Match) -> str:
+        name, converter = match.group(1), match.group(2)
+        return f"<path:{name}>" if converter == "path" else f"<{name}>"
 
-    Differs from Django: Bolt paths are untyped (matchit ``{x}``), so params are
-    not converter-validated - a mismatch surfaces as ``NoReverseMatch``.
+    return _PARAM_RE.sub(_convert, bolt_path).lstrip("/")
 
-    Short-circuits to plain Django when there are no Bolt routes, so the global
-    patch is a transparent no-op for projects (or tests) without a Bolt API.
+
+def _reverse_only_view(*args, **kwargs):  # pragma: no cover - never invoked
+    raise RuntimeError("django_bolt reverse-only view should never be called")
+
+
+def _iter_named_routes(api):
+    """Yield ``(namespace, name, route, explicit)`` for every named route on ``api``."""
+    routes = list(getattr(api, "_routes", []))
+    routes += [(None, path, hid, fn) for path, hid, fn in getattr(api, "_websocket_routes", [])]
+    for _method, full_path, handler_id, _fn in routes:
+        meta = api._handler_meta.get(handler_id) or {}
+        name = meta.get("name")
+        if not name:
+            continue
+        yield meta.get("namespace") or "", name, _to_django_route(full_path), bool(meta.get("name_explicit"))
+
+
+def build_urlpatterns(api) -> list:
+    """Build reverse-only ``urlpatterns`` from a (merged) BoltAPI.
+
+    Flat routes reverse by their bare name; routes whose API set a ``namespace``
+    are grouped under it and reverse as ``namespace:name``, like a Django
+    ``include`` with an ``app_name``. Identical targets (e.g. several methods on
+    one path) are deduped, an explicit name wins over a derived one, and two
+    explicit names mapping to different paths are a configuration error.
     """
-    if urlconf is None and _bolt_routes_present():
-        try:
-            return _django_reverse(
-                viewname, _BOLT_URLCONF, args, kwargs, current_app, query=query, fragment=fragment
+    # (namespace, name) -> (route, explicit). Resolve priority/collisions here.
+    chosen: dict[tuple[str, str], tuple[str, bool]] = {}
+    for namespace, name, route, explicit in _iter_named_routes(api):
+        key = (namespace, name)
+        existing = chosen.get(key)
+        if existing is None:
+            chosen[key] = (route, explicit)
+            continue
+        prev_route, prev_explicit = existing
+        if prev_route == route:
+            continue
+        if explicit and prev_explicit:
+            label = f"{namespace}:{name}" if namespace else name
+            raise ImproperlyConfigured(
+                f"Duplicate route name {label!r} maps to both {prev_route!r} and {route!r}."
             )
-        except NoReverseMatch:
-            pass  # not a Bolt route - fall through to Django's ROOT_URLCONF
-        # Django's ROOT_URLCONF is served under the Django mount prefix in a Bolt
-        # process, so prepend it. A miss raises NoReverseMatch from here as usual.
-        return _mount_prefix() + _django_reverse(
-            viewname, None, args, kwargs, current_app, query=query, fragment=fragment
-        )
-    return _django_reverse(
-        viewname, urlconf, args, kwargs, current_app, query=query, fragment=fragment
-    )
+        if explicit and not prev_explicit:
+            chosen[key] = (route, True)
+
+    flat: list = []
+    namespaced: dict[str, list] = {}
+    for (namespace, name), (route, _explicit) in chosen.items():
+        pattern = _path(route, _reverse_only_view, name=name)
+        (namespaced.setdefault(namespace, []) if namespace else flat).append(pattern)
+
+    urlpatterns = list(flat)
+    for namespace, patterns in namespaced.items():
+        urlpatterns.append(_path("", include((patterns, namespace))))
+    return urlpatterns
 
 
-reverse_lazy = lazy(reverse, str)
+def _discover_urlpatterns() -> list:
+    """Autodiscover Bolt APIs the same way ``runbolt`` does, then build their patterns."""
+    command = _Runbolt()
+    apis = command.autodiscover_apis()
+    if not apis:
+        return []
+    return build_urlpatterns(command.merge_apis(apis))
 
 
-def _bolt_routes_present() -> bool:
-    """Whether the synthetic urlconf has any Bolt routes (cached, built on first use)."""
-    global _has_bolt_routes
-    if _has_bolt_routes is _UNRESOLVED:
-        _has_bolt_routes = bool(importlib.import_module(_BOLT_URLCONF).urlpatterns)
-    return _has_bolt_routes
-
-
-def _mount_prefix() -> str:
-    """Cached prefix the mounted Django app is served under ("" if none)."""
-    global _django_mount_prefix
-    if _django_mount_prefix is _UNRESOLVED:
-        _django_mount_prefix = (
-            getattr(importlib.import_module(_BOLT_URLCONF), "django_mount_prefix", None) or ""
-        )
-    return _django_mount_prefix
-
-
-def patch_django_reverse() -> None:
-    """Install ``reverse``/``reverse_lazy`` over Django's globally.
-
-    Idempotent. Making this truly global takes three steps, because callers bind
-    ``reverse`` in different ways:
-
-    1. Repoint the canonical definition (``django.urls.base``) and the package
-       re-export (``django.urls``). The render-time ``from django.urls import
-       reverse`` inside the ``{% url %}`` tag reads the re-export, so templates
-       are covered by this alone.
-    2. Replace ``reverse_lazy`` too — Django's is ``lazy(reverse, str)`` frozen
-       around the *original* reverse, so patching reverse doesn't reach it.
-    3. Sweep ``sys.modules`` for modules that did ``from django.urls import
-       reverse``/``reverse_lazy`` at import time and froze a local copy (e.g.
-       ``django.shortcuts``). Modules imported *after* this runs pick up the
-       patched names naturally.
-
-    Our ``reverse`` keeps a reference to the original via the module-level
-    ``_django_reverse`` (captured at import, before this patch), so the
-    Bolt-miss fall-through still reaches Django — no recursion.
-    """
-    if getattr(django.urls.base.reverse, "_bolt_patched", False):
-        return  # already installed (idempotent; guards against re-capture)
-
-    original_reverse = django.urls.base.reverse
-    original_reverse_lazy = django.urls.base.reverse_lazy
-    reverse._bolt_patched = True
-
-    # 1 + 2: canonical definition, package re-export, and reverse_lazy.
-    django.urls.base.reverse = reverse
-    django.urls.reverse = reverse
-    django.urls.base.reverse_lazy = reverse_lazy
-    django.urls.reverse_lazy = reverse_lazy
-
-    # 3: repoint consumers that froze the names locally before the patch.
-    for module in list(sys.modules.values()):
-        mod_name = getattr(module, "__name__", "") or ""
-        if module is None or mod_name.startswith(("django.urls", "django_bolt.urls")):
-            continue  # skip the source modules and our own (preserves _django_reverse)
-        if getattr(module, "reverse", None) is original_reverse:
-            module.reverse = reverse
-        if getattr(module, "reverse_lazy", None) is original_reverse_lazy:
-            module.reverse_lazy = reverse_lazy
-
-
-__all__ = ["reverse", "reverse_lazy", "patch_django_reverse"]
+urlpatterns = _discover_urlpatterns()

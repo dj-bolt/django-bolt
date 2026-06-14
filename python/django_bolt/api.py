@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import dis
 import inspect
-import re
 import sys
 import threading
 from collections.abc import Callable
@@ -25,7 +24,6 @@ from django.core.asgi import get_asgi_application
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
 from django.utils.functional import SimpleLazyObject
-from django.utils.text import slugify
 
 from . import _json
 from ._kwargs import (
@@ -80,6 +78,7 @@ from .serialization import (
 )
 from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata, HandlerPattern
+from .utils import slugify_route_name
 from .views import APIView, ViewSet
 from .websocket import mark_websocket_handler
 
@@ -113,24 +112,6 @@ def _normalize_path(path: str, trailing_slash: str = "strip") -> str:
         return path if path.endswith("/") else path + "/"
     else:  # "keep"
         return path
-
-
-# Names are sluggified to follow Django convention.
-# TODO: determine if this convention is more confusing than just resolving to regular snake-cased names...
-_CAMEL_RE_1 = re.compile(r"(.)([A-Z][a-z]+)")
-_CAMEL_RE_2 = re.compile(r"([a-z0-9])([A-Z])")
-
-def _slugify_route_name(value: str) -> str:
-    """Normalize a route name to a Django-style slug (CamelCase split first)."""
-    snaked = _CAMEL_RE_2.sub(r"\1_\2", _CAMEL_RE_1.sub(r"\1_\2", value))
-    return slugify(snaked.replace("_", "-"))
-
-
-def _route_namespace(fn: Callable) -> str:
-    """Derive the URL-reverse namespace for a handler from its module."""
-    module = getattr(fn, "__module__", "") or ""
-    top = module.split(".", 1)[0]
-    return _slugify_route_name(top)
 
 
 def _normalize_mount_prefix(path: str) -> str:
@@ -327,6 +308,7 @@ class BoltAPI:
         self,
         prefix: str = "",
         trailing_slash: str = "strip",
+        namespace: str | None = None,
         middleware: list[Any] | None = None,
         django_middleware: bool | list[str] | dict[str, Any] | None = None,
         enable_logging: bool = True,
@@ -345,6 +327,9 @@ class BoltAPI:
                 - "strip": Remove trailing slashes (default, cleaner URLs)
                 - "append": Add trailing slashes (Django convention)
                 - "keep": No normalization, keep as registered
+            namespace: Optional reverse namespace for this API's routes. When set,
+                routes reverse as ``reverse("<namespace>:<name>")`` (opt-in, like a
+                Django ``app_name``); when None they reverse by their bare name.
             middleware: List of Bolt middleware classes (Django-style) or
                 DjangoMiddleware/DjangoMiddlewareStack wrappers
             django_middleware: Django middleware configuration. Can be:
@@ -374,6 +359,7 @@ class BoltAPI:
         self._next_handler_id = 0
         self.prefix = prefix.rstrip("/")  # Remove trailing slash from prefix
         self.trailing_slash = trailing_slash  # Mode: "strip", "append", or "keep"
+        self.namespace = namespace  # Opt-in reverse namespace; see django_bolt.urls
         self._validate_response_default = validate_response
 
         # Build middleware list: Django middleware first, then custom middleware
@@ -798,9 +784,9 @@ class BoltAPI:
             meta["is_websocket"] = True
 
             # URL-reverse identity, same scheme as HTTP routes (see _route_decorator).
-            meta["name"] = _slugify_route_name(name if name is not None else fn.__name__)
+            meta["name"] = name if name is not None else slugify_route_name(fn.__name__)
             meta["name_explicit"] = name is not None
-            meta["namespace"] = _route_namespace(fn)
+            meta["namespace"] = self.namespace or ""
 
             # Compile optimized argument injector (same as HTTP handlers)
             injector = self._compile_argument_injector(meta)
@@ -927,13 +913,15 @@ class BoltAPI:
                 if merged_validate_response is None and hasattr(handler, "__bolt_validate_response__"):
                     merged_validate_response = handler.__bolt_validate_response__
 
-                # A view's methods all share one path, so the name applies to each;
-                # when unnamed, fall back to the view class name. namespace and
-                # name_explicit are resolved inside _route_decorator.
+                # A view's methods all share one path, so the name applies to each.
+                # When unnamed, derive from the class name (slugified) and mark it
+                # non-explicit so it can't collide-error with an explicit route.
+                view_name = name if name is not None else slugify_route_name(view_cls.__name__)
                 route_decorator = self._route_decorator(
                     method_upper,
                     path,
-                    name=name if name is not None else view_cls.__name__,
+                    name=view_name,
+                    _name_explicit=name is not None,
                     response_model=_RESPONSE_MODEL_UNSET,  # Use method's return annotation
                     status_code=merged_status_code,
                     validate_response=merged_validate_response,
@@ -1018,9 +1006,9 @@ class BoltAPI:
             if actual_lookup_field == "pk" and hasattr(viewset_cls, "lookup_field"):
                 actual_lookup_field = viewset_cls.lookup_field
 
-            # Reverse-name base for all generated routes; falls back to the class
-            # name when no base name was given.
-            vs_base = name or viewset_cls.__name__
+            # Reverse-name base for all generated routes. An explicit name is kept
+            # verbatim; the class-name fallback is slugified.
+            vs_base = name if name is not None else slugify_route_name(viewset_cls.__name__)
 
             # Define standard action mappings with HTTP-compliant status codes
             # Format: action_name: (method, path, default_status_code)
@@ -1108,12 +1096,12 @@ class BoltAPI:
                 ):
                     handler = paginate(viewset_cls.pagination_class)(handler)
 
-                # Derive route name from the viewset base + action suffix
-                # (e.g. "user-list", "user-retrieve"). Always derived.
-                route_name = f"{vs_base}-{action_name}"
+                # Derive route name from the viewset base + slugified action suffix
+                # (e.g. "user-list", "user-retrieve", "user-partial-update").
+                route_name = f"{vs_base}-{slugify_route_name(action_name)}"
 
-                # Register the route. Generated names are non-explicit so they
-                # don't shadow or collide-error with explicitly named routes.
+                # Generated names are non-explicit so they don't shadow or
+                # collide-error with explicitly named routes.
                 route_decorator = self._route_decorator(
                     http_method,
                     route_path,
@@ -1278,13 +1266,12 @@ class BoltAPI:
                         attr.validate_response if attr.validate_response is not None else class_validate_response
                     )
 
-                    # Derive the action's reverse name: base + suffix. The suffix is
-                    # the @action name override (explicit) or the function name
-                    # (derived). attr.path is the URL segment, not a name source.
-                    action_suffix = attr.name or unbound_fn.__name__
+                    # Derive the action's reverse name: base + suffix. An explicit
+                    # @action(name=...) suffix is verbatim; the function-name fallback
+                    # is slugified. attr.path is the URL segment, not a name source.
+                    action_suffix = attr.name if attr.name is not None else slugify_route_name(unbound_fn.__name__)
                     action_route_name = f"{base_name}-{action_suffix}" if base_name else action_suffix
 
-                    # Register using existing route decorator
                     decorator = self._route_decorator(
                         http_method,
                         action_path,
@@ -1353,10 +1340,12 @@ class BoltAPI:
             # Store sync/async metadata
             meta["is_async"] = is_async
 
-            # URL-reverse identity - handles explicit naming peiority and bolt's module-based namespace
-            meta["name"] = _slugify_route_name(name if name is not None else fn.__name__)
+            # URL-reverse identity. A provided name is used verbatim (callers slugify
+            # any framework-derived tokens before passing them in); only the bare
+            # fn-name fallback is slugified here. namespace is opt-in per BoltAPI.
+            meta["name"] = name if name is not None else slugify_route_name(fn.__name__)
             meta["name_explicit"] = name is not None and _name_explicit
-            meta["namespace"] = _route_namespace(fn)
+            meta["namespace"] = self.namespace or ""
 
             # Detect csrf_exempt for Django CSRF middleware support
             # Django's @csrf_exempt decorator sets handler.csrf_exempt = True
@@ -2913,11 +2902,6 @@ class BoltAPI:
                 await send(rewritten)
 
             await asgi_app(django_scope, receive, django_send)
-
-        # Mark the wrapper so tooling (e.g. route listing) and prefix-aware URL
-        # reversing can detect Django-backed mounts and recover their behavior.
-        django_mount_wrapper._bolt_django_mount = True
-        django_mount_wrapper._bolt_django_clear_root_path = clear_root_path
 
         self.mount_asgi(path, django_mount_wrapper)
 
