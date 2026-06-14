@@ -86,9 +86,7 @@ def build_urlpatterns(api) -> list:
             continue
         if explicit and prev_explicit:
             label = f"{namespace}:{name}" if namespace else name
-            raise ImproperlyConfigured(
-                f"Duplicate route name {label!r} maps to both {prev_route!r} and {route!r}."
-            )
+            raise ImproperlyConfigured(f"Duplicate route name {label!r} maps to both {prev_route!r} and {route!r}.")
         if explicit and not prev_explicit:
             chosen[key] = (route, True)
 

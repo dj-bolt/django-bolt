@@ -119,9 +119,7 @@ def test_buffered_brotli_wire_bytes_smaller_than_plaintext(make_server_project):
 def test_buffered_below_minimum_size_passes_through_uncompressed(make_server_project):
     """`/tiny` is well below the configured 1000-byte threshold and must
     leave the server uncompressed."""
-    project = _make_buffered_project(
-        make_server_project, backend="brotli", minimum_size=1000
-    )
+    project = _make_buffered_project(make_server_project, backend="brotli", minimum_size=1000)
     with project.start(startup_path="/health") as server:
         resp = server.get("/tiny", headers={"Accept-Encoding": "br"})
 
@@ -132,9 +130,7 @@ def test_buffered_below_minimum_size_passes_through_uncompressed(make_server_pro
 
 def test_buffered_above_minimum_size_is_compressed(make_server_project):
     """Same config compresses the larger `/data` route above the threshold."""
-    project = _make_buffered_project(
-        make_server_project, backend="brotli", minimum_size=1000
-    )
+    project = _make_buffered_project(make_server_project, backend="brotli", minimum_size=1000)
     with project.start(startup_path="/health") as server:
         resp = server.get("/data", headers={"Accept-Encoding": "br"})
 
@@ -149,9 +145,7 @@ def test_buffered_above_minimum_size_is_compressed(make_server_project):
 def test_buffered_gzip_fallback_when_backend_not_accepted(make_server_project):
     """Configured backend is brotli but client only accepts gzip → server
     falls back to gzip rather than sending identity."""
-    project = _make_buffered_project(
-        make_server_project, backend="brotli", gzip_fallback=True
-    )
+    project = _make_buffered_project(make_server_project, backend="brotli", gzip_fallback=True)
     with project.start(startup_path="/health") as server:
         resp = server.get("/data", headers={"Accept-Encoding": "gzip"})
 
@@ -163,9 +157,7 @@ def test_buffered_gzip_fallback_when_backend_not_accepted(make_server_project):
 def test_buffered_no_match_no_fallback_passes_through(make_server_project):
     """Client accepts only an unsupported coding and `gzip_fallback=False`
     → server returns identity."""
-    project = _make_buffered_project(
-        make_server_project, backend="brotli", gzip_fallback=False
-    )
+    project = _make_buffered_project(make_server_project, backend="brotli", gzip_fallback=False)
     with project.start(startup_path="/health") as server:
         resp = server.get("/data", headers={"Accept-Encoding": "deflate"})
 
@@ -189,9 +181,7 @@ def test_brotli_level_and_lgwin_extreme_values_roundtrip(make_server_project):
     """Brotli at max quality (11) and minimum sliding window (lgwin=10):
     both tuning knobs flow through and the encoder still produces a body
     that decodes back to the original JSON."""
-    project = _make_buffered_project(
-        make_server_project, backend="brotli", brotli_level=11, brotli_lgwin=10
-    )
+    project = _make_buffered_project(make_server_project, backend="brotli", brotli_level=11, brotli_lgwin=10)
     with project.start(startup_path="/health") as server:
         resp = server.get("/data", headers={"Accept-Encoding": "br"})
 
@@ -204,9 +194,7 @@ def test_brotli_level_and_lgwin_extreme_values_roundtrip(make_server_project):
 
 def test_gzip_level_extreme_value_roundtrip(make_server_project):
     """Gzip at max compression (level=9) flows through and roundtrips."""
-    project = _make_buffered_project(
-        make_server_project, backend="gzip", gzip_level=9
-    )
+    project = _make_buffered_project(make_server_project, backend="gzip", gzip_level=9)
     with project.start(startup_path="/health") as server:
         resp = server.get("/data", headers={"Accept-Encoding": "gzip"})
 
@@ -222,9 +210,7 @@ def test_zstd_level_extreme_value_roundtrip(make_server_project):
     roundtrips. Guards against the level being silently clamped or dropped
     by the Python→Rust dict parsing."""
     pytest.importorskip("zstandard", reason="zstandard package not installed")
-    project = _make_buffered_project(
-        make_server_project, backend="zstd", zstd_level=22
-    )
+    project = _make_buffered_project(make_server_project, backend="zstd", zstd_level=22)
     with project.start(startup_path="/health") as server:
         resp = server.get("/data", headers={"Accept-Encoding": "zstd"})
 
@@ -276,10 +262,9 @@ def test_buffered_and_sse_share_one_compression_config(make_server_project):
     assert ev.headers.get("content-encoding", "").lower() == "br"
     decoded = ev.content
     for i in range(3):
-        assert (
-            f'data: {{"i": {i}}}\n\n'.encode() in decoded
-            or f'data: {{"i":{i}}}\n\n'.encode() in decoded
-        ), f"event i={i} not found in decoded SSE stream"
+        assert f'data: {{"i": {i}}}\n\n'.encode() in decoded or f'data: {{"i":{i}}}\n\n'.encode() in decoded, (
+            f"event i={i} not found in decoded SSE stream"
+        )
 
 
 # ─── RFC 7231 §5.3.4 Accept-Encoding negotiation ────────────────────────

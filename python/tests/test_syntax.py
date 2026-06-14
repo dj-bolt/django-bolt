@@ -20,12 +20,12 @@ from django_bolt.testing import TestClient
 def api():
     """
     Create and return a BoltAPI instance configured with a comprehensive set of test routes.
-    
+
     The returned API registers routes that exercise parameter binding (path, query, header, cookie, form, file),
     response typing and conversion (plain text, bytes, JSON, HTML, file, redirect), streaming (sync and async generators,
     SSE, typed async iterables), error handling, method handling (HEAD/OPTIONS), multipart uploads with size limits,
     CORS behavior, and response model validation/coercion.
-    
+
     Returns:
         api (BoltAPI): A BoltAPI configured with the test endpoints used throughout the test suite.
     """
@@ -274,10 +274,10 @@ def api():
     async def form_struct(data: Annotated[FormDataStruct, Form()]):
         """
         Return selected fields extracted from the parsed form data.
-        
+
         Parameters:
             data (FormDataStruct): Parsed form data populated from the request body via Form().
-        
+
         Returns:
             dict: A dictionary with keys `username`, `age`, and `active` taken from `data`.
         """
@@ -294,13 +294,13 @@ def api():
     async def form_with_list(data: Annotated[FormDataWithList, Form()]):
         """
         Handle a multipart or urlencoded form that may contain repeated keys for list fields.
-        
+
         Parameters:
             data (FormDataWithList): Parsed form data with fields:
                 - name (str): Username or identifier from the form.
                 - tags (list[str]): Zero-or-more tag values collected from repeated `tags` keys; defaults to an empty list when absent.
                 - counts (list[int]): Zero-or-more integer values collected from repeated `counts` keys; defaults to an empty list when absent.
-        
+
         Returns:
             dict: A dictionary with keys `"name"`, `"tags"`, and `"counts"` containing the parsed values.
         """

@@ -236,15 +236,15 @@ def _collect_struct_errors(
 ) -> list[dict[str, Any]]:
     """
     Collect validation errors for every field of a msgspec struct from the provided input mapping.
-    
+
     Validate each field of `struct_type` against `data` and return a list of error objects describing either per-field validation failures or missing required fields/files. This function treats form fields as body-located errors when `param_type` is "form field" and, when `has_files` is True, enables upload-file decoding for validation.
-    
+
     Parameters:
         struct_type (type): The msgspec struct/serializer type whose fields to validate.
         data (dict[str, Any]): The input mapping of encoded field names to values.
         param_type (str): The parameter source name used in error locations (e.g., "query", "cookie", "form field").
         has_files (bool): Enable upload-file decoding hooks when True.
-    
+
     Returns:
         list[dict[str, Any]]: A list of error dictionaries. Each dictionary contains:
             - "type": one of "validation_error", "missing_field", or "file_missing".
@@ -288,12 +288,12 @@ _SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
 def _is_sequence_field(field_type: Any) -> bool:
     """
     Determine whether a type annotation represents a sequence container (list, set, frozenset, or tuple).
-    
+
     Unwraps Optional[...] before checking the underlying origin.
-    
+
     Parameters:
         field_type (Any): The type annotation to inspect.
-    
+
     Returns:
         bool: `True` if the (unwrapped) annotation's origin is one of list, set, frozenset, or tuple; `False` otherwise.
     """
@@ -304,10 +304,10 @@ def _is_sequence_field(field_type: Any) -> bool:
 def _collect_sequence_field_names(struct_type: type) -> tuple[str, ...]:
     """
     Identify encoded (wire-side) field names for struct fields whose annotated type is a sequence.
-    
+
     Used at extractor registration time so callers can precompute which incoming keys should be wrapped
     as single-element lists when the wire value is a scalar.
-    
+
     Returns:
         tuple[str, ...]: Encoded field names (using `encode_name` when present, otherwise the field name)
         whose target type is a sequence (list/set/tuple/frozenset).
@@ -322,18 +322,18 @@ def _collect_sequence_field_names(struct_type: type) -> tuple[str, ...]:
 def _create_param_struct_extractor(struct_type: type, default: Any, param_type: str) -> Callable:
     """
     Create an extractor that builds and validates a msgspec Struct/Serializer from parameter data.
-    
+
     The returned callable accepts parameter maps (and, when the struct has upload-file fields, an optional files map), converts the incoming values into an instance of `struct_type`, and performs validation. On validation failures the extractor raises RequestValidationError containing collected per-field errors. When the struct contains upload-file fields the extractor will also append created UploadFile instances to `files_map["_upload_files"]` for downstream cleanup.
-    
+
     Behavioral notes:
     - Sequence-typed struct fields (e.g., list[T], tuple[T, ...], set[T]) accept single scalar wire values: scalars are wrapped into one-element lists before conversion.
     - The returned callable has an attribute `needs_files_map` set to True when upload-file fields are present (callable signature: (param_map, files_map | None) -> struct) and False otherwise (callable signature: (param_map) -> struct).
-    
+
     Parameters:
         struct_type (type): msgspec struct/serializer type to produce.
         default (Any): Reserved for optional-struct support; not used by the extractor itself.
         param_type (str): Human-readable parameter source name used in error locations (e.g., "query parameter", "form field", "cookie").
-    
+
     Returns:
         Callable: An extractor function that produces a validated instance of `struct_type` from incoming parameter data and raises RequestValidationError on validation errors.
     """
@@ -348,14 +348,14 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
         def extract_with_files(param_map: dict[str, Any], files_map: dict[str, Any] | None = None) -> Any:
             """
             Builds and returns a msgspec struct by merging parameter values with uploaded-file data and converting them into the target struct type.
-            
+
             Parameters:
                 param_map (dict[str, Any]): Mapping of parameter names to their wire values (e.g., form/query/cookie fields).
                 files_map (dict[str, Any] | None): Optional mapping of file field names to uploaded-file info; a list of created UploadFile instances will be appended to `files_map["_upload_files"]`.
-            
+
             Returns:
                 The converted instance of the pre-registered msgspec struct type.
-            
+
             Raises:
                 RequestValidationError: When validation errors are collected from the struct conversion (reported as structured errors).
                 msgspec.ValidationError: Re-raised when conversion fails but no structured errors were collected.
@@ -400,13 +400,13 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
         def extract(param_map: dict[str, Any]) -> Any:
             """
             Convert a mapping of encoded parameter names to values into an instance of the target struct, wrapping scalar values into single-element lists for precomputed sequence fields.
-            
+
             Parameters:
                 param_map (dict[str, Any]): Mapping of encoded field names (as received from the request source) to their wire values.
-            
+
             Returns:
                 Any: An instance of the pre-bound `struct_type` produced by msgspec.convert.
-            
+
             Raises:
                 RequestValidationError: If msgspec conversion fails and detailed per-field errors are collected.
                 msgspec.ValidationError: If msgspec conversion fails but no per-field errors were produced.

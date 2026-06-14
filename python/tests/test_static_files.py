@@ -211,6 +211,7 @@ class TestFindStaticFile:
         assert_path_rejected("C:temp/file.txt")
         assert_path_rejected("\\\\server\\share\\file.txt")
 
+
 class TestStaticFileServing:
     """Tests for static file serving via the test client."""
 

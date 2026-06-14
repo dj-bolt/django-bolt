@@ -173,6 +173,7 @@ def test_streaming_response_rejects_removed_compress_kwarg():
     """Passing `compress=` raises `TypeError` — the kwarg was removed in
     favor of the `CompressionConfig`/`@no_compress` model.
     """
+
     async def gen():
         yield "x"
 
