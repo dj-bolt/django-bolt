@@ -532,7 +532,7 @@ class TestAnalyzeDependencyTree:
 
     def test_no_dep_fields_produces_no_needs(self):
         meta = {"fields": []}
-        needs = analyze_dependency_tree(meta, lambda fn: {})
+        needs = analyze_dependency_tree(meta, lambda _fn: {})
         assert needs == DependencyNeeds()
 
     def test_dep_reading_request_query_marks_query(self):

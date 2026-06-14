@@ -6,11 +6,13 @@ import asyncio
 from typing import Annotated
 
 import msgspec
+from django.core.files.base import File as DjangoFile
 
 from django_bolt import BoltAPI, UploadFile
 from django_bolt.datastructures import UploadFile as UploadFileClass
 from django_bolt.params import File, Form
 from django_bolt.testing import TestClient
+from tests.test_models import Document
 
 
 # Define structs at module level to avoid NameError with get_type_hints
@@ -165,9 +167,7 @@ class TestUploadFileClass:
         django_file = upload.file
 
         # Check it's a Django File
-        from django.core.files.base import File
-
-        assert isinstance(django_file, File)
+        assert isinstance(django_file, DjangoFile)
         assert django_file.name == "document.pdf"
         assert django_file.read() == b"fake pdf content"
 
@@ -755,8 +755,6 @@ class TestDjangoFileFieldIntegration:
 
     def test_save_to_filefield(self, django_db_setup, db, tmp_path, settings):
         """Test saving uploaded file to Django FileField."""
-        from tests.test_models import Document
-
         # Configure media root to temp directory
         settings.MEDIA_ROOT = str(tmp_path)
 
@@ -797,8 +795,6 @@ class TestDjangoFileFieldIntegration:
 
     def test_save_to_filefield_async(self, django_db_setup, db, tmp_path, settings):
         """Test saving uploaded file to Django FileField in async handler."""
-        from tests.test_models import Document
-
         settings.MEDIA_ROOT = str(tmp_path)
 
         api = BoltAPI()
@@ -836,8 +832,6 @@ class TestDjangoFileFieldIntegration:
 
     def test_direct_assign_to_filefield(self, django_db_setup, db, tmp_path, settings):
         """Test directly assigning UploadFile.file to a FileField (no .save() on field)."""
-        from tests.test_models import Document
-
         settings.MEDIA_ROOT = str(tmp_path)
 
         api = BoltAPI()
@@ -877,8 +871,6 @@ class TestDjangoFileFieldIntegration:
 
     def test_direct_assign_to_filefield_async(self, django_db_setup, db, tmp_path, settings):
         """Test directly assigning UploadFile.file to a FileField in async handler."""
-        from tests.test_models import Document
-
         settings.MEDIA_ROOT = str(tmp_path)
 
         api = BoltAPI()

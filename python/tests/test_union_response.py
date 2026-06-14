@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Optional, Union
 
 import msgspec
-import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.openapi.config import OpenAPIConfig
+from django_bolt.openapi.schema_generator import SchemaGenerator
+from django_bolt.responses import EventSourceResponse
 from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
 
@@ -136,8 +137,6 @@ def test_inline_path_204_with_none_returns_empty_body():
 
 def test_inline_path_struct_with_response_class_sse():
     """response_class=EventSourceResponse must not be shadowed by the struct inline path."""
-    from django_bolt.responses import EventSourceResponse
-
     api = BoltAPI()
 
     @api.get("/events", response_class=EventSourceResponse, response_model=Tagged)
@@ -218,7 +217,6 @@ def test_tagged_union_emits_per_arm_examples_in_openapi():
     first arm and hides the discriminator semantics. Per-arm examples surface
     each variant with its tag value.
     """
-    from django_bolt.openapi.config import OpenAPIConfig
 
     class Cat(msgspec.Struct, tag=True):
         name: str
@@ -233,8 +231,6 @@ def test_tagged_union_emits_per_arm_examples_in_openapi():
     @api.get("/pet", response_model=Cat | Dog)
     async def get_pet():
         return Cat(name="x")
-
-    from django_bolt.openapi.schema_generator import SchemaGenerator
 
     schema = SchemaGenerator(api, api._openapi_config).generate().to_schema()
     media = schema["paths"]["/pet"]["get"]["responses"]["200"]["content"]["application/json"]
@@ -259,8 +255,6 @@ def test_list_of_tagged_union_omits_per_arm_examples():
     heterogeneous example array with one of each arm — the truthful
     shape — so we just stay out of its way.
     """
-    from django_bolt.openapi.config import OpenAPIConfig
-    from django_bolt.openapi.schema_generator import SchemaGenerator
 
     class Cat(msgspec.Struct, tag=True):
         name: str

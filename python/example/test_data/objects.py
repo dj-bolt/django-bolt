@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
-from enum import Enum
+from enum import StrEnum
 
 import pydantic
 
 
-class Species(str, Enum):
+class Species(StrEnum):
     DOG = "Dog"
     CAT = "Cat"
     MONKEY = "Monkey"

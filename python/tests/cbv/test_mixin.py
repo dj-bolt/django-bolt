@@ -1,6 +1,7 @@
 import pytest
 
 from django_bolt import BoltAPI, ModelViewSet, ViewSet
+from django_bolt._view_context import _current_request
 from django_bolt.pagination import PageNumberPagination, paginate
 from django_bolt.serializers import Serializer, field_validator
 from django_bolt.testing import TestClient
@@ -466,8 +467,6 @@ async def test_get_object_without_request_raises_clear_error():
 @pytest.mark.asyncio
 @pytest.mark.django_db(transaction=True)
 async def test_get_object_reads_request_from_context_var():
-    from django_bolt._view_context import _current_request
-
     article = await Article.objects.acreate(title="Keyword Lookup", content="Content", author="Author 1")
 
     class ArticleViewSet(ViewSet):

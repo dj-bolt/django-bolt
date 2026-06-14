@@ -254,7 +254,9 @@ pub fn create_test_app(
     };
 
     let global_compression_config = match compression_config {
-        Some(d) => Some(Arc::new(crate::metadata::CompressionConfig::from_python_dict(d.as_any())?)),
+        Some(d) => Some(Arc::new(
+            crate::metadata::CompressionConfig::from_python_dict(d.as_any())?,
+        )),
         None => None,
     };
 

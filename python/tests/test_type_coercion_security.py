@@ -806,8 +806,6 @@ class TestDecimalEdgeCases:
         assert response.status_code == 200
         data = response.json()
         # Decimal may be returned in scientific notation (1E-8) or fixed (0.00000001)
-        from decimal import Decimal
-
         returned = Decimal(data["value"])
         expected = Decimal("0.00000001")
         assert returned == expected, f"Expected {expected}, got {returned}"

@@ -31,8 +31,7 @@ from django_bolt.middleware import cors, rate_limit, skip_middleware
 from django_bolt.params import Body, Cookie, Depends, Header, Path, Query
 from django_bolt.responses import StreamingResponse
 from django_bolt.testing import TestClient
-from django_bolt.views import APIView, ModelViewSet, ViewSet
-from tests.test_models import Article
+from django_bolt.views import APIView, ViewSet
 
 # --- Fixtures ---
 
@@ -125,15 +124,6 @@ def test_query_parameter_validation(api):
         assert response.status_code == 200
         assert response.json()["page"] == 1
         assert response.json()["limit"] == 50
-
-        # TODO: Enable when constraint validation is implemented
-        # # Invalid: page < 1
-        # response = client.get("/search?page=0")
-        # assert response.status_code == 400
-
-        # # Invalid: limit > 100
-        # response = client.get("/search?limit=200")
-        # assert response.status_code == 400
 
 
 def test_path_parameter_validation(api):

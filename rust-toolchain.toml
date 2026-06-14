@@ -1,0 +1,8 @@
+# Pin the Rust toolchain so local builds, CI, and the `cargo fmt` gate all use
+# one version — no rustfmt drift between contributors and CI. rustup reads this
+# automatically for every cargo/rustfmt invocation in the repo. Renovate keeps
+# the channel current via its built-in rust-toolchain manager.
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+components = ["rustfmt"]

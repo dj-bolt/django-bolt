@@ -82,7 +82,9 @@ pub fn select_stream_encoding(
         }
     }
     if cfg.gzip_fallback && accepts_encoding(ae, "gzip") {
-        return Some(StreamCodec::Gzip { level: cfg.gzip_level });
+        return Some(StreamCodec::Gzip {
+            level: cfg.gzip_level,
+        });
     }
     None
 }
@@ -93,8 +95,12 @@ fn codec_for_backend(backend: &str, cfg: &CompressionConfig) -> Option<StreamCod
             quality: cfg.brotli_level,
             lgwin: cfg.brotli_lgwin,
         }),
-        "gzip" => Some(StreamCodec::Gzip { level: cfg.gzip_level }),
-        "zstd" => Some(StreamCodec::Zstd { level: cfg.zstd_level }),
+        "gzip" => Some(StreamCodec::Gzip {
+            level: cfg.gzip_level,
+        }),
+        "zstd" => Some(StreamCodec::Zstd {
+            level: cfg.zstd_level,
+        }),
         _ => None,
     }
 }
@@ -172,7 +178,9 @@ struct SinkWriter {
 
 impl SinkWriter {
     fn new() -> Self {
-        SinkWriter { buf: Vec::with_capacity(SINK_BUF_CAPACITY) }
+        SinkWriter {
+            buf: Vec::with_capacity(SINK_BUF_CAPACITY),
+        }
     }
 
     /// Yield the current buffer, leaving a fresh 4 KiB-capacity `Vec` in place.
@@ -386,8 +394,10 @@ mod tests {
     use std::io::Read;
 
     async fn collect_compressed(codec: StreamCodec, events: Vec<&'static [u8]>) -> Vec<Bytes> {
-        let items: Vec<Result<Bytes, std::io::Error>> =
-            events.into_iter().map(|b| Ok(Bytes::from_static(b))).collect();
+        let items: Vec<Result<Bytes, std::io::Error>> = events
+            .into_iter()
+            .map(|b| Ok(Bytes::from_static(b)))
+            .collect();
         let inner = stream::iter(items);
         let mut wrapped = EncoderStream::new(inner, codec);
         let mut out = Vec::new();
@@ -410,32 +420,53 @@ mod tests {
     #[tokio::test]
     async fn brotli_roundtrip_decodes_to_concatenated_input() {
         let chunks = collect_compressed(
-            StreamCodec::Brotli { quality: 5, lgwin: 18 },
+            StreamCodec::Brotli {
+                quality: 5,
+                lgwin: 18,
+            },
             vec![b"data: one\n\n", b"data: two\n\n", b"data: three\n\n"],
         )
         .await;
         let compressed = concat(&chunks);
         let mut decoded = Vec::new();
-        Decompressor::new(&compressed[..], 4096).read_to_end(&mut decoded).unwrap();
+        Decompressor::new(&compressed[..], 4096)
+            .read_to_end(&mut decoded)
+            .unwrap();
         assert_eq!(decoded, b"data: one\n\ndata: two\n\ndata: three\n\n");
     }
 
     #[tokio::test]
     async fn brotli_emits_per_event_chunks() {
         let chunks = collect_compressed(
-            StreamCodec::Brotli { quality: 5, lgwin: 18 },
+            StreamCodec::Brotli {
+                quality: 5,
+                lgwin: 18,
+            },
             vec![b"data: one\n\n", b"data: two\n\n", b"data: three\n\n"],
         )
         .await;
-        assert!(chunks.len() >= 3, "expected per-event flush, got {} chunks", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "expected per-event flush, got {} chunks",
+            chunks.len()
+        );
     }
 
     #[tokio::test]
     async fn brotli_empty_stream() {
-        let chunks = collect_compressed(StreamCodec::Brotli { quality: 5, lgwin: 18 }, vec![]).await;
+        let chunks = collect_compressed(
+            StreamCodec::Brotli {
+                quality: 5,
+                lgwin: 18,
+            },
+            vec![],
+        )
+        .await;
         let compressed = concat(&chunks);
         let mut decoded = Vec::new();
-        Decompressor::new(&compressed[..], 4096).read_to_end(&mut decoded).unwrap();
+        Decompressor::new(&compressed[..], 4096)
+            .read_to_end(&mut decoded)
+            .unwrap();
         assert!(decoded.is_empty());
     }
 
@@ -450,7 +481,9 @@ mod tests {
         .await;
         let compressed = concat(&chunks);
         let mut decoded = Vec::new();
-        GzDecoder::new(&compressed[..]).read_to_end(&mut decoded).unwrap();
+        GzDecoder::new(&compressed[..])
+            .read_to_end(&mut decoded)
+            .unwrap();
         assert_eq!(decoded, b"data: one\n\ndata: two\n\ndata: three\n\n");
     }
 
@@ -461,7 +494,11 @@ mod tests {
             vec![b"data: one\n\n", b"data: two\n\n", b"data: three\n\n"],
         )
         .await;
-        assert!(chunks.len() >= 3, "expected per-event flush, got {} chunks", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "expected per-event flush, got {} chunks",
+            chunks.len()
+        );
     }
 
     // ─── Zstd ─────────────────────────────────────────────────────────
@@ -485,7 +522,11 @@ mod tests {
             vec![b"data: one\n\n", b"data: two\n\n", b"data: three\n\n"],
         )
         .await;
-        assert!(chunks.len() >= 3, "expected per-event flush, got {} chunks", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "expected per-event flush, got {} chunks",
+            chunks.len()
+        );
     }
 
     // ─── Accept-Encoding parser ────────────────────────────────────────

@@ -390,11 +390,7 @@ pub async fn parse_multipart(
             // Type coercion
             let type_hint = type_hints.get(&field_name).copied().unwrap_or(TYPE_STRING);
             let coerced = coerce_param(&value, type_hint).map_err(|e| {
-                ValidationError::type_coercion_error(
-                    &field_name,
-                    type_hint_name(type_hint),
-                    &e,
-                )
+                ValidationError::type_coercion_error(&field_name, type_hint_name(type_hint), &e)
             })?;
 
             // Preserve duplicate keys (e.g. multi-select) as FormValue::Multi.

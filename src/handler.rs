@@ -398,8 +398,7 @@ pub fn form_result_to_py(
                 }
             }
             FormValue::Multi(vs) => {
-                let items: Vec<Py<PyAny>> =
-                    vs.iter().map(|v| coerced_value_to_py(py, v)).collect();
+                let items: Vec<Py<PyAny>> = vs.iter().map(|v| coerced_value_to_py(py, v)).collect();
                 let list = PyList::new(py, items)?;
                 form_dict.set_item(key, list)?;
             }
@@ -553,9 +552,7 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
 
 /// Borrow the global `CompressionConfig` from `AppState` attached to the
 /// request. Returns `None` when no `BoltAPI(compression=...)` was configured.
-fn compression_config_from_req(
-    req: &HttpRequest,
-) -> Option<&crate::metadata::CompressionConfig> {
+fn compression_config_from_req(req: &HttpRequest) -> Option<&crate::metadata::CompressionConfig> {
     req.app_data::<actix_web::web::Data<std::sync::Arc<crate::state::AppState>>>()
         .and_then(|s| s.global_compression_config.as_deref())
 }
@@ -664,12 +661,8 @@ async fn build_response_from_parsed(
                     mark_skip_cors(&mut response, skip_cors);
                     return response;
                 }
-                let stream = create_sse_stream(
-                    content_obj,
-                    is_async_generator,
-                    ping_interval,
-                    codec,
-                );
+                let stream =
+                    create_sse_stream(content_obj, is_async_generator, ping_interval, codec);
                 let mut response = response_builder::build_sse_response(
                     parsed.status,
                     headers,
