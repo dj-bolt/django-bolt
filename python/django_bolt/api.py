@@ -79,7 +79,6 @@ from .serialization import (
 )
 from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata, HandlerPattern
-from .utils import slugify_route_name
 from .views import APIView, ViewSet
 from .websocket import mark_websocket_handler
 
@@ -780,7 +779,7 @@ class BoltAPI:
             meta["is_websocket"] = True
 
             # URL-reverse identity, same scheme as HTTP routes (see _route_decorator).
-            meta["name"] = name if name is not None else slugify_route_name(fn.__name__)
+            meta["name"] = name if name is not None else fn.__name__
             meta["name_explicit"] = name is not None
             meta["namespace"] = self.namespace or ""
 
@@ -910,9 +909,9 @@ class BoltAPI:
                     merged_validate_response = handler.__bolt_validate_response__
 
                 # A view's methods all share one path, so the name applies to each.
-                # When unnamed, derive from the class name (slugified) and mark it
+                # When unnamed, fall back to the verbatim class name and mark it
                 # non-explicit so it can't collide-error with an explicit route.
-                view_name = name if name is not None else slugify_route_name(view_cls.__name__)
+                view_name = name if name is not None else view_cls.__name__
                 route_decorator = self._route_decorator(
                     method_upper,
                     path,
@@ -981,7 +980,11 @@ class BoltAPI:
             path: Base URL path (e.g., "/users")
             name: Optional base URL-reverse name. Standard actions are named
                 ``{name}-{action}`` (e.g. "user-list", "user-retrieve"); custom
-                @action routes are named ``{name}-{action_name}``. Unnamed when omitted.
+                @action routes are named ``{name}-{action_name}``. When omitted,
+                the base defaults to the slugified ViewSet class name, so
+                ``UserViewSet`` yields "user-view-set-list", "user-view-set-retrieve",
+                etc. -- reverse() works without an explicit name (a derived base is
+                non-explicit, so it loses collisions to explicitly named routes).
             guards: Optional guards to apply to all routes
             auth: Optional auth backends to apply to all routes
             status_code: Optional default status code (overrides action-specific defaults)
@@ -1002,9 +1005,9 @@ class BoltAPI:
             if actual_lookup_field == "pk" and hasattr(viewset_cls, "lookup_field"):
                 actual_lookup_field = viewset_cls.lookup_field
 
-            # Reverse-name base for all generated routes. An explicit name is kept
-            # verbatim; the class-name fallback is slugified.
-            vs_base = name if name is not None else slugify_route_name(viewset_cls.__name__)
+            # Reverse-name base for all generated routes. Both an explicit name and
+            # the class-name fallback are used verbatim.
+            vs_base = name if name is not None else viewset_cls.__name__
 
             # Define standard action mappings with HTTP-compliant status codes
             # Format: action_name: (method, path, default_status_code)
@@ -1092,9 +1095,9 @@ class BoltAPI:
                 ):
                     handler = paginate(viewset_cls.pagination_class)(handler)
 
-                # Derive route name from the viewset base + slugified action suffix
-                # (e.g. "user-list", "user-retrieve", "user-partial-update").
-                route_name = f"{vs_base}-{slugify_route_name(action_name)}"
+                # Derive route name from the viewset base + verbatim action suffix
+                # (e.g. "user-list", "user-retrieve", "user-partial_update").
+                route_name = f"{vs_base}-{action_name}"
 
                 # Generated names are non-explicit so they don't shadow or
                 # collide-error with explicitly named routes.
@@ -1262,17 +1265,19 @@ class BoltAPI:
                         attr.validate_response if attr.validate_response is not None else class_validate_response
                     )
 
-                    # Derive the action's reverse name: base + suffix. An explicit
-                    # @action(name=...) suffix is verbatim; the function-name fallback
-                    # is slugified. attr.path is the URL segment, not a name source.
-                    action_suffix = attr.name if attr.name is not None else slugify_route_name(unbound_fn.__name__)
+                    # Derive the action's reverse name: base + suffix. Both an explicit
+                    # @action(name=...) suffix and the function-name fallback are used
+                    # verbatim. attr.path is the URL segment, not a name source.
+                    action_suffix = attr.name if attr.name is not None else unbound_fn.__name__
                     action_route_name = f"{base_name}-{action_suffix}" if base_name else action_suffix
 
+                    # An explicit @action(name=...) is user-intended, so the route
+                    # is explicit even when the viewset base name was derived.
                     decorator = self._route_decorator(
                         http_method,
                         action_path,
                         name=action_route_name,
-                        _name_explicit=base_name_explicit,
+                        _name_explicit=base_name_explicit or attr.name is not None,
                         response_model=attr.response_model,
                         status_code=attr.status_code,
                         validate_response=final_validate_response,
@@ -1336,10 +1341,10 @@ class BoltAPI:
             # Store sync/async metadata
             meta["is_async"] = is_async
 
-            # URL-reverse identity. A provided name is used verbatim (callers slugify
-            # any framework-derived tokens before passing them in); only the bare
-            # fn-name fallback is slugified here. namespace is opt-in per BoltAPI.
-            meta["name"] = name if name is not None else slugify_route_name(fn.__name__)
+            # URL-reverse identity. Both a provided name and the bare fn-name fallback
+            # are used verbatim (one rule, no transform — like Starlette's
+            # endpoint.__name__). namespace is opt-in per BoltAPI.
+            meta["name"] = name if name is not None else fn.__name__
             meta["name_explicit"] = name is not None and _name_explicit
             meta["namespace"] = self.namespace or ""
 

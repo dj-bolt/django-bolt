@@ -1,9 +1,10 @@
 """Tests for URL reversing of Bolt routes.
 
-Covers route-name derivation (explicit names kept verbatim, framework-derived
-names slugified), opt-in per-API namespaces, Bolt-to-Django path conversion, and
-the reverse-only urlpatterns that ``django_bolt.urls`` contributes to
-``ROOT_URLCONF`` so Django's native ``reverse()`` resolves Bolt names.
+Covers route-name derivation (every derived name is taken verbatim from its
+Python identifier, exactly like an explicit ``name=``), opt-in per-API
+namespaces, Bolt-to-Django path conversion, and the reverse-only urlpatterns
+that ``django_bolt.urls`` contributes to ``ROOT_URLCONF`` so Django's native
+``reverse()`` resolves Bolt names.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ from django.urls import reverse as django_reverse
 
 from django_bolt import BoltAPI, ViewSet, action
 from django_bolt.urls import _to_django_route, build_urlpatterns
-from django_bolt.utils import slugify_route_name
 from django_bolt.views import APIView
 
 _urlconf_counter = 0
@@ -45,20 +45,6 @@ def _route_metas(api: BoltAPI) -> list[dict]:
 
 
 # --- Pure helpers ---------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("GetMission", "get-mission"),
-        ("get_mission", "get-mission"),
-        ("UserViewSet", "user-view-set"),
-        ("partial_update", "partial-update"),
-        ("Already-Slug", "already-slug"),
-    ],
-)
-def test_slugify_route_name(value, expected):
-    assert slugify_route_name(value) == expected
 
 
 @pytest.mark.parametrize(
@@ -91,7 +77,8 @@ def test_explicit_name_is_kept_verbatim():
     assert meta["name_explicit"] is True
 
 
-def test_derived_name_is_slugified():
+def test_derived_name_is_verbatim():
+    """A derived name is the bare function identifier, untransformed (like Starlette)."""
     api = BoltAPI()
 
     @api.get("/y")
@@ -99,7 +86,7 @@ def test_derived_name_is_slugified():
         return {}
 
     meta = _route_metas(api)[0]
-    assert meta["name"] == "get-mission"
+    assert meta["name"] == "get_mission"
     assert meta["name_explicit"] is False
 
 
@@ -123,7 +110,7 @@ def test_namespace_is_opt_in():
 
 
 def test_unnamed_view_is_not_explicit():
-    """A view()'s class-name fallback is derived, so it must not be explicit."""
+    """A view()'s class-name fallback is the verbatim class name, and not explicit."""
     api = BoltAPI()
 
     @api.view("/items")
@@ -136,7 +123,7 @@ def test_unnamed_view_is_not_explicit():
 
     metas = _route_metas(api)
     assert metas, "expected registered routes"
-    assert all(m["name"] == "item-view" for m in metas)
+    assert all(m["name"] == "ItemView" for m in metas)
     assert all(m["name_explicit"] is False for m in metas)
 
 
@@ -170,11 +157,11 @@ def test_viewset_action_names():
     names = {m["name"] for m in _route_metas(api)}
     assert "user-list" in names
     assert "user-retrieve" in names
-    assert "user-partial-update" in names
+    assert "user-partial_update" in names
     assert all(m["name_explicit"] for m in _route_metas(api))
 
 
-def test_unnamed_viewset_derives_slug_and_is_not_explicit():
+def test_unnamed_viewset_derives_class_name_and_is_not_explicit():
     api = BoltAPI()
 
     @api.viewset("/users")
@@ -183,12 +170,12 @@ def test_unnamed_viewset_derives_slug_and_is_not_explicit():
             return []
 
     meta = _route_metas(api)[0]
-    assert meta["name"] == "user-view-set-list"
+    assert meta["name"] == "UserViewSet-list"
     assert meta["name_explicit"] is False
 
 
 def test_custom_action_reverse_name():
-    """@action routes reverse as {base}-{action}, slugified from the method name."""
+    """@action routes reverse as {base}-{action}, taken verbatim from the method name."""
     api = BoltAPI()
 
     @api.viewset("/users", name="user")
@@ -199,6 +186,21 @@ def test_custom_action_reverse_name():
 
     names = {m["name"] for m in _route_metas(api)}
     assert "user-recent" in names
+
+
+def test_explicit_action_name_is_explicit_on_unnamed_viewset():
+    """An @action(name=...) is user-intended, so it stays explicit even when the
+    viewset base name is derived from the class name."""
+    api = BoltAPI()
+
+    @api.viewset("/users")
+    class UserViewSet(ViewSet):
+        @action(["GET"], detail=False, name="active")
+        async def list_active(self, request):
+            return []
+
+    meta = next(m for m in _route_metas(api) if m["name"] == "UserViewSet-active")
+    assert meta["name_explicit"] is True
 
 
 # --- reverse() against the contributed urlpatterns ------------------------
