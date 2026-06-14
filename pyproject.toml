@@ -76,7 +76,7 @@ dev = [
     "pydantic>=2",
     "pyyaml>=5.2",
     "maturin>=1.9.6",
-    "django==6.0.2",
+    "django==6.0.6",
     "ruff>=0.8",
     "vulture>=2.11", #for dead code detection
     "nanodjango>=0.16",

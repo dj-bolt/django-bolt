@@ -17,8 +17,8 @@ jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["extension-module", "abi3-py312"] }
-pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py312"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 actix-web = { version = "4", features = ["compress-gzip", "compress-brotli", "compress-zstd", "cookies"] }
 cookie = "0.18"  # RFC 6265 compliant cookie handling
 actix-http = "3"
