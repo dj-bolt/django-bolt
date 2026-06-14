@@ -11,16 +11,22 @@
         .active { background: #28a745; }
         .completed { background: #6c757d; }
         .aborted { background: #dc3545; }
+        a { color: #00d4ff; margin-right: 12px; }
     </style>
 </head>
 <body>
     <h1>Mission Dashboard</h1>
     <p>Total missions: {{ missions|length }}</p>
+    <p>List endpoint (via {% templatetag openblock %} url {% templatetag closeblock %}):
+       <a href="{% url 'missions-list' %}">{% url 'missions-list' %}</a></p>
     {% for mission in missions %}
     <div class="mission">
         <strong>{{ mission.name }}</strong>
         <span class="status {{ mission.status }}">{{ mission.status|upper }}</span>
         <p>{{ mission.description|default:"No description" }}</p>
+        <!-- {% templatetag openblock %} url {% templatetag closeblock %} resolves Bolt route names served by Rust -->
+        <a href="{% url 'mission-detail' mission_id=mission.id %}">detail</a>
+        <a href="{% url 'mission-log' mission_id=mission.id %}">log</a>
     </div>
     {% empty %}
     <p>No missions found.</p>
