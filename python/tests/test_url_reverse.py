@@ -17,8 +17,8 @@ from django.urls import NoReverseMatch
 from django.urls import reverse as django_reverse
 
 from django_bolt import BoltAPI, ViewSet, action
-from django_bolt.utils import slugify_route_name
 from django_bolt.urls import _to_django_route, build_urlpatterns
+from django_bolt.utils import slugify_route_name
 from django_bolt.views import APIView
 
 _urlconf_counter = 0
