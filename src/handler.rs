@@ -1112,9 +1112,19 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 Some(len) if len > 0 => Vec::with_capacity(len),
                 _ => Vec::new(),
             };
+            let mut total_read: usize = 0;
             while let Some(chunk) = payload.next().await {
                 match chunk {
-                    Ok(data) => body_vec.extend_from_slice(&data),
+                    Ok(data) => {
+                        total_read = match total_read.checked_add(data.len()) {
+                            Some(v) => v,
+                            None => return responses::error_413(),
+                        };
+                        if total_read > state.max_payload_size {
+                            return responses::error_413();
+                        }
+                        body_vec.extend_from_slice(&data);
+                    }
                     Err(e) => {
                         return HttpResponse::BadRequest()
                             .content_type("application/json")
