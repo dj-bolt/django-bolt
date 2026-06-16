@@ -310,7 +310,6 @@ impl RouteExecutionPlan {
     const HAS_AUTH_OR_GUARDS: u16 = 1 << 7;
     const HAS_RATE_LIMIT: u16 = 1 << 8;
     const CAN_SYNC_DISPATCH: u16 = 1 << 9;
-    const NEEDS_META: u16 = 1 << 10;
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
@@ -324,7 +323,6 @@ impl RouteExecutionPlan {
         has_auth_or_guards: bool,
         has_rate_limit: bool,
         can_sync_dispatch: bool,
-        needs_meta: bool,
     ) -> Self {
         let mut bits = 0u16;
         if needs_body {
@@ -356,9 +354,6 @@ impl RouteExecutionPlan {
         }
         if can_sync_dispatch {
             bits |= Self::CAN_SYNC_DISPATCH;
-        }
-        if needs_meta {
-            bits |= Self::NEEDS_META;
         }
         Self { bits }
     }
@@ -412,11 +407,6 @@ impl RouteExecutionPlan {
     pub const fn can_sync_dispatch(self) -> bool {
         (self.bits & Self::CAN_SYNC_DISPATCH) != 0
     }
-
-    #[inline]
-    pub const fn needs_meta(self) -> bool {
-        (self.bits & Self::NEEDS_META) != 0
-    }
 }
 
 #[inline]
@@ -424,25 +414,36 @@ fn has_enforcing_guards(guards: &[Guard]) -> bool {
     guards.iter().any(|guard| !matches!(guard, Guard::AllowAny))
 }
 
-/// Metadata table keyed by handler_id, backed by AHashMap for memory efficiency.
+/// Dense metadata table keyed by handler_id.
 ///
-/// Previously used Vec<Option<RouteMetadata>> sized to max_id+1, which wasted
-/// memory for sparse handler IDs (e.g., after merging APIs or when IDs jump).
-/// AHashMap achieves O(1) lookup with memory proportional to actual entries
-/// rather than the numeric range of handler IDs.
+/// Handler IDs in this codebase are always dense 0..N (both merge paths
+/// renumber monotonically), so a Vec is optimal — zero wasted None slots,
+/// O(1) array index lookup, no hashing overhead, and less memory than a
+/// HashMap's bucket over-allocation + stored hashes/keys.
 #[derive(Debug, Clone, Default)]
 pub struct RouteMetadataStore {
-    by_handler_id: AHashMap<usize, RouteMetadata>,
+    by_handler_id: Vec<Option<RouteMetadata>>,
 }
 
 impl RouteMetadataStore {
     pub fn from_map(map: AHashMap<usize, RouteMetadata>) -> Self {
-        Self { by_handler_id: map }
+        if map.is_empty() {
+            return Self::default();
+        }
+
+        let max_id = map.keys().copied().max().unwrap_or(0);
+        let mut by_handler_id = vec![None; max_id + 1];
+        for (handler_id, metadata) in map {
+            by_handler_id[handler_id] = Some(metadata);
+        }
+        Self { by_handler_id }
     }
 
     #[inline]
     pub fn get(&self, handler_id: usize) -> Option<&RouteMetadata> {
-        self.by_handler_id.get(&handler_id)
+        self.by_handler_id
+            .get(handler_id)
+            .and_then(|metadata| metadata.as_ref())
     }
 }
 
@@ -611,12 +612,6 @@ impl RouteMetadata {
             .flatten()
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false);
-        let needs_meta = py_meta
-            .get_item("needs_meta")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract::<bool>().ok())
-            .unwrap_or(true);
         let plan = RouteExecutionPlan::from_parts(
             needs_body,
             needs_query,
@@ -628,7 +623,6 @@ impl RouteMetadata {
             has_auth_or_guards,
             has_rate_limit,
             can_sync_dispatch,
-            needs_meta,
         );
 
         // Form field type hints (same format as param_types)
