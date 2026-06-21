@@ -2,10 +2,12 @@
 
 Each module here is ordinary Python — linted, type-checked, and navigable in an
 IDE — that defines its own ``api = BoltAPI()``, a ``/health`` readiness route,
-and the handlers under test. Tests install one into a ``runbolt`` subprocess via
-``create_server_project(api_source=app_source("..."))`` (the file is copied
-verbatim, so what you read is exactly what runs), and the same module can be
-imported and driven in-process with ``TestClient`` for fast coverage.
+and the handlers under test. Tests usually point a ``runbolt`` subprocess at one
+by import path via ``create_server_project(api_module=app_module("..."))`` (which
+sets ``settings.BOLT_API``), so the subprocess imports the *same* module object
+that the in-process ``TestClient`` uses — no file copy. ``app_source(...)`` is
+the copy-into-``api.py`` fallback for the few tests that need an on-disk file
+(autodiscovery, ``--dev``/reload, artifact).
 
 This replaces the old pattern of authoring handlers inside triple-quoted source
 strings (see issue #218): strings get no tooling and, in the worst cases, became
@@ -42,3 +44,17 @@ def app_text(name: str) -> str:
     ``create_server_project(extra_files=...)``.
     """
     return app_source(name).read_text()
+
+
+def app_module(name: str, attr: str = "api") -> str:
+    """Return the ``"package.module:attr"`` path for ``api_module=``.
+
+    This points runbolt at the module via ``settings.BOLT_API`` (no file copy),
+    so the subprocess imports the exact module object the in-process
+    ``TestClient`` uses. Prefer this over ``app_source`` except where a test
+    needs an on-disk ``api.py`` — autodiscovery, ``--dev``/reload (the watcher
+    needs a file in the temp project), or artifact tests (which must run from
+    the installed wheel, not the source tree).
+    """
+    app_source(name)  # validate the module exists
+    return f"{__name__}.{name}:{attr}"

@@ -5,13 +5,15 @@ import time
 
 import pytest
 
-from .apps import app_source
+from .apps import app_module, app_source
 
 pytestmark = [pytest.mark.server_integration, pytest.mark.platform_smoke]
 
 
 def test_runbolt_serves_http_request(make_server_project):
-    project = make_server_project(api_source=app_source("hello"))
+    # Loaded by import path via BOLT_API (no copy). The --dev variant below keeps
+    # api_source so the reload watcher only sees files in the temp project.
+    project = make_server_project(api_module=app_module("hello"))
 
     with project.start() as server:
         response = server.get("/hello")

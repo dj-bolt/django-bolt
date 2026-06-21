@@ -5,13 +5,13 @@ import time
 import httpx
 import pytest
 
-from .apps import app_source
+from .apps import app_module
 
 pytestmark = pytest.mark.server_integration
 
 
 def _make_sse_project(make_server_project):
-    return make_server_project(api_source=app_source("sse_cors"))
+    return make_server_project(api_module=app_module("sse_cors"))
 
 
 def test_async_sse_has_cors_headers(make_server_project):

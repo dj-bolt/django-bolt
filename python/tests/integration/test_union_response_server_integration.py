@@ -4,13 +4,13 @@ import pytest
 
 from django_bolt.testing import TestClient
 
-from .apps import app_source, union_response
+from .apps import app_module, union_response
 
 pytestmark = pytest.mark.server_integration
 
 
 def test_union_response_each_branch_carries_tag(make_server_project):
-    project = make_server_project(api_source=app_source("union_response"))
+    project = make_server_project(api_module=app_module("union_response"))
 
     with project.start() as server:
         post = server.get("/feed/0")
@@ -46,7 +46,7 @@ def test_union_response_each_branch_carries_tag(make_server_project):
 
 
 def test_union_response_list_serializes_mixed_tags(make_server_project):
-    project = make_server_project(api_source=app_source("union_response"))
+    project = make_server_project(api_module=app_module("union_response"))
 
     with project.start() as server:
         response = server.get("/feed")
@@ -60,7 +60,7 @@ def test_union_response_list_serializes_mixed_tags(make_server_project):
 
 
 def test_union_response_openapi_advertises_all_branches(make_server_project):
-    project = make_server_project(api_source=app_source("union_response"))
+    project = make_server_project(api_module=app_module("union_response"))
 
     with project.start() as server:
         response = server.get("/docs/openapi.json")

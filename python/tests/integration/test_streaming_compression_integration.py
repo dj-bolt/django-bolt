@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from .apps import app_source
+from .apps import app_module
 
 pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
 
@@ -27,7 +27,7 @@ pytestmark = pytest.mark.server_integration
 
 
 def _make_streaming_project(make_server_project):
-    return make_server_project(api_source=app_source("streaming_compression"))
+    return make_server_project(api_module=app_module("streaming_compression"))
 
 
 def test_default_on_brotli_sse_end_to_end(make_server_project):

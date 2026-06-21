@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from .apps import app_source
+from .apps import app_module
 
 pytestmark = pytest.mark.server_integration
 
@@ -32,7 +32,7 @@ _TEMPLATES = [
 
 
 def test_url_template_tag_resolves_bolt_route(make_server_project):
-    project = make_server_project(api_source=app_source("url_reverse"), urls_content=_URLS, templates=_TEMPLATES)
+    project = make_server_project(api_module=app_module("url_reverse"), urls_content=_URLS, templates=_TEMPLATES)
     with project.start() as server:
         body = server.wait_for_text("/render", 'href="/missions/42"')
     assert body == '<a href="/missions/42">go</a>'

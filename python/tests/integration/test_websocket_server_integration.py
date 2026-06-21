@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from .apps import app_source
+from .apps import app_module
 from .helpers import SimpleWebSocketClient
 
 pytestmark = pytest.mark.server_integration
 
 
 def _make_websocket_project(make_server_project):
-    return make_server_project(api_source=app_source("websocket_auth"))
+    return make_server_project(api_module=app_module("websocket_auth"))
 
 
 def test_websocket_handshake_auth_and_close(make_server_project):

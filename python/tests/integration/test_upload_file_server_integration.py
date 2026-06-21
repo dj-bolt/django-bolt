@@ -14,7 +14,7 @@ import hashlib
 
 import pytest
 
-from .apps import app_source
+from .apps import app_module
 
 pytestmark = pytest.mark.server_integration
 
@@ -24,7 +24,7 @@ def _sha256(data: bytes) -> str:
 
 
 def test_single_file_upload_roundtrips_bytes(make_server_project):
-    project = make_server_project(api_source=app_source("upload"))
+    project = make_server_project(api_module=app_module("upload"))
     payload = b"\x89PNG\r\n\x1a\n" + b"pixels" * 2048
 
     with project.start() as server:
@@ -43,7 +43,7 @@ def test_single_file_upload_roundtrips_bytes(make_server_project):
 
 
 def test_multiple_files_upload_preserves_each_payload(make_server_project):
-    project = make_server_project(api_source=app_source("upload"))
+    project = make_server_project(api_module=app_module("upload"))
     files_payload = [
         ("a.bin", b"first-file-contents" * 64),
         ("b.bin", b"second-file" * 128),
@@ -67,7 +67,7 @@ def test_multiple_files_upload_preserves_each_payload(make_server_project):
 
 
 def test_struct_form_with_file_and_text_fields(make_server_project):
-    project = make_server_project(api_source=app_source("upload"))
+    project = make_server_project(api_module=app_module("upload"))
     payload = b"avatar-bytes" * 512
 
     with project.start() as server:
@@ -87,7 +87,7 @@ def test_struct_form_with_file_and_text_fields(make_server_project):
 
 
 def test_upload_exceeding_max_size_is_rejected(make_server_project):
-    project = make_server_project(api_source=app_source("upload"))
+    project = make_server_project(api_module=app_module("upload"))
     oversized = b"x" * 4096  # endpoint caps at 1024 bytes
 
     with project.start() as server:

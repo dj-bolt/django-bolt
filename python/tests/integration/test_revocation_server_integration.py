@@ -19,7 +19,7 @@ import time
 import jwt
 import pytest
 
-from .apps import app_source
+from .apps import app_module
 from .apps.revocation import SECRET
 
 pytestmark = pytest.mark.server_integration
@@ -37,7 +37,7 @@ def test_revoked_token_is_rejected_by_real_server(make_server_project):
     `meta["_revocation_handlers"]` → dispatch hook) is set up at server
     startup and that the dispatch hook actually rejects revoked tokens.
     """
-    project = make_server_project(api_source=app_source("revocation"))
+    project = make_server_project(api_module=app_module("revocation"))
 
     with project.start() as server:
         login = server.request("POST", "/login")
@@ -60,7 +60,7 @@ def test_token_without_jti_rejected_by_real_server(make_server_project):
     """When ``revocation_store=`` is configured, ``require_jti`` is
     auto-enabled — a token without a ``jti`` claim must be rejected
     even on the very first request."""
-    project = make_server_project(api_source=app_source("revocation"))
+    project = make_server_project(api_module=app_module("revocation"))
 
     with project.start() as server:
         # Issue a token without a jti claim — bypasses the /login helper.
@@ -91,7 +91,7 @@ def test_unrevoked_token_works_across_many_requests(make_server_project):
     requests — locks in that the dispatch hook doesn't accidentally
     invalidate valid tokens (e.g., via a stale per-request side
     effect)."""
-    project = make_server_project(api_source=app_source("revocation"))
+    project = make_server_project(api_module=app_module("revocation"))
 
     with project.start() as server:
         token = server.request("POST", "/login").json()["token"]

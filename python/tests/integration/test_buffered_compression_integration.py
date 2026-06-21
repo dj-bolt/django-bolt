@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from .apps import app_source
+from .apps import app_module
 
 pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
 
@@ -43,7 +43,7 @@ def _make_buffered_project(make_server_project, *, backend: str, **kwargs: objec
         from django_bolt.middleware import CompressionConfig
         BOLT_COMPRESSION = CompressionConfig(backend={backend!r}{extras})
         """,
-        api_source=app_source("compression_data"),
+        api_module=app_module("compression_data"),
     )
 
 
@@ -224,7 +224,7 @@ def test_buffered_and_sse_share_one_compression_config(make_server_project):
         from django_bolt.middleware import CompressionConfig
         BOLT_COMPRESSION = CompressionConfig(backend="brotli")
         """,
-        api_source=app_source("compression_sse"),
+        api_module=app_module("compression_sse"),
     )
     with project.start(startup_path="/health") as server:
         buf = server.get("/buffered", headers={"Accept-Encoding": "br"})
@@ -299,7 +299,7 @@ def test_buffered_and_sse_share_negotiation_parser(make_server_project):
         from django_bolt.middleware import CompressionConfig
         BOLT_COMPRESSION = CompressionConfig(backend="brotli")
         """,
-        api_source=app_source("compression_sse"),
+        api_module=app_module("compression_sse"),
     )
     with project.start(startup_path="/health") as server:
         buf = server.get("/buffered", headers={"Accept-Encoding": "br;q=0, gzip"})

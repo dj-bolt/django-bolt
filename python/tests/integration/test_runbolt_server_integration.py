@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from .apps import app_source, app_text
+from .apps import app_module, app_source, app_text
 
 pytestmark = pytest.mark.server_integration
 
@@ -41,7 +41,7 @@ def test_runbolt_applies_global_cors_settings_at_startup(make_server_project):
         settings_extra="""
         CORS_ALLOWED_ORIGINS = ["https://example.com"]
         """,
-        api_source=app_source("global_cors"),
+        api_module=app_module("global_cors"),
     )
 
     with project.start() as server:
@@ -53,7 +53,7 @@ def test_runbolt_applies_global_cors_settings_at_startup(make_server_project):
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Multiprocess smoke only runs on Linux.")
 def test_runbolt_processes_two_shuts_down_cleanly(make_server_project):
-    project = make_server_project(api_source=app_source("multiprocess_pid"))
+    project = make_server_project(api_module=app_module("multiprocess_pid"))
 
     server = project.start(processes=2)
     response = server.get("/pid")

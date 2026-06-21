@@ -5,9 +5,10 @@ TestClient already covers the unit-level wiring; these tests exercise the real
 TCP + actix-web + Rust form parser to catch regressions in the FormValue
 Single/Multi grouping and the Python-side scalar-to-list wrapping.
 
-The app under test lives in ``apps/form_list.py`` — a real, lint-checked module
-that is installed verbatim into the subprocess and also driven in-process by
-``TestClient`` below (write once, test at two altitudes).
+The app under test lives in ``apps/form_list.py`` — a real, lint-checked module.
+The subprocess imports it by path via ``BOLT_API`` (``api_module``) and the
+in-process ``TestClient`` below imports the same module object: one source,
+tested at two altitudes.
 """
 
 from __future__ import annotations
@@ -16,13 +17,13 @@ import pytest
 
 from django_bolt.testing import TestClient
 
-from .apps import app_source, form_list
+from .apps import app_module, form_list
 
 pytestmark = pytest.mark.server_integration
 
 
 def test_urlencoded_repeated_keys_bind_to_list(make_server_project):
-    project = make_server_project(api_source=app_source("form_list"))
+    project = make_server_project(api_module=app_module("form_list"))
     body = "name=alice&tags=red&tags=green&tags=blue&counts=1&counts=2"
 
     with project.start() as server:
@@ -49,7 +50,7 @@ def test_multipart_repeated_keys_bind_to_list(make_server_project):
     - tags: ["x", "y", "z"]
     - counts: [10]
     """
-    project = make_server_project(api_source=app_source("form_list"))
+    project = make_server_project(api_module=app_module("form_list"))
 
     with project.start() as server:
         response = server.request(
@@ -72,7 +73,7 @@ def test_multipart_repeated_keys_bind_to_list(make_server_project):
 
 
 def test_single_urlencoded_value_wraps_to_one_element_list(make_server_project):
-    project = make_server_project(api_source=app_source("form_list"))
+    project = make_server_project(api_module=app_module("form_list"))
 
     with project.start() as server:
         response = server.request(
@@ -89,7 +90,7 @@ def test_single_urlencoded_value_wraps_to_one_element_list(make_server_project):
 
 
 def test_missing_list_field_uses_struct_default(make_server_project):
-    project = make_server_project(api_source=app_source("form_list"))
+    project = make_server_project(api_module=app_module("form_list"))
 
     with project.start() as server:
         response = server.request(

@@ -636,7 +636,9 @@ with TestClient(api) as client:
 
 Only use subprocess-based tests (`subprocess.Popen` + `runbolt`) when testing behavior that `TestClient` cannot exercise (e.g., startup wiring, auto-reload, multi-process, signal handling, actual TCP, streaming, WebSocket handshakes, or packaged artifacts).
 
-For subprocess tests, author the app under test as a **real module** in `python/tests/integration/apps/`, not as a Python source string. Install it with `make_server_project(api_source=app_source("my_app"))` — the file is copied verbatim into the subprocess as `<package>/api.py`, so it gets full linting/type-checking/IDE support and what you read is exactly what runs. App modules must be self-contained (define their own `api = BoltAPI()` and a `/health` route, no relative imports). Because each module exposes `api`, the same definition can also be driven in-process with `TestClient(my_app.api)` (write once, test at two altitudes). Do **not** add new `project_api_body="""..."""` source strings.
+For subprocess tests, author the app under test as a **real module** in `python/tests/integration/apps/`, not as a Python source string. App modules must be self-contained (define their own `api = BoltAPI()` and a `/health` route, no relative imports), so they double as in-process fixtures: `TestClient(my_app.api)`.
+
+Prefer `make_server_project(api_module=app_module("my_app"))`: it points runbolt at the module by import path via `settings.BOLT_API`, so the subprocess imports the **same module object** the in-process `TestClient` uses — no file copy, and it exercises the real `BOLT_API` entrypoint. Use `make_server_project(api_source=app_source("my_app"))` (copies the file into `<package>/api.py`) only when the test needs an on-disk file: autodiscovery tests, `--dev`/reload tests (the reload watcher must see a file in the temp project, not the source tree), and artifact tests (which must run from the installed wheel, not the source tree). Do **not** add new `project_api_body="""..."""` source strings.
 
 Use the layered markers consistently:
 
