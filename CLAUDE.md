@@ -646,6 +646,8 @@ Use the layered markers consistently:
 - `platform_smoke`: Small cross-platform smoke coverage for the real server.
 - `artifact_smoke`: Isolated wheel/sdist installation checks that run outside the source tree.
 
+`server_integration` is reserved for tests that actually start `runbolt`. When an integration module also contains an in-process `TestClient` test (the "two altitudes" pattern), apply `@pytest.mark.server_integration` per subprocess test rather than a module-level `pytestmark`, and leave the in-process test unmarked — never blanket a whole module so the in-process test inherits a server marker it doesn't earn.
+
 If a change touches startup, reload, multiprocessing, actual TCP, streaming, WebSocket handshake behavior, startup-time settings, or packaged artifacts, add or update a `server_integration` or `artifact_smoke` test.
 
 ### What Makes a Good Test

@@ -19,9 +19,8 @@ from django_bolt.testing import TestClient
 
 from .apps import app_module, form_list
 
-pytestmark = pytest.mark.server_integration
 
-
+@pytest.mark.server_integration
 def test_urlencoded_repeated_keys_bind_to_list(make_server_project):
     project = make_server_project(api_module=app_module("form_list"))
     body = "name=alice&tags=red&tags=green&tags=blue&counts=1&counts=2"
@@ -41,6 +40,7 @@ def test_urlencoded_repeated_keys_bind_to_list(make_server_project):
     assert data["counts"] == [1, 2]
 
 
+@pytest.mark.server_integration
 def test_multipart_repeated_keys_bind_to_list(make_server_project):
     """
     Verify that multipart/form-data repeated keys are bound to list fields and scalar values are converted and wrapped as needed.
@@ -72,6 +72,7 @@ def test_multipart_repeated_keys_bind_to_list(make_server_project):
     assert data["counts"] == [10]
 
 
+@pytest.mark.server_integration
 def test_single_urlencoded_value_wraps_to_one_element_list(make_server_project):
     project = make_server_project(api_module=app_module("form_list"))
 
@@ -89,6 +90,7 @@ def test_single_urlencoded_value_wraps_to_one_element_list(make_server_project):
     assert data["counts"] == []
 
 
+@pytest.mark.server_integration
 def test_missing_list_field_uses_struct_default(make_server_project):
     project = make_server_project(api_module=app_module("form_list"))
 

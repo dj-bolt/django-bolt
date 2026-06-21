@@ -285,7 +285,9 @@ class ServerProject:
         self-contained (define its own ``api = BoltAPI()`` and a ``/health``
         route, no relative imports) so it copies cleanly into the subprocess.
         """
-        content = Path(source).read_text()
+        # Read as bytes so write_file copies the file byte-for-byte. The str path
+        # runs _normalize_python_source (dedent + lstrip), which would not be verbatim.
+        content = Path(source).read_bytes()
         return self.write_file(f"{self.package_name}/api.py", content)
 
     def read_file(self, relative_path: str) -> str:
@@ -355,6 +357,18 @@ def create_server_project(
     python_executable: str | None = None,
     preserve_pythonpath: bool = True,
 ) -> ServerProject:
+    provided = [
+        name
+        for name, value in (
+            ("api_module", api_module),
+            ("api_source", api_source),
+            ("project_api_body", project_api_body),
+        )
+        if value
+    ]
+    if len(provided) > 1:
+        raise ValueError(f"Pass only one of api_module / api_source / project_api_body, got {provided}")
+
     project = ServerProject(
         root=root,
         package_name=package_name,

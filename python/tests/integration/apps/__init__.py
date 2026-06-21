@@ -30,6 +30,8 @@ def app_source(name: str) -> Path:
     Pass the result as ``create_server_project(api_source=...)`` to install the
     module as the subprocess project's ``api.py``.
     """
+    if "/" in name or "\\" in name or name != Path(name).name:
+        raise ValueError(f"app module name must be a bare basename, got {name!r}")
     path = _APPS_DIR / f"{name}.py"
     if not path.exists():
         raise FileNotFoundError(f"No integration test app module named {name!r} at {path}")

@@ -6,9 +6,8 @@ from django_bolt.testing import TestClient
 
 from .apps import app_module, union_response
 
-pytestmark = pytest.mark.server_integration
 
-
+@pytest.mark.server_integration
 def test_union_response_each_branch_carries_tag(make_server_project):
     project = make_server_project(api_module=app_module("union_response"))
 
@@ -45,6 +44,7 @@ def test_union_response_each_branch_carries_tag(make_server_project):
     }
 
 
+@pytest.mark.server_integration
 def test_union_response_list_serializes_mixed_tags(make_server_project):
     project = make_server_project(api_module=app_module("union_response"))
 
@@ -59,6 +59,7 @@ def test_union_response_list_serializes_mixed_tags(make_server_project):
     assert body[2]["target_kind"] == "post"
 
 
+@pytest.mark.server_integration
 def test_union_response_openapi_advertises_all_branches(make_server_project):
     project = make_server_project(api_module=app_module("union_response"))
 
