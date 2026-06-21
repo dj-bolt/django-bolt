@@ -3,6 +3,9 @@
 These exercise real multipart streaming over TCP through the actix-web pipeline
 (which TestClient cannot fully reproduce), catching regressions in body reading,
 Rust multipart parsing, and payload-size enforcement.
+
+The app under test lives in ``apps/upload.py`` — a real, lint-checked module
+installed verbatim into the subprocess.
 """
 
 from __future__ import annotations
@@ -11,64 +14,9 @@ import hashlib
 
 import pytest
 
+from .apps import app_source
+
 pytestmark = pytest.mark.server_integration
-
-
-UPLOAD_API_BODY = """
-import hashlib
-
-from typing import Annotated
-import msgspec
-
-from django_bolt import UploadFile
-from django_bolt.params import File, Form
-
-
-class ProfileForm(msgspec.Struct):
-    name: str
-    avatar: Annotated[UploadFile, File(max_size=5_000_000, allowed_types=["image/*"])]
-
-
-@api.post("/upload/single")
-async def upload_single(file: Annotated[UploadFile, File(max_size=5_000_000)]):
-    content = await file.read()
-    return {
-        "filename": file.filename,
-        "content_type": file.content_type,
-        "size": len(content),
-        "sha256": hashlib.sha256(content).hexdigest(),
-    }
-
-
-@api.post("/upload/multiple")
-async def upload_multiple(files: Annotated[list[UploadFile], File(max_files=5)]):
-    digests = []
-    for upload in files:
-        data = await upload.read()
-        digests.append({
-            "filename": upload.filename,
-            "size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-        })
-    return {"count": len(digests), "files": digests}
-
-
-@api.post("/upload/profile")
-async def upload_profile(data: Annotated[ProfileForm, Form()]):
-    content = await data.avatar.read()
-    return {
-        "name": data.name,
-        "avatar_filename": data.avatar.filename,
-        "avatar_size": len(content),
-        "avatar_sha256": hashlib.sha256(content).hexdigest(),
-    }
-
-
-@api.post("/upload/size-capped")
-async def upload_size_capped(file: Annotated[UploadFile, File(max_size=1024)]):
-    content = await file.read()
-    return {"size": len(content)}
-"""
 
 
 def _sha256(data: bytes) -> str:
@@ -76,7 +24,7 @@ def _sha256(data: bytes) -> str:
 
 
 def test_single_file_upload_roundtrips_bytes(make_server_project):
-    project = make_server_project(project_api_body=UPLOAD_API_BODY)
+    project = make_server_project(api_source=app_source("upload"))
     payload = b"\x89PNG\r\n\x1a\n" + b"pixels" * 2048
 
     with project.start() as server:
@@ -95,7 +43,7 @@ def test_single_file_upload_roundtrips_bytes(make_server_project):
 
 
 def test_multiple_files_upload_preserves_each_payload(make_server_project):
-    project = make_server_project(project_api_body=UPLOAD_API_BODY)
+    project = make_server_project(api_source=app_source("upload"))
     files_payload = [
         ("a.bin", b"first-file-contents" * 64),
         ("b.bin", b"second-file" * 128),
@@ -119,7 +67,7 @@ def test_multiple_files_upload_preserves_each_payload(make_server_project):
 
 
 def test_struct_form_with_file_and_text_fields(make_server_project):
-    project = make_server_project(project_api_body=UPLOAD_API_BODY)
+    project = make_server_project(api_source=app_source("upload"))
     payload = b"avatar-bytes" * 512
 
     with project.start() as server:
@@ -139,7 +87,7 @@ def test_struct_form_with_file_and_text_fields(make_server_project):
 
 
 def test_upload_exceeding_max_size_is_rejected(make_server_project):
-    project = make_server_project(project_api_body=UPLOAD_API_BODY)
+    project = make_server_project(api_source=app_source("upload"))
     oversized = b"x" * 4096  # endpoint caps at 1024 bytes
 
     with project.start() as server:

@@ -636,6 +636,8 @@ with TestClient(api) as client:
 
 Only use subprocess-based tests (`subprocess.Popen` + `runbolt`) when testing behavior that `TestClient` cannot exercise (e.g., startup wiring, auto-reload, multi-process, signal handling, actual TCP, streaming, WebSocket handshakes, or packaged artifacts).
 
+For subprocess tests, author the app under test as a **real module** in `python/tests/integration/apps/`, not as a Python source string. Install it with `make_server_project(api_source=app_source("my_app"))` — the file is copied verbatim into the subprocess as `<package>/api.py`, so it gets full linting/type-checking/IDE support and what you read is exactly what runs. App modules must be self-contained (define their own `api = BoltAPI()` and a `/health` route, no relative imports). Because each module exposes `api`, the same definition can also be driven in-process with `TestClient(my_app.api)` (write once, test at two altitudes). Do **not** add new `project_api_body="""..."""` source strings.
+
 Use the layered markers consistently:
 
 - `server_integration`: Real `runbolt` process tests for startup, TCP, reload, streaming, and server-only settings.

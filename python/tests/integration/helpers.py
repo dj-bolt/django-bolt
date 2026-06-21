@@ -267,6 +267,20 @@ class ServerProject:
             source,
         )
 
+    def install_api(self, source: Path | str) -> Path:
+        """Install a real, self-contained module as the project's ``api.py``.
+
+        Unlike :meth:`write_project_api` (which wraps a source *string* in
+        injected boilerplate), this copies a vetted ``.py`` file verbatim. The
+        module under test is real Python in the repo, so it gets full linting,
+        type-checking and IDE support, and the same file can be imported by
+        ``TestClient`` for fast in-process coverage. The module must be
+        self-contained (define its own ``api = BoltAPI()`` and a ``/health``
+        route, no relative imports) so it copies cleanly into the subprocess.
+        """
+        content = Path(source).read_text()
+        return self.write_file(f"{self.package_name}/api.py", content)
+
     def read_file(self, relative_path: str) -> str:
         return self.path(relative_path).read_text()
 
@@ -323,6 +337,7 @@ def create_server_project(
     *,
     package_name: str = "testproj",
     project_api_body: str = "",
+    api_source: Path | str | None = None,
     urls_content: str = "urlpatterns = []\n",
     settings_extra: str = "",
     extra_files: dict[str, str | bytes] | None = None,
@@ -385,7 +400,10 @@ def create_server_project(
         settings_source,
     )
     project.write_file(f"{package_name}/urls.py", urls_content)
-    project.write_project_api(project_api_body)
+    if api_source is not None:
+        project.install_api(api_source)
+    else:
+        project.write_project_api(project_api_body)
     project.write_file(
         "manage.py",
         f"""
