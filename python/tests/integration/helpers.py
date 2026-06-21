@@ -357,14 +357,17 @@ def create_server_project(
     python_executable: str | None = None,
     preserve_pythonpath: bool = True,
 ) -> ServerProject:
+    # "Provided" must match the branch logic below exactly (api_module/api_source
+    # use `is not None`, project_api_body uses non-empty), so e.g. api_module=""
+    # alongside api_source can't slip past the conflict check via truthiness.
     provided = [
         name
-        for name, value in (
-            ("api_module", api_module),
-            ("api_source", api_source),
-            ("project_api_body", project_api_body),
+        for name, is_provided in (
+            ("api_module", api_module is not None),
+            ("api_source", api_source is not None),
+            ("project_api_body", bool(project_api_body)),
         )
-        if value
+        if is_provided
     ]
     if len(provided) > 1:
         raise ValueError(f"Pass only one of api_module / api_source / project_api_body, got {provided}")
