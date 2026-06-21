@@ -15,6 +15,8 @@ from django.db import models
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.param_functions import Query
+from django_bolt.serializers import Serializer
+from django_bolt.serializers.types import Email, HttpsURL, PositiveInt
 from django_bolt.testing import TestClient
 
 
@@ -367,3 +369,162 @@ def test_component_schema_omits_description_when_no_docstring():
     assert "description" not in schema
     # title is unconditional
     assert schema["title"] == "BareStruct"
+
+
+# ---------- documented constrained types (custom types) --------------
+#
+# Regression tests for #235. msgspec.inspect wraps a field whose
+# `Annotated[T, Meta(...)]` carries informational fields (description /
+# examples / title) in a `Metadata` node — distinct from a constraints-only
+# Meta, which stays a bare `*Type`. The generator must unwrap that node to
+# the underlying type (+ constraints + docs); otherwise the field falls
+# through to the generic `object` fallback and codegen tools (typescript-fetch,
+# openapi-typescript) emit `object` instead of string/integer. Every built-in
+# type in `serializers.types` (Email, PositiveInt, HttpsURL, …) carries a
+# `description`, so all of them hit this path.
+
+
+def test_documented_str_constraint_renders_as_string_not_object():
+    """A str field with constraints AND a description must render as `string`."""
+
+    class DocStr(msgspec.Struct):
+        code: Annotated[str, msgspec.Meta(max_length=10, pattern=r"^[A-Z]+$", description="A code")]
+
+    props = _get_response_component_schema(DocStr)["properties"]
+    # Without the fix this is {"type": "object"} (the reported bug).
+    assert props["code"]["type"] == "string"
+    assert props["code"]["maxLength"] == 10
+    assert props["code"]["pattern"] == r"^[A-Z]+$"
+    assert props["code"]["description"] == "A code"
+
+
+def test_documented_int_constraint_renders_as_integer_not_object():
+    """An int field with a constraint AND a description must render as `integer`."""
+
+    class DocInt(msgspec.Struct):
+        qty: Annotated[int, msgspec.Meta(gt=0, description="Positive quantity")]
+
+    props = _get_response_component_schema(DocInt)["properties"]
+    assert props["qty"]["type"] == "integer"
+    assert props["qty"]["exclusiveMinimum"] == 0
+    assert props["qty"]["description"] == "Positive quantity"
+
+
+def test_documented_type_carries_examples():
+    """The `examples` carried by a documented Meta survive onto the schema."""
+
+    class WithExamples(msgspec.Struct):
+        name: Annotated[str, msgspec.Meta(min_length=1, examples=["alice", "bob"])]
+
+    props = _get_response_component_schema(WithExamples)["properties"]
+    assert props["name"]["type"] == "string"
+    assert props["name"]["minLength"] == 1
+    assert props["name"]["examples"] == ["alice", "bob"]
+
+
+def test_builtin_custom_types_in_serializer_render_concrete_types():
+    """The reported scenario: a Serializer using built-in Email/PositiveInt/HttpsURL.
+
+    Each property must carry its concrete base type, not the generic `object`.
+    """
+
+    class Account(Serializer):
+        email: Email
+        age: PositiveInt
+        site: HttpsURL
+
+    props = _get_response_component_schema(Account)["properties"]
+    assert props["email"]["type"] == "string"
+    assert props["email"]["maxLength"] == 254
+    assert props["age"]["type"] == "integer"
+    assert props["age"]["exclusiveMinimum"] == 0
+    assert props["site"]["type"] == "string"
+    # None of them may collapse to a bare object.
+    assert all(props[f]["type"] != "object" for f in ("email", "age", "site"))
+
+
+def test_documented_constrained_field_matches_msgspec_schema():
+    """Bolt's component schema for documented custom types matches msgspec's own.
+
+    This is the contract codegen tools rely on: the spec Bolt emits must be the
+    same one `msgspec.json.schema` would produce for the equivalent struct.
+    """
+
+    class Account(Serializer):
+        email: Email
+        age: PositiveInt
+        site: HttpsURL
+
+    bolt_props = _get_response_component_schema(Account)["properties"]
+    msgspec_props = msgspec.json.schema(Account)["$defs"]["Account"]["properties"]
+    for field_name in ("email", "age", "site"):
+        assert bolt_props[field_name]["type"] == msgspec_props[field_name]["type"]
+
+
+def test_documented_query_struct_field_renders_concrete_type():
+    """A documented constrained field on a query struct types the parameter.
+
+    Exercises the `_extract_parameters` -> `_msgspec_field_schema` path, which is
+    distinct from the response-component path.
+    """
+
+    class Filters(msgspec.Struct):
+        code: Annotated[str, msgspec.Meta(max_length=5, description="Short code")] = "AB"
+
+    code_schema = _get_query_param_schema(Filters, "code")
+    assert code_schema["type"] == "string"
+    assert code_schema["maxLength"] == 5
+    assert code_schema["description"] == "Short code"
+
+
+def test_documented_custom_type_as_bare_response_model():
+    """A documented custom type used directly as a (nested) response model.
+
+    `-> list[Email]` reaches the generator as a raw `typing.Annotated` still
+    carrying its msgspec Meta; the array items must type as `string`.
+    """
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/emails")
+    async def list_emails() -> list[Email]:
+        pass
+
+    schema = _get_schema(api)
+    items = schema["paths"]["/emails"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["items"]
+    assert items["type"] == "string"
+    assert items["maxLength"] == 254
+
+
+def test_nullable_documented_custom_type_unwraps_inside_union():
+    """`HttpsURL | None` — the Metadata node nested in the union must unwrap.
+
+    Nullable custom types are the common shape (`website: HttpsURL | None = None`);
+    under OpenAPI 3.1 the type sits in the first `anyOf` arm beside `{"type": "null"}`.
+    """
+
+    class Profile(Serializer):
+        website: HttpsURL | None = None
+
+    props = _get_response_component_schema(Profile)["properties"]
+    arms = props["website"]["anyOf"]
+    typed = next(arm for arm in arms if arm.get("type") != "null")
+    assert typed["type"] == "string"
+    assert typed["maxLength"] == 200
+    assert {"type": "null"} in arms
+
+
+def test_constraints_only_meta_still_omits_description():
+    """A constraints-only Meta (no docs) stays a bare *Type and gains no description.
+
+    Guards the boundary the fix hinges on: only Meta with informational fields
+    becomes a Metadata node. This must keep working unchanged.
+    """
+
+    class ConstraintsOnly(msgspec.Struct):
+        n: Annotated[int, msgspec.Meta(ge=1, le=9)]
+
+    props = _get_response_component_schema(ConstraintsOnly)["properties"]
+    assert props["n"]["type"] == "integer"
+    assert props["n"]["minimum"] == 1
+    assert props["n"]["maximum"] == 9
+    assert "description" not in props["n"]

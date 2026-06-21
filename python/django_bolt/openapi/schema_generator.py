@@ -232,6 +232,27 @@ class SchemaGenerator:
             )
         )
 
+    @staticmethod
+    def _apply_json_schema_extra(schema: Schema, extra: dict[str, Any]) -> Schema:
+        """Merge a msgspec ``extra_json_schema`` mapping onto a Schema in place.
+
+        ``msgspec.inspect`` collects the *informational* JSON-schema fields of a
+        ``Meta(...)`` annotation — ``title``/``description``/``examples`` plus any
+        explicit ``extra_json_schema`` — into this dict, keyed by their
+        JSON-schema names (the numeric/string *constraints* live on the wrapped
+        ``*Type`` instead). Map each key onto the matching Schema dataclass
+        attribute, translating camelCase JSON keys (e.g. ``maxLength``) to the
+        snake_case field name via the alias map. Keys with no corresponding
+        Schema field (e.g. arbitrary ``x-`` extensions) are skipped — the spec
+        dataclass cannot represent them. Returns the same Schema for chaining.
+        """
+        alias_map = Schema.field_aliases()  # {json_alias: field_name}
+        for key, value in extra.items():
+            attr = alias_map.get(key, key)
+            if hasattr(schema, attr):
+                setattr(schema, attr, value)
+        return schema
+
     def _msgspec_field_schema(
         self, field: Any, *, register_component: bool = False
     ) -> tuple[str, Schema | Reference, bool]:
@@ -1010,6 +1031,28 @@ class SchemaGenerator:
 
         # Handle msgspec type info objects (IntType, StrType, BoolType, etc.)
         type_name = type(type_annotation).__name__
+
+        # msgspec.inspect wraps an ``Annotated[T, Meta(...)]`` whose Meta carries
+        # informational fields (title/description/examples or an explicit
+        # extra_json_schema) in a ``Metadata`` node: ``.type`` is the underlying
+        # ``*Type`` (StrType/IntType/…) carrying the constraints, and
+        # ``.extra_json_schema`` holds the informational fields. A Meta with
+        # *only* constraints stays a bare ``*Type`` (handled below), but every
+        # documented custom type — Email, PositiveInt, HttpsURL, … i.e. all of
+        # ``serializers.types`` — gets this wrapper. Without unwrapping it here,
+        # those fields fall through every branch to the generic ``object``
+        # fallback and codegen tools (typescript-fetch, openapi-typescript)
+        # emit ``object`` instead of string/integer. (#235)
+        if type_name == "Metadata":
+            base = self._type_to_schema(type_annotation.type, register_component=register_component)
+            extra = getattr(type_annotation, "extra_json_schema", None)
+            # Constraints already live on ``base`` (from the wrapped *Type); only
+            # the docs need merging, and only onto an inline Schema — a $ref to a
+            # component (Struct) carries its own description and can't take siblings.
+            if extra and isinstance(base, Schema):
+                self._apply_json_schema_extra(base, extra)
+            return base
+
         if hasattr(type_annotation, "__class__") and type_name.endswith("Type"):
             # Numeric types with constraint support (ge/gt/le/lt/multiple_of)
             if type_name == "IntType":
@@ -1109,6 +1152,19 @@ class SchemaGenerator:
         args = get_args(type_annotation)
 
         if origin is Annotated:
+            # A documented custom type (e.g. ``Email = Annotated[str, Meta(...)]``)
+            # used directly as a response model — bare (``-> Email``) or nested
+            # (``-> list[Email]``) — reaches here as a raw typing.Annotated still
+            # carrying its msgspec Meta. Normalize it through msgspec.inspect so it
+            # renders identically to the same type used as a Struct field (the
+            # Metadata branch above then applies constraints + docs). Param markers
+            # like Query()/Header() are not msgspec.Meta, so ``Annotated[T, Query()]``
+            # still falls through to the plain unwrap below. (#235)
+            if any(isinstance(m, msgspec.Meta) for m in args[1:]):
+                return self._type_to_schema(
+                    msgspec.inspect.type_info(type_annotation),
+                    register_component=register_component,
+                )
             # Unwrap Annotated[T, ...]
             type_annotation = args[0]
             origin = get_origin(type_annotation)
