@@ -6,11 +6,12 @@ import httpx
 import pytest
 
 from .apps import app_module
+from .helpers import ServerProject
 
 pytestmark = pytest.mark.server_integration
 
 
-def _make_sse_project(make_server_project):
+def _make_sse_project(make_server_project) -> ServerProject:
     return make_server_project(api_module=app_module("sse_cors"))
 
 

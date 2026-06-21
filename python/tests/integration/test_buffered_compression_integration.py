@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 
 from .apps import app_module
+from .helpers import ServerProject
 
 pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
 
@@ -30,7 +31,7 @@ pytestmark = pytest.mark.server_integration
 # ─── Project factory ────────────────────────────────────────────────────
 
 
-def _make_buffered_project(make_server_project, *, backend: str, **kwargs: object):
+def _make_buffered_project(make_server_project, *, backend: str, **kwargs: object) -> ServerProject:
     """Build a project that configures ``BOLT_COMPRESSION`` via Django
     settings (the production-realistic path through ``runbolt``) and
     installs the ``compression_data`` app — a large JSON route plus a tiny

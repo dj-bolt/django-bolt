@@ -3,12 +3,12 @@ from __future__ import annotations
 import pytest
 
 from .apps import app_module
-from .helpers import SimpleWebSocketClient
+from .helpers import ServerProject, SimpleWebSocketClient
 
 pytestmark = pytest.mark.server_integration
 
 
-def _make_websocket_project(make_server_project):
+def _make_websocket_project(make_server_project) -> ServerProject:
     return make_server_project(api_module=app_module("websocket_auth"))
 
 

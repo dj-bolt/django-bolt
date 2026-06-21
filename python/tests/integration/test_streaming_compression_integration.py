@@ -20,13 +20,14 @@ from __future__ import annotations
 import pytest
 
 from .apps import app_module
+from .helpers import ServerProject
 
 pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
 
 pytestmark = pytest.mark.server_integration
 
 
-def _make_streaming_project(make_server_project):
+def _make_streaming_project(make_server_project) -> ServerProject:
     return make_server_project(api_module=app_module("streaming_compression"))
 
 
