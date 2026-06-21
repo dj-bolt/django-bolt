@@ -32,3 +32,13 @@ def app_source(name: str) -> Path:
     if not path.exists():
         raise FileNotFoundError(f"No integration test app module named {name!r} at {path}")
     return path
+
+
+def app_text(name: str) -> str:
+    """Return the source text of app module ``name``.
+
+    Use this when the module must be installed somewhere other than the
+    project's own ``api.py`` — e.g. as a secondary app's ``api.py`` passed via
+    ``create_server_project(extra_files=...)``.
+    """
+    return app_source(name).read_text()

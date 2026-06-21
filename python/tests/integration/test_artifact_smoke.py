@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from .apps import app_source
+
 pytestmark = pytest.mark.artifact_smoke
 
 
@@ -30,33 +32,25 @@ def test_installed_artifact_runs_runbolt(make_server_project, installed_artifact
     project = make_server_project(
         python_executable=str(installed_artifact_python),
         preserve_pythonpath=False,
-        project_api_body="""
-        @api.get("/artifact")
-        async def artifact():
-            return {"mode": "plain"}
-        """,
+        api_source=app_source("artifact"),
     )
 
     with project.start() as server:
         response = server.get("/artifact")
 
     assert response.status_code == 200
-    assert response.json() == {"mode": "plain"}
+    assert response.json() == {"mode": "ok"}
 
 
 def test_installed_artifact_runs_runbolt_dev(make_server_project, installed_artifact_python: Path):
     project = make_server_project(
         python_executable=str(installed_artifact_python),
         preserve_pythonpath=False,
-        project_api_body="""
-        @api.get("/artifact")
-        async def artifact():
-            return {"mode": "dev"}
-        """,
+        api_source=app_source("artifact"),
     )
 
     with project.start(dev=True) as server:
         response = server.get("/artifact")
 
     assert response.status_code == 200
-    assert response.json() == {"mode": "dev"}
+    assert response.json() == {"mode": "ok"}

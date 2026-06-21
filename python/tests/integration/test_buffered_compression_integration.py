@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import pytest
 
+from .apps import app_source
+
 pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
 
 pytestmark = pytest.mark.server_integration
@@ -31,12 +33,8 @@ pytestmark = pytest.mark.server_integration
 def _make_buffered_project(make_server_project, *, backend: str, **kwargs: object):
     """Build a project that configures ``BOLT_COMPRESSION`` via Django
     settings (the production-realistic path through ``runbolt``) and
-    exposes a large JSON route plus a tiny one.
-
-    Using ``settings_extra`` keeps the harness-injected
-    ``api = BoltAPI()`` / ``/health`` route intact — re-assigning ``api``
-    in ``project_api_body`` would orphan ``/health`` and break the startup
-    probe.
+    installs the ``compression_data`` app — a large JSON route plus a tiny
+    one, with its own ``/health`` startup probe.
     """
     kwargs_repr = ", ".join(f"{k}={v!r}" for k, v in kwargs.items())
     extras = f", {kwargs_repr}" if kwargs_repr else ""
@@ -45,15 +43,7 @@ def _make_buffered_project(make_server_project, *, backend: str, **kwargs: objec
         from django_bolt.middleware import CompressionConfig
         BOLT_COMPRESSION = CompressionConfig(backend={backend!r}{extras})
         """,
-        project_api_body="""
-        @api.get("/data")
-        async def get_data():
-            return {"payload": "x" * 2000}
-
-        @api.get("/tiny")
-        async def tiny():
-            return {"x": "small"}
-        """,
+        api_source=app_source("compression_data"),
     )
 
 
@@ -234,21 +224,7 @@ def test_buffered_and_sse_share_one_compression_config(make_server_project):
         from django_bolt.middleware import CompressionConfig
         BOLT_COMPRESSION = CompressionConfig(backend="brotli")
         """,
-        project_api_body="""
-        from django_bolt.responses import EventSourceResponse
-
-        @api.get("/buffered")
-        async def buffered():
-            return {"payload": "x" * 2000}
-
-        @api.get("/sse")
-        async def sse():
-            async def gen():
-                for i in range(3):
-                    yield {"i": i}
-                    await asyncio.sleep(0)
-            return EventSourceResponse(gen())
-        """,
+        api_source=app_source("compression_sse"),
     )
     with project.start(startup_path="/health") as server:
         buf = server.get("/buffered", headers={"Accept-Encoding": "br"})
@@ -323,21 +299,7 @@ def test_buffered_and_sse_share_negotiation_parser(make_server_project):
         from django_bolt.middleware import CompressionConfig
         BOLT_COMPRESSION = CompressionConfig(backend="brotli")
         """,
-        project_api_body="""
-        from django_bolt.responses import EventSourceResponse
-
-        @api.get("/buffered")
-        async def buffered():
-            return {"payload": "x" * 2000}
-
-        @api.get("/sse")
-        async def sse():
-            async def gen():
-                for i in range(3):
-                    yield {"i": i}
-                    await asyncio.sleep(0)
-            return EventSourceResponse(gen())
-        """,
+        api_source=app_source("compression_sse"),
     )
     with project.start(startup_path="/health") as server:
         buf = server.get("/buffered", headers={"Accept-Encoding": "br;q=0, gzip"})
