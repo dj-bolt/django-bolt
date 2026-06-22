@@ -7,7 +7,7 @@ Tests for OpenAPI schema accuracy improvements:
 """
 
 import enum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import msgspec
 from django.db import models
@@ -528,3 +528,134 @@ def test_constraints_only_meta_still_omits_description():
     assert props["n"]["minimum"] == 1
     assert props["n"]["maximum"] == 9
     assert "description" not in props["n"]
+
+
+# ---------- typed dict value types (dict[K, V]) ----------------------
+#
+# Regression tests for the dict value-type erasure bug. Both dict code paths in
+# `_type_to_schema` (the msgspec `DictType` branch for Struct fields, and the
+# typing `origin is dict` branch for bare/nested response models) used to drop
+# V and emit `additionalProperties: true` unconditionally. Mirroring the list
+# handlers, they now recurse into V so `dict[str, V]` emits
+# `additionalProperties: <schema for V>`, matching `msgspec.json.schema`.
+# Untyped values (bare dict / dict[str, Any]) must still emit
+# `additionalProperties: true` rather than regressing to `{"type": "object"}`.
+
+
+def test_dict_str_int_value_type_preserved():
+    """`dict[str, int]` must carry the value type, not collapse to `true`."""
+
+    class IntMap(msgspec.Struct):
+        counts: dict[str, int]
+
+    props = _get_response_component_schema(IntMap)["properties"]
+    assert props["counts"]["type"] == "object"
+    # Without the fix this is `additionalProperties: true` (the bug).
+    assert props["counts"]["additionalProperties"] == {"type": "integer"}
+
+
+def test_dict_str_str_value_type_preserved():
+    """`dict[str, str]` renders a string-valued `additionalProperties`."""
+
+    class StrMap(msgspec.Struct):
+        labels: dict[str, str]
+
+    props = _get_response_component_schema(StrMap)["properties"]
+    assert props["labels"]["additionalProperties"] == {"type": "string"}
+
+
+def test_dict_str_struct_value_emits_ref_and_registers_component():
+    """`dict[str, SomeStruct]` emits a `$ref` value and registers the component."""
+
+    class DictValueItem(msgspec.Struct):
+        x: int
+
+    class StructMap(msgspec.Struct):
+        items: dict[str, DictValueItem]
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/structmap")
+    async def get_structmap() -> StructMap:
+        pass
+
+    components = _get_schema(api)["components"]["schemas"]
+    ap = components["StructMap"]["properties"]["items"]["additionalProperties"]
+    assert ap == {"$ref": "#/components/schemas/DictValueItem"}
+    # The nested value struct must be registered as its own component.
+    assert "DictValueItem" in components
+
+
+def test_dict_str_optional_value_renders_anyof_with_null():
+    """`dict[str, int | None]` renders an `anyOf` value with a `null` arm."""
+
+    class OptMap(msgspec.Struct):
+        maybe: dict[str, int | None]
+
+    props = _get_response_component_schema(OptMap)["properties"]
+    assert props["maybe"]["additionalProperties"]["anyOf"] == [
+        {"type": "integer"},
+        {"type": "null"},
+    ]
+
+
+def test_dict_str_any_keeps_additional_properties_true():
+    """`dict[str, Any]` has no value type to describe — keep `true`, don't regress.
+
+    Guards the boundary the fix hinges on: an untyped value (msgspec models it as
+    `AnyType`) must NOT become `additionalProperties: {"type": "object"}`.
+    """
+
+    class AnyMap(msgspec.Struct):
+        meta: dict[str, Any]
+
+    props = _get_response_component_schema(AnyMap)["properties"]
+    assert props["meta"]["type"] == "object"
+    assert props["meta"]["additionalProperties"] is True
+
+
+def test_dict_value_types_match_msgspec_schema():
+    """Bolt's `additionalProperties` matches `msgspec.json.schema` for typed dicts.
+
+    Compares the directly-comparable cases (primitive + nullable values); the
+    struct-valued case differs only in `$ref` path (`#/components/schemas` vs
+    msgspec's `#/$defs`) and is covered separately above.
+    """
+
+    class Maps(msgspec.Struct):
+        counts: dict[str, int]
+        labels: dict[str, str]
+        maybe: dict[str, int | None]
+
+    bolt_props = _get_response_component_schema(Maps)["properties"]
+    msgspec_props = msgspec.json.schema_components((Maps,))[1]["Maps"]["properties"]
+    for field_name in ("counts", "labels", "maybe"):
+        assert bolt_props[field_name]["additionalProperties"] == msgspec_props[field_name]["additionalProperties"]
+
+
+def test_dict_value_type_preserved_in_typing_path():
+    """`-> dict[str, int]` exercises the typing `origin is dict` branch (not msgspec)."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/counts")
+    async def get_counts() -> dict[str, int]:
+        pass
+
+    schema = _get_schema(api)
+    resp = schema["paths"]["/counts"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert resp["type"] == "object"
+    assert resp["additionalProperties"] == {"type": "integer"}
+
+
+def test_untyped_dict_typing_path_keeps_additional_properties_true():
+    """`-> dict[str, Any]` on the typing path keeps `true`, doesn't regress."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/raw")
+    async def get_raw() -> dict[str, Any]:
+        pass
+
+    schema = _get_schema(api)
+    resp = schema["paths"]["/raw"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert resp["type"] == "object"
+    assert resp["additionalProperties"] is True

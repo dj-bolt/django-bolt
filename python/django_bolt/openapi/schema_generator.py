@@ -1128,8 +1128,18 @@ class SchemaGenerator:
                     item_schema = self._type_to_schema(item_type, register_component=register_component)
                     return Schema(type="array", items=item_schema)
                 return Schema(type="array", items=Schema(type="object"))
-            # For dict types from msgspec
+            # For dict types from msgspec — recurse into the *value* type so
+            # dict[str, V] emits additionalProperties: <schema for V>, mirroring
+            # the ListType branch above and matching msgspec.json.schema. JSON
+            # object keys are always strings, so only V is described. An untyped
+            # value (bare dict / dict[str, Any], which msgspec models as AnyType)
+            # has nothing to describe — keep additionalProperties: true rather
+            # than regressing to {"type": "object"}.
             if type_name == "DictType":
+                value_type = getattr(type_annotation, "value_type", None)
+                if value_type is not None and type(value_type).__name__ != "AnyType":
+                    value_schema = self._type_to_schema(value_type, register_component=register_component)
+                    return Schema(type="object", additional_properties=value_schema)
                 return Schema(type="object", additional_properties=True)
             # For enum types from msgspec (EnumType for plain enums,
             # CustomType for Django TextChoices/IntegerChoices which use
@@ -1214,8 +1224,17 @@ class SchemaGenerator:
             item_schema = self._type_to_schema(item_type, register_component=register_component)
             return Schema(type="array", items=item_schema)
 
-        # Handle dict
+        # Handle dict — recurse into the value type V of dict[K, V] so the
+        # schema carries additionalProperties: <schema for V>, mirroring the
+        # list branch above and matching msgspec.json.schema. Keys are JSON
+        # strings, so only V is described. Bare dict[K] without a value type or
+        # dict[str, Any] has nothing to describe — keep additionalProperties:
+        # true rather than regressing untyped dicts to {"type": "object"}.
         if origin is dict:
+            value_type = args[1] if len(args) == 2 else None
+            if value_type is not None and value_type is not Any:
+                value_schema = self._type_to_schema(value_type, register_component=register_component)
+                return Schema(type="object", additional_properties=value_schema)
             return Schema(type="object", additional_properties=True)
 
         # Bare typing.Literal annotations don't come through
