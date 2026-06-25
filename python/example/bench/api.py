@@ -2,6 +2,7 @@ import msgspec
 
 from django_bolt import BoltAPI, action
 from django_bolt.exceptions import NotFound
+from django_bolt.serializers.types import Email, HttpsURL, PositiveInt
 from django_bolt.views import ViewSet
 
 from .models import BenchItem
@@ -34,6 +35,25 @@ class BenchItemUpdate(msgspec.Struct):
     value: int | None = None
     description: str | None = None
     is_active: bool | None = None
+
+
+class SchemaDemo(msgspec.Struct):
+    """Demonstrates the OpenAPI schema-accuracy fixes from PR #243.
+
+    Before the fix the codegen-facing schema collapsed these to useless types:
+    - ``email``/``age``/``site`` are documented custom types
+      (``Annotated[T, Meta(description=...)]``) that rendered as ``object``;
+      they now render as ``string``/``integer`` carrying their constraints.
+    - ``scores``/``labels`` are typed maps that rendered as
+      ``additionalProperties: true`` (TS ``Record<string, unknown>``); they
+      now carry the value schema (``additionalProperties: {type: ...}``).
+    """
+
+    email: Email  # -> string (maxLength 254, pattern)
+    age: PositiveInt  # -> integer (exclusiveMinimum 0)
+    site: HttpsURL | None  # -> anyOf [string, null]
+    scores: dict[str, int]  # -> additionalProperties: {type: integer}
+    labels: dict[str, str]  # -> additionalProperties: {type: string}
 
 
 # ============================================================================
@@ -209,3 +229,25 @@ class BenchItemViewSet(ViewSet):
                 )
             )
         return {"count": len(items), "items": items}
+
+
+# ============================================================================
+# OpenAPI schema-accuracy demo (PR #243)
+# ============================================================================
+
+
+@api.get("/schema-demo")
+async def schema_demo() -> SchemaDemo:
+    """GET /bench/schema-demo - Documented custom types + typed dicts in OpenAPI.
+
+    Open the Swagger "Schema" tab for the 200 response and confirm:
+    - ``email``/``age``/``site`` are ``string``/``integer`` (not ``object``)
+    - ``scores``/``labels`` show ``additionalProperties`` typed as integer/string
+    """
+    return SchemaDemo(
+        email="alice@example.com",
+        age=30,
+        site="https://example.com",
+        scores={"cpu": 80, "mem": 60},
+        labels={"env": "prod", "region": "us-east"},
+    )
