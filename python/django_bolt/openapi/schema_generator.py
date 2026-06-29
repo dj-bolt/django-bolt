@@ -33,7 +33,29 @@ if TYPE_CHECKING:
     from ..api import BoltAPI
     from .config import OpenAPIConfig
 
-__all__ = ("SchemaGenerator",)
+__all__ = ("ComponentNameCollisionError", "SchemaGenerator")
+
+
+class ComponentNameCollisionError(ValueError):
+    """Two distinct types claim the same OpenAPI component name.
+
+    Structs and enums share a single ``#/components/schemas`` namespace keyed by
+    ``__name__``. When two different types resolve to the same name, emitting a
+    shared ``$ref`` would silently point one of them at the wrong schema, so the
+    generator raises this instead. The message is built in ``__init__`` (rather
+    than at the raise site) so the colliding types stay introspectable and the
+    raise site stays terse.
+    """
+
+    def __init__(self, schema_name: str, new_type: type, existing_type: type) -> None:
+        self.schema_name = schema_name
+        self.new_type = new_type
+        self.existing_type = existing_type
+        super().__init__(
+            f"OpenAPI component name collision: {new_type!r} and {existing_type!r} "
+            f"both map to component schema '{schema_name}'. Rename one type so "
+            f"each component has a unique name."
+        )
 
 # Mapping from auth backend scheme_name to OpenAPI security scheme identifier
 _SCHEME_NAME_MAP: dict[str, str] = {
@@ -1368,11 +1390,7 @@ class SchemaGenerator:
             self._component_types[schema_name] = cls
             return True
         if existing is not cls:
-            raise ValueError(
-                f"OpenAPI component name collision: {cls!r} and {existing!r} "
-                f"both map to component schema '{schema_name}'. Rename one type "
-                f"so each component has a unique name."
-            )
+            raise ComponentNameCollisionError(schema_name, cls, existing)
         return False
 
     def _struct_to_component_schema(self, struct_type: type) -> Reference:

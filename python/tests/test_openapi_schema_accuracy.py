@@ -10,10 +10,12 @@ import enum
 from typing import Annotated, Any, Literal
 
 import msgspec
+import pytest
 from django.db import models
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
+from django_bolt.openapi.schema_generator import ComponentNameCollisionError, SchemaGenerator
 from django_bolt.param_functions import Query
 from django_bolt.serializers import Serializer
 from django_bolt.serializers.types import Email, HttpsURL, PositiveInt
@@ -850,7 +852,8 @@ def test_struct_and_enum_name_collision_raises():
     """A struct and an enum sharing a `__name__` must not silently share a `$ref`.
 
     They'd otherwise both register `#/components/schemas/Status`, with the
-    second silently resolving to the first's shape. The generator raises instead.
+    second silently resolving to the first's shape. Schema generation raises a
+    `ComponentNameCollisionError` (a `ValueError`) naming both colliding types.
     """
 
     class Status(enum.StrEnum):  # noqa: F811 - intentional name clash with the struct below
@@ -873,12 +876,12 @@ def test_struct_and_enum_name_collision_raises():
     async def get_wrapper() -> Wrapper:
         pass
 
-    api._register_openapi_routes()
-    with TestClient(api) as client:
-        response = client.get("/docs/openapi.json")
-    # The collision surfaces as a 500 (the ValueError propagates out of schema
-    # generation) rather than a 200 carrying a silently-wrong $ref.
-    assert response.status_code == 500
+    generator = SchemaGenerator(api, api._openapi_config)
+    with pytest.raises(ComponentNameCollisionError) as exc_info:
+        generator.generate()
+    assert exc_info.value.schema_name == "Status"
+    assert {exc_info.value.new_type, exc_info.value.existing_type} == {StatusEnum, StatusStruct}
+    assert "OpenAPI component name collision" in str(exc_info.value)
 
 
 def test_same_named_enum_reused_across_fields_does_not_falsely_collide():
