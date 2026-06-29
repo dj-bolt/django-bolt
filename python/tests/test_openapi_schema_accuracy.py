@@ -846,6 +846,58 @@ def test_query_param_enum_stays_inline():
     assert set(inner["enum"]) == {"active", "inactive"}
 
 
+def test_struct_and_enum_name_collision_raises():
+    """A struct and an enum sharing a `__name__` must not silently share a `$ref`.
+
+    They'd otherwise both register `#/components/schemas/Status`, with the
+    second silently resolving to the first's shape. The generator raises instead.
+    """
+
+    class Status(enum.StrEnum):  # noqa: F811 - intentional name clash with the struct below
+        ok = "ok"
+
+    StatusEnum = Status
+
+    class Status(msgspec.Struct):  # noqa: F811 - intentional name clash with the enum above
+        code: int
+
+    StatusStruct = Status
+
+    class Wrapper(msgspec.Struct):
+        state: StatusEnum
+        detail: StatusStruct
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/wrapper")
+    async def get_wrapper() -> Wrapper:
+        pass
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        response = client.get("/docs/openapi.json")
+    # The collision surfaces as a 500 (the ValueError propagates out of schema
+    # generation) rather than a 200 carrying a silently-wrong $ref.
+    assert response.status_code == 500
+
+
+def test_same_named_enum_reused_across_fields_does_not_falsely_collide():
+    """The same enum on multiple fields is reuse, not a collision — no raise."""
+
+    class TwoStages(msgspec.Struct):
+        primary: GateReason
+        secondary: GateReason
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/twostages")
+    async def get_two() -> TwoStages:
+        pass
+
+    schema = _get_schema(api)
+    assert "GateReason" in schema["components"]["schemas"]
+
+
 def test_shared_enum_reuses_single_component():
     """The same enum on two fields registers one component and two `$ref`s."""
 

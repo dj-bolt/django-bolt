@@ -196,6 +196,10 @@ class SchemaGenerator:
         self.api = api
         self.config = config
         self.schemas: dict[str, Schema] = {}  # Component schemas registry
+        # Tracks which type currently owns each component name so structs and
+        # enums (which share the `self.schemas` namespace, keyed by __name__)
+        # can't silently reuse each other's `$ref`. See _claim_component_name.
+        self._component_types: dict[str, type] = {}
 
     @staticmethod
     def _schema_kwargs(**kwargs: Any) -> dict[str, Any]:
@@ -1276,7 +1280,7 @@ class SchemaGenerator:
         # Default to generic object
         return Schema(type="object")
 
-    def _struct_to_schema(self, struct_type: type, register_component: bool = False) -> Schema:
+    def _struct_to_schema(self, struct_type: type, *, register_component: bool = False) -> Schema:
         """Convert msgspec.Struct to inline OpenAPI Schema.
 
         For tagged unions (``msgspec.Struct, tag=...``), msgspec injects the
@@ -1344,6 +1348,33 @@ class SchemaGenerator:
             required=required or None,
         )
 
+    def _claim_component_name(self, schema_name: str, cls: type) -> bool:
+        """Reserve a component name for ``cls``, guarding against collisions.
+
+        Structs and enums share the ``self.schemas`` namespace, keyed only by
+        ``__name__``. Two distinct types with the same name (a struct ``Status``
+        and an enum ``Status``, or same-named types from different modules)
+        would otherwise have the second silently reuse the first's ``$ref``,
+        emitting a reference that resolves to the wrong schema shape.
+
+        Returns ``True`` when the name is newly claimed (the caller must build
+        and store the schema), ``False`` when it was already claimed by the
+        *same* type (reuse the existing ``$ref``). Raises ``ValueError`` when a
+        *different* type already holds the name — surfacing the collision loudly
+        instead of producing a silently wrong spec.
+        """
+        existing = self._component_types.get(schema_name)
+        if existing is None:
+            self._component_types[schema_name] = cls
+            return True
+        if existing is not cls:
+            raise ValueError(
+                f"OpenAPI component name collision: {cls!r} and {existing!r} "
+                f"both map to component schema '{schema_name}'. Rename one type "
+                f"so each component has a unique name."
+            )
+        return False
+
     def _struct_to_component_schema(self, struct_type: type) -> Reference:
         """Convert msgspec.Struct to component schema and return reference.
 
@@ -1355,8 +1386,10 @@ class SchemaGenerator:
         """
         schema_name = struct_type.__name__
 
-        # Check if already registered (or currently being processed)
-        if schema_name not in self.schemas:
+        # Claim the name (raising on a collision with a different type) before
+        # processing fields. A re-entry for the *same* struct returns False and
+        # reuses the sentinel/real schema already in self.schemas.
+        if self._claim_component_name(schema_name, struct_type):
             # Insert a sentinel *before* processing fields so that
             # self-referential types (e.g. TreeNode with children:
             # list[TreeNode]) hit the guard on re-entry instead of
@@ -1386,7 +1419,7 @@ class SchemaGenerator:
         """
         schema_name = enum_cls.__name__
 
-        if schema_name not in self.schemas:
+        if self._claim_component_name(schema_name, enum_cls):
             schema = self._enum_values_schema([e.value for e in enum_cls])
             # Read the enum's *own* docstring (not an inherited one) the same
             # way structs do; undocumented enums carry no `description`.
