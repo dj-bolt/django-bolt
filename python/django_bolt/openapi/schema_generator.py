@@ -57,6 +57,7 @@ class ComponentNameCollisionError(ValueError):
             f"each component has a unique name."
         )
 
+
 # Mapping from auth backend scheme_name to OpenAPI security scheme identifier
 _SCHEME_NAME_MAP: dict[str, str] = {
     "jwt": "BearerAuth",
