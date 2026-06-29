@@ -303,6 +303,16 @@ class SchemaGenerator:
         return Schema(any_of=arms)
 
     @staticmethod
+    def _array_schema(item_schema: Schema | Reference) -> Schema:
+        """``array`` schema for a ``list[T]``/sequence, with ``items`` set to T's
+        schema. Shared by the msgspec-inspect ``ListType`` branch and the typing
+        ``list`` branch so both describe their element type identically. An
+        untyped element resolves to ``{"type": "object"}`` upstream, matching the
+        bare-``dict`` fallback in ``_mapping_schema``.
+        """
+        return Schema(type="array", items=item_schema)
+
+    @staticmethod
     def _mapping_schema(value_schema: Schema | Reference | None) -> Schema:
         """``object`` schema for a ``dict[K, V]``/mapping.
 
@@ -1220,10 +1230,12 @@ class SchemaGenerator:
                 )
             if type_name == "ListType":
                 item_type = getattr(type_annotation, "item_type", None)
-                if item_type:
-                    item_schema = self._type_to_schema(item_type, register_component=register_component)
-                    return Schema(type="array", items=item_schema)
-                return Schema(type="array", items=Schema(type="object"))
+                item_schema = (
+                    self._type_to_schema(item_type, register_component=register_component)
+                    if item_type
+                    else Schema(type="object")
+                )
+                return self._array_schema(item_schema)
             # For dict types from msgspec — recurse into the *value* type via
             # _mapping_schema. An untyped value (bare dict / dict[str, Any],
             # which msgspec models as AnyType) stays additionalProperties: true.
@@ -1314,11 +1326,11 @@ class SchemaGenerator:
             inner = [self._type_to_schema(arg, register_component=register_component) for arg in non_none_args]
             return self._union_schema(inner, has_none=has_none, tagged=_is_tagged_struct_union(non_none_args))
 
-        # Handle list
+        # Handle list — recurse into the element type T of list[T] via
+        # _array_schema, mirroring the msgspec ListType branch above.
         if origin is list:
             item_type = args[0] if args else Any
-            item_schema = self._type_to_schema(item_type, register_component=register_component)
-            return Schema(type="array", items=item_schema)
+            return self._array_schema(self._type_to_schema(item_type, register_component=register_component))
 
         # Handle dict — recurse into the value type V of dict[K, V] via
         # _mapping_schema. Bare dict[K] without a value type or dict[str, Any]
