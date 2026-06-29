@@ -1247,6 +1247,17 @@ class SchemaGenerator:
             else:
                 return self._struct_to_schema(type_annotation)
 
+        # Handle bare enum classes (e.g. ``-> GateReason`` or ``list[GateReason]``).
+        # A named enum used as a Struct *field* reaches the msgspec.inspect
+        # EnumType/CustomType branch above; used directly as a (nested) response
+        # model it arrives here as a raw enum class via the typing path. Mirror
+        # the Struct handling: promote to a named component + $ref in component
+        # contexts, inline otherwise. (#246)
+        if isinstance(type_annotation, type) and issubclass(type_annotation, enum.Enum):
+            if register_component:
+                return self._enum_to_component_schema(type_annotation)
+            return self._enum_values_schema([e.value for e in type_annotation])
+
         if origin is Union or origin is UnionType:
             # Split out `None` into a `null` arm (OpenAPI 3.1 nullable
             # encoding). Use `one_of` for tagged Struct unions so Swagger

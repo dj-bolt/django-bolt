@@ -780,6 +780,43 @@ def test_named_enum_without_docstring_omits_description():
     assert component["title"] == "UndocumentedColor"
 
 
+def test_bare_enum_response_model_emits_ref_and_component():
+    """`-> GateReason` (a bare enum, not a struct field) becomes a `$ref` + component.
+
+    Struct *fields* reach the msgspec.inspect enum branch; a bare/nested enum
+    response annotation arrives via the typing path and used to fall through to
+    `{"type": "object"}`. It must promote like any other named enum.
+    """
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/reason")
+    async def get_reason() -> GateReason:
+        pass
+
+    schema = _get_schema(api)
+    resp = schema["paths"]["/reason"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert resp == {"$ref": "#/components/schemas/GateReason"}
+    component = schema["components"]["schemas"]["GateReason"]
+    assert component["description"] == "Why a feature is off."
+    assert component["type"] == "string"
+    assert set(component["enum"]) == {"entitlement", "capability"}
+
+
+def test_bare_enum_inside_list_response_model_emits_ref():
+    """`-> list[GateReason]` recurses to the same `$ref` for its item type."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/reasons")
+    async def get_reasons() -> list[GateReason]:
+        pass
+
+    schema = _get_schema(api)
+    resp = schema["paths"]["/reasons"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert resp["type"] == "array"
+    assert resp["items"] == {"$ref": "#/components/schemas/GateReason"}
+    assert "GateReason" in schema["components"]["schemas"]
+
+
 def test_nullable_named_enum_field_refs_inside_anyof():
     """`GateReason | None = None` → `anyOf: [$ref, null]` with `default: null`.
 
