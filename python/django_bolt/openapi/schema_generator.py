@@ -277,6 +277,15 @@ class SchemaGenerator:
         if has_default:
             field_schema = self._with_default(field_schema, default)
             field_required = False
+        elif field.default_factory is not msgspec.NODEFAULT:
+            # Factory-defaulted fields (the usual mutable-default case, e.g.
+            # ``list``/``dict``) carry their default on ``field.default_factory``
+            # instead of ``field.default`` — materialize it so the schema gains
+            # ``default: []``/``{}``, matching ``msgspec.json.schema``. The
+            # _FieldMarker path above never reaches here (markers live on
+            # ``field.default``, leaving ``default_factory`` as NODEFAULT).
+            field_schema = self._with_default(field_schema, field.default_factory())
+            field_required = False
 
         return field_name, field_schema, field_required
 
@@ -1149,6 +1158,15 @@ class SchemaGenerator:
                 and hasattr(type_annotation, "cls")
                 and issubclass(type_annotation.cls, enum.Enum)
             ):
+                # Named enum classes (enum.Enum / msgspec EnumType / Django
+                # TextChoices/IntegerChoices) are promoted to named components +
+                # $ref in component contexts (request/response bodies), parallel
+                # to how Structs are registered — so consumers get a reusable
+                # type and the enum's docstring survives as `description`. In
+                # inline contexts (query params) they stay inline. Anonymous
+                # `Literal[...]` unions (LiteralType, below) always stay inline.
+                if register_component:
+                    return self._enum_to_component_schema(type_annotation.cls)
                 values = [e.value for e in type_annotation.cls]
                 return self._enum_values_schema(values)
             # msgspec.inspect.type_info represents Literal fields on Structs as
@@ -1258,7 +1276,7 @@ class SchemaGenerator:
         # Default to generic object
         return Schema(type="object")
 
-    def _struct_to_schema(self, struct_type: type) -> Schema:
+    def _struct_to_schema(self, struct_type: type, register_component: bool = False) -> Schema:
         """Convert msgspec.Struct to inline OpenAPI Schema.
 
         For tagged unions (``msgspec.Struct, tag=...``), msgspec injects the
@@ -1280,6 +1298,9 @@ class SchemaGenerator:
 
         Args:
             struct_type: msgspec.Struct type.
+            register_component: Whether nested complex types (enums, structs)
+                should be registered as named components + ``$ref`` rather than
+                inlined. True for body/response schemas, False for inline use.
 
         Returns:
             Schema object.
@@ -1289,7 +1310,9 @@ class SchemaGenerator:
         required = []
 
         for field in struct_info.fields:
-            field_name, field_schema, field_required = self._msgspec_field_schema(field, register_component=False)
+            field_name, field_schema, field_required = self._msgspec_field_schema(
+                field, register_component=register_component
+            )
             properties[field_name] = field_schema
 
             # Check if required
@@ -1340,6 +1363,35 @@ class SchemaGenerator:
             # recursing infinitely.  The sentinel is overwritten once
             # _struct_to_schema returns the real schema.
             self.schemas[schema_name] = Schema(type="object")
-            self.schemas[schema_name] = self._struct_to_schema(struct_type)
+            self.schemas[schema_name] = self._struct_to_schema(struct_type, register_component=True)
+
+        return Reference(ref=f"#/components/schemas/{schema_name}")
+
+    def _enum_to_component_schema(self, enum_cls: type) -> Reference:
+        """Register a named enum class as a component schema and return a reference.
+
+        Parallels ``_struct_to_component_schema``: named enums (``enum.Enum`` /
+        msgspec ``EnumType`` / Django ``TextChoices``/``IntegerChoices``) become
+        reusable ``#/components/schemas/<Name>`` entries + ``$ref`` so codegen
+        tools can emit a shared type, and the enum's docstring survives as
+        ``description``. The narrowest fitting ``type`` is inferred from the
+        member values, and ``title`` is set to the class name — matching the
+        shape ``msgspec.json.schema_components`` produces for enums.
+
+        Args:
+            enum_cls: An ``enum.Enum`` subclass.
+
+        Returns:
+            Reference to the component schema.
+        """
+        schema_name = enum_cls.__name__
+
+        if schema_name not in self.schemas:
+            schema = self._enum_values_schema([e.value for e in enum_cls])
+            # Read the enum's *own* docstring (not an inherited one) the same
+            # way structs do; undocumented enums carry no `description`.
+            own_doc = enum_cls.__dict__.get("__doc__")
+            description = inspect.cleandoc(own_doc) if own_doc else None
+            self.schemas[schema_name] = replace(schema, title=schema_name, description=description)
 
         return Reference(ref=f"#/components/schemas/{schema_name}")

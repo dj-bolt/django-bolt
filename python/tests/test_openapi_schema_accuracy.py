@@ -659,3 +659,210 @@ def test_untyped_dict_typing_path_keeps_additional_properties_true():
     resp = schema["paths"]["/raw"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
     assert resp["type"] == "object"
     assert resp["additionalProperties"] is True
+
+
+# ---------- factory defaults (default_factory) -----------------------
+#
+# Regression tests for #245. `_msgspec_field_schema` carried `field.default`
+# onto the schema but never read `field.default_factory`, so factory-defaulted
+# fields (the usual mutable-default case: `list`/`dict`) lost their `default`.
+# It now materializes the factory, matching `msgspec.json.schema`.
+
+
+class FactoryDefaults(msgspec.Struct):
+    name: str = ""
+    tags: list[str] = msgspec.field(default_factory=list)
+    meta: dict[str, str] = msgspec.field(default_factory=dict)
+
+
+def test_factory_default_list_materialized():
+    """A `default_factory=list` field carries `default: []`, not no default."""
+    props = _get_response_component_schema(FactoryDefaults, path="/factory")["properties"]
+    # Without the fix `tags` has no `default` at all (the reported bug).
+    assert props["tags"]["default"] == []
+
+
+def test_factory_default_dict_materialized():
+    """A `default_factory=dict` field carries `default: {}`."""
+    props = _get_response_component_schema(FactoryDefaults, path="/factory")["properties"]
+    assert props["meta"]["default"] == {}
+
+
+def test_scalar_default_still_present_alongside_factory_defaults():
+    """The pre-existing scalar-default path is untouched by the factory fallback."""
+    props = _get_response_component_schema(FactoryDefaults, path="/factory")["properties"]
+    assert props["name"]["default"] == ""
+
+
+def test_factory_defaulted_fields_are_not_required():
+    """Factory-defaulted fields are optional, so they stay out of `required`."""
+    schema = _get_response_component_schema(FactoryDefaults, path="/factory")
+    assert "required" not in schema or schema.get("required") in (None, [])
+
+
+def test_factory_defaults_match_msgspec_schema():
+    """Bolt's component schema for factory defaults matches `msgspec.json.schema`."""
+    bolt_props = _get_response_component_schema(FactoryDefaults, path="/factory")["properties"]
+    msgspec_props = msgspec.json.schema_components((FactoryDefaults,))[1]["FactoryDefaults"]["properties"]
+    for field_name in ("name", "tags", "meta"):
+        assert bolt_props[field_name]["default"] == msgspec_props[field_name]["default"]
+
+
+# ---------- named enums promoted to components -----------------------
+#
+# Regression tests for #246. Named enum classes (`enum.Enum` / msgspec
+# `EnumType` / Django `TextChoices`) used in body/response schemas are now
+# promoted to named `#/components/schemas/<Name>` components + `$ref`, parallel
+# to how Structs are handled — so consumers get a reusable type and the enum's
+# docstring survives as `description`. Anonymous `Literal[...]` unions stay
+# inline; query-param enums (covered above) also stay inline.
+
+
+class GateReason(enum.StrEnum):
+    """Why a feature is off."""
+
+    entitlement = "entitlement"
+    capability = "capability"
+
+
+class UndocumentedColor(enum.StrEnum):
+    red = "red"
+    green = "green"
+
+
+def test_named_enum_field_emits_ref_in_component_schema():
+    """An enum field inside a response struct becomes a `$ref`, not inline."""
+
+    class FeatureState(msgspec.Struct):
+        reason: GateReason
+
+    props = _get_response_component_schema(FeatureState)["properties"]
+    assert props["reason"] == {"$ref": "#/components/schemas/GateReason"}
+
+
+def test_named_enum_registers_component_with_description():
+    """The promoted enum component carries its values, title, and docstring."""
+
+    class FeatureState(msgspec.Struct):
+        reason: GateReason
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/feature")
+    async def get_feature() -> FeatureState:
+        pass
+
+    components = _get_schema(api)["components"]["schemas"]
+    assert "GateReason" in components
+    enum_component = components["GateReason"]
+    assert enum_component["title"] == "GateReason"
+    assert enum_component["description"] == "Why a feature is off."
+    assert enum_component["type"] == "string"
+    assert set(enum_component["enum"]) == {"entitlement", "capability"}
+
+
+def test_named_enum_without_docstring_omits_description():
+    """An undocumented enum component carries no `description` field."""
+
+    class Palette(msgspec.Struct):
+        color: UndocumentedColor
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/palette")
+    async def get_palette() -> Palette:
+        pass
+
+    component = _get_schema(api)["components"]["schemas"]["UndocumentedColor"]
+    assert "description" not in component
+    assert component["title"] == "UndocumentedColor"
+
+
+def test_nullable_named_enum_field_refs_inside_anyof():
+    """`GateReason | None = None` → `anyOf: [$ref, null]` with `default: null`.
+
+    Matches the shape `msgspec.json.schema_components` produces.
+    """
+
+    class FeatureState(msgspec.Struct):
+        reason: GateReason | None = None
+
+    schema = _get_response_component_schema(FeatureState)
+    reason = schema["properties"]["reason"]
+    assert reason["anyOf"] == [
+        {"$ref": "#/components/schemas/GateReason"},
+        {"type": "null"},
+    ]
+    assert reason["default"] is None
+
+
+def test_django_text_choices_promoted_to_component():
+    """A Django `TextChoices` field (msgspec `CustomType`) is promoted too."""
+
+    class Task(msgspec.Struct):
+        status: DjangoStatus
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/task")
+    async def get_task() -> Task:
+        pass
+
+    components = _get_schema(api)["components"]["schemas"]
+    assert components["Task"]["properties"]["status"] == {"$ref": "#/components/schemas/DjangoStatus"}
+    assert components["DjangoStatus"]["type"] == "string"
+    assert set(components["DjangoStatus"]["enum"]) == {"planned", "active", "completed"}
+
+
+def test_anonymous_literal_field_stays_inline():
+    """An anonymous `Literal[...]` field is NOT promoted — it stays inline.
+
+    Guards the boundary the design hinges on: only named enum *classes* become
+    components; anonymous literal unions have no name to register under.
+    """
+
+    class SortSpec(msgspec.Struct):
+        order: Literal["asc", "desc"] = "asc"
+
+    schema = _get_response_component_schema(SortSpec)
+    order = schema["properties"]["order"]
+    assert "$ref" not in order
+    assert order["type"] == "string"
+    assert set(order["enum"]) == {"asc", "desc"}
+    # No component should have been registered for the anonymous literal.
+    assert set(schema["properties"]) == {"order"}
+
+
+def test_query_param_enum_stays_inline():
+    """Query-param enums are NOT promoted (inline context); existing behavior holds."""
+
+    class FilterQuery(msgspec.Struct):
+        status: RegularEnum | None = None
+
+    status_schema = _get_query_param_schema(FilterQuery, "status")
+    inner = status_schema["anyOf"][0]
+    assert "$ref" not in inner
+    assert inner["type"] == "string"
+    assert set(inner["enum"]) == {"active", "inactive"}
+
+
+def test_shared_enum_reuses_single_component():
+    """The same enum on two fields registers one component and two `$ref`s."""
+
+    class TwoGates(msgspec.Struct):
+        primary: GateReason
+        secondary: GateReason
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/gates")
+    async def get_gates() -> TwoGates:
+        pass
+
+    schema = _get_schema(api)
+    components = schema["components"]["schemas"]
+    ref = {"$ref": "#/components/schemas/GateReason"}
+    assert components["TwoGates"]["properties"]["primary"] == ref
+    assert components["TwoGates"]["properties"]["secondary"] == ref
+    # Exactly one shared enum component, not one per use site.
+    assert sum(1 for name in components if name == "GateReason") == 1
