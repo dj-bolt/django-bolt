@@ -86,7 +86,16 @@ just perf-test  # 4 processes × 1 worker, 50k requests
 
 # ORM-specific benchmark
 just orm-test   # Sets up DB, seeds data, benchmarks ORM endpoints
+
+# Memory soak (leak gate): sustained load on a body endpoint, samples server
+# RSS over time, exits non-zero if RSS grows past the threshold (MiB).
+just soak          # 120s, fail if RSS grows >50 MiB (positional args, defaults shown)
+just soak 180 40   # 180s soak, 40 MiB threshold
 ```
+
+Queue/allocation *behavior* (bounded-drop, clean shutdown) is unit-tested in
+`python/tests/test_logging.py`; `just soak` guards whole-server RSS *stability*
+and needs `bombardier` installed.
 
 ### Database (Standard Django)
 

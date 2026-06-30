@@ -145,6 +145,14 @@ build-bench: build save-bench
 bench-params host=host port=port c=c n=n p=p workers=workers:
     P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark_params.sh
 
+# Memory soak: sustained load on a body endpoint; fails (exit 1) if RSS grows
+# past threshold MiB (leak gate). Needs bombardier. Args are positional:
+#   just soak              # 120s, 50 MiB threshold (defaults)
+#   just soak 180          # 180s soak
+#   just soak 180 40       # 180s, fail if RSS grows >40 MiB
+soak dur="120" threshold="50" c=c host=host port="8011":
+    P=1 WORKERS=1 C={{c}} DUR={{dur}} THRESHOLD_MIB={{threshold}} HOST={{host}} PORT={{port}} ./scripts/soak_memory.sh
+
 # Release new version
 # Usage: just release 0.2.2
 # Usage: just release 0.3.0-alpha1 (for pre-releases)
