@@ -1055,6 +1055,24 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     let is_multipart = content_type.starts_with("multipart/form-data");
     let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
 
+    // Parse Content-Length once and fast-reject oversized requests before reading
+    // any body bytes. Applies to both multipart and non-multipart paths so the
+    // payload-size limit is enforced consistently regardless of content type.
+    // Only enforced when the route actually reads a body; no-body routes ignore
+    // the payload as before. For chunked encoding (no Content-Length), the
+    // per-path streaming checks below still bound the aggregate body against
+    // state.max_payload_size.
+    let content_length: Option<usize> = req
+        .headers()
+        .get(actix_web::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if (needs_body || needs_form_parsing)
+        && matches!(content_length, Some(len) if len > state.max_payload_size)
+    {
+        return responses::error_413();
+    }
+
     // Read body from payload only when needed.
     // For multipart, we need the payload stream directly.
     let (body, form_result): (Vec<u8>, Option<FormParseResult>) =
@@ -1087,29 +1105,33 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 max_upload_size,
                 memory_spool_threshold,
                 DEFAULT_MAX_PARTS,
+                state.max_payload_size,
             )
             .await
             {
                 Ok(result) => (Vec::new(), Some(result)),
                 Err(validation_error) => {
+                    // Aggregate-size overflow maps to 413 to match the non-multipart
+                    // path; other multipart failures stay 422 validation errors.
+                    if validation_error.error_type == "payload_too_large" {
+                        return responses::error_413();
+                    }
                     return build_validation_error_response(&validation_error);
                 }
             }
         } else {
-            // Read payload as bytes (for non-multipart requests)
-            // Pre-allocate body buffer using Content-Length to avoid repeated Vec
-            // reallocations during extend_from_slice. For chunked encoding or missing
-            // Content-Length, Vec::new() starts at 0 capacity (geometric growth).
-            let content_length: Option<usize> = req
-                .headers()
-                .get(actix_web::http::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<usize>().ok());
-            if matches!(content_length, Some(len) if len > state.max_payload_size) {
-                return responses::error_413();
-            }
+            // Read payload as bytes (for non-multipart requests).
+            // Content-Length was parsed and range-checked above; use it to pre-size
+            // the buffer and avoid repeated Vec reallocations during
+            // extend_from_slice. For chunked encoding or missing Content-Length,
+            // Vec::new() starts at 0 capacity (geometric growth).
+            //
+            // Cap pre-allocation so a forged Content-Length can't reserve up to
+            // max_payload_size of address space from the header alone; larger
+            // legitimate bodies still grow as bytes actually arrive.
+            const BODY_PREALLOC_CAP: usize = 64 * 1024;
             let mut body_vec = match content_length {
-                Some(len) if len > 0 => Vec::with_capacity(len),
+                Some(len) if len > 0 => Vec::with_capacity(len.min(BODY_PREALLOC_CAP)),
                 _ => Vec::new(),
             };
             let mut total_read: usize = 0;

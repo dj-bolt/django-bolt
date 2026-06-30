@@ -276,6 +276,7 @@ pub fn parse_urlencoded(
 ///         /* max_upload_size */ 10 * 1024 * 1024,
 ///         /* memory_limit */ 1024 * 1024,
 ///         /* max_parts */ 1000,
+///         /* max_total_size */ 50 * 1024 * 1024,
 ///     ).await;
 ///
 ///     match result {
@@ -295,10 +296,16 @@ pub async fn parse_multipart(
     max_upload_size: usize,
     memory_limit: usize,
     max_parts: usize,
+    max_total_size: usize,
 ) -> Result<FormParseResult, ValidationError> {
     let mut form_map: HashMap<String, FormValue> = HashMap::new();
     let mut files_map: HashMap<String, Vec<FileInfo>> = HashMap::new();
     let mut part_count = 0;
+    // Aggregate bytes accepted across all parts (files + form fields). Bounds the
+    // total payload against the global limit; per-file `max_upload_size` remains
+    // the finer-grained limit. Overshoot is at most one part's worth, since each
+    // part is already individually bounded.
+    let mut total_bytes: usize = 0;
 
     while let Some(item) = payload.next().await {
         // Security: Check part count BEFORE expensive field parsing
@@ -348,6 +355,17 @@ pub async fn parse_multipart(
             )
             .await?;
 
+            // Enforce aggregate payload limit across all parts.
+            total_bytes = total_bytes.saturating_add(file_info.size);
+            if total_bytes > max_total_size {
+                return Err(ValidationError {
+                    error_type: "payload_too_large".to_string(),
+                    loc: vec!["body".to_string()],
+                    msg: format!("Payload exceeds maximum size of {} bytes", max_total_size),
+                    ctx: HashMap::new(),
+                });
+            }
+
             // Validate file if constraints exist
             if let Some(constraints) = file_constraints.get(&field_name) {
                 validate_file(&file_info, &field_name, constraints)?;
@@ -382,6 +400,17 @@ pub async fn parse_multipart(
                     msg: format!("Failed to read field data: {}", e),
                     ctx: HashMap::new(),
                 })?;
+                // Enforce aggregate payload limit incrementally so an unbounded
+                // form field can't exhaust memory before the part finishes.
+                total_bytes = total_bytes.saturating_add(data.len());
+                if total_bytes > max_total_size {
+                    return Err(ValidationError {
+                        error_type: "payload_too_large".to_string(),
+                        loc: vec!["body".to_string()],
+                        msg: format!("Payload exceeds maximum size of {} bytes", max_total_size),
+                        ctx: HashMap::new(),
+                    });
+                }
                 value_bytes.extend_from_slice(&data);
             }
 

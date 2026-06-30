@@ -865,6 +865,21 @@ async fn handle_test_request_internal(
     let is_multipart = content_type.starts_with("multipart/form-data");
     let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
 
+    // Parse Content-Length once and fast-reject oversized requests before reading
+    // body bytes — mirrors the production handler so payload-size limits behave
+    // identically under TestClient. Only enforced for routes that read a body.
+    let needs_body = route_meta.as_ref().map_or(true, |m| m.plan.needs_body());
+    let content_length: Option<usize> = req
+        .headers()
+        .get(actix_web::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if (needs_body || needs_form_parsing)
+        && matches!(content_length, Some(len) if len > state.max_payload_size)
+    {
+        return responses::error_413();
+    }
+
     // Read body from payload (before form parsing consumes it for multipart)
     let (body, form_result): (Vec<u8>, Option<FormParseResult>) =
         if needs_form_parsing && is_multipart {
@@ -898,12 +913,17 @@ async fn handle_test_request_internal(
                 max_upload_size,
                 memory_spool_threshold,
                 DEFAULT_MAX_PARTS,
+                state.max_payload_size,
             )
             .await
             {
                 Ok(result) => (Vec::new(), Some(result)),
                 Err(validation_error) => {
-                    // Return HTTP 422 for validation errors
+                    // Aggregate-size overflow maps to 413 to match the non-multipart
+                    // path; other multipart failures stay 422 validation errors.
+                    if validation_error.error_type == "payload_too_large" {
+                        return responses::error_413();
+                    }
                     let body = serde_json::json!({
                         "detail": [validation_error.to_json()]
                     });
@@ -913,11 +933,24 @@ async fn handle_test_request_internal(
                 }
             }
         } else {
-            // Read payload as bytes (for non-multipart requests)
+            // Read payload as bytes (for non-multipart requests).
+            // Bound the aggregate body against max_payload_size during streaming
+            // so chunked requests (no Content-Length) are also enforced — mirrors
+            // the production handler.
             let mut body_bytes = web::BytesMut::new();
+            let mut total_read: usize = 0;
             while let Some(chunk) = payload.next().await {
                 match chunk {
-                    Ok(data) => body_bytes.extend_from_slice(&data),
+                    Ok(data) => {
+                        total_read = match total_read.checked_add(data.len()) {
+                            Some(v) => v,
+                            None => return responses::error_413(),
+                        };
+                        if total_read > state.max_payload_size {
+                            return responses::error_413();
+                        }
+                        body_bytes.extend_from_slice(&data);
+                    }
                     Err(e) => {
                         return HttpResponse::BadRequest()
                             .content_type("application/json")

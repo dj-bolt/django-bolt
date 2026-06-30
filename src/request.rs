@@ -16,6 +16,13 @@ pub enum HttpMethod {
     DELETE = 4,
     HEAD = 5,
     OPTIONS = 6,
+    /// Defensive fallback for a method outside the standard set. Unreachable in
+    /// practice: `Router::register` rejects non-standard methods and
+    /// `Router::find` returns `None` for them, so a `PyRequest` is only ever
+    /// built for one of the seven variants above. If a future construction path
+    /// could carry an arbitrary verb to `PyRequest`, switch this to carry the
+    /// original string (e.g. `Other(Box<str>)`) so `request.method` never
+    /// silently reports "UNKNOWN".
     Unknown = 7,
 }
 

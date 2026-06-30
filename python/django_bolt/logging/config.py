@@ -15,7 +15,7 @@ import logging.config
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from logging.handlers import QueueHandler, QueueListener
-from queue import Queue
+from queue import Full, Queue
 
 try:
     from django.conf import settings
@@ -225,6 +225,22 @@ def get_default_logging_config() -> LoggingConfig:
     )
 
 
+class _DropOnFullQueueHandler(QueueHandler):
+    """QueueHandler that drops records when the bounded queue is full.
+
+    The stock ``QueueHandler`` calls ``Queue.put_nowait``, which raises
+    ``queue.Full`` once the bounded queue saturates. ``emit`` then routes that
+    to ``handleError``, which writes a traceback to stderr per record (because
+    ``logging.raiseExceptions`` defaults to ``True``) — a stderr storm under the
+    exact load spike the bound is meant to survive. Swallowing ``Full`` here
+    drops the record quietly while keeping the listener thread healthy.
+    """
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        with contextlib.suppress(Full):
+            self.queue.put_nowait(record)
+
+
 def _ensure_queue_logging(base_level: str) -> QueueHandler:
     """Create or reuse a queue-based logging setup.
 
@@ -236,11 +252,11 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
     global _QUEUE_LISTENER, _QUEUE  # noqa: PLW0603
 
     if _QUEUE is None:
-        # Bounded queue prevents OOM under extreme load spikes.
-        # Once full, log records are silently dropped (better than crashing).
+        # Bounded queue prevents unbounded backlog → OOM under load spikes.
+        # Records are dropped (via _DropOnFullQueueHandler) when full.
         _QUEUE = Queue(maxsize=10000)
 
-    queue_handler = QueueHandler(_QUEUE)
+    queue_handler = _DropOnFullQueueHandler(_QUEUE)
     queue_handler.setLevel(logging.DEBUG)
 
     if _QUEUE_LISTENER is None:

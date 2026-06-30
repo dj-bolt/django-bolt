@@ -9,8 +9,11 @@ These tests validate the behavior documented in docs/LOGGING.md:
 - Integration with Django's logging system
 """
 
+import io
 import logging
+from contextlib import redirect_stderr
 from logging.handlers import QueueHandler
+from queue import Queue
 from unittest.mock import Mock
 
 import pytest
@@ -18,7 +21,11 @@ from django.conf import settings
 
 import django_bolt.logging.config as config_module
 from django_bolt.logging import LoggingConfig, LoggingMiddleware, create_logging_middleware
-from django_bolt.logging.config import _ensure_queue_logging, setup_django_logging
+from django_bolt.logging.config import (
+    _DropOnFullQueueHandler,
+    _ensure_queue_logging,
+    setup_django_logging,
+)
 
 
 class TestLoggingConfig:
@@ -724,6 +731,48 @@ class TestQueueBasedLogging:
         # Should have created listener
         assert config_module._QUEUE_LISTENER is not None, "QueueListener should be created"
         assert config_module._QUEUE is not None, "Queue should be created"
+
+    def test_ensure_queue_logging_uses_drop_on_full_handler(self):
+        """The bounded queue must use the drop-on-full handler, not a stock QueueHandler.
+
+        A stock QueueHandler routes queue.Full to handleError(), spamming stderr
+        under load instead of dropping. The handler must swallow Full instead.
+        """
+        config_module._QUEUE_LISTENER = None
+        config_module._QUEUE = None
+
+        handler = _ensure_queue_logging("INFO")
+
+        assert isinstance(handler, _DropOnFullQueueHandler), (
+            "Bounded queue requires _DropOnFullQueueHandler to avoid stderr storms when full"
+        )
+
+    def test_drop_on_full_handler_drops_silently_when_full(self):
+        """Emitting into a full queue must drop the record without touching stderr.
+
+        Regression: stock QueueHandler.emit() catches queue.Full and calls
+        handleError(), which writes a traceback to stderr per dropped record
+        (logging.raiseExceptions defaults to True) — a stderr storm under the
+        exact load spike the bounded queue is meant to survive.
+        """
+        bounded = Queue(maxsize=1)
+        handler = _DropOnFullQueueHandler(bounded)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname=__file__, lineno=1,
+            msg="payload", args=None, exc_info=None,
+        )
+
+        # Saturate the queue.
+        handler.emit(record)
+        assert bounded.full(), "Queue should be full after first emit"
+
+        # A second emit must neither raise nor write to stderr, and must drop.
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            handler.emit(record)
+
+        assert captured.getvalue() == "", "Full queue must drop silently, not write to stderr"
+        assert bounded.qsize() == 1, "Overflow record must be dropped, leaving queue unchanged"
 
     def test_setup_django_logging_configures_queue_handlers(self):
         """setup_django_logging should configure queue handlers for django loggers."""
