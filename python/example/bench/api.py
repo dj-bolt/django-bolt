@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import enum
+
 import msgspec
 
 from django_bolt import BoltAPI, action
@@ -37,16 +41,29 @@ class BenchItemUpdate(msgspec.Struct):
     is_active: bool | None = None
 
 
-class SchemaDemo(msgspec.Struct):
-    """Demonstrates the OpenAPI schema-accuracy fixes from PR #243.
+class DeploymentStage(enum.StrEnum):
+    """Lifecycle stage of a deployment."""
 
-    Before the fix the codegen-facing schema collapsed these to useless types:
+    planned = "planned"
+    active = "active"
+    retired = "retired"
+
+
+class SchemaDemo(msgspec.Struct):
+    """Demonstrates the OpenAPI schema-accuracy fixes from PRs #243, #245, #246.
+
+    Before the fixes the codegen-facing schema collapsed these to useless types:
     - ``email``/``age``/``site`` are documented custom types
       (``Annotated[T, Meta(description=...)]``) that rendered as ``object``;
       they now render as ``string``/``integer`` carrying their constraints.
     - ``scores``/``labels`` are typed maps that rendered as
       ``additionalProperties: true`` (TS ``Record<string, unknown>``); they
-      now carry the value schema (``additionalProperties: {type: ...}``).
+      now carry the value schema (``additionalProperties: {type: ...}``). (#243)
+    - ``tags``/``meta`` use ``default_factory`` (mutable defaults); their
+      ``default`` (``[]``/``{}``) used to be dropped and is now emitted. (#245)
+    - ``stage`` is a named enum that used to be inlined as ``{type, enum}`` at
+      the use site; it now ``$ref``s a reusable ``DeploymentStage`` component
+      carrying the enum's docstring as ``description``. (#246)
     """
 
     email: Email  # -> string (maxLength 254, pattern)
@@ -54,6 +71,9 @@ class SchemaDemo(msgspec.Struct):
     site: HttpsURL | None  # -> anyOf [string, null]
     scores: dict[str, int]  # -> additionalProperties: {type: integer}
     labels: dict[str, str]  # -> additionalProperties: {type: string}
+    stage: DeploymentStage = DeploymentStage.planned  # -> $ref DeploymentStage
+    tags: list[str] = msgspec.field(default_factory=list)  # -> default: []
+    meta: dict[str, str] = msgspec.field(default_factory=dict)  # -> default: {}
 
 
 # ============================================================================
@@ -238,11 +258,13 @@ class BenchItemViewSet(ViewSet):
 
 @api.get("/schema-demo")
 async def schema_demo() -> SchemaDemo:
-    """GET /bench/schema-demo - Documented custom types + typed dicts in OpenAPI.
+    """GET /bench/schema-demo - Documented custom types, typed dicts, factory defaults, named enums.
 
     Open the Swagger "Schema" tab for the 200 response and confirm:
     - ``email``/``age``/``site`` are ``string``/``integer`` (not ``object``)
     - ``scores``/``labels`` show ``additionalProperties`` typed as integer/string
+    - ``tags``/``meta`` carry ``default: []``/``default: {}``
+    - ``stage`` is a ``$ref`` to a reusable ``DeploymentStage`` component
     """
     return SchemaDemo(
         email="alice@example.com",
@@ -250,4 +272,7 @@ async def schema_demo() -> SchemaDemo:
         site="https://example.com",
         scores={"cpu": 80, "mem": 60},
         labels={"env": "prod", "region": "us-east"},
+        stage=DeploymentStage.active,
+        tags=["bench", "demo"],
+        meta={"owner": "team-a"},
     )
