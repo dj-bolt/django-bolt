@@ -11,6 +11,7 @@ These tests validate the behavior documented in docs/LOGGING.md:
 
 import io
 import logging
+import time
 from contextlib import redirect_stderr, suppress
 from logging.handlers import QueueHandler
 from queue import Queue
@@ -22,6 +23,7 @@ from django.conf import settings
 import django_bolt.logging.config as config_module
 from django_bolt.logging import LoggingConfig, LoggingMiddleware, create_logging_middleware
 from django_bolt.logging.config import (
+    _BoundedQueueListener,
     _DropOnFullQueueHandler,
     _ensure_queue_logging,
     setup_django_logging,
@@ -796,6 +798,38 @@ class TestQueueBasedLogging:
                 handler.emit(record)
         assert captured.getvalue() == "", "No notice should be written while capacity remains"
         assert handler.dropped_count == 0
+
+    def test_listener_stops_cleanly_when_queue_saturated(self):
+        """QueueListener.stop() must not raise queue.Full on a saturated bounded queue.
+
+        Regression (found via memory soak): the stock QueueListener.enqueue_sentinel()
+        uses put_nowait, which raises queue.Full when the bounded queue is full, so
+        stop() crashes and the listener thread leaks. _BoundedQueueListener uses a
+        blocking put for the sentinel so shutdown is reliable under saturation.
+        """
+
+        class _SlowSink(logging.Handler):
+            def emit(self, record):
+                time.sleep(0.002)  # consumer slower than the producer → queue saturates
+
+        q = Queue(maxsize=5)
+        listener = _BoundedQueueListener(q, _SlowSink())
+        listener.start()
+        handler = _DropOnFullQueueHandler(q)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname=__file__, lineno=1,
+            msg="payload", args=None, exc_info=None,
+        )
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            for _ in range(3000):
+                handler.emit(record)  # far outpaces the slow sink → drops + full queue
+        assert q.qsize() >= 1, "queue should hold a backlog (saturated) before stop"
+        assert handler.dropped_count > 0, "saturation should have dropped records"
+
+        # The bug: stock QueueListener.stop() raises queue.Full here. This must not.
+        listener.stop()
+        assert listener._thread is None, "listener thread should have stopped cleanly"
 
     def test_queue_size_is_configurable_via_settings(self):
         """BOLT_LOG_QUEUE_SIZE overrides the default 10000 bound."""

@@ -265,6 +265,20 @@ class _DropOnFullQueueHandler(QueueHandler):
                 )
 
 
+class _BoundedQueueListener(QueueListener):
+    """QueueListener that stops cleanly even when the bounded queue is full.
+
+    The stock ``QueueListener.stop()`` calls ``enqueue_sentinel()``, which uses
+    ``Queue.put_nowait`` — on a saturated bounded queue that raises ``queue.Full``
+    and ``stop()`` fails, leaving the listener thread running. The listener thread
+    is the consumer, so a *blocking* put is guaranteed to drain and succeed; use
+    it for the sentinel so shutdown is reliable under load.
+    """
+
+    def enqueue_sentinel(self) -> None:
+        self.queue.put(self._sentinel)
+
+
 def _ensure_queue_logging(base_level: str) -> QueueHandler:
     """Create or reuse a queue-based logging setup.
 
@@ -299,7 +313,7 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
             )
         )
 
-        listener = QueueListener(_QUEUE, console_handler)
+        listener = _BoundedQueueListener(_QUEUE, console_handler)
         listener.start()
 
         # Only register atexit once for cleanup
