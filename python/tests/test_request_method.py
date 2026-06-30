@@ -17,8 +17,9 @@ method (so a request carrying one 404s before ``PyRequest`` is built). It cannot
 be exercised through ``TestClient``: the in-process harness coerces any
 unsupported method to GET when building the Actix request
 (``src/testing.rs`` ``_ => Method::GET``), so a non-standard verb never even
-reaches routing there. Real-server coverage belongs in a ``server_integration``
-test that opens a raw socket — see the plan note in the PR discussion.
+reaches routing there. Real-server coverage lives in
+``tests/integration/test_request_method_server_integration.py``, which sends a
+non-standard verb to a live runbolt server and asserts it is rejected (404/405).
 """
 
 from __future__ import annotations

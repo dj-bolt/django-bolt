@@ -7,11 +7,14 @@ Adopts Litestar's queue-based logging approach so request logging stays
 non-blocking and fully controlled by application logging config.
 """
 
+from __future__ import annotations
+
 import atexit
 import contextlib
 import importlib
 import logging
 import logging.config
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from logging.handlers import QueueHandler, QueueListener
@@ -233,12 +236,33 @@ class _DropOnFullQueueHandler(QueueHandler):
     to ``handleError``, which writes a traceback to stderr per record (because
     ``logging.raiseExceptions`` defaults to ``True``) — a stderr storm under the
     exact load spike the bound is meant to survive. Swallowing ``Full`` here
-    drops the record quietly while keeping the listener thread healthy.
+    drops the record while keeping the listener thread healthy.
+
+    Drops are not fully silent: ``dropped_count`` tracks the total, and a single
+    terse line is written straight to stderr on the first drop and then once per
+    ``_DROP_WARN_INTERVAL`` drops. We write to stderr directly rather than via
+    the logging system so the warning still surfaces when the queue (the very
+    thing that is saturated) cannot accept more records, and so it can't recurse
+    back into this handler.
     """
 
+    # Surface saturation roughly this often without re-spamming under load.
+    _DROP_WARN_INTERVAL = 10_000
+
+    def __init__(self, queue: Queue) -> None:
+        super().__init__(queue)
+        self.dropped_count = 0
+
     def enqueue(self, record: logging.LogRecord) -> None:
-        with contextlib.suppress(Full):
+        try:
             self.queue.put_nowait(record)
+        except Full:
+            self.dropped_count += 1
+            if self.dropped_count % self._DROP_WARN_INTERVAL == 1:
+                sys.stderr.write(
+                    f"django-bolt: log queue saturated, dropped "
+                    f"{self.dropped_count} record(s)\n"
+                )
 
 
 def _ensure_queue_logging(base_level: str) -> QueueHandler:
@@ -253,8 +277,14 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
 
     if _QUEUE is None:
         # Bounded queue prevents unbounded backlog → OOM under load spikes.
-        # Records are dropped (via _DropOnFullQueueHandler) when full.
-        _QUEUE = Queue(maxsize=10000)
+        # Records are dropped (via _DropOnFullQueueHandler) when full. The bound
+        # is configurable via the BOLT_LOG_QUEUE_SIZE setting (default 10000),
+        # consistent with the other BOLT_* logging settings.
+        max_queue_size = 10000
+        if settings is not None:
+            with contextlib.suppress(Exception):
+                max_queue_size = int(getattr(settings, "BOLT_LOG_QUEUE_SIZE", 10000))
+        _QUEUE = Queue(maxsize=max_queue_size)
 
     queue_handler = _DropOnFullQueueHandler(_QUEUE)
     queue_handler.setLevel(logging.DEBUG)

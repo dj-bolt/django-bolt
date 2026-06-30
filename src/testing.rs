@@ -660,7 +660,9 @@ async fn handle_test_request_internal(
     router: Arc<Router>,
     route_metadata: Arc<RouteMetadataStore>,
 ) -> HttpResponse {
-    use crate::handler::{extract_headers, handle_python_error};
+    use crate::handler::{
+        content_length_exceeds_limit, extract_headers, handle_python_error, parse_content_length,
+    };
     use crate::middleware;
     use crate::middleware::auth::populate_auth_context;
     use crate::request::{HttpMethod, PyRequest};
@@ -865,18 +867,16 @@ async fn handle_test_request_internal(
     let is_multipart = content_type.starts_with("multipart/form-data");
     let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
 
-    // Parse Content-Length once and fast-reject oversized requests before reading
-    // body bytes — mirrors the production handler so payload-size limits behave
-    // identically under TestClient. Only enforced for routes that read a body.
+    // Fast-reject oversized requests before reading body bytes, reusing the
+    // production helpers so payload-size limits behave identically under
+    // TestClient (per src/CLAUDE.md: tests reuse production code).
     let needs_body = route_meta.as_ref().map_or(true, |m| m.plan.needs_body());
-    let content_length: Option<usize> = req
-        .headers()
-        .get(actix_web::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
-    if (needs_body || needs_form_parsing)
-        && matches!(content_length, Some(len) if len > state.max_payload_size)
-    {
+    let content_length = parse_content_length(&req);
+    if content_length_exceeds_limit(
+        content_length,
+        state.max_payload_size,
+        needs_body || needs_form_parsing,
+    ) {
         return responses::error_413();
     }
 
@@ -921,7 +921,9 @@ async fn handle_test_request_internal(
                 Err(validation_error) => {
                     // Aggregate-size overflow maps to 413 to match the non-multipart
                     // path; other multipart failures stay 422 validation errors.
-                    if validation_error.error_type == "payload_too_large" {
+                    if validation_error.error_type
+                        == crate::form_parsing::ERROR_TYPE_PAYLOAD_TOO_LARGE
+                    {
                         return responses::error_413();
                     }
                     let body = serde_json::json!({

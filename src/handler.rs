@@ -20,6 +20,7 @@ use crate::error;
 use crate::form_parsing::{
     parse_multipart, parse_urlencoded, FileContent, FileFieldConstraints, FileInfo,
     FormParseResult, FormValue, ValidationError, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
+    ERROR_TYPE_PAYLOAD_TOO_LARGE,
 };
 use crate::metadata::{RustArgBinding, RustArgSource};
 use crate::middleware;
@@ -761,6 +762,40 @@ pub(crate) fn build_prebound_args_kwargs(
     Some((args.unbind(), kwargs.unbind()))
 }
 
+/// Maximum pre-allocation for a request body buffer.
+///
+/// A forged `Content-Length` could otherwise make `Vec::with_capacity` reserve
+/// up to `max_payload_size` of address space from the header alone. Capping the
+/// pre-allocation means only bytes that actually arrive grow the buffer (past
+/// this cap it falls back to geometric growth). 64 KiB covers typical
+/// JSON/form bodies without a realloc while bounding header-driven reservation.
+pub(crate) const BODY_PREALLOC_CAP: usize = 64 * 1024;
+
+/// Parse the `Content-Length` header into a `usize`, if present and valid.
+/// Shared by the production handler and the in-process test handler so both
+/// enforce the payload limit identically (per src/CLAUDE.md: tests reuse
+/// production code rather than duplicating it).
+#[inline]
+pub(crate) fn parse_content_length(req: &HttpRequest) -> Option<usize> {
+    req.headers()
+        .get(actix_web::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
+/// Whether a request with the given `Content-Length` must be fast-rejected with
+/// 413 before reading the body. Only enforced for routes that read a body;
+/// no-body routes ignore the payload. For chunked encoding (no Content-Length)
+/// this returns false and the per-path streaming checks bound the body instead.
+#[inline]
+pub(crate) fn content_length_exceeds_limit(
+    content_length: Option<usize>,
+    max_payload_size: usize,
+    reads_body: bool,
+) -> bool {
+    reads_body && matches!(content_length, Some(len) if len > max_payload_size)
+}
+
 pub async fn handle_request<const ACCESS_LOG: bool>(
     req: HttpRequest,
     mut payload: web::Payload,
@@ -1058,18 +1093,12 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     // Parse Content-Length once and fast-reject oversized requests before reading
     // any body bytes. Applies to both multipart and non-multipart paths so the
     // payload-size limit is enforced consistently regardless of content type.
-    // Only enforced when the route actually reads a body; no-body routes ignore
-    // the payload as before. For chunked encoding (no Content-Length), the
-    // per-path streaming checks below still bound the aggregate body against
-    // state.max_payload_size.
-    let content_length: Option<usize> = req
-        .headers()
-        .get(actix_web::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
-    if (needs_body || needs_form_parsing)
-        && matches!(content_length, Some(len) if len > state.max_payload_size)
-    {
+    let content_length = parse_content_length(&req);
+    if content_length_exceeds_limit(
+        content_length,
+        state.max_payload_size,
+        needs_body || needs_form_parsing,
+    ) {
         return responses::error_413();
     }
 
@@ -1113,7 +1142,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 Err(validation_error) => {
                     // Aggregate-size overflow maps to 413 to match the non-multipart
                     // path; other multipart failures stay 422 validation errors.
-                    if validation_error.error_type == "payload_too_large" {
+                    if validation_error.error_type == ERROR_TYPE_PAYLOAD_TOO_LARGE {
                         return responses::error_413();
                     }
                     return build_validation_error_response(&validation_error);
@@ -1126,10 +1155,9 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // extend_from_slice. For chunked encoding or missing Content-Length,
             // Vec::new() starts at 0 capacity (geometric growth).
             //
-            // Cap pre-allocation so a forged Content-Length can't reserve up to
-            // max_payload_size of address space from the header alone; larger
-            // legitimate bodies still grow as bytes actually arrive.
-            const BODY_PREALLOC_CAP: usize = 64 * 1024;
+            // Cap pre-allocation (BODY_PREALLOC_CAP) so a forged Content-Length
+            // can't reserve up to max_payload_size of address space from the
+            // header alone; larger legitimate bodies still grow as bytes arrive.
             let mut body_vec = match content_length {
                 Some(len) if len > 0 => Vec::with_capacity(len.min(BODY_PREALLOC_CAP)),
                 _ => Vec::new(),

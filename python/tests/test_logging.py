@@ -11,7 +11,7 @@ These tests validate the behavior documented in docs/LOGGING.md:
 
 import io
 import logging
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, suppress
 from logging.handlers import QueueHandler
 from queue import Queue
 from unittest.mock import Mock
@@ -747,13 +747,15 @@ class TestQueueBasedLogging:
             "Bounded queue requires _DropOnFullQueueHandler to avoid stderr storms when full"
         )
 
-    def test_drop_on_full_handler_drops_silently_when_full(self):
-        """Emitting into a full queue must drop the record without touching stderr.
+    def test_drop_on_full_handler_drops_without_traceback_storm(self):
+        """A full queue drops records with a terse notice — never a traceback storm.
 
         Regression: stock QueueHandler.emit() catches queue.Full and calls
-        handleError(), which writes a traceback to stderr per dropped record
+        handleError(), which writes a full traceback to stderr per dropped record
         (logging.raiseExceptions defaults to True) — a stderr storm under the
-        exact load spike the bounded queue is meant to survive.
+        exact load spike the bounded queue is meant to survive. The drop-on-full
+        handler instead drops the record, tracks dropped_count, and emits one
+        short line (no traceback) on the first drop.
         """
         bounded = Queue(maxsize=1)
         handler = _DropOnFullQueueHandler(bounded)
@@ -766,13 +768,53 @@ class TestQueueBasedLogging:
         handler.emit(record)
         assert bounded.full(), "Queue should be full after first emit"
 
-        # A second emit must neither raise nor write to stderr, and must drop.
+        # Further emits must not raise, must drop, and must not dump a traceback.
         captured = io.StringIO()
         with redirect_stderr(captured):
-            handler.emit(record)
+            for _ in range(5):
+                handler.emit(record)
 
-        assert captured.getvalue() == "", "Full queue must drop silently, not write to stderr"
-        assert bounded.qsize() == 1, "Overflow record must be dropped, leaving queue unchanged"
+        output = captured.getvalue()
+        assert "Traceback" not in output, "Full queue must not dump a traceback per record"
+        assert bounded.qsize() == 1, "Overflow records must be dropped, queue unchanged"
+        assert handler.dropped_count == 5, "Each overflow record must be counted"
+        # Throttled: only the first drop emits a line (interval is 10000).
+        assert output.count("\n") == 1, "Drop notice must be throttled, not per-record"
+        assert "dropped" in output
+
+    def test_drop_on_full_handler_does_not_warn_until_full(self):
+        """No drop notice while the queue has capacity."""
+        bounded = Queue(maxsize=4)
+        handler = _DropOnFullQueueHandler(bounded)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname=__file__, lineno=1,
+            msg="payload", args=None, exc_info=None,
+        )
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            for _ in range(4):
+                handler.emit(record)
+        assert captured.getvalue() == "", "No notice should be written while capacity remains"
+        assert handler.dropped_count == 0
+
+    def test_queue_size_is_configurable_via_settings(self):
+        """BOLT_LOG_QUEUE_SIZE overrides the default 10000 bound."""
+        config_module._QUEUE_LISTENER = None
+        config_module._QUEUE = None
+        had_attr = hasattr(settings, "BOLT_LOG_QUEUE_SIZE")
+        prev = getattr(settings, "BOLT_LOG_QUEUE_SIZE", None)
+        settings.BOLT_LOG_QUEUE_SIZE = 123
+        try:
+            _ensure_queue_logging("INFO")
+            assert config_module._QUEUE.maxsize == 123
+        finally:
+            if had_attr:
+                settings.BOLT_LOG_QUEUE_SIZE = prev
+            else:
+                with suppress(AttributeError):
+                    delattr(settings, "BOLT_LOG_QUEUE_SIZE")
+            config_module._QUEUE_LISTENER = None
+            config_module._QUEUE = None
 
     def test_setup_django_logging_configures_queue_handlers(self):
         """setup_django_logging should configure queue handlers for django loggers."""
