@@ -6,6 +6,7 @@ Tests for OpenAPI schema accuracy improvements:
 - Struct field defaults in body schemas
 """
 
+import datetime
 import enum
 from typing import Annotated, Any, Literal
 
@@ -710,6 +711,42 @@ def test_factory_defaults_match_msgspec_schema():
         assert bolt_props[field_name]["default"] == msgspec_props[field_name]["default"]
 
 
+def test_arbitrary_default_factory_emits_no_default():
+    """A non-builtin factory (e.g. `datetime.now`) emits NO `default`, matching msgspec.
+
+    msgspec only materializes the four builtin mutable factories
+    (`list`/`dict`/`set`/`bytearray`); every other factory gets no `default`.
+    Materializing one here would both diverge from msgspec and freeze a value
+    (e.g. a generation-time timestamp) into the spec.
+    """
+
+    class WithDynamicFactory(msgspec.Struct):
+        created: datetime.datetime = msgspec.field(default_factory=datetime.datetime.now)
+
+    props = _get_response_component_schema(WithDynamicFactory, path="/dyn")["properties"]
+    assert "default" not in props["created"]
+    msgspec_props = msgspec.json.schema_components((WithDynamicFactory,))[1]["WithDynamicFactory"]["properties"]
+    assert "default" not in msgspec_props["created"]
+
+
+def test_nonencodable_default_factory_does_not_break_schema_generation():
+    """A factory returning a non-JSON-encodable object must not crash schema generation.
+
+    Materializing such a factory into `default` would embed an unencodable object
+    and 500 the whole `/docs/openapi.json` endpoint. The whitelist avoids calling
+    it at all, so generation succeeds and the field simply carries no `default`.
+    """
+
+    class Opaque:
+        pass
+
+    class WithOpaqueFactory(msgspec.Struct):
+        thing: Opaque = msgspec.field(default_factory=Opaque)
+
+    props = _get_response_component_schema(WithOpaqueFactory, path="/opaque")["properties"]
+    assert "default" not in props["thing"]
+
+
 # ---------- named enums promoted to components -----------------------
 #
 # Regression tests for #246. Named enum classes (`enum.Enum` / msgspec
@@ -885,23 +922,74 @@ def test_query_param_enum_stays_inline():
     assert set(inner["enum"]) == {"active", "inactive"}
 
 
-def test_struct_and_enum_name_collision_raises():
-    """A struct and an enum sharing a `__name__` must not silently share a `$ref`.
+def test_same_named_types_from_different_modules_coexist():
+    """Two distinct same-named types from different modules both get components.
 
-    They'd otherwise both register `#/components/schemas/Status`, with the
-    second silently resolving to the first's shape. Schema generation raises a
-    `ComponentNameCollisionError` (a `ValueError`) naming both colliding types.
+    Component names are a flat namespace, but a clash on the short `__name__`
+    expands *both* colliding types to their `module.qualname` (matching
+    `msgspec.json.schema_components`) so neither silently steals the other's
+    `$ref`. The bare name is not used; each `$ref` resolves to the right shape;
+    `title` stays the short class name.
     """
 
-    class Status(enum.StrEnum):  # noqa: F811 - intentional name clash with the struct below
+    class Status(enum.StrEnum):  # noqa: F811 - intentional short-name clash with the struct below
+        ok = "ok"
+
+    Status.__module__ = "app_a.api"
+    StatusEnum = Status
+
+    class Status(msgspec.Struct):  # noqa: F811 - intentional short-name clash with the enum above
+        code: int
+
+    Status.__module__ = "app_b.api"
+    StatusStruct = Status
+
+    class Wrapper(msgspec.Struct):
+        state: StatusEnum
+        detail: StatusStruct
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/wrapper")
+    async def get_wrapper() -> Wrapper:
+        pass
+
+    components = _get_schema(api)["components"]["schemas"]
+    state_key = components["Wrapper"]["properties"]["state"]["$ref"].split("/")[-1]
+    detail_key = components["Wrapper"]["properties"]["detail"]["$ref"].split("/")[-1]
+
+    assert "Status" not in components  # bare name claimed by neither
+    assert state_key != detail_key  # both coexist under distinct (qualified) names
+    assert components[state_key]["type"] == "string" and set(components[state_key]["enum"]) == {"ok"}
+    assert components[detail_key]["properties"]["code"]["type"] == "integer"
+    # Qualified component *key*, but the short class name still on `title`.
+    assert components[state_key]["title"] == "Status"
+    assert components[detail_key]["title"] == "Status"
+
+
+def test_genuinely_indistinguishable_types_raise():
+    """Two types with the *same* module + qualname can't be told apart — raise.
+
+    Distinct types that share both `__name__` and `module.qualname` (e.g. two
+    classes defined under the same name in the same scope) have no name that
+    separates them. Qualifying both still collides, so generation raises a
+    `ComponentNameCollisionError` (a `ValueError`) rather than emit a `$ref`
+    that resolves to the wrong shape. `msgspec.json.schema_components` itself
+    fails (KeyError) on this case; we fail with a clear, typed error.
+    """
+
+    class Status(enum.StrEnum):  # noqa: F811 - intentional clash with the struct below
         ok = "ok"
 
     StatusEnum = Status
 
-    class Status(msgspec.Struct):  # noqa: F811 - intentional name clash with the enum above
+    class Status(msgspec.Struct):  # noqa: F811 - intentional clash with the enum above
         code: int
 
     StatusStruct = Status
+    # Same scope ⇒ identical __qualname__ and __module__ ⇒ indistinguishable.
+    assert StatusEnum.__qualname__ == StatusStruct.__qualname__
+    assert StatusEnum.__module__ == StatusStruct.__module__
 
     class Wrapper(msgspec.Struct):
         state: StatusEnum
@@ -916,7 +1004,6 @@ def test_struct_and_enum_name_collision_raises():
     generator = SchemaGenerator(api, api._openapi_config)
     with pytest.raises(ComponentNameCollisionError) as exc_info:
         generator.generate()
-    assert exc_info.value.schema_name == "Status"
     assert {exc_info.value.new_type, exc_info.value.existing_type} == {StatusEnum, StatusStruct}
     assert "OpenAPI component name collision" in str(exc_info.value)
 

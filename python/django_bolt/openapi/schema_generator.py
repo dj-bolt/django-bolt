@@ -4,6 +4,7 @@ import enum
 import http.client
 import inspect
 import re
+from collections.abc import Callable
 from dataclasses import replace
 from types import UnionType
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_origin
@@ -218,11 +219,18 @@ class SchemaGenerator:
         """
         self.api = api
         self.config = config
-        self.schemas: dict[str, Schema] = {}  # Component schemas registry
-        # Tracks which type currently owns each component name so structs and
-        # enums (which share the `self.schemas` namespace, keyed by __name__)
-        # can't silently reuse each other's `$ref`. See _claim_component_name.
-        self._component_types: dict[str, type] = {}
+        self.schemas: dict[str, Schema] = {}  # Component schemas registry, keyed by final name
+        # Component naming is two-pass (matching `msgspec.json.schema_components`):
+        # during route processing each struct/enum is registered by *type identity*
+        # with a shared, not-yet-named `Reference`; once every component is known,
+        # `_finalize_component_names` assigns names — short `__name__` normally,
+        # `module.qualname` only for the types whose short names actually collide —
+        # and stamps each shared Reference in place. Keying by type (not name)
+        # means two same-named types from different modules coexist instead of one
+        # silently stealing the other's `$ref`. Dict insertion order is the
+        # registration order the name map iterates.
+        self._component_ref: dict[type, Reference] = {}
+        self._component_schema: dict[type, Schema] = {}
 
     @staticmethod
     def _schema_kwargs(**kwargs: Any) -> dict[str, Any]:
@@ -394,11 +402,17 @@ class SchemaGenerator:
         if has_default:
             field_schema = self._with_default(field_schema, default)
             field_required = False
-        elif field.default_factory is not msgspec.NODEFAULT:
-            # Factory-defaulted fields (the usual mutable-default case, e.g.
-            # ``list``/``dict``) carry their default on ``field.default_factory``
+        elif field.default_factory in (list, dict, set, bytearray):
+            # Mutable-default fields carry their default on ``field.default_factory``
             # instead of ``field.default`` — materialize it so the schema gains
-            # ``default: []``/``{}``, matching ``msgspec.json.schema``. The
+            # ``default: []``/``{}``. The whitelist mirrors ``msgspec.json.schema``
+            # exactly (``_json_schema.py``): only these four builtin factories are
+            # materialized. Immutable factories (``tuple``/``frozenset``) are stored
+            # by msgspec as a plain ``field.default`` and so are handled by the
+            # ``has_default`` branch above; arbitrary factories (``datetime.now``,
+            # a ``lambda``, a class) deliberately get NO default — both because
+            # msgspec emits none and because calling them here could embed a
+            # non-JSON-encodable object that crashes spec serialization. The
             # _FieldMarker path above never reaches here (markers live on
             # ``field.default``, leaving ``default_factory`` as NODEFAULT).
             field_schema = self._with_default(field_schema, field.default_factory())
@@ -509,7 +523,11 @@ class SchemaGenerator:
         # Auto-register security schemes from auth backends used on routes
         self._register_security_schemes(openapi)
 
-        # Add component schemas
+        # Assign final component names now that every component type is known,
+        # then expose the populated registry. Names are decided before this point
+        # only as type-keyed placeholders, so this is what actually fills
+        # self.schemas and stamps the shared `$ref`s.
+        self._finalize_component_names()
         if self.schemas:
             openapi.components.schemas = self.schemas
 
@@ -1411,76 +1429,101 @@ class SchemaGenerator:
             required=required or None,
         )
 
-    def _claim_component_name(self, schema_name: str, cls: type) -> bool:
-        """Reserve a component name for ``cls``, guarding against collisions.
+    def _register_component(self, cls: type, build_schema: Callable[[], Schema]) -> Reference:
+        """Register ``cls`` as a component (by type identity) and return its shared Reference.
 
-        Structs and enums share the ``self.schemas`` namespace, keyed only by
-        ``__name__``. Two distinct types with the same name (a struct ``Status``
-        and an enum ``Status``, or same-named types from different modules)
-        would otherwise have the second silently reuse the first's ``$ref``,
-        emitting a reference that resolves to the wrong schema shape.
+        Keyed by the type, not its name: the actual ``$ref`` string is left empty
+        until ``_finalize_component_names`` runs, so two same-named types from
+        different modules can both be registered here and later disambiguated
+        instead of one stealing the other's name. Returns the *same* Reference
+        instance on every call for a given type, so stamping its ``ref`` once at
+        finalize time updates every use site — including refs nested inside
+        ``allOf``/``anyOf`` wrappers built by ``_with_default``/``_union_schema``.
 
-        Returns ``True`` when the name is newly claimed (the caller must build
-        and store the schema), ``False`` when it was already claimed by the
-        *same* type (reuse the existing ``$ref``). Raises ``ValueError`` when a
-        *different* type already holds the name — surfacing the collision loudly
-        instead of producing a silently wrong spec.
+        The Reference is stored *before* ``build_schema`` runs so that a
+        self-referential type (e.g. ``TreeNode`` with ``children: list[TreeNode]``)
+        re-entering this method gets the existing Reference instead of recursing
+        infinitely.
         """
-        existing = self._component_types.get(schema_name)
-        if existing is None:
-            self._component_types[schema_name] = cls
-            return True
-        if existing is not cls:
-            raise ComponentNameCollisionError(schema_name, cls, existing)
-        return False
+        ref = self._component_ref.get(cls)
+        if ref is not None:
+            return ref
+        ref = Reference(ref="")  # named in _finalize_component_names
+        self._component_ref[cls] = ref
+        self._component_schema[cls] = build_schema()
+        return ref
 
     def _struct_to_component_schema(self, struct_type: type) -> Reference:
-        """Convert msgspec.Struct to component schema and return reference.
-
-        Args:
-            struct_type: msgspec.Struct type.
-
-        Returns:
-            Reference to component schema.
-        """
-        schema_name = struct_type.__name__
-
-        # Claim the name (raising on a collision with a different type) before
-        # processing fields. A re-entry for the *same* struct returns False and
-        # reuses the sentinel/real schema already in self.schemas.
-        if self._claim_component_name(schema_name, struct_type):
-            # Insert a sentinel *before* processing fields so that
-            # self-referential types (e.g. TreeNode with children:
-            # list[TreeNode]) hit the guard on re-entry instead of
-            # recursing infinitely.  The sentinel is overwritten once
-            # _struct_to_schema returns the real schema.
-            self.schemas[schema_name] = Schema(type="object")
-            self.schemas[schema_name] = self._struct_to_schema(struct_type, register_component=True)
-
-        return Reference(ref=f"#/components/schemas/{schema_name}")
+        """Convert msgspec.Struct to a component schema and return its reference."""
+        return self._register_component(
+            struct_type,
+            lambda: self._struct_to_schema(struct_type, register_component=True),
+        )
 
     def _enum_to_component_schema(self, enum_cls: type) -> Reference:
-        """Register a named enum class as a component schema and return a reference.
+        """Register a named enum class as a component schema and return its reference.
 
         Parallels ``_struct_to_component_schema``: named enums (``enum.Enum`` /
         msgspec ``EnumType`` / Django ``TextChoices``/``IntegerChoices``) become
         reusable ``#/components/schemas/<Name>`` entries + ``$ref`` so codegen
         tools can emit a shared type, and the enum's docstring survives as
         ``description``. The narrowest fitting ``type`` is inferred from the
-        member values, and ``title`` is set to the class name — matching the
-        shape ``msgspec.json.schema_components`` produces for enums.
-
-        Args:
-            enum_cls: An ``enum.Enum`` subclass.
-
-        Returns:
-            Reference to the component schema.
+        member values, and ``title`` is set to the (short) class name — matching
+        the shape ``msgspec.json.schema_components`` produces for enums.
         """
-        schema_name = enum_cls.__name__
 
-        if self._claim_component_name(schema_name, enum_cls):
+        def build() -> Schema:
             schema = self._enum_values_schema([e.value for e in enum_cls])
             # Read the enum's *own* docstring (not an inherited one), like structs.
-            self.schemas[schema_name] = replace(schema, title=schema_name, description=self._own_docstring(enum_cls))
+            # Title stays the short class name even when the component is keyed by a
+            # qualified name on collision, matching msgspec.
+            return replace(schema, title=enum_cls.__name__, description=self._own_docstring(enum_cls))
 
-        return Reference(ref=f"#/components/schemas/{schema_name}")
+        return self._register_component(enum_cls, build)
+
+    def _finalize_component_names(self) -> None:
+        """Assign final names to every registered component and populate self.schemas.
+
+        Two-pass naming, mirroring ``msgspec.json.schema_components``: a component
+        keeps its short ``__name__`` unless another *distinct* type shares it, in
+        which case every colliding type expands to its normalized
+        ``module.qualname`` so all of them coexist. Each type's shared Reference is
+        stamped in place, updating all of its use sites at once.
+        """
+
+        def normalize(name: str) -> str:
+            return re.sub(r"[^a-zA-Z0-9.\-_]", "_", name)
+
+        def fullname(cls: type) -> str:
+            return normalize(f"{cls.__module__}.{cls.__qualname__}")
+
+        # First map name -> type, expanding only the names that actually collide.
+        names: dict[str, type] = {}
+        conflicts: set[str] = set()
+
+        def assign(name: str, cls: type) -> None:
+            existing = names.get(name)
+            if existing is not None and existing is not cls:
+                # Even the qualified names match (same module + qualname) — the
+                # types are genuinely indistinguishable by name. Fail loudly
+                # rather than emit a $ref that resolves to the wrong shape.
+                raise ComponentNameCollisionError(name, cls, existing)
+            names[name] = cls
+
+        for cls in self._component_ref:
+            short = normalize(cls.__name__)
+            if short in names and names[short] is not cls:
+                # First collision on this short name: re-home the incumbent under
+                # its qualified name and mark the short name as conflicted.
+                incumbent = names.pop(short)
+                conflicts.add(short)
+                assign(fullname(incumbent), incumbent)
+            if short in conflicts:
+                assign(fullname(cls), cls)
+            else:
+                assign(short, cls)
+
+        # Stamp each shared Reference and publish the schema under its final name.
+        for name, cls in names.items():
+            self._component_ref[cls].ref = f"#/components/schemas/{name}"
+            self.schemas[name] = self._component_schema[cls]
