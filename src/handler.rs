@@ -783,17 +783,16 @@ pub(crate) fn parse_content_length(req: &HttpRequest) -> Option<usize> {
         .and_then(|v| v.parse::<usize>().ok())
 }
 
-/// Whether a request with the given `Content-Length` must be fast-rejected with
-/// 413 before reading the body. Only enforced for routes that read a body;
-/// no-body routes ignore the payload. For chunked encoding (no Content-Length)
-/// this returns false and the per-path streaming checks bound the body instead.
+/// Whether the given `Content-Length` exceeds the limit and must be fast-rejected
+/// with 413 before reading the body. Callers pass `None` (e.g. no-body routes or
+/// chunked requests with no Content-Length), for which this returns false and the
+/// per-path streaming checks bound the body instead.
 #[inline]
 pub(crate) fn content_length_exceeds_limit(
     content_length: Option<usize>,
     max_payload_size: usize,
-    reads_body: bool,
 ) -> bool {
-    reads_body && matches!(content_length, Some(len) if len > max_payload_size)
+    matches!(content_length, Some(len) if len > max_payload_size)
 }
 
 pub async fn handle_request<const ACCESS_LOG: bool>(
@@ -1090,15 +1089,18 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     let is_multipart = content_type.starts_with("multipart/form-data");
     let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
 
-    // Parse Content-Length once and fast-reject oversized requests before reading
-    // any body bytes. Applies to both multipart and non-multipart paths so the
+    // Parse Content-Length and fast-reject oversized requests before reading any
+    // body bytes. Applies to both multipart and non-multipart paths so the
     // payload-size limit is enforced consistently regardless of content type.
-    let content_length = parse_content_length(&req);
-    if content_length_exceeds_limit(
-        content_length,
-        state.max_payload_size,
-        needs_body || needs_form_parsing,
-    ) {
+    // Only computed for routes that read a body — no-body routes (e.g. the hot
+    // GET path) skip the header lookup entirely.
+    let reads_body = needs_body || needs_form_parsing;
+    let content_length = if reads_body {
+        parse_content_length(&req)
+    } else {
+        None
+    };
+    if content_length_exceeds_limit(content_length, state.max_payload_size) {
         return responses::error_413();
     }
 

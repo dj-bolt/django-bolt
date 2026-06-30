@@ -869,14 +869,16 @@ async fn handle_test_request_internal(
 
     // Fast-reject oversized requests before reading body bytes, reusing the
     // production helpers so payload-size limits behave identically under
-    // TestClient (per src/CLAUDE.md: tests reuse production code).
+    // TestClient (per src/CLAUDE.md: tests reuse production code). Only computed
+    // for routes that read a body.
     let needs_body = route_meta.as_ref().map_or(true, |m| m.plan.needs_body());
-    let content_length = parse_content_length(&req);
-    if content_length_exceeds_limit(
-        content_length,
-        state.max_payload_size,
-        needs_body || needs_form_parsing,
-    ) {
+    let reads_body = needs_body || needs_form_parsing;
+    let content_length = if reads_body {
+        parse_content_length(&req)
+    } else {
+        None
+    };
+    if content_length_exceeds_limit(content_length, state.max_payload_size) {
         return responses::error_413();
     }
 
