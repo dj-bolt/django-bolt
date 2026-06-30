@@ -74,28 +74,26 @@ just format
 
 ### Benchmarking
 
+All benchmark/soak recipes need `bombardier` (`go install github.com/codesenberg/bombardier@latest`)
+and `setsid` (`brew install util-linux` on macOS).
+
 ```bash
-# Full benchmark suite (saves results)
-just save-bench  # Creates/rotates BENCHMARK_BASELINE.md and BENCHMARK_DEV.md
+# Full benchmark suite. First run creates bench/BENCHMARK_BASELINE.md, second
+# creates bench/BENCHMARK_DEV.md + prints a comparison, third rotates dev→baseline.
+just save-bench                  # defaults: host=127.0.0.1 port=8001 c=100 n=10000 p=8 workers=1
+just save-bench 127.0.0.1 8001 100 50000   # positional: host port c n ...
 
-# Custom benchmark
-just bench C=100 N=50000  # 100 concurrent, 50k requests
+# Focused parameter/form-parsing benchmark (fast iteration)
+just bench-params
 
-# High-performance test
-just perf-test  # 4 processes × 1 worker, 50k requests
-
-# ORM-specific benchmark
-just orm-test   # Sets up DB, seeds data, benchmarks ORM endpoints
-
-# Memory soak (leak gate): sustained load on a body endpoint, samples server
-# RSS over time, exits non-zero if RSS grows past the threshold (MiB).
-just soak          # 120s, fail if RSS grows >50 MiB (positional args, defaults shown)
-just soak 180 40   # 180s soak, 40 MiB threshold
+# Memory soak (leak gate): sustained load across several endpoint types, samples
+# server RSS per phase, exits non-zero if RSS grows past the threshold (MiB).
+just soak          # ~20s/endpoint, fail if any endpoint's RSS grows >50 MiB
+just soak 40 30    # positional: per-endpoint seconds, then threshold MiB
 ```
 
 Queue/allocation *behavior* (bounded-drop, clean shutdown) is unit-tested in
-`python/tests/test_logging.py`; `just soak` guards whole-server RSS *stability*
-and needs `bombardier` installed.
+`python/tests/test_logging.py`; `just soak` guards whole-server RSS *stability*.
 
 ### Database (Standard Django)
 

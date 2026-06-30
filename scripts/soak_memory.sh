@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Memory soak: drive a body-reading endpoint under sustained load, sample the
-# server's RSS over time, and fail (exit 1) if memory grows beyond a threshold.
+# Memory soak: drive several endpoint *types* under sustained load and fail
+# (exit 1) if any one of them grows the server's RSS past a threshold.
 #
-# This catches per-request leaks that unit tests miss. It is intentionally NOT
-# part of `just test-py` (it needs bombardier + a few minutes); run it manually
-# or on a schedule. Queue/allocation *behavior* is unit-tested in
-# python/tests/test_logging.py — this guards whole-server RSS *stability*.
+# Covering multiple path categories catches leaks that are specific to a code
+# path (body reading, param coercion, header/cookie extraction, error building,
+# streaming generators) — a single-endpoint soak would miss them. RSS growth is
+# measured WITHIN each endpoint's window, so legitimate steady-state differences
+# between endpoints don't cause false positives.
 #
-# Env knobs (with defaults):
-#   HOST=127.0.0.1 PORT=8011 P=1 WORKERS=1 CONC=100 DUR=120
-#   METHOD=PUT ENDPOINT=/items/1 BODY='{"name":"soak","price":1.5,"is_offer":true}'
-#   THRESHOLD_MIB=50   # fail if RSS grows more than this from the post-warmup baseline
+# This is intentionally NOT part of `just test-py` (needs bombardier + minutes).
+# Queue/allocation *behavior* is unit-tested in python/tests/test_logging.py;
+# this guards whole-server RSS *stability*.
+#
+# Env knobs (defaults): HOST=127.0.0.1 PORT=8011 P=1 WORKERS=1 CONC=100
+#   DUR=20            # seconds of load per endpoint
+#   THRESHOLD_MIB=50  # fail if an endpoint grows RSS more than this
 set -u
 
 HOST=${HOST:-127.0.0.1}
@@ -18,13 +22,22 @@ PORT=${PORT:-8011}
 P=${P:-1}
 WORKERS=${WORKERS:-1}
 CONC=${CONC:-100}
-DUR=${DUR:-120}
-METHOD=${METHOD:-PUT}
-ENDPOINT=${ENDPOINT:-/items/1}
-BODY=${BODY:-'{"name":"soak","price":1.5,"is_offer":true}'}
+DUR=${DUR:-20}
 THRESHOLD_MIB=${THRESHOLD_MIB:-50}
+JSON_BODY='{"name":"soak","price":1.5,"is_offer":true}'
 
-# --- tool discovery (mirrors scripts/benchmark.sh) ---
+# Endpoint phases: "label|kind|method|path". `kind` selects extra request flags.
+PHASES=(
+    "no-body GET        |plain |GET|/"
+    "path+query params  |plain |GET|/items/1?q=hello"
+    "JSON body (PUT)    |json  |PUT|/items/1"
+    "header extraction  |header|GET|/header"
+    "cookie parsing     |cookie|GET|/cookie"
+    "error/exception    |plain |GET|/exc"
+    "HTML response      |plain |GET|/html"
+    "streaming response |plain |GET|/stream"
+)
+
 BOMBARDIER_BIN=""
 if command -v bombardier &>/dev/null; then BOMBARDIER_BIN="bombardier"
 elif [ -f "$HOME/go/bin/bombardier" ]; then BOMBARDIER_BIN="$HOME/go/bin/bombardier"
@@ -45,7 +58,6 @@ uv run python manage.py collectstatic --noinput >/dev/null 2>&1 || true
 DJANGO_BOLT_WORKERS=$WORKERS uv run python manage.py runbolt \
     --host "$HOST" --port "$PORT" --processes "$P" >/tmp/bolt-soak-server.log 2>&1 &
 
-# Wait for readiness.
 code=""
 for _ in $(seq 1 30); do
     code=$(curl -s -o /dev/null -w '%{http_code}' "http://$HOST:$PORT/" || true)
@@ -54,49 +66,63 @@ for _ in $(seq 1 30); do
 done
 [ "$code" = "200" ] || { echo "ERROR: server not ready (last status: $code)" >&2; exit 2; }
 
-# Warm up so allocator/caches settle before the baseline sample.
-"$BOMBARDIER_BIN" -c 50 -d 10s -m "$METHOD" -H 'Content-Type: application/json' \
-    -b "$BODY" "http://$HOST:$PORT$ENDPOINT" >/dev/null 2>&1
-
-RSS_CSV="${TMPDIR:-/tmp}/bolt-soak-rss-$$.csv"
-echo "elapsed_s,rss_kb" > "$RSS_CSV"
-(
-    t=0
-    while [ "$t" -le "$DUR" ]; do
-        rss=0
-        for p in $(pgrep -f "$PROC_MATCH"); do
-            r=$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ')
-            [ -n "$r" ] && rss=$((rss + r))
-        done
-        echo "$t,$rss" >> "$RSS_CSV"
-        sleep 2; t=$((t + 2))
+# Sum RSS (KiB) across all runbolt processes.
+sample_rss() {
+    local rss=0 r
+    for p in $(pgrep -f "$PROC_MATCH"); do
+        r=$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ')
+        [ -n "$r" ] && rss=$((rss + r))
     done
-) &
-SAMPLER=$!
+    echo "$rss"
+}
 
-echo "Soaking $METHOD $ENDPOINT for ${DUR}s (C=$CONC, P=$P, WORKERS=$WORKERS)..."
-"$BOMBARDIER_BIN" -c "$CONC" -d "${DUR}s" -m "$METHOD" -H 'Content-Type: application/json' \
-    -b "$BODY" -l "http://$HOST:$PORT$ENDPOINT" 2>&1 | tr '\r' '\n' | grep -E "Reqs/sec|2xx|5xx|errors" || true
-wait "$SAMPLER" 2>/dev/null || true
+# Run one endpoint phase; echoes "PASS"/"FAIL" line, returns 1 on failure.
+run_phase() {
+    local label="$1" kind="$2" method="$3" path="$4"
+    local url="http://$HOST:$PORT$path"
+    local args=(-c "$CONC" -d "${DUR}s" -m "$method")
+    case "$kind" in
+        json)   args+=(-H 'Content-Type: application/json' -b "$JSON_BODY") ;;
+        header) args+=(-H 'x-test: soak') ;;
+        cookie) args+=(-H 'Cookie: session=abc') ;;
+    esac
 
-# Analyze: fail if RSS grew more than THRESHOLD_MIB from the post-warmup baseline.
-THRESHOLD_MIB="$THRESHOLD_MIB" python3 - "$RSS_CSV" <<'PY'
-import csv, os, statistics, sys
-rows = list(csv.DictReader(open(sys.argv[1])))
-rss = [int(r["rss_kb"]) / 1024 for r in rows]
-t = [int(r["elapsed_s"]) for r in rows]
-n = len(rss)
-if n < 3:
-    print("SOAK INCONCLUSIVE: too few samples"); sys.exit(2)
-base = rss[1]                       # skip the very first sample (warmup tail)
-end, mx = rss[-1], max(rss)
-mt, mr = statistics.mean(t), statistics.mean(rss)
-slope = sum((t[i]-mt)*(rss[i]-mr) for i in range(n)) / (sum((t[i]-mt)**2 for i in range(n)) or 1)
-growth = end - base
+    # Warm this endpoint first so one-time steady-state allocation (e.g. streaming
+    # task/buffer setup on first use) is NOT counted as growth — we want to detect
+    # per-request leaks, i.e. growth from steady-state to steady-state.
+    "$BOMBARDIER_BIN" -c "$CONC" -d 4s -m "$method" "${args[@]:6}" "$url" >/dev/null 2>&1
+    sleep 1
+    local start_rss end_rss
+    start_rss=$(sample_rss)
+    "$BOMBARDIER_BIN" "${args[@]}" "$url" >/dev/null 2>&1
+    end_rss=$(sample_rss)
+
+    THRESHOLD_MIB="$THRESHOLD_MIB" python3 - "$label" "$start_rss" "$end_rss" <<'PY'
+import os, sys
+label, start_kb, end_kb = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+start, end = start_kb/1024, end_kb/1024
+growth = end - start
 thr = float(os.environ["THRESHOLD_MIB"])
-print(f"RSS: start={base:.1f} end={end:.1f} max={mx:.1f} MiB | growth={growth:+.1f} MiB | "
-      f"slope={slope*60:+.3f} MiB/min over {t[-1]}s")
-if growth > thr:
-    print(f"SOAK FAIL: RSS grew {growth:.1f} MiB (> {thr:.0f} MiB threshold) — possible leak"); sys.exit(1)
-print(f"SOAK PASS: RSS stable (growth {growth:+.1f} MiB <= {thr:.0f} MiB threshold)")
+status = "FAIL" if growth > thr else "PASS"
+print(f"  [{status}] {label.strip():22} start={start:6.1f}  end={end:6.1f}  growth={growth:+6.1f} MiB")
+sys.exit(1 if status == "FAIL" else 0)
 PY
+}
+
+echo "Memory soak: ${DUR}s/endpoint, C=$CONC, P=$P, threshold=${THRESHOLD_MIB} MiB"
+# Warm up so allocator/caches settle before the first measured phase.
+"$BOMBARDIER_BIN" -c 50 -d 8s "http://$HOST:$PORT/" >/dev/null 2>&1
+
+overall=0
+for phase in "${PHASES[@]}"; do
+    IFS='|' read -r label kind method path <<< "$phase"
+    run_phase "$label" "$(echo "$kind" | tr -d ' ')" "$(echo "$method" | tr -d ' ')" "$(echo "$path" | tr -d ' ')" || overall=1
+done
+
+echo ""
+if [ "$overall" -eq 0 ]; then
+    echo "SOAK PASS: all endpoints stable (no RSS growth > ${THRESHOLD_MIB} MiB)"
+else
+    echo "SOAK FAIL: one or more endpoints grew RSS past ${THRESHOLD_MIB} MiB — possible leak"
+fi
+exit "$overall"
