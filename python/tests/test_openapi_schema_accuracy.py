@@ -747,6 +747,49 @@ def test_nonencodable_default_factory_does_not_break_schema_generation():
     assert "default" not in props["thing"]
 
 
+def test_every_factory_kind_matches_msgspec_default():
+    """Across every factory kind, bolt's `default` presence + value matches msgspec.
+
+    msgspec is the correctness oracle here. It materializes the four builtin
+    mutable factories (`list`/`dict`/`set`/`bytearray`); stores immutable
+    factories (`tuple`/`frozenset`) as a plain `default`; and emits NO default
+    for arbitrary factories. This pins all three behaviors at once — and would
+    catch the whitelist being narrowed (e.g. dropping `set`/`bytearray`) or
+    widened (materializing `datetime.now`). Both sides are normalized through
+    the same JSON encode so set→[] / bytearray→"" compare like-for-like.
+    """
+
+    class EveryFactory(msgspec.Struct):
+        as_list: list = msgspec.field(default_factory=list)
+        as_dict: dict = msgspec.field(default_factory=dict)
+        as_set: set = msgspec.field(default_factory=set)
+        as_bytearray: bytearray = msgspec.field(default_factory=bytearray)
+        as_tuple: tuple = msgspec.field(default_factory=tuple)
+        as_frozenset: frozenset = msgspec.field(default_factory=frozenset)
+        as_dynamic: datetime.datetime = msgspec.field(default_factory=datetime.datetime.now)
+
+    def as_json(value):
+        return msgspec.json.decode(msgspec.json.encode(value))
+
+    bolt_props = _get_response_component_schema(EveryFactory, path="/every")["properties"]
+    msgspec_props = msgspec.json.schema_components((EveryFactory,))[1]["EveryFactory"]["properties"]
+
+    sentinel = object()
+    for field_name in ("as_list", "as_dict", "as_set", "as_bytearray", "as_tuple", "as_frozenset", "as_dynamic"):
+        bolt_default = bolt_props[field_name].get("default", sentinel)
+        ms_field = msgspec_props[field_name]
+        if "default" in ms_field:
+            assert bolt_default == as_json(ms_field["default"]), field_name
+        else:
+            assert bolt_default is sentinel, f"{field_name} should carry no default (matching msgspec)"
+
+    # Concrete spot-checks so the parity assertion can't pass vacuously.
+    assert bolt_props["as_set"]["default"] == []
+    assert bolt_props["as_bytearray"]["default"] == ""
+    assert bolt_props["as_tuple"]["default"] == []
+    assert "default" not in bolt_props["as_dynamic"]
+
+
 # ---------- named enums promoted to components -----------------------
 #
 # Regression tests for #246. Named enum classes (`enum.Enum` / msgspec
