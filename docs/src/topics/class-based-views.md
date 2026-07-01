@@ -262,6 +262,7 @@ class ArticleViewSet(ViewSet):
 | `methods`        | yes      | List of HTTP methods: `["GET"]`, `["POST"]`, etc.                                        |
 | `detail`         | yes      | `True` for instance actions (`/{pk}/action`), `False` for collection actions (`/action`) |
 | `path`           | no       | Custom URL path (defaults to function name)                                              |
+| `name`           | no       | URL-reverse suffix; combined with the viewset base as `{base}-{name}` (see below)        |
 | `auth`           | no       | List of authentication backends (overrides class-level `auth`)                           |
 | `guards`         | no       | List of permission guards (overrides class-level `guards`)                               |
 | `response_model` | no       | Response model for serialization                                                         |
@@ -280,6 +281,10 @@ async def some_method_name(self, request, pk: int):
     """POST /articles/{pk}/custom-action-name"""
     return {"action": "custom-action-name", "article_id": pk}
 ```
+
+### URL reversing
+
+`view()`, `viewset()`, and `@action` all accept `name=` for URL reversing. A viewset names each route `{base}-{action}` (e.g. `user-list`, `user-recent`). See [URL names and reversing](routing.md#url-names-and-reversing) for the full reference.
 
 ### Actions with query parameters
 

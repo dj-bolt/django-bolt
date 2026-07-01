@@ -5,10 +5,20 @@ These tests verify that the OpenAPI/Swagger documentation endpoints
 are working correctly and not throwing internal errors.
 """
 
+import time
+from typing import Annotated
+
+import jwt
 import msgspec
+from django.contrib.admin.views.decorators import staff_member_required
 
 from django_bolt import BoltAPI
+from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
+from django_bolt.datastructures import UploadFile
 from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
+from django_bolt.openapi.spec import Components, SecurityScheme
+from django_bolt.params import File, Form
+from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
 
 
@@ -148,7 +158,6 @@ def test_openapi_renders_serializer_with_field_marker_default():
     internal _FieldMarker (which carries a bare object() sentinel for
     unset defaults) into the OpenAPI schema's JSON output.
     """
-    from django_bolt.serializers import Serializer, field
 
     class AstronautCreated(Serializer):
         id: int
@@ -203,8 +212,6 @@ def test_openapi_disabled_returns_404():
 
 def test_openapi_protected_without_auth_returns_401():
     """Test that protected docs without authentication return 401."""
-    from django_bolt.auth import IsAuthenticated, JWTAuthentication
-
     api = BoltAPI(
         openapi_config=OpenAPIConfig(
             title="Test API",
@@ -233,12 +240,6 @@ def test_openapi_protected_without_auth_returns_401():
 
 def test_openapi_protected_with_valid_auth():
     """Test that protected docs with valid authentication work."""
-    import time
-
-    import jwt
-
-    from django_bolt.auth import IsAuthenticated, JWTAuthentication
-
     api = BoltAPI(
         openapi_config=OpenAPIConfig(
             title="Test API",
@@ -280,8 +281,6 @@ def test_openapi_protected_with_valid_auth():
 
 def test_openapi_all_routes_protected():
     """Test that all OpenAPI routes are protected when guards are set."""
-    from django_bolt.auth import IsAuthenticated, JWTAuthentication
-
     api = BoltAPI(
         openapi_config=OpenAPIConfig(
             title="Test API",
@@ -339,8 +338,6 @@ def test_openapi_django_auth_redirects_to_login():
 
 def test_openapi_django_auth_with_staff_member_required():
     """Test that staff_member_required decorator redirects non-staff to admin login."""
-    from django.contrib.admin.views.decorators import staff_member_required
-
     api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0", django_auth=staff_member_required))
 
     @api.get("/test")
@@ -399,8 +396,6 @@ def test_openapi_security_requirements_for_authenticated_routes():
     The authorize button in Swagger UI was not shown because security extraction
     was looking for 'auth' key instead of '_auth_backend_instances'.
     """
-    from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
-
     api = BoltAPI(openapi_config=OpenAPIConfig(title="Auth Test API", version="1.0.0"))
 
     # Public route - no auth
@@ -472,9 +467,6 @@ def test_openapi_security_requirements_for_authenticated_routes():
 
 def test_openapi_security_schemes_preserve_user_defined():
     """Test that user-defined security schemes are preserved and not overwritten."""
-    from django_bolt.auth import JWTAuthentication, IsAuthenticated
-    from django_bolt.openapi.spec import Components, SecurityScheme
-
     custom_scheme = SecurityScheme(
         type="http",
         scheme="bearer",
@@ -515,11 +507,6 @@ def test_openapi_form_serializer_flattens_struct_fields():
     Also covers UploadFile / list[UploadFile] schema shape inside and outside the
     struct.
     """
-    from typing import Annotated
-
-    from django_bolt.datastructures import UploadFile
-    from django_bolt.params import File, Form
-    from django_bolt.serializers import Serializer
 
     class RegisterForm(Serializer):
         username: str

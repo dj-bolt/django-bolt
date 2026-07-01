@@ -81,9 +81,7 @@ def test_static_prefix_requires_path_boundary(make_server_project):
         boundary = server.get("/statictest.css")
 
     assert ok.status_code == 200
-    assert boundary.status_code == 404, (
-        f"/statictest.css should NOT match /static scope, got {boundary.status_code}"
-    )
+    assert boundary.status_code == 404, f"/statictest.css should NOT match /static scope, got {boundary.status_code}"
 
 
 def test_media_does_not_fall_through_to_static_finders(make_server_project):
@@ -116,8 +114,7 @@ def test_media_does_not_fall_through_to_static_finders(make_server_project):
     assert static_hit.status_code == 200
     # The bug: file leaks through /media/ via finder fallback.
     assert media_leak.status_code == 404, (
-        f"/media/bait.css should NOT resolve via staticfiles finders, "
-        f"got {media_leak.status_code}"
+        f"/media/bait.css should NOT resolve via staticfiles finders, got {media_leak.status_code}"
     )
 
 
@@ -193,9 +190,7 @@ def test_media_traversal_blocked(make_server_project, attack_path):
     with project.start() as server:
         response = server.get(attack_path)
 
-    assert response.status_code in (400, 404), (
-        f"{attack_path} must not succeed, got {response.status_code}"
-    )
+    assert response.status_code in (400, 404), f"{attack_path} must not succeed, got {response.status_code}"
 
 
 def test_media_symlink_outside_root_blocked(make_server_project, tmp_path):
@@ -224,9 +219,7 @@ def test_media_symlink_outside_root_blocked(make_server_project, tmp_path):
     with project.start() as server:
         response = server.get("/media/escape.txt")
 
-    assert response.status_code == 404, (
-        f"Symlink escaping MEDIA_ROOT must 404, got {response.status_code}"
-    )
+    assert response.status_code == 404, f"Symlink escaping MEDIA_ROOT must 404, got {response.status_code}"
     assert b"SECRET_CONTENT_DO_NOT_LEAK" not in response.content
 
 
@@ -295,16 +288,11 @@ def test_media_directory_request_does_not_list_or_500(make_server_project):
         response = server.get("/media/photos")
         trailing = server.get("/media/photos/")
 
-    assert response.status_code == 404, (
-        f"/media/photos must 404, got {response.status_code}"
-    )
-    assert trailing.status_code == 404, (
-        f"/media/photos/ must 404 (not list), got {trailing.status_code}"
-    )
+    assert response.status_code == 404, f"/media/photos must 404, got {response.status_code}"
+    assert trailing.status_code == 404, f"/media/photos/ must 404 (not list), got {trailing.status_code}"
     for body in (response.content, trailing.content):
-        assert b"a.txt" not in body and b"b.txt" not in body, (
-            "directory listing must not appear in the response body"
-        )
+        assert b"a.txt" not in body, "directory listing must not appear in the response body"
+        assert b"b.txt" not in body, "directory listing must not appear in the response body"
 
 
 def test_media_root_path_returns_404(make_server_project):
@@ -321,10 +309,10 @@ def test_media_root_path_returns_404(make_server_project):
 @pytest.mark.parametrize(
     "attack_path",
     [
-        "/media/%252e%252e/etc/passwd",      # double-encoded ../
-        "/media/..\\etc\\passwd",            # backslash traversal
-        "/media/sub\\..\\..\\etc\\passwd",   # nested backslash traversal
-        "/media//etc/passwd",                # leading-slash absolute path
+        "/media/%252e%252e/etc/passwd",  # double-encoded ../
+        "/media/..\\etc\\passwd",  # backslash traversal
+        "/media/sub\\..\\..\\etc\\passwd",  # nested backslash traversal
+        "/media//etc/passwd",  # leading-slash absolute path
     ],
 )
 def test_media_exotic_traversal_blocked(make_server_project, attack_path):
@@ -334,9 +322,7 @@ def test_media_exotic_traversal_blocked(make_server_project, attack_path):
     with project.start() as server:
         response = server.get(attack_path)
 
-    assert response.status_code in (400, 404), (
-        f"{attack_path} must not succeed, got {response.status_code}"
-    )
+    assert response.status_code in (400, 404), f"{attack_path} must not succeed, got {response.status_code}"
     # Whatever it returns, it must not contain /etc/passwd content
     assert b"root:" not in response.content
 
@@ -468,7 +454,7 @@ def test_media_serves_csp_header_when_configured(make_server_project):
         ("evil.html", b"<script>alert(1)</script>"),
         ("evil.htm", b"<script>alert(1)</script>"),
         ("evil.xhtml", b"<html><script>alert(1)</script></html>"),
-        ("evil.shtml", b"<!--#exec cmd=\"x\" --><script>alert(1)</script>"),
+        ("evil.shtml", b'<!--#exec cmd="x" --><script>alert(1)</script>'),
         ("evil.svg", b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
         ("evil.svgz", b"\x1f\x8bsvg-bytes-here"),
         ("evil.xml", b"<?xml version='1.0'?><root/>"),
@@ -479,9 +465,7 @@ def test_media_serves_csp_header_when_configured(make_server_project):
         ("evil.wasm", b"\x00asm\x01\x00\x00\x00"),
     ],
 )
-def test_media_dangerous_uploads_force_attachment_and_octet_stream(
-    make_server_project, filename, body
-):
+def test_media_dangerous_uploads_force_attachment_and_octet_stream(make_server_project, filename, body):
     """User-uploaded scriptable types must be downloaded, not rendered.
 
     The bug this guards against: stored XSS via a user uploading
@@ -499,8 +483,7 @@ def test_media_dangerous_uploads_force_attachment_and_octet_stream(
     assert response.status_code == 200
     # MUST be the inert type — the browser will not interpret octet-stream.
     assert response.headers.get("content-type") == "application/octet-stream", (
-        f"{filename}: content-type leaked as "
-        f"{response.headers.get('content-type')!r} — browser may execute as script"
+        f"{filename}: content-type leaked as {response.headers.get('content-type')!r} — browser may execute as script"
     )
     # MUST force download. `inline` would still execute renderable types.
     disposition = response.headers.get("content-disposition", "")
@@ -508,9 +491,7 @@ def test_media_dangerous_uploads_force_attachment_and_octet_stream(
         f"{filename}: Content-Disposition must be `attachment`, got {disposition!r}"
     )
     # Body must still be the original bytes; we're rewriting headers, not content.
-    assert response.content == body, (
-        f"{filename}: body should be served unchanged (this is a header-level fix)"
-    )
+    assert response.content == body, f"{filename}: body should be served unchanged (this is a header-level fix)"
 
 
 @pytest.mark.parametrize(
@@ -523,9 +504,7 @@ def test_media_dangerous_uploads_force_attachment_and_octet_stream(
         ("data.json", b'{"ok":true}\n', "application/json"),
     ],
 )
-def test_media_safe_types_keep_their_content_type(
-    make_server_project, filename, body, content_type_prefix
-):
+def test_media_safe_types_keep_their_content_type(make_server_project, filename, body, content_type_prefix):
     """Regression guard for the XSS fix.
 
     The dangerous-extension rewrite must NOT break legitimate inline serving
@@ -584,9 +563,7 @@ def test_media_dotfile_paths_return_404(make_server_project, dotfile_path):
     with project.start() as server:
         response = server.get(f"/media/{dotfile_path}")
 
-    assert response.status_code == 404, (
-        f"/media/{dotfile_path} must not be served, got {response.status_code}"
-    )
+    assert response.status_code == 404, f"/media/{dotfile_path} must not be served, got {response.status_code}"
     assert b"SECRET=do-not-leak" not in response.content
 
 

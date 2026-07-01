@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "django-bolt"
-version = "0.8.1"
+version = "0.8.4"
 description = "High-performance API framework for Django with Rust-powered endpoints delivering 60k+ RPS"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -46,6 +46,11 @@ dependencies = [
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
 nanodjango = ["nanodjango>=0.16"]
+# MCP add-on: a separately-published, version-coupled package. `mcp` is the
+# canonical extra; `bolt-mcp` is an alias so `pip install django-bolt[bolt-mcp]`
+# also works. tool.uv.sources keeps local dev on the workspace copy.
+mcp = ["bolt-mcp>=0.1.0"]
+bolt-mcp = ["bolt-mcp>=0.1.0"]
 
 [project.urls]
 Homepage = "https://github.com/FarhanAliRaza/django-bolt"
@@ -64,7 +69,10 @@ module-name = "django_bolt._core"
 python-source = "python"
 
 [tool.uv.workspace]
-members = []
+members = ["python/bolt-mcp"]
+
+[tool.uv.sources]
+bolt-mcp = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -73,12 +81,13 @@ dev = [
     "pydantic>=2",
     "pyyaml>=5.2",
     "maturin>=1.9.6",
-    "django==6.0.2",
+    "django==6.0.6",
     "ruff>=0.8",
     "vulture>=2.11", #for dead code detection
     "nanodjango>=0.16",
     "openapi-spec-validator>=0.8.5",
     "zstandard>=0.25.0", # for testing with zstd-compressed payloads
+    "bolt-mcp", # workspace member: MCP server support (editable)
 ]
 docs = [
     "zensical",

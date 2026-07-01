@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
 import time
 from collections.abc import AsyncIterable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Protocol
 
 import msgspec
@@ -32,6 +34,7 @@ from django_bolt.openapi import OpenAPIConfig
 from django_bolt.param_functions import Cookie, Depends, File, Form, Header
 from django_bolt.responses import (
     HTML,
+    JSON,
     EventSourceResponse,
     FileResponse,
     PlainText,
@@ -42,6 +45,8 @@ from django_bolt.responses import (
 from django_bolt.serializers import Serializer, field_validator
 from django_bolt.types import Request
 from django_bolt.views import APIView, ViewSet
+
+from .middleware_demo import middleware_api
 
 
 @asynccontextmanager
@@ -260,8 +265,6 @@ async def bench_list() -> list[PostActivity]:
 
 # Mount the middleware API as a sub-application (FastAPI-style)
 # This preserves the middleware_api's own middleware configuration
-from .middleware_demo import middleware_api
-
 api.mount("/middleware", middleware_api)
 
 
@@ -569,28 +572,19 @@ async def read_1k() -> list[ItemSchema]:
 
 @api.get("/100k-json")
 async def read_100k():
-    """
-    Endpoint that returns 10k JSON objects.
-
-    """
+    """Endpoint that returns 100k JSON objects."""
     return test_data.JSON_100K
 
 
 @api.get("/500k-json")
-async def read_100k():
-    """
-    Endpoint that returns 10k JSON objects.
-
-    """
+async def read_500k():
+    """Endpoint that returns 500k JSON objects."""
     return test_data.JSON_500K
 
 
 @api.get("/1m-json")
-async def read_100k():
-    """
-    Endpoint that returns 10k JSON objects.
-
-    """
+async def read_1m():
+    """Endpoint that returns 1m JSON objects."""
     return test_data.JSON_1M
 
 
@@ -757,8 +751,6 @@ async def cookies_valid():
     Response headers should include:
         Set-Cookie: session=abc123; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax
     """
-    from django_bolt.responses import JSON
-
     response = JSON({"message": "Cookie set successfully", "cookie_name": "session"})
     response.set_cookie(
         "session",
@@ -782,8 +774,6 @@ async def cookies_multiple():
 
     Response headers should include multiple Set-Cookie headers.
     """
-    from django_bolt.responses import JSON
-
     response = JSON({"message": "Multiple cookies set", "cookies": ["user_id", "theme", "lang"]})
     response.set_cookie("user_id", "12345", httponly=True)
     response.set_cookie("theme", "dark", max_age=86400 * 365)  # 1 year
@@ -802,8 +792,6 @@ async def cookies_delete():
     Response headers should include:
         Set-Cookie: session=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT
     """
-    from django_bolt.responses import JSON
-
     response = JSON({"message": "Cookie deleted", "cookie_name": "session"})
     response.delete_cookie("session")
     return response
@@ -825,8 +813,6 @@ async def cookies_invalid_name():
 
     The Set-Cookie header will NOT appear in the response.
     """
-    from django_bolt.responses import JSON
-
     response = JSON(
         {
             "message": "Attempted to set cookie with invalid name",
@@ -856,8 +842,6 @@ async def cookies_invalid_value():
 
     The Set-Cookie header will NOT appear in the response.
     """
-    from django_bolt.responses import JSON
-
     response = JSON(
         {
             "message": "Attempted to set cookie with control characters in value",
@@ -885,8 +869,6 @@ async def cookies_mixed():
     Only valid cookies will appear in Set-Cookie headers.
     Invalid ones will be logged and skipped.
     """
-    from django_bolt.responses import JSON
-
     response = JSON(
         {
             "message": "Mixed valid/invalid cookies",
@@ -920,8 +902,6 @@ async def cookies_special_chars():
 
     The value with spaces will be properly quoted in the Set-Cookie header.
     """
-    from django_bolt.responses import JSON
-
     response = JSON(
         {
             "message": "Cookie with special characters",
@@ -971,12 +951,12 @@ async def handle_mixed(
 ):
     """
     Handle a multipart form submission containing a title, description, and optional file attachments.
-    
+
     Parameters:
         title (str): Form field for the item's title.
         description (str): Form field for the item's description.
         attachments (list[dict] | None): Uploaded files (each represented as a dict with file metadata); may be omitted.
-    
+
     Returns:
         dict: A summary containing `title`, `description`, `has_attachments` (`true` if any attachments were provided, `false` otherwise), and `attachment_count` when attachments are present.
     """
@@ -996,13 +976,13 @@ class FormRepeatedKeys(msgspec.Struct):
 async def handle_form_list(data: Annotated[FormRepeatedKeys, Form()]):
     """
     Handle a submitted form containing repeated keys and return summary statistics.
-    
+
     Parameters:
         data (FormRepeatedKeys): Parsed form payload with fields:
             - name: submitted name string
             - tags: list of submitted tag strings (may be empty)
             - counts: list of submitted integers corresponding to counts (may be empty)
-    
+
     Returns:
         dict: Summary with keys:
             - name (str): the submitted name
@@ -1695,11 +1675,10 @@ async def websocket_load_test(websocket: WebSocket):
         python scripts/ws_load.py ws://localhost:8000/ws -c 50 -d 10
     """
     await websocket.accept()
-    try:
+    # Loop until the client disconnects (which raises inside iter_text()).
+    with suppress(Exception):
         async for message in websocket.iter_text():
             await websocket.send_text(message)
-    except Exception:
-        pass  # Client disconnected
 
 
 @api.websocket("/ws/echo")
@@ -1727,11 +1706,10 @@ async def websocket_room(websocket: WebSocket, room_id: str):
         websocat ws://localhost:8000/ws/room/lobby
     """
     await websocket.accept()
-    try:
+    # Loop until the client disconnects (which raises inside iter_text()).
+    with suppress(Exception):
         async for message in websocket.iter_text():
             await websocket.send_text(f"[{room_id}] {message}")
-    except Exception:
-        pass  # Client disconnected
 
 
 @api.view("/cbv-chat-completions")

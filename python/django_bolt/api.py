@@ -20,6 +20,7 @@ except ImportError:
 
 # Import local modules
 import msgspec
+from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
@@ -307,6 +308,7 @@ class BoltAPI:
         self,
         prefix: str = "",
         trailing_slash: str = "strip",
+        namespace: str | None = None,
         middleware: list[Any] | None = None,
         django_middleware: bool | list[str] | dict[str, Any] | None = None,
         enable_logging: bool = True,
@@ -325,6 +327,9 @@ class BoltAPI:
                 - "strip": Remove trailing slashes (default, cleaner URLs)
                 - "append": Add trailing slashes (Django convention)
                 - "keep": No normalization, keep as registered
+            namespace: Optional reverse namespace for this API's routes. When set,
+                routes reverse as ``reverse("<namespace>:<name>")`` (opt-in, like a
+                Django ``app_name``); when None they reverse by their bare name.
             middleware: List of Bolt middleware classes (Django-style) or
                 DjangoMiddleware/DjangoMiddlewareStack wrappers
             django_middleware: Django middleware configuration. Can be:
@@ -354,6 +359,7 @@ class BoltAPI:
         self._next_handler_id = 0
         self.prefix = prefix.rstrip("/")  # Remove trailing slash from prefix
         self.trailing_slash = trailing_slash  # Mode: "strip", "append", or "keep"
+        self.namespace = namespace  # Opt-in reverse namespace; see django_bolt.urls
         self._validate_response_default = validate_response
 
         # Build middleware list: Django middleware first, then custom middleware
@@ -490,13 +496,8 @@ class BoltAPI:
            explicitly disables compression.
         3. Otherwise fall back to this `BoltAPI`'s own `_compression`.
         """
-        try:
-            from django.conf import settings as _settings
-        except Exception:
-            _settings = None
-
-        if _settings is not None and hasattr(_settings, "BOLT_COMPRESSION"):
-            bolt_compression = _settings.BOLT_COMPRESSION
+        if django_settings is not None and hasattr(django_settings, "BOLT_COMPRESSION"):
+            bolt_compression = django_settings.BOLT_COMPRESSION
             if bolt_compression is None or bolt_compression is False:
                 return None
             return bolt_compression.to_rust_config()
@@ -506,6 +507,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
         validate_response: bool | None = None,
@@ -519,6 +521,7 @@ class BoltAPI:
         return self._route_decorator(
             "GET",
             path,
+            name=name,
             response_model=response_model,
             status_code=status_code,
             validate_response=validate_response,
@@ -534,6 +537,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
         validate_response: bool | None = None,
@@ -547,6 +551,7 @@ class BoltAPI:
         return self._route_decorator(
             "POST",
             path,
+            name=name,
             response_model=response_model,
             status_code=status_code,
             validate_response=validate_response,
@@ -562,6 +567,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
         validate_response: bool | None = None,
@@ -575,6 +581,7 @@ class BoltAPI:
         return self._route_decorator(
             "PUT",
             path,
+            name=name,
             response_model=response_model,
             status_code=status_code,
             validate_response=validate_response,
@@ -590,6 +597,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
         validate_response: bool | None = None,
@@ -603,6 +611,7 @@ class BoltAPI:
         return self._route_decorator(
             "PATCH",
             path,
+            name=name,
             response_model=response_model,
             status_code=status_code,
             validate_response=validate_response,
@@ -618,6 +627,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
         validate_response: bool | None = None,
@@ -631,6 +641,7 @@ class BoltAPI:
         return self._route_decorator(
             "DELETE",
             path,
+            name=name,
             response_model=response_model,
             status_code=status_code,
             validate_response=validate_response,
@@ -646,6 +657,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
         validate_response: bool | None = None,
@@ -659,6 +671,7 @@ class BoltAPI:
         return self._route_decorator(
             "HEAD",
             path,
+            name=name,
             response_model=response_model,
             status_code=status_code,
             validate_response=validate_response,
@@ -674,6 +687,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
         validate_response: bool | None = None,
@@ -687,6 +701,7 @@ class BoltAPI:
         return self._route_decorator(
             "OPTIONS",
             path,
+            name=name,
             response_model=response_model,
             status_code=status_code,
             validate_response=validate_response,
@@ -702,6 +717,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
     ):
@@ -725,12 +741,13 @@ class BoltAPI:
                 async for message in websocket.iter_json():
                     await websocket.send_json({"echo": message})
         """
-        return self._websocket_decorator(path, guards=guards, auth=auth)
+        return self._websocket_decorator(path, name=name, guards=guards, auth=auth)
 
     def _websocket_decorator(
         self,
         path: str,
         *,
+        name: str | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
     ):
@@ -760,6 +777,11 @@ class BoltAPI:
             meta = self._compile_websocket_binder(fn, full_path)
             meta["is_async"] = True
             meta["is_websocket"] = True
+
+            # URL-reverse identity, same scheme as HTTP routes (see _route_decorator).
+            meta["name"] = name if name is not None else fn.__name__
+            meta["name_explicit"] = name is not None
+            meta["namespace"] = self.namespace or ""
 
             # Compile optimized argument injector (same as HTTP handlers)
             injector = self._compile_argument_injector(meta)
@@ -800,6 +822,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         methods: list[str] | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
@@ -822,6 +845,8 @@ class BoltAPI:
 
         Args:
             path: URL path pattern (e.g., "/users/{user_id}")
+            name: Optional URL-reverse name applied to every method handler (they
+                share the view's path)
             methods: Optional list of HTTP methods to register (defaults to all implemented methods)
             guards: Optional per-route guard overrides (merged with class-level guards)
             auth: Optional per-route auth overrides (merged with class-level auth)
@@ -883,10 +908,15 @@ class BoltAPI:
                 if merged_validate_response is None and hasattr(handler, "__bolt_validate_response__"):
                     merged_validate_response = handler.__bolt_validate_response__
 
-                # Register using existing route decorator
+                # A view's methods all share one path, so the name applies to each.
+                # When unnamed, fall back to the verbatim class name and mark it
+                # non-explicit so it can't collide-error with an explicit route.
+                view_name = name if name is not None else view_cls.__name__
                 route_decorator = self._route_decorator(
                     method_upper,
                     path,
+                    name=view_name,
+                    _name_explicit=name is not None,
                     response_model=_RESPONSE_MODEL_UNSET,  # Use method's return annotation
                     status_code=merged_status_code,
                     validate_response=merged_validate_response,
@@ -901,7 +931,7 @@ class BoltAPI:
             # Scan for custom action methods (methods decorated with @action)
             # Note: api.view() doesn't have base path context for @action decorator
             # Custom actions with @action should use api.viewset() instead
-            self._register_custom_actions(view_cls, base_path=None, lookup_field=None)
+            self._register_custom_actions(view_cls, base_path=None, lookup_field=None, base_name=None)
 
             return view_cls
 
@@ -911,6 +941,7 @@ class BoltAPI:
         self,
         path: str,
         *,
+        name: str | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         status_code: int | None = None,
@@ -947,6 +978,13 @@ class BoltAPI:
 
         Args:
             path: Base URL path (e.g., "/users")
+            name: Optional base URL-reverse name. Standard actions are named
+                ``{name}-{action}`` (e.g. "user-list", "user-retrieve"); custom
+                @action routes are named ``{name}-{action_name}``. When omitted,
+                the base defaults to the slugified ViewSet class name, so
+                ``UserViewSet`` yields "user-view-set-list", "user-view-set-retrieve",
+                etc. -- reverse() works without an explicit name (a derived base is
+                non-explicit, so it loses collisions to explicitly named routes).
             guards: Optional guards to apply to all routes
             auth: Optional auth backends to apply to all routes
             status_code: Optional default status code (overrides action-specific defaults)
@@ -966,6 +1004,10 @@ class BoltAPI:
             actual_lookup_field = lookup_field
             if actual_lookup_field == "pk" and hasattr(viewset_cls, "lookup_field"):
                 actual_lookup_field = viewset_cls.lookup_field
+
+            # Reverse-name base for all generated routes. Both an explicit name and
+            # the class-name fallback are used verbatim.
+            vs_base = name if name is not None else viewset_cls.__name__
 
             # Define standard action mappings with HTTP-compliant status codes
             # Format: action_name: (method, path, default_status_code)
@@ -1053,10 +1095,17 @@ class BoltAPI:
                 ):
                     handler = paginate(viewset_cls.pagination_class)(handler)
 
-                # Register the route
+                # Derive route name from the viewset base + verbatim action suffix
+                # (e.g. "user-list", "user-retrieve", "user-partial_update").
+                route_name = f"{vs_base}-{action_name}"
+
+                # Generated names are non-explicit so they don't shadow or
+                # collide-error with explicitly named routes.
                 route_decorator = self._route_decorator(
                     http_method,
                     route_path,
+                    name=route_name,
+                    _name_explicit=name is not None,
                     response_model=method_response_model,
                     status_code=merged_status_code,
                     validate_response=merged_validate_response,
@@ -1067,7 +1116,13 @@ class BoltAPI:
                 route_decorator(handler)
 
             # Scan for custom actions (@action decorator)
-            self._register_custom_actions(viewset_cls, base_path=path, lookup_field=actual_lookup_field)
+            self._register_custom_actions(
+                viewset_cls,
+                base_path=path,
+                lookup_field=actual_lookup_field,
+                base_name=vs_base,
+                base_name_explicit=name is not None,
+            )
 
             return viewset_cls
 
@@ -1086,7 +1141,14 @@ class BoltAPI:
         except (AttributeError, TypeError, ValueError):
             return _RESPONSE_MODEL_UNSET
 
-    def _register_custom_actions(self, view_cls: type, base_path: str | None, lookup_field: str | None):
+    def _register_custom_actions(
+        self,
+        view_cls: type,
+        base_path: str | None,
+        lookup_field: str | None,
+        base_name: str | None = None,
+        base_name_explicit: bool = False,
+    ):
         """
         Scan a ViewSet class for custom action methods and register them.
 
@@ -1096,6 +1158,8 @@ class BoltAPI:
             view_cls: The ViewSet class to scan
             base_path: Base path for the ViewSet (e.g., "/users")
             lookup_field: Lookup field name for detail actions (e.g., "id", "pk")
+            base_name: Base URL-reverse name for the viewset.
+            base_name_explicit: True when the user named the viewset directly
         """
 
         # Get class-level auth and guards (if any)
@@ -1201,10 +1265,19 @@ class BoltAPI:
                         attr.validate_response if attr.validate_response is not None else class_validate_response
                     )
 
-                    # Register the custom action
+                    # Derive the action's reverse name: base + suffix. Both an explicit
+                    # @action(name=...) suffix and the function-name fallback are used
+                    # verbatim. attr.path is the URL segment, not a name source.
+                    action_suffix = attr.name if attr.name is not None else unbound_fn.__name__
+                    action_route_name = f"{base_name}-{action_suffix}" if base_name else action_suffix
+
+                    # An explicit @action(name=...) is user-intended, so the route
+                    # is explicit even when the viewset base name was derived.
                     decorator = self._route_decorator(
                         http_method,
                         action_path,
+                        name=action_route_name,
+                        _name_explicit=base_name_explicit or attr.name is not None,
                         response_model=attr.response_model,
                         status_code=attr.status_code,
                         validate_response=final_validate_response,
@@ -1221,6 +1294,7 @@ class BoltAPI:
         method: str,
         path: str,
         *,
+        name: str | None = None,
         response_model: Any = _RESPONSE_MODEL_UNSET,
         status_code: int | None = None,
         validate_response: bool | None = None,
@@ -1230,6 +1304,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        _name_explicit: bool = True,
         _skip_prefix: bool = False,
         _router_middleware: list[Any] | None = None,
     ):
@@ -1265,6 +1340,13 @@ class BoltAPI:
 
             # Store sync/async metadata
             meta["is_async"] = is_async
+
+            # URL-reverse identity. Both a provided name and the bare fn-name fallback
+            # are used verbatim (one rule, no transform — like Starlette's
+            # endpoint.__name__). namespace is opt-in per BoltAPI.
+            meta["name"] = name if name is not None else fn.__name__
+            meta["name_explicit"] = name is not None and _name_explicit
+            meta["namespace"] = self.namespace or ""
 
             # Detect csrf_exempt for Django CSRF middleware support
             # Django's @csrf_exempt decorator sets handler.csrf_exempt = True
@@ -2823,6 +2905,40 @@ class BoltAPI:
             await asgi_app(django_scope, receive, django_send)
 
         self.mount_asgi(path, django_mount_wrapper)
+
+    def mount_mcp(
+        self,
+        mcp: Any,
+        path: str = "/mcp",
+        *,
+        auth: list[Any] | None = None,
+        guards: list[Any] | None = None,
+        oauth: Any | None = None,
+        expose: Any | None = None,
+    ) -> None:
+        """Serve an MCP (Model Context Protocol) server over Streamable HTTP on this API.
+
+        Registers the MCP endpoint (POST/GET/DELETE) at ``path`` (default ``/mcp``)::
+
+            from bolt_mcp import MCP
+
+            mcp = MCP("my-server")
+            api.mount_mcp(mcp, expose=[get_item])
+
+        Requires the optional ``bolt-mcp`` package. ``auth``/``guards`` enforce
+        django-bolt auth in Rust before the handler; ``oauth`` enables the OAuth 2.1
+        Resource Server flow; ``expose`` is an explicit allowlist of existing route
+        handlers to surface as tools. See :func:`bolt_mcp.mount_mcp` for details.
+        """
+        # Lazy import keeps bolt-mcp an optional dependency: django-bolt core never
+        # imports it at module load, only when mount_mcp is actually called.
+        try:
+            from bolt_mcp import mount_mcp  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "api.mount_mcp(...) requires the optional 'bolt-mcp' package. Install it with `pip install 'django-bolt[mcp]'`."
+            ) from exc
+        mount_mcp(self, mcp, path, auth=auth, guards=guards, oauth=oauth, expose=expose)
 
     def include_router(self, router: Router, prefix: str = "") -> None:
         """

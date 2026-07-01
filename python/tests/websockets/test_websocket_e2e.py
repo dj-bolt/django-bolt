@@ -73,11 +73,9 @@ class TestWebSocketEcho:
         @api.websocket("/ws/echo")
         async def echo_handler(websocket: WebSocket):
             await websocket.accept()
-            try:
+            with contextlib.suppress(Exception):
                 async for message in websocket.iter_text():
                     await websocket.send_text(f"Echo: {message}")
-            except Exception:
-                pass
 
         return api
 
@@ -125,7 +123,7 @@ class TestWebSocketJSON:
         @api.websocket("/ws/json")
         async def json_handler(websocket: WebSocket):
             await websocket.accept()
-            try:
+            with contextlib.suppress(Exception):
                 async for data in websocket.iter_json():
                     # Echo back with processing
                     response = {
@@ -133,8 +131,6 @@ class TestWebSocketJSON:
                         "type": type(data).__name__,
                     }
                     await websocket.send_json(response)
-            except Exception:
-                pass
 
         return api
 
@@ -182,12 +178,10 @@ class TestWebSocketBinary:
         @api.websocket("/ws/binary")
         async def binary_handler(websocket: WebSocket):
             await websocket.accept()
-            try:
+            with contextlib.suppress(Exception):
                 async for data in websocket.iter_bytes():
                     # Echo back with length prefix
                     await websocket.send_bytes(len(data).to_bytes(4, "big") + data)
-            except Exception:
-                pass
 
         return api
 
@@ -225,11 +219,9 @@ class TestWebSocketPathParams:
         async def chat_handler(websocket: WebSocket, room_id: str):
             await websocket.accept()
             await websocket.send_text(f"Joined room: {room_id}")
-            try:
+            with contextlib.suppress(Exception):
                 async for message in websocket.iter_text():
                     await websocket.send_text(f"[{room_id}] {message}")
-            except Exception:
-                pass
 
         @api.websocket("/ws/user/{user_id}/channel/{channel_id}")
         async def multi_param_handler(websocket: WebSocket, user_id: str, channel_id: str):
@@ -400,9 +392,8 @@ class TestWebSocketConcurrency:
             my_count = connection_count["value"]
             await websocket.send_json({"connection_number": my_count})
             try:
-                await websocket.receive_text()  # Wait for close
-            except Exception:
-                pass
+                with contextlib.suppress(Exception):
+                    await websocket.receive_text()  # Wait for close
             finally:
                 connection_count["value"] -= 1
 

@@ -2,17 +2,18 @@
 Integration test for middleware with TestClient
 """
 
-import anyio
+import asyncio
 import time
 
+import anyio
 import django
 import jwt
 import pytest
-from django.conf import settings  # noqa: PLC0415
+from django.conf import settings
 
 from django_bolt import BoltAPI, StreamingResponse
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
-from django_bolt.middleware import cors, rate_limit
+from django_bolt.middleware import Middleware, cors, rate_limit
 from django_bolt.testing import TestClient
 
 
@@ -305,9 +306,6 @@ def test_streaming_with_custom_middleware_class():
     The key is that middleware must be passed as a CLASS (not instance), so that
     the middleware chain can instantiate it with get_response.
     """
-    import asyncio
-
-    from django_bolt.middleware import Middleware
 
     class CustomTestMiddleware(Middleware):
         """Custom test middleware that just passes through."""

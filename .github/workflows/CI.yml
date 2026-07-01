@@ -24,10 +24,12 @@ jobs:
         python-version: ["3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           version: "latest"
 
@@ -37,7 +39,13 @@ jobs:
           uv venv
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
 
       - name: Install dependencies
         run: |
@@ -55,15 +63,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           version: "latest"
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.13"
 
@@ -71,7 +81,13 @@ jobs:
         run: uv venv
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -91,15 +107,17 @@ jobs:
         python-version: ["3.12", "3.14"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           version: "latest"
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -107,7 +125,13 @@ jobs:
         run: uv venv
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -128,15 +152,17 @@ jobs:
         os: ["macos-latest", "windows-latest"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           version: "latest"
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.13"
 
@@ -144,7 +170,13 @@ jobs:
         run: uv venv
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -161,7 +193,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Free disk space
         run: |
@@ -169,7 +203,7 @@ jobs:
           docker volume prune -f
 
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x86_64
           args: --release --out dist --interpreter 3.12 3.13 3.14
@@ -178,7 +212,7 @@ jobs:
           docker-options: --pull always
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: wheels-linux-x86_64
           path: dist
@@ -189,17 +223,19 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: universal2-apple-darwin
           args: --release --out dist --interpreter 3.12 3.13 3.14
           sccache: "true"
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: wheels-macos-universal2
           path: dist
@@ -210,17 +246,19 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x64
           args: --release --out dist --interpreter 3.12 3.13 3.14
           sccache: "true"
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: wheels-windows-x64
           path: dist
@@ -231,7 +269,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Free disk space
         run: |
@@ -239,13 +279,13 @@ jobs:
           docker volume prune -f
 
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
           args: --out dist
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: wheels-sdist
           path: dist
@@ -257,10 +297,12 @@ jobs:
     needs: [linux, macos, windows, sdist]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: wheels-*
           path: dist
@@ -275,6 +317,40 @@ jobs:
       - name: List all wheels
         run: ls -lh dist/
 
+  # Supply-chain gate: a vulnerable dep compiled into the wheel (Rust) or
+  # resolved at install (Python) passes manual release review. This catches it;
+  # it blocks release via `needs` below.
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: ""
+
+      - name: cargo audit (Rust deps in Cargo.lock)
+        run: |
+          cargo install cargo-audit --locked
+          # RUSTSEC-2023-0071 (rsa Marvin attack): no fixed release exists. rsa is
+          # transitive via jsonwebtoken, and the timing oracle targets RSA
+          # private-key decryption, not the public-key path JWT verification uses.
+          cargo audit --ignore RUSTSEC-2023-0071
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "latest"
+
+      - name: pip-audit (Python deps in uv.lock)
+        run: |
+          uv export --no-emit-project --no-dev --format requirements-txt --output-file audit-reqs.txt
+          uvx pip-audit --requirement audit-reqs.txt --no-deps
+
   artifact_smoke:
     name: Artifact Smoke ${{ matrix.artifact-kind }}
     if: startsWith(github.ref, 'refs/tags/v')
@@ -286,15 +362,17 @@ jobs:
         artifact-kind: ["wheel", "sdist"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           version: "latest"
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.13"
 
@@ -302,7 +380,13 @@ jobs:
         run: uv venv
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
+        # `toolchain` so the action reads the file. Default rust-cache is safe to
+        # share across the Python matrix: the abi3 build is version-agnostic
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -312,14 +396,14 @@ jobs:
 
       - name: Download Linux wheel artifact
         if: matrix.artifact-kind == 'wheel'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: wheels-linux-x86_64
           path: dist
 
       - name: Download source artifact
         if: matrix.artifact-kind == 'sdist'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: wheels-sdist
           path: dist
@@ -346,7 +430,7 @@ jobs:
     name: Release to PyPI
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [test, validate, server_smoke_linux, server_integration_linux, platform_smoke, artifact_smoke]
+    needs: [test, validate, audit, server_smoke_linux, server_integration_linux, platform_smoke, artifact_smoke]
     environment:
       name: pypi
       url: https://pypi.org/project/django-bolt/
@@ -355,10 +439,12 @@ jobs:
       contents: write # Required for GitHub release
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: wheels-*
           path: dist
@@ -374,7 +460,7 @@ jobs:
         run: uv publish --trusted-publishing always
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           generate_release_notes: true

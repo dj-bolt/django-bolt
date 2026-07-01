@@ -5,9 +5,10 @@ Provides configuration options for response compression (gzip, brotli, zstd).
 Compression levels are handled automatically by Actix Web with optimized defaults.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Literal
-
 
 # Static type aliases for the per-codec tuning fields. The `Literal` types
 # are checker-only: mypy/pyright will flag obvious out-of-range literals at
@@ -54,8 +55,28 @@ past 6; 9 is rarely worth the extra cost for dynamic responses.
 """
 
 ZstdLevel = Literal[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-    12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
 ]
 """Zstd compression level (1..=22).
 

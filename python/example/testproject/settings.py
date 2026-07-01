@@ -44,6 +44,10 @@ INSTALLED_APPS = [
     "bench",
     "core",
     "missions",
+    "mcp_demo",
+    # Tables for the built-in MCP OAuth Authorization Server (bolt_mcp.oauth). Only used
+    # when an mcp mount passes oauth=AuthorizationServer(...); run `manage.py migrate`.
+    "bolt_mcp.oauth",
 ]
 
 MIDDLEWARE = [

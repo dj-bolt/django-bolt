@@ -43,7 +43,7 @@ curl -L "$DOWNLOAD_URL" -o ~/.local/bin/hey
 if [ $? -eq 0 ]; then
     chmod +x ~/.local/bin/hey
     echo "✅ hey installed to ~/.local/bin/hey"
-    
+
     # Check if ~/.local/bin is in PATH
     if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
         echo ""
@@ -52,7 +52,7 @@ if [ $? -eq 0 ]; then
         echo ""
         echo "Add this to your ~/.bashrc or ~/.zshrc to make it permanent"
     fi
-    
+
     # Test installation
     if ~/.local/bin/hey -h &> /dev/null; then
         echo "✅ hey is working!"

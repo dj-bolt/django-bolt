@@ -17,7 +17,7 @@ def api():
     async def get_meta(request):
         """Return all META keys and values."""
         meta = request.META
-        return {k: v for k, v in meta.items()}
+        return dict(meta)
 
     @api.get("/meta/method")
     async def get_meta_method(request):

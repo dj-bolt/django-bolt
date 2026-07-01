@@ -4,6 +4,7 @@ import enum
 import http.client
 import inspect
 import re
+from collections.abc import Callable
 from dataclasses import replace
 from types import UnionType
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_origin
@@ -33,7 +34,30 @@ if TYPE_CHECKING:
     from ..api import BoltAPI
     from .config import OpenAPIConfig
 
-__all__ = ("SchemaGenerator",)
+__all__ = ("ComponentNameCollisionError", "SchemaGenerator")
+
+
+class ComponentNameCollisionError(ValueError):
+    """Two distinct types claim the same OpenAPI component name.
+
+    Structs and enums share a single ``#/components/schemas`` namespace keyed by
+    ``__name__``. When two different types resolve to the same name, emitting a
+    shared ``$ref`` would silently point one of them at the wrong schema, so the
+    generator raises this instead. The message is built in ``__init__`` (rather
+    than at the raise site) so the colliding types stay introspectable and the
+    raise site stays terse.
+    """
+
+    def __init__(self, schema_name: str, new_type: type, existing_type: type) -> None:
+        self.schema_name = schema_name
+        self.new_type = new_type
+        self.existing_type = existing_type
+        super().__init__(
+            f"OpenAPI component name collision: {new_type!r} and {existing_type!r} "
+            f"both map to component schema '{schema_name}'. Rename one type so "
+            f"each component has a unique name."
+        )
+
 
 # Mapping from auth backend scheme_name to OpenAPI security scheme identifier
 _SCHEME_NAME_MAP: dict[str, str] = {
@@ -195,7 +219,18 @@ class SchemaGenerator:
         """
         self.api = api
         self.config = config
-        self.schemas: dict[str, Schema] = {}  # Component schemas registry
+        self.schemas: dict[str, Schema] = {}  # Component schemas registry, keyed by final name
+        # Component naming is two-pass (matching `msgspec.json.schema_components`):
+        # during route processing each struct/enum is registered by *type identity*
+        # with a shared, not-yet-named `Reference`; once every component is known,
+        # `_finalize_component_names` assigns names — short `__name__` normally,
+        # `module.qualname` only for the types whose short names actually collide —
+        # and stamps each shared Reference in place. Keying by type (not name)
+        # means two same-named types from different modules coexist instead of one
+        # silently stealing the other's `$ref`. Dict insertion order is the
+        # registration order the name map iterates.
+        self._component_ref: dict[type, Reference] = {}
+        self._component_schema: dict[type, Schema] = {}
 
     @staticmethod
     def _schema_kwargs(**kwargs: Any) -> dict[str, Any]:
@@ -219,6 +254,96 @@ class SchemaGenerator:
             return Schema(type="integer", enum=enum_values)
         return Schema(enum=enum_values)
 
+    @staticmethod
+    def _own_docstring(cls: type) -> str | None:
+        """Return a class's *own* cleaned docstring, or None when it has none.
+
+        Reads ``__dict__`` directly rather than ``inspect.getdoc`` so a class
+        that defines no docstring doesn't inherit its base's (e.g. an
+        undocumented Struct would otherwise pick up ``msgspec.Struct``'s
+        multi-page base docstring). ``cleandoc`` strips uniform indentation so
+        multi-line docstrings render correctly as JSDoc. Matches what
+        ``msgspec.json.schema_components`` carries through.
+        """
+        own_doc = cls.__dict__.get("__doc__")
+        return inspect.cleandoc(own_doc) if own_doc else None
+
+    def _enum_schema(self, enum_cls: type, *, register_component: bool) -> Schema | Reference:
+        """Promote a named enum to a component (``$ref``) or inline its values.
+
+        Single source for the "promote in body/response contexts, inline in
+        query/param contexts" policy shared by the msgspec-inspect enum branch
+        and the bare enum-class branch of ``_type_to_schema`` — so the two
+        paths can't drift (a missing bare-enum path was exactly bug #246's gap).
+        """
+        if register_component:
+            return self._enum_to_component_schema(enum_cls)
+        return self._enum_values_schema([e.value for e in enum_cls])
+
+    def _union_schema(
+        self,
+        inner_schemas: list[Schema | Reference],
+        *,
+        has_none: bool,
+        tagged: bool,
+    ) -> Schema | Reference:
+        """Assemble an OpenAPI 3.1 union schema from already-built arm schemas.
+
+        Centralizes the null-encoding + collapse policy shared by the two union
+        branches (msgspec-inspect ``UnionType`` and typing ``Union``/PEP 604):
+
+        - ``has_none`` appends a ``{"type": "null"}`` arm — OpenAPI 3.1 expresses
+          nullability via ``null`` in the type union, not the legacy 3.0
+          ``nullable: true``. Preserving it keeps generated specs round-tripping
+          through tooling like openapi-typescript (which would otherwise drop
+          the ``| null`` arm).
+        - A single remaining arm collapses to itself (no needless wrapper).
+        - ``tagged`` selects ``one_of`` (tagged Struct unions → Swagger UI
+          per-variant dropdown + 3.1 discriminator semantics) over ``any_of``.
+        """
+        arms = list(inner_schemas)
+        if has_none:
+            arms.append(Schema(type="null"))
+        if len(arms) == 1:
+            return arms[0]
+        if tagged:
+            return Schema(one_of=arms)
+        return Schema(any_of=arms)
+
+    @staticmethod
+    def _mapping_schema(value_schema: Schema | Reference | None) -> Schema:
+        """``object`` schema for a ``dict[K, V]``/mapping.
+
+        A typed value emits ``additionalProperties: <schema for V>`` (mirroring
+        the list item handling and matching ``msgspec.json.schema``); an untyped
+        value (bare ``dict`` / ``dict[str, Any]``) keeps
+        ``additionalProperties: true`` rather than regressing to a bare
+        ``{"type": "object"}``. JSON object keys are always strings, so only V
+        is described.
+        """
+        if value_schema is None:
+            return Schema(type="object", additional_properties=True)
+        return Schema(type="object", additional_properties=value_schema)
+
+    def _summary_and_description(
+        self, handler: Any, summary: str | None, description: str | None
+    ) -> tuple[str | None, str | None]:
+        """Fill any missing summary/description from the handler's docstring.
+
+        First line → summary, remainder → description, honoring
+        ``config.use_handler_docstrings``. Explicit metadata already on
+        ``summary``/``description`` is left untouched. Shared by the HTTP and
+        WebSocket operation builders.
+        """
+        if (summary is None or description is None) and self.config.use_handler_docstrings and handler.__doc__:
+            doc = inspect.cleandoc(handler.__doc__)
+            lines = doc.split("\n", 1)
+            if summary is None:
+                summary = lines[0]
+            if description is None and len(lines) > 1:
+                description = lines[1].strip()
+        return summary, description
+
     def _numeric_type_schema(self, type_annotation: Any, schema_type: str) -> Schema:
         """Build a numeric schema from msgspec numeric type metadata."""
         return Schema(
@@ -231,6 +356,27 @@ class SchemaGenerator:
                 multiple_of=type_annotation.multiple_of,
             )
         )
+
+    @staticmethod
+    def _apply_json_schema_extra(schema: Schema, extra: dict[str, Any]) -> Schema:
+        """Merge a msgspec ``extra_json_schema`` mapping onto a Schema in place.
+
+        ``msgspec.inspect`` collects the *informational* JSON-schema fields of a
+        ``Meta(...)`` annotation — ``title``/``description``/``examples`` plus any
+        explicit ``extra_json_schema`` — into this dict, keyed by their
+        JSON-schema names (the numeric/string *constraints* live on the wrapped
+        ``*Type`` instead). Map each key onto the matching Schema dataclass
+        attribute, translating camelCase JSON keys (e.g. ``maxLength``) to the
+        snake_case field name via the alias map. Keys with no corresponding
+        Schema field (e.g. arbitrary ``x-`` extensions) are skipped — the spec
+        dataclass cannot represent them. Returns the same Schema for chaining.
+        """
+        alias_map = Schema.field_aliases()  # {json_alias: field_name}
+        for key, value in extra.items():
+            attr = alias_map.get(key, key)
+            if hasattr(schema, attr):
+                setattr(schema, attr, value)
+        return schema
 
     def _msgspec_field_schema(
         self, field: Any, *, register_component: bool = False
@@ -255,6 +401,21 @@ class SchemaGenerator:
 
         if has_default:
             field_schema = self._with_default(field_schema, default)
+            field_required = False
+        elif field.default_factory in (list, dict, set, bytearray):
+            # Mutable-default fields carry their default on ``field.default_factory``
+            # instead of ``field.default`` — materialize it so the schema gains
+            # ``default: []``/``{}``. The whitelist mirrors ``msgspec.json.schema``
+            # exactly (``_json_schema.py``): only these four builtin factories are
+            # materialized. Immutable factories (``tuple``/``frozenset``) are stored
+            # by msgspec as a plain ``field.default`` and so are handled by the
+            # ``has_default`` branch above; arbitrary factories (``datetime.now``,
+            # a ``lambda``, a class) deliberately get NO default — both because
+            # msgspec emits none and because calling them here could embed a
+            # non-JSON-encodable object that crashes spec serialization. The
+            # _FieldMarker path above never reaches here (markers live on
+            # ``field.default``, leaving ``default_factory`` as NODEFAULT).
+            field_schema = self._with_default(field_schema, field.default_factory())
             field_required = False
 
         return field_name, field_schema, field_required
@@ -362,7 +523,11 @@ class SchemaGenerator:
         # Auto-register security schemes from auth backends used on routes
         self._register_security_schemes(openapi)
 
-        # Add component schemas
+        # Assign final component names now that every component type is known,
+        # then expose the populated registry. Names are decided before this point
+        # only as type-keyed placeholders, so this is what actually fills
+        # self.schemas and stamps the shared `$ref`s.
+        self._finalize_component_names()
         if self.schemas:
             openapi.components.schemas = self.schemas
 
@@ -394,15 +559,7 @@ class SchemaGenerator:
         # Prefer explicit metadata over docstring extraction
         summary = meta.get("openapi_summary")
         description = meta.get("openapi_description")
-
-        # Fallback to docstring if not explicitly set
-        if (summary is None or description is None) and self.config.use_handler_docstrings and handler.__doc__:
-            doc = inspect.cleandoc(handler.__doc__)
-            lines = doc.split("\n", 1)
-            if summary is None:
-                summary = lines[0]
-            if description is None and len(lines) > 1:
-                description = lines[1].strip()
+        summary, description = self._summary_and_description(handler, summary, description)
 
         # Extract parameters
         parameters = self._extract_parameters(meta, path)
@@ -459,15 +616,7 @@ class SchemaGenerator:
         # Prefer explicit metadata over docstring extraction
         summary = meta.get("openapi_summary")
         description = meta.get("openapi_description")
-
-        # Fallback to docstring if not explicitly set
-        if (summary is None or description is None) and self.config.use_handler_docstrings and handler.__doc__:
-            doc = inspect.cleandoc(handler.__doc__)
-            lines = doc.split("\n", 1)
-            if summary is None:
-                summary = lines[0]
-            if description is None and len(lines) > 1:
-                description = lines[1].strip()
+        summary, description = self._summary_and_description(handler, summary, description)
 
         # Add WebSocket indicator to summary/description
         if summary and not summary.lower().startswith("websocket"):
@@ -1010,6 +1159,28 @@ class SchemaGenerator:
 
         # Handle msgspec type info objects (IntType, StrType, BoolType, etc.)
         type_name = type(type_annotation).__name__
+
+        # msgspec.inspect wraps an ``Annotated[T, Meta(...)]`` whose Meta carries
+        # informational fields (title/description/examples or an explicit
+        # extra_json_schema) in a ``Metadata`` node: ``.type`` is the underlying
+        # ``*Type`` (StrType/IntType/…) carrying the constraints, and
+        # ``.extra_json_schema`` holds the informational fields. A Meta with
+        # *only* constraints stays a bare ``*Type`` (handled below), but every
+        # documented custom type — Email, PositiveInt, HttpsURL, … i.e. all of
+        # ``serializers.types`` — gets this wrapper. Without unwrapping it here,
+        # those fields fall through every branch to the generic ``object``
+        # fallback and codegen tools (typescript-fetch, openapi-typescript)
+        # emit ``object`` instead of string/integer. (#235)
+        if type_name == "Metadata":
+            base = self._type_to_schema(type_annotation.type, register_component=register_component)
+            extra = getattr(type_annotation, "extra_json_schema", None)
+            # Constraints already live on ``base`` (from the wrapped *Type); only
+            # the docs need merging, and only onto an inline Schema — a $ref to a
+            # component (Struct) carries its own description and can't take siblings.
+            if extra and isinstance(base, Schema):
+                self._apply_json_schema_extra(base, extra)
+            return base
+
         if hasattr(type_annotation, "__class__") and type_name.endswith("Type"):
             # Numeric types with constraint support (ge/gt/le/lt/multiple_of)
             if type_name == "IntType":
@@ -1060,34 +1231,26 @@ class SchemaGenerator:
                     return Schema(type="null") if has_none else Schema(type="object")
 
                 inner_schemas = [self._type_to_schema(t, register_component=register_component) for t in non_none_types]
-                # Per OpenAPI 3.1 (the version this generator declares),
-                # nullable fields are expressed via `null` in the type
-                # union — not the legacy 3.0 `nullable: true`. Preserving
-                # None here means generated specs round-trip correctly
-                # through tooling like openapi-typescript, which uses the
-                # spec verbatim and would otherwise lose the `| null` arm
-                # of the generated TS type.
-                if has_none:
-                    inner_schemas.append(Schema(type="null"))
-
-                if len(inner_schemas) == 1:
-                    return inner_schemas[0]
-                if _is_tagged_struct_union(non_none_types):
-                    # Tagged Struct union — `one_of` makes Swagger UI
-                    # render a dropdown showing each variant's example,
-                    # and matches the OpenAPI 3.1 discriminator semantics
-                    # (exactly one branch matches via the tag field).
-                    return Schema(one_of=inner_schemas)
-                return Schema(any_of=inner_schemas)
+                return self._union_schema(
+                    inner_schemas,
+                    has_none=has_none,
+                    tagged=_is_tagged_struct_union(non_none_types),
+                )
             if type_name == "ListType":
                 item_type = getattr(type_annotation, "item_type", None)
                 if item_type:
                     item_schema = self._type_to_schema(item_type, register_component=register_component)
                     return Schema(type="array", items=item_schema)
                 return Schema(type="array", items=Schema(type="object"))
-            # For dict types from msgspec
+            # For dict types from msgspec — recurse into the *value* type via
+            # _mapping_schema. An untyped value (bare dict / dict[str, Any],
+            # which msgspec models as AnyType) stays additionalProperties: true.
             if type_name == "DictType":
-                return Schema(type="object", additional_properties=True)
+                value_type = getattr(type_annotation, "value_type", None)
+                typed = value_type is not None and type(value_type).__name__ != "AnyType"
+                return self._mapping_schema(
+                    self._type_to_schema(value_type, register_component=register_component) if typed else None
+                )
             # For enum types from msgspec (EnumType for plain enums,
             # CustomType for Django TextChoices/IntegerChoices which use
             # a metaclass that msgspec doesn't recognise as a standard enum)
@@ -1096,8 +1259,14 @@ class SchemaGenerator:
                 and hasattr(type_annotation, "cls")
                 and issubclass(type_annotation.cls, enum.Enum)
             ):
-                values = [e.value for e in type_annotation.cls]
-                return self._enum_values_schema(values)
+                # Named enum classes (enum.Enum / msgspec EnumType / Django
+                # TextChoices/IntegerChoices) are promoted to named components +
+                # $ref in component contexts (request/response bodies), parallel
+                # to how Structs are registered — so consumers get a reusable
+                # type and the enum's docstring survives as `description`. In
+                # inline contexts (query params) they stay inline. Anonymous
+                # `Literal[...]` unions (LiteralType, below) always stay inline.
+                return self._enum_schema(type_annotation.cls, register_component=register_component)
             # msgspec.inspect.type_info represents Literal fields on Structs as
             # LiteralType, so keep this branch alongside the bare typing.Literal
             # branch below.
@@ -1109,6 +1278,19 @@ class SchemaGenerator:
         args = get_args(type_annotation)
 
         if origin is Annotated:
+            # A documented custom type (e.g. ``Email = Annotated[str, Meta(...)]``)
+            # used directly as a response model — bare (``-> Email``) or nested
+            # (``-> list[Email]``) — reaches here as a raw typing.Annotated still
+            # carrying its msgspec Meta. Normalize it through msgspec.inspect so it
+            # renders identically to the same type used as a Struct field (the
+            # Metadata branch above then applies constraints + docs). Param markers
+            # like Query()/Header() are not msgspec.Meta, so ``Annotated[T, Query()]``
+            # still falls through to the plain unwrap below. (#235)
+            if any(isinstance(m, msgspec.Meta) for m in args[1:]):
+                return self._type_to_schema(
+                    msgspec.inspect.type_info(type_annotation),
+                    register_component=register_component,
+                )
             # Unwrap Annotated[T, ...]
             type_annotation = args[0]
             origin = get_origin(type_annotation)
@@ -1136,21 +1318,19 @@ class SchemaGenerator:
             else:
                 return self._struct_to_schema(type_annotation)
 
+        # Handle bare enum classes (e.g. ``-> GateReason`` or ``list[GateReason]``).
+        # A named enum used as a Struct *field* reaches the msgspec.inspect
+        # EnumType/CustomType branch above; used directly as a (nested) response
+        # model it arrives here as a raw enum class via the typing path. Same
+        # promote-or-inline policy as the field path, via _enum_schema. (#246)
+        if isinstance(type_annotation, type) and issubclass(type_annotation, enum.Enum):
+            return self._enum_schema(type_annotation, register_component=register_component)
+
         if origin is Union or origin is UnionType:
-            # Split out `None` into a `null` arm (OpenAPI 3.1 nullable
-            # encoding). Use `one_of` for tagged Struct unions so Swagger
-            # UI renders a per-branch dropdown; `any_of` for everything
-            # else (primitive nullable, mixed unions) for spec accuracy.
             non_none_args = [arg for arg in args if arg is not type(None)]
             has_none = len(non_none_args) != len(args)
             inner = [self._type_to_schema(arg, register_component=register_component) for arg in non_none_args]
-            if has_none:
-                inner.append(Schema(type="null"))
-            if len(inner) == 1:
-                return inner[0]
-            if _is_tagged_struct_union(non_none_args):
-                return Schema(one_of=inner)
-            return Schema(any_of=inner)
+            return self._union_schema(inner, has_none=has_none, tagged=_is_tagged_struct_union(non_none_args))
 
         # Handle list
         if origin is list:
@@ -1158,9 +1338,15 @@ class SchemaGenerator:
             item_schema = self._type_to_schema(item_type, register_component=register_component)
             return Schema(type="array", items=item_schema)
 
-        # Handle dict
+        # Handle dict — recurse into the value type V of dict[K, V] via
+        # _mapping_schema. Bare dict[K] without a value type or dict[str, Any]
+        # stays additionalProperties: true (no value type to describe).
         if origin is dict:
-            return Schema(type="object", additional_properties=True)
+            value_type = args[1] if len(args) == 2 else None
+            typed = value_type is not None and value_type is not Any
+            return self._mapping_schema(
+                self._type_to_schema(value_type, register_component=register_component) if typed else None
+            )
 
         # Bare typing.Literal annotations don't come through
         # msgspec.inspect.type_info, so they need their own path here.
@@ -1183,7 +1369,7 @@ class SchemaGenerator:
         # Default to generic object
         return Schema(type="object")
 
-    def _struct_to_schema(self, struct_type: type) -> Schema:
+    def _struct_to_schema(self, struct_type: type, *, register_component: bool = False) -> Schema:
         """Convert msgspec.Struct to inline OpenAPI Schema.
 
         For tagged unions (``msgspec.Struct, tag=...``), msgspec injects the
@@ -1197,8 +1383,17 @@ class SchemaGenerator:
         ``oneOf`` arms with the variant name (e.g. ``PostActivity``)
         instead of the positional fallback (``#0``, ``#1``, ``#2``).
 
+        ``description`` is carried from the struct's (cleaned) ``__doc__``,
+        matching the shape ``msgspec.json.schema_components`` produces. This
+        is what ``openapi-typescript`` and similar codegen tools surface as
+        JSDoc on generated types — without it every consumer-side type loses
+        its hover-documentation.
+
         Args:
             struct_type: msgspec.Struct type.
+            register_component: Whether nested complex types (enums, structs)
+                should be registered as named components + ``$ref`` rather than
+                inlined. True for body/response schemas, False for inline use.
 
         Returns:
             Schema object.
@@ -1208,7 +1403,9 @@ class SchemaGenerator:
         required = []
 
         for field in struct_info.fields:
-            field_name, field_schema, field_required = self._msgspec_field_schema(field, register_component=False)
+            field_name, field_schema, field_required = self._msgspec_field_schema(
+                field, register_component=register_component
+            )
             properties[field_name] = field_schema
 
             # Check if required
@@ -1221,32 +1418,112 @@ class SchemaGenerator:
             properties[tag_field] = self._enum_values_schema([tag])
             required.append(tag_field)
 
+        # Pull `description` from the struct's *own* docstring only (see
+        # _own_docstring — avoids inheriting msgspec.Struct's base docstring).
+        # Matches `msgspec.json.schema_components` behavior.
         return Schema(
             title=struct_type.__name__,
             type="object",
+            description=self._own_docstring(struct_type),
             properties=properties,
             required=required or None,
         )
 
-    def _struct_to_component_schema(self, struct_type: type) -> Reference:
-        """Convert msgspec.Struct to component schema and return reference.
+    def _register_component(self, cls: type, build_schema: Callable[[], Schema]) -> Reference:
+        """Register ``cls`` as a component (by type identity) and return its shared Reference.
 
-        Args:
-            struct_type: msgspec.Struct type.
+        Keyed by the type, not its name: the actual ``$ref`` string is left empty
+        until ``_finalize_component_names`` runs, so two same-named types from
+        different modules can both be registered here and later disambiguated
+        instead of one stealing the other's name. Returns the *same* Reference
+        instance on every call for a given type, so stamping its ``ref`` once at
+        finalize time updates every use site — including refs nested inside
+        ``allOf``/``anyOf`` wrappers built by ``_with_default``/``_union_schema``.
 
-        Returns:
-            Reference to component schema.
+        The Reference is stored *before* ``build_schema`` runs so that a
+        self-referential type (e.g. ``TreeNode`` with ``children: list[TreeNode]``)
+        re-entering this method gets the existing Reference instead of recursing
+        infinitely.
         """
-        schema_name = struct_type.__name__
+        ref = self._component_ref.get(cls)
+        if ref is not None:
+            return ref
+        ref = Reference(ref="")  # named in _finalize_component_names
+        self._component_ref[cls] = ref
+        self._component_schema[cls] = build_schema()
+        return ref
 
-        # Check if already registered (or currently being processed)
-        if schema_name not in self.schemas:
-            # Insert a sentinel *before* processing fields so that
-            # self-referential types (e.g. TreeNode with children:
-            # list[TreeNode]) hit the guard on re-entry instead of
-            # recursing infinitely.  The sentinel is overwritten once
-            # _struct_to_schema returns the real schema.
-            self.schemas[schema_name] = Schema(type="object")
-            self.schemas[schema_name] = self._struct_to_schema(struct_type)
+    def _struct_to_component_schema(self, struct_type: type) -> Reference:
+        """Convert msgspec.Struct to a component schema and return its reference."""
+        return self._register_component(
+            struct_type,
+            lambda: self._struct_to_schema(struct_type, register_component=True),
+        )
 
-        return Reference(ref=f"#/components/schemas/{schema_name}")
+    def _enum_to_component_schema(self, enum_cls: type) -> Reference:
+        """Register a named enum class as a component schema and return its reference.
+
+        Parallels ``_struct_to_component_schema``: named enums (``enum.Enum`` /
+        msgspec ``EnumType`` / Django ``TextChoices``/``IntegerChoices``) become
+        reusable ``#/components/schemas/<Name>`` entries + ``$ref`` so codegen
+        tools can emit a shared type, and the enum's docstring survives as
+        ``description``. The narrowest fitting ``type`` is inferred from the
+        member values, and ``title`` is set to the (short) class name — matching
+        the shape ``msgspec.json.schema_components`` produces for enums.
+        """
+
+        def build() -> Schema:
+            schema = self._enum_values_schema([e.value for e in enum_cls])
+            # Read the enum's *own* docstring (not an inherited one), like structs.
+            # Title stays the short class name even when the component is keyed by a
+            # qualified name on collision, matching msgspec.
+            return replace(schema, title=enum_cls.__name__, description=self._own_docstring(enum_cls))
+
+        return self._register_component(enum_cls, build)
+
+    def _finalize_component_names(self) -> None:
+        """Assign final names to every registered component and populate self.schemas.
+
+        Two-pass naming, mirroring ``msgspec.json.schema_components``: a component
+        keeps its short ``__name__`` unless another *distinct* type shares it, in
+        which case every colliding type expands to its normalized
+        ``module.qualname`` so all of them coexist. Each type's shared Reference is
+        stamped in place, updating all of its use sites at once.
+        """
+
+        def normalize(name: str) -> str:
+            return re.sub(r"[^a-zA-Z0-9.\-_]", "_", name)
+
+        def fullname(cls: type) -> str:
+            return normalize(f"{cls.__module__}.{cls.__qualname__}")
+
+        # First map name -> type, expanding only the names that actually collide.
+        names: dict[str, type] = {}
+        conflicts: set[str] = set()
+
+        def assign(name: str, cls: type) -> None:
+            existing = names.get(name)
+            if existing is not None and existing is not cls:
+                # Even the qualified names match (same module + qualname) — the
+                # types are genuinely indistinguishable by name. Fail loudly
+                # rather than emit a $ref that resolves to the wrong shape.
+                raise ComponentNameCollisionError(name, cls, existing)
+            names[name] = cls
+
+        for cls in self._component_ref:
+            short = normalize(cls.__name__)
+            if short in names and names[short] is not cls:
+                # First collision on this short name: re-home the incumbent under
+                # its qualified name and mark the short name as conflicted.
+                incumbent = names.pop(short)
+                conflicts.add(short)
+                assign(fullname(incumbent), incumbent)
+            if short in conflicts:
+                assign(fullname(cls), cls)
+            else:
+                assign(short, cls)
+
+        # Stamp each shared Reference and publish the schema under its final name.
+        for name, cls in names.items():
+            self._component_ref[cls].ref = f"#/components/schemas/{name}"
+            self.schemas[name] = self._component_schema[cls]

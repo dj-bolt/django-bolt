@@ -117,6 +117,5 @@ def test_lifespan_startup_failure_prevents_tests():
     async def x():
         return "x"
 
-    with pytest.raises(RuntimeError, match="startup failed"):
-        with TestClient(api):
-            pass
+    with pytest.raises(RuntimeError, match="startup failed"), TestClient(api):
+        pass

@@ -59,7 +59,7 @@ def test_urlencoded_repeated_keys_bind_to_list(make_server_project):
 def test_multipart_repeated_keys_bind_to_list(make_server_project):
     """
     Verify that multipart/form-data repeated keys are bound to list fields and scalar values are converted and wrapped as needed.
-    
+
     Sends a multipart POST to /form-list with multiple `tags`, a single `name`, and a single numeric `counts` value, then asserts the response status is 200 and the JSON body contains:
     - name: "bob"
     - tags: ["x", "y", "z"]

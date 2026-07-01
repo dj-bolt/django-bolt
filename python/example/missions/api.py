@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from typing import Annotated, Literal
 
+from django.urls import reverse
 from msgspec import Meta
 
 from django_bolt import BoltAPI, Request
@@ -131,8 +132,25 @@ async def mission_control_status():
     return {"status": "operational", "message": "Mission Control Online"}
 
 
+@api.get("/reverse-demo")
+async def reverse_demo():
+    """Resolve Bolt route names back to URLs with Django's ``reverse()``.
+
+    These routes live only in Rust's matchit router, yet ``django.urls.reverse``
+    resolves them by name because ``testproject/urls.py`` includes
+    ``django_bolt.urls`` (a reverse-only urlconf built from the named routes).
+    Path params come straight from Django's converters -- nothing here knows
+    about Bolt.
+    """
+    return {
+        "missions_list": reverse("missions-list"),
+        "mission_detail": reverse("mission-detail", kwargs={"mission_id": 42}),
+        "mission_log": reverse("mission-log", kwargs={"mission_id": 42}),
+    }
+
+
 # Endpoints
-@api.get("/missions")
+@api.get("/missions", name="missions-list")
 async def list_missions(filters: Annotated[MissionFilters, Query()]) -> MissionListResponse:
     """List all missions with optional filtering."""
     queryset = Mission.objects.all()
@@ -144,7 +162,7 @@ async def list_missions(filters: Annotated[MissionFilters, Query()]) -> MissionL
     return MissionListResponse(missions=missions, count=len(missions))
 
 
-@api.get("/missions/{mission_id}")
+@api.get("/missions/{mission_id}", name="mission-detail")
 async def get_mission(mission_id: int) -> MissionResponse:
     """Get a specific mission by ID."""
     try:
@@ -222,7 +240,7 @@ async def get_classified_info(
     }
 
 
-@api.get("/missions/{mission_id}/log")
+@api.get("/missions/{mission_id}/log", name="mission-log")
 async def get_mission_log(mission_id: int):
     """Return a plain-text mission log."""
     try:
@@ -414,6 +432,7 @@ async def mission_dashboard(request: Request):
     async for mission in Mission.objects.all()[:20]:
         missions.append(
             {
+                "id": mission.id,
                 "name": mission.name,
                 "status": mission.status,
                 "description": mission.description,

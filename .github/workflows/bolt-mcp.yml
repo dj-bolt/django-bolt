@@ -1,0 +1,51 @@
+name: bolt-mcp
+
+# Publishes the pure-Python `bolt-mcp` package (the django-bolt MCP add-on) to PyPI.
+# Triggered by `bolt-mcp-v*` tags — kept separate from django-bolt's `v*` tags so the
+# Rust wheel build (CI.yml) and this pure-Python build never cross-trigger.
+# Functional tests run in the main CI on PRs/master; this workflow only builds + publishes.
+
+on:
+  push:
+    tags:
+      - "bolt-mcp-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish at a time — never let two tag pushes race to upload the same version.
+concurrency:
+  group: publish-bolt-mcp
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & publish bolt-mcp to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/bolt-mcp/
+    permissions:
+      id-token: write # Required for PyPI trusted publishing
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0 # full history + tags so hatch-vcs can derive the version
+          persist-credentials: false # don't leave the token in .git/config (OIDC handles publishing)
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.10.3"
+
+      - name: Build bolt-mcp (pure-python wheel + sdist)
+        run: uv build --package bolt-mcp
+
+      - name: Check artifacts
+        run: |
+          pip install twine
+          twine check --strict dist/*
+
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always

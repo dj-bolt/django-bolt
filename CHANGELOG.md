@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **OpenAPI: named enums now emit reusable components** - Enums (`enum.Enum`, msgspec `EnumType`, Django `TextChoices`/`IntegerChoices`) used in request/response bodies were inlined as `{"type": "string", "enum": [...]}` at every use site, so codegen tools (`openapi-typescript`, `typescript-fetch`) couldn't emit a shared named type and the enum's docstring was lost. Named enum classes are now promoted to `#/components/schemas/<Name>` components + `$ref` — parallel to how Structs are registered — carrying their docstring as `description`, matching `msgspec.json.schema_components`. Anonymous `Literal[...]` unions and query-parameter enums stay inline (no name to register under / inline context). Component naming is two-pass: a type keeps its short `__name__` unless another *distinct* type shares it, in which case the colliding types expand to their `module.qualname` so same-named types from different apps coexist (also matching `msgspec.json.schema_components`); only types that are indistinguishable by module + qualname raise `ComponentNameCollisionError`. (#246)
+- **OpenAPI: struct field `default_factory` values are no longer dropped** - Fields whose default came from one of the builtin mutable factories (`list`/`dict`/`set`/`bytearray`, e.g. `tags: list[str] = msgspec.field(default_factory=list)`) lost their `default` in the generated schema because the generator read only `field.default`, never `field.default_factory`. It now materializes those four factories so the schema carries `default: []`/`default: {}`, matching `msgspec.json.schema` exactly — other factories (e.g. `datetime.now`) deliberately get no `default`, as msgspec does, which also avoids embedding a non-JSON-encodable value that would break spec serialization. (#245)
+- **OpenAPI: typed dict values now render their value type** - `dict[K, V]` was emitted as `{"type": "object", "additionalProperties": true}` regardless of `V`, so codegen tools (`openapi-typescript`, `typescript-fetch`) generated `Record<string, unknown>` for every typed map (`dict[str, int]`, `dict[str, SomeStruct]`, str→str maps, …). Both dict paths in the schema generator now recurse into `V` — exactly as the adjacent list handlers recurse into the item type — emitting `additionalProperties: {"type": "integer"}`, `additionalProperties: {"$ref": …}` (nested Structs are registered as components), or `additionalProperties: {"anyOf": [...]}` for `dict[str, T | None]`, matching `msgspec.json.schema`. Untyped dicts (`dict`, `dict[str, Any]`) keep `additionalProperties: true`.
+- **OpenAPI: documented constrained types now render as their base type** - Custom types built with `Annotated[T, msgspec.Meta(...)]` that also carry a `description`/`examples`/`title` — every type in `django_bolt.serializers.types` (`Email`, `PositiveInt`, `HttpsURL`, …) — were emitted as an empty `{"type": "object"}` schema, so codegen tools (`openapi-typescript`, `typescript-fetch`) generated `object` instead of `string`/`integer`. `msgspec.inspect` wraps such fields in a `Metadata` node that the generator didn't recognise; it now unwraps that node to the underlying type, carrying constraints (`maxLength`, `pattern`, `exclusiveMinimum`, …) and docs through, matching `msgspec.json.schema`. Custom types used directly as response models (`-> Email`, `-> list[Email]`) are normalised the same way. (#235)
+
+## [0.8.2]
+
+### Added
+
+- **Optional `bolt-mcp` add-on (MCP over Streamable HTTP)** - New pure-Python `bolt-mcp` package and an `api.mount_mcp()` entrypoint serve a Model Context Protocol server at a route, reusing Django-Bolt's Rust-side auth and per-tool guards. Supports OAuth 2.1 — including a built-in Authorization Server (RFC 9728/8414 discovery, RFC 7591 dynamic client registration, Authorization Code + PKCE, RFC 7009 revocation) so OAuth-native clients (Claude.ai, ChatGPT, Claude Code) link once and refresh silently — plus an explicit tool allowlist. Stays an optional dependency via lazy import and ships its own tag-driven release flow (`just release-mcp`).
+- **URL reversing for Bolt routes** - Include `django_bolt.urls` in your `ROOT_URLCONF` (`path("", include("django_bolt.urls"))`) and Django's `reverse()`, `reverse_lazy()`, and the `{% url %}` template tag resolve Bolt route names. Entries are reverse-only — Bolt still serves the paths in Rust and the registered views never run; path converters, `args`/`kwargs`, `query`, and `fragment` come from Django's own resolver.
+- **`name=` on every route decorator** - `@api.get/post/put/patch/delete/head/options`, `@api.websocket`, `@api.view`, `@api.viewset`, and `@action` accept an explicit reverse name. Unnamed routes derive a name verbatim from the Python identifier (function name, or class name for class-based views); viewsets name each route `{base}-{action}` (e.g. `user-list`, `user-partial_update`).
+- **Opt-in reverse namespaces** - `BoltAPI(namespace="...")` mirrors Django's `app_name`; namespaced routes reverse as `namespace:name` and resolve only under that namespace.
+
+### Security
+
+- **Supply-chain hardening for CI** - All third-party GitHub Actions and pre-commit hooks are SHA-pinned (with version comments), closing the tag-mutation hole; Renovate keeps the digests updated. A new `prek` lint workflow (ruff + trailing-whitespace/end-of-file hooks) runs on every PR. (#238)
+
+### Fixed
+
+- **OpenAPI component schemas carry struct title and description** - `_struct_to_schema` now populates `title` from a `msgspec.Struct`'s `__name__` and `description` from the struct's own docstring, matching `msgspec.json.schema_components`. Downstream codegen (e.g. `openapi-typescript`) renders the description as JSDoc on generated types. The docstring is read from `struct_type.__dict__` directly so an undocumented struct doesn't inherit `msgspec.Struct`'s base-class docstring. (#224)
+
+### Documentation
+
+- **Routing docs** - New "URL names and reversing" section in `routing.md` covering wiring, naming, derived names, namespaces, viewset/`@action` naming, and collision rules; `class-based-views.md` documents the `@action` `name=` parameter and cross-links it.
+
 ## [0.8.1]
 
 ### Added

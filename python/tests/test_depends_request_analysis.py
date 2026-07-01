@@ -20,7 +20,6 @@ from django_bolt import BoltAPI
 from django_bolt.params import Depends, Query
 from django_bolt.testing import TestClient
 
-
 # --- Dependency callables (module-level so inspect.getsource works) ---
 
 

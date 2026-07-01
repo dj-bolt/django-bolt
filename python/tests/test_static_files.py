@@ -11,10 +11,13 @@ Also tests Django template {% static %} tag integration.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
 import tempfile
 
 import pytest
+from django.conf import settings
 from django.contrib.staticfiles.finders import get_finder
 from django.core.exceptions import SuspiciousFileOperation
 
@@ -146,8 +149,6 @@ class TestFindStaticFile:
 
     def test_find_file_in_static_root(self, monkeypatch):
         """Test that finder-only lookup does not search STATIC_ROOT."""
-        from django.conf import settings
-
         original_root = getattr(settings, "STATIC_ROOT", None)
         original_dirs = getattr(settings, "STATICFILES_DIRS", None)
         settings.STATIC_ROOT = TEST_STATIC_DIR
@@ -168,8 +169,6 @@ class TestFindStaticFile:
 
     def test_find_file_in_staticfiles_dirs(self, monkeypatch):
         """Test finding a file in STATICFILES_DIRS."""
-        from django.conf import settings
-
         # Create a second static directory
         second_dir = tempfile.mkdtemp(prefix="django_bolt_static2_")
         second_css = os.path.join(second_dir, "custom.css")
@@ -211,6 +210,7 @@ class TestFindStaticFile:
         assert_path_rejected("C:temp/file.txt")
         assert_path_rejected("\\\\server\\share\\file.txt")
 
+
 class TestStaticFileServing:
     """Tests for static file serving via the test client."""
 
@@ -237,8 +237,6 @@ class TestStaticFileServing:
 
     def test_serve_css_file(self, client, monkeypatch):
         """Test serving a CSS file."""
-        from django.conf import settings
-
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATIC_URL = "/static/"
 
@@ -249,8 +247,6 @@ class TestStaticFileServing:
 
     def test_serve_js_file(self, client, monkeypatch):
         """Test serving a JavaScript file."""
-        from django.conf import settings
-
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATIC_URL = "/static/"
 
@@ -262,8 +258,6 @@ class TestStaticFileServing:
 
     def test_serve_image_file(self, client, monkeypatch):
         """Test serving an image file."""
-        from django.conf import settings
-
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATIC_URL = "/static/"
 
@@ -322,8 +316,6 @@ def test_admin_static_served_via_native_finder_fallback():
     runserver) so finders resolve admin assets. pytest-django forces
     DEBUG=False during tests, so we opt back in explicitly and restore.
     """
-    from django.conf import settings
-
     original_debug = settings.DEBUG
     try:
         settings.DEBUG = True
@@ -352,8 +344,6 @@ class TestStaticTemplateTag:
     @pytest.fixture(scope="class")
     def api_with_template(self):
         """Create API with template that uses static tag."""
-        from django.conf import settings
-
         # Configure static settings
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATIC_URL = "/static/"
@@ -384,8 +374,6 @@ class TestMultipleDirectories:
 
     def test_searches_directories_in_order(self, monkeypatch):
         """Test that directories are searched in priority order."""
-        from django.conf import settings
-
         # Create two directories with same-named file
         dir1 = tempfile.mkdtemp(prefix="static_priority1_")
         dir2 = tempfile.mkdtemp(prefix="static_priority2_")
@@ -410,8 +398,6 @@ class TestMultipleDirectories:
 
     def test_fallback_to_second_directory(self, monkeypatch):
         """Test falling back to second directory when file not in first."""
-        from django.conf import settings
-
         # Create two directories, file only in second
         dir1 = tempfile.mkdtemp(prefix="static_fallback1_")
         dir2 = tempfile.mkdtemp(prefix="static_fallback2_")
@@ -552,8 +538,6 @@ class TestSymlinkSecurity:
     @pytest.fixture(scope="class")
     def setup_symlink_test(self):
         """Create a test directory with symlinks."""
-        import shutil
-
         # Create a fresh test directory
         test_dir = tempfile.mkdtemp(prefix="symlink_test_")
         safe_dir = os.path.join(test_dir, "safe")
@@ -565,15 +549,15 @@ class TestSymlinkSecurity:
             f.write("SAFE_CONTENT")
 
         # Create a file outside the static directory
-        outside_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-        outside_file.write(b"OUTSIDE_CONTENT_SHOULD_NOT_BE_SERVED")
-        outside_file.close()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as outside_file:
+            outside_file.write(b"OUTSIDE_CONTENT_SHOULD_NOT_BE_SERVED")
+        outside_file_name = outside_file.name
 
         # Create a symlink inside the static directory pointing outside
         symlink_path = os.path.join(safe_dir, "malicious_link.txt")
 
         try:
-            os.symlink(outside_file.name, symlink_path)
+            os.symlink(outside_file_name, symlink_path)
             symlink_created = True
         except OSError:
             # Symlink creation may fail on some systems (e.g., Windows without admin)
@@ -583,19 +567,17 @@ class TestSymlinkSecurity:
             "test_dir": test_dir,
             "safe_dir": safe_dir,
             "safe_file": safe_file,
-            "outside_file": outside_file.name,
+            "outside_file": outside_file_name,
             "symlink_path": symlink_path,
             "symlink_created": symlink_created,
         }
 
         # Cleanup
-        try:
+        with contextlib.suppress(Exception):
             if symlink_created and os.path.islink(symlink_path):
                 os.unlink(symlink_path)
-            os.unlink(outside_file.name)
+            os.unlink(outside_file_name)
             shutil.rmtree(test_dir)
-        except Exception:
-            pass
 
     def test_symlink_outside_directory_blocked(self, setup_symlink_test):
         """Test symlink security behavior.
@@ -606,8 +588,6 @@ class TestSymlinkSecurity:
         """
         if not setup_symlink_test["symlink_created"]:
             pytest.skip("Symlink creation not supported on this system")
-
-        from django.conf import settings
 
         settings.STATIC_ROOT = None
         settings.STATICFILES_DIRS = [setup_symlink_test["safe_dir"]]
@@ -630,8 +610,6 @@ class TestSymlinkSecurity:
 
     def test_safe_file_still_accessible(self, setup_symlink_test):
         """Test that regular files within the directory are still accessible."""
-        from django.conf import settings
-
         settings.STATIC_ROOT = None
         settings.STATICFILES_DIRS = [setup_symlink_test["safe_dir"]]
         settings.STATIC_URL = "/static/"
@@ -645,8 +623,6 @@ class TestSymlinkSecurity:
         """Test that symlinks within the static directory still work."""
         if not setup_symlink_test["symlink_created"]:
             pytest.skip("Symlink creation not supported on this system")
-
-        from django.conf import settings
 
         safe_dir = setup_symlink_test["safe_dir"]
 
@@ -677,8 +653,6 @@ class TestContentSecurityPolicy:
 
     def test_csp_header_applied_when_configured(self):
         """Test that CSP header is applied when BOLT_STATIC_CSP is set."""
-        from django.conf import settings
-
         # Configure CSP
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
@@ -697,8 +671,6 @@ class TestContentSecurityPolicy:
 
     def test_no_csp_header_when_not_configured(self):
         """Test that no CSP header is added when not configured."""
-        from django.conf import settings
-
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
         settings.STATIC_URL = "/static/"
@@ -718,8 +690,6 @@ class TestContentSecurityPolicy:
 
     def test_csp_setting_formats(self):
         """Test various CSP setting formats are accepted."""
-        from django.conf import settings
-
         # Test string format
         settings.BOLT_STATIC_CSP = "default-src 'self'"
         assert settings.BOLT_STATIC_CSP == "default-src 'self'"
@@ -752,16 +722,12 @@ class TestEdgeCases:
     @pytest.fixture(autouse=True)
     def setup_static_dir(self):
         """Setup static directory for tests."""
-        from django.conf import settings
-
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
         settings.STATIC_URL = "/static/"
 
     def test_file_with_spaces_in_name(self):
         """Test finding files with spaces in the name."""
-        from django.conf import settings
-
         settings.STATIC_ROOT = TEST_STATIC_DIR
 
         # Create a file with spaces
@@ -780,8 +746,6 @@ class TestEdgeCases:
 
     def test_file_with_unicode_name(self):
         """Test finding files with unicode characters in the name."""
-        from django.conf import settings
-
         settings.STATIC_ROOT = TEST_STATIC_DIR
 
         # Create a file with unicode characters
@@ -801,7 +765,7 @@ class TestEdgeCases:
     def test_empty_file(self, client):
         """Test serving an empty file."""
         empty_file = os.path.join(TEST_STATIC_DIR, "empty.txt")
-        with open(empty_file, "w") as f:
+        with open(empty_file, "w"):
             pass  # Create empty file
 
         try:
@@ -831,8 +795,6 @@ class TestEdgeCases:
 
     def test_deeply_nested_path(self, client):
         """Test serving files from deeply nested directories."""
-        import shutil
-
         deep_dir = os.path.join(TEST_STATIC_DIR, "a", "b", "c", "d", "e")
         os.makedirs(deep_dir, exist_ok=True)
         deep_file = os.path.join(deep_dir, "deep.txt")
@@ -856,8 +818,6 @@ class TestDebugModeFinders:
 
     def test_admin_static_found_in_debug_mode(self):
         """Test that Django admin static files are found when DEBUG=True."""
-        from django.conf import settings
-
         original_debug = getattr(settings, "DEBUG", None)
         settings.DEBUG = True
 
@@ -873,8 +833,6 @@ class TestDebugModeFinders:
 
     def test_configured_dirs_work_regardless_of_debug(self):
         """Test that explicitly configured directories always work."""
-        from django.conf import settings
-
         settings.STATIC_ROOT = None
         settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
         settings.STATIC_URL = "/static/"
@@ -897,8 +855,6 @@ class TestDebugModeFinders:
         Note: This tests the Python-level find_static_file function.
         The actual Rust handler checks app_state.debug before calling Django finders.
         """
-        from django.conf import settings
-
         # Create an empty STATIC_ROOT with no admin files
         empty_static_root = tempfile.mkdtemp(prefix="empty_static_")
 
@@ -922,14 +878,12 @@ class TestDebugModeFinders:
 
             # Now verify our configured dirs don't have it
             settings.DEBUG = False
-            result = find_static_file("admin/css/base.css")
+            find_static_file("admin/css/base.css")
             # The Python find_static_file always checks finders
             # but the Rust handler gates this behind debug flag
             # This test documents that the file won't be in our configured dirs
 
             # Verify empty static root doesn't have admin files
-            import os
-
             admin_in_configured_dir = os.path.exists(os.path.join(empty_static_root, "admin/css/base.css"))
             assert not admin_in_configured_dir, "Admin files should not be in our empty STATIC_ROOT"
 
@@ -941,8 +895,6 @@ class TestDebugModeFinders:
             if original_dirs is not None:
                 settings.STATICFILES_DIRS = original_dirs
             # Cleanup
-            import shutil
-
             shutil.rmtree(empty_static_root, ignore_errors=True)
 
     def test_rust_handler_debug_flag_integration(self):
@@ -955,8 +907,6 @@ class TestDebugModeFinders:
 
         Note: This test uses the TestClient which exercises the Rust static file handler.
         """
-        from django.conf import settings
-
         # Create empty static root (no admin files)
         empty_static_root = tempfile.mkdtemp(prefix="empty_static_")
 
@@ -1010,6 +960,4 @@ class TestDebugModeFinders:
             if original_dirs is not None:
                 settings.STATICFILES_DIRS = original_dirs
             # Cleanup
-            import shutil
-
             shutil.rmtree(empty_static_root, ignore_errors=True)

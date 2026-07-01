@@ -11,10 +11,11 @@ This test suite verifies that:
 
 from __future__ import annotations
 
-import inspect  # noqa: PLC0415
+import inspect
 
 import msgspec
 
+import django_bolt.api as api_module
 from django_bolt import BoltAPI
 from django_bolt.serializers import Serializer
 from django_bolt.typing import is_msgspec_struct
@@ -304,8 +305,6 @@ def test_non_struct_response_type():
 
 def test_metadata_extraction_at_registration():
     """Test that field extraction happens once at route registration, not per-request."""
-    import django_bolt.api as api_module
-
     api = BoltAPI()
     call_count = 0
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from django_bolt import BoltAPI
-from django_bolt.testing import AsyncTestClient, TestClient
+from django_bolt.testing import TestClient
 
 
 @pytest.fixture(scope="module")

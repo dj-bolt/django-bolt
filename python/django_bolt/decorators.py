@@ -36,6 +36,7 @@ class ActionHandler:
         "methods",
         "detail",
         "path",
+        "name",
         "auth",
         "guards",
         "response_model",
@@ -52,6 +53,7 @@ class ActionHandler:
         methods: list[str],
         detail: bool,
         path: str | None = None,
+        name: str | None = None,
         auth: list[Any] | None = None,
         guards: list[Any] | None = None,
         response_model: Any = _RESPONSE_MODEL_UNSET,
@@ -65,6 +67,7 @@ class ActionHandler:
         self.methods = [m.upper() for m in methods]  # Normalize to uppercase
         self.detail = detail
         self.path = path or fn.__name__  # Default to function name
+        self.name = name
         self.auth = auth
         self.guards = guards
         self.response_model = response_model
@@ -89,6 +92,7 @@ def action(
     detail: bool,
     path: str | None = None,
     *,
+    name: str | None = None,
     auth: list[Any] | None = None,
     guards: list[Any] | None = None,
     response_model: Any = _RESPONSE_MODEL_UNSET,
@@ -117,7 +121,9 @@ def action(
     Args:
         methods: List of HTTP methods (e.g., ["GET"], ["POST"], ["GET", "POST"])
         detail: True for instance-level (requires pk), False for collection-level
-        path: Optional custom action name (defaults to function name)
+        path: Optional custom path segment (defaults to function name)
+        name: Optional URL-reverse suffix override. Combined with the viewset's
+            base name as ``{base}-{name}``; defaults to the path/function name.
         auth: Optional authentication backends (overrides class-level auth)
         guards: Optional permission guards (overrides class-level guards)
         response_model: Optional response model for serialization
@@ -176,6 +182,7 @@ def action(
             methods=methods,
             detail=detail,
             path=path,
+            name=name,
             auth=auth,
             guards=guards,
             response_model=response_model,
