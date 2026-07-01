@@ -71,9 +71,39 @@ fn get_time_class(py: Python<'_>) -> &Py<PyAny> {
     })
 }
 
-/// Maximum allowed length for parameter values (8KB default)
-/// Prevents memory exhaustion attacks from extremely long parameters
-pub const MAX_PARAM_LENGTH: usize = 8192;
+/// Default maximum allowed length for parameter values (8KB).
+/// Prevents memory exhaustion attacks from extremely long parameters.
+pub const DEFAULT_MAX_PARAM_LENGTH: usize = 8192;
+
+/// Hard upper bound for the configurable parameter length (1MB).
+/// A misconfigured `DJANGO_BOLT_MAX_PARAM_LENGTH` (e.g. an enormous value) must
+/// not be able to nullify the DoS guardrail, so any configured value is clamped
+/// to this cap.
+pub const MAX_ALLOWED_PARAM_LENGTH: usize = 1024 * 1024;
+
+#[inline]
+fn parse_max_param_length(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|parsed| *parsed > 0)
+        .map(|parsed| parsed.min(MAX_ALLOWED_PARAM_LENGTH))
+        .unwrap_or(DEFAULT_MAX_PARAM_LENGTH)
+}
+
+/// Resolve the configured maximum parameter length from the
+/// `DJANGO_BOLT_MAX_PARAM_LENGTH` environment variable.
+///
+/// Call this exactly ONCE at server startup and store the result in
+/// `AppState.max_param_length`. The per-request hot path then reads that plain
+/// field — no env access, no lock, no atomics. Missing, empty, non-integer, or
+/// `0` values fall back to [`DEFAULT_MAX_PARAM_LENGTH`].
+pub fn resolve_max_param_length() -> usize {
+    parse_max_param_length(
+        std::env::var("DJANGO_BOLT_MAX_PARAM_LENGTH")
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// Type hint constants (must match Python's get_type_hint_id() in compiler.py)
 pub const TYPE_INT: u8 = 1;
@@ -123,6 +153,36 @@ impl CoercedValue {
     }
 }
 
+/// Error returned by [`coerce_param`] / [`coerce_param_with_limit`].
+///
+/// Callers distinguish the two variants structurally:
+/// * [`CoerceError::TooLong`] is a hard security limit — it MUST always be
+///   rejected (422 for HTTP, upgrade rejection for WebSockets). Never fall back
+///   to passing the oversized value through.
+/// * [`CoerceError::Invalid`] is a normal type-coercion failure. Some callers
+///   (WebSocket scope building) intentionally fall back to the raw string here.
+///
+/// `Display` reproduces the exact same messages the old `String` errors used,
+/// so existing `format!("{e}")` / `.to_string()` consumers are unchanged.
+#[derive(Debug, Clone)]
+pub enum CoerceError {
+    /// Value exceeded the configured `max_param_length` (in bytes).
+    TooLong { len: usize, max: usize },
+    /// Value could not be parsed into the requested type.
+    Invalid(String),
+}
+
+impl std::fmt::Display for CoerceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoerceError::TooLong { len, max } => {
+                write!(f, "Parameter too long: {} bytes (max {} bytes)", len, max)
+            }
+            CoerceError::Invalid(msg) => f.write_str(msg),
+        }
+    }
+}
+
 /// Coerce a string value to the specified type
 ///
 /// # Arguments
@@ -131,17 +191,34 @@ impl CoercedValue {
 ///
 /// # Returns
 /// * `Ok(CoercedValue)` - Successfully coerced value
-/// * `Err(String)` - Error message describing the coercion failure
-pub fn coerce_param(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
-    // Security: Reject excessively long parameters to prevent memory exhaustion
-    if value.len() > MAX_PARAM_LENGTH {
-        return Err(format!(
-            "Parameter too long: {} bytes (max {} bytes)",
-            value.len(),
-            MAX_PARAM_LENGTH
-        ));
+/// * `Err(CoerceError)` - Structured error (`TooLong` vs `Invalid`)
+pub fn coerce_param(value: &str, type_hint: u8) -> Result<CoercedValue, CoerceError> {
+    coerce_param_with_limit(value, type_hint, DEFAULT_MAX_PARAM_LENGTH)
+}
+
+/// Same as [`coerce_param`] but takes the startup-resolved length limit
+/// (`AppState.max_param_length`) so the hot path never re-resolves config.
+pub(crate) fn coerce_param_with_limit(
+    value: &str,
+    type_hint: u8,
+    max_length: usize,
+) -> Result<CoercedValue, CoerceError> {
+    // Security: Reject excessively long parameters to prevent memory exhaustion.
+    // Surfaced as a distinct variant so callers can enforce it as a hard limit
+    // without inspecting the error message text.
+    if value.len() > max_length {
+        return Err(CoerceError::TooLong {
+            len: value.len(),
+            max: max_length,
+        });
     }
 
+    coerce_typed(value, type_hint).map_err(CoerceError::Invalid)
+}
+
+/// Parse `value` into `type_hint` without the length check. Plain-message errors
+/// are wrapped in [`CoerceError::Invalid`] by the public entry points above.
+fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
     match type_hint {
         TYPE_INT => value
             .parse::<i64>()
@@ -256,18 +333,21 @@ fn parse_time(value: &str) -> Result<CoercedValue, String> {
 /// Convert a string value to Python object based on type hint.
 /// Handles all supported types including datetime, uuid, and decimal.
 /// Returns PyResult to properly handle validation errors.
+/// `max_length` is the startup-resolved limit (`AppState.max_param_length`),
+/// passed in so the `params_to_py_dict` hot loop never re-resolves config.
 #[inline]
 pub fn coerce_to_py(
     py: pyo3::Python<'_>,
     value: &str,
     type_hint: u8,
+    max_length: usize,
 ) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
     // Security: Validate length for ALL types (defense in depth)
-    if value.len() > MAX_PARAM_LENGTH {
+    if value.len() > max_length {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Parameter too long: {} bytes (max {} bytes)",
             value.len(),
-            MAX_PARAM_LENGTH
+            max_length
         )));
     }
 
@@ -413,11 +493,12 @@ pub fn params_to_py_dict<'py>(
     py: pyo3::Python<'py>,
     params: &ahash::AHashMap<String, String>,
     param_types: &std::collections::HashMap<String, u8>,
+    max_param_length: usize,
 ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
     let dict = pyo3::types::PyDict::new(py);
     for (name, value) in params {
         let type_hint = param_types.get(name).copied().unwrap_or(TYPE_STRING);
-        let py_value = coerce_to_py(py, value, type_hint)?;
+        let py_value = coerce_to_py(py, value, type_hint, max_param_length)?;
         let _ = dict.set_item(name, py_value);
     }
     Ok(dict)
@@ -544,14 +625,45 @@ mod tests {
 
     #[test]
     fn test_param_length_limit() {
+        let max_length = DEFAULT_MAX_PARAM_LENGTH;
         // Valid length should work
-        let valid = "a".repeat(MAX_PARAM_LENGTH);
+        let valid = "a".repeat(max_length);
         assert!(coerce_param(&valid, TYPE_STRING).is_ok());
 
         // Exceeding limit should fail
-        let too_long = "a".repeat(MAX_PARAM_LENGTH + 1);
+        let too_long = "a".repeat(max_length + 1);
         let result = coerce_param(&too_long, TYPE_STRING);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Parameter too long"));
+        assert!(matches!(result, Err(CoerceError::TooLong { .. })));
+    }
+
+    #[test]
+    fn test_parse_max_param_length_defaults_for_invalid_values() {
+        assert_eq!(parse_max_param_length(None), DEFAULT_MAX_PARAM_LENGTH);
+        assert_eq!(parse_max_param_length(Some("")), DEFAULT_MAX_PARAM_LENGTH);
+        assert_eq!(parse_max_param_length(Some("0")), DEFAULT_MAX_PARAM_LENGTH);
+        assert_eq!(
+            parse_max_param_length(Some("not-a-number")),
+            DEFAULT_MAX_PARAM_LENGTH
+        );
+    }
+
+    #[test]
+    fn test_parse_max_param_length_accepts_valid_positive_value() {
+        assert_eq!(parse_max_param_length(Some("16384")), 16384);
+    }
+
+    #[test]
+    fn test_parse_max_param_length_clamps_to_upper_bound() {
+        // A misconfigured oversized value must be clamped to the hard cap so it
+        // cannot nullify the DoS guardrail.
+        assert_eq!(
+            parse_max_param_length(Some("999999999999")),
+            MAX_ALLOWED_PARAM_LENGTH
+        );
+        // The cap itself is accepted as-is.
+        assert_eq!(
+            parse_max_param_length(Some(&MAX_ALLOWED_PARAM_LENGTH.to_string())),
+            MAX_ALLOWED_PARAM_LENGTH
+        );
     }
 }

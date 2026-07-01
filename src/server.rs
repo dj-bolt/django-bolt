@@ -774,12 +774,16 @@ pub fn start_server(
         }
     });
 
+    // Resolve DJANGO_BOLT_MAX_PARAM_LENGTH once at startup, not per request.
+    let max_param_length = crate::type_coercion::resolve_max_param_length();
+
     let app_state = Arc::new(AppState {
         dispatch: dispatch.into(),
         dispatch_sync: dispatch_sync.into(),
         debug,
         max_header_size,
         max_payload_size,
+        max_param_length,
         asgi_mount_timeout,
         global_cors_config,
         cors_origin_regexes,

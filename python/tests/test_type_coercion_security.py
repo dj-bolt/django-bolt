@@ -2,7 +2,7 @@
 Security tests for type coercion in Django-Bolt.
 
 Tests cover:
-- DoS prevention via parameter length limits (8KB max for ALL params)
+- DoS prevention via parameter length limits (default 8KB max for ALL params)
 - Integer overflow/underflow at i64 boundaries
 - Float special values (infinity, NaN)
 - Boolean validation (strict accepted values, empty string rejected)
@@ -133,7 +133,7 @@ def client(api):
 
 
 # =============================================================================
-# 1. Parameter Length DoS Tests (8KB Limit)
+# 1. Parameter Length DoS Tests (default 8KB limit)
 # =============================================================================
 
 
@@ -141,8 +141,11 @@ class TestParameterLengthLimits:
     """
     Test parameter length limits that prevent memory exhaustion DoS attacks.
 
-    Security measure: MAX_PARAM_LENGTH = 8192 bytes in src/type_coercion.rs
-    Note: Length limit is enforced during type coercion, so only typed params are checked.
+    Security measure: max param length is configurable via DJANGO_BOLT_MAX_PARAM_LENGTH
+    (default: 8192 bytes) in src/type_coercion.rs
+    Note: The length limit is applied to all path/query parameters in the request
+    pipeline (typed and plain-string alike), not only to params that go through
+    type coercion.
     """
 
     def test_typed_path_param_at_limit_succeeds(self, client):

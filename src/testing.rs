@@ -45,7 +45,7 @@ use crate::handler::{
 };
 use crate::request_pipeline::validate_and_cache_typed_params;
 use crate::static_files::handle_file;
-use crate::type_coercion::{coerce_param, params_to_py_dict, TYPE_STRING};
+use crate::type_coercion::{coerce_param_with_limit, params_to_py_dict, CoerceError, TYPE_STRING};
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
@@ -124,6 +124,9 @@ pub struct TestAppState {
     pub global_compression_config: Option<Arc<crate::metadata::CompressionConfig>>,
     pub debug: bool,
     pub max_payload_size: usize,
+    /// Max byte length for parameter values (resolved once from
+    /// DJANGO_BOLT_MAX_PARAM_LENGTH), mirroring production `AppState`.
+    pub max_param_length: usize,
     pub asgi_mount_timeout: Duration,
     /// Trailing slash handling mode: "strip", "append", or "keep"
     pub trailing_slash: String,
@@ -342,6 +345,7 @@ pub fn create_test_app(
         global_compression_config,
         debug,
         max_payload_size,
+        max_param_length: crate::type_coercion::resolve_max_param_length(),
         asgi_mount_timeout,
         trailing_slash: trailing_slash.unwrap_or_else(|| "strip".to_string()),
         static_files_config: static_config,
@@ -505,6 +509,7 @@ pub fn test_request(
                 global_compression_config,
                 debug,
                 max_payload_size,
+                max_param_length,
                 asgi_mount_timeout,
                 _trailing_slash,
                 static_files_config,
@@ -520,6 +525,7 @@ pub fn test_request(
                     state.global_compression_config.clone(),
                     state.debug,
                     state.max_payload_size,
+                    state.max_param_length,
                     state.asgi_mount_timeout,
                     state.trailing_slash.clone(),
                     state.static_files_config.clone(),
@@ -534,6 +540,7 @@ pub fn test_request(
                 debug,
                 max_header_size: 8192,
                 max_payload_size,
+                max_param_length,
                 asgi_mount_timeout,
                 global_cors_config: global_cors_config.clone(),
                 cors_origin_regexes: vec![],
@@ -771,12 +778,16 @@ async fn handle_test_request_internal(
         None
     };
 
+    // Max parameter length resolved once at startup; read the plain field here.
+    let max_param_length = state.max_param_length;
+
     // Validate typed parameters before GIL acquisition and cache non-string coerced values.
     let (path_coerced, query_coerced) = if let Some(ref meta) = route_meta {
         match validate_and_cache_typed_params(
             path_params.as_ref(),
             query_params.as_ref(),
             &meta.param_types,
+            max_param_length,
         ) {
             Ok(cached) => cached,
             Err(response) => return response,
@@ -900,6 +911,7 @@ async fn handle_test_request_internal(
                 max_upload_size,
                 memory_spool_threshold,
                 DEFAULT_MAX_PARTS,
+                max_param_length,
             )
             .await
             {
@@ -940,7 +952,7 @@ async fn handle_test_request_internal(
                     .cloned()
                     .unwrap_or_default();
 
-                match parse_urlencoded(&body, &form_type_hints) {
+                match parse_urlencoded(&body, &form_type_hints, max_param_length) {
                     Ok(form_map) => {
                         let result = FormParseResult {
                             form_map,
@@ -1023,11 +1035,16 @@ async fn handle_test_request_internal(
         };
 
         let headers_dict = match &headers_for_python {
-            Some(h) => Some(params_to_py_dict(py, h, &param_types)?),
+            Some(h) => Some(params_to_py_dict(py, h, &param_types, max_param_length)?),
             None => None,
         };
         let cookies_dict = if needs_cookies {
-            Some(params_to_py_dict(py, &cookies, &param_types)?)
+            Some(params_to_py_dict(
+                py,
+                &cookies,
+                &param_types,
+                max_param_length,
+            )?)
         } else {
             None
         };
@@ -1266,15 +1283,21 @@ pub fn handle_test_websocket(
         .unwrap_or_default();
 
     // Build path_params dict with type coercion
+    let max_param_length = app.max_param_length;
     let path_params_dict = pyo3::types::PyDict::new(py);
     for (k, v) in path_params.iter() {
         let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
-        match coerce_param(v, type_hint) {
+        match coerce_param_with_limit(v, type_hint, max_param_length) {
             Ok(coerced) => {
                 let py_value = coerced_value_to_py(py, &coerced);
                 path_params_dict.set_item(k, py_value)?;
             }
-            Err(_) => {
+            // Oversized values are a hard error — never fall back to the raw string.
+            Err(e @ CoerceError::TooLong { .. }) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
+            }
+            // Genuine type-coercion failure: fall back to the raw string.
+            Err(CoerceError::Invalid(_)) => {
                 path_params_dict.set_item(k, v)?;
             }
         }
@@ -1299,12 +1322,17 @@ pub fn handle_test_websocket(
                         .copied()
                         .unwrap_or(TYPE_STRING);
 
-                    match coerce_param(&decoded_value, type_hint) {
+                    match coerce_param_with_limit(&decoded_value, type_hint, max_param_length) {
                         Ok(coerced) => {
                             let py_value = coerced_value_to_py(py, &coerced);
                             query_dict.set_item(decoded_key.as_ref(), py_value)?;
                         }
-                        Err(_) => {
+                        // Oversized values are a hard error — never fall back to raw string.
+                        Err(e @ CoerceError::TooLong { .. }) => {
+                            return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
+                        }
+                        // Genuine type-coercion failure: fall back to the raw string.
+                        Err(CoerceError::Invalid(_)) => {
                             query_dict.set_item(decoded_key.as_ref(), decoded_value.as_ref())?;
                         }
                     }

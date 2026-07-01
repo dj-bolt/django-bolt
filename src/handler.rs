@@ -901,12 +901,16 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
     let needs_body = plan.map_or(true, |p| p.needs_body());
 
+    // Max parameter length resolved once at startup; read the plain field here.
+    let max_param_length = state.max_param_length;
+
     // Type validation for path and query parameters (Rust-native, no GIL)
     let (path_coerced, query_coerced) = if let Some(route_meta) = route_metadata {
         match validate_and_cache_typed_params(
             path_params.as_ref(),
             query_params.as_ref(),
             &route_meta.param_types,
+            max_param_length,
         ) {
             Ok(cached) => cached,
             Err(response) => return response,
@@ -1078,6 +1082,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 max_upload_size,
                 memory_spool_threshold,
                 DEFAULT_MAX_PARTS,
+                max_param_length,
             )
             .await
             {
@@ -1110,7 +1115,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                     .map(|m| &m.form_type_hints)
                     .unwrap_or(&empty_form_type_hints);
 
-                match parse_urlencoded(&body_vec, form_type_hints) {
+                match parse_urlencoded(&body_vec, form_type_hints, max_param_length) {
                     Ok(form_map) => {
                         let result = FormParseResult {
                             form_map,
@@ -1184,7 +1189,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
         let headers_py: Option<Py<PyDict>> = if needs_headers {
             if let Some(headers_map) = headers.as_ref() {
-                Some(params_to_py_dict(py, headers_map, param_types)?.unbind())
+                Some(params_to_py_dict(py, headers_map, param_types, max_param_length)?.unbind())
             } else {
                 Some(PyDict::new(py).unbind())
             }
@@ -1193,7 +1198,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         };
         let cookies_py: Option<Py<PyDict>> = if needs_cookies {
             if let Some(cookies_map) = cookies.as_ref() {
-                Some(params_to_py_dict(py, cookies_map, param_types)?.unbind())
+                Some(params_to_py_dict(py, cookies_map, param_types, max_param_length)?.unbind())
             } else {
                 Some(PyDict::new(py).unbind())
             }
