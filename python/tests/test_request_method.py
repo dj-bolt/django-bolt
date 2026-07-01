@@ -77,9 +77,7 @@ class TestRequestMethodRoundTrip:
     def test_method_round_trips(self, client, verb):
         response = client.request(verb, "/echo")
         assert response.status_code == 200
-        assert response.json()["method"] == verb, (
-            f"request.method must report {verb!r}, not a degraded 'UNKNOWN'"
-        )
+        assert response.json()["method"] == verb, f"request.method must report {verb!r}, not a degraded 'UNKNOWN'"
 
     def test_head_route_is_reachable(self, client):
         # HEAD responses carry no body, so we can only assert the route matched

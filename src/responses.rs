@@ -143,7 +143,10 @@ mod tests {
     #[test]
     fn test_error_413_static() {
         let response = error_413();
-        assert_eq!(response.status(), actix_web::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[test]

@@ -259,10 +259,7 @@ class _DropOnFullQueueHandler(QueueHandler):
         except Full:
             self.dropped_count += 1
             if self.dropped_count % self._DROP_WARN_INTERVAL == 1:
-                sys.stderr.write(
-                    f"django-bolt: log queue saturated, dropped "
-                    f"{self.dropped_count} record(s)\n"
-                )
+                sys.stderr.write(f"django-bolt: log queue saturated, dropped {self.dropped_count} record(s)\n")
 
 
 class _BoundedQueueListener(QueueListener):

@@ -50,7 +50,8 @@ def test_chunked_over_limit_rejected_with_413(make_server_project):
         # total_read check can stop it. (Garbage body: the size check fires
         # before JSON validation, so this asserts the overflow branch, not 422.)
         response = server.request(
-            "POST", "/sink",
+            "POST",
+            "/sink",
             content=_chunks(50_000),
             headers={"content-type": "application/json"},
         )
@@ -66,7 +67,8 @@ def test_chunked_under_limit_is_not_size_rejected(make_server_project):
         # Valid small JSON, streamed chunked and well under the 2000-byte limit.
         body = b'{"data":"' + b"y" * 200 + b'"}'
         response = server.request(
-            "POST", "/sink",
+            "POST",
+            "/sink",
             content=iter([body]),
             headers={"content-type": "application/json"},
         )

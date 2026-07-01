@@ -762,8 +762,13 @@ class TestQueueBasedLogging:
         bounded = Queue(maxsize=1)
         handler = _DropOnFullQueueHandler(bounded)
         record = logging.LogRecord(
-            name="test", level=logging.INFO, pathname=__file__, lineno=1,
-            msg="payload", args=None, exc_info=None,
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="payload",
+            args=None,
+            exc_info=None,
         )
 
         # Saturate the queue.
@@ -789,8 +794,13 @@ class TestQueueBasedLogging:
         bounded = Queue(maxsize=4)
         handler = _DropOnFullQueueHandler(bounded)
         record = logging.LogRecord(
-            name="test", level=logging.INFO, pathname=__file__, lineno=1,
-            msg="payload", args=None, exc_info=None,
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="payload",
+            args=None,
+            exc_info=None,
         )
         captured = io.StringIO()
         with redirect_stderr(captured):
@@ -817,8 +827,13 @@ class TestQueueBasedLogging:
         listener.start()
         handler = _DropOnFullQueueHandler(q)
         record = logging.LogRecord(
-            name="test", level=logging.INFO, pathname=__file__, lineno=1,
-            msg="payload", args=None, exc_info=None,
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="payload",
+            args=None,
+            exc_info=None,
         )
         captured = io.StringIO()
         with redirect_stderr(captured):
