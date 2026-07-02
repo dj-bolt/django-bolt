@@ -19,6 +19,47 @@ Under the hood, Django-Bolt uses `SO_REUSEPORT` so the kernel load-balances inco
 
 **Rule of thumb:** Set `--processes` to the number of CPU cores available.
 
+## Worker recycling (memory leaks)
+
+Long-running Python processes slowly accumulate resident memory — leaky C extensions, allocator fragmentation, unbounded caches. Traditional servers like Gunicorn work around this with `max_requests` restarts; request count is only a proxy for memory, so Django-Bolt (like Granian) recycles workers on the actual symptoms instead:
+
+```bash
+# Recycle any worker whose resident memory exceeds 512 MiB
+python manage.py runbolt --processes 4 --max-rss 512
+
+# Also recycle each worker every 6 hours, and replace crashed workers
+python manage.py runbolt --processes 4 \
+    --max-rss 512 \
+    --workers-lifetime 21600 \
+    --respawn-failed-workers
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--max-rss <MiB>` | Recycle a worker once its resident set size exceeds this many MiB (checked about once per second). Set it well above your baseline per-worker RSS. `0` disables (default). |
+| `--workers-lifetime <seconds>` | Recycle each worker after this much uptime. `0` disables (default). |
+| `--respawn-failed-workers` | Fork a replacement when a worker exits unexpectedly (crash, OOM kill) instead of letting the fleet shrink. |
+| `--workers-kill-timeout <seconds>` | How long a worker gets to shut down gracefully before it is SIGKILLed (default: 30). |
+
+Any of these options enables the supervising parent process, even with `--processes 1`.
+
+### How recycling works (zero-downtime, WebSocket-aware)
+
+Recycling is **spawn-first and graceful** — it is safe for long-lived connections:
+
+1. The supervisor forks a **replacement worker first**; `SO_REUSEPORT` lets old and new workers share the port, so there is never a moment without an accepting process.
+2. The old worker receives SIGTERM and stops accepting new connections — the kernel routes new traffic to healthy workers.
+3. Active **WebSocket connections receive a proper close frame with code `1012` (Service Restart)** instead of an abrupt reset. Clients should treat 1012 as "reconnect now"; the reconnect lands on a healthy worker. New upgrade attempts on the draining worker get `503`.
+4. In-flight HTTP requests finish (up to `--workers-kill-timeout`, which also sets the server's internal graceful-shutdown window).
+5. If the worker still hasn't exited after the timeout, it is SIGKILLed.
+
+The same drain sequence runs on plain `SIGTERM` (systemd stop, `kubectl delete pod`), so deploys and scale-downs also close WebSockets cleanly. `SIGINT` (Ctrl-C) stops immediately without draining; pressing Ctrl-C twice force-kills workers.
+
+!!! note "WebSocket clients must reconnect"
+    No server can migrate a live TCP connection between processes. Recycling closes WebSockets *cleanly* (close code 1012) rather than avoiding the disconnect. Build reconnect logic into your WebSocket clients and keep per-connection session state in Redis/the database so a reconnect is transparent.
+
+The graceful-shutdown window can also be set directly via the `DJANGO_BOLT_SHUTDOWN_TIMEOUT` environment variable (seconds, default 30) when running without the supervisor.
+
 ## Production deployment
 
 For production, run Django-Bolt as a managed service behind a reverse proxy.

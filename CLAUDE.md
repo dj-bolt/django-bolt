@@ -165,6 +165,7 @@ just release VERSION=0.2.2 DRY_RUN=1    # Test without changes
      - `middleware.py` - Middleware decorators (@cors, @rate_limit, @skip_middleware)
    - `middleware/compiler.py` - Compiles Python middleware config to Rust metadata
    - `management/commands/runbolt.py` - Django management command with autodiscovery
+   - `workers.py` - Worker supervisor for `runbolt`: RSS/lifetime-based recycling (`--max-rss`, `--workers-lifetime`), crash respawn, graceful spawn-first recycle with WebSocket drain (close code 1012)
 
 3. **Django Integration**
    - `runbolt` management command auto-discovers `api.py` files in:
@@ -432,6 +433,7 @@ uv run --with pytest pytest python/tests -s -vv
 - `bootstrap.py` - Django configuration helper
 - `cli.py` - CLI tool (`django-bolt version` command)
 - `management/commands/runbolt.py` - Django management command with autodiscovery
+- `workers.py` - Worker supervisor (RSS/lifetime recycling, crash respawn, graceful shutdown)
 - `apps.py` - Django app configuration
 
 ## Troubleshooting (Development)

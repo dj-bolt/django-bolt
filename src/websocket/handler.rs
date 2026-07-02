@@ -469,6 +469,14 @@ pub async fn handle_websocket_upgrade_with_handler(
         return Ok(HttpResponse::BadRequest().body("Expected WebSocket upgrade request"));
     }
 
+    // Refuse new connections while draining for shutdown/recycle; clients
+    // that retry will land on a healthy worker via SO_REUSEPORT.
+    if super::is_draining() {
+        return Ok(HttpResponse::ServiceUnavailable()
+            .content_type("application/json")
+            .body(r#"{"detail":"Server is shutting down"}"#));
+    }
+
     // Check connection limit FIRST (before any processing)
     let current_connections = ACTIVE_WS_CONNECTIONS.load(Ordering::Relaxed);
     if current_connections >= config.max_connections {
