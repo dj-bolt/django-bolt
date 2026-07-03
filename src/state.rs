@@ -88,6 +88,10 @@ pub struct AppState {
     pub debug: bool,
     pub max_header_size: usize,
     pub max_payload_size: usize,
+    /// Max byte length for path/query/form/header/cookie parameter values.
+    /// Resolved once at startup from DJANGO_BOLT_MAX_PARAM_LENGTH (see
+    /// `type_coercion::resolve_max_param_length`); read directly on the hot path.
+    pub max_param_length: usize,
     pub asgi_mount_timeout: Duration,
     pub global_cors_config: Option<CorsConfig>, // Global CORS configuration from Django settings
     pub cors_origin_regexes: Vec<Regex>,        // Compiled regex patterns for origin matching

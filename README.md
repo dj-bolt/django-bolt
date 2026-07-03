@@ -62,6 +62,20 @@ INSTALLED_APPS = [
 python manage.py runbolt --dev
 ```
 
+### Runtime environment variables
+
+#### `DJANGO_BOLT_MAX_PARAM_LENGTH`
+
+Maximum allowed size (in bytes) for path/query/form parameter values.
+
+- **Default:** `8192`
+- **Read once at startup:** value is resolved and cached on first access
+- **Fallback behavior:** missing, empty, non-numeric, or `0` values fall back to `8192`
+
+```bash
+export DJANGO_BOLT_MAX_PARAM_LENGTH=65536
+```
+
 ---
 
 **Key Features:**
