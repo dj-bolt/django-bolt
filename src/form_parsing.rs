@@ -17,6 +17,22 @@ pub const DEFAULT_MEMORY_LIMIT: usize = 1024 * 1024;
 /// Maximum number of multipart parts allowed
 pub const DEFAULT_MAX_PARTS: usize = 100;
 
+/// `ValidationError::error_type` value used when the aggregate payload exceeds
+/// the configured limit. Callers (handler/test dispatch) match on this to map
+/// the error to HTTP 413 instead of the default 422. Defined once here so the
+/// producer and consumers can't drift on the string.
+pub const ERROR_TYPE_PAYLOAD_TOO_LARGE: &str = "payload_too_large";
+
+/// Build the aggregate-payload-too-large validation error (mapped to HTTP 413).
+fn payload_too_large_error(max_total_size: usize) -> ValidationError {
+    ValidationError {
+        error_type: ERROR_TYPE_PAYLOAD_TOO_LARGE.to_string(),
+        loc: vec!["body".to_string()],
+        msg: format!("Payload exceeds maximum size of {} bytes", max_total_size),
+        ctx: HashMap::new(),
+    }
+}
+
 /// File content - either in memory or spooled to disk
 #[derive(Debug)]
 pub enum FileContent {
@@ -283,6 +299,7 @@ pub fn parse_urlencoded(
 ///         /* memory_limit */ 1024 * 1024,
 ///         /* max_parts */ 1000,
 ///         /* max_param_length */ 8192,
+///         /* max_total_size */ 50 * 1024 * 1024,
 ///     ).await;
 ///
 ///     match result {
@@ -303,10 +320,16 @@ pub async fn parse_multipart(
     memory_limit: usize,
     max_parts: usize,
     max_param_length: usize,
+    max_total_size: usize,
 ) -> Result<FormParseResult, ValidationError> {
     let mut form_map: HashMap<String, FormValue> = HashMap::new();
     let mut files_map: HashMap<String, Vec<FileInfo>> = HashMap::new();
     let mut part_count = 0;
+    // Aggregate bytes accepted across all parts (files + form fields). Bounds the
+    // total payload against the global limit; per-file `max_upload_size` remains
+    // the finer-grained limit. Overshoot is at most one part's worth, since each
+    // part is already individually bounded.
+    let mut total_bytes: usize = 0;
 
     while let Some(item) = payload.next().await {
         // Security: Check part count BEFORE expensive field parsing
@@ -356,6 +379,13 @@ pub async fn parse_multipart(
             )
             .await?;
 
+            // Enforce aggregate payload limit across all parts. checked_add so a
+            // pathological size can't wrap; overflow is treated as over-limit.
+            total_bytes = match total_bytes.checked_add(file_info.size) {
+                Some(v) if v <= max_total_size => v,
+                _ => return Err(payload_too_large_error(max_total_size)),
+            };
+
             // Validate file if constraints exist
             if let Some(constraints) = file_constraints.get(&field_name) {
                 validate_file(&file_info, &field_name, constraints)?;
@@ -404,6 +434,12 @@ pub async fn parse_multipart(
                         .to_string(),
                     ));
                 }
+                // Enforce aggregate payload limit incrementally so an unbounded
+                // form field can't exhaust memory before the part finishes.
+                total_bytes = match total_bytes.checked_add(data.len()) {
+                    Some(v) if v <= max_total_size => v,
+                    _ => return Err(payload_too_large_error(max_total_size)),
+                };
                 value_bytes.extend_from_slice(&data);
             }
 
@@ -823,6 +859,7 @@ mod tests {
             DEFAULT_MEMORY_LIMIT,
             DEFAULT_MAX_PARTS,
             max_param_length,
+            usize::MAX,
         ));
 
         // The oversized field is rejected as "too long".

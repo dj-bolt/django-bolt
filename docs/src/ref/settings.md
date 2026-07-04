@@ -244,6 +244,20 @@ LOGGING = {
 }
 ```
 
+### BOLT_LOG_QUEUE_SIZE
+
+Django-Bolt logs through a bounded, non-blocking queue (a background thread
+forwards records to the console). This sets the queue's maximum depth. When the
+queue is full — e.g. during an extreme burst of error logging — new records are
+dropped rather than accumulating in memory, preventing unbounded RAM growth under
+load. Drops are counted and surfaced with a throttled notice to `stderr`.
+
+```python
+BOLT_LOG_QUEUE_SIZE = 10000
+```
+
+**Default:** `10000`
+
 ## Django signals settings
 
 ### BOLT_EMIT_SIGNALS
@@ -397,6 +411,7 @@ api = BoltAPI(
 | `BOLT_ALLOWED_FILE_PATHS` | `list[str]` | `None` | File serving whitelist |
 | `BOLT_STATIC_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for static (`public`) |
 | `BOLT_MEDIA_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for media (`private`) |
+| `BOLT_LOG_QUEUE_SIZE` | `int` | `10000` | Max depth of the non-blocking log queue (records dropped when full) |
 | `BOLT_EMIT_SIGNALS` | `bool` | `False` | Enable Django request signals |
 | `BOLT_DEV_FORCE_POLLING` | `bool` | `False` | Force `--dev` reloader to use polling instead of native file events |
 | `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |

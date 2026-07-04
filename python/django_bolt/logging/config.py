@@ -7,15 +7,18 @@ Adopts Litestar's queue-based logging approach so request logging stays
 non-blocking and fully controlled by application logging config.
 """
 
+from __future__ import annotations
+
 import atexit
 import contextlib
 import importlib
 import logging
 import logging.config
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from logging.handlers import QueueHandler, QueueListener
-from queue import Queue
+from queue import Full, Queue
 
 try:
     from django.conf import settings
@@ -225,6 +228,58 @@ def get_default_logging_config() -> LoggingConfig:
     )
 
 
+# Default bound for the logging queue (see BOLT_LOG_QUEUE_SIZE).
+_DEFAULT_LOG_QUEUE_SIZE = 10000
+
+
+class _DropOnFullQueueHandler(QueueHandler):
+    """QueueHandler that drops records when the bounded queue is full.
+
+    The stock ``QueueHandler`` calls ``Queue.put_nowait``, which raises
+    ``queue.Full`` once the bounded queue saturates. ``emit`` then routes that
+    to ``handleError``, which writes a traceback to stderr per record (because
+    ``logging.raiseExceptions`` defaults to ``True``) — a stderr storm under the
+    exact load spike the bound is meant to survive. Swallowing ``Full`` here
+    drops the record while keeping the listener thread healthy.
+
+    Drops are not fully silent: ``dropped_count`` tracks the total, and a single
+    terse line is written straight to stderr on the first drop and then once per
+    ``_DROP_WARN_INTERVAL`` drops. We write to stderr directly rather than via
+    the logging system so the warning still surfaces when the queue (the very
+    thing that is saturated) cannot accept more records, and so it can't recurse
+    back into this handler.
+    """
+
+    # Surface saturation roughly this often without re-spamming under load.
+    _DROP_WARN_INTERVAL = 10_000
+
+    def __init__(self, queue: Queue) -> None:
+        super().__init__(queue)
+        self.dropped_count = 0
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        try:
+            self.queue.put_nowait(record)
+        except Full:
+            self.dropped_count += 1
+            if self.dropped_count % self._DROP_WARN_INTERVAL == 1:
+                sys.stderr.write(f"django-bolt: log queue saturated, dropped {self.dropped_count} record(s)\n")
+
+
+class _BoundedQueueListener(QueueListener):
+    """QueueListener that stops cleanly even when the bounded queue is full.
+
+    The stock ``QueueListener.stop()`` calls ``enqueue_sentinel()``, which uses
+    ``Queue.put_nowait`` — on a saturated bounded queue that raises ``queue.Full``
+    and ``stop()`` fails, leaving the listener thread running. The listener thread
+    is the consumer, so a *blocking* put is guaranteed to drain and succeed; use
+    it for the sentinel so shutdown is reliable under load.
+    """
+
+    def enqueue_sentinel(self) -> None:
+        self.queue.put(self._sentinel)
+
+
 def _ensure_queue_logging(base_level: str) -> QueueHandler:
     """Create or reuse a queue-based logging setup.
 
@@ -236,9 +291,28 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
     global _QUEUE_LISTENER, _QUEUE  # noqa: PLW0603
 
     if _QUEUE is None:
-        _QUEUE = Queue(-1)
+        # Bounded queue prevents unbounded backlog → OOM under load spikes.
+        # Records are dropped (via _DropOnFullQueueHandler) when full. The bound
+        # is configurable via the BOLT_LOG_QUEUE_SIZE setting (default 10000),
+        # consistent with the other BOLT_* logging settings.
+        max_queue_size = _DEFAULT_LOG_QUEUE_SIZE
+        if settings is not None:
+            try:
+                max_queue_size = int(getattr(settings, "BOLT_LOG_QUEUE_SIZE", _DEFAULT_LOG_QUEUE_SIZE))
+            except Exception as exc:  # noqa: BLE001 - unconfigured settings or a bad value
+                sys.stderr.write(f"django-bolt: invalid BOLT_LOG_QUEUE_SIZE ({exc}); using {_DEFAULT_LOG_QUEUE_SIZE}\n")
+                max_queue_size = _DEFAULT_LOG_QUEUE_SIZE
+            if max_queue_size <= 0:
+                # Queue(maxsize<=0) is UNBOUNDED — exactly the OOM risk the bound
+                # exists to prevent. Refuse it loudly and fall back to the default.
+                sys.stderr.write(
+                    f"django-bolt: BOLT_LOG_QUEUE_SIZE must be > 0 (got {max_queue_size}); "
+                    f"using {_DEFAULT_LOG_QUEUE_SIZE}\n"
+                )
+                max_queue_size = _DEFAULT_LOG_QUEUE_SIZE
+        _QUEUE = Queue(maxsize=max_queue_size)
 
-    queue_handler = QueueHandler(_QUEUE)
+    queue_handler = _DropOnFullQueueHandler(_QUEUE)
     queue_handler.setLevel(logging.DEBUG)
 
     if _QUEUE_LISTENER is None:
@@ -251,7 +325,7 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
             )
         )
 
-        listener = QueueListener(_QUEUE, console_handler)
+        listener = _BoundedQueueListener(_QUEUE, console_handler)
         listener.start()
 
         # Only register atexit once for cleanup

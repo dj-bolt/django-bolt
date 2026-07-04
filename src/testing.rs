@@ -669,7 +669,10 @@ async fn handle_test_request_internal(
     router: Arc<Router>,
     route_metadata: Arc<RouteMetadataStore>,
 ) -> HttpResponse {
-    use crate::handler::{extract_headers, handle_python_error};
+    use crate::handler::{
+        build_validation_error_response, content_length_exceeds_limit, extract_headers,
+        handle_python_error, parse_content_length,
+    };
     use crate::middleware;
     use crate::middleware::auth::populate_auth_context;
     use crate::request::PyRequest;
@@ -878,102 +881,126 @@ async fn handle_test_request_internal(
     let is_multipart = content_type.starts_with("multipart/form-data");
     let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
 
+    // Fast-reject oversized requests before reading body bytes, reusing the
+    // production helpers so payload-size limits behave identically under
+    // TestClient (per src/CLAUDE.md: tests reuse production code). Only computed
+    // for routes that read a body.
+    let needs_body = route_meta.as_ref().map_or(true, |m| m.plan.needs_body());
+    let reads_body = needs_body || needs_form_parsing;
+    let content_length = if reads_body {
+        parse_content_length(&req)
+    } else {
+        None
+    };
+    if content_length_exceeds_limit(content_length, state.max_payload_size) {
+        return responses::error_413();
+    }
+
     // Read body from payload (before form parsing consumes it for multipart)
-    let (body, form_result): (Vec<u8>, Option<FormParseResult>) =
-        if needs_form_parsing && is_multipart {
-            // Multipart form parsing - uses the payload stream directly
+    let (body, form_result): (Vec<u8>, Option<FormParseResult>) = if needs_form_parsing
+        && is_multipart
+    {
+        // Multipart form parsing - uses the payload stream directly
+        let form_type_hints = route_meta
+            .as_ref()
+            .map(|m| &m.form_type_hints)
+            .cloned()
+            .unwrap_or_default();
+        let file_constraints = route_meta
+            .as_ref()
+            .map(|m| &m.file_constraints)
+            .cloned()
+            .unwrap_or_default();
+        let max_upload_size = route_meta
+            .as_ref()
+            .map(|m| m.max_upload_size)
+            .unwrap_or(1024 * 1024);
+        let memory_spool_threshold = route_meta
+            .as_ref()
+            .map(|m| m.memory_spool_threshold)
+            .unwrap_or(DEFAULT_MEMORY_LIMIT);
+
+        // Create Multipart from the payload
+        let multipart = Multipart::new(req.headers(), payload);
+
+        match parse_multipart(
+            multipart,
+            &form_type_hints,
+            &file_constraints,
+            max_upload_size,
+            memory_spool_threshold,
+            DEFAULT_MAX_PARTS,
+            max_param_length,
+            state.max_payload_size,
+        )
+        .await
+        {
+            Ok(result) => (Vec::new(), Some(result)),
+            Err(validation_error) => {
+                // Aggregate-size overflow maps to 413 to match the non-multipart
+                // path; other multipart failures stay 422 validation errors.
+                if validation_error.error_type == crate::form_parsing::ERROR_TYPE_PAYLOAD_TOO_LARGE
+                {
+                    return responses::error_413();
+                }
+                return build_validation_error_response(&validation_error);
+            }
+        }
+    } else {
+        // Read payload as bytes (for non-multipart requests).
+        // Bound the aggregate body against max_payload_size during streaming
+        // so chunked requests (no Content-Length) are also enforced — mirrors
+        // the production handler.
+        let mut body_bytes = web::BytesMut::new();
+        let mut total_read: usize = 0;
+        while let Some(chunk) = payload.next().await {
+            match chunk {
+                Ok(data) => {
+                    total_read = match total_read.checked_add(data.len()) {
+                        Some(v) => v,
+                        None => return responses::error_413(),
+                    };
+                    if total_read > state.max_payload_size {
+                        return responses::error_413();
+                    }
+                    body_bytes.extend_from_slice(&data);
+                }
+                Err(e) => {
+                    return HttpResponse::BadRequest()
+                        .content_type("application/json")
+                        .body(format!(
+                            "{{\"error\": \"Failed to read request body: {}\"}}",
+                            e
+                        ));
+                }
+            }
+        }
+        let body = body_bytes.freeze();
+
+        // URL-encoded form parsing
+        if needs_form_parsing && is_urlencoded {
             let form_type_hints = route_meta
                 .as_ref()
                 .map(|m| &m.form_type_hints)
                 .cloned()
                 .unwrap_or_default();
-            let file_constraints = route_meta
-                .as_ref()
-                .map(|m| &m.file_constraints)
-                .cloned()
-                .unwrap_or_default();
-            let max_upload_size = route_meta
-                .as_ref()
-                .map(|m| m.max_upload_size)
-                .unwrap_or(1024 * 1024);
-            let memory_spool_threshold = route_meta
-                .as_ref()
-                .map(|m| m.memory_spool_threshold)
-                .unwrap_or(DEFAULT_MEMORY_LIMIT);
 
-            // Create Multipart from the payload
-            let multipart = Multipart::new(req.headers(), payload);
-
-            match parse_multipart(
-                multipart,
-                &form_type_hints,
-                &file_constraints,
-                max_upload_size,
-                memory_spool_threshold,
-                DEFAULT_MAX_PARTS,
-                max_param_length,
-            )
-            .await
-            {
-                Ok(result) => (Vec::new(), Some(result)),
+            match parse_urlencoded(&body, &form_type_hints, max_param_length) {
+                Ok(form_map) => {
+                    let result = FormParseResult {
+                        form_map,
+                        files_map: HashMap::new(),
+                    };
+                    (body.to_vec(), Some(result))
+                }
                 Err(validation_error) => {
-                    // Return HTTP 422 for validation errors
-                    let body = serde_json::json!({
-                        "detail": [validation_error.to_json()]
-                    });
-                    return HttpResponse::UnprocessableEntity()
-                        .content_type("application/json")
-                        .body(body.to_string());
+                    return build_validation_error_response(&validation_error);
                 }
             }
         } else {
-            // Read payload as bytes (for non-multipart requests)
-            let mut body_bytes = web::BytesMut::new();
-            while let Some(chunk) = payload.next().await {
-                match chunk {
-                    Ok(data) => body_bytes.extend_from_slice(&data),
-                    Err(e) => {
-                        return HttpResponse::BadRequest()
-                            .content_type("application/json")
-                            .body(format!(
-                                "{{\"error\": \"Failed to read request body: {}\"}}",
-                                e
-                            ));
-                    }
-                }
-            }
-            let body = body_bytes.freeze();
-
-            // URL-encoded form parsing
-            if needs_form_parsing && is_urlencoded {
-                let form_type_hints = route_meta
-                    .as_ref()
-                    .map(|m| &m.form_type_hints)
-                    .cloned()
-                    .unwrap_or_default();
-
-                match parse_urlencoded(&body, &form_type_hints, max_param_length) {
-                    Ok(form_map) => {
-                        let result = FormParseResult {
-                            form_map,
-                            files_map: HashMap::new(),
-                        };
-                        (body.to_vec(), Some(result))
-                    }
-                    Err(validation_error) => {
-                        // Return HTTP 422 for validation errors
-                        let body = serde_json::json!({
-                            "detail": [validation_error.to_json()]
-                        });
-                        return HttpResponse::UnprocessableEntity()
-                            .content_type("application/json")
-                            .body(body.to_string());
-                    }
-                }
-            } else {
-                (body.to_vec(), None)
-            }
-        };
+            (body.to_vec(), None)
+        }
+    };
 
     let is_head_request = method == "HEAD";
 
