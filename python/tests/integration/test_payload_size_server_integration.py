@@ -60,6 +60,70 @@ def test_chunked_over_limit_rejected_with_413(make_server_project):
     )
 
 
+MULTIPART_API_BODY = """
+from django_bolt import UploadFile
+from django_bolt.params import File
+
+
+@api.post("/upload")
+async def upload(avatar: UploadFile = File(max_size=100_000)):
+    return {"size": avatar.size}
+"""
+
+_BOUNDARY = "boltaggregateboundary"
+
+
+def _multipart_chunks(payload: bytes, chunk: int = 1000):
+    """Yield a hand-rolled multipart body in chunks (streamed → no Content-Length)."""
+    body = (
+        (
+            f"--{_BOUNDARY}\r\n"
+            'Content-Disposition: form-data; name="avatar"; filename="blob.bin"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        + payload
+        + f"\r\n--{_BOUNDARY}--\r\n".encode()
+    )
+    for i in range(0, len(body), chunk):
+        yield body[i : i + chunk]
+
+
+def test_chunked_multipart_over_aggregate_limit_rejected_with_413(make_server_project):
+    """Chunked multipart over BOLT_MAX_UPLOAD_SIZE must 413 via the aggregate check.
+
+    No Content-Length (streamed) → the fast-reject can't fire, and the per-file
+    File(max_size=100_000) is far above the 50 KB payload — so only the aggregate
+    max_total_size bound inside parse_multipart can produce the 413. Regression
+    for the master-merge that dropped the max_total_size wiring from the
+    production parse_multipart call.
+    """
+    project = make_server_project(project_api_body=MULTIPART_API_BODY, settings_extra=SETTINGS_EXTRA)
+    with project.start() as server:
+        response = server.request(
+            "POST",
+            "/upload",
+            content=_multipart_chunks(b"x" * 50_000),
+            headers={"content-type": f"multipart/form-data; boundary={_BOUNDARY}"},
+        )
+    assert response.status_code == 413, (
+        f"chunked multipart over the aggregate limit must 413, got {response.status_code}: {response.text[:200]}"
+    )
+
+
+def test_chunked_multipart_under_aggregate_limit_succeeds(make_server_project):
+    """A small chunked multipart body must not be size-rejected (control)."""
+    project = make_server_project(project_api_body=MULTIPART_API_BODY, settings_extra=SETTINGS_EXTRA)
+    with project.start() as server:
+        response = server.request(
+            "POST",
+            "/upload",
+            content=_multipart_chunks(b"y" * 500),
+            headers={"content-type": f"multipart/form-data; boundary={_BOUNDARY}"},
+        )
+    assert response.status_code == 200, f"expected 200, got {response.status_code}: {response.text[:200]}"
+    assert response.json()["size"] == 500
+
+
 def test_chunked_under_limit_is_not_size_rejected(make_server_project):
     """A small chunked body must not be size-rejected (control for the above)."""
     project = make_server_project(project_api_body=API_BODY, settings_extra=SETTINGS_EXTRA)

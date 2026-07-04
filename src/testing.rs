@@ -670,7 +670,8 @@ async fn handle_test_request_internal(
     route_metadata: Arc<RouteMetadataStore>,
 ) -> HttpResponse {
     use crate::handler::{
-        content_length_exceeds_limit, extract_headers, handle_python_error, parse_content_length,
+        build_validation_error_response, content_length_exceeds_limit, extract_headers,
+        handle_python_error, parse_content_length,
     };
     use crate::middleware;
     use crate::middleware::auth::populate_auth_context;
@@ -929,6 +930,7 @@ async fn handle_test_request_internal(
             max_upload_size,
             memory_spool_threshold,
             DEFAULT_MAX_PARTS,
+            max_param_length,
             state.max_payload_size,
         )
         .await
@@ -941,12 +943,7 @@ async fn handle_test_request_internal(
                 {
                     return responses::error_413();
                 }
-                let body = serde_json::json!({
-                    "detail": [validation_error.to_json()]
-                });
-                return HttpResponse::UnprocessableEntity()
-                    .content_type("application/json")
-                    .body(body.to_string());
+                return build_validation_error_response(&validation_error);
             }
         }
     } else {
@@ -987,93 +984,23 @@ async fn handle_test_request_internal(
                 .map(|m| &m.form_type_hints)
                 .cloned()
                 .unwrap_or_default();
-            let file_constraints = route_meta
-                .as_ref()
-                .map(|m| &m.file_constraints)
-                .cloned()
-                .unwrap_or_default();
-            let max_upload_size = route_meta
-                .as_ref()
-                .map(|m| m.max_upload_size)
-                .unwrap_or(1024 * 1024);
-            let memory_spool_threshold = route_meta
-                .as_ref()
-                .map(|m| m.memory_spool_threshold)
-                .unwrap_or(DEFAULT_MEMORY_LIMIT);
 
-            // Create Multipart from the payload
-            let multipart = Multipart::new(req.headers(), payload);
-
-            match parse_multipart(
-                multipart,
-                &form_type_hints,
-                &file_constraints,
-                max_upload_size,
-                memory_spool_threshold,
-                DEFAULT_MAX_PARTS,
-                max_param_length,
-            )
-            .await
-            {
-                Ok(result) => (Vec::new(), Some(result)),
+            match parse_urlencoded(&body, &form_type_hints, max_param_length) {
+                Ok(form_map) => {
+                    let result = FormParseResult {
+                        form_map,
+                        files_map: HashMap::new(),
+                    };
+                    (body.to_vec(), Some(result))
+                }
                 Err(validation_error) => {
-                    // Return HTTP 422 for validation errors
-                    let body = serde_json::json!({
-                        "detail": [validation_error.to_json()]
-                    });
-                    return HttpResponse::UnprocessableEntity()
-                        .content_type("application/json")
-                        .body(body.to_string());
+                    return build_validation_error_response(&validation_error);
                 }
             }
         } else {
-            // Read payload as bytes (for non-multipart requests)
-            let mut body_bytes = web::BytesMut::new();
-            while let Some(chunk) = payload.next().await {
-                match chunk {
-                    Ok(data) => body_bytes.extend_from_slice(&data),
-                    Err(e) => {
-                        return HttpResponse::BadRequest()
-                            .content_type("application/json")
-                            .body(format!(
-                                "{{\"error\": \"Failed to read request body: {}\"}}",
-                                e
-                            ));
-                    }
-                }
-            }
-            let body = body_bytes.freeze();
-
-            // URL-encoded form parsing
-            if needs_form_parsing && is_urlencoded {
-                let form_type_hints = route_meta
-                    .as_ref()
-                    .map(|m| &m.form_type_hints)
-                    .cloned()
-                    .unwrap_or_default();
-
-                match parse_urlencoded(&body, &form_type_hints, max_param_length) {
-                    Ok(form_map) => {
-                        let result = FormParseResult {
-                            form_map,
-                            files_map: HashMap::new(),
-                        };
-                        (body.to_vec(), Some(result))
-                    }
-                    Err(validation_error) => {
-                        // Return HTTP 422 for validation errors
-                        let body = serde_json::json!({
-                            "detail": [validation_error.to_json()]
-                        });
-                        return HttpResponse::UnprocessableEntity()
-                            .content_type("application/json")
-                            .body(body.to_string());
-                    }
-                }
-            } else {
-                (body.to_vec(), None)
-            }
-        };
+            (body.to_vec(), None)
+        }
+    };
 
     let is_head_request = method == "HEAD";
 

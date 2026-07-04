@@ -299,6 +299,7 @@ pub fn parse_urlencoded(
 ///         /* memory_limit */ 1024 * 1024,
 ///         /* max_parts */ 1000,
 ///         /* max_param_length */ 8192,
+///         /* max_total_size */ 50 * 1024 * 1024,
 ///     ).await;
 ///
 ///     match result {
@@ -319,6 +320,7 @@ pub async fn parse_multipart(
     memory_limit: usize,
     max_parts: usize,
     max_param_length: usize,
+    max_total_size: usize,
 ) -> Result<FormParseResult, ValidationError> {
     let mut form_map: HashMap<String, FormValue> = HashMap::new();
     let mut files_map: HashMap<String, Vec<FileInfo>> = HashMap::new();
@@ -432,6 +434,12 @@ pub async fn parse_multipart(
                         .to_string(),
                     ));
                 }
+                // Enforce aggregate payload limit incrementally so an unbounded
+                // form field can't exhaust memory before the part finishes.
+                total_bytes = match total_bytes.checked_add(data.len()) {
+                    Some(v) if v <= max_total_size => v,
+                    _ => return Err(payload_too_large_error(max_total_size)),
+                };
                 value_bytes.extend_from_slice(&data);
             }
 
@@ -851,6 +859,7 @@ mod tests {
             DEFAULT_MEMORY_LIMIT,
             DEFAULT_MAX_PARTS,
             max_param_length,
+            usize::MAX,
         ));
 
         // The oversized field is rejected as "too long".

@@ -865,6 +865,40 @@ class TestQueueBasedLogging:
             config_module._QUEUE_LISTENER = None
             config_module._QUEUE = None
 
+    @pytest.mark.parametrize("bad_value", [0, -1, "10k"], ids=["zero", "negative", "non-int"])
+    def test_invalid_queue_size_falls_back_to_bounded_default_with_notice(self, bad_value):
+        """A bad BOLT_LOG_QUEUE_SIZE must not silently create an UNBOUNDED queue.
+
+        Queue(maxsize<=0) is unbounded — the exact OOM risk the bound exists to
+        prevent — and a non-int value must not be silently ignored (project rule:
+        never silently ignore errors). Both cases must fall back to the bounded
+        default AND surface a notice on stderr.
+        """
+        config_module._QUEUE_LISTENER = None
+        config_module._QUEUE = None
+        had_attr = hasattr(settings, "BOLT_LOG_QUEUE_SIZE")
+        prev = getattr(settings, "BOLT_LOG_QUEUE_SIZE", None)
+        settings.BOLT_LOG_QUEUE_SIZE = bad_value
+        try:
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                _ensure_queue_logging("INFO")
+            assert config_module._QUEUE.maxsize == 10000, (
+                f"BOLT_LOG_QUEUE_SIZE={bad_value!r} must fall back to the bounded default, "
+                f"got maxsize={config_module._QUEUE.maxsize} (<=0 means unbounded)"
+            )
+            assert "BOLT_LOG_QUEUE_SIZE" in captured.getvalue(), (
+                "misconfiguration must be surfaced on stderr, not silently ignored"
+            )
+        finally:
+            if had_attr:
+                settings.BOLT_LOG_QUEUE_SIZE = prev
+            else:
+                with suppress(AttributeError):
+                    delattr(settings, "BOLT_LOG_QUEUE_SIZE")
+            config_module._QUEUE_LISTENER = None
+            config_module._QUEUE = None
+
     def test_setup_django_logging_configures_queue_handlers(self):
         """setup_django_logging should configure queue handlers for django loggers."""
         # Configure Django settings for test

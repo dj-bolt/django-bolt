@@ -1134,6 +1134,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 memory_spool_threshold,
                 DEFAULT_MAX_PARTS,
                 max_param_length,
+                state.max_payload_size,
             )
             .await
             {

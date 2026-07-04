@@ -228,6 +228,10 @@ def get_default_logging_config() -> LoggingConfig:
     )
 
 
+# Default bound for the logging queue (see BOLT_LOG_QUEUE_SIZE).
+_DEFAULT_LOG_QUEUE_SIZE = 10000
+
+
 class _DropOnFullQueueHandler(QueueHandler):
     """QueueHandler that drops records when the bounded queue is full.
 
@@ -291,10 +295,21 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
         # Records are dropped (via _DropOnFullQueueHandler) when full. The bound
         # is configurable via the BOLT_LOG_QUEUE_SIZE setting (default 10000),
         # consistent with the other BOLT_* logging settings.
-        max_queue_size = 10000
+        max_queue_size = _DEFAULT_LOG_QUEUE_SIZE
         if settings is not None:
-            with contextlib.suppress(Exception):
-                max_queue_size = int(getattr(settings, "BOLT_LOG_QUEUE_SIZE", 10000))
+            try:
+                max_queue_size = int(getattr(settings, "BOLT_LOG_QUEUE_SIZE", _DEFAULT_LOG_QUEUE_SIZE))
+            except Exception as exc:  # noqa: BLE001 - unconfigured settings or a bad value
+                sys.stderr.write(f"django-bolt: invalid BOLT_LOG_QUEUE_SIZE ({exc}); using {_DEFAULT_LOG_QUEUE_SIZE}\n")
+                max_queue_size = _DEFAULT_LOG_QUEUE_SIZE
+            if max_queue_size <= 0:
+                # Queue(maxsize<=0) is UNBOUNDED — exactly the OOM risk the bound
+                # exists to prevent. Refuse it loudly and fall back to the default.
+                sys.stderr.write(
+                    f"django-bolt: BOLT_LOG_QUEUE_SIZE must be > 0 (got {max_queue_size}); "
+                    f"using {_DEFAULT_LOG_QUEUE_SIZE}\n"
+                )
+                max_queue_size = _DEFAULT_LOG_QUEUE_SIZE
         _QUEUE = Queue(maxsize=max_queue_size)
 
     queue_handler = _DropOnFullQueueHandler(_QUEUE)
