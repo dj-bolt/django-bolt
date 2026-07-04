@@ -25,7 +25,7 @@ use crate::form_parsing::{
 use crate::metadata::{RustArgBinding, RustArgSource};
 use crate::middleware;
 use crate::middleware::auth::populate_auth_context;
-use crate::request::{HttpMethod, PyRequest};
+use crate::request::PyRequest;
 use crate::request_pipeline::validate_and_cache_typed_params;
 use crate::response_builder;
 use crate::response_meta::ResponseMeta;
@@ -263,13 +263,13 @@ pub fn extract_headers(
 }
 
 /// Build HTTP 422 response for validation errors
-/// Avoids serde_json::json!() macro to prevent intermediate Value allocation
 pub fn build_validation_error_response(error: &ValidationError) -> HttpResponse {
-    let detail_json = error.to_json().to_string();
-    let body = format!(r#"{{"detail":[{}]}}"#, detail_json);
+    let body = serde_json::json!({
+        "detail": [error.to_json()]
+    });
     HttpResponse::UnprocessableEntity()
         .content_type("application/json")
-        .body(body)
+        .body(body.to_string())
 }
 
 /// Convert CoercedValue to Python object
@@ -755,15 +755,6 @@ pub(crate) fn build_prebound_args_kwargs(
     Some((args.unbind(), kwargs.unbind()))
 }
 
-/// Maximum pre-allocation for a request body buffer.
-///
-/// A forged `Content-Length` could otherwise make `Vec::with_capacity` reserve
-/// up to `max_payload_size` of address space from the header alone. Capping the
-/// pre-allocation means only bytes that actually arrive grow the buffer (past
-/// this cap it falls back to geometric growth). 64 KiB covers typical
-/// JSON/form bodies without a realloc while bounding header-driven reservation.
-pub(crate) const BODY_PREALLOC_CAP: usize = 64 * 1024;
-
 /// Parse the `Content-Length` header into a `usize`, if present and valid.
 /// Shared by the production handler and the in-process test handler so both
 /// enforce the payload limit identically (per src/CLAUDE.md: tests reuse
@@ -904,11 +895,8 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         }
     };
 
-    // Store method/path for Python (needed after route_match is dropped)
-    // Method is stored as a compact 1-byte HttpMethod enum instead of a heap-allocated
-    // String. HTTP methods are from a fixed set so a heap allocation per request is
-    // unnecessary — the getter returns &'static str with zero allocation.
-    let method_owned = HttpMethod::from_str(method);
+    // Store method/path as owned for Python (needed after route_match is dropped)
+    let method_owned = method.to_string();
     let path_owned = path.to_string();
 
     // Get parsed route metadata (Rust-native) by reference.
@@ -1150,18 +1138,9 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             }
         } else {
             // Read payload as bytes (for non-multipart requests).
-            // Content-Length was parsed and range-checked above; use it to pre-size
-            // the buffer and avoid repeated Vec reallocations during
-            // extend_from_slice. For chunked encoding or missing Content-Length,
-            // Vec::new() starts at 0 capacity (geometric growth).
-            //
-            // Cap pre-allocation (BODY_PREALLOC_CAP) so a forged Content-Length
-            // can't reserve up to max_payload_size of address space from the
-            // header alone; larger legitimate bodies still grow as bytes arrive.
-            let mut body_vec = match content_length {
-                Some(len) if len > 0 => Vec::with_capacity(len.min(BODY_PREALLOC_CAP)),
-                _ => Vec::new(),
-            };
+            // The aggregate size is bounded against max_payload_size during
+            // streaming so chunked requests (no Content-Length) are enforced too.
+            let mut body_vec = Vec::new();
             let mut total_read: usize = 0;
             while let Some(chunk) = payload.next().await {
                 match chunk {

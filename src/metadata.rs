@@ -415,11 +415,6 @@ fn has_enforcing_guards(guards: &[Guard]) -> bool {
 }
 
 /// Dense metadata table keyed by handler_id.
-///
-/// Handler IDs in this codebase are always dense 0..N (both merge paths
-/// renumber monotonically), so a Vec is optimal — zero wasted None slots,
-/// O(1) array index lookup, no hashing overhead, and less memory than a
-/// HashMap's bucket over-allocation + stored hashes/keys.
 #[derive(Debug, Clone, Default)]
 pub struct RouteMetadataStore {
     by_handler_id: Vec<Option<RouteMetadata>>,

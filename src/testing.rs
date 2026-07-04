@@ -675,7 +675,7 @@ async fn handle_test_request_internal(
     };
     use crate::middleware;
     use crate::middleware::auth::populate_auth_context;
-    use crate::request::{HttpMethod, PyRequest};
+    use crate::request::PyRequest;
     use crate::responses;
     use crate::router::parse_query_string;
     use crate::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
@@ -1125,7 +1125,7 @@ async fn handle_test_request_internal(
         };
 
         let request = PyRequest {
-            method: HttpMethod::from_str(method),
+            method: method.to_string(),
             path: path.to_string(),
             body: body.to_vec(),
             path_params: path_params_dict,

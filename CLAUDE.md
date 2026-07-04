@@ -74,8 +74,7 @@ just format
 
 ### Benchmarking
 
-All benchmark/soak recipes need `bombardier` (`go install github.com/codesenberg/bombardier@latest`)
-and `setsid` (`brew install util-linux` on macOS).
+Benchmark recipes need `bombardier` (`go install github.com/codesenberg/bombardier@latest`).
 
 ```bash
 # Full benchmark suite. First run creates bench/BENCHMARK_BASELINE.md, second
@@ -85,15 +84,7 @@ just save-bench 127.0.0.1 8001 100 50000   # positional: host port c n ...
 
 # Focused parameter/form-parsing benchmark (fast iteration)
 just bench-params
-
-# Memory soak (leak gate): sustained load across several endpoint types, samples
-# server RSS per phase, exits non-zero if RSS grows past the threshold (MiB).
-just soak          # ~20s/endpoint, fail if any endpoint's RSS grows >50 MiB
-just soak 40 30    # positional: per-endpoint seconds, then threshold MiB
 ```
-
-Queue/allocation *behavior* (bounded-drop, clean shutdown) is unit-tested in
-`python/tests/test_logging.py`; `just soak` guards whole-server RSS *stability*.
 
 ### Database (Standard Django)
 
