@@ -35,13 +35,13 @@ class APIView:
     Base class for class-based views in Django-Bolt.
 
     Attributes:
-        http_method_names: List of supported HTTP methods (lowercase)
+        http_method_names: Tuple of supported HTTP methods (lowercase)
         guards: List of guard/permission classes to apply to all methods
         auth: List of authentication backends to apply to all methods
         status_code: Default status code for responses (can be overridden per-method)
     """
 
-    http_method_names = ["get", "post", "put", "patch", "delete", "head", "options", "query"]
+    http_method_names = ("get", "post", "put", "patch", "delete", "head", "options", "query")
 
     # Class-level defaults (can be overridden by subclasses)
     guards: list[Any] | None = None
