@@ -300,6 +300,11 @@ def _response_serializer_info(response_type: Any) -> tuple[Any, bool]:
     return None, False
 
 
+def _annotation_may_need_relation_load(annotation: Any) -> bool:
+    annotation = _strip_optional(annotation)
+    return get_origin(annotation) in {list, tuple, set, frozenset}
+
+
 def _dump_dict(serializer_cls: Any, value: dict, validate_dicts: bool) -> Any:
     """Validate already-serialized dicts only when response validation is on."""
     if not validate_dicts:
@@ -372,8 +377,11 @@ async def _dump_many_async(serializer_cls: Any, items: Any, sync_safe: bool, val
 def _serializer_from_model_sync_safe(serializer_cls: Any) -> bool:
     """True when async relation loading is unnecessary."""
     serializer_cls._ensure_from_model_ready()
+    type_hints = getattr(serializer_cls, "__cached_type_hints__", {})
     return not any(
-        spec.nested is not None or (spec.source is not None and "." in spec.source)
+        spec.nested is not None
+        or spec.source is not None
+        or _annotation_may_need_relation_load(type_hints.get(spec.field_name))
         for spec in serializer_cls.__model_field_specs__
     )
 

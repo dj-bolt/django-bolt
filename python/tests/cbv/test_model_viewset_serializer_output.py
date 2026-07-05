@@ -51,6 +51,11 @@ class PostOut(Serializer):
         return len(self.title)
 
 
+class AuthorPostIds(Serializer):
+    id: int
+    posts: list[int]
+
+
 @pytest.fixture
 def article():
     return Article.objects.create(title="hello", content="the body", author="A1")
@@ -91,7 +96,11 @@ def test_plain_struct_viewset_keeps_values_projection(article):
         queryset = Article.objects.all()
         serializer_class = PlainArticle
 
-    list_meta = next(api._handler_meta[hid] for _m, path, hid, _h in api._routes if path == "/articles")
+    list_meta = next(
+        api._handler_meta[hid]
+        for method, path, hid, _h in api._routes
+        if method == "GET" and path == "/articles"
+    )
     assert list_meta["response_field_names"] == ["id", "title", "content"]
 
     with TestClient(api) as client:
@@ -179,6 +188,22 @@ def test_unloaded_nested_serializer_falls_back_to_afrom_model():
                 "title_len": 4,
             }
         ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_direct_reverse_relation_field_uses_async_fallback():
+    api = BoltAPI()
+    author = Author.objects.create(name="Ada", email="ada@x.io")
+    post = BlogPost.objects.create(title="Post", content="body", author=author)
+
+    @api.get("/authors", response_model=list[AuthorPostIds])
+    async def authors():
+        return Author.objects.all()
+
+    with TestClient(api) as client:
+        r = client.get("/authors")
+        assert r.status_code == 200, r.text
+        assert r.json() == [{"id": author.id, "posts": [post.id]}]
 
 
 @pytest.mark.django_db(transaction=True)
