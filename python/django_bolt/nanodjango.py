@@ -43,6 +43,7 @@ _BOLT_DECORATOR_NAMES: tuple[str, ...] = (
     "delete",
     "head",
     "options",
+    "query",
     "websocket",
 )
 _BOLT_MOUNT_NAMES: tuple[str, ...] = ("mount_django", "mount")

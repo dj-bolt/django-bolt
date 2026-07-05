@@ -178,7 +178,7 @@ fn find_cors_config<'a>(
 
     // For OPTIONS, try multiple methods to find route config
     let methods_to_try: &[&str] = if method == &Method::OPTIONS {
-        &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
+        &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "QUERY"]
     } else {
         // Use a slice pointing to the method string
         // This avoids allocation for the common case

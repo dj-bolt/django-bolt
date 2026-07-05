@@ -505,6 +505,13 @@ class TestClient(httpx.Client):
             response = self._add_streaming_methods(response)
         return response
 
+    def query(self, url: str | httpx.URL, *, stream: bool = False, **kwargs: Any) -> Response:
+        """QUERY request with optional streaming support."""
+        response = self.request("QUERY", url, **kwargs)
+        if stream:
+            response = self._add_streaming_methods(response)
+        return response
+
     @staticmethod
     def _iter_response_content(
         content: bytes, chunk_size: int = 1024, decode_unicode: bool = False

@@ -37,6 +37,7 @@ Django-Bolt supports all common HTTP methods:
 | `@api.delete()` | DELETE | Remove resources |
 | `@api.head()` | HEAD | Get headers only |
 | `@api.options()` | OPTIONS | Get allowed methods |
+| `@api.query()` | QUERY | Read using a request body |
 
 Example with all methods:
 
@@ -70,6 +71,38 @@ async def options_items():
     from django_bolt import Response
     return Response({}, headers={"Allow": "GET, POST, PUT, PATCH, DELETE"})
 ```
+
+### The QUERY method
+
+`QUERY` is a safe, idempotent method that carries a request body. It behaves like `GET` — it reads, it doesn't change server state, and it can be retried — but its parameters travel in the body instead of the query string. Reach for it when a query is too large or too structured for a URL (a nested filter, a long list of IDs, a search document) and a `POST` would wrongly read as a write.
+
+A `QUERY` handler takes a body the same way a `POST` handler does:
+
+```python
+import msgspec
+from django_bolt import BoltAPI
+
+api = BoltAPI()
+
+class Search(msgspec.Struct):
+    term: str
+    limit: int = 20
+
+@api.query("/search")
+async def search(query: Search) -> dict:
+    return {"term": query.term, "limit": query.limit}
+```
+
+```http
+QUERY /search HTTP/1.1
+Content-Type: application/json
+
+{"term": "django", "limit": 5}
+```
+
+`QUERY` works everywhere the other methods do: on routers (`router.query(...)`), on class-based views (an `async def query` handler), and in the test client (`client.query("/search", json=...)`). It's included in the automatic `Allow` header and the default CORS method list.
+
+One caveat for tooling: `query` only becomes a documented operation in the OpenAPI 3.2 draft. Django-Bolt emits 3.1, so the built-in docs UIs render `QUERY` endpoints, but a strict 3.1 validator will reject the operation.
 
 ## Path parameters
 

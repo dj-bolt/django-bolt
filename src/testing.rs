@@ -170,6 +170,7 @@ fn parse_cors_config_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<CorsConfig>
                 "PATCH".to_string(),
                 "DELETE".to_string(),
                 "OPTIONS".to_string(),
+                "QUERY".to_string(),
             ]
         });
 
@@ -617,7 +618,8 @@ pub fn test_request(
             let mut req = test::TestRequest::with_uri(&uri);
 
             // Set method
-            req = match method.to_uppercase().as_str() {
+            let method_upper = method.to_uppercase();
+            req = match method_upper.as_str() {
                 "GET" => req.method(actix_web::http::Method::GET),
                 "POST" => req.method(actix_web::http::Method::POST),
                 "PUT" => req.method(actix_web::http::Method::PUT),
@@ -625,7 +627,10 @@ pub fn test_request(
                 "DELETE" => req.method(actix_web::http::Method::DELETE),
                 "OPTIONS" => req.method(actix_web::http::Method::OPTIONS),
                 "HEAD" => req.method(actix_web::http::Method::HEAD),
-                _ => req.method(actix_web::http::Method::GET),
+                other => req.method(
+                    actix_web::http::Method::from_bytes(other.as_bytes())
+                        .unwrap_or(actix_web::http::Method::GET),
+                ),
             };
 
             // Set headers

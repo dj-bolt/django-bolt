@@ -41,7 +41,7 @@ class APIView:
         status_code: Default status code for responses (can be overridden per-method)
     """
 
-    http_method_names = ["get", "post", "put", "patch", "delete", "head", "options"]
+    http_method_names = ["get", "post", "put", "patch", "delete", "head", "options", "query"]
 
     # Class-level defaults (can be overridden by subclasses)
     guards: list[Any] | None = None

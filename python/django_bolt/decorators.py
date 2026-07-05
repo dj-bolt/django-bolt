@@ -171,7 +171,7 @@ def action(
     def decorator(fn: Callable) -> ActionHandler:
         """Wrap the function with ActionHandler metadata."""
         # Validate methods
-        valid_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+        valid_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY"}
         for method in methods:
             if method.upper() not in valid_methods:
                 raise ValueError(f"Invalid HTTP method '{method}'. Valid methods: {', '.join(sorted(valid_methods))}")

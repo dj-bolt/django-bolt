@@ -713,6 +713,36 @@ class BoltAPI:
             response_class=response_class,
         )
 
+    def query(
+        self,
+        path: str,
+        *,
+        name: str | None = None,
+        response_model: Any = _RESPONSE_MODEL_UNSET,
+        status_code: int | None = None,
+        validate_response: bool | None = None,
+        guards: list[Any] | None = None,
+        auth: list[Any] | None = None,
+        tags: list[str] | None = None,
+        summary: str | None = None,
+        description: str | None = None,
+        response_class: type | None = None,
+    ):
+        return self._route_decorator(
+            "QUERY",
+            path,
+            name=name,
+            response_model=response_model,
+            status_code=status_code,
+            validate_response=validate_response,
+            guards=guards,
+            auth=auth,
+            tags=tags,
+            summary=summary,
+            description=description,
+            response_class=response_class,
+        )
+
     def websocket(
         self,
         path: str,
@@ -2995,7 +3025,7 @@ class BoltAPI:
             route_router_middleware = route_meta.pop("_router_middleware", [])
 
             # Register route with merged settings and preserved router middleware.
-            if method.upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+            if method.upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY"}:
                 continue
 
             decorator = self._route_decorator(

@@ -379,7 +379,7 @@ def create_item(request):
         assert len(extra_src) == 2
 
     def test_detects_all_http_methods(self):
-        methods = ["get", "post", "put", "patch", "delete", "head", "options", "websocket"]
+        methods = ["get", "post", "put", "patch", "delete", "head", "options", "query", "websocket"]
         for method in methods:
             source = f"""\
 bolt = BoltAPI()

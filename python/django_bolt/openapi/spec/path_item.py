@@ -65,6 +65,9 @@ class PathItem(BaseSchemaObject):
     trace: Operation | None = None
     """A definition of a TRACE operation on this path."""
 
+    query: Operation | None = None
+    """A definition of a QUERY operation on this path."""
+
     servers: list[Server] | None = None
     """An alternative ``server`` array to service all operations in this path."""
 

@@ -173,6 +173,15 @@ class Router:
 
         return dec
 
+    def query(self, path: str, **kwargs: Any):
+        """Register a QUERY route."""
+
+        def dec(fn: Callable):
+            self._add("QUERY", path, fn, **kwargs)
+            return fn
+
+        return dec
+
     def include_router(
         self,
         router: "Router",

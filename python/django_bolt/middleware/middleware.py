@@ -485,7 +485,7 @@ def cors(
             {
                 "type": "cors",
                 "origins": origin_list,
-                "methods": methods or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+                "methods": methods or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"],
                 "headers": headers,
                 "credentials": credentials,
                 "max_age": max_age,

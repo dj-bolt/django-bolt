@@ -139,6 +139,7 @@ pub struct Router {
     delete: MethodRouter,
     head: MethodRouter,
     options: MethodRouter,
+    query: MethodRouter,
 }
 
 impl Router {
@@ -151,6 +152,7 @@ impl Router {
             delete: MethodRouter::new(),
             head: MethodRouter::new(),
             options: MethodRouter::new(),
+            query: MethodRouter::new(),
         }
     }
 
@@ -169,6 +171,7 @@ impl Router {
             "DELETE" => &mut self.delete,
             "HEAD" => &mut self.head,
             "OPTIONS" => &mut self.options,
+            "QUERY" => &mut self.query,
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Unsupported method: {}",
@@ -230,6 +233,7 @@ impl Router {
             "DELETE" => &self.delete,
             "HEAD" => &self.head,
             "OPTIONS" => &self.options,
+            "QUERY" => &self.query,
             _ => return None,
         };
 
@@ -272,6 +276,7 @@ impl Router {
             ("DELETE", &self.delete),
             ("HEAD", &self.head),
             ("OPTIONS", &self.options),
+            ("QUERY", &self.query),
         ];
 
         for (method_name, method_router) in method_routers.iter() {

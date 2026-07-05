@@ -352,7 +352,7 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
 
     # 5. Complex types (msgspec.Struct, dataclass) -> body (if allowed)
     if is_msgspec_struct(unwrapped) or is_dataclass_type(unwrapped):
-        if http_method in {"POST", "PUT", "PATCH"}:
+        if http_method in {"POST", "PUT", "PATCH", "QUERY"}:
             return "body"
         # For GET/DELETE/HEAD, this will trigger validation error later
         return "body"

@@ -65,6 +65,7 @@ impl Default for CorsConfig {
             "PATCH".to_string(),
             "DELETE".to_string(),
             "OPTIONS".to_string(),
+            "QUERY".to_string(),
         ];
         let headers = vec!["Content-Type".to_string(), "Authorization".to_string()];
         let expose_headers = vec![];
