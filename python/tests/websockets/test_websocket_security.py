@@ -153,6 +153,58 @@ async def test_websocket_no_cors_config_allows_same_origin():
         assert msg == "connected"
 
 
+# --- Parameter Length Limit Tests ---
+
+
+@pytest.mark.asyncio
+async def test_websocket_oversized_query_param_rejected():
+    """Oversized query param rejects the upgrade instead of passing a raw string through.
+
+    Before the fix, a length-limit violation was swallowed by the string fallback,
+    so the oversized value reached the handler. Now it is a hard error.
+    """
+    api = BoltAPI()
+
+    @api.websocket("/ws/echo")
+    async def echo_handler(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    oversized = "a" * 9000  # exceeds the default 8192-byte limit
+
+    with pytest.raises(ValueError, match=r"Parameter too long"):
+        async with WebSocketTestClient(
+            api,
+            "/ws/echo",
+            query_string=f"value={oversized}",
+            cors_allowed_origins=["*"],
+            read_django_settings=False,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_oversized_path_param_rejected():
+    """Oversized path param rejects the upgrade instead of passing a raw string through."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/{value}")
+    async def echo_handler(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    oversized = "a" * 9000  # exceeds the default 8192-byte limit
+
+    with pytest.raises(ValueError, match=r"Parameter too long"):
+        async with WebSocketTestClient(
+            api,
+            f"/ws/{oversized}",
+            cors_allowed_origins=["*"],
+            read_django_settings=False,
+        ):
+            pass
+
+
 # --- Rate Limiting Tests ---
 
 

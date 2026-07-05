@@ -18,7 +18,7 @@ use crate::handler::coerced_value_to_py;
 use crate::metadata::CorsConfig;
 use crate::middleware::rate_limit::check_rate_limit;
 use crate::state::{AppState, ROUTE_METADATA, TASK_LOCALS};
-use crate::type_coercion::{coerce_param, TYPE_STRING};
+use crate::type_coercion::{coerce_param_with_limit, CoerceError, TYPE_STRING};
 use crate::validation::{validate_auth_and_guards, AuthGuardResult};
 
 use super::actor::WebSocketActor;
@@ -83,6 +83,7 @@ fn build_scope(
     req: &HttpRequest,
     path_params: &AHashMap<String, String>,
     param_types: &HashMap<String, u8>,
+    max_param_length: usize,
 ) -> PyResult<Py<PyAny>> {
     let scope_dict = PyDict::new(py);
     scope_dict.set_item("type", "websocket")?;
@@ -103,13 +104,17 @@ fn build_scope(
                     .copied()
                     .unwrap_or(TYPE_STRING);
 
-                match coerce_param(&decoded_value, type_hint) {
+                match coerce_param_with_limit(&decoded_value, type_hint, max_param_length) {
                     Ok(coerced) => {
                         let py_value = coerced_value_to_py(py, &coerced);
                         query_dict.set_item(decoded_key.as_ref(), py_value)?;
                     }
-                    Err(_) => {
-                        // Fall back to string on coercion error
+                    // Oversized values reject the upgrade — never pass a raw string through.
+                    Err(e @ CoerceError::TooLong { .. }) => {
+                        return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
+                    }
+                    // Genuine type-coercion failure: fall back to the raw string.
+                    Err(CoerceError::Invalid(_)) => {
                         query_dict.set_item(decoded_key.as_ref(), decoded_value.as_ref())?;
                     }
                 }
@@ -135,13 +140,17 @@ fn build_scope(
     let params_dict = PyDict::new(py);
     for (k, v) in path_params.iter() {
         let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
-        match coerce_param(v, type_hint) {
+        match coerce_param_with_limit(v, type_hint, max_param_length) {
             Ok(coerced) => {
                 let py_value = coerced_value_to_py(py, &coerced);
                 params_dict.set_item(k.as_str(), py_value)?;
             }
-            Err(_) => {
-                // Fall back to string on coercion error
+            // Oversized values reject the upgrade — never pass a raw string through.
+            Err(e @ CoerceError::TooLong { .. }) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
+            }
+            // Genuine type-coercion failure: fall back to the raw string.
+            Err(CoerceError::Invalid(_)) => {
                 params_dict.set_item(k.as_str(), v.as_str())?;
             }
         }
@@ -547,7 +556,9 @@ pub async fn handle_websocket_upgrade_with_handler(
         .unwrap_or_default();
 
     // Build scope for Python - if this fails, decrement counter
-    let scope = match Python::attach(|py| build_scope(py, &req, &path_params, &param_types)) {
+    let scope = match Python::attach(|py| {
+        build_scope(py, &req, &path_params, &param_types, state.max_param_length)
+    }) {
         Ok(s) => s,
         Err(e) => {
             // CRITICAL: Decrement counter on error to prevent resource leak

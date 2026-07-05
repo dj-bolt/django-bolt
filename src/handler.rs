@@ -20,6 +20,7 @@ use crate::error;
 use crate::form_parsing::{
     parse_multipart, parse_urlencoded, FileContent, FileFieldConstraints, FileInfo,
     FormParseResult, FormValue, ValidationError, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
+    ERROR_TYPE_PAYLOAD_TOO_LARGE,
 };
 use crate::metadata::{RustArgBinding, RustArgSource};
 use crate::middleware;
@@ -754,6 +755,30 @@ pub(crate) fn build_prebound_args_kwargs(
     Some((args.unbind(), kwargs.unbind()))
 }
 
+/// Parse the `Content-Length` header into a `usize`, if present and valid.
+/// Shared by the production handler and the in-process test handler so both
+/// enforce the payload limit identically (per src/CLAUDE.md: tests reuse
+/// production code rather than duplicating it).
+#[inline]
+pub(crate) fn parse_content_length(req: &HttpRequest) -> Option<usize> {
+    req.headers()
+        .get(actix_web::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
+/// Whether the given `Content-Length` exceeds the limit and must be fast-rejected
+/// with 413 before reading the body. Callers pass `None` (e.g. no-body routes or
+/// chunked requests with no Content-Length), for which this returns false and the
+/// per-path streaming checks bound the body instead.
+#[inline]
+pub(crate) fn content_length_exceeds_limit(
+    content_length: Option<usize>,
+    max_payload_size: usize,
+) -> bool {
+    matches!(content_length, Some(len) if len > max_payload_size)
+}
+
 pub async fn handle_request<const ACCESS_LOG: bool>(
     req: HttpRequest,
     mut payload: web::Payload,
@@ -871,7 +896,6 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     };
 
     // Store method/path as owned for Python (needed after route_match is dropped)
-    // OPTIMIZATION: Use compact strings to reduce allocation overhead
     let method_owned = method.to_string();
     let path_owned = path.to_string();
 
@@ -901,12 +925,16 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
     let needs_body = plan.map_or(true, |p| p.needs_body());
 
+    // Max parameter length resolved once at startup; read the plain field here.
+    let max_param_length = state.max_param_length;
+
     // Type validation for path and query parameters (Rust-native, no GIL)
     let (path_coerced, query_coerced) = if let Some(route_meta) = route_metadata {
         match validate_and_cache_typed_params(
             path_params.as_ref(),
             query_params.as_ref(),
             &route_meta.param_types,
+            max_param_length,
         ) {
             Ok(cached) => cached,
             Err(response) => return response,
@@ -1032,7 +1060,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             .unwrap_or_else(|| "127.0.0.1".to_string());
         (host, scheme, remote_addr)
     } else {
-        // No headers extracted → no Django middleware → META won't be accessed
+        // No META needed → empty strings (META getter will return defaults)
         (String::new(), String::new(), String::new())
     };
 
@@ -1045,6 +1073,21 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
     let is_multipart = content_type.starts_with("multipart/form-data");
     let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
+
+    // Parse Content-Length and fast-reject oversized requests before reading any
+    // body bytes. Applies to both multipart and non-multipart paths so the
+    // payload-size limit is enforced consistently regardless of content type.
+    // Only computed for routes that read a body — no-body routes (e.g. the hot
+    // GET path) skip the header lookup entirely.
+    let reads_body = needs_body || needs_form_parsing;
+    let content_length = if reads_body {
+        parse_content_length(&req)
+    } else {
+        None
+    };
+    if content_length_exceeds_limit(content_length, state.max_payload_size) {
+        return responses::error_413();
+    }
 
     // Read body from payload only when needed.
     // For multipart, we need the payload stream directly.
@@ -1078,20 +1121,39 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 max_upload_size,
                 memory_spool_threshold,
                 DEFAULT_MAX_PARTS,
+                max_param_length,
+                state.max_payload_size,
             )
             .await
             {
                 Ok(result) => (Vec::new(), Some(result)),
                 Err(validation_error) => {
+                    // Aggregate-size overflow maps to 413 to match the non-multipart
+                    // path; other multipart failures stay 422 validation errors.
+                    if validation_error.error_type == ERROR_TYPE_PAYLOAD_TOO_LARGE {
+                        return responses::error_413();
+                    }
                     return build_validation_error_response(&validation_error);
                 }
             }
         } else {
-            // Read payload as bytes (for non-multipart requests)
+            // Read payload as bytes (for non-multipart requests).
+            // The aggregate size is bounded against max_payload_size during
+            // streaming so chunked requests (no Content-Length) are enforced too.
             let mut body_vec = Vec::new();
+            let mut total_read: usize = 0;
             while let Some(chunk) = payload.next().await {
                 match chunk {
-                    Ok(data) => body_vec.extend_from_slice(&data),
+                    Ok(data) => {
+                        total_read = match total_read.checked_add(data.len()) {
+                            Some(v) => v,
+                            None => return responses::error_413(),
+                        };
+                        if total_read > state.max_payload_size {
+                            return responses::error_413();
+                        }
+                        body_vec.extend_from_slice(&data);
+                    }
                     Err(e) => {
                         return HttpResponse::BadRequest()
                             .content_type("application/json")
@@ -1110,7 +1172,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                     .map(|m| &m.form_type_hints)
                     .unwrap_or(&empty_form_type_hints);
 
-                match parse_urlencoded(&body_vec, form_type_hints) {
+                match parse_urlencoded(&body_vec, form_type_hints, max_param_length) {
                     Ok(form_map) => {
                         let result = FormParseResult {
                             form_map,
@@ -1184,7 +1246,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
         let headers_py: Option<Py<PyDict>> = if needs_headers {
             if let Some(headers_map) = headers.as_ref() {
-                Some(params_to_py_dict(py, headers_map, param_types)?.unbind())
+                Some(params_to_py_dict(py, headers_map, param_types, max_param_length)?.unbind())
             } else {
                 Some(PyDict::new(py).unbind())
             }
@@ -1193,7 +1255,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         };
         let cookies_py: Option<Py<PyDict>> = if needs_cookies {
             if let Some(cookies_map) = cookies.as_ref() {
-                Some(params_to_py_dict(py, cookies_map, param_types)?.unbind())
+                Some(params_to_py_dict(py, cookies_map, param_types, max_param_length)?.unbind())
             } else {
                 Some(PyDict::new(py).unbind())
             }

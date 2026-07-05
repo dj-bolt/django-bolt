@@ -13,6 +13,7 @@ pub static ERROR_BODY_401: &[u8] = br#"{"detail":"Authentication required"}"#;
 pub static ERROR_BODY_403: &[u8] = br#"{"detail":"Permission denied"}"#;
 pub static ERROR_BODY_404: &[u8] = br#"{"detail":"Not Found"}"#;
 pub static ERROR_BODY_400_HEADERS: &[u8] = br#"{"detail":"Too many headers"}"#;
+pub static ERROR_BODY_413: &[u8] = br#"{"detail":"Payload too large"}"#;
 
 /// Cache for pre-formatted rate limit error bodies (keyed by retry_after seconds)
 /// This avoids allocating the same error message repeatedly
@@ -79,6 +80,14 @@ pub fn error_400_too_many_headers() -> HttpResponse {
         .body(ERROR_BODY_400_HEADERS)
 }
 
+/// 413 Payload Too Large with static body
+#[inline]
+pub fn error_413() -> HttpResponse {
+    HttpResponse::PayloadTooLarge()
+        .content_type("application/json")
+        .body(ERROR_BODY_413)
+}
+
 /// For errors that need dynamic content, we provide a fast formatter
 #[inline]
 pub fn error_400_header_too_large(max_size: usize) -> HttpResponse {
@@ -128,6 +137,16 @@ mod tests {
         assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_403).is_ok());
         assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_404).is_ok());
         assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_400_HEADERS).is_ok());
+        assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_413).is_ok());
+    }
+
+    #[test]
+    fn test_error_413_static() {
+        let response = error_413();
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[test]

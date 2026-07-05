@@ -23,7 +23,7 @@ elif [ -f "$HOME/.local/bin/bombardier" ]; then
 fi
 
 if [ -z "$BOMBARDIER_BIN" ]; then
-    echo "ERROR: bombardier not installed. Install with: go install github.com/codesenberg/bombardier@latest"
+    echo "ERROR: bombardier not installed. Install with: go install github.com/codesenberg/bombardier@latest" >&2
     exit 1
 fi
 
@@ -36,7 +36,7 @@ elif [ -f "/opt/homebrew/opt/util-linux/bin/setsid" ]; then
 fi
 
 if [ -z "$SETSID_BIN" ]; then
-    echo "ERROR: setsid not installed. Install with: brew install util-linux (macOS) or apt install util-linux (Linux)"
+    echo "ERROR: setsid not installed. Install with: brew install util-linux (macOS) or apt install util-linux (Linux)" >&2
     exit 1
 fi
 
