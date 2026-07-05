@@ -436,6 +436,14 @@ class SchemaGenerator:
         paths: dict[str, PathItem] = {}
         collected_tags: set[str] = set()
 
+        # The QUERY method is only representable as a Path Item operation in
+        # OpenAPI 3.2.0+. Emitting a `query` operation under the default 3.1.0
+        # declaration produces a document that fails strict 3.1 validation
+        # ("unevaluatedProperties: false"). Bump the declared version only when
+        # a QUERY route is actually present, so non-QUERY APIs keep declaring
+        # 3.1.0 for maximum downstream tooling compatibility.
+        has_query_operation = False
+
         # Process HTTP routes
         for method, path, handler_id, handler in self.api._routes:
             # Skip OpenAPI docs routes (always excluded)
@@ -473,6 +481,8 @@ class SchemaGenerator:
 
             # Add operation to path item
             method_lower = method.lower()
+            if method_lower == "query":
+                has_query_operation = True
             setattr(paths[path], method_lower, operation)
 
         # Process WebSocket routes
@@ -519,6 +529,9 @@ class SchemaGenerator:
             paths[ws_path].extensions["x-websocket"] = True
 
         openapi.paths = paths
+
+        if has_query_operation:
+            openapi.openapi = "3.2.0"
 
         # Auto-register security schemes from auth backends used on routes
         self._register_security_schemes(openapi)

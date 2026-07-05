@@ -66,6 +66,12 @@ if [ "$QCODE" != "200" ]; then
     exit 1
 fi
 
+PCODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "$BODY" "http://$HOST:$PORT/bench/parse")
+if [ "$PCODE" != "200" ]; then
+    echo "Expected 200 from POST /bench/parse but got $PCODE; aborting." >&2
+    exit 1
+fi
+
 run_bench() {
     local name="$1" method="$2" path="$3"
     printf "### %s\n" "$name"

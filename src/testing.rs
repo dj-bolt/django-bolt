@@ -627,10 +627,18 @@ pub fn test_request(
                 "DELETE" => req.method(actix_web::http::Method::DELETE),
                 "OPTIONS" => req.method(actix_web::http::Method::OPTIONS),
                 "HEAD" => req.method(actix_web::http::Method::HEAD),
-                other => req.method(
-                    actix_web::http::Method::from_bytes(other.as_bytes())
-                        .unwrap_or(actix_web::http::Method::GET),
+                // QUERY is a supported method but has no actix constant.
+                "QUERY" => req.method(
+                    actix_web::http::Method::from_bytes(b"QUERY")
+                        .expect("QUERY is a valid HTTP method token"),
                 ),
+                // Reject anything that isn't a supported method instead of
+                // silently defaulting to GET, which would hide typos in tests.
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Unsupported HTTP method {other:?}"
+                    )));
+                }
             };
 
             // Set headers

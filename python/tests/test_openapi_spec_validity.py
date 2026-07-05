@@ -147,6 +147,33 @@ def test_generated_spec_declares_openapi_3_1(full_spec: dict) -> None:
     assert full_spec.get("openapi", "").startswith("3.1.")
 
 
+def test_query_operation_declares_openapi_3_2_and_validates() -> None:
+    """A QUERY route is only representable as a Path Item operation in
+    OpenAPI 3.2.0+. Under the default 3.1.0 declaration the generated
+    `query` operation fails strict 3.1 validation ("unevaluatedProperties:
+    false"), so the generator must bump the declared version to 3.2.0
+    whenever a QUERY route is present — and the result must still validate."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Query API", version="1.0.0"))
+
+    @api.query("/search")
+    async def search(request, data: ItemMutationIn) -> ItemBase:
+        pass
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+
+    assert spec.get("openapi") == "3.2.0"
+    assert "query" in spec["paths"]["/search"]
+    validate(spec)
+
+
+def test_query_free_spec_keeps_openapi_3_1(full_spec: dict) -> None:
+    """The 3.2.0 bump is conditional: APIs without a QUERY route must keep
+    declaring 3.1.0 for maximum downstream tooling compatibility."""
+    assert full_spec.get("openapi", "").startswith("3.1.")
+
+
 def test_no_dangling_refs_in_components(full_spec: dict) -> None:
     """Every `$ref` in the spec must resolve to a `components.schemas`
     entry. Catches the bug class where a Struct is referenced inside
