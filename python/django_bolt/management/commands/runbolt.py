@@ -9,6 +9,7 @@ import importlib.util
 import os
 import signal
 import sys
+import traceback
 import warnings
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts, serve_with_lifespan
+from django_bolt.workers import MIB, WorkerSupervisor
 
 try:
     from django_bolt.logging.config import setup_django_logging
@@ -386,6 +388,42 @@ class Command(BaseCommand):
         parser.add_argument(
             "--keep-alive", type=int, default=None, help="HTTP keep-alive timeout in seconds (default: OS setting)"
         )
+        parser.add_argument(
+            "--max-rss",
+            type=int,
+            default=0,
+            help=(
+                "Recycle a worker once its resident memory exceeds this many MiB "
+                "(0 = disabled). Guards long-running servers against slow Python "
+                "memory leaks; recycling is graceful (spawn-first, WebSockets "
+                "closed with 1012 Service Restart)."
+            ),
+        )
+        parser.add_argument(
+            "--workers-lifetime",
+            type=int,
+            default=0,
+            help="Recycle each worker after this many seconds of uptime (0 = disabled)",
+        )
+        parser.add_argument(
+            "--respawn-failed-workers",
+            action="store_true",
+            help="Respawn workers that exit unexpectedly instead of letting the fleet shrink",
+        )
+        parser.add_argument(
+            "--workers-kill-timeout",
+            type=int,
+            default=30,
+            help=(
+                "Seconds a worker gets to shut down gracefully (finish in-flight "
+                "requests, close WebSockets) before it is SIGKILLed (default: 30)"
+            ),
+        )
+
+    @staticmethod
+    def _supervision_requested(options) -> bool:
+        """True when any worker-recycling option is enabled."""
+        return bool(options["max_rss"] or options["workers_lifetime"] or options["respawn_failed_workers"])
 
     def handle(self, *args, **options):
         processes = options["processes"]
@@ -398,11 +436,14 @@ class Command(BaseCommand):
             if processes > 1:
                 self.stdout.write(self.style.WARNING("  Warning: dev mode forces --processes=1 for auto-reload"))
                 options["processes"] = 1
+            if self._supervision_requested(options):
+                self.stdout.write(self.style.WARNING("  Warning: worker recycling options are ignored in dev mode"))
 
             self.run_with_autoreload(options)
         else:
-            # Production mode (current logic)
-            if processes > 1:
+            # Production mode. Worker recycling needs the supervising parent
+            # even for a single worker, so route through start_multiprocess.
+            if processes > 1 or (self._supervision_requested(options) and not dev_worker_mode):
                 self.start_multiprocess(options)
             else:
                 self.start_single_process(options, dev_mode=effective_dev_mode)
@@ -427,63 +468,72 @@ class Command(BaseCommand):
             sys.exit(exit_code)
 
     def start_multiprocess(self, options):
-        """Start multiple processes with SO_REUSEPORT.
+        """Start worker processes with SO_REUSEPORT under a supervisor.
 
         Prints the startup banner once from the parent process, then forks
         children that each run start_single_process (which skips the banner
-        when process_id is set).
+        when process_id is set). The parent supervises the workers: it
+        recycles them on --max-rss / --workers-lifetime limits (spawn-first,
+        graceful drain), respawns crashed workers when
+        --respawn-failed-workers is set, and coordinates graceful shutdown
+        on SIGTERM/SIGINT.
         """
+        if not hasattr(os, "fork"):
+            raise CommandError(
+                "--processes > 1 and worker recycling require os.fork(), which is unavailable on this platform"
+            )
+
         processes = options["processes"]
+        kill_timeout = options["workers_kill_timeout"]
 
         # Run autodiscovery + banner once in the parent before forking so the
         # user sees a single clean banner instead of N copies.
         self._print_multiprocess_banner(options)
 
-        # Store child PIDs for cleanup
-        child_pids = []
+        # Give Actix the same graceful-shutdown window the supervisor allows
+        # before escalating to SIGKILL (user-set env takes precedence).
+        os.environ.setdefault("DJANGO_BOLT_SHUTDOWN_TIMEOUT", str(kill_timeout))
+
+        def spawn_worker(slot: int) -> int:
+            pid = os.fork()
+            if pid != 0:
+                return pid
+            # Child: reset inherited handlers so only the supervising parent
+            # reacts to terminal signals; the Rust server installs its own
+            # SIGTERM/SIGINT handling for graceful drain.
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            # Always enable SO_REUSEPORT: during recycling the replacement
+            # worker binds the port while the old worker is still draining.
+            os.environ["DJANGO_BOLT_REUSE_PORT"] = "1"
+            os.environ["DJANGO_BOLT_PROCESS_ID"] = str(slot)
+            exit_code = 0
+            try:
+                self.start_single_process(options, process_id=slot)
+            except BaseException:
+                traceback.print_exc()
+                exit_code = 1
+            finally:
+                os._exit(exit_code)
+            return 0  # unreachable: os._exit never returns
+
+        supervisor = WorkerSupervisor(
+            processes=processes,
+            spawn=spawn_worker,
+            max_rss_bytes=options["max_rss"] * MIB if options["max_rss"] else None,
+            lifetime_seconds=float(options["workers_lifetime"]) if options["workers_lifetime"] else None,
+            respawn_failed=options["respawn_failed_workers"],
+            kill_timeout=float(kill_timeout),
+            log=lambda message: self.stdout.write(f"  {message}"),
+        )
 
         def signal_handler(signum, frame):
-            self.stdout.write("\n  Shutting down...")
-            for pid in child_pids:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGTERM)
-            # Wait for children to exit before the parent exits
-            for pid in list(child_pids):
-                with contextlib.suppress(ChildProcessError):
-                    os.waitpid(pid, 0)
-            sys.exit(0)
+            supervisor.request_shutdown()
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        # Fork processes
-        for i in range(processes):
-            pid = os.fork()
-            if pid == 0:
-                # Child: reset signals to default so only the parent prints
-                # shutdown messages and manages the process group.
-                signal.signal(signal.SIGINT, signal.SIG_DFL)
-                signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                os.environ["DJANGO_BOLT_REUSE_PORT"] = "1"
-                os.environ["DJANGO_BOLT_PROCESS_ID"] = str(i)
-                self.start_single_process(options, process_id=i)
-                os._exit(0)
-            else:
-                # Parent process
-                child_pids.append(pid)
-
-        # Parent waits for children
-        try:
-            while True:
-                pid, status = os.wait()
-                if pid in child_pids:
-                    child_pids.remove(pid)
-                if not child_pids:
-                    break
-        except ChildProcessError:
-            pass
-        except KeyboardInterrupt:
-            pass
+        supervisor.run()
 
     def _print_multiprocess_banner(self, options):
         """Perform a dry-run of autodiscovery to collect route/feature info,
@@ -550,6 +600,16 @@ class Command(BaseCommand):
             features.append(("Compression", "enabled"))
         if middleware_count:
             features.append(("Middleware", f"{middleware_count} handlers"))
+
+        recycling_bits = []
+        if options["max_rss"]:
+            recycling_bits.append(f"max-rss {options['max_rss']}MiB")
+        if options["workers_lifetime"]:
+            recycling_bits.append(f"lifetime {options['workers_lifetime']}s")
+        if options["respawn_failed_workers"]:
+            recycling_bits.append("respawn-on-failure")
+        if recycling_bits:
+            features.append(("Recycling", ", ".join(recycling_bits)))
 
         self._print_startup_banner(
             options=options,

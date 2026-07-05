@@ -18,7 +18,7 @@ mod handler;
 mod messages;
 mod router;
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Re-export public API
 #[allow(unused_imports)] // Re-exported for external use
@@ -34,3 +34,20 @@ pub use router::WebSocketRouter;
 
 /// Global counter for active WebSocket connections
 pub static ACTIVE_WS_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Process-wide flag: the server is shutting down or being recycled.
+///
+/// While draining, new WebSocket upgrades are refused with 503 and existing
+/// connections are closed with 1012 (Service Restart) so clients reconnect
+/// and land on a healthy worker (SO_REUSEPORT routes them there).
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Begin draining WebSocket connections (called once on shutdown signal).
+pub fn begin_drain() {
+    DRAINING.store(true, Ordering::Release);
+}
+
+/// Whether the server is currently draining for shutdown/recycle.
+pub fn is_draining() -> bool {
+    DRAINING.load(Ordering::Acquire)
+}

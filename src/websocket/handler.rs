@@ -469,6 +469,18 @@ pub async fn handle_websocket_upgrade_with_handler(
         return Ok(HttpResponse::BadRequest().body("Expected WebSocket upgrade request"));
     }
 
+    // Refuse new connections while draining for shutdown/recycle; clients
+    // that retry will land on a healthy worker via SO_REUSEPORT.
+    // Best-effort: the acceptor is usually torn down (handle.stop) right after
+    // draining begins, so most new upgrades are refused at the TCP layer before
+    // reaching here. This mainly covers an upgrade racing in on an already-open
+    // keep-alive connection during the drain window.
+    if super::is_draining() {
+        return Ok(HttpResponse::ServiceUnavailable()
+            .content_type("application/json")
+            .body(r#"{"detail":"Server is shutting down"}"#));
+    }
+
     // Check connection limit FIRST (before any processing)
     let current_connections = ACTIVE_WS_CONNECTIONS.load(Ordering::Relaxed);
     if current_connections >= config.max_connections {

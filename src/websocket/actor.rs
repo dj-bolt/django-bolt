@@ -12,6 +12,9 @@ use super::config::WS_CONFIG;
 use super::messages::{SendToClient, WsMessage};
 use super::ACTIVE_WS_CONNECTIONS;
 
+/// How often each connection polls the process-wide drain flag.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// WebSocket actor that bridges Actix and Python
 pub struct WebSocketActor {
     /// Client heartbeat tracking
@@ -61,6 +64,23 @@ impl WebSocketActor {
         });
     }
 
+    /// Poll the process-wide drain flag; when the server begins shutting
+    /// down (stop or recycle), close the connection with 1012 (Service
+    /// Restart) so clients know to reconnect — they'll land on a healthy
+    /// worker via SO_REUSEPORT.
+    fn start_drain_watch(&self, ctx: &mut ws::WebsocketContext<Self>) {
+        ctx.run_interval(DRAIN_POLL_INTERVAL, |act, ctx| {
+            if super::is_draining() && act.close_code.is_none() {
+                act.close_code = Some(1012);
+                ctx.close(Some(ws::CloseReason {
+                    code: ws::CloseCode::Restart,
+                    description: Some("server restarting".to_string()),
+                }));
+                ctx.stop();
+            }
+        });
+    }
+
     /// Close connection with error code when Python channel fails
     fn close_on_channel_error(&mut self, ctx: &mut ws::WebsocketContext<Self>, error: &str) {
         eprintln!("[django-bolt] {}", error);
@@ -78,6 +98,7 @@ impl Actor for WebSocketActor {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         self.start_heartbeat(ctx);
+        self.start_drain_watch(ctx);
     }
 
     fn stopped(&mut self, _ctx: &mut Self::Context) {

@@ -812,6 +812,14 @@ pub fn start_server(
                     .map(|seconds| KeepAlive::Timeout(std::time::Duration::from_secs(seconds)))
                     .unwrap_or(KeepAlive::Os);
 
+                // Graceful-shutdown window: how long in-flight connections get
+                // to finish after a shutdown signal before being force-closed.
+                // The runbolt supervisor sets this to --workers-kill-timeout.
+                let shutdown_timeout: u64 = std::env::var("DJANGO_BOLT_SHUTDOWN_TIMEOUT")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(30);
+
                 {
                     let server = HttpServer::new(move || {
                         let mut app = App::new()
@@ -880,6 +888,10 @@ pub fn start_server(
                     })
                     .keep_alive(keep_alive)
                     .client_request_timeout(std::time::Duration::from_secs(0))
+                    // Signals are handled by our own task below (WebSocket
+                    // drain must run before the Actix graceful stop).
+                    .disable_signals()
+                    .shutdown_timeout(shutdown_timeout)
                     .workers(workers);
 
                     let use_reuse_port = std::env::var("DJANGO_BOLT_REUSE_PORT")
@@ -923,11 +935,26 @@ pub fn start_server(
                     listener
                         .set_nonblocking(true)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                    server
+                    let server = server
                         .listen(listener)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-                        .run()
-                        .await
+                        .run();
+
+                    // Custom shutdown sequencing (Actix signals disabled above):
+                    // 1. close WebSocket connections with 1012 Service Restart so
+                    //    clients reconnect to a healthy worker,
+                    // 2. graceful Actix stop (drain in-flight HTTP up to
+                    //    shutdown_timeout). SIGTERM drains gracefully;
+                    //    SIGINT/SIGQUIT stop immediately (Actix's default
+                    //    per-signal semantics).
+                    let handle = server.handle();
+                    aw::rt::spawn(async move {
+                        let graceful = wait_for_shutdown_signal().await;
+                        crate::websocket::begin_drain();
+                        handle.stop(graceful).await;
+                    });
+
+                    server.await
                 }
             })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
@@ -935,6 +962,50 @@ pub fn start_server(
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Server error: {}", e)))?;
 
     Ok(())
+}
+
+/// Wait for a shutdown signal. Returns `true` for graceful shutdown (SIGTERM)
+/// and `false` for immediate shutdown (SIGINT/SIGQUIT), mirroring
+/// actix-server's default per-signal semantics.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> bool {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // If a handler cannot be installed, log it and never resolve that arm:
+    // the remaining signals still work, and the OS default disposition was
+    // already replaced only for successfully-installed handlers.
+    async fn recv_or_pending(sig: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
+        match sig {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[django-bolt] Failed to install {} handler: {}; graceful shutdown for this signal is disabled",
+                    name, e
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    tokio::select! {
+        _ = recv_or_pending(signal(SignalKind::terminate()), "SIGTERM") => true,
+        _ = recv_or_pending(signal(SignalKind::interrupt()), "SIGINT") => false,
+        _ = recv_or_pending(signal(SignalKind::quit()), "SIGQUIT") => false,
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> bool {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        eprintln!(
+            "[django-bolt] Failed to install Ctrl-C handler: {}; graceful shutdown is disabled",
+            e
+        );
+        std::future::pending::<()>().await;
+    }
+    false
 }
 
 /// Guard function to detect WebSocket upgrade requests
