@@ -22,6 +22,8 @@ from typing import Any
 
 import httpx
 
+from .apps import PACKAGE_ROOT
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_TIMEOUT = 20.0
 
@@ -355,6 +357,7 @@ class ServerProject:
     package_name: str
     python_executable: str
     preserve_pythonpath: bool = True
+    extra_pythonpath: list[str] = field(default_factory=list)
 
     def path(self, relative_path: str) -> Path:
         return self.root / relative_path
@@ -377,16 +380,12 @@ class ServerProject:
             temporary_path.unlink(missing_ok=True)
         return path
 
-    def write_project_api(self, api_body: str) -> Path:
-        normalized_api_body = _normalize_python_source(api_body).rstrip()
+    def write_project_api(self) -> Path:
         source = "\n".join(
             [
                 "from __future__ import annotations",
                 "",
-                "import asyncio",
-                "import time",
-                "",
-                "from django_bolt import BoltAPI, StreamingResponse, WebSocket",
+                "from django_bolt import BoltAPI",
                 "",
                 "api = BoltAPI()",
                 "",
@@ -396,13 +395,27 @@ class ServerProject:
                 '    return {"status": "ok"}',
             ]
         )
-        if normalized_api_body:
-            source = f"{source}\n\n\n{normalized_api_body}"
         source = f"{source}\n"
         return self.write_file(
             f"{self.package_name}/api.py",
             source,
         )
+
+    def install_api(self, source: Path | str) -> Path:
+        """Install a real, self-contained module as the project's ``api.py``.
+
+        Unlike :meth:`write_project_api` (which writes the fixed default
+        readiness app), this copies a vetted ``.py`` file verbatim. The module
+        under test is real Python in the repo, so it gets full linting,
+        type-checking and IDE support, and the same file can be imported by
+        ``TestClient`` for fast in-process coverage. The module must be
+        self-contained (define its own ``api = BoltAPI()`` and a ``/health``
+        route, no relative imports) so it copies cleanly into the subprocess.
+        """
+        # Read as bytes so write_file copies the file byte-for-byte. The str path
+        # runs _normalize_python_source (dedent + lstrip), which would not be verbatim.
+        content = Path(source).read_bytes()
+        return self.write_file(f"{self.package_name}/api.py", content)
 
     def read_file(self, relative_path: str) -> str:
         return self.path(relative_path).read_text()
@@ -419,6 +432,13 @@ class ServerProject:
         timeout: float = DEFAULT_TIMEOUT,
         env: dict[str, str] | None = None,
     ) -> RunningServer:
+        if dev and not (self.root / self.package_name / "api.py").exists():
+            raise ValueError(
+                "runbolt --dev watches files in the temp project, but this project has no "
+                "<package>/api.py on disk (api_module loads by import path) — the reload "
+                "watcher would never see changes. Use api_source= for --dev/reload tests."
+            )
+
         port = get_free_port(host) if port is None else port
         command = [
             self.python_executable,
@@ -439,10 +459,10 @@ class ServerProject:
         process_env = os.environ.copy()
         process_env.update(env or {})
         existing_pythonpath = process_env.get("PYTHONPATH", "")
+        pythonpath_parts = [str(self.root), *self.extra_pythonpath]
         if self.preserve_pythonpath and existing_pythonpath:
-            process_env["PYTHONPATH"] = f"{self.root}{os.pathsep}{existing_pythonpath}"
-        else:
-            process_env["PYTHONPATH"] = str(self.root)
+            pythonpath_parts.append(existing_pythonpath)
+        process_env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
 
         process = _spawn_process(command, cwd=self.root, env=process_env)
         return RunningServer(
@@ -459,7 +479,8 @@ def create_server_project(
     root: Path,
     *,
     package_name: str = "testproj",
-    project_api_body: str = "",
+    api_source: Path | str | None = None,
+    api_module: str | None = None,
     urls_content: str = "urlpatterns = []\n",
     settings_extra: str = "",
     extra_files: dict[str, str | bytes] | None = None,
@@ -469,6 +490,15 @@ def create_server_project(
     python_executable: str | None = None,
     preserve_pythonpath: bool = True,
 ) -> ServerProject:
+    if api_module is not None and api_source is not None:
+        raise ValueError("pass at most one of api_module= or api_source=")
+
+    if api_module is not None and not preserve_pythonpath:
+        raise ValueError(
+            "api_module requires the repo source tree on the subprocess PYTHONPATH; "
+            "isolated projects (preserve_pythonpath=False, e.g. artifact tests) must use api_source"
+        )
+
     project = ServerProject(
         root=root,
         package_name=package_name,
@@ -490,29 +520,30 @@ def create_server_project(
     ]
 
     project.write_file(f"{package_name}/__init__.py", "")
-    settings_source = "\n".join(
-        [
-            "from pathlib import Path",
-            "",
-            "BASE_DIR = Path(__file__).resolve().parent.parent",
-            'SECRET_KEY = "django-bolt-server-integration"',
-            "DEBUG = True",
-            'ALLOWED_HOSTS = ["*"]',
-            f"INSTALLED_APPS = {_python_list_literal(all_installed_apps)}",
-            "DATABASES = {",
-            '    "default": {',
-            '        "ENGINE": "django.db.backends.sqlite3",',
-            '        "NAME": str(BASE_DIR / "db.sqlite3"),',
-            "    }",
-            "}",
-            "USE_TZ = True",
-            'TIME_ZONE = "UTC"',
-            f'ROOT_URLCONF = "{package_name}.urls"',
-            'DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"',
-            f"MIDDLEWARE = {middleware!r}",
-            f"TEMPLATES = {templates!r}",
-        ]
-    )
+    settings_lines = [
+        "from pathlib import Path",
+        "",
+        "BASE_DIR = Path(__file__).resolve().parent.parent",
+        'SECRET_KEY = "django-bolt-server-integration"',
+        "DEBUG = True",
+        'ALLOWED_HOSTS = ["*"]',
+        f"INSTALLED_APPS = {_python_list_literal(all_installed_apps)}",
+        "DATABASES = {",
+        '    "default": {',
+        '        "ENGINE": "django.db.backends.sqlite3",',
+        '        "NAME": str(BASE_DIR / "db.sqlite3"),',
+        "    }",
+        "}",
+        "USE_TZ = True",
+        'TIME_ZONE = "UTC"',
+        f'ROOT_URLCONF = "{package_name}.urls"',
+        'DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"',
+        f"MIDDLEWARE = {middleware!r}",
+        f"TEMPLATES = {templates!r}",
+    ]
+    if api_module is not None:
+        settings_lines.append(f"BOLT_API = [{api_module!r}]")
+    settings_source = "\n".join(settings_lines)
     normalized_settings_extra = _normalize_python_source(settings_extra).rstrip()
     if normalized_settings_extra:
         settings_source = f"{settings_source}\n\n{normalized_settings_extra}"
@@ -522,7 +553,15 @@ def create_server_project(
         settings_source,
     )
     project.write_file(f"{package_name}/urls.py", urls_content)
-    project.write_project_api(project_api_body)
+    if api_module is not None:
+        # Load the app by import path via ``BOLT_API`` — no file copy. Put the
+        # package root on the subprocess path so ``tests.integration.apps.*``
+        # resolves to the same module the in-process client imports.
+        project.extra_pythonpath = [str(PACKAGE_ROOT)]
+    elif api_source is not None:
+        project.install_api(api_source)
+    else:
+        project.write_project_api()
     project.write_file(
         "manage.py",
         f"""

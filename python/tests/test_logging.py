@@ -9,8 +9,12 @@ These tests validate the behavior documented in docs/LOGGING.md:
 - Integration with Django's logging system
 """
 
+import io
 import logging
+import time
+from contextlib import redirect_stderr, suppress
 from logging.handlers import QueueHandler
+from queue import Queue
 from unittest.mock import Mock
 
 import pytest
@@ -18,7 +22,12 @@ from django.conf import settings
 
 import django_bolt.logging.config as config_module
 from django_bolt.logging import LoggingConfig, LoggingMiddleware, create_logging_middleware
-from django_bolt.logging.config import _ensure_queue_logging, setup_django_logging
+from django_bolt.logging.config import (
+    _BoundedQueueListener,
+    _DropOnFullQueueHandler,
+    _ensure_queue_logging,
+    setup_django_logging,
+)
 
 
 class TestLoggingConfig:
@@ -724,6 +733,171 @@ class TestQueueBasedLogging:
         # Should have created listener
         assert config_module._QUEUE_LISTENER is not None, "QueueListener should be created"
         assert config_module._QUEUE is not None, "Queue should be created"
+
+    def test_ensure_queue_logging_uses_drop_on_full_handler(self):
+        """The bounded queue must use the drop-on-full handler, not a stock QueueHandler.
+
+        A stock QueueHandler routes queue.Full to handleError(), spamming stderr
+        under load instead of dropping. The handler must swallow Full instead.
+        """
+        config_module._QUEUE_LISTENER = None
+        config_module._QUEUE = None
+
+        handler = _ensure_queue_logging("INFO")
+
+        assert isinstance(handler, _DropOnFullQueueHandler), (
+            "Bounded queue requires _DropOnFullQueueHandler to avoid stderr storms when full"
+        )
+
+    def test_drop_on_full_handler_drops_without_traceback_storm(self):
+        """A full queue drops records with a terse notice — never a traceback storm.
+
+        Regression: stock QueueHandler.emit() catches queue.Full and calls
+        handleError(), which writes a full traceback to stderr per dropped record
+        (logging.raiseExceptions defaults to True) — a stderr storm under the
+        exact load spike the bounded queue is meant to survive. The drop-on-full
+        handler instead drops the record, tracks dropped_count, and emits one
+        short line (no traceback) on the first drop.
+        """
+        bounded = Queue(maxsize=1)
+        handler = _DropOnFullQueueHandler(bounded)
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="payload",
+            args=None,
+            exc_info=None,
+        )
+
+        # Saturate the queue.
+        handler.emit(record)
+        assert bounded.full(), "Queue should be full after first emit"
+
+        # Further emits must not raise, must drop, and must not dump a traceback.
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            for _ in range(5):
+                handler.emit(record)
+
+        output = captured.getvalue()
+        assert "Traceback" not in output, "Full queue must not dump a traceback per record"
+        assert bounded.qsize() == 1, "Overflow records must be dropped, queue unchanged"
+        assert handler.dropped_count == 5, "Each overflow record must be counted"
+        # Throttled: only the first drop emits a line (interval is 10000).
+        assert output.count("\n") == 1, "Drop notice must be throttled, not per-record"
+        assert "dropped" in output
+
+    def test_drop_on_full_handler_does_not_warn_until_full(self):
+        """No drop notice while the queue has capacity."""
+        bounded = Queue(maxsize=4)
+        handler = _DropOnFullQueueHandler(bounded)
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="payload",
+            args=None,
+            exc_info=None,
+        )
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            for _ in range(4):
+                handler.emit(record)
+        assert captured.getvalue() == "", "No notice should be written while capacity remains"
+        assert handler.dropped_count == 0
+
+    def test_listener_stops_cleanly_when_queue_saturated(self):
+        """QueueListener.stop() must not raise queue.Full on a saturated bounded queue.
+
+        Regression (found via memory soak): the stock QueueListener.enqueue_sentinel()
+        uses put_nowait, which raises queue.Full when the bounded queue is full, so
+        stop() crashes and the listener thread leaks. _BoundedQueueListener uses a
+        blocking put for the sentinel so shutdown is reliable under saturation.
+        """
+
+        class _SlowSink(logging.Handler):
+            def emit(self, record):
+                time.sleep(0.002)  # consumer slower than the producer → queue saturates
+
+        q = Queue(maxsize=5)
+        listener = _BoundedQueueListener(q, _SlowSink())
+        listener.start()
+        handler = _DropOnFullQueueHandler(q)
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="payload",
+            args=None,
+            exc_info=None,
+        )
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            for _ in range(3000):
+                handler.emit(record)  # far outpaces the slow sink → drops + full queue
+        assert q.qsize() >= 1, "queue should hold a backlog (saturated) before stop"
+        assert handler.dropped_count > 0, "saturation should have dropped records"
+
+        # The bug: stock QueueListener.stop() raises queue.Full here. This must not.
+        listener.stop()
+        assert listener._thread is None, "listener thread should have stopped cleanly"
+
+    def test_queue_size_is_configurable_via_settings(self):
+        """BOLT_LOG_QUEUE_SIZE overrides the default 10000 bound."""
+        config_module._QUEUE_LISTENER = None
+        config_module._QUEUE = None
+        had_attr = hasattr(settings, "BOLT_LOG_QUEUE_SIZE")
+        prev = getattr(settings, "BOLT_LOG_QUEUE_SIZE", None)
+        settings.BOLT_LOG_QUEUE_SIZE = 123
+        try:
+            _ensure_queue_logging("INFO")
+            assert config_module._QUEUE.maxsize == 123
+        finally:
+            if had_attr:
+                settings.BOLT_LOG_QUEUE_SIZE = prev
+            else:
+                with suppress(AttributeError):
+                    delattr(settings, "BOLT_LOG_QUEUE_SIZE")
+            config_module._QUEUE_LISTENER = None
+            config_module._QUEUE = None
+
+    @pytest.mark.parametrize("bad_value", [0, -1, "10k"], ids=["zero", "negative", "non-int"])
+    def test_invalid_queue_size_falls_back_to_bounded_default_with_notice(self, bad_value):
+        """A bad BOLT_LOG_QUEUE_SIZE must not silently create an UNBOUNDED queue.
+
+        Queue(maxsize<=0) is unbounded — the exact OOM risk the bound exists to
+        prevent — and a non-int value must not be silently ignored (project rule:
+        never silently ignore errors). Both cases must fall back to the bounded
+        default AND surface a notice on stderr.
+        """
+        config_module._QUEUE_LISTENER = None
+        config_module._QUEUE = None
+        had_attr = hasattr(settings, "BOLT_LOG_QUEUE_SIZE")
+        prev = getattr(settings, "BOLT_LOG_QUEUE_SIZE", None)
+        settings.BOLT_LOG_QUEUE_SIZE = bad_value
+        try:
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                _ensure_queue_logging("INFO")
+            assert config_module._QUEUE.maxsize == 10000, (
+                f"BOLT_LOG_QUEUE_SIZE={bad_value!r} must fall back to the bounded default, "
+                f"got maxsize={config_module._QUEUE.maxsize} (<=0 means unbounded)"
+            )
+            assert "BOLT_LOG_QUEUE_SIZE" in captured.getvalue(), (
+                "misconfiguration must be surfaced on stderr, not silently ignored"
+            )
+        finally:
+            if had_attr:
+                settings.BOLT_LOG_QUEUE_SIZE = prev
+            else:
+                with suppress(AttributeError):
+                    delattr(settings, "BOLT_LOG_QUEUE_SIZE")
+            config_module._QUEUE_LISTENER = None
+            config_module._QUEUE = None
 
     def test_setup_django_logging_configures_queue_handlers(self):
         """setup_django_logging should configure queue handlers for django loggers."""

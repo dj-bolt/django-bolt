@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from .apps import app_module
 from .helpers import ServerProject
 
 pytestmark = pytest.mark.server_integration
@@ -10,26 +11,7 @@ pytestmark = pytest.mark.server_integration
 def _make_project(make_server_project) -> ServerProject:
     """Project exposing every parameter surface the limit is enforced on:
     HTTP path, HTTP query, urlencoded form and multipart form."""
-    return make_server_project(
-        project_api_body="""
-        from typing import Annotated
-
-        from django_bolt.param_functions import Form, Query
-
-
-        @api.get("/echo/{value}")
-        async def echo_path(value: str):
-            return {"length": len(value)}
-
-        @api.get("/echo-query")
-        async def echo_query(value: str = Query()):
-            return {"length": len(value)}
-
-        @api.post("/echo-form")
-        async def echo_form(value: Annotated[str, Form()]):
-            return {"length": len(value)}
-        """
-    )
+    return make_server_project(api_module=app_module("param_length_echo"))
 
 
 # --- Path parameters ---

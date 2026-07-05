@@ -95,7 +95,11 @@ def pytest_configure(config):
             DATABASES={
                 "default": {
                     "ENGINE": "django.db.backends.sqlite3",
-                    "NAME": "/tmp/django_bolt_test.sqlite3",  # File-based for better thread isolation
+                    # File-based for better thread isolation. One file per xdist worker
+                    # (PYTEST_XDIST_WORKER is unset in serial runs): concurrent workers
+                    # sharing a single SQLite file fail with locked-database, UNIQUE
+                    # (django_content_type), and FK errors.
+                    "NAME": f"/tmp/django_bolt_test{os.environ.get('PYTEST_XDIST_WORKER', '')}.sqlite3",
                 }
             },
             USE_TZ=True,

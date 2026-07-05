@@ -19,45 +19,16 @@ from __future__ import annotations
 
 import pytest
 
+from .apps import app_module
+
 pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
 
 pytestmark = pytest.mark.server_integration
 
 
-def _make_streaming_project(make_server_project):
-    return make_server_project(
-        project_api_body="""
-        from django_bolt.responses import EventSourceResponse, StreamingResponse
-        from django_bolt.middleware import no_compress
-
-        @api.get("/events")
-        async def stream():
-            async def gen():
-                for i in range(5):
-                    yield {"i": i}
-            return EventSourceResponse(gen())
-
-        @api.get("/events/raw")
-        @no_compress
-        async def raw_stream():
-            async def gen():
-                for i in range(3):
-                    yield {"i": i}
-            return EventSourceResponse(gen())
-
-        @api.get("/text")
-        async def text_stream():
-            async def gen():
-                for chunk in ("alpha-", "beta-", "gamma"):
-                    yield chunk
-            return StreamingResponse(gen(), media_type="text/plain")
-        """,
-    )
-
-
 def test_default_on_brotli_sse_end_to_end(make_server_project):
     """Bare `EventSourceResponse(gen())` with default `BoltAPI()` → brotli SSE."""
-    project = _make_streaming_project(make_server_project)
+    project = make_server_project(api_module=app_module("streaming_compression"))
     with project.start(startup_path="/health") as server:
         resp = server.get("/events", headers={"Accept-Encoding": "br"})
 
@@ -73,7 +44,7 @@ def test_default_on_brotli_sse_end_to_end(make_server_project):
 
 def test_default_on_gzip_fallback_sse(make_server_project):
     """Client only accepts gzip → server falls back to gzip per-chunk."""
-    project = _make_streaming_project(make_server_project)
+    project = make_server_project(api_module=app_module("streaming_compression"))
     with project.start(startup_path="/health") as server:
         resp = server.get("/events", headers={"Accept-Encoding": "gzip"})
 
@@ -87,7 +58,7 @@ def test_default_on_gzip_fallback_sse(make_server_project):
 
 def test_no_compress_decorator_opts_out(make_server_project):
     """`@no_compress` on a streaming handler skips wire compression."""
-    project = _make_streaming_project(make_server_project)
+    project = make_server_project(api_module=app_module("streaming_compression"))
     with project.start(startup_path="/health") as server:
         resp = server.get("/events/raw", headers={"Accept-Encoding": "br"})
 
@@ -99,7 +70,7 @@ def test_no_compress_decorator_opts_out(make_server_project):
 
 def test_generic_streaming_response_auto_compresses(make_server_project):
     """Default-on applies to generic `StreamingResponse`, not just SSE."""
-    project = _make_streaming_project(make_server_project)
+    project = make_server_project(api_module=app_module("streaming_compression"))
     with project.start(startup_path="/health") as server:
         resp = server.get("/text", headers={"Accept-Encoding": "br"})
 

@@ -2,33 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from .helpers import SimpleWebSocketClient
+from .apps import app_module
+from .helpers import ServerProject, SimpleWebSocketClient
 
 pytestmark = pytest.mark.server_integration
 
 
-def _make_websocket_project(make_server_project):
-    return make_server_project(
-        project_api_body="""
-        from django_bolt.websocket import CloseCode
-
-
-        @api.websocket("/ws/protected")
-        async def protected(websocket: WebSocket):
-            await websocket.accept()
-
-            if websocket.headers.get("authorization") != "Bearer secret-token":
-                await websocket.close(code=CloseCode.POLICY_VIOLATION, reason="unauthorized")
-                return
-
-            await websocket.send_text("authorized")
-            async for message in websocket.iter_text():
-                if message == "bye":
-                    await websocket.close(code=CloseCode.NORMAL, reason="done")
-                    return
-                await websocket.send_text(f"echo:{message}")
-        """
-    )
+def _make_websocket_project(make_server_project) -> ServerProject:
+    return make_server_project(api_module=app_module("websocket_auth"))
 
 
 def test_websocket_handshake_auth_and_close(make_server_project):

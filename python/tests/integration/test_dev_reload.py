@@ -5,6 +5,8 @@ import time
 
 import pytest
 
+from .apps import app_source
+
 pytestmark = [pytest.mark.server_integration]
 
 
@@ -16,11 +18,7 @@ def test_runbolt_dev_reloads_with_force_polling(make_server_project):
     use the same generous timeout as the inotify case.
     """
     project = make_server_project(
-        project_api_body="""
-        @api.get("/version")
-        async def version():
-            return {"version": "v1"}
-        """,
+        api_source=app_source("reload_v1"),
         settings_extra="BOLT_DEV_FORCE_POLLING = True",
     )
 
@@ -29,13 +27,7 @@ def test_runbolt_dev_reloads_with_force_polling(make_server_project):
         assert initial.json() == {"version": "v1"}
 
         time.sleep(0.3)
-        project.write_project_api(
-            """
-            @api.get("/version")
-            async def version():
-                return {"version": "v2"}
-            """
-        )
+        project.install_api(app_source("reload_v2"))
 
         payload = server.wait_for_json("/version", lambda body: body["version"] == "v2", timeout=30)
 

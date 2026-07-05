@@ -891,7 +891,7 @@ class Command(BaseCommand):
         # Check explicit settings first
         if hasattr(settings, "BOLT_API"):
             for api_path in settings.BOLT_API:
-                api = self.import_api(api_path)
+                api = self.import_api(api_path, required=True)
                 if api:
                     apis.append((api_path, api))
             return self._deduplicate_apis(apis)
@@ -973,9 +973,11 @@ class Command(BaseCommand):
                 self.stdout.write(f"  Skipped duplicate API: {api_path}")
         return deduplicated
 
-    def import_api(self, dotted_path):
+    def import_api(self, dotted_path, *, required: bool = False):
         """Import a BoltAPI instance from dotted path like 'myapp.api:api'"""
         if ":" not in dotted_path:
+            if required:
+                raise CommandError(f"BOLT_API entry {dotted_path!r} could not be imported: expected 'module:attr' path")
             return None
 
         module_path, attr_name = dotted_path.split(":", 1)
@@ -986,6 +988,8 @@ class Command(BaseCommand):
             # Check if the error is for the target module itself (optional)
             # or for a dependency within the module (fatal error)
             if e.name == module_path or e.name == module_path.split(".")[0]:
+                if required:
+                    raise CommandError(f"BOLT_API entry {dotted_path!r} could not be imported: {e}") from e
                 # Target module doesn't exist - this is fine, api.py is optional
                 return None
             else:
@@ -995,6 +999,11 @@ class Command(BaseCommand):
 
         # If attribute doesn't exist, return None (not an error, just doesn't have that attr)
         if not hasattr(module, attr_name):
+            if required:
+                raise CommandError(
+                    f"BOLT_API entry {dotted_path!r} could not be imported: "
+                    f"module {module_path!r} has no attribute {attr_name!r}"
+                )
             return None
 
         api = getattr(module, attr_name)
@@ -1002,6 +1011,12 @@ class Command(BaseCommand):
         # Verify it's a BoltAPI instance
         if isinstance(api, BoltAPI):
             return api
+
+        if required:
+            raise CommandError(
+                f"BOLT_API entry {dotted_path!r} could not be imported: "
+                f"{module_path!r}.{attr_name} is not a BoltAPI instance"
+            )
 
         return None
 

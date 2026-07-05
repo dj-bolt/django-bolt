@@ -5,71 +5,13 @@ import time
 import httpx
 import pytest
 
+from .apps import app_module
+
 pytestmark = pytest.mark.server_integration
 
 
-def _make_sse_project(make_server_project):
-    return make_server_project(
-        project_api_body="""
-        from django_bolt.middleware import cors
-
-
-        @api.get("/sse-cors-async")
-        @cors(origins=["https://example.com", "https://trusted.com"])
-        async def sse_cors_async():
-            async def gen():
-                for i in range(3):
-                    yield f"data: message-{i}\\n\\n"
-                    await asyncio.sleep(0.01)
-            return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-        @api.get("/sse-cors-sync")
-        @cors(origins=["https://sync-app.com"])
-        async def sse_cors_sync():
-            def gen():
-                for i in range(3):
-                    yield f"data: sync-{i}\\n\\n"
-                    time.sleep(0.01)
-            return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-        @api.get("/sse-cors-credentials")
-        @cors(origins=["https://secure.com"], credentials=True)
-        async def sse_cors_credentials():
-            async def gen():
-                yield "data: secure\\n\\n"
-            return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-        @api.get("/sse-cors-wildcard")
-        @cors(origins=["*"])
-        async def sse_cors_wildcard():
-            async def gen():
-                yield "data: public\\n\\n"
-            return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-        @api.get("/sse-no-cors")
-        async def sse_no_cors():
-            async def gen():
-                yield "data: no-cors\\n\\n"
-            return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-        @api.get("/sse-timing")
-        async def sse_timing():
-            async def gen():
-                for i in range(3):
-                    yield f"data: timing-{i}\\n\\n"
-                    await asyncio.sleep(0.2)
-            return StreamingResponse(gen(), media_type="text/event-stream")
-        """
-    )
-
-
 def test_async_sse_has_cors_headers(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server:
         response = server.get("/sse-cors-async", headers={"Origin": "https://example.com"})
@@ -85,7 +27,7 @@ def test_async_sse_has_cors_headers(make_server_project):
 
 
 def test_sync_sse_has_cors_headers(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server:
         response = server.get("/sse-cors-sync", headers={"Origin": "https://sync-app.com"})
@@ -95,7 +37,7 @@ def test_sync_sse_has_cors_headers(make_server_project):
 
 
 def test_sse_cors_credentials(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server:
         response = server.get("/sse-cors-credentials", headers={"Origin": "https://secure.com"})
@@ -106,7 +48,7 @@ def test_sse_cors_credentials(make_server_project):
 
 
 def test_sse_without_cors_decorator_has_no_headers(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server:
         response = server.get("/sse-no-cors", headers={"Origin": "https://example.com"})
@@ -116,7 +58,7 @@ def test_sse_without_cors_decorator_has_no_headers(make_server_project):
 
 
 def test_sse_streams_in_real_time(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server, httpx.Client(timeout=10, headers={"Accept-Encoding": "identity"}) as client:
         timestamps: list[float] = []

@@ -2,59 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = pytest.mark.server_integration
+from django_bolt.testing import TestClient
+
+from .apps import app_module, union_response
 
 
-FEED_API_BODY = """
-import msgspec
-
-
-class PostActivity(msgspec.Struct, tag="post"):
-    id: int
-    actor: str
-    title: str
-    body: str
-
-
-class CommentActivity(msgspec.Struct, tag="comment"):
-    id: int
-    actor: str
-    post_id: int
-    text: str
-
-
-class LikeActivity(msgspec.Struct, tag="like"):
-    id: int
-    actor: str
-    target_id: int
-    target_kind: str
-
-
-FeedItem = PostActivity | CommentActivity | LikeActivity
-
-
-@api.get("/feed/{item_id}", response_model=FeedItem)
-async def feed_item(item_id: int) -> FeedItem:
-    kind = item_id % 3
-    if kind == 0:
-        return PostActivity(id=item_id, actor="alice", title="hello", body="world")
-    if kind == 1:
-        return CommentActivity(id=item_id, actor="bob", post_id=item_id - 1, text="nice")
-    return LikeActivity(id=item_id, actor="carol", target_id=item_id - 2, target_kind="post")
-
-
-@api.get("/feed", response_model=list[FeedItem])
-async def feed() -> list[FeedItem]:
-    return [
-        PostActivity(id=0, actor="alice", title="t0", body="b0"),
-        CommentActivity(id=1, actor="bob", post_id=0, text="c1"),
-        LikeActivity(id=2, actor="carol", target_id=0, target_kind="post"),
-    ]
-"""
-
-
+@pytest.mark.server_integration
 def test_union_response_each_branch_carries_tag(make_server_project):
-    project = make_server_project(project_api_body=FEED_API_BODY)
+    project = make_server_project(api_module=app_module("union_response"))
 
     with project.start() as server:
         post = server.get("/feed/0")
@@ -89,8 +44,9 @@ def test_union_response_each_branch_carries_tag(make_server_project):
     }
 
 
+@pytest.mark.server_integration
 def test_union_response_list_serializes_mixed_tags(make_server_project):
-    project = make_server_project(project_api_body=FEED_API_BODY)
+    project = make_server_project(api_module=app_module("union_response"))
 
     with project.start() as server:
         response = server.get("/feed")
@@ -103,8 +59,9 @@ def test_union_response_list_serializes_mixed_tags(make_server_project):
     assert body[2]["target_kind"] == "post"
 
 
+@pytest.mark.server_integration
 def test_union_response_openapi_advertises_all_branches(make_server_project):
-    project = make_server_project(project_api_body=FEED_API_BODY)
+    project = make_server_project(api_module=app_module("union_response"))
 
     with project.start() as server:
         response = server.get("/docs/openapi.json")
@@ -133,3 +90,16 @@ def test_union_response_openapi_advertises_all_branches(make_server_project):
     items_schema = feed_list_schema["items"]
     list_union = items_schema.get("oneOf") or items_schema.get("anyOf")
     assert list_union is not None, f"expected oneOf/anyOf in list[Union] items schema, got {items_schema!r}"
+
+
+def test_union_response_each_branch_carries_tag_in_process():
+    """Same app module, in-process — fast confirmation that each union branch
+    serializes with its tag. The subprocess tests cover the real TCP + OpenAPI path."""
+    with TestClient(union_response.api) as client:
+        post = client.get("/feed/0")
+        comment = client.get("/feed/1")
+        like = client.get("/feed/2")
+
+    assert post.json() == {"type": "post", "id": 0, "actor": "alice", "title": "hello", "body": "world"}
+    assert comment.json() == {"type": "comment", "id": 1, "actor": "bob", "post_id": 0, "text": "nice"}
+    assert like.json() == {"type": "like", "id": 2, "actor": "carol", "target_id": 0, "target_kind": "post"}
