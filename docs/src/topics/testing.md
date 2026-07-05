@@ -4,12 +4,15 @@ icon: lucide/flask-conical
 
 # Testing
 
-Django-Bolt provides a `TestClient` for testing your API endpoints without starting a server.
-`httpx` is included in `django-bolt` dependencies because the testing clients are built on top of it.
+Django-Bolt routes every request through its Rust HTTP layer, and so does its
+test client. When a test passes against `TestClient`, the request went through
+the same routing, parameter validation, authentication, and serialization code
+that will handle it in production. There is no separate "test mode" that
+quietly behaves differently.
 
-## TestClient
-
-The `TestClient` routes requests through the Rust layer, providing realistic testing:
+`TestClient` runs entirely in-process — no server to start, no port to pick —
+and it's built on `httpx`, which django-bolt already depends on, so there's
+nothing extra to install:
 
 ```python
 from django_bolt import BoltAPI
@@ -21,114 +24,85 @@ api = BoltAPI()
 async def hello():
     return {"message": "world"}
 
-# Test the endpoint
 with TestClient(api) as client:
     response = client.get("/hello")
     assert response.status_code == 200
     assert response.json() == {"message": "world"}
 ```
 
+That's the whole idea. The rest of this page covers the details: making
+requests, working with the database, testing auth, and the rare cases where an
+in-process client isn't enough.
+
 ## Making requests
 
-### GET requests
+If you've used `httpx` or `requests`, you already know this API. Each HTTP
+method has its own function; query strings go in the URL, and headers, JSON
+bodies, and form data are keyword arguments:
 
 ```python
 with TestClient(api) as client:
-    # Simple GET
-    response = client.get("/users")
-
-    # GET with query parameters
-    response = client.get("/search?q=test&limit=20")
-
-    # GET with headers
-    response = client.get("/secure", headers={"Authorization": "Bearer token"})
+    client.get("/search?q=test&limit=20")
+    client.get("/secure", headers={"Authorization": "Bearer token"})
+    client.post("/users", json={"name": "John", "email": "john@example.com"})
+    client.post("/login", data={"username": "john", "password": "secret"})
+    client.put("/users/1", json={"name": "Updated", "email": "u@example.com"})
+    client.patch("/users/1", json={"name": "Patched"})
+    client.delete("/users/1")
 ```
 
-### POST requests
-
-```python
-with TestClient(api) as client:
-    # POST with JSON body
-    response = client.post(
-        "/users",
-        json={"name": "John", "email": "john@example.com"}
-    )
-
-    # POST with form data
-    response = client.post(
-        "/login",
-        data={"username": "john", "password": "secret"}
-    )
-```
-
-### PUT, PATCH, DELETE
-
-```python
-with TestClient(api) as client:
-    # PUT (full update)
-    response = client.put(
-        "/users/1",
-        json={"name": "Updated", "email": "updated@example.com"}
-    )
-
-    # PATCH (partial update)
-    response = client.patch("/users/1", json={"name": "Patched"})
-
-    # DELETE
-    response = client.delete("/users/1")
-```
-
-## Response object
-
-The response object provides access to status, headers, and body:
+Responses give you the status code, headers, and body in whatever form you
+need:
 
 ```python
 response = client.get("/users/1")
 
-# Status code
-assert response.status_code == 200
-
-# JSON body
-data = response.json()
-assert data["id"] == 1
-
-# Raw content
-raw = response.content  # bytes
-
-# Headers
-content_type = response.headers.get("content-type")
+response.status_code                    # 200
+response.json()                         # decoded body
+response.content                        # raw bytes
+response.headers.get("content-type")   # "application/json"
 ```
 
-## Testing path parameters
+## Testing validation
+
+Path parameters, query parameters, headers, and request bodies are all
+extracted and validated before your handler runs. A good test suite covers
+both directions: the request that reaches the handler, and the request that
+never should.
 
 ```python
-@api.get("/users/{user_id}")
-async def get_user(user_id: int):
-    return {"id": user_id, "name": f"User {user_id}"}
+import msgspec
 
-with TestClient(api) as client:
-    response = client.get("/users/123")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["id"] == 123
-    assert data["name"] == "User 123"
+class UserCreate(msgspec.Struct):
+    name: str
+    email: str
+
+@api.post("/teams/{team_id}/users", status_code=201)
+async def create_user(team_id: int, user: UserCreate, notify: bool = False):
+    return {"team": team_id, "name": user.name, "notify": notify}
 ```
-
-## Testing query parameters
 
 ```python
-@api.get("/search")
-async def search(q: str, limit: int = 10):
-    return {"query": q, "limit": limit}
-
 with TestClient(api) as client:
-    response = client.get("/search?q=test&limit=20")
-    data = response.json()
-    assert data["query"] == "test"
-    assert data["limit"] == 20
+    # The handler receives coerced, validated arguments
+    response = client.post(
+        "/teams/7/users?notify=true",
+        json={"name": "John", "email": "john@example.com"},
+    )
+    assert response.status_code == 201
+    assert response.json() == {"team": 7, "name": "John", "notify": True}
+
+    # A body that fails validation never reaches the handler
+    response = client.post("/teams/7/users", json={})
+    assert response.status_code == 422
+
+    # An unknown path is a plain 404
+    assert client.get("/nonexistent").status_code == 404
 ```
 
-## Testing headers
+Anything else a handler can declare — headers, cookies, form fields,
+dependencies — is tested the same way: send the request, assert on the
+response. For example, a header parameter:
 
 ```python
 from typing import Annotated
@@ -139,91 +113,15 @@ async def with_header(x_custom: Annotated[str, Header()]):
     return {"header_value": x_custom}
 
 with TestClient(api) as client:
-    response = client.get(
-        "/with-header",
-        headers={"X-Custom": "test-value"}
-    )
+    response = client.get("/with-header", headers={"X-Custom": "test-value"})
     assert response.json() == {"header_value": "test-value"}
-```
-
-## Testing request body
-
-```python
-import msgspec
-
-class UserCreate(msgspec.Struct):
-    name: str
-    email: str
-
-@api.post("/users")
-async def create_user(user: UserCreate):
-    return {"id": 1, "name": user.name, "email": user.email}
-
-with TestClient(api) as client:
-    response = client.post(
-        "/users",
-        json={"name": "John", "email": "john@example.com"}
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["id"] == 1
-    assert data["name"] == "John"
-```
-
-## Testing error responses
-
-```python
-with TestClient(api) as client:
-    # Test 404
-    response = client.get("/nonexistent")
-    assert response.status_code == 404
-
-    # Test validation error (422)
-    response = client.post("/users", json={})  # Missing required fields
-    assert response.status_code == 422
-```
-
-## Testing custom status codes
-
-```python
-@api.post("/created", status_code=201)
-async def create():
-    return {"created": True}
-
-with TestClient(api) as client:
-    response = client.post("/created")
-    assert response.status_code == 201
-```
-
-## Testing multiple HTTP methods
-
-```python
-@api.get("/resource")
-async def get_resource():
-    return {"method": "GET"}
-
-@api.post("/resource")
-async def create_resource():
-    return {"method": "POST"}
-
-@api.put("/resource")
-async def update_resource():
-    return {"method": "PUT"}
-
-@api.delete("/resource")
-async def delete_resource():
-    return {"method": "DELETE"}
-
-with TestClient(api) as client:
-    assert client.get("/resource").json() == {"method": "GET"}
-    assert client.post("/resource").json() == {"method": "POST"}
-    assert client.put("/resource").json() == {"method": "PUT"}
-    assert client.delete("/resource").json() == {"method": "DELETE"}
 ```
 
 ## Streaming responses
 
-### SSE with EventSourceResponse
+Streaming endpoints work in tests too. By default the client buffers the whole
+response, which is usually what you want — the stream has a beginning and an
+end, and you assert on the result:
 
 ```python
 from django_bolt.responses import EventSourceResponse
@@ -242,9 +140,7 @@ with TestClient(api) as client:
     assert 'data: {"message":"world"}' in body
 ```
 
-### Raw streaming with StreamingResponse
-
-Test streaming with `stream=True`:
+Pass `stream=True` to iterate over the body in chunks or lines instead:
 
 ```python
 @api.get("/stream")
@@ -256,29 +152,33 @@ async def stream():
 
 with TestClient(api) as client:
     response = client.get("/stream", stream=True)
-    assert response.status_code == 200
 
-    # Iterate over chunks
-    chunks = list(response.iter_content(chunk_size=32, decode_unicode=True))
-    assert len(chunks) > 0
-
-    # Or iterate over lines
     lines = list(response.iter_lines())
-    data_lines = [l for l in lines if l.startswith("data:")]
+    data_lines = [line for line in lines if line.startswith("data:")]
     assert len(data_lines) == 5
 ```
 
-## Testing with pytest
+One thing to be aware of: even with `stream=True`, the in-process client
+collects the response before handing it to you. You're testing what the stream
+*contains*, not that events arrive while the handler is still producing them.
+If the timing itself is the behavior under test, see
+[testing against a live server](#testing-against-a-live-server) below.
 
-### Real project pattern (recommended)
+WebSocket endpoints have their own test client — see
+[Testing WebSockets](websocket.md#testing-websockets).
 
-Import the API object from your real app module so tests match production routing:
+## Using pytest
+
+Wrap the client in a fixture so tests stay short. Prefer importing the API
+object from your real app module — that way your tests exercise the same
+routes, middleware, and auth configuration that production runs, and a route
+you forgot to register fails a test instead of a deploy:
 
 ```python
 # tests/test_api.py
 import pytest
 from django_bolt.testing import TestClient
-from myproject.api import api  # Your actual API module
+from myproject.api import api  # your actual API module
 
 @pytest.fixture
 def client():
@@ -290,17 +190,13 @@ def test_hello(client):
     assert response.status_code == 200
 ```
 
-### Isolated API fixture pattern
+Sometimes you want a throwaway API instead — when testing a reusable
+component, or reproducing a bug in isolation. Building one inside a fixture
+works fine:
 
 ```python
-# tests/test_api.py
-import pytest
-from django_bolt import BoltAPI
-from django_bolt.testing import TestClient
-
 @pytest.fixture
 def api():
-    """Create fresh API instance."""
     api = BoltAPI()
 
     @api.get("/hello")
@@ -311,19 +207,14 @@ def api():
 
 @pytest.fixture
 def client(api):
-    """Create test client."""
     with TestClient(api) as client:
         yield client
-
-def test_hello(client):
-    response = client.get("/hello")
-    assert response.status_code == 200
-    assert response.json() == {"message": "world"}
 ```
 
-### Testing with Django database
+## Endpoints that use the database
 
-When testing endpoints that access the Django database, you **must** use `@pytest.mark.django_db(transaction=True)`:
+When a handler touches the Django ORM, mark the test with
+`@pytest.mark.django_db(transaction=True)`:
 
 ```python
 import pytest
@@ -344,7 +235,6 @@ def api():
 
 @pytest.mark.django_db(transaction=True)
 def test_get_user(api):
-    # Create test data
     user = User.objects.create(username="testuser", email="test@example.com")
 
     with TestClient(api) as client:
@@ -353,11 +243,13 @@ def test_get_user(api):
         assert response.json()["username"] == "testuser"
 ```
 
-#### Why `transaction=True` is required
+### Why `transaction=True` is required
 
-Django-Bolt's `TestClient` routes requests through the Rust/Actix HTTP layer, which runs async handlers in a **separate thread** with its own database connection. This differs from in-process test clients that share the same thread and connection.
-
-The problem with pytest-django's default `@pytest.mark.django_db`:
+This one trips everyone up once, so it's worth understanding. `TestClient`
+runs your handlers on the Rust/Actix side, in a separate thread with its own
+database connection. pytest-django's default `django_db` mark wraps each test
+in a transaction that is rolled back at the end — which means the data your
+test creates is never committed, and a second connection can't see it:
 
 ```
 Test Thread (Connection A)          Rust/Actix Thread (Connection B)
@@ -373,9 +265,8 @@ User.objects.create(id=1)
 ROLLBACK
 ```
 
-Without `transaction=True`, pytest-django wraps tests in a transaction that never commits. The async handler runs in a separate database connection that cannot see uncommitted data from the test's transaction.
-
-With `transaction=True`, data is committed immediately and visible to all connections:
+With `transaction=True`, data is committed immediately and every connection
+sees it:
 
 ```
 Test Thread                         Rust/Actix Thread
@@ -389,9 +280,11 @@ User.objects.create(id=1)
                                     ✅ Found! (committed data visible)
 ```
 
-#### Recommended approach: Cleanup fixture
+### Cleaning up between tests
 
-Since `transaction=True` commits data, you need explicit cleanup between tests:
+The flip side of committing for real is that rollback no longer cleans up for
+you. Delete your test data explicitly — an autouse fixture keeps this out of
+the tests themselves:
 
 ```python
 import pytest
@@ -428,40 +321,36 @@ class TestUserEndpoints:
             assert response.json()["count"] == 2
 ```
 
-#### Alternative approach: Create data via API
+### Or create data through the API
 
-For true end-to-end tests, create data through the API itself:
+For end-to-end flows, skip the ORM in the test entirely and create data
+through the API itself. Whatever the endpoints write is committed and visible,
+so there's nothing to coordinate:
 
 ```python
 @pytest.mark.django_db(transaction=True)
-class TestUserEndpoints:
+def test_create_and_get_user():
+    with TestClient(api) as client:
+        create_response = client.post(
+            "/users",
+            json={"username": "testuser", "email": "test@example.com"},
+        )
+        assert create_response.status_code == 200
+        user_id = create_response.json()["id"]
 
-    def test_create_and_get_user(self):
-        with TestClient(api) as client:
-            # Create via API (automatically committed)
-            create_response = client.post(
-                "/users",
-                json={"username": "testuser", "email": "test@example.com"}
-            )
-            assert create_response.status_code == 200
-            user_id = create_response.json()["id"]
-
-            # Fetch via API
-            get_response = client.get(f"/users/{user_id}")
-            assert get_response.status_code == 200
-            assert get_response.json()["username"] == "testuser"
+        get_response = client.get(f"/users/{user_id}")
+        assert get_response.status_code == 200
+        assert get_response.json()["username"] == "testuser"
 ```
 
-**When to use each approach:**
+Reaching for the ORM is more direct when a test needs specific data in place;
+going through the API tests the full round trip. Use whichever reads better
+for the test at hand.
 
-| Approach | Use when |
-|----------|----------|
-| ORM + cleanup fixture | Testing specific endpoints with controlled test data |
-| Create via API | Testing full CRUD flows, integration tests |
+### ViewSets
 
-Both approaches work well. The ORM approach is more concise for focused tests, while the API approach tests the complete request flow.
-
-### Testing ViewSets
+Class-based views need nothing special — register the viewset and hit its
+routes:
 
 ```python
 import pytest
@@ -494,20 +383,88 @@ def test_article_viewset(api):
     Article.objects.create(title="Test Article", content="Content")
 
     with TestClient(api) as client:
-        # Test list
         response = client.get("/articles")
         assert response.status_code == 200
         assert len(response.json()) == 1
 
-        # Test retrieve
         response = client.get("/articles/1")
         assert response.status_code == 200
         assert response.json()["title"] == "Test Article"
 ```
 
+## Authenticated endpoints
+
+You don't need a login flow to test a protected route.
+`create_jwt_for_user` signs a token with your `SECRET_KEY` — the same default
+`JWTAuthentication` verifies against — so a real user plus one function call
+gets you valid credentials. Token validation happens in Rust from the token's
+claims; no database lookup runs per request.
+
+```python
+import pytest
+from django.contrib.auth.models import User
+from django_bolt import BoltAPI
+from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
+from django_bolt.testing import TestClient
+
+api = BoltAPI()
+
+@api.get("/private", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+async def private():
+    return {"ok": True}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_private_requires_a_token():
+    user = User.objects.create_user(username="alice", password="s3cret")
+    token = create_jwt_for_user(user)
+
+    with TestClient(api) as client:
+        # No token: the guard rejects the request before the handler runs
+        assert client.get("/private").status_code == 401
+
+        response = client.get("/private", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == 200
+```
+
+Test the locked door, not just the open one: the 401 assertion is the one
+that catches a route someone forgot to guard.
+
+## Lifespan events
+
+If your API defines a [lifespan](lifespan.md), `TestClient` runs it: startup
+when you enter the `with` block, shutdown when you leave. Each `with` block is
+its own fresh instance, so state never leaks from one test to the next.
+
+```python
+from contextlib import asynccontextmanager
+from django_bolt import BoltAPI
+from django_bolt.testing import TestClient
+
+@asynccontextmanager
+async def lifespan(app):
+    app._cache = {"ready": True}
+    yield
+    app._cache.clear()
+
+api = BoltAPI(lifespan=lifespan)
+
+@api.get("/status")
+async def status(request):
+    return {"ready": request.app._cache.get("ready", False)}
+
+with TestClient(api) as client:
+    # startup has already run
+    response = client.get("/status")
+    assert response.json() == {"ready": True}
+# shutdown runs here
+```
+
 ## AsyncTestClient
 
-For async test functions, use `AsyncTestClient`:
+When the test itself is async — because it awaits other things alongside the
+request, or your suite runs under `pytest-asyncio` — use `AsyncTestClient`.
+Same API, awaitable:
 
 ```python
 import pytest
@@ -528,74 +485,76 @@ async def test_async():
         assert response.json() == {"message": "world"}
 ```
 
-The `AsyncTestClient` is useful when:
+## Testing against a live server
 
-- Your test function is async
-- You need to await other async operations in the same test
-- You're using `pytest-asyncio`
+Almost everything belongs in `TestClient`. But it runs in-process, and once in
+a while that's the wrong altitude: a client SDK that insists on a real URL, an
+SSE consumer that must receive events *while* the handler is producing them,
+or a smoke test that your project actually boots under `runbolt` the way it
+will in production.
 
-## Lifespan support
-
-The `TestClient` automatically runs [lifespan](lifespan.md) events. Startup runs when entering the `with` block, shutdown runs when exiting:
-
-```python
-from contextlib import asynccontextmanager
-from django_bolt import BoltAPI
-from django_bolt.testing import TestClient
-
-@asynccontextmanager
-async def lifespan(app):
-    app._cache = {"ready": True}
-    yield
-    app._cache.clear()
-
-api = BoltAPI(lifespan=lifespan)
-
-@api.get("/status")
-async def status(request):
-    return {"ready": request.app._cache.get("ready", False)}
-
-with TestClient(api) as client:
-    # Lifespan startup has already run
-    response = client.get("/status")
-    assert response.json() == {"ready": True}
-# Lifespan shutdown runs here
-```
-
-If no lifespan is configured, `TestClient` works exactly as before.
-
-## Test isolation
-
-Each `TestClient` context creates isolated state:
+For those cases you don't need anything from django-bolt — start your own
+project's server in a subprocess and point `httpx` at it:
 
 ```python
-def test_isolated():
-    api = BoltAPI()
+# conftest.py
+import socket
+import subprocess
+import sys
+import time
 
-    @api.get("/counter")
-    async def counter():
-        return {"count": 1}
+import httpx
+import pytest
 
-    # Each with block is isolated
-    with TestClient(api) as client:
-        response = client.get("/counter")
-        assert response.json()["count"] == 1
 
-    with TestClient(api) as client:
-        response = client.get("/counter")
-        assert response.json()["count"] == 1  # Fresh state
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture(scope="session")
+def bolt_server():
+    port = free_port()
+    process = subprocess.Popen(
+        [sys.executable, "manage.py", "runbolt", "--host", "127.0.0.1", "--port", str(port)]
+    )
+    client = httpx.Client(base_url=f"http://127.0.0.1:{port}")
+    try:
+        deadline = time.time() + 15
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError("runbolt exited before it became ready")
+            try:
+                client.get("/health")  # any route works: a response means it's up
+                break
+            except httpx.TransportError:
+                if time.time() > deadline:
+                    raise TimeoutError("server did not become ready in 15s")
+                time.sleep(0.2)
+        yield client
+    finally:
+        client.close()
+        process.terminate()
+        process.wait(timeout=5)
 ```
 
-## Best practices
+Don't name the fixture `live_server` — pytest-django reserves that name for
+its own fixture, and if you shadow it, pytest-django will skip your tests
+whenever `DJANGO_SETTINGS_MODULE` isn't configured, silently.
 
-1. **Use fixtures**: Create API and client fixtures for reuse.
+Now a test can consume a stream as it arrives, over a real socket:
 
-2. **Test all status codes**: Verify success (2xx), client errors (4xx), and server errors (5xx).
+```python
+def test_events_arrive_while_streaming(bolt_server):
+    with bolt_server.stream("GET", "/sse") as response:
+        first_event = next(
+            line for line in response.iter_lines() if line.startswith("data:")
+        )
+        assert first_event == 'data: {"message":"hello"}'
+```
 
-3. **Test validation**: Ensure invalid input returns 422 with proper error messages.
-
-4. **Test authentication**: Verify endpoints require proper auth when expected.
-
-5. **Use `django_db` mark**: For tests that access the database.
-
-6. **Clean up test data**: Use database transactions that roll back.
+Keep these tests rare. Starting a server costs around a second per test —
+hundreds of times slower than `TestClient` — and everything about your
+handlers' behavior is already covered in-process. Reserve the live server for
+behavior that only exists on a real socket.
