@@ -97,9 +97,7 @@ def test_plain_struct_viewset_keeps_values_projection(article):
         serializer_class = PlainArticle
 
     list_meta = next(
-        api._handler_meta[hid]
-        for method, path, hid, _h in api._routes
-        if method == "GET" and path == "/articles"
+        api._handler_meta[hid] for method, path, hid, _h in api._routes if method == "GET" and path == "/articles"
     )
     assert list_meta["response_field_names"] == ["id", "title", "content"]
 
