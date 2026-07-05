@@ -317,7 +317,7 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     1. If name matches path parameter -> "path"
     2. If special name (request, req) -> "request"
     3. If simple type (str, int, float, bool) -> "query"
-    4. If msgspec.Struct or dataclass -> "body" (if method allows body)
+    4. If msgspec.Struct or dataclass -> "body" (method validation happens later)
     5. Default -> "query"
 
     Args:
