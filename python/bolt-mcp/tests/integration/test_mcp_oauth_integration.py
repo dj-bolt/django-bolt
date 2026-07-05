@@ -19,7 +19,7 @@ import sys
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from _helpers import parse_rpc, rpc_body
+from _helpers import mcp_app_source, parse_rpc, rpc_body
 from bolt_mcp.oauth.pkce import compute_s256
 
 pytestmark = pytest.mark.server_integration
@@ -29,40 +29,6 @@ ISSUER = "http://testserver"
 REDIRECT_URI = "http://localhost:9999/callback"
 USERNAME = "alice"
 PASSWORD = "s3cr3t-pw-123456"
-
-MCP_API_BODY = f"""
-from bolt_mcp import MCP, mount_mcp, principal
-from bolt_mcp.oauth import AuthorizationServer
-from django_bolt import HasPermission, IsAuthenticated, Request
-
-mcp = MCP("oauth-itest", "1.0")
-
-
-@mcp.tool
-async def add(a: int, b: int) -> dict:
-    return {{"sum": a + b}}
-
-
-@mcp.tool(guards=[IsAuthenticated()])
-async def whoami(request: Request) -> dict:
-    return principal(request)
-
-
-@mcp.tool(guards=[HasPermission("reports:read")])
-async def read_report() -> dict:
-    return {{"report": "Q3 up 42%"}}
-
-
-class ITestAuth(AuthorizationServer):
-    issuer = "{ISSUER}"
-    auto_consent = True  # the login POST issues the code directly
-
-    def get_extra_claims(self, user, *, scopes, client_id):
-        return {{"permissions": ["reports:read"] if user.is_staff else []}}
-
-
-mount_mcp(api, mcp, oauth=ITestAuth())
-"""
 
 _CREATE_USER = (
     "from django.contrib.auth import get_user_model as M;"
@@ -132,7 +98,7 @@ def _login_for_tokens(server, client_id: str, *, scope: str = "mcp") -> dict:
 
 def test_oauth_authorization_code_flow_end_to_end(make_server_project):
     project = make_server_project(
-        project_api_body=MCP_API_BODY,
+        api_source=mcp_app_source("oauth"),
         installed_apps=["django.contrib.sessions", "bolt_mcp.oauth"],
     )
     _manage(project, "migrate", "--noinput")
@@ -243,7 +209,7 @@ def test_oauth_client_and_refresh_token_survive_server_restart(make_server_proje
     the dynamically registered client and the pre-restart refresh token are still honored.
     """
     project = make_server_project(
-        project_api_body=MCP_API_BODY,
+        api_source=mcp_app_source("oauth"),
         installed_apps=["django.contrib.sessions", "bolt_mcp.oauth"],
     )
     _manage(project, "migrate", "--noinput")

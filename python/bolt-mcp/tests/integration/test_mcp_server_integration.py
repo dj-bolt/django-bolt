@@ -3,23 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from _helpers import INITIALIZE_PARAMS, mcp_headers, parse_rpc, rpc_body
+from _helpers import INITIALIZE_PARAMS, mcp_app_source, mcp_headers, parse_rpc, rpc_body
 
 pytestmark = pytest.mark.server_integration
-
-MCP_API_BODY = """
-from bolt_mcp import MCP, mount_mcp
-
-mcp = MCP("itest-server", "1.2.3")
-
-
-@mcp.tool
-async def add(a: int, b: int) -> dict:
-    return {"sum": a + b}
-
-
-mount_mcp(api, mcp)
-"""
 
 
 def _post(server, method, params=None, *, request_id=1, session_id=None):
@@ -29,7 +15,7 @@ def _post(server, method, params=None, *, request_id=1, session_id=None):
 
 
 def test_full_handshake_and_tool_call(make_server_project):
-    project = make_server_project(project_api_body=MCP_API_BODY)
+    project = make_server_project(api_source=mcp_app_source("server"))
     with project.start() as server:
         init = _post(server, "initialize", INITIALIZE_PARAMS)
         assert init.status_code == 200

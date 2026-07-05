@@ -12,30 +12,9 @@ import json
 import httpx
 import msgspec
 import pytest
-from _helpers import PROTOCOL, mcp_headers, rpc_body
+from _helpers import PROTOCOL, mcp_app_source, mcp_headers, rpc_body
 
 pytestmark = pytest.mark.server_integration
-
-MCP_API_BODY = """
-from bolt_mcp import MCP, Context, mount_mcp
-
-mcp = MCP("bidi-itest", "1.0")   # stateful: sample/elicit need a session
-
-
-@mcp.tool
-async def echo_via_llm(text: str, ctx: Context) -> dict:
-    reply = await ctx.sample(text)               # ask the client's LLM
-    return {"reply": reply["content"]["text"]}
-
-
-@mcp.tool
-async def confirm(ctx: Context) -> dict:
-    answer = await ctx.elicit("Proceed?")        # ask the user
-    return {"answer": answer["content"]}
-
-
-mount_mcp(api, mcp)
-"""
 
 
 def _initialize(server):
@@ -85,7 +64,7 @@ def _round_trip(server, session_id, *, tool, arguments, expect_method, client_re
 
 
 def test_sampling_round_trip(make_server_project):
-    project = make_server_project(project_api_body=MCP_API_BODY)
+    project = make_server_project(api_source=mcp_app_source("sample"))
     with project.start() as server:
         sid = _initialize(server)
         final = _round_trip(
@@ -100,7 +79,7 @@ def test_sampling_round_trip(make_server_project):
 
 
 def test_elicitation_round_trip(make_server_project):
-    project = make_server_project(project_api_body=MCP_API_BODY)
+    project = make_server_project(api_source=mcp_app_source("sample"))
     with project.start() as server:
         sid = _initialize(server)
         final = _round_trip(

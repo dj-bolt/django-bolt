@@ -14,65 +14,12 @@ read-only MCP calls; the mode tests spin up their own server with a different ``
 from __future__ import annotations
 
 import pytest
-from _helpers import PROTOCOL, _parse_all_sse, mcp_headers, parse_rpc, rpc_body
+from _helpers import PROTOCOL, _parse_all_sse, mcp_app_source, mcp_headers, parse_rpc, rpc_body
 
 pytestmark = pytest.mark.server_integration
 
 # Picked up by the module-scoped ``feature_server`` fixture (see integration/conftest.py).
-MCP_API_BODY = """
-from bolt_mcp import MCP, Context, mount_mcp
-
-mcp = MCP("features-itest", "2.0")  # default: stateful + SSE framing
-
-
-@mcp.tool
-async def add(a: int, b: int) -> dict:
-    \"\"\"Add two integers.\"\"\"
-    return {"sum": a + b}
-
-
-@mcp.tool
-async def boom() -> dict:
-    \"\"\"Always raises — exercises in-band tool errors.\"\"\"
-    raise ValueError("kaboom")
-
-
-@mcp.tool
-async def crunch(n: int, ctx: Context) -> dict:
-    \"\"\"Stream progress, then return — exercises Context notifications over SSE.\"\"\"
-    for i in range(n):
-        await ctx.report_progress(i, n, message=f"step {i}")
-    await ctx.info("almost done")
-    return {"done": n}
-
-
-@mcp.resource("config://app", name="app-config", mime_type="application/json",
-              description="Static app configuration")
-async def app_config() -> str:
-    return '{"env": "itest"}'
-
-
-@mcp.resource("users://{user_id}/profile", name="user-profile", mime_type="application/json")
-async def user_profile(user_id: int) -> str:
-    # user_id is extracted from the URI as a string and must arrive coerced to int.
-    return f'{{"id": {user_id}, "type": "{type(user_id).__name__}"}}'
-
-
-@mcp.prompt
-async def summarize(topic: str) -> str:
-    \"\"\"Summarize a topic.\"\"\"
-    return f"Please summarize: {topic}"
-
-
-# An ordinary REST route, explicitly exposed as an MCP tool (never implicit).
-@api.get("/double/{n}")
-async def double(n: int) -> dict:
-    \"\"\"Double a number.\"\"\"
-    return {"result": n * 2}
-
-
-mount_mcp(api, mcp, expose=[double])
-"""
+MCP_APP = "features"
 
 
 def _post(server, method, params=None, *, session_id=None, request_id=1):
@@ -219,37 +166,8 @@ def test_unknown_method_returns_jsonrpc_error(feature_server):
 
 
 # ── transport modes (own server each) ────────────────────────────────────────---
-JSON_MODE_API_BODY = """
-from bolt_mcp import MCP, mount_mcp
-
-mcp = MCP("json-itest", "1.0", json_response=True)  # single application/json object, no SSE
-
-
-@mcp.tool
-async def add(a: int, b: int) -> dict:
-    return {"sum": a + b}
-
-
-mount_mcp(api, mcp)
-"""
-
-STATELESS_API_BODY = """
-from bolt_mcp import MCP, mount_mcp
-
-mcp = MCP("stateless-itest", "1.0", stateless=True)  # no session, no GET channel
-
-
-@mcp.tool
-async def add(a: int, b: int) -> dict:
-    return {"sum": a + b}
-
-
-mount_mcp(api, mcp)
-"""
-
-
 def test_json_response_mode_returns_single_json_object(make_server_project):
-    project = make_server_project(project_api_body=JSON_MODE_API_BODY)
+    project = make_server_project(api_source=mcp_app_source("json_mode"))
     with project.start() as server:
         sid, _ = _init(server)
         called = _post(server, "tools/call", {"name": "add", "arguments": {"a": 2, "b": 3}}, session_id=sid)
@@ -258,7 +176,7 @@ def test_json_response_mode_returns_single_json_object(make_server_project):
 
 
 def test_stateless_mode_issues_no_session_and_accepts_calls(make_server_project):
-    project = make_server_project(project_api_body=STATELESS_API_BODY)
+    project = make_server_project(api_source=mcp_app_source("stateless"))
     with project.start() as server:
         session_id, _ = _init(server)
         assert session_id is None  # stateless: no Mcp-Session-Id header issued
