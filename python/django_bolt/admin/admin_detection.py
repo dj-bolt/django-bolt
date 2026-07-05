@@ -2,6 +2,8 @@
 Utilities for detecting and configuring Django admin integration.
 """
 
+from __future__ import annotations
+
 import logging
 import sys
 
