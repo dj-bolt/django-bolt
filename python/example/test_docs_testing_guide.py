@@ -17,15 +17,15 @@ import httpx
 import pytest
 from django.contrib.auth import get_user_model
 
-from django_bolt import BoltAPI
-from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
-from django_bolt.responses import EventSourceResponse, StreamingResponse
-from django_bolt.testing import TestClient
-
 # The real app modules, imported the way the guide's "real project pattern" shows.
 from testproject.api import api
 from users.api import api as users_api
 from users.models import User
+
+from django_bolt import BoltAPI
+from django_bolt.auth import create_jwt_for_user
+from django_bolt.responses import EventSourceResponse, StreamingResponse
+from django_bolt.testing import TestClient
 
 
 # ── TestClient basics ─────────────────────────────────────────────────────────
@@ -146,9 +146,9 @@ def bolt_server():
             try:
                 client.get("/")  # any route works: a response means it's up
                 break
-            except httpx.TransportError:
+            except httpx.TransportError as err:
                 if time.time() > deadline:
-                    raise TimeoutError("server did not become ready in 15s")
+                    raise TimeoutError("server did not become ready in 15s") from err
                 time.sleep(0.2)
         yield client
     finally:
