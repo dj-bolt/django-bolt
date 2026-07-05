@@ -4,17 +4,15 @@ import sys
 
 import pytest
 
+from .apps import app_bytes, app_module, app_source
+
 pytestmark = pytest.mark.server_integration
 
 
 def test_runbolt_autodiscovers_project_and_app_apis(make_server_project):
     project = make_server_project(
         installed_apps=["extraapp.apps.ExtraAppConfig"],
-        project_api_body="""
-        @api.get("/project-api")
-        async def project_api():
-            return {"source": "project"}
-        """,
+        api_source=app_source("autodiscover_project"),
         extra_files={
             "extraapp/__init__.py": "",
             "extraapp/apps.py": """
@@ -24,27 +22,21 @@ def test_runbolt_autodiscovers_project_and_app_apis(make_server_project):
             class ExtraAppConfig(AppConfig):
                 name = "extraapp"
             """,
-            "extraapp/api.py": """
-            from django_bolt import BoltAPI
-
-            api = BoltAPI()
-
-
-            @api.get("/app-api")
-            async def app_api():
-                return {"source": "app"}
-            """,
+            "extraapp/api.py": app_bytes("autodiscover_extraapp"),
         },
     )
 
     with project.start() as server:
         project_response = server.get("/project-api")
         app_response = server.get("/app-api")
+        app_health_response = server.get("/app-health")
 
     assert project_response.status_code == 200
     assert project_response.json() == {"source": "project"}
     assert app_response.status_code == 200
     assert app_response.json() == {"source": "app"}
+    assert app_health_response.status_code == 200
+    assert app_health_response.json() == {"status": "ok"}
 
 
 def test_runbolt_applies_global_cors_settings_at_startup(make_server_project):
@@ -52,11 +44,7 @@ def test_runbolt_applies_global_cors_settings_at_startup(make_server_project):
         settings_extra="""
         CORS_ALLOWED_ORIGINS = ["https://example.com"]
         """,
-        project_api_body="""
-        @api.get("/global-cors")
-        async def global_cors():
-            return {"ok": True}
-        """,
+        api_module=app_module("global_cors"),
     )
 
     with project.start() as server:
@@ -68,16 +56,7 @@ def test_runbolt_applies_global_cors_settings_at_startup(make_server_project):
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Multiprocess smoke only runs on Linux.")
 def test_runbolt_processes_two_shuts_down_cleanly(make_server_project):
-    project = make_server_project(
-        project_api_body="""
-        import os
-
-
-        @api.get("/pid")
-        async def pid():
-            return {"pid": os.getpid()}
-        """
-    )
+    project = make_server_project(api_module=app_module("multiprocess_pid"))
 
     server = project.start(processes=2)
     response = server.get("/pid")

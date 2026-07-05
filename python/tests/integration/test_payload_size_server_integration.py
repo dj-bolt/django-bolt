@@ -14,21 +14,10 @@ from __future__ import annotations
 
 import pytest
 
+from .apps import app_module
+
 pytestmark = pytest.mark.server_integration
 
-
-API_BODY = """
-import msgspec
-
-
-class Blob(msgspec.Struct):
-    data: str
-
-
-@api.post("/sink")
-async def sink(blob: Blob) -> dict:
-    return {"len": len(blob.data)}
-"""
 
 # Keep the limit small so the body crosses it after a couple of chunks.
 SETTINGS_EXTRA = "BOLT_MAX_UPLOAD_SIZE = 2000"
@@ -44,7 +33,7 @@ def _chunks(total: int, chunk: int = 1000):
 
 def test_chunked_over_limit_rejected_with_413(make_server_project):
     """A chunked body (no Content-Length) over the limit must 413 mid-stream."""
-    project = make_server_project(project_api_body=API_BODY, settings_extra=SETTINGS_EXTRA)
+    project = make_server_project(api_module=app_module("payload_sink"), settings_extra=SETTINGS_EXTRA)
     with project.start() as server:
         # 50 KB streamed as chunks → no Content-Length → only the streaming
         # total_read check can stop it. (Garbage body: the size check fires
@@ -59,16 +48,6 @@ def test_chunked_over_limit_rejected_with_413(make_server_project):
         f"chunked over-limit body must 413 via the streaming check, got {response.status_code}"
     )
 
-
-MULTIPART_API_BODY = """
-from django_bolt import UploadFile
-from django_bolt.params import File
-
-
-@api.post("/upload")
-async def upload(avatar: UploadFile = File(max_size=100_000)):
-    return {"size": avatar.size}
-"""
 
 _BOUNDARY = "boltaggregateboundary"
 
@@ -97,7 +76,7 @@ def test_chunked_multipart_over_aggregate_limit_rejected_with_413(make_server_pr
     for the master-merge that dropped the max_total_size wiring from the
     production parse_multipart call.
     """
-    project = make_server_project(project_api_body=MULTIPART_API_BODY, settings_extra=SETTINGS_EXTRA)
+    project = make_server_project(api_module=app_module("payload_sink"), settings_extra=SETTINGS_EXTRA)
     with project.start() as server:
         response = server.request(
             "POST",
@@ -112,7 +91,7 @@ def test_chunked_multipart_over_aggregate_limit_rejected_with_413(make_server_pr
 
 def test_chunked_multipart_under_aggregate_limit_succeeds(make_server_project):
     """A small chunked multipart body must not be size-rejected (control)."""
-    project = make_server_project(project_api_body=MULTIPART_API_BODY, settings_extra=SETTINGS_EXTRA)
+    project = make_server_project(api_module=app_module("payload_sink"), settings_extra=SETTINGS_EXTRA)
     with project.start() as server:
         response = server.request(
             "POST",
@@ -126,7 +105,7 @@ def test_chunked_multipart_under_aggregate_limit_succeeds(make_server_project):
 
 def test_chunked_under_limit_is_not_size_rejected(make_server_project):
     """A small chunked body must not be size-rejected (control for the above)."""
-    project = make_server_project(project_api_body=API_BODY, settings_extra=SETTINGS_EXTRA)
+    project = make_server_project(api_module=app_module("payload_sink"), settings_extra=SETTINGS_EXTRA)
     with project.start() as server:
         # Valid small JSON, streamed chunked and well under the 2000-byte limit.
         body = b'{"data":"' + b"y" * 200 + b'"}'

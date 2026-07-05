@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any
 
 import jwt
@@ -14,6 +15,17 @@ from django_bolt import BoltAPI
 DUAL_ACCEPT = "application/json, text/event-stream"
 JSON_CONTENT_TYPE = "application/json"
 PROTOCOL = "2025-06-18"
+_MCP_APPS_DIR = Path(__file__).resolve().parent / "integration" / "apps"
+
+
+def mcp_app_source(name: str) -> Path:
+    """Return a real MCP integration app module path for ``api_source=``."""
+    if "/" in name or "\\" in name or name != Path(name).name:
+        raise ValueError(f"app module name must be a bare basename, got {name!r}")
+    path = _MCP_APPS_DIR / f"{name}.py"
+    if not path.exists():
+        raise FileNotFoundError(f"No MCP integration app module named {name!r} at {path}")
+    return path
 
 
 def rpc_body(method: str, params: dict | None = None, *, id: int | str | None = 1) -> bytes:

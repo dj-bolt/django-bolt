@@ -634,11 +634,17 @@ with TestClient(api) as client:
 
 Only use subprocess-based tests (`subprocess.Popen` + `runbolt`) when testing behavior that `TestClient` cannot exercise (e.g., startup wiring, auto-reload, multi-process, signal handling, actual TCP, streaming, WebSocket handshakes, or packaged artifacts).
 
+For subprocess tests, author the app under test as a **real module** in `python/tests/integration/apps/`, not as a Python source string. App modules must be self-contained (define their own `api = BoltAPI()` and a `/health` route, no relative imports; a secondary app that is autodiscovered alongside a primary app must use a namespaced health route instead, e.g. `/app-health`, because duplicate paths across merged APIs are a startup error), so they double as in-process fixtures: `TestClient(my_app.api)`.
+
+Prefer `make_server_project(api_module=app_module("my_app"))`: it points runbolt at the module by import path via `settings.BOLT_API`, so the subprocess imports the **same module object** the in-process `TestClient` uses — no file copy, and it exercises the real `BOLT_API` entrypoint. Use `make_server_project(api_source=app_source("my_app"))` (copies the file into `<package>/api.py`) only when the test needs an on-disk file: autodiscovery tests, `--dev`/reload tests (the reload watcher must see a file in the temp project, not the source tree), and artifact tests (which must run from the installed wheel, not the source tree). The old source-string app-body parameter has been removed; author apps as real modules under `python/tests/integration/apps/`.
+
 Use the layered markers consistently:
 
 - `server_integration`: Real `runbolt` process tests for startup, TCP, reload, streaming, and server-only settings.
 - `platform_smoke`: Small cross-platform smoke coverage for the real server.
 - `artifact_smoke`: Isolated wheel/sdist installation checks that run outside the source tree.
+
+`server_integration` is reserved for tests that actually start `runbolt`. When an integration module also contains an in-process `TestClient` test (the "two altitudes" pattern), apply `@pytest.mark.server_integration` per subprocess test rather than a module-level `pytestmark`, and leave the in-process test unmarked — never blanket a whole module so the in-process test inherits a server marker it doesn't earn.
 
 If a change touches startup, reload, multiprocessing, actual TCP, streaming, WebSocket handshake behavior, startup-time settings, or packaged artifacts, add or update a `server_integration` or `artifact_smoke` test.
 

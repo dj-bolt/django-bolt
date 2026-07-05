@@ -19,68 +19,10 @@ import time
 import jwt
 import pytest
 
+from .apps import app_module
+from .apps.revocation import SECRET
+
 pytestmark = pytest.mark.server_integration
-
-
-_SECRET = "revocation-server-integration-secret"
-
-
-def _make_api_body() -> str:
-    """API body shipped to the runbolt subprocess.
-
-    Defines a JWT-protected route + a logout endpoint that revokes the
-    token's JTI via an in-memory store. The login endpoint issues
-    tokens with random JTIs and exposes ``exp`` so the test client can
-    reuse them.
-    """
-    return f"""
-        import time
-        import uuid
-
-        import jwt
-
-        from django_bolt.auth import (
-            InMemoryRevocation,
-            IsAuthenticated,
-            JWTAuthentication,
-        )
-
-        SECRET = {_SECRET!r}
-        revocation = InMemoryRevocation()
-        auth = JWTAuthentication(secret=SECRET, revocation_store=revocation)
-
-
-        @api.post("/login")
-        async def login():
-            jti = uuid.uuid4().hex
-            now = int(time.time())
-            token = jwt.encode(
-                {{
-                    "sub": "1",
-                    "jti": jti,
-                    "iat": now,
-                    "exp": now + 3600,
-                    "is_staff": False,
-                    "is_superuser": False,
-                    "username": "subject",
-                }},
-                SECRET,
-                algorithm="HS256",
-            )
-            return {{"token": token, "jti": jti}}
-
-
-        @api.get("/protected", auth=[auth], guards=[IsAuthenticated()])
-        async def protected(request):
-            return {{"ok": True, "user_id": request["context"].get("user_id")}}
-
-
-        @api.post("/logout", auth=[auth], guards=[IsAuthenticated()])
-        async def logout(request):
-            claims = request["context"]["auth_claims"]
-            await revocation.revoke(claims["jti"], exp=claims.get("exp"))
-            return {{"status": "logged_out"}}
-    """
 
 
 def test_revoked_token_is_rejected_by_real_server(make_server_project):
@@ -95,7 +37,7 @@ def test_revoked_token_is_rejected_by_real_server(make_server_project):
     `meta["_revocation_handlers"]` → dispatch hook) is set up at server
     startup and that the dispatch hook actually rejects revoked tokens.
     """
-    project = make_server_project(project_api_body=_make_api_body())
+    project = make_server_project(api_module=app_module("revocation"))
 
     with project.start() as server:
         login = server.request("POST", "/login")
@@ -118,7 +60,7 @@ def test_token_without_jti_rejected_by_real_server(make_server_project):
     """When ``revocation_store=`` is configured, ``require_jti`` is
     auto-enabled — a token without a ``jti`` claim must be rejected
     even on the very first request."""
-    project = make_server_project(project_api_body=_make_api_body())
+    project = make_server_project(api_module=app_module("revocation"))
 
     with project.start() as server:
         # Issue a token without a jti claim — bypasses the /login helper.
@@ -132,7 +74,7 @@ def test_token_without_jti_rejected_by_real_server(make_server_project):
                 "is_superuser": False,
                 "username": "subject",
             },
-            _SECRET,
+            SECRET,
             algorithm="HS256",
         )
 
@@ -149,7 +91,7 @@ def test_unrevoked_token_works_across_many_requests(make_server_project):
     requests — locks in that the dispatch hook doesn't accidentally
     invalidate valid tokens (e.g., via a stale per-request side
     effect)."""
-    project = make_server_project(project_api_body=_make_api_body())
+    project = make_server_project(api_module=app_module("revocation"))
 
     with project.start() as server:
         token = server.request("POST", "/login").json()["token"]

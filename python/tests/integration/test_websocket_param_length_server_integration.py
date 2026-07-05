@@ -16,6 +16,7 @@ import socket
 
 import pytest
 
+from .apps import app_module
 from .helpers import SimpleWebSocketClient
 
 pytestmark = pytest.mark.server_integration
@@ -74,19 +75,7 @@ def _attempt_ws_upgrade(host: str, port: int, path: str, *, timeout: float = 5.0
 
 
 def _make_ws_project(make_server_project):
-    return make_server_project(
-        project_api_body="""
-        @api.websocket("/ws/path/{value}")
-        async def path_ws(websocket: WebSocket, value: str):
-            await websocket.accept()
-            await websocket.send_text("connected")
-
-        @api.websocket("/ws/plain")
-        async def plain_ws(websocket: WebSocket):
-            await websocket.accept()
-            await websocket.send_text("connected")
-        """
-    )
+    return make_server_project(api_module=app_module("ws_param_length"))
 
 
 def test_websocket_oversized_path_param_rejects_upgrade(make_server_project):

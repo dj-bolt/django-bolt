@@ -8,24 +8,9 @@ response framing, the long-lived GET listen channel, single-stream-per-session
 from __future__ import annotations
 
 import pytest
-from _helpers import INITIALIZE_PARAMS, mcp_headers, rpc_body
+from _helpers import INITIALIZE_PARAMS, mcp_app_source, mcp_headers, rpc_body
 
 pytestmark = pytest.mark.server_integration
-
-MCP_API_BODY = """
-from bolt_mcp import MCP, mount_mcp
-
-mcp = MCP("sse-itest", "1.0")
-
-
-# Default (non json_response) servers stream every POST response as SSE.
-@mcp.tool
-async def add(a: int, b: int) -> dict:
-    return {"sum": a + b}
-
-
-mount_mcp(api, mcp)
-"""
 
 
 def _initialize(server) -> str:
@@ -39,7 +24,7 @@ def _initialize(server) -> str:
 
 
 def test_tool_call_streams_sse_response(make_server_project):
-    project = make_server_project(project_api_body=MCP_API_BODY)
+    project = make_server_project(api_source=mcp_app_source("sse"))
     with project.start() as server:
         session_id = _initialize(server)
         with server.client.stream(
@@ -55,7 +40,7 @@ def test_tool_call_streams_sse_response(make_server_project):
 
 
 def test_get_listen_channel_single_stream_and_delete(make_server_project):
-    project = make_server_project(project_api_body=MCP_API_BODY)
+    project = make_server_project(api_source=mcp_app_source("sse"))
     with project.start() as server:
         session_id = _initialize(server)
         sse_headers = {"Accept": "text/event-stream", "Mcp-Session-Id": session_id}

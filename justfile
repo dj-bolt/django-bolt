@@ -50,7 +50,7 @@ run-dev:
 
 # Run Python tests (verbose)
 test-py:
-    uv run --with pytest pytest python/tests -s -vv
+    uv run --with pytest --with pytest-xdist pytest python/tests -s -vv -n auto
 
 # Run ruff linter (checks all code)
 lint:
