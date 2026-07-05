@@ -30,6 +30,7 @@ import pytest
 
 from django_bolt.workers import MIB, get_rss_bytes
 
+from .apps import app_module
 from .helpers import SimpleWebSocketClient, child_pids, generate_load
 
 pytestmark = pytest.mark.server_integration
@@ -41,55 +42,6 @@ _requires_posix = pytest.mark.skipif(
     platform.system() == "Windows",
     reason="worker recycling under load requires POSIX fork + /proc RSS reading",
 )
-
-PID_API_BODY = """
-import os
-
-
-@api.get("/pid")
-async def pid():
-    return {"pid": os.getpid()}
-
-
-@api.get("/die")
-async def die():
-    os._exit(1)
-"""
-
-# A deliberately leaky app: each /leak request retains memory forever, so a
-# worker's RSS climbs without bound until --max-rss recycles it. 16 KiB/request
-# makes RSS climb fast enough that, without recycling, workers would blow far
-# past the limit within the load window — so a worker seen back near baseline
-# is unambiguous proof that recycling reset it.
-LEAK_API_BODY = """
-import os
-
-_LEAK = []
-
-
-@api.get("/leak")
-async def leak():
-    _LEAK.append(bytearray(16384))  # retain 16 KiB per request == a memory leak
-    return {"pid": os.getpid(), "chunks": len(_LEAK)}
-"""
-
-WS_ECHO_API_BODY = """
-@api.websocket("/ws/echo")
-async def echo(websocket: WebSocket):
-    await websocket.accept()
-    async for message in websocket.iter_text():
-        await websocket.send_text(f"echo:{message}")
-"""
-
-
-def _peak_worker_rss_mib(supervisor_pid: int) -> float:
-    """Largest current RSS (MiB) across the supervisor's worker children."""
-    peak = 0.0
-    for pid in child_pids(supervisor_pid):
-        rss = get_rss_bytes(pid)
-        if rss is not None:
-            peak = max(peak, rss / MIB)
-    return peak
 
 
 def _receive_close_skipping_pings(websocket: SimpleWebSocketClient) -> tuple[int, str]:
@@ -110,7 +62,7 @@ def _wait_for_pid_change(server, first_pid: int, timeout: float = RECYCLE_TIMEOU
 
 
 def test_sigterm_closes_websockets_with_service_restart_code(make_server_project):
-    project = make_server_project(project_api_body=WS_ECHO_API_BODY)
+    project = make_server_project(api_module=app_module("recycling_ws_echo"))
 
     with (
         project.start() as server,
@@ -134,7 +86,7 @@ def test_sigterm_closes_websockets_with_service_restart_code(make_server_project
 
 
 def test_workers_lifetime_recycles_worker_without_downtime(make_server_project):
-    project = make_server_project(project_api_body=PID_API_BODY)
+    project = make_server_project(api_module=app_module("recycling_pid"))
 
     with project.start(
         extra_args=["--workers-lifetime", "2", "--workers-kill-timeout", "5"],
@@ -159,7 +111,7 @@ def test_workers_lifetime_recycles_under_load_without_dropping_requests(make_ser
     dropped connection or a gap with no accepting process would show up as a
     non-zero failure count.
     """
-    project = make_server_project(project_api_body=PID_API_BODY)
+    project = make_server_project(api_module=app_module("recycling_pid"))
 
     with project.start(
         processes=2,
@@ -204,7 +156,7 @@ def test_max_rss_recycles_leaking_app_under_load_with_bounded_memory(make_server
       (verified via a no-recycle control), and
     - not a single request is dropped despite the constant churn.
     """
-    project = make_server_project(project_api_body=LEAK_API_BODY)
+    project = make_server_project(api_module=app_module("recycling_leak"))
 
     # Measure a fresh worker's baseline RSS so the limit is above idle memory —
     # this exercises the *leak-driven* recycle path, not an immediate trip.
@@ -268,7 +220,7 @@ def test_max_rss_recycles_leaking_app_under_load_with_bounded_memory(make_server
 
 
 def test_max_rss_recycles_worker(make_server_project):
-    project = make_server_project(project_api_body=PID_API_BODY)
+    project = make_server_project(api_module=app_module("recycling_pid"))
 
     # 1 MiB is far below any real worker's baseline RSS, so the very first
     # RSS check trips the limit — exercising the full CLI → supervisor →
@@ -282,7 +234,7 @@ def test_max_rss_recycles_worker(make_server_project):
 
 
 def test_respawn_failed_workers_replaces_crashed_worker(make_server_project):
-    project = make_server_project(project_api_body=PID_API_BODY)
+    project = make_server_project(api_module=app_module("recycling_pid"))
 
     with project.start(extra_args=["--respawn-failed-workers"]) as server:
         first_pid = server.get("/pid").json()["pid"]
