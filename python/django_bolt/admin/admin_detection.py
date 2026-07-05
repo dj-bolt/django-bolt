@@ -6,9 +6,39 @@ import logging
 import sys
 
 from django.conf import settings
+from django.contrib.sessions.middleware import SessionMiddleware
 from django.urls import get_resolver
+from django.utils.module_loading import import_string
 
 logger = logging.getLogger(__name__)
+
+
+def _has_session_middleware() -> bool:
+    """Check whether a session middleware is configured in ``settings.MIDDLEWARE``.
+
+    Django admin is auto-mounted through Django's own ASGI application, whose
+    request handling runs ``settings.MIDDLEWARE``. Admin therefore needs a
+    ``SessionMiddleware`` in that chain to maintain login state — it does *not*
+    require the ``django.contrib.sessions`` app to be in ``INSTALLED_APPS``.
+
+    Matching against a subclass (rather than the exact class) mirrors Django's
+    own admin system check (``admin.E410``), so alternative session backends
+    whose middleware subclasses the stock ``SessionMiddleware`` — e.g.
+    django-qsessions' ``qsessions.middleware.SessionMiddleware`` — are recognized.
+
+    Returns:
+        True if a ``SessionMiddleware`` (or subclass) is present, else False.
+    """
+    for middleware_path in getattr(settings, "MIDDLEWARE", None) or ():
+        try:
+            middleware_class = import_string(middleware_path)
+        except ImportError:
+            # Unimportable middleware is reported elsewhere; skip it here.
+            continue
+        if isinstance(middleware_class, type) and issubclass(middleware_class, SessionMiddleware):
+            return True
+
+    return False
 
 
 def is_admin_installed() -> bool:
@@ -147,10 +177,14 @@ def should_enable_admin() -> bool:
 
     # Check if required dependencies are installed
     try:
+        # These apps must be in INSTALLED_APPS for admin to function.
+        # NOTE: django.contrib.sessions is intentionally NOT required here —
+        # admin only needs a SessionMiddleware in the chain (checked below),
+        # which alternative backends like django-qsessions provide via a
+        # subclass while replacing the sessions app in INSTALLED_APPS.
         required_apps = [
             "django.contrib.auth",
             "django.contrib.contenttypes",
-            "django.contrib.sessions",
         ]
 
         for app in required_apps:
@@ -161,6 +195,18 @@ def should_enable_admin() -> bool:
                     file=sys.stderr,
                 )
                 return False
+
+        # Admin needs session support in the middleware chain to track login
+        # state. Mirrors Django's own admin.E410 system check.
+        if not _has_session_middleware():
+            print(
+                "[django-bolt] Warning: Django admin is installed but no SessionMiddleware "
+                "(django.contrib.sessions.middleware.SessionMiddleware or a subclass, e.g. "
+                "qsessions.middleware.SessionMiddleware) was found in settings.MIDDLEWARE. "
+                "Admin integration disabled.",
+                file=sys.stderr,
+            )
+            return False
 
         return True
 
