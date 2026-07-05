@@ -234,9 +234,7 @@ def test_max_rss_recycles_leaking_app_under_load_with_bounded_memory(make_server
         def sample() -> None:
             nonlocal peak_rss, min_rss_late
             seen_workers.update(child_pids(server.process.pid))
-            current = [
-                get_rss_bytes(pid) for pid in child_pids(server.process.pid)
-            ]
+            current = [get_rss_bytes(pid) for pid in child_pids(server.process.pid)]
             live = [rss / MIB for rss in current if rss]
             if live:
                 peak_rss = max(peak_rss, max(live))
