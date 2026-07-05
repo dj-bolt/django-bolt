@@ -163,6 +163,16 @@ class ArticleViewSet(ModelViewSet):
     pagination_class = PageNumberPagination
 ```
 
+### Serializer output
+
+When `serializer_class` is a `Serializer`, generated `list` and `retrieve`
+actions render models through `from_model()` + `dump()`. This preserves computed
+fields, inherited fields, `write_only` exclusions, aliases, `source` mapping,
+and nested serializers.
+
+Plain `msgspec.Struct` response models still use the faster `QuerySet.values()`
+projection path for raw column output.
+
 ### get_queryset
 
 Override to customize the queryset:

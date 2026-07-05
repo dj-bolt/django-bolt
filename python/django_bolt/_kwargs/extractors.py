@@ -922,8 +922,9 @@ def coerce_to_response_type(value: Any, annotation: Any, meta: HandlerMetadata |
         if meta and "response_field_names" in meta:
             field_names = meta["response_field_names"]
         else:
-            # Fallback: runtime introspection (slower)
-            field_names = list(getattr(annotation, "__annotations__", {}).keys())
+            field_names = list(
+                getattr(annotation, "__struct_fields__", None) or getattr(annotation, "__annotations__", {}).keys()
+            )
 
         mapped = {name: getattr(value, name, None) for name in field_names}
         try:

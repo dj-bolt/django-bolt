@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import mimetypes
 import types
@@ -35,7 +36,7 @@ from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 from . import _json
 from ._kwargs import coerce_to_response_type, coerce_to_response_type_async
 from .cookies import Cookie
-from .exceptions import ResponseValidationError
+from .exceptions import ResponseValidationError, UnloadedRelationError
 from .responses import (
     HTML,
     JSON,
@@ -273,9 +274,149 @@ def _response_validation_is_required(annotation: Any) -> bool:
     return annotation not in _VALIDATION_NOOP_TYPES
 
 
+def _strip_optional(annotation: Any) -> Any:
+    origin = get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        args = [a for a in get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return annotation
+
+
+def _response_serializer_info(response_type: Any) -> tuple[Any, bool]:
+    """Return (serializer_class, many) for Serializer or list[Serializer]."""
+    rt = _strip_optional(response_type)
+
+    if _is_bolt_serializer(rt):
+        return rt, False
+
+    if get_origin(rt) is list:
+        args = get_args(rt)
+        if args:
+            item = _strip_optional(args[0])
+            if _is_bolt_serializer(item):
+                return item, True
+
+    return None, False
+
+
+def _dump_dict(serializer_cls: Any, value: dict, validate_dicts: bool) -> Any:
+    """Validate already-serialized dicts only when response validation is on."""
+    if not validate_dicts:
+        return value
+    return msgspec.convert(value, serializer_cls).dump()
+
+
+def _is_serializer_instance(value: Any) -> bool:
+    return getattr(value.__class__, "__is_bolt_serializer__", False)
+
+
+def _dump_one_sync(serializer_cls: Any, value: Any, validate_dicts: bool) -> Any:
+    if value is None:
+        return value
+    if _is_serializer_instance(value):
+        return value.dump()
+    if isinstance(value, dict):
+        return _dump_dict(serializer_cls, value, validate_dicts)
+    return serializer_cls.from_model(value).dump()
+
+
+async def _dump_one_async(serializer_cls: Any, value: Any, sync_safe: bool, validate_dicts: bool) -> Any:
+    if value is None:
+        return value
+    if _is_serializer_instance(value):
+        return value.dump()
+    if isinstance(value, dict):
+        return _dump_dict(serializer_cls, value, validate_dicts)
+    if sync_safe:
+        return serializer_cls.from_model(value).dump()
+    try:
+        return serializer_cls.from_model(value).dump()
+    except UnloadedRelationError:
+        pass
+    return (await serializer_cls.afrom_model(value)).dump()
+
+
+def _dump_many_sync(serializer_cls: Any, items: Any, validate_dicts: bool) -> list[Any]:
+    items = items if isinstance(items, list) else list(items)
+    if not items:
+        return items
+    first = items[0]
+    if isinstance(first, dict):
+        return [_dump_dict(serializer_cls, item, validate_dicts) for item in items]
+    if _is_serializer_instance(first):
+        return [item.dump() for item in items]
+    instances = [serializer_cls.from_model(item) for item in items]
+    return serializer_cls.dump_many(instances)
+
+
+async def _dump_many_async(serializer_cls: Any, items: Any, sync_safe: bool, validate_dicts: bool) -> list[Any]:
+    items = items if isinstance(items, list) else list(items)
+    if not items:
+        return items
+    first = items[0]
+    if isinstance(first, dict):
+        return [_dump_dict(serializer_cls, item, validate_dicts) for item in items]
+    if _is_serializer_instance(first):
+        return [item.dump() for item in items]
+    if sync_safe:
+        instances = [serializer_cls.from_model(item) for item in items]
+    else:
+        try:
+            instances = [serializer_cls.from_model(item) for item in items]
+        except UnloadedRelationError:
+            instances = list(await asyncio.gather(*(serializer_cls.afrom_model(item) for item in items)))
+    return serializer_cls.dump_many(instances)
+
+
+def _serializer_from_model_sync_safe(serializer_cls: Any) -> bool:
+    """True when async relation loading is unnecessary."""
+    serializer_cls._ensure_from_model_ready()
+    return not any(
+        spec.nested is not None or (spec.source is not None and "." in spec.source)
+        for spec in serializer_cls.__model_field_specs__
+    )
+
+
+def _compile_serializer_response_handlers(serializer_cls: Any, many: bool, validate_dicts: bool) -> tuple[Any, Any]:
+    """Compile normalizers that render model/queryset output via the serializer."""
+    sync_safe = _serializer_from_model_sync_safe(serializer_cls)
+
+    if many:
+
+        def normalize_sync(value: Any) -> Any:
+            if not isinstance(value, (list, tuple)):
+                return value
+            return _dump_many_sync(serializer_cls, value, validate_dicts)
+
+        async def normalize_async(value: Any) -> Any:
+            if not isinstance(value, (list, tuple)):
+                return value
+            return await _dump_many_async(serializer_cls, value, sync_safe, validate_dicts)
+
+        return normalize_sync, normalize_async
+
+    def normalize_sync(value: Any) -> Any:
+        return _dump_one_sync(serializer_cls, value, validate_dicts)
+
+    async def normalize_async(value: Any) -> Any:
+        return await _dump_one_async(serializer_cls, value, sync_safe, validate_dicts)
+
+    return normalize_sync, normalize_async
+
+
 def _compile_response_validator(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
     response_type = meta.get("response_type")
-    if not meta.get("validate_response", True) or not _response_validation_is_required(response_type):
+    if not _response_validation_is_required(response_type):
+        return None, None
+
+    serializer_cls, many = _response_serializer_info(response_type)
+    if serializer_cls is not None:
+        return _compile_serializer_response_handlers(
+            serializer_cls, many, validate_dicts=meta.get("validate_response", True)
+        )
+
+    if not meta.get("validate_response", True):
         return None, None
 
     def validate_sync(value: Any) -> Any:
@@ -604,6 +745,22 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     stream_info = meta.get("_stream_info", (False, None))
     response_class = meta.get("response_class")
 
+    is_serializer_response = _response_serializer_info(meta.get("response_type"))[0] is not None
+
+    def prepare_list(result: list[Any]) -> Any:
+        if is_serializer_response:
+            return result
+        result = _convert_serializers(result)
+        if model_projector is not None and result and not isinstance(result[0], (dict, msgspec.Struct)):
+            return model_projector(result)
+        return result
+
+    def convert_serializer_result(result: Any) -> tuple[Any, bool]:
+        if is_serializer_response:
+            return result, False
+        converted = _convert_serializers(result)
+        return converted, converted is not result
+
     async def data_handler(result: Any, status_code: int | None = None) -> ResponseWireV1:
         current_status = default_status_code if status_code is None else status_code
 
@@ -613,12 +770,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, dict):
             return await _serialize_json_payload_async(result, current_status, validator_async)
         if isinstance(result, list):
-            result = _convert_serializers(result)
-            # When validate_response=False and list contains model instances (not dicts/Structs),
-            # project them to dicts using pre-compiled field names from the response type annotation.
-            if model_projector is not None and result and not isinstance(result[0], (dict, msgspec.Struct)):
-                result = model_projector(result)
-            return await _serialize_json_payload_async(result, current_status, validator_async)
+            return await _serialize_json_payload_async(prepare_list(result), current_status, validator_async)
         if isinstance(result, (bytes, bytearray)):
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
@@ -628,9 +780,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if auto_stream is not None:
             return _to_stream_wire(auto_stream)
 
-        original = result
-        result = _convert_serializers(result)
-        if result is not original:
+        result, was_converted = convert_serializer_result(result)
+        if was_converted:
             return await _serialize_json_payload_async(result, current_status, validator_async)
 
         if isinstance(result, QuerySet):
@@ -657,10 +808,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, dict):
             return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, list):
-            result = _convert_serializers(result)
-            if model_projector is not None and result and not isinstance(result[0], (dict, msgspec.Struct)):
-                result = model_projector(result)
-            return _serialize_json_payload_sync(result, current_status, validator_sync)
+            return _serialize_json_payload_sync(prepare_list(result), current_status, validator_sync)
         if isinstance(result, (bytes, bytearray)):
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
@@ -670,9 +818,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if auto_stream is not None:
             return _to_stream_wire(auto_stream)
 
-        original = result
-        result = _convert_serializers(result)
-        if result is not original:
+        result, was_converted = convert_serializer_result(result)
+        if was_converted:
             return _serialize_json_payload_sync(result, current_status, validator_sync)
 
         if isinstance(result, QuerySet):

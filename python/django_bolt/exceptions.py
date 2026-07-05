@@ -104,6 +104,10 @@ class SerializationError(BoltException, ValueError):
     """Server-side serialization misuse or unsupported serializer state."""
 
 
+class UnloadedRelationError(SerializationError):
+    """A sync serializer path needs an unloaded Django relation."""
+
+
 class RequestValidationError(ValidationException):
     """Request data validation error.
 

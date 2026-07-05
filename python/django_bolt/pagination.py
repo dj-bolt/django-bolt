@@ -33,6 +33,7 @@ import msgspec
 from asgiref.sync import sync_to_async
 
 from . import _json
+from .exceptions import UnloadedRelationError
 
 __all__ = [
     "PaginationBase",
@@ -244,6 +245,13 @@ class PaginationBase(ABC):
                     serializer_instances = None
                 else:
                     return serializer_class.dump_many(serializer_instances)
+
+            try:
+                serializer_instances = [serializer_class.from_model(item) for item in items]
+            except UnloadedRelationError:
+                pass
+            else:
+                return serializer_class.dump_many(serializer_instances)
 
             serializer_instances = list(await asyncio.gather(*(serializer_class.afrom_model(item) for item in items)))
             return serializer_class.dump_many(serializer_instances)

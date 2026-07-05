@@ -4,7 +4,7 @@ Tests for response_model parameter priority and QuerySet optimization.
 This test suite verifies that:
 1. response_model parameter takes precedence over return annotations
 2. Return annotations work as fallback when response_model not provided
-3. Both syntaxes produce identical metadata (field names for QuerySet optimization)
+3. Both syntaxes produce identical metadata
 4. Works with Serializer subclasses (django-bolt's enhanced msgspec.Struct)
 5. Works with both sync and async handlers
 """
@@ -67,9 +67,7 @@ def test_response_model_overrides_annotation():
     # Verify response_type is UserMini (from response_model), not UserFull (from annotation)
     assert meta["response_type"] == list[UserMini]
 
-    # Verify field names extracted from UserMini
-    assert "response_field_names" in meta
-    assert set(meta["response_field_names"]) == {"id", "username"}
+    assert "response_field_names" not in meta
 
 
 def test_response_model_overrides_annotation_async():
@@ -85,8 +83,7 @@ def test_response_model_overrides_annotation_async():
     meta = api._handler_meta[handler_id]
 
     assert meta["response_type"] == list[UserMini]
-    assert "response_field_names" in meta
-    assert set(meta["response_field_names"]) == {"id", "username"}
+    assert "response_field_names" not in meta
 
 
 # ============================================================================
@@ -109,9 +106,7 @@ def test_return_annotation_fallback():
     # Verify response_type is UserMini (from return annotation)
     assert meta["response_type"] == list[UserMini]
 
-    # Verify field names extracted
-    assert "response_field_names" in meta
-    assert set(meta["response_field_names"]) == {"id", "username"}
+    assert "response_field_names" not in meta
 
 
 def test_return_annotation_fallback_async():
@@ -127,8 +122,7 @@ def test_return_annotation_fallback_async():
     meta = api._handler_meta[handler_id]
 
     assert meta["response_type"] == list[UserMini]
-    assert "response_field_names" in meta
-    assert set(meta["response_field_names"]) == {"id", "username"}
+    assert "response_field_names" not in meta
 
 
 # ============================================================================
@@ -159,9 +153,8 @@ def test_both_syntaxes_produce_same_metadata():
     # Both should have same response_type
     assert meta1["response_type"] == meta2["response_type"]
 
-    # Both should have same field names
-    assert meta1["response_field_names"] == meta2["response_field_names"]
-    assert set(meta1["response_field_names"]) == {"id", "username"}
+    assert "response_field_names" not in meta1
+    assert "response_field_names" not in meta2
 
 
 def test_both_syntaxes_produce_same_metadata_async():
@@ -183,7 +176,8 @@ def test_both_syntaxes_produce_same_metadata_async():
     meta2 = api2._handler_meta[handler_id2]
 
     assert meta1["response_type"] == meta2["response_type"]
-    assert meta1["response_field_names"] == meta2["response_field_names"]
+    assert "response_field_names" not in meta1
+    assert "response_field_names" not in meta2
 
 
 # ============================================================================
@@ -199,8 +193,8 @@ def test_serializer_subclass_recognized():
     assert is_msgspec_struct(PlainStruct)
 
 
-def test_serializer_field_extraction():
-    """Test field extraction from Serializer subclasses."""
+def test_serializer_not_projected_via_values():
+    """Serializer subclasses are routed through from_model+dump, not .values()."""
     api = BoltAPI()
 
     @api.get("/users", response_model=list[UserFull])
@@ -211,10 +205,8 @@ def test_serializer_field_extraction():
     _method, _path, handler_id, _handler = api._routes[0]
     meta = api._handler_meta[handler_id]
 
-    # Verify all UserFull fields extracted
-    assert "response_field_names" in meta
-    expected_fields = {"id", "username", "email", "first_name", "last_name"}
-    assert set(meta["response_field_names"]) == expected_fields
+    assert meta["response_type"] == list[UserFull]
+    assert "response_field_names" not in meta
 
 
 def test_plain_msgspec_struct_field_extraction():
@@ -334,7 +326,7 @@ def test_metadata_extraction_at_registration():
         _method, _path, handler_id, _handler = api._routes[0]
         meta = api._handler_meta[handler_id]
 
-        assert "response_field_names" in meta
+        assert "response_field_names" not in meta
 
         # Still should be 1 (no additional calls)
         assert call_count == 1
@@ -439,8 +431,7 @@ def test_compile_binder_focused_on_parameters():
     # Verify response_type set correctly (response_model, not annotation)
     assert meta["response_type"] == list[UserMini]
 
-    # Verify field names from response_model (UserMini), not annotation (UserFull)
-    assert set(meta["response_field_names"]) == {"id", "username"}
+    assert "response_field_names" not in meta
 
 
 # ============================================================================
@@ -461,8 +452,8 @@ def test_nested_list_extraction():
     meta = api._handler_meta[handler_id]
 
     # Should work with typing.List as well
-    assert "response_field_names" in meta
-    assert set(meta["response_field_names"]) == {"id", "username"}
+    assert meta["response_type"] == list[UserMini]
+    assert "response_field_names" not in meta
 
 
 # ============================================================================

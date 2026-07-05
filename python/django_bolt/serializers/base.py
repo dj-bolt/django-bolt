@@ -38,7 +38,7 @@ from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
 
 from django_bolt import _json
-from django_bolt.exceptions import RequestValidationError, SerializationError
+from django_bolt.exceptions import RequestValidationError, SerializationError, UnloadedRelationError
 
 from .decorators import (
     ComputedFieldConfig,
@@ -62,6 +62,7 @@ T = TypeVar("T", bound="Serializer")
 _MISSING = object()
 _USE_DEFAULT = object()
 _STRUCT_META = type(msgspec.Struct)
+_MODEL_VALUE_NOOP_TYPES = (str, int, float, bool, bytes, type(None))
 
 
 @dataclass(frozen=True)
@@ -416,6 +417,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
     # _FieldMarker default resolution (populated by __init_subclass__)
     __field_marker_defaults__: ClassVar[dict[str, Any]] = {}  # field_name -> actual default value
+    __field_marker_fields__: ClassVar[tuple[str, ...]] = ()
 
     # Fast-path flags: Control which validation runs (set at class definition time)
     __skip_validation__: ClassVar[bool] = True  # Skip all validation
@@ -546,6 +548,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Initialize with Meta values (will be updated by _lazy_collect_field_configs)
         cls.__field_configs__ = {}
         cls.__field_marker_defaults__ = {}
+        cls.__field_marker_fields__ = ()
         cls.__read_only_fields__ = frozenset(read_only)
         cls.__write_only_fields__ = frozenset(write_only)
         cls.__source_mapping__ = {}
@@ -707,7 +710,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         """
         _setattr = msgspec_structs.force_setattr
 
-        for field_name in self.__struct_fields__:
+        for field_name in self.__class__.__field_marker_fields__:
             current_value = getattr(self, field_name)
 
             # Check if the current value is a _FieldMarker (meaning the user
@@ -731,6 +734,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         msgspec has already processed the class and set __struct_defaults__.
         """
         field_configs: dict[str, FieldConfig] = {}
+        field_marker_fields: list[str] = []
         read_only: set[str] = set()
         write_only: set[str] = set()
         source_mapping: dict[str, str] = {}
@@ -740,6 +744,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if isinstance(default_val, _FieldMarker):
                 config = default_val.config
                 field_configs[field_name] = config
+                field_marker_fields.append(field_name)
 
                 if config.read_only:
                     read_only.add(field_name)
@@ -753,6 +758,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls.__read_only_fields__ = cls.__read_only_fields__ | frozenset(read_only)
         cls.__write_only_fields__ = cls.__write_only_fields__ | frozenset(write_only)
         cls.__source_mapping__.update(source_mapping)
+        cls.__field_marker_fields__ = tuple(field_marker_fields)
 
         default_field_names = {field_name for field_name, _ in _iter_field_defaults(cls)}
         cls.__model_field_specs__ = tuple(
@@ -1213,7 +1219,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         instance: Any,
     ) -> None:
         """Raise a descriptive error when sync from_model() would need ORM I/O."""
-        raise SerializationError(
+        raise UnloadedRelationError(
             f"{cls.__name__}.{field_name} requires loaded relation '{relation.source}' on "
             f"{instance.__class__.__name__} when using from_model(). Preload it with "
             f"{cls._relation_loading_hint(_DjangoRelationInfo(relation.relation_name, relation.relation_kind, relation.relation_name, None))} "
@@ -1351,6 +1357,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 return None
 
             is_last = idx == len(parts) - 1
+            if isinstance(current, DjangoModel) and part in current.__dict__:
+                current = current.__dict__[part]
+                continue
+
             relation = _get_django_relation_info(current.__class__, part) if isinstance(current, DjangoModel) else None
 
             if relation is not None:
@@ -1405,6 +1415,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 return None
 
             is_last = idx == len(parts) - 1
+            if isinstance(current, DjangoModel) and part in current.__dict__:
+                current = current.__dict__[part]
+                continue
+
             relation = _get_django_relation_info(current.__class__, part) if isinstance(current, DjangoModel) else None
 
             if relation is not None:
@@ -1444,6 +1458,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     @classmethod
     def _convert_regular_from_model_value(cls, value: Any, *, field_name: str) -> Any:
         """Convert ORM-ish values into regular serializer output values."""
+        if value.__class__ in _MODEL_VALUE_NOOP_TYPES:
+            return value
         if isinstance(value, Choices):
             # Django keeps create()/acreate() choices as enum members in memory until
             # the instance is reloaded from the database. Normalize them here so
@@ -2329,7 +2345,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             UserSerializer.dump_many(users)
         """
         cls._ensure_dump_ready()
-        instances_list = list(instances)
+        instances_list = instances if isinstance(instances, list) else list(instances)
 
         # FAST PATH: use msgspec native methods (significantly faster than Python iteration)
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
@@ -2343,12 +2359,16 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             return [_asdict(instance) for instance in instances_list]
 
         # SLOW PATH: Need special handling (computed fields, write_only, exclude_*, etc.)
+        field_specs = cls._get_dump_field_specs()
+        computed_specs = cls._get_computed_dump_specs()
         return [
-            instance.dump(
+            instance._dump_impl(
                 exclude_none=exclude_none,
                 exclude_unset=exclude_unset,
                 exclude_defaults=exclude_defaults,
                 by_alias=by_alias,
+                field_specs=field_specs,
+                computed_specs=computed_specs,
             )
             for instance in instances_list
         ]
@@ -2550,12 +2570,15 @@ class SerializerView(Iterable[T]):
             List of filtered dictionary representations
         """
         return [
-            self.dump(
-                instance,
+            instance._dump_impl(
                 exclude_none=exclude_none,
                 exclude_unset=exclude_unset,
                 exclude_defaults=exclude_defaults,
                 by_alias=by_alias,
+                include_fields=self._include_fields,
+                exclude_fields=self._exclude_fields,
+                field_specs=self._field_specs,
+                computed_specs=self._computed_specs,
             )
             for instance in instances
         ]
