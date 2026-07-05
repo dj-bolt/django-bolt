@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from .apps import app_module, app_source, app_text
+from .apps import app_bytes, app_module, app_source
 
 pytestmark = pytest.mark.server_integration
 
@@ -22,18 +22,21 @@ def test_runbolt_autodiscovers_project_and_app_apis(make_server_project):
             class ExtraAppConfig(AppConfig):
                 name = "extraapp"
             """,
-            "extraapp/api.py": app_text("autodiscover_extraapp"),
+            "extraapp/api.py": app_bytes("autodiscover_extraapp"),
         },
     )
 
     with project.start() as server:
         project_response = server.get("/project-api")
         app_response = server.get("/app-api")
+        app_health_response = server.get("/app-health")
 
     assert project_response.status_code == 200
     assert project_response.json() == {"source": "project"}
     assert app_response.status_code == 200
     assert app_response.json() == {"source": "app"}
+    assert app_health_response.status_code == 200
+    assert app_health_response.json() == {"status": "ok"}
 
 
 def test_runbolt_applies_global_cors_settings_at_startup(make_server_project):

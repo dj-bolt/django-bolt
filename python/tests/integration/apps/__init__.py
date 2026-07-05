@@ -24,6 +24,17 @@ from pathlib import Path
 _APPS_DIR = Path(__file__).resolve().parent
 
 
+def _find_package_root(start: Path) -> Path:
+    root = start
+    while (root / "__init__.py").exists():
+        root = root.parent
+    return root
+
+
+PACKAGE_ROOT = _find_package_root(_APPS_DIR)
+_DOTTED_PREFIX = ".".join(_APPS_DIR.relative_to(PACKAGE_ROOT).parts)
+
+
 def app_source(name: str) -> Path:
     """Return the path to the app module ``name`` (without the ``.py`` suffix).
 
@@ -38,14 +49,16 @@ def app_source(name: str) -> Path:
     return path
 
 
-def app_text(name: str) -> str:
-    """Return the source text of app module ``name``.
+def app_bytes(name: str) -> bytes:
+    """Return the source bytes of app module ``name``.
 
     Use this when the module must be installed somewhere other than the
     project's own ``api.py`` — e.g. as a secondary app's ``api.py`` passed via
-    ``create_server_project(extra_files=...)``.
+    ``create_server_project(extra_files=...)``. Bytes make
+    ``ServerProject.write_file`` copy the module byte-for-byte, matching
+    ``install_api``; the string path normalizes Python source.
     """
-    return app_source(name).read_text()
+    return app_source(name).read_bytes()
 
 
 def app_module(name: str, attr: str = "api") -> str:
@@ -59,4 +72,4 @@ def app_module(name: str, attr: str = "api") -> str:
     the installed wheel, not the source tree).
     """
     app_source(name)  # validate the module exists
-    return f"{__name__}.{name}:{attr}"
+    return f"{_DOTTED_PREFIX}.{name}:{attr}"

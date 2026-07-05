@@ -6,17 +6,12 @@ import httpx
 import pytest
 
 from .apps import app_module
-from .helpers import ServerProject
 
 pytestmark = pytest.mark.server_integration
 
 
-def _make_sse_project(make_server_project) -> ServerProject:
-    return make_server_project(api_module=app_module("sse_cors"))
-
-
 def test_async_sse_has_cors_headers(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server:
         response = server.get("/sse-cors-async", headers={"Origin": "https://example.com"})
@@ -32,7 +27,7 @@ def test_async_sse_has_cors_headers(make_server_project):
 
 
 def test_sync_sse_has_cors_headers(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server:
         response = server.get("/sse-cors-sync", headers={"Origin": "https://sync-app.com"})
@@ -42,7 +37,7 @@ def test_sync_sse_has_cors_headers(make_server_project):
 
 
 def test_sse_cors_credentials(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server:
         response = server.get("/sse-cors-credentials", headers={"Origin": "https://secure.com"})
@@ -53,7 +48,7 @@ def test_sse_cors_credentials(make_server_project):
 
 
 def test_sse_without_cors_decorator_has_no_headers(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server:
         response = server.get("/sse-no-cors", headers={"Origin": "https://example.com"})
@@ -63,7 +58,7 @@ def test_sse_without_cors_decorator_has_no_headers(make_server_project):
 
 
 def test_sse_streams_in_real_time(make_server_project):
-    project = _make_sse_project(make_server_project)
+    project = make_server_project(api_module=app_module("sse_cors"))
 
     with project.start() as server, httpx.Client(timeout=10, headers={"Accept-Encoding": "identity"}) as client:
         timestamps: list[float] = []
