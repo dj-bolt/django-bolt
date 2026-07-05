@@ -28,9 +28,7 @@ def test_admin_enabled_with_qsessions_style_backend(monkeypatch):
     from INSTALLED_APPS and its middleware is swapped for a subclass. Admin must
     still be recognized as usable.
     """
-    middleware = [
-        QSESSIONS_MIDDLEWARE if m == DJANGO_SESSION_MIDDLEWARE else m for m in settings.MIDDLEWARE
-    ]
+    middleware = [QSESSIONS_MIDDLEWARE if m == DJANGO_SESSION_MIDDLEWARE else m for m in settings.MIDDLEWARE]
     monkeypatch.setattr(settings, "INSTALLED_APPS", _installed_without_sessions())
     monkeypatch.setattr(settings, "MIDDLEWARE", middleware)
 
