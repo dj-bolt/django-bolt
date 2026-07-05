@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import hashlib
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -22,6 +24,141 @@ import httpx
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_TIMEOUT = 20.0
+
+
+def child_pids(parent_pid: int) -> set[int]:
+    """Return the PIDs of a process's direct children (POSIX only).
+
+    Used to observe worker recycling: the ``runbolt`` supervisor forks one
+    worker per slot, so a changing child-PID set is proof of recycles.
+    """
+    result = subprocess.run(
+        ["ps", "--ppid", str(parent_pid), "-o", "pid="],
+        capture_output=True,
+        text=True,
+    )
+    return {int(token) for token in result.stdout.split()}
+
+
+@dataclass
+class LoadResult:
+    """Aggregate outcome of a :func:`generate_load` run.
+
+    ``ok``       requests that eventually got a <400 response.
+    ``failed``   requests that stayed failed after exhausting retries — genuine
+                 downtime (no worker could serve the request).
+    ``retried``  requests that hit a transient transport error / 5xx but
+                 succeeded on a retry — the expected, benign consequence of a
+                 keep-alive connection being closed by a graceful drain. A real
+                 client (browser, load balancer, bombardier) reconnects and
+                 retries idempotent GETs transparently, so this is *not*
+                 downtime; it is tracked separately for observability.
+    """
+
+    ok: int
+    failed: int
+    retried: int
+    errors: dict[str, int]
+
+    @property
+    def total(self) -> int:
+        return self.ok + self.failed
+
+    @property
+    def failure_rate(self) -> float:
+        return self.failed / self.total if self.total else 1.0
+
+
+def generate_load(
+    url: str,
+    *,
+    duration_s: float,
+    concurrency: int = 16,
+    timeout_s: float = 3.0,
+    max_attempts: int = 4,
+    on_tick: Callable[[], None] | None = None,
+    tick_interval: float = 0.25,
+) -> LoadResult:
+    """Bombard *url* with concurrent keep-alive requests for *duration_s*.
+
+    A dependency-free stand-in for an external load tool (bombardier/wrk): each
+    worker thread drives its own connection-pooled ``httpx.Client`` so requests
+    reuse connections the way a real client does.
+
+    Only idempotent GETs are issued, so — like any real HTTP client or load
+    balancer — a transient transport error or 5xx is retried on a fresh
+    connection up to ``max_attempts`` times. A request counts as ``failed`` only
+    if every attempt fails, which is the true "server dropped the request /
+    there was no accepting process" signal. Transient errors that a retry
+    recovers from are counted in ``retried`` (see :class:`LoadResult`).
+
+    ``on_tick`` is invoked from a side thread every ``tick_interval`` seconds
+    (e.g. to sample worker PIDs) for the duration of the run.
+    """
+    deadline = time.monotonic() + duration_s
+    stop = threading.Event()
+    lock = threading.Lock()
+    counters = {"ok": 0, "failed": 0, "retried": 0}
+    errors: collections.Counter[str] = collections.Counter()
+
+    def worker() -> None:
+        ok = 0
+        failed = 0
+        retried = 0
+        local_errors: collections.Counter[str] = collections.Counter()
+        with httpx.Client(timeout=timeout_s) as client:
+            while not stop.is_set() and time.monotonic() < deadline:
+                succeeded = False
+                had_retry = False
+                for attempt in range(max_attempts):
+                    try:
+                        response = client.get(url)
+                        if response.status_code < 500:
+                            succeeded = True
+                            break
+                        local_errors[f"status={response.status_code}"] += 1
+                    except httpx.HTTPError as exc:
+                        local_errors[type(exc).__name__] += 1
+                    had_retry = True
+                    time.sleep(0.02 * (attempt + 1))
+                if succeeded:
+                    ok += 1
+                    if had_retry:
+                        retried += 1
+                else:
+                    failed += 1
+        with lock:
+            counters["ok"] += ok
+            counters["failed"] += failed
+            counters["retried"] += retried
+            errors.update(local_errors)
+
+    def ticker() -> None:
+        while not stop.is_set() and time.monotonic() < deadline:
+            if on_tick is not None:
+                on_tick()
+            time.sleep(tick_interval)
+
+    threads = [threading.Thread(target=worker, name=f"load-{i}") for i in range(concurrency)]
+    tick_thread = threading.Thread(target=ticker, name="load-ticker") if on_tick is not None else None
+    for thread in threads:
+        thread.start()
+    if tick_thread is not None:
+        tick_thread.start()
+    try:
+        for thread in threads:
+            thread.join()
+    finally:
+        stop.set()
+        if tick_thread is not None:
+            tick_thread.join()
+
+    return LoadResult(
+        ok=counters["ok"],
+        failed=counters["failed"],
+        retried=counters["retried"],
+        errors=dict(errors),
+    )
 
 
 def get_free_port(host: str = DEFAULT_HOST) -> int:
