@@ -43,13 +43,13 @@ python manage.py runbolt --processes 4 \
 
 Any of these options enables the supervising parent process, even with `--processes 1`.
 
-### How recycling works (zero-downtime, WebSocket-aware)
+### How recycling works (near-zero-downtime, WebSocket-aware)
 
 Recycling is **spawn-first and graceful** — it is safe for long-lived connections:
 
-1. The supervisor forks a **replacement worker first**; `SO_REUSEPORT` lets old and new workers share the port, so there is never a moment without an accepting process.
+1. The supervisor forks a **replacement worker first**; `SO_REUSEPORT` lets old and new workers share the port, so an accepting process is always up. (Closing the old worker's socket can reset the handful of connections already queued on it — negligible with keep-alive clients, which simply retry.)
 2. The old worker receives SIGTERM and stops accepting new connections — the kernel routes new traffic to healthy workers.
-3. Active **WebSocket connections receive a proper close frame with code `1012` (Service Restart)** instead of an abrupt reset. Clients should treat 1012 as "reconnect now"; the reconnect lands on a healthy worker. New upgrade attempts on the draining worker get `503`.
+3. Active **WebSocket connections receive a proper close frame with code `1012` (Service Restart)** instead of an abrupt reset. Clients should treat 1012 as "reconnect now"; the reconnect lands on a healthy worker. New connections to the draining worker are refused, so they retry onto a healthy one.
 4. In-flight HTTP requests finish (up to `--workers-kill-timeout`, which also sets the server's internal graceful-shutdown window).
 5. If the worker still hasn't exited after the timeout, it is SIGKILLed.
 
