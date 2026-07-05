@@ -9,6 +9,11 @@ from django_bolt import BoltAPI
 api = BoltAPI()
 
 
+@api.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 class SearchQuery(msgspec.Struct):
     term: str
     limit: int = 10

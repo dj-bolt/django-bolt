@@ -170,6 +170,10 @@ Register a HEAD endpoint.
 
 Register an OPTIONS endpoint.
 
+#### @api.query(path, **options)
+
+Register a QUERY endpoint — a safe, idempotent read that takes a request body. Declare a body parameter as you would for POST. See [The QUERY method](../topics/routing.md#the-query-method).
+
 ### Route options
 
 All route decorators accept these options:

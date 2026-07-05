@@ -56,6 +56,10 @@ class ResourceView(APIView):
     async def delete(self, request):
         """Handle DELETE requests"""
         return {"method": "DELETE"}
+
+    async def query(self, request):
+        """Handle QUERY requests (a read that takes a request body)"""
+        return {"method": "QUERY"}
 ```
 
 ### Class-level configuration

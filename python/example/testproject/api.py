@@ -659,6 +659,13 @@ async def bench_parse(req: Request, payload: BenchPayload):
     return {"ok": True, "n": len(payload.items), "count": payload.count}
 
 
+@api.query("/bench/query")
+async def bench_query(req: Request, payload: BenchPayload):
+    # Byte-identical work to /bench/parse (POST). The only difference is the
+    # HTTP QUERY method, so diffing RPS isolates the method's routing cost.
+    return {"ok": True, "n": len(payload.items), "count": payload.count}
+
+
 @api.get("/bench/slow")
 async def bench_slow(ms: int | None = 100):
     # Simulate slow I/O (network) with asyncio.sleep

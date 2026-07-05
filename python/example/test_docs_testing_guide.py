@@ -136,9 +136,7 @@ def _free_port() -> int:
 @pytest.fixture(scope="module")
 def bolt_server():
     port = _free_port()
-    process = subprocess.Popen(
-        [sys.executable, "manage.py", "runbolt", "--host", "127.0.0.1", "--port", str(port)]
-    )
+    process = subprocess.Popen([sys.executable, "manage.py", "runbolt", "--host", "127.0.0.1", "--port", str(port)])
     client = httpx.Client(base_url=f"http://127.0.0.1:{port}")
     try:
         deadline = time.time() + 15

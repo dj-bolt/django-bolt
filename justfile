@@ -145,6 +145,10 @@ build-bench: build save-bench
 bench-params host=host port=port c=c n=n p=p workers=workers:
     P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark_params.sh
 
+# Focused HTTP QUERY method benchmark (QUERY vs POST, identical work)
+bench-query host=host port=port c=c n=n p=p workers=workers:
+    P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark_query.sh
+
 # Release new version
 # Usage: just release 0.2.2
 # Usage: just release 0.3.0-alpha1 (for pre-releases)

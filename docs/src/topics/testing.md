@@ -49,6 +49,7 @@ with TestClient(api) as client:
     client.put("/users/1", json={"name": "Updated", "email": "u@example.com"})
     client.patch("/users/1", json={"name": "Patched"})
     client.delete("/users/1")
+    client.query("/search", json={"term": "django"})
 ```
 
 Responses give you the status code, headers, and body in whatever form you
