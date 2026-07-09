@@ -55,7 +55,7 @@ bolt-mcp = ["bolt-mcp>=0.1.0"]
 [project.urls]
 Homepage = "https://github.com/dj-bolt/django-bolt"
 Repository = "https://github.com/dj-bolt/django-bolt"
-Documentation = "https://github.com/dj-bolt/django-bolt#readme"
+Documentation = "https://bolt.farhana.li/"
 "Bug Tracker" = "https://github.com/dj-bolt/django-bolt/issues"
 [project.scripts]
 django-bolt = "django_bolt.cli:main"
