@@ -826,6 +826,10 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<A
                 .get("header")
                 .and_then(|h| h.extract::<String>(py).ok())
                 .unwrap_or_else(|| "authorization".to_string());
+            let cookie = dict
+                .get("cookie")
+                .and_then(|c| c.extract::<Option<String>>(py).ok())
+                .flatten();
             let audience = dict
                 .get("audience")
                 .and_then(|a| a.extract::<String>(py).ok());
@@ -837,6 +841,7 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<A
                 secret,
                 algorithms,
                 header,
+                cookie,
                 audience,
                 issuer,
             })

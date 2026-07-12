@@ -153,7 +153,7 @@ impl CoercedValue {
     }
 }
 
-/// Error returned by [`coerce_param`] / [`coerce_param_with_limit`].
+/// Error returned by [`coerce_param`].
 ///
 /// Callers distinguish the two variants structurally:
 /// * [`CoerceError::TooLong`] is a hard security limit — it MUST always be
@@ -183,22 +183,10 @@ impl std::fmt::Display for CoerceError {
     }
 }
 
-/// Coerce a string value to the specified type
-///
-/// # Arguments
-/// * `value` - The string value to coerce
-/// * `type_hint` - Type hint constant (TYPE_INT, TYPE_FLOAT, etc.)
-///
-/// # Returns
-/// * `Ok(CoercedValue)` - Successfully coerced value
-/// * `Err(CoerceError)` - Structured error (`TooLong` vs `Invalid`)
-pub fn coerce_param(value: &str, type_hint: u8) -> Result<CoercedValue, CoerceError> {
-    coerce_param_with_limit(value, type_hint, DEFAULT_MAX_PARAM_LENGTH)
-}
-
-/// Same as [`coerce_param`] but takes the startup-resolved length limit
-/// (`AppState.max_param_length`) so the hot path never re-resolves config.
-pub(crate) fn coerce_param_with_limit(
+/// Coerce a string value to the specified type, with the startup-resolved
+/// length limit (`AppState.max_param_length`) so the hot path never
+/// re-resolves config.
+pub(crate) fn coerce_param(
     value: &str,
     type_hint: u8,
     max_length: usize,
@@ -511,68 +499,68 @@ mod tests {
     #[test]
     fn test_coerce_int() {
         assert!(matches!(
-            coerce_param("42", TYPE_INT),
+            coerce_param("42", TYPE_INT, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Int(42))
         ));
         assert!(matches!(
-            coerce_param("-123", TYPE_INT),
+            coerce_param("-123", TYPE_INT, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Int(-123))
         ));
-        assert!(coerce_param("abc", TYPE_INT).is_err());
+        assert!(coerce_param("abc", TYPE_INT, DEFAULT_MAX_PARAM_LENGTH).is_err());
     }
 
     #[test]
     fn test_coerce_float() {
         assert!(
-            matches!(coerce_param("3.14", TYPE_FLOAT), Ok(CoercedValue::Float(f)) if (f - 3.14).abs() < 0.001)
+            matches!(coerce_param("3.14", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Float(f)) if (f - 3.14).abs() < 0.001)
         );
         assert!(
-            matches!(coerce_param("-2.5", TYPE_FLOAT), Ok(CoercedValue::Float(f)) if (f + 2.5).abs() < 0.001)
+            matches!(coerce_param("-2.5", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Float(f)) if (f + 2.5).abs() < 0.001)
         );
-        assert!(coerce_param("not_a_float", TYPE_FLOAT).is_err());
+        assert!(coerce_param("not_a_float", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH).is_err());
     }
 
     #[test]
     fn test_coerce_bool() {
         assert!(matches!(
-            coerce_param("true", TYPE_BOOL),
+            coerce_param("true", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(true))
         ));
         assert!(matches!(
-            coerce_param("True", TYPE_BOOL),
+            coerce_param("True", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(true))
         ));
         assert!(matches!(
-            coerce_param("1", TYPE_BOOL),
+            coerce_param("1", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(true))
         ));
         assert!(matches!(
-            coerce_param("yes", TYPE_BOOL),
+            coerce_param("yes", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(true))
         ));
         assert!(matches!(
-            coerce_param("on", TYPE_BOOL),
+            coerce_param("on", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(true))
         ));
 
         assert!(matches!(
-            coerce_param("false", TYPE_BOOL),
+            coerce_param("false", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(false))
         ));
         assert!(matches!(
-            coerce_param("False", TYPE_BOOL),
+            coerce_param("False", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(false))
         ));
         assert!(matches!(
-            coerce_param("0", TYPE_BOOL),
+            coerce_param("0", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(false))
         ));
         assert!(matches!(
-            coerce_param("no", TYPE_BOOL),
+            coerce_param("no", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(false))
         ));
         assert!(matches!(
-            coerce_param("off", TYPE_BOOL),
+            coerce_param("off", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(false))
         ));
     }
@@ -581,46 +569,58 @@ mod tests {
     fn test_coerce_uuid() {
         let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
         assert!(matches!(
-            coerce_param(uuid_str, TYPE_UUID),
+            coerce_param(uuid_str, TYPE_UUID, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Uuid(_))
         ));
-        assert!(coerce_param("not-a-uuid", TYPE_UUID).is_err());
+        assert!(coerce_param("not-a-uuid", TYPE_UUID, DEFAULT_MAX_PARAM_LENGTH).is_err());
     }
 
     #[test]
     fn test_coerce_datetime() {
         // ISO 8601 with Z suffix
         assert!(matches!(
-            coerce_param("2024-01-15T10:30:00Z", TYPE_DATETIME),
+            coerce_param(
+                "2024-01-15T10:30:00Z",
+                TYPE_DATETIME,
+                DEFAULT_MAX_PARAM_LENGTH
+            ),
             Ok(CoercedValue::DateTime(_))
         ));
 
         // ISO 8601 with timezone offset
         assert!(matches!(
-            coerce_param("2024-01-15T10:30:00+00:00", TYPE_DATETIME),
+            coerce_param(
+                "2024-01-15T10:30:00+00:00",
+                TYPE_DATETIME,
+                DEFAULT_MAX_PARAM_LENGTH
+            ),
             Ok(CoercedValue::DateTime(_))
         ));
 
         // Naive datetime
         assert!(matches!(
-            coerce_param("2024-01-15T10:30:00", TYPE_DATETIME),
+            coerce_param(
+                "2024-01-15T10:30:00",
+                TYPE_DATETIME,
+                DEFAULT_MAX_PARAM_LENGTH
+            ),
             Ok(CoercedValue::NaiveDateTime(_))
         ));
 
-        assert!(coerce_param("not-a-datetime", TYPE_DATETIME).is_err());
+        assert!(coerce_param("not-a-datetime", TYPE_DATETIME, DEFAULT_MAX_PARAM_LENGTH).is_err());
     }
 
     #[test]
     fn test_coerce_decimal() {
         assert!(matches!(
-            coerce_param("123.45", TYPE_DECIMAL),
+            coerce_param("123.45", TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Decimal(_))
         ));
         assert!(matches!(
-            coerce_param("-99.99", TYPE_DECIMAL),
+            coerce_param("-99.99", TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Decimal(_))
         ));
-        assert!(coerce_param("not_decimal", TYPE_DECIMAL).is_err());
+        assert!(coerce_param("not_decimal", TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH).is_err());
     }
 
     #[test]
@@ -628,11 +628,11 @@ mod tests {
         let max_length = DEFAULT_MAX_PARAM_LENGTH;
         // Valid length should work
         let valid = "a".repeat(max_length);
-        assert!(coerce_param(&valid, TYPE_STRING).is_ok());
+        assert!(coerce_param(&valid, TYPE_STRING, DEFAULT_MAX_PARAM_LENGTH).is_ok());
 
         // Exceeding limit should fail
         let too_long = "a".repeat(max_length + 1);
-        let result = coerce_param(&too_long, TYPE_STRING);
+        let result = coerce_param(&too_long, TYPE_STRING, DEFAULT_MAX_PARAM_LENGTH);
         assert!(matches!(result, Err(CoerceError::TooLong { .. })));
     }
 

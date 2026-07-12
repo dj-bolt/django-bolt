@@ -122,6 +122,37 @@ async def get_me(request):
 
 The user is only loaded from the database when you access `request.user`. If you don't need the full user object, use `request.context` which is available without a database query.
 
+### Custom user query
+
+By default `request.user` runs `User.objects.get(pk=<sub claim>)`. To use a
+different query — `select_related`, `defer`, a custom user model, lookup by
+username — subclass the backend and override `get_user`:
+
+```python
+class MyJWT(JWTAuthentication):
+    async def get_user(self, user_id, auth_context):
+        return await (
+            User.objects
+            .select_related("track", "member")
+            .defer("track__image", "member__joined_at")
+            .aget(id=user_id)
+        )
+
+@api.get("/tasks", auth=[MyJWT()], guards=[IsAuthenticated()])
+async def tasks(request):
+    user = request.user  # loaded with your query
+    ...
+```
+
+Overriding the async `get_user` or the sync `get_user_sync` both work —
+either alone is enough. If you define both, sync handlers use
+`get_user_sync` directly (no event-loop overhead) and it is also preferred
+for async handlers via a worker thread.
+
+The override is scoped to the routes that use that backend instance —
+routes authenticated with a plain `JWTAuthentication` keep the default
+pk-based query, even in the same app.
+
 ### Using dependency injection
 
 Alternatively, use the `get_current_user` dependency:
@@ -147,6 +178,7 @@ JWTAuthentication(
     secret="your-secret-key",    # Default: Django's SECRET_KEY
     algorithms=["HS256"],        # Allowed algorithms
     header="authorization",      # Header name
+    cookie=None,                 # Cookie name to read the token from
     audience="your-app",         # Required audience claim
     issuer="your-issuer",        # Required issuer claim
 )
@@ -157,6 +189,36 @@ Supported algorithms:
 - `HS256`, `HS384`, `HS512` - HMAC with SHA-2
 - `RS256`, `RS384`, `RS512` - RSA with SHA-2
 - `ES256`, `ES384`, `ES512` - ECDSA with SHA-2
+
+### Cookie-based tokens
+
+For browser clients that store the JWT in a cookie (e.g. an `HttpOnly`
+`access_token` cookie), pass `cookie=` with the cookie name:
+
+```python
+@api.get(
+    "/profile",
+    auth=[JWTAuthentication(cookie="access_token")],
+    guards=[IsAuthenticated()],
+)
+async def profile(request):
+    return {"user_id": request["context"]["user_id"]}
+```
+
+When `cookie=` is set, the token is read from the named cookie only — the
+`Authorization` header is ignored for that backend. The cookie value is the
+raw token, no `Bearer` prefix needed. Extraction and validation both
+happen in Rust, without acquiring the GIL.
+
+To serve both browser (cookie) and API (bearer header) clients on the same
+endpoint, register two backends — they're tried in order:
+
+```python
+auth=[
+    JWTAuthentication(cookie="access_token"),
+    JWTAuthentication(),
+]
+```
 
 ## API key authentication
 

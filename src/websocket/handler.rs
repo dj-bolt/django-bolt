@@ -18,7 +18,7 @@ use crate::handler::coerced_value_to_py;
 use crate::metadata::CorsConfig;
 use crate::middleware::rate_limit::check_rate_limit;
 use crate::state::{AppState, ROUTE_METADATA, TASK_LOCALS};
-use crate::type_coercion::{coerce_param_with_limit, CoerceError, TYPE_STRING};
+use crate::type_coercion::{coerce_param, CoerceError, TYPE_STRING};
 use crate::validation::{validate_auth_and_guards, AuthGuardResult};
 
 use super::actor::WebSocketActor;
@@ -104,7 +104,7 @@ fn build_scope(
                     .copied()
                     .unwrap_or(TYPE_STRING);
 
-                match coerce_param_with_limit(&decoded_value, type_hint, max_param_length) {
+                match coerce_param(&decoded_value, type_hint, max_param_length) {
                     Ok(coerced) => {
                         let py_value = coerced_value_to_py(py, &coerced);
                         query_dict.set_item(decoded_key.as_ref(), py_value)?;
@@ -140,7 +140,7 @@ fn build_scope(
     let params_dict = PyDict::new(py);
     for (k, v) in path_params.iter() {
         let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
-        match coerce_param_with_limit(v, type_hint, max_param_length) {
+        match coerce_param(v, type_hint, max_param_length) {
             Ok(coerced) => {
                 let py_value = coerced_value_to_py(py, &coerced);
                 params_dict.set_item(k.as_str(), py_value)?;

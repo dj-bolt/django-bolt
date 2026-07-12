@@ -84,6 +84,7 @@ pub enum AuthBackend {
         secret: String,
         algorithms: Vec<String>,
         header: String,
+        cookie: Option<String>,
         audience: Option<String>,
         issuer: Option<String>,
     },
@@ -106,6 +107,7 @@ pub fn authenticate(
                 secret,
                 algorithms,
                 header,
+                cookie,
                 audience,
                 issuer,
             } => {
@@ -114,6 +116,7 @@ pub fn authenticate(
                     secret,
                     algorithms,
                     header,
+                    cookie.as_deref(),
                     audience.as_deref(),
                     issuer.as_deref(),
                 ) {
@@ -134,23 +137,41 @@ pub fn authenticate(
     None
 }
 
+/// Find a cookie value by name in a raw Cookie header string.
+/// Zero-allocation scan — returns a slice into the header value.
+fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<&'a str> {
+    for pair in raw_cookie.split(';') {
+        let part = pair.trim();
+        if let Some(eq) = part.find('=') {
+            let (k, v) = part.split_at(eq);
+            if k == name {
+                return Some(&v[1..]); // Skip '=' character
+            }
+        }
+    }
+    None
+}
+
 fn try_jwt_auth(
     headers: &AHashMap<String, String>,
     secret: &str,
     algorithms: &[String],
     header_name: &str,
+    cookie_name: Option<&str>,
     audience: Option<&str>,
     issuer: Option<&str>,
 ) -> Option<AuthContext> {
-    // Get auth header
-    let auth_header = headers.get(header_name)?;
-
-    // Extract token (remove "Bearer " prefix if present)
-    let token = if auth_header.starts_with("Bearer ") {
-        &auth_header[7..]
-    } else {
-        auth_header
+    // Extract raw token: the named cookie when configured, the auth header
+    // otherwise. No fallback between sources.
+    let raw_token = match cookie_name {
+        Some(name) => headers
+            .get("cookie")
+            .and_then(|raw| find_cookie_value(raw, name))?,
+        None => headers.get(header_name)?.as_str(),
     };
+
+    // Remove "Bearer " prefix if present
+    let token = raw_token.strip_prefix("Bearer ").unwrap_or(raw_token);
 
     // Use FIRST algorithm only (as specified in config) - don't try multiple algorithms
     // This is more efficient and follows the principle: one token, one algorithm
