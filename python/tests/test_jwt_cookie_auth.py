@@ -252,6 +252,38 @@ class TestGetUserOverrideResolution:
             assert response.json()["username"] == "syncoverride"
 
     @pytest.mark.django_db(transaction=True)
+    def test_override_honored_alongside_plain_backend_on_other_route(self):
+        """A custom get_user must win on its own route even when a plain JWT
+        backend (same scheme_name) is registered first on another route.
+
+        Guards against global scheme-keyed loader registration, where the
+        first "jwt" backend silently supplies user loading for all routes.
+        """
+        user = User.objects.create(username="perroute")
+
+        class UsernameJWT(JWTAuthentication):
+            async def get_user(self, user_id, auth_context):
+                return await User.objects.aget(username=user_id)
+
+        api = BoltAPI()
+
+        # Plain backend registers "jwt" first.
+        @api.get("/plain", auth=[JWTAuthentication(secret=SECRET)], guards=[IsAuthenticated()])
+        async def plain(request):
+            return {"ok": True}
+
+        @api.get("/custom-me", auth=[UsernameJWT(secret=SECRET)], guards=[IsAuthenticated()])
+        async def custom_me(request):
+            u = request.user
+            return {"username": u.username if u else None}
+
+        token = create_token(user_id=user.username)
+        with TestClient(api) as client:
+            response = client.get("/custom-me", headers={"Authorization": f"Bearer {token}"})
+            assert response.status_code == 200
+            assert response.json()["username"] == "perroute"
+
+    @pytest.mark.django_db(transaction=True)
     def test_default_backend_loads_by_pk(self):
         """Plain JWTAuthentication keeps the default pk-based query."""
         user = User.objects.create(username="plainuser")

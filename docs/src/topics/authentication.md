@@ -149,6 +149,10 @@ either alone is enough. If you define both, sync handlers use
 `get_user_sync` directly (no event-loop overhead) and it is also preferred
 for async handlers via a worker thread.
 
+The override is scoped to the routes that use that backend instance —
+routes authenticated with a plain `JWTAuthentication` keep the default
+pk-based query, even in the same app.
+
 ### Using dependency injection
 
 Alternatively, use the `get_current_user` dependency:

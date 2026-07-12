@@ -7,8 +7,11 @@ Eager loading (optional): Loads user immediately at dispatch time
 
 Backends customize user loading by overriding get_user (async) and/or
 get_user_sync (sync) — overriding either one alone is honored. The effective
-strategy per backend is resolved once at registration time, so the per-request
-path is a single dict lookup plus a call.
+strategy is resolved once per route at registration time (resolve_user_loader,
+stored in the handler meta keyed by scheme name), so the per-request path is a
+single dict lookup plus a call. Resolution must be per-route, not per scheme
+name: two JWTAuthentication subclasses share scheme_name "jwt" but can carry
+different get_user overrides.
 """
 
 from __future__ import annotations
@@ -58,7 +61,7 @@ def _has_custom_get_user(cls: type) -> bool:
     return method is not None and method not in _FRAMEWORK_GET_USER
 
 
-def _resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any] | None:
+def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any] | None:
     """
     Resolve the sync user-loading strategy for a backend, once at registration.
 
@@ -107,6 +110,16 @@ def _resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any
     return None
 
 
+def default_django_user_loader(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
+    """Default user query for schemes with no backend instance on the route
+    (e.g. Rust-side session auth): ``User.objects.get(pk=user_id)``."""
+    User = get_user_model()
+
+    if is_async_context:
+        return _get_executor().submit(User.objects.get, pk=user_id).result()
+    return User.objects.get(pk=user_id)
+
+
 def register_auth_backend(backend_name: str, backend_instance: Any) -> None:
     """
     Register an authentication backend instance for user resolution.
@@ -119,7 +132,7 @@ def register_auth_backend(backend_name: str, backend_instance: Any) -> None:
         backend_instance: Instance of the authentication backend class
     """
     _auth_backend_registry[backend_name] = backend_instance
-    _resolved_loader_registry[backend_name] = _resolve_user_loader(backend_instance)
+    _resolved_loader_registry[backend_name] = resolve_user_loader(backend_instance)
 
 
 def get_registered_backend(backend_name: str) -> Any | None:
@@ -189,8 +202,4 @@ def load_user_sync(
         return loader(user_id, auth_context, is_async_context)
 
     # Unregistered backend (e.g. session auth): default Django user query
-    User = get_user_model()
-
-    if is_async_context:
-        return _get_executor().submit(User.objects.get, pk=user_id).result()
-    return User.objects.get(pk=user_id)
+    return default_django_user_loader(user_id, auth_context, is_async_context)

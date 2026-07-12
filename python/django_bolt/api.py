@@ -37,7 +37,7 @@ from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler, warn_blocking_handler
 from .auth import get_default_authentication_classes, register_auth_backend
-from .auth.user_loader import load_user_sync
+from .auth.user_loader import default_django_user_loader, resolve_user_loader
 from .concurrency import sync_to_thread
 from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
 from .error_handlers import handle_exception
@@ -1607,6 +1607,16 @@ class BoltAPI:
             # below for revocation precomputation and _auth_backend_instances.
             effective_auth_backends = auth if auth is not None else (get_default_authentication_classes() or [])
 
+            # scheme_name → user loader for THIS route's backends. Must be
+            # per-route: JWTAuthentication subclasses all share scheme "jwt"
+            # but can carry different get_user overrides. First backend of a
+            # scheme wins (Rust reports only the scheme that authenticated).
+            user_loaders: dict[str, Any] = {}
+            for backend in effective_auth_backends:
+                if backend.scheme_name not in user_loaders:
+                    user_loaders[backend.scheme_name] = resolve_user_loader(backend)
+            meta["_user_loaders"] = user_loaders
+
             # scheme_name → handler. Lookup at dispatch is O(1) via the
             # matched backend's name. None when no backend has revocation.
             revocation_handlers: dict[str, Callable] = {
@@ -2639,11 +2649,18 @@ class BoltAPI:
 
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    backend_name = auth_context.get("auth_backend")
-                    is_async_ctx = meta["is_async"]
-                    request["user"] = SimpleLazyObject(
-                        partial(load_user_sync, user_id, backend_name, auth_context, is_async_ctx)
+                    # Route-local loader for the scheme that authenticated;
+                    # schemes with no backend instance (Rust session auth)
+                    # fall back to the default pk query. A loader of None
+                    # means the backend has no user resolution — leave
+                    # request.user unset (PyRequest getter returns None).
+                    loader = meta["_user_loaders"].get(
+                        auth_context.get("auth_backend"), default_django_user_loader
                     )
+                    if loader is not None:
+                        request["user"] = SimpleLazyObject(
+                            partial(loader, user_id, auth_context, meta["is_async"])
+                        )
 
             # 3. Check if we need to execute middleware
             # Middleware runs for:
@@ -2707,10 +2724,11 @@ class BoltAPI:
             if auth_context:
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    backend_name = auth_context.get("auth_backend")
-                    request["user"] = SimpleLazyObject(
-                        partial(load_user_sync, user_id, backend_name, auth_context, False)
+                    loader = meta["_user_loaders"].get(
+                        auth_context.get("auth_backend"), default_django_user_loader
                     )
+                    if loader is not None:
+                        request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context, False))
 
             # Call pre-compiled sync executor directly (no coroutine, no await)
             return meta["_sync_executor"](handler, request)
