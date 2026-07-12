@@ -1617,6 +1617,14 @@ class BoltAPI:
                     user_loaders[backend.scheme_name] = resolve_user_loader(backend)
             meta["_user_loaders"] = user_loaders
 
+            # Execution context for request.user loads on the async dispatch
+            # path: async handlers run on the event loop, and non-blocking
+            # sync handlers are run inline on it too — both need the loader
+            # to use the executor (sync ORM on the loop thread raises
+            # SynchronousOnlyOperation). Only blocking sync handlers run in
+            # a worker thread, where a direct ORM call is safe and faster.
+            meta["_user_load_is_async_ctx"] = meta["is_async"] or not meta["is_blocking"]
+
             # scheme_name → handler. Lookup at dispatch is O(1) via the
             # matched backend's name. None when no backend has revocation.
             revocation_handlers: dict[str, Callable] = {
@@ -2656,7 +2664,9 @@ class BoltAPI:
                     # request.user unset (PyRequest getter returns None).
                     loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
                     if loader is not None:
-                        request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context, meta["is_async"]))
+                        request["user"] = SimpleLazyObject(
+                            partial(loader, user_id, auth_context, meta["_user_load_is_async_ctx"])
+                        )
 
             # 3. Check if we need to execute middleware
             # Middleware runs for:

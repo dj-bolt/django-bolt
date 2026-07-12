@@ -227,7 +227,8 @@ class JWTAuthentication(BaseAuthentication):
         Synchronously load user from database using the user_id from JWT token.
 
         This method does the actual DB query. Thread pool wrapping is handled
-        by user_loader.load_user_sync() based on the handler's async context.
+        by the loader resolved in user_loader.resolve_user_loader() based on
+        the handler's execution context.
         """
         if not user_id:
             return None

@@ -112,12 +112,19 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
 
 def default_django_user_loader(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
     """Default user query for schemes with no backend instance on the route
-    (e.g. Rust-side session auth): ``User.objects.get(pk=user_id)``."""
+    (e.g. Rust-side session auth): ``User.objects.get(pk=user_id)``.
+
+    Returns None for a stale user_id (user deleted after the session/token
+    was issued), mirroring the framework get_user/get_user_sync defaults.
+    """
     User = get_user_model()
 
-    if is_async_context:
-        return _get_executor().submit(User.objects.get, pk=user_id).result()
-    return User.objects.get(pk=user_id)
+    try:
+        if is_async_context:
+            return _get_executor().submit(User.objects.get, pk=user_id).result()
+        return User.objects.get(pk=user_id)
+    except User.DoesNotExist:
+        return None
 
 
 def register_auth_backend(backend_name: str, backend_instance: Any) -> None:

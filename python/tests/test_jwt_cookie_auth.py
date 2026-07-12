@@ -15,7 +15,8 @@ import pytest
 from django.contrib.auth.models import User
 
 from django_bolt import BoltAPI
-from django_bolt.auth import IsAuthenticated, JWTAuthentication
+from django_bolt.auth import InMemoryRevocation, IsAuthenticated, JWTAuthentication
+from django_bolt.auth.user_loader import default_django_user_loader
 from django_bolt.testing import TestClient
 
 SECRET = "test-secret"
@@ -282,6 +283,39 @@ class TestGetUserOverrideResolution:
             response = client.get("/custom-me", headers={"Authorization": f"Bearer {token}"})
             assert response.status_code == 200
             assert response.json()["username"] == "perroute"
+
+    @pytest.mark.django_db(transaction=True)
+    def test_default_loader_returns_none_for_stale_user_id(self):
+        """The fallback loader (unregistered schemes, e.g. session auth) must
+        return None for a deleted user, like the framework backend defaults —
+        not raise User.DoesNotExist into the handler."""
+        assert default_django_user_loader("999999", None, False) is None
+
+    @pytest.mark.django_db(transaction=True)
+    def test_sync_handler_on_async_dispatch_path_loads_user(self):
+        """A sync handler forced onto the async dispatch path (here via a
+        revocation store) runs inline on the event loop when it has no
+        detected ORM operations. request.user must still load — the loader
+        has to route the query through the executor, not call the sync ORM
+        on the event-loop thread (SynchronousOnlyOperation).
+        """
+        user = User.objects.create(username="syncloop")
+        api = BoltAPI()
+
+        @api.get(
+            "/sync-loop-me",
+            auth=[JWTAuthentication(secret=SECRET, revocation_store=InMemoryRevocation())],
+            guards=[IsAuthenticated()],
+        )
+        def sync_loop_me(request):
+            u = request.user
+            return {"username": u.username if u else None}
+
+        token = create_token(user_id=str(user.id), jti="sync-loop-jti")
+        with TestClient(api) as client:
+            response = client.get("/sync-loop-me", headers={"Authorization": f"Bearer {token}"})
+            assert response.status_code == 200, response.text
+            assert response.json()["username"] == "syncloop"
 
     @pytest.mark.django_db(transaction=True)
     def test_default_backend_loads_by_pk(self):

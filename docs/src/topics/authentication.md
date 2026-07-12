@@ -207,7 +207,7 @@ async def profile(request):
 
 When `cookie=` is set, the token is read from the named cookie only — the
 `Authorization` header is ignored for that backend. The cookie value is the
-raw token, no `Bearer ` prefix needed. Extraction and validation both
+raw token, no `Bearer` prefix needed. Extraction and validation both
 happen in Rust, without acquiring the GIL.
 
 To serve both browser (cookie) and API (bearer header) clients on the same
