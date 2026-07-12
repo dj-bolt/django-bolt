@@ -101,12 +101,16 @@ class JWTAuthentication(BaseAuthentication):
     JWT token authentication.
 
     Validates JWT tokens using the configured secret and algorithms.
-    Tokens should be provided in the Authorization header as "Bearer <token>".
+    Tokens should be provided in the Authorization header as "Bearer <token>",
+    or in a cookie when `cookie` is set.
 
     Args:
         secret: Secret key for JWT validation. If None, uses Django's SECRET_KEY.
         algorithms: List of allowed JWT algorithms (default: ["HS256"])
         header: Header name to extract token from (default: "authorization")
+        cookie: Optional cookie name to extract the token from. When set, the
+            token is read from the named cookie only (the header is ignored).
+            The cookie value is the raw token (no "Bearer " prefix needed).
         audience: Optional JWT audience claim to validate
         issuer: Optional JWT issuer claim to validate
     """
@@ -126,6 +130,7 @@ class JWTAuthentication(BaseAuthentication):
         secret: str | None = None,
         algorithms: list[str] | None = None,
         header: str = "authorization",
+        cookie: str | None = None,
         audience: str | None = None,
         issuer: str | None = None,
         revoked_token_handler: RevokedTokenHandler | None = None,
@@ -135,6 +140,7 @@ class JWTAuthentication(BaseAuthentication):
         self.secret = secret
         self.algorithms = algorithms or ["HS256"]
         self.header = header
+        self.cookie = cookie
         self.audience = audience
         self.issuer = issuer
 
@@ -183,6 +189,7 @@ class JWTAuthentication(BaseAuthentication):
             "secret": self.secret,
             "algorithms": self.algorithms,
             "header": self.header.lower(),
+            "cookie": self.cookie,
             "audience": self.audience,
             "issuer": self.issuer,
             "require_jti": self.require_jti,

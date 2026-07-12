@@ -45,7 +45,7 @@ use crate::handler::{
 };
 use crate::request_pipeline::validate_and_cache_typed_params;
 use crate::static_files::handle_file;
-use crate::type_coercion::{coerce_param_with_limit, params_to_py_dict, CoerceError, TYPE_STRING};
+use crate::type_coercion::{coerce_param, params_to_py_dict, CoerceError, TYPE_STRING};
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
@@ -1327,7 +1327,7 @@ pub fn handle_test_websocket(
     let path_params_dict = pyo3::types::PyDict::new(py);
     for (k, v) in path_params.iter() {
         let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
-        match coerce_param_with_limit(v, type_hint, max_param_length) {
+        match coerce_param(v, type_hint, max_param_length) {
             Ok(coerced) => {
                 let py_value = coerced_value_to_py(py, &coerced);
                 path_params_dict.set_item(k, py_value)?;
@@ -1362,7 +1362,7 @@ pub fn handle_test_websocket(
                         .copied()
                         .unwrap_or(TYPE_STRING);
 
-                    match coerce_param_with_limit(&decoded_value, type_hint, max_param_length) {
+                    match coerce_param(&decoded_value, type_hint, max_param_length) {
                         Ok(coerced) => {
                             let py_value = coerced_value_to_py(py, &coerced);
                             query_dict.set_item(decoded_key.as_ref(), py_value)?;

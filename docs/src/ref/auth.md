@@ -19,6 +19,7 @@ JWTAuthentication(
     secret=None,              # JWT secret (default: Django SECRET_KEY)
     algorithms=["HS256"],     # Allowed algorithms
     header="authorization",   # Header name
+    cookie=None,              # Cookie name to read the token from
     audience=None,            # Required audience claim
     issuer=None,              # Required issuer claim
     revocation_store=None,    # Token revocation store
@@ -32,6 +33,7 @@ JWTAuthentication(
 | `secret`           | `str`           | Django SECRET_KEY | JWT signing secret      |
 | `algorithms`       | `list[str]`     | `["HS256"]`       | Allowed JWT algorithms  |
 | `header`           | `str`           | `"authorization"` | Header containing token |
+| `cookie`           | `str`           | `None`            | Cookie containing token (replaces `header` when set) |
 | `audience`         | `str`           | `None`            | Required `aud` claim    |
 | `issuer`           | `str`           | `None`            | Required `iss` claim    |
 | `revocation_store` | RevocationStore | `None`            | Token revocation store  |

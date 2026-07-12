@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use tempfile::NamedTempFile;
 
-use crate::type_coercion::{coerce_param_with_limit, CoerceError, CoercedValue, TYPE_STRING};
+use crate::type_coercion::{coerce_param, CoerceError, CoercedValue, TYPE_STRING};
 
 /// Memory limit for in-memory file storage (1MB default)
 pub const DEFAULT_MEMORY_LIMIT: usize = 1024 * 1024;
@@ -248,7 +248,7 @@ pub fn parse_urlencoded(
     for (key, value) in parsed {
         let type_hint = type_hints.get(&key).copied().unwrap_or(TYPE_STRING);
         let coerced =
-            coerce_param_with_limit(&value, type_hint, max_param_length).map_err(|e| {
+            coerce_param(&value, type_hint, max_param_length).map_err(|e| {
                 ValidationError::type_coercion_error(
                     &key,
                     type_hint_name(type_hint),
@@ -447,7 +447,7 @@ pub async fn parse_multipart(
 
             // Type coercion
             let coerced =
-                coerce_param_with_limit(&value, type_hint, max_param_length).map_err(|e| {
+                coerce_param(&value, type_hint, max_param_length).map_err(|e| {
                     ValidationError::type_coercion_error(
                         &field_name,
                         type_hint_name(type_hint),
