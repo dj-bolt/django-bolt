@@ -378,7 +378,7 @@ uv run --with pytest pytest python/tests -s -vv
 ## Supported Versions
 
 - **Python**: 3.12, 3.13, 3.14 (source of truth: the `pyproject.toml` classifiers, which CI reads)
-- **Django**: 4.2, 5.0, 5.1
+- **Django**: 4.2, 5.0, 5.1, 5.2, 6.0
 - **PyPy**: Supported (performance slower than CPython)
 
 ## Project Structure (python/django_bolt)
