@@ -2654,13 +2654,9 @@ class BoltAPI:
                     # fall back to the default pk query. A loader of None
                     # means the backend has no user resolution — leave
                     # request.user unset (PyRequest getter returns None).
-                    loader = meta["_user_loaders"].get(
-                        auth_context.get("auth_backend"), default_django_user_loader
-                    )
+                    loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
                     if loader is not None:
-                        request["user"] = SimpleLazyObject(
-                            partial(loader, user_id, auth_context, meta["is_async"])
-                        )
+                        request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context, meta["is_async"]))
 
             # 3. Check if we need to execute middleware
             # Middleware runs for:
@@ -2724,9 +2720,7 @@ class BoltAPI:
             if auth_context:
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    loader = meta["_user_loaders"].get(
-                        auth_context.get("auth_backend"), default_django_user_loader
-                    )
+                    loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
                     if loader is not None:
                         request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context, False))
 

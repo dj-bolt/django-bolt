@@ -247,14 +247,9 @@ pub fn parse_urlencoded(
 
     for (key, value) in parsed {
         let type_hint = type_hints.get(&key).copied().unwrap_or(TYPE_STRING);
-        let coerced =
-            coerce_param(&value, type_hint, max_param_length).map_err(|e| {
-                ValidationError::type_coercion_error(
-                    &key,
-                    type_hint_name(type_hint),
-                    &e.to_string(),
-                )
-            })?;
+        let coerced = coerce_param(&value, type_hint, max_param_length).map_err(|e| {
+            ValidationError::type_coercion_error(&key, type_hint_name(type_hint), &e.to_string())
+        })?;
 
         match result.entry(key) {
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -446,14 +441,13 @@ pub async fn parse_multipart(
             let value = String::from_utf8_lossy(&value_bytes).to_string();
 
             // Type coercion
-            let coerced =
-                coerce_param(&value, type_hint, max_param_length).map_err(|e| {
-                    ValidationError::type_coercion_error(
-                        &field_name,
-                        type_hint_name(type_hint),
-                        &e.to_string(),
-                    )
-                })?;
+            let coerced = coerce_param(&value, type_hint, max_param_length).map_err(|e| {
+                ValidationError::type_coercion_error(
+                    &field_name,
+                    type_hint_name(type_hint),
+                    &e.to_string(),
+                )
+            })?;
 
             // Preserve duplicate keys (e.g. multi-select) as FormValue::Multi.
             // First occurrence is Single — zero extra alloc for the common case.

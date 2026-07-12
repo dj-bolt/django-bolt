@@ -579,19 +579,31 @@ mod tests {
     fn test_coerce_datetime() {
         // ISO 8601 with Z suffix
         assert!(matches!(
-            coerce_param("2024-01-15T10:30:00Z", TYPE_DATETIME, DEFAULT_MAX_PARAM_LENGTH),
+            coerce_param(
+                "2024-01-15T10:30:00Z",
+                TYPE_DATETIME,
+                DEFAULT_MAX_PARAM_LENGTH
+            ),
             Ok(CoercedValue::DateTime(_))
         ));
 
         // ISO 8601 with timezone offset
         assert!(matches!(
-            coerce_param("2024-01-15T10:30:00+00:00", TYPE_DATETIME, DEFAULT_MAX_PARAM_LENGTH),
+            coerce_param(
+                "2024-01-15T10:30:00+00:00",
+                TYPE_DATETIME,
+                DEFAULT_MAX_PARAM_LENGTH
+            ),
             Ok(CoercedValue::DateTime(_))
         ));
 
         // Naive datetime
         assert!(matches!(
-            coerce_param("2024-01-15T10:30:00", TYPE_DATETIME, DEFAULT_MAX_PARAM_LENGTH),
+            coerce_param(
+                "2024-01-15T10:30:00",
+                TYPE_DATETIME,
+                DEFAULT_MAX_PARAM_LENGTH
+            ),
             Ok(CoercedValue::NaiveDateTime(_))
         ));
 
