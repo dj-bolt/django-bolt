@@ -14,14 +14,48 @@ permissions:
   contents: read
 
 jobs:
+  # Supported Python versions, parsed from the pyproject.toml classifiers
+  python-versions:
+    name: Read Python versions from pyproject.toml
+    runs-on: ubuntu-latest
+    outputs:
+      versions-json: ${{ steps.extract.outputs.versions-json }}
+      versions: ${{ steps.extract.outputs.versions }}
+      min-max-json: ${{ steps.extract.outputs.min-max-json }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Extract supported versions from classifiers
+        id: extract
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              classifiers = tomllib.load(f)["project"]["classifiers"]
+          prefix = "Programming Language :: Python :: 3."
+          versions = sorted(
+              (c.removeprefix("Programming Language :: Python :: ") for c in classifiers if c.startswith(prefix)),
+              key=lambda v: tuple(map(int, v.split("."))),
+          )
+          assert versions, "no 'Programming Language :: Python :: 3.X' classifiers in pyproject.toml"
+          print(f"versions-json={json.dumps(versions)}")
+          print(f"versions={' '.join(versions)}")
+          print(f"min-max-json={json.dumps([versions[0], versions[-1]])}")
+          EOF
+
   # Run tests across Python versions
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    needs: python-versions
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13", "3.14"]
+        python-version: ${{ fromJSON(needs.python-versions.outputs.versions-json) }}
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -101,10 +135,11 @@ jobs:
   server_integration_linux:
     name: Server Integration Linux Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    needs: python-versions
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.14"]
+        python-version: ${{ fromJSON(needs.python-versions.outputs.min-max-json) }}
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -191,6 +226,7 @@ jobs:
   linux-amd64:
     name: Build wheels on Linux x86_64
     runs-on: ubuntu-latest
+    needs: python-versions
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -206,7 +242,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x86_64
-          args: --release --out dist --interpreter 3.12 3.13 3.14
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
           sccache: "true"
           manylinux: auto
           docker-options: --pull always
@@ -221,6 +257,7 @@ jobs:
   linux-arm64:
     name: Build wheels on Linux ARM
     runs-on: ubuntu-24.04-arm
+    needs: python-versions
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -236,7 +273,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: aarch64
-          args: --release --out dist --interpreter 3.12 3.13 3.14
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
           sccache: "true"
           manylinux: auto
           docker-options: --pull always
@@ -251,6 +288,7 @@ jobs:
   macos:
     name: Build wheels on macOS
     runs-on: macos-latest
+    needs: python-versions
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -261,7 +299,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: universal2-apple-darwin
-          args: --release --out dist --interpreter 3.12 3.13 3.14
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
           sccache: "true"
 
       - name: Upload wheels
@@ -274,6 +312,7 @@ jobs:
   windows:
     name: Build wheels on Windows
     runs-on: windows-latest
+    needs: python-versions
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -284,7 +323,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x64
-          args: --release --out dist --interpreter 3.12 3.13 3.14
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
           sccache: "true"
 
       - name: Upload wheels
