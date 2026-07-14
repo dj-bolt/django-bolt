@@ -199,8 +199,29 @@ fn try_jwt_auth(
         validation.set_issuer(&[iss]);
     }
 
+    // Build the decoding key appropriately for the algorithm family. HMAC
+    // algorithms use the raw secret bytes directly; RSA/EC algorithms need
+    // `secret` parsed as a PEM-encoded public key instead - using
+    // `from_secret` for those would hand `decode` a key of the wrong kind,
+    // causing every valid asymmetric token to fail verification.
+    let key = match algorithm {
+        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
+            DecodingKey::from_secret(secret.as_bytes())
+        }
+        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
+            match DecodingKey::from_rsa_pem(secret.as_bytes()) {
+                Ok(key) => key,
+                Err(_) => return None,
+            }
+        }
+        Algorithm::ES256 | Algorithm::ES384 => match DecodingKey::from_ec_pem(secret.as_bytes()) {
+            Ok(key) => key,
+            Err(_) => return None,
+        },
+        _ => return None,
+    };
+
     // Decode token with the specified algorithm
-    let key = DecodingKey::from_secret(secret.as_bytes());
     match decode::<Claims>(token, &key, &validation) {
         Ok(token_data) => Some(AuthContext::from_jwt_claims(token_data.claims, "jwt")),
         Err(_) => None,

@@ -78,6 +78,7 @@ bolt-mcp = { workspace = true }
 
 [dependency-groups]
 dev = [
+    "cryptography>=41.0", # for RS256/EC JWT test keypairs
     "pytest-asyncio>=1.2.0",
     "pytest-django>=4.9.0",
     "pydantic>=2",
