@@ -61,7 +61,7 @@ yQIDAQAB
 api = BoltAPI()
 
 
-@api.get("/health")
+@api.get("/app-health")
 async def health():
     return {"status": "ok"}
 
