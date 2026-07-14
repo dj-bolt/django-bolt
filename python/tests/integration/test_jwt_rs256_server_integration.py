@@ -31,7 +31,7 @@ def test_rs256_jwt_over_real_server(make_server_project):
     project = app_module("jwt_rs256_user")
     token = make_token("rs256-user")
 
-    with make_server_project(api_module=project).start() as server:
+    with make_server_project(api_module=project).start(startup_path="/app-health") as server:
         ok = server.get("/whoami", headers={"Authorization": f"Bearer {token}"})
         assert ok.status_code == 200, ok.text
         assert ok.json()["user_id"] == "rs256-user"
