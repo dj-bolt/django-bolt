@@ -186,9 +186,16 @@ JWTAuthentication(
 
 Supported algorithms:
 
-- `HS256`, `HS384`, `HS512` - HMAC with SHA-2
-- `RS256`, `RS384`, `RS512` - RSA with SHA-2
-- `ES256`, `ES384`, `ES512` - ECDSA with SHA-2
+- `HS256`, `HS384`, `HS512` - HMAC with SHA-2 (`secret` is the shared secret)
+- `RS256`, `RS384`, `RS512` - RSA with SHA-2 (`secret` is a PEM public key)
+- `PS256`, `PS384`, `PS512` - RSA-PSS with SHA-2 (`secret` is a PEM public key)
+- `ES256`, `ES384` - ECDSA with SHA-2 (`secret` is a PEM public key)
+- `EdDSA` - Ed25519 (`secret` is a PEM public key)
+
+All algorithms in one backend must share a key family; unknown names or a
+malformed PEM fail at server startup. To verify tokens from an external
+provider (Clerk, Auth0, ...), pass the provider's PEM public key as
+`secret` with the matching asymmetric algorithm.
 
 ### Cookie-based tokens
 

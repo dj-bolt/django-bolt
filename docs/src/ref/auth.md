@@ -30,8 +30,8 @@ JWTAuthentication(
 
 | Parameter          | Type            | Default           | Description             |
 | ------------------ | --------------- | ----------------- | ----------------------- |
-| `secret`           | `str`           | Django SECRET_KEY | JWT signing secret      |
-| `algorithms`       | `list[str]`     | `["HS256"]`       | Allowed JWT algorithms  |
+| `secret`           | `str`           | Django SECRET_KEY | HMAC secret, or PEM public key for asymmetric algorithms |
+| `algorithms`       | `list[str]`     | `["HS256"]`       | Allowed JWT algorithms (token `alg` must be in this list) |
 | `header`           | `str`           | `"authorization"` | Header containing token |
 | `cookie`           | `str`           | `None`            | Cookie containing token (replaces `header` when set) |
 | `audience`         | `str`           | `None`            | Required `aud` claim    |
@@ -40,9 +40,42 @@ JWTAuthentication(
 
 #### Supported algorithms
 
-- HMAC: `HS256`, `HS384`, `HS512`
-- RSA: `RS256`, `RS384`, `RS512`
-- ECDSA: `ES256`, `ES384`, `ES512`
+- HMAC: `HS256`, `HS384`, `HS512` — `secret` is the shared secret
+- RSA: `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512` — `secret` is a PEM-encoded RSA public key
+- ECDSA: `ES256`, `ES384` — `secret` is a PEM-encoded EC public key
+- EdDSA: `EdDSA` (Ed25519) — `secret` is a PEM-encoded Ed25519 public key
+
+All algorithms in one backend must share a key family (you cannot mix
+`HS256` with `RS256`). Invalid configuration — an unknown algorithm name,
+mixed families, or a malformed PEM — fails at server startup with a
+descriptive error rather than rejecting every token at runtime.
+
+Verifying tokens from an external identity provider (Clerk, Auth0, etc.)
+works by passing the provider's PEM public key:
+
+```python
+JWTAuthentication(
+    secret=CLERK_PEM_PUBLIC_KEY,   # from the provider's dashboard
+    algorithms=["RS256"],
+    issuer="https://your-app.clerk.accounts.dev",
+)
+```
+
+#### Validation behavior
+
+All validation runs in Rust on the hot path, using a verification key
+prebuilt at startup:
+
+- The token's `alg` header must be in `algorithms`; anything else is
+  rejected before signature verification (prevents algorithm-confusion
+  attacks). JOSE header extension parameters of any JSON type are
+  tolerated per RFC 7515 §4.1.11 (Clerk and Auth0 emit non-string ones).
+- `exp` is required; `exp`/`nbf` are checked with 60 seconds of
+  clock-skew leeway.
+- `aud` may be a string or an array. It is only validated when
+  `audience` is configured; tokens carrying an `aud` claim are not
+  rejected just because no audience was configured.
+- When `issuer` is configured, tokens missing `iss` are rejected.
 
 ### APIKeyAuthentication
 

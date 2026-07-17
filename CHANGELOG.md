@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Asymmetric JWT algorithms (RS256/RS384/RS512/ES256/ES384) actually verify** - `JWTAuthentication` configured with a PEM public key and an asymmetric algorithm rejected every token: the decoding key was unconditionally built with `DecodingKey::from_secret()`, which is only valid for HMAC. The verification key is now built once at registration, branching on the algorithm family (HMAC secret, RSA/EC/Ed25519 PEM public key) — nothing is parsed per request. PS256/PS384/PS512 and EdDSA are newly supported; ES512 (never actually supported by the underlying crate) is removed from the docs. (#261)
+- **Tokens with non-string JOSE header parameters validate** - RFC 7515 §4.1.11 permits header extension parameters of any JSON type, and real providers use that (Clerk: `"oiat": <int>`; Auth0: `"gty": [...]`). The `jsonwebtoken` crate's `Header` type only accepts string extras, so such tokens failed to parse before signature verification even ran ([jsonwebtoken#489](https://github.com/Keats/jsonwebtoken/issues/489), fixed upstream only in the unreleased v11). Validation now owns the decode loop — lenient header parse, `crypto::verify`, in-line claims checks — so provider tokens verify today.
+- **`aud` claims matching real-world tokens** - An array-valued `aud` (Auth0 default) failed claims deserialization, and a token merely *carrying* an `aud` claim was rejected when no audience was configured. `aud` now accepts a string or an array and is only validated when `audience=` is set.
+- **The full `algorithms` list is honored** - Only the first configured algorithm was ever used for verification. A token's `alg` header must now name any algorithm in the configured list (all must share one key family).
+
+### Security
+
+- **Invalid auth configuration fails at startup instead of silently serving unauthenticated** - A JWT backend with a malformed PEM, an unknown algorithm name (previously silently coerced to HS256), or mixed key families — and any route metadata that fails to parse — now aborts startup (and raises in `TestClient`) with a descriptive error. Previously the backend or route metadata was silently dropped, leaving the route serving without its configured authentication.
+- **Issuer enforcement is strict** - When `issuer=` is configured, tokens missing the `iss` claim are now rejected (previously accepted).
+- **JWT rejection reasons are logged at debug level** - Failures (expired, bad signature, algorithm not allowed, audience/issuer mismatch) were silently collapsed into a generic 401 with no trace; they are now visible with `RUST_LOG=debug`.
+
 ## [0.9.0]
 
 ### Added

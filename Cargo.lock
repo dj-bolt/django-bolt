@@ -880,6 +880,7 @@ dependencies = [
  "actix-web",
  "actix-web-actors",
  "ahash 0.8.12",
+ "base64",
  "brotli",
  "bytes",
  "chrono",

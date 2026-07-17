@@ -32,6 +32,7 @@ matchit = "0.9"
 # Middleware dependencies
 governor = "0.10"  # Rate limiting
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }  # JWT authentication
+base64 = "0.22"  # base64url token-segment decoding for the JWT validation loop
 dashmap = "6"  # Fast concurrent hashmap for rate limiting
 parking_lot = "0.12"  # Fast RwLock for shared state
 serde = { version = "1", features = ["derive"] }

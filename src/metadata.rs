@@ -4,13 +4,14 @@
 /// Rust enums at registration time, eliminating per-request GIL overhead.
 use actix_web::http::header::HeaderValue;
 use ahash::{AHashMap, AHashSet};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
 use crate::form_parsing::FileFieldConstraints;
-use crate::middleware::auth::AuthBackend;
+use crate::middleware::auth::{build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend};
 use crate::permissions::Guard;
 
 /// Request value source for Rust-side argument prebinding.
@@ -505,13 +506,12 @@ impl RouteMetadata {
             }
         }
 
-        // Parse auth backends
+        // Parse auth backends. Failures propagate: a backend that fails to
+        // parse must abort startup, not leave the route unauthenticated.
         if let Ok(Some(auth_list)) = py_meta.get_item("auth_backends") {
             if let Ok(py_backends) = auth_list.extract::<Vec<HashMap<String, Py<PyAny>>>>() {
                 for backend_dict in py_backends {
-                    if let Some(backend) = parse_auth_backend(&backend_dict, py) {
-                        auth_backends.push(backend);
-                    }
+                    auth_backends.push(parse_auth_backend(&backend_dict, py)?);
                 }
             }
         }
@@ -811,17 +811,35 @@ fn parse_rate_limit_config(
     Some(config)
 }
 
-/// Parse a single auth backend from Python dict
-fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<AuthBackend> {
-    let backend_type = dict.get("type")?.extract::<String>(py).ok()?;
+/// Parse a single auth backend from Python dict.
+///
+/// Invalid auth configuration is a hard error, not a skip: silently dropping
+/// a backend would leave the route serving without the authentication the
+/// user configured.
+fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<AuthBackend> {
+    let backend_type = dict
+        .get("type")
+        .ok_or_else(|| PyValueError::new_err("Auth backend metadata missing 'type'"))?
+        .extract::<String>(py)?;
 
     match backend_type.as_str() {
         "jwt" => {
-            let secret = dict.get("secret")?.extract::<String>(py).ok()?;
-            let algorithms = dict
+            let secret = dict
+                .get("secret")
+                .ok_or_else(|| PyValueError::new_err("JWT auth backend missing 'secret'"))?
+                .extract::<String>(py)?;
+            let algorithm_names = dict
                 .get("algorithms")
                 .and_then(|a| a.extract::<Vec<String>>(py).ok())
                 .unwrap_or_else(|| vec!["HS256".to_string()]);
+            let algorithms = algorithm_names
+                .iter()
+                .map(|name| parse_jwt_algorithm(name).map_err(PyValueError::new_err))
+                .collect::<PyResult<Vec<_>>>()?;
+            // Key material is validated and parsed once here — the request
+            // path never touches the raw secret/PEM again.
+            let key =
+                build_jwt_decoding_key(&secret, &algorithms).map_err(PyValueError::new_err)?;
             let header = dict
                 .get("header")
                 .and_then(|h| h.extract::<String>(py).ok())
@@ -837,8 +855,8 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<A
                 .get("issuer")
                 .and_then(|i| i.extract::<String>(py).ok());
 
-            Some(AuthBackend::JWT {
-                secret,
+            Ok(AuthBackend::JWT {
+                key,
                 algorithms,
                 header,
                 cookie,
@@ -863,13 +881,16 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<A
                 .and_then(|kp| kp.extract::<HashMap<String, Vec<String>>>(py).ok())
                 .unwrap_or_default();
 
-            Some(AuthBackend::APIKey {
+            Ok(AuthBackend::APIKey {
                 api_keys,
                 header,
                 key_permissions,
             })
         }
-        _ => None,
+        other => Err(PyValueError::new_err(format!(
+            "Unknown auth backend type '{}'",
+            other
+        ))),
     }
 }
 

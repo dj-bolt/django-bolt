@@ -441,14 +441,19 @@ pub fn register_test_middleware_metadata(
 
     for (handler_id, meta) in metadata {
         if let Ok(py_dict) = meta.bind(py).cast::<PyDict>() {
-            if let Ok(parsed) = RouteMetadata::from_python(py_dict, py) {
-                // Inject global CORS config if route doesn't have explicit config
-                let mut route_meta = parsed;
-                if route_meta.cors_config.is_none() && !route_meta.plan.skip_cors() {
-                    route_meta.cors_config = app.global_cors_config.clone();
-                }
-                parsed_metadata.insert(handler_id, route_meta);
+            // Propagate parse failures so tests fail loudly instead of the
+            // route silently losing its auth/middleware config.
+            let mut route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Failed to parse route metadata for handler {}: {}",
+                    handler_id, e
+                ))
+            })?;
+            // Inject global CORS config if route doesn't have explicit config
+            if route_meta.cors_config.is_none() && !route_meta.plan.skip_cors() {
+                route_meta.cors_config = app.global_cors_config.clone();
             }
+            parsed_metadata.insert(handler_id, route_meta);
         }
     }
 
