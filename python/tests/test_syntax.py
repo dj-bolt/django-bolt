@@ -6,8 +6,9 @@ from typing import Annotated
 
 import msgspec
 import pytest
+from django.conf import settings
 
-from django_bolt import JSON, BoltAPI, Response, StreamingResponse
+from django_bolt import JSON, BoltAPI, Response, StreamingResponse, UploadFile
 from django_bolt.exceptions import HTTPException
 from django_bolt.param_functions import Cookie, Depends, Form, Header, Query
 from django_bolt.param_functions import File as FileParam
@@ -758,17 +759,28 @@ def test_large_file_upload_rejected_by_default(api):
         assert response.status_code in (413, 422), f"Expected 413 or 422, got {response.status_code}: {response.text}"
 
 
-def test_large_file_upload_with_increased_limit(api):
-    """Test that file uploads within the limit work correctly.
+def test_large_file_upload_with_increased_limit():
+    """Raising BOLT_MAX_UPLOAD_SIZE lets through an upload the default limit would reject."""
+    had_attr = hasattr(settings, "BOLT_MAX_UPLOAD_SIZE")
+    prev = getattr(settings, "BOLT_MAX_UPLOAD_SIZE", None)
+    settings.BOLT_MAX_UPLOAD_SIZE = 4 * 1024 * 1024
+    try:
+        api = BoltAPI()
 
-    Note: Upload size limits are now compiled into route metadata at startup.
-    The default max_upload_size is 1MB, set in middleware/compiler.py.
-    Testing dynamic BOLT_MAX_UPLOAD_SIZE changes requires server restart.
-    """
-    # This test is skipped because max_upload_size is now compiled at route registration time
-    # and cannot be changed dynamically. To test increased limits, need to configure
-    # max_upload_size in route metadata before server starts.
-    pytest.skip("Upload size limits are now compiled at route registration time (Rust implementation)")
+        @api.post("/upload")
+        async def upload(avatar: UploadFile = FileParam()):
+            return {"size": avatar.size}
+
+        content = b"x" * (2 * 1024 * 1024)
+        with TestClient(api) as test_client:
+            response = test_client.post("/upload", files={"avatar": ("big.bin", content, "application/octet-stream")})
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
+        assert response.json()["size"] == len(content)
+    finally:
+        if had_attr:
+            settings.BOLT_MAX_UPLOAD_SIZE = prev
+        else:
+            delattr(settings, "BOLT_MAX_UPLOAD_SIZE")
 
 
 def test_error_responses_have_cors_headers(api):
