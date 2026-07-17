@@ -47,6 +47,15 @@ from .revocation import (
 # JWT Token handling
 from .token import Token
 
+# Access + refresh token lifecycle
+from .tokens import (
+    TokenPair,
+    TokenRotationError,
+    create_token_pair,
+    rotate_refresh_token,
+    set_token_cookies,
+)
+
 # User loading for request.user
 from .user_loader import (
     get_registered_backend,
@@ -77,6 +86,12 @@ __all__ = [
     "get_current_user",
     "extract_user_id_from_context",
     "get_auth_context",
+    # Token pair lifecycle (access + refresh)
+    "TokenPair",
+    "TokenRotationError",
+    "create_token_pair",
+    "rotate_refresh_token",
+    "set_token_cookies",
     # Revocation (optional)
     "RevocationStore",
     "InMemoryRevocation",

@@ -540,14 +540,10 @@ pub async fn handle_websocket_upgrade_with_handler(
                     // Guards passed, continue with WebSocket upgrade
                 }
                 AuthGuardResult::Unauthorized => {
-                    return Ok(HttpResponse::Unauthorized()
-                        .content_type("application/json")
-                        .body(r#"{"detail":"Authentication required"}"#));
+                    return Ok(crate::responses::error_401());
                 }
                 AuthGuardResult::Forbidden => {
-                    return Ok(HttpResponse::Forbidden()
-                        .content_type("application/json")
-                        .body(r#"{"detail":"Permission denied"}"#));
+                    return Ok(crate::responses::error_403());
                 }
             }
         }

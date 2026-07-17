@@ -30,12 +30,18 @@ JWTAuthentication(
 
 | Parameter          | Type            | Default           | Description             |
 | ------------------ | --------------- | ----------------- | ----------------------- |
-| `secret`           | `str`           | Django SECRET_KEY | HMAC secret, or PEM public key for asymmetric algorithms |
+| `secret`           | `str`           | Django SECRET_KEY | HMAC secret (also accepts a PEM public key for compatibility) |
+| `public_key`       | `str`           | `None`            | PEM public key for asymmetric algorithms (preferred over `secret`) |
 | `algorithms`       | `list[str]`     | `["HS256"]`       | Allowed JWT algorithms (token `alg` must be in this list) |
 | `header`           | `str`           | `"authorization"` | Header containing token |
 | `cookie`           | `str`           | `None`            | Cookie containing token (replaces `header` when set) |
 | `audience`         | `str`           | `None`            | Required `aud` claim    |
 | `issuer`           | `str`           | `None`            | Required `iss` claim    |
+| `leeway`           | `int`           | `60`              | Clock-skew tolerance (seconds) for `exp`/`nbf` |
+| `token_type`       | `str`           | `None`            | Required `typ` claim (e.g. `"refresh"` for a rotation endpoint); access routes reject `typ:"refresh"` |
+| `csrf`             | `bool`          | `True`            | For cookie tokens, enforce a cross-site origin check on unsafe methods |
+| `jwks_url`         | `str`           | `None`            | JWKS endpoint URL; keys fetched at startup and selected by token `kid` |
+| `jwks`             | `dict \| str`   | `None`            | JWKS document supplied directly (alternative to `jwks_url`) |
 | `revocation_store` | RevocationStore | `None`            | Token revocation store  |
 
 #### Supported algorithms

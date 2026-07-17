@@ -10,10 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
-/// Clock-skew tolerance (seconds) applied to `exp`/`nbf` validation.
-/// Matches the default leeway of `jsonwebtoken::Validation`.
-const CLOCK_SKEW_LEEWAY_SECS: i64 = 60;
-
 /// JWT `aud` claim: RFC 7519 §4.1.3 allows a single string or an array of
 /// strings. Real-world providers (e.g. Auth0) emit both forms.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +37,7 @@ pub struct Claims {
     pub aud: Option<Audience>,            // Audience (string or array)
     pub iss: Option<String>,              // Issuer
     pub jti: Option<String>,              // JWT ID
+    pub typ: Option<String>,              // Token type ("access"/"refresh")
     pub is_staff: Option<bool>,           // Staff status
     pub is_superuser: Option<bool>,       // Admin/superuser status
     pub is_admin: Option<bool>,           // Alternative admin field
@@ -102,22 +99,58 @@ impl AuthContext {
     }
 }
 
+/// Where a JWT backend gets its verification key(s), resolved once at
+/// registration. Both variants avoid any per-request key parsing.
+#[derive(Debug, Clone)]
+pub enum JwtKeySource {
+    /// A single key from an HMAC secret or PEM public key.
+    Static(DecodingKey),
+    /// A JWKS: keys indexed by `kid`, selected per request from the token's
+    /// `kid` header (RS/ES providers like Clerk, Auth0, Okta).
+    Jwks(HashMap<String, DecodingKey>),
+}
+
+impl JwtKeySource {
+    /// Select the verification key for a token, given its `kid` header.
+    /// For a JWKS with exactly one key the `kid` may be omitted.
+    fn select(&self, kid: Option<&str>) -> Option<&DecodingKey> {
+        match self {
+            JwtKeySource::Static(key) => Some(key),
+            JwtKeySource::Jwks(keys) => match kid {
+                Some(kid) => keys.get(kid),
+                None if keys.len() == 1 => keys.values().next(),
+                None => None,
+            },
+        }
+    }
+}
+
 /// Authentication backend configuration
 #[derive(Debug, Clone)]
 pub enum AuthBackend {
     JWT {
-        /// Verification key, built once at registration from the configured
-        /// secret (HMAC) or PEM public key (RSA/EC/Ed25519). Never parsed on
-        /// the request path.
-        key: DecodingKey,
+        /// Verification key(s), built once at registration from the configured
+        /// secret (HMAC), PEM public key (RSA/EC/Ed25519), or JWKS. Never
+        /// parsed on the request path.
+        keys: JwtKeySource,
         /// Allowlist of accepted algorithms. A token whose `alg` header is
         /// not in this list is rejected before signature verification, so a
-        /// token can never downgrade to a different family than `key`.
+        /// token can never downgrade to a different family than `keys`.
         algorithms: Vec<Algorithm>,
         header: String,
         cookie: Option<String>,
         audience: Option<String>,
         issuer: Option<String>,
+        /// Clock-skew tolerance (seconds) for `exp`/`nbf`.
+        leeway: i64,
+        /// Expected `typ` claim. `Some(t)` requires the token to carry
+        /// exactly `typ == t` (e.g. a rotation endpoint sets "refresh").
+        /// `None` (normal access routes) rejects `typ == "refresh"` so a
+        /// refresh token can never authenticate a regular endpoint.
+        token_type: Option<String>,
+        /// Whether this cookie-sourced backend enforces CSRF on unsafe
+        /// methods. Meaningful only when `cookie` is `Some`.
+        cookie_csrf: bool,
     },
     APIKey {
         api_keys: HashSet<String>,
@@ -185,6 +218,29 @@ pub fn build_jwt_decoding_key(
     }
 }
 
+/// Build a `kid -> DecodingKey` map from a JWKS JSON document at
+/// registration time. The document is typically fetched from a provider's
+/// `jwks_url` (Clerk, Auth0, ...) by Python at startup and handed here as a
+/// string. Keys without a `kid` are skipped (they can't be selected).
+pub fn build_jwks_key_source(jwks_json: &str) -> Result<JwtKeySource, String> {
+    let set: jsonwebtoken::jwk::JwkSet = serde_json::from_str(jwks_json)
+        .map_err(|e| format!("Invalid JWKS document for JWT auth: {}", e))?;
+    let mut keys = HashMap::new();
+    for jwk in &set.keys {
+        let kid = match &jwk.common.key_id {
+            Some(kid) => kid.clone(),
+            None => continue,
+        };
+        let key = DecodingKey::from_jwk(jwk)
+            .map_err(|e| format!("Invalid JWK '{}' in JWKS for JWT auth: {}", kid, e))?;
+        keys.insert(kid, key);
+    }
+    if keys.is_empty() {
+        return Err("JWKS document contained no usable keys (each key needs a 'kid')".to_string());
+    }
+    Ok(JwtKeySource::Jwks(keys))
+}
+
 /// Authenticate using configured backends and return AuthContext
 /// Returns None if no authentication was successful
 pub fn authenticate(
@@ -194,21 +250,26 @@ pub fn authenticate(
     for backend in backends {
         match backend {
             AuthBackend::JWT {
-                key,
+                keys,
                 algorithms,
                 header,
                 cookie,
                 audience,
                 issuer,
+                leeway,
+                token_type,
+                cookie_csrf: _,
             } => {
                 if let Some(ctx) = try_jwt_auth(
                     headers,
-                    key,
+                    keys,
                     algorithms,
                     header,
                     cookie.as_deref(),
                     audience.as_deref(),
                     issuer.as_deref(),
+                    *leeway,
+                    token_type.as_deref(),
                 ) {
                     return Some(ctx);
                 }
@@ -225,6 +286,23 @@ pub fn authenticate(
         }
     }
     None
+}
+
+/// Whether any JWT backend on the route reads its token from a cookie with
+/// CSRF enforcement enabled. Cookie-sourced credentials are automatically
+/// attached by the browser, so state-changing requests to such routes need
+/// a cross-site origin check (see `validation::passes_cookie_csrf`).
+pub fn route_requires_cookie_csrf(backends: &[AuthBackend]) -> bool {
+    backends.iter().any(|b| {
+        matches!(
+            b,
+            AuthBackend::JWT {
+                cookie: Some(_),
+                cookie_csrf: true,
+                ..
+            }
+        )
+    })
 }
 
 /// Find a cookie value by name in a raw Cookie header string.
@@ -253,6 +331,8 @@ fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<&'a str> {
 #[derive(Deserialize)]
 struct TokenHeader {
     alg: String,
+    #[serde(default)]
+    kid: Option<String>,
 }
 
 /// Decode and validate a JWT against a prebuilt key and algorithm allowlist.
@@ -261,12 +341,15 @@ struct TokenHeader {
 /// JOSE header is parsed leniently (see [`TokenHeader`]) and claims
 /// validation matches real-world tokens (`aud` as string or array; `aud`
 /// ignored when no audience is configured).
+#[allow(clippy::too_many_arguments)]
 fn decode_and_validate(
     token: &str,
-    key: &DecodingKey,
+    keys: &JwtKeySource,
     algorithms: &[Algorithm],
     audience: Option<&str>,
     issuer: Option<&str>,
+    leeway: i64,
+    token_type: Option<&str>,
 ) -> Option<Claims> {
     let (message, signature) = token.rsplit_once('.')?;
     let (header_b64, claims_b64) = message.split_once('.')?;
@@ -284,6 +367,16 @@ fn decode_and_validate(
         );
         return None;
     }
+
+    // Select the verification key: the single static key, or the JWKS key
+    // matching the token's `kid`.
+    let key = match keys.select(header.kid.as_deref()) {
+        Some(key) => key,
+        None => {
+            log::debug!("JWT rejected: no key matches the token's kid");
+            return None;
+        }
+    };
 
     match crypto::verify(signature, message.as_bytes(), key, alg) {
         Ok(true) => {}
@@ -306,9 +399,26 @@ fn decode_and_validate(
         }
     };
 
+    // Token-type separation (symmetric enforcement): an expected type must
+    // match exactly; routes with no expectation never accept refresh tokens.
+    match token_type {
+        Some(expected) => {
+            if claims.typ.as_deref() != Some(expected) {
+                log::debug!("JWT rejected: typ claim does not match expected token type");
+                return None;
+            }
+        }
+        None => {
+            if claims.typ.as_deref() == Some("refresh") {
+                log::debug!("JWT rejected: refresh token used on an access route");
+                return None;
+            }
+        }
+    }
+
     let now = get_current_timestamp() as i64;
     match claims.exp {
-        Some(exp) if exp >= now - CLOCK_SKEW_LEEWAY_SECS => {}
+        Some(exp) if exp >= now - leeway => {}
         Some(_) => {
             log::debug!("JWT rejected: token expired");
             return None;
@@ -319,7 +429,7 @@ fn decode_and_validate(
         }
     }
     if let Some(nbf) = claims.nbf {
-        if nbf > now + CLOCK_SKEW_LEEWAY_SECS {
+        if nbf > now + leeway {
             log::debug!("JWT rejected: token not yet valid (nbf)");
             return None;
         }
@@ -349,14 +459,17 @@ fn decode_and_validate(
     Some(claims)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_jwt_auth(
     headers: &AHashMap<String, String>,
-    key: &DecodingKey,
+    keys: &JwtKeySource,
     algorithms: &[Algorithm],
     header_name: &str,
     cookie_name: Option<&str>,
     audience: Option<&str>,
     issuer: Option<&str>,
+    leeway: i64,
+    token_type: Option<&str>,
 ) -> Option<AuthContext> {
     // Extract raw token: the named cookie when configured, the auth header
     // otherwise. No fallback between sources.
@@ -370,7 +483,9 @@ fn try_jwt_auth(
     // Remove "Bearer " prefix if present
     let token = raw_token.strip_prefix("Bearer ").unwrap_or(raw_token);
 
-    let claims = decode_and_validate(token, key, algorithms, audience, issuer)?;
+    let claims = decode_and_validate(
+        token, keys, algorithms, audience, issuer, leeway, token_type,
+    )?;
     Some(AuthContext::from_jwt_claims(claims, "jwt"))
 }
 
@@ -460,6 +575,7 @@ pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: P
         }
         set_if_some!(claims_dict, py, "iss", &claims.iss);
         set_if_some!(claims_dict, py, "jti", &claims.jti);
+        set_if_some!(claims_dict, py, "typ", &claims.typ);
 
         // Extra claims keys come from the JWT payload — can't be interned
         // statically since the set is open. set_item(&str, ...) handles them.
@@ -494,8 +610,8 @@ mod tests {
 
     const SECRET: &str = "test-secret";
 
-    fn hs256_key() -> DecodingKey {
-        DecodingKey::from_secret(SECRET.as_bytes())
+    fn hs256_key() -> JwtKeySource {
+        JwtKeySource::Static(DecodingKey::from_secret(SECRET.as_bytes()))
     }
 
     /// Build a token from raw JSON parts so tests can emit headers that
@@ -527,8 +643,16 @@ mod tests {
         let claims_json = format!(r#"{{"sub":"42","exp":{}}}"#, future_exp());
         let token = sign_token(header, &claims_json, Algorithm::HS256);
 
-        let claims = decode_and_validate(&token, &hs256_key(), &[Algorithm::HS256], None, None)
-            .expect("token with non-string header extras must validate");
+        let claims = decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None,
+        )
+        .expect("token with non-string header extras must validate");
         assert_eq!(claims.sub.as_deref(), Some("42"));
     }
 
@@ -538,7 +662,16 @@ mod tests {
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
         assert!(
-            decode_and_validate(&token, &hs256_key(), &[Algorithm::HS384], None, None).is_none(),
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS384],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none(),
             "HS256 token must be rejected when only HS384 is allowed"
         );
     }
@@ -550,7 +683,7 @@ mod tests {
 
         let allowed = [Algorithm::HS256, Algorithm::HS384];
         assert!(
-            decode_and_validate(&token, &hs256_key(), &allowed, None, None).is_some(),
+            decode_and_validate(&token, &hs256_key(), &allowed, None, None, 60, None).is_some(),
             "every algorithm in the configured list must be usable, not just the first"
         );
     }
@@ -565,9 +698,16 @@ mod tests {
             format!("{}A", &token[..token.len() - 1])
         };
 
-        assert!(
-            decode_and_validate(&tampered, &hs256_key(), &[Algorithm::HS256], None, None).is_none()
-        );
+        assert!(decode_and_validate(
+            &tampered,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -578,18 +718,32 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(
-            decode_and_validate(&token, &hs256_key(), &[Algorithm::HS256], None, None).is_none()
-        );
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None
+        )
+        .is_none());
     }
 
     #[test]
     fn rejects_missing_exp() {
         let token = sign_token(r#"{"alg":"HS256"}"#, r#"{"sub":"42"}"#, Algorithm::HS256);
 
-        assert!(
-            decode_and_validate(&token, &hs256_key(), &[Algorithm::HS256], None, None).is_none()
-        );
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -601,9 +755,16 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(
-            decode_and_validate(&token, &hs256_key(), &[Algorithm::HS256], None, None).is_none()
-        );
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -614,15 +775,23 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(
-            decode_and_validate(&token, &hs256_key(), &[Algorithm::HS256], Some("api"), None)
-                .is_some()
-        );
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            Some("api"),
+            None,
+            60,
+            None
+        )
+        .is_some());
         assert!(decode_and_validate(
             &token,
             &hs256_key(),
             &[Algorithm::HS256],
             Some("mobile"),
+            None,
+            60,
             None
         )
         .is_none());
@@ -635,9 +804,16 @@ mod tests {
         let claims_json = format!(r#"{{"sub":"42","exp":{},"aud":"api"}}"#, future_exp());
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(
-            decode_and_validate(&token, &hs256_key(), &[Algorithm::HS256], None, None).is_some()
-        );
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None
+        )
+        .is_some());
     }
 
     #[test]
@@ -653,7 +829,9 @@ mod tests {
             &hs256_key(),
             &[Algorithm::HS256],
             None,
-            Some("https://issuer.example")
+            Some("https://issuer.example"),
+            60,
+            None
         )
         .is_some());
         assert!(decode_and_validate(
@@ -661,7 +839,9 @@ mod tests {
             &hs256_key(),
             &[Algorithm::HS256],
             None,
-            Some("https://other.example")
+            Some("https://other.example"),
+            60,
+            None
         )
         .is_none());
 
@@ -673,7 +853,9 @@ mod tests {
             &hs256_key(),
             &[Algorithm::HS256],
             None,
-            Some("https://issuer.example")
+            Some("https://issuer.example"),
+            60,
+            None
         )
         .is_none());
     }
@@ -692,5 +874,136 @@ mod tests {
         assert!(parse_jwt_algorithm("none").is_err());
         assert!(parse_jwt_algorithm("RS256").is_ok());
         assert!(parse_jwt_algorithm("EdDSA").is_ok());
+    }
+
+    #[test]
+    fn refresh_token_rejected_on_access_route() {
+        let claims_json = format!(r#"{{"sub":"42","exp":{},"typ":"refresh"}}"#, future_exp());
+        let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
+
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none(),
+            "typ:\"refresh\" must never authenticate a route with no expected token type"
+        );
+    }
+
+    #[test]
+    fn token_type_expectation_enforced_both_ways() {
+        let refresh_json = format!(r#"{{"sub":"42","exp":{},"typ":"refresh"}}"#, future_exp());
+        let refresh = sign_token(r#"{"alg":"HS256"}"#, &refresh_json, Algorithm::HS256);
+        let access_json = format!(r#"{{"sub":"42","exp":{}}}"#, future_exp());
+        let access = sign_token(r#"{"alg":"HS256"}"#, &access_json, Algorithm::HS256);
+
+        // A rotation endpoint expecting "refresh" accepts refresh tokens...
+        assert!(decode_and_validate(
+            &refresh,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            Some("refresh")
+        )
+        .is_some());
+        // ...and rejects access tokens (no typ at all).
+        assert!(decode_and_validate(
+            &access,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            Some("refresh")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn access_typ_accepted_on_access_route() {
+        // Tokens minted with an explicit typ:"access" work on normal routes.
+        let claims_json = format!(r#"{{"sub":"42","exp":{},"typ":"access"}}"#, future_exp());
+        let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
+
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn jwks_selects_key_by_kid() {
+        // Two HMAC "keys" in a JWKS-shaped source; the token's kid selects
+        // which one verifies. (HMAC in a JwkSource is unusual but lets us
+        // build the map without RSA machinery in a unit test.)
+        let mut keys = HashMap::new();
+        keys.insert("key-a".to_string(), DecodingKey::from_secret(b"secret-a"));
+        keys.insert("key-b".to_string(), DecodingKey::from_secret(b"secret-b"));
+        let source = JwtKeySource::Jwks(keys);
+
+        assert!(source.select(Some("key-a")).is_some());
+        assert!(source.select(Some("key-b")).is_some());
+        assert!(source.select(Some("key-c")).is_none());
+        // Ambiguous without a kid when more than one key exists.
+        assert!(source.select(None).is_none());
+    }
+
+    #[test]
+    fn jwks_without_kid_uses_sole_key() {
+        let mut keys = HashMap::new();
+        keys.insert("only".to_string(), DecodingKey::from_secret(b"s"));
+        let source = JwtKeySource::Jwks(keys);
+        assert!(source.select(None).is_some());
+    }
+
+    #[test]
+    fn build_jwks_rejects_empty_or_invalid() {
+        assert!(build_jwks_key_source("not json").is_err());
+        assert!(build_jwks_key_source(r#"{"keys":[]}"#).is_err());
+    }
+
+    #[test]
+    fn leeway_is_configurable() {
+        // Expired 30s ago: accepted with 60s leeway, rejected with 0.
+        let claims_json = format!(
+            r#"{{"sub":"42","exp":{}}}"#,
+            get_current_timestamp() as i64 - 30
+        );
+        let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
+
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None
+        )
+        .is_some());
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            0,
+            None
+        )
+        .is_none());
     }
 }

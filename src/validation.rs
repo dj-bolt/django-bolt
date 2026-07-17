@@ -42,6 +42,64 @@ pub enum AuthGuardResult {
     Forbidden,
 }
 
+/// Whether an HTTP method is "safe" (RFC 9110 §9.2.1) — read-only and thus
+/// exempt from CSRF checks.
+#[inline(always)]
+fn is_safe_method(method: &str) -> bool {
+    matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE")
+}
+
+/// Cross-site request forgery check for cookie-authenticated routes.
+///
+/// Bolt endpoints bypass Django's `CsrfViewMiddleware`, so a JWT read from a
+/// cookie has no CSRF protection unless the framework adds it. When any JWT
+/// backend on the route sources its token from a cookie, an unsafe-method
+/// request must prove it did not originate cross-site. This is pure header
+/// inspection (no state, no body): the browser-set `Sec-Fetch-Site` is
+/// authoritative when present, falling back to an `Origin`/`Referer` host
+/// comparison against the request `Host` for older clients.
+///
+/// Returns `true` when the request is allowed to proceed.
+#[inline]
+pub fn passes_cookie_csrf(method: &str, headers: &AHashMap<String, String>) -> bool {
+    if is_safe_method(method) {
+        return true;
+    }
+
+    // Fetch metadata sends `Sec-Fetch-Site` on every request in modern
+    // browsers; `same-origin`/`none` are trusted, everything else (cross-site,
+    // same-site subdomain) is rejected for a state-changing cookie request.
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return matches!(site.as_str(), "same-origin" | "none");
+    }
+
+    // Fallback: compare the Origin (or Referer) host to the request Host.
+    let host = match headers.get("host") {
+        Some(h) => h.as_str(),
+        None => return false, // No Host to compare against — refuse.
+    };
+    if let Some(origin) = headers.get("origin") {
+        return origin_host_matches(origin, host);
+    }
+    if let Some(referer) = headers.get("referer") {
+        return origin_host_matches(referer, host);
+    }
+    // No Sec-Fetch-Site, no Origin, no Referer on an unsafe request: a
+    // browser would have sent at least one, so this is not a same-origin
+    // browser form post. Refuse.
+    false
+}
+
+/// Compare the host authority of a URL (`https://example.com:443/path`)
+/// against a request `Host` header value.
+fn origin_host_matches(url: &str, host: &str) -> bool {
+    // Strip scheme.
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    // Authority ends at the first '/'.
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    authority == host
+}
+
 /// Validate authentication and evaluate guards
 /// This combines auth + guards into a single reusable flow
 ///
@@ -131,5 +189,60 @@ mod tests {
         let headers = AHashMap::new();
         let result = validate_auth_and_guards(&headers, &[], &[]);
         matches!(result, AuthGuardResult::Allow(None));
+    }
+
+    fn headers_with(pairs: &[(&str, &str)]) -> AHashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn csrf_safe_methods_always_pass() {
+        let headers = headers_with(&[("sec-fetch-site", "cross-site")]);
+        assert!(passes_cookie_csrf("GET", &headers));
+        assert!(passes_cookie_csrf("HEAD", &headers));
+        assert!(passes_cookie_csrf("OPTIONS", &headers));
+    }
+
+    #[test]
+    fn csrf_sec_fetch_site_is_authoritative() {
+        assert!(passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("sec-fetch-site", "same-origin")])
+        ));
+        assert!(passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("sec-fetch-site", "none")])
+        ));
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("sec-fetch-site", "cross-site")])
+        ));
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("sec-fetch-site", "same-site")])
+        ));
+    }
+
+    #[test]
+    fn csrf_origin_host_fallback() {
+        assert!(passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("host", "example.com"), ("origin", "https://example.com")])
+        ));
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("host", "example.com"), ("origin", "https://evil.com")])
+        ));
+    }
+
+    #[test]
+    fn csrf_unsafe_request_without_any_origin_signal_is_refused() {
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("host", "example.com")])
+        ));
     }
 }

@@ -11,7 +11,9 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
 use crate::form_parsing::FileFieldConstraints;
-use crate::middleware::auth::{build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend};
+use crate::middleware::auth::{
+    build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
+};
 use crate::permissions::Guard;
 
 /// Request value source for Rust-side argument prebinding.
@@ -824,10 +826,6 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
 
     match backend_type.as_str() {
         "jwt" => {
-            let secret = dict
-                .get("secret")
-                .ok_or_else(|| PyValueError::new_err("JWT auth backend missing 'secret'"))?
-                .extract::<String>(py)?;
             let algorithm_names = dict
                 .get("algorithms")
                 .and_then(|a| a.extract::<Vec<String>>(py).ok())
@@ -837,9 +835,24 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
                 .map(|name| parse_jwt_algorithm(name).map_err(PyValueError::new_err))
                 .collect::<PyResult<Vec<_>>>()?;
             // Key material is validated and parsed once here — the request
-            // path never touches the raw secret/PEM again.
-            let key =
-                build_jwt_decoding_key(&secret, &algorithms).map_err(PyValueError::new_err)?;
+            // path never touches the raw secret/PEM/JWKS again. A JWKS
+            // document (fetched by Python from the provider's jwks_url) takes
+            // precedence over a single secret when both are present.
+            let jwks = dict
+                .get("jwks")
+                .and_then(|j| j.extract::<Option<String>>(py).ok())
+                .flatten();
+            let keys = if let Some(jwks_json) = jwks {
+                build_jwks_key_source(&jwks_json).map_err(PyValueError::new_err)?
+            } else {
+                let secret = dict
+                    .get("secret")
+                    .ok_or_else(|| PyValueError::new_err("JWT auth backend missing 'secret'"))?
+                    .extract::<String>(py)?;
+                JwtKeySource::Static(
+                    build_jwt_decoding_key(&secret, &algorithms).map_err(PyValueError::new_err)?,
+                )
+            };
             let header = dict
                 .get("header")
                 .and_then(|h| h.extract::<String>(py).ok())
@@ -854,14 +867,29 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
             let issuer = dict
                 .get("issuer")
                 .and_then(|i| i.extract::<String>(py).ok());
+            let leeway = dict
+                .get("leeway")
+                .and_then(|l| l.extract::<i64>(py).ok())
+                .unwrap_or(60);
+            let token_type = dict
+                .get("token_type")
+                .and_then(|t| t.extract::<Option<String>>(py).ok())
+                .flatten();
+            let cookie_csrf = dict
+                .get("cookie_csrf")
+                .and_then(|c| c.extract::<bool>(py).ok())
+                .unwrap_or(true);
 
             Ok(AuthBackend::JWT {
-                key,
+                keys,
                 algorithms,
                 header,
                 cookie,
                 audience,
                 issuer,
+                leeway,
+                token_type,
+                cookie_csrf,
             })
         }
         "api_key" => {

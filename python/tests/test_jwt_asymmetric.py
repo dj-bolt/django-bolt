@@ -26,6 +26,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from django.core.exceptions import ImproperlyConfigured
 
 from django_bolt import BoltAPI
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
@@ -75,7 +76,13 @@ def client():
     add_route("/hs-multi", JWTAuthentication(secret=HS_SECRET, algorithms=["HS256", "HS384"]))
     add_route("/hs256-aud", JWTAuthentication(secret=HS_SECRET, algorithms=["HS256"], audience="api"))
     add_route("/rs256", JWTAuthentication(secret=RSA_PUBLIC_PEM, algorithms=["RS256"]))
+    # public_key= is the preferred spelling for asymmetric keys.
+    add_route("/rs256-pubkey", JWTAuthentication(public_key=RSA_PUBLIC_PEM, algorithms=["RS256"]))
     add_route("/es256", JWTAuthentication(secret=EC_PUBLIC_PEM, algorithms=["ES256"]))
+    # Short leeway route for exp-skew testing.
+    add_route("/hs256-noleeway", JWTAuthentication(secret=HS_SECRET, algorithms=["HS256"], leeway=0))
+    # Token-type separation: access route (default) vs refresh route.
+    add_route("/refresh-only", JWTAuthentication(secret=HS_SECRET, algorithms=["HS256"], token_type="refresh"))
 
     with TestClient(api) as test_client:
         yield test_client
@@ -193,6 +200,58 @@ class TestAlgorithmList:
     def test_unlisted_algorithm_rejected(self, client):
         token = make_token("HS384", HS_SECRET)
         response = get(client, "/hs256", token)
+        assert response.status_code == 401
+
+
+class TestPublicKeyParam:
+    def test_public_key_param_verifies_rs256(self, client):
+        token = make_token("RS256", RSA_PRIVATE_PEM)
+        response = get(client, "/rs256-pubkey", token)
+        assert response.status_code == 200
+        assert response.json()["user_id"] == "user123"
+
+    def test_secret_and_public_key_together_rejected(self):
+        with pytest.raises(ImproperlyConfigured, match="not both"):
+            JWTAuthentication(secret=HS_SECRET, public_key=RSA_PUBLIC_PEM, algorithms=["RS256"])
+
+
+class TestLeeway:
+    def test_recently_expired_token_accepted_within_default_leeway(self, client):
+        # Expired 30s ago — inside the default 60s leeway.
+        token = make_token("HS256", HS_SECRET, exp=int(time.time()) - 30)
+        response = get(client, "/hs256", token)
+        assert response.status_code == 200
+
+    def test_recently_expired_token_rejected_with_zero_leeway(self, client):
+        token = make_token("HS256", HS_SECRET, exp=int(time.time()) - 30)
+        response = get(client, "/hs256-noleeway", token)
+        assert response.status_code == 401
+
+    def test_negative_leeway_rejected(self):
+        with pytest.raises(ImproperlyConfigured, match="leeway"):
+            JWTAuthentication(secret=HS_SECRET, leeway=-1)
+
+
+class TestTokenTypeSeparation:
+    def test_refresh_token_rejected_on_access_route(self, client):
+        token = make_token("HS256", HS_SECRET, typ="refresh")
+        response = get(client, "/hs256", token)
+        assert response.status_code == 401
+
+    def test_access_token_accepted_on_access_route(self, client):
+        token = make_token("HS256", HS_SECRET, typ="access")
+        response = get(client, "/hs256", token)
+        assert response.status_code == 200
+
+    def test_refresh_token_accepted_on_refresh_route(self, client):
+        token = make_token("HS256", HS_SECRET, typ="refresh")
+        response = get(client, "/refresh-only", token)
+        assert response.status_code == 200
+
+    def test_access_token_rejected_on_refresh_route(self, client):
+        # A normal access token (no typ) must not satisfy a refresh endpoint.
+        token = make_token("HS256", HS_SECRET)
+        response = get(client, "/refresh-only", token)
         assert response.status_code == 401
 
 

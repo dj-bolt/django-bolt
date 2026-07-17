@@ -16,12 +16,14 @@ Performance: ~60k+ RPS with JWT validation happening entirely in Rust.
 
 from __future__ import annotations
 
+import json
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
@@ -105,14 +107,43 @@ class JWTAuthentication(BaseAuthentication):
     or in a cookie when `cookie` is set.
 
     Args:
-        secret: Secret key for JWT validation. If None, uses Django's SECRET_KEY.
-        algorithms: List of allowed JWT algorithms (default: ["HS256"])
+        secret: HMAC secret for JWT validation. If None (and no public_key),
+            uses Django's SECRET_KEY.
+        algorithms: List of allowed JWT algorithms (default: ["HS256"]). The
+            token's ``alg`` header must name one of these; all must share one
+            key family.
         header: Header name to extract token from (default: "authorization")
         cookie: Optional cookie name to extract the token from. When set, the
             token is read from the named cookie only (the header is ignored).
             The cookie value is the raw token (no "Bearer " prefix needed).
         audience: Optional JWT audience claim to validate
         issuer: Optional JWT issuer claim to validate
+        public_key: PEM-encoded public key for asymmetric algorithms
+            (RS*/PS*/ES*/EdDSA). Preferred over passing a PEM via ``secret``
+            (which also works, for compatibility). Mutually exclusive with
+            ``secret``.
+        leeway: Clock-skew tolerance in seconds applied to ``exp``/``nbf``
+            validation (default: 60).
+        token_type: Expected ``typ`` claim. When set (e.g. ``"refresh"`` for
+            a token-rotation endpoint), tokens must carry exactly that
+            ``typ``. When left as None (normal access routes), tokens
+            carrying ``typ: "refresh"`` are rejected so refresh tokens can
+            never authenticate a regular endpoint.
+        csrf: When the token is read from a ``cookie``, enforce a cross-site
+            origin check on unsafe (state-changing) HTTP methods, since bolt
+            bypasses Django's ``CsrfViewMiddleware`` and cookies are attached
+            automatically by the browser. Default True. Ignored for
+            header-sourced tokens (not auto-attached). Set False only for
+            API-only cookie deployments that provide their own protection.
+        jwks_url: URL of a JWKS endpoint (e.g. a provider's
+            ``/.well-known/jwks.json``). Fetched once at server startup; the
+            key set is parsed into per-``kid`` decoding keys in Rust and the
+            token's ``kid`` header selects the key. Use with an asymmetric
+            ``algorithms`` list (e.g. ``["RS256"]``). Rotation to a new
+            ``kid`` is picked up on the next server start.
+        jwks: A JWKS document (dict or JSON string) supplied directly instead
+            of fetching a ``jwks_url`` — useful for tests or air-gapped
+            deployments. Mutually exclusive with ``secret``/``public_key``.
     """
 
     # Class-level cached User model - resolved once on first use
@@ -136,16 +167,40 @@ class JWTAuthentication(BaseAuthentication):
         revoked_token_handler: RevokedTokenHandler | None = None,
         revocation_store: Any | None = None,
         require_jti: bool = False,
+        public_key: str | None = None,
+        leeway: int = 60,
+        token_type: str | None = None,
+        csrf: bool = True,
+        jwks_url: str | None = None,
+        jwks: dict[str, Any] | str | None = None,
     ):
+        provided_keys = [k for k in (secret, public_key) if k is not None]
+        if len(provided_keys) > 1:
+            raise ImproperlyConfigured(
+                "JWTAuthentication accepts either 'secret' (HMAC) or 'public_key' (asymmetric), not both."
+            )
+        if (jwks_url or jwks) and provided_keys:
+            raise ImproperlyConfigured(
+                "JWTAuthentication accepts JWKS (jwks_url/jwks) or a static key (secret/public_key), not both."
+            )
+        if leeway < 0:
+            raise ImproperlyConfigured("JWTAuthentication leeway must be >= 0 seconds.")
         self.secret = secret
+        self.public_key = public_key
         self.algorithms = algorithms or ["HS256"]
         self.header = header
         self.cookie = cookie
         self.audience = audience
         self.issuer = issuer
+        self.leeway = leeway
+        self.token_type = token_type
+        self.csrf = csrf
+        self.jwks_url = jwks_url
+        self._jwks = jwks
 
-        # If no secret provided, try to get Django's SECRET_KEY
-        if self.secret is None:
+        # If no key material provided at all (and no JWKS), fall back to
+        # Django's SECRET_KEY.
+        if self.secret is None and self.public_key is None and not (jwks_url or jwks):
             try:
                 if not hasattr(settings, "SECRET_KEY"):
                     raise ImproperlyConfigured(
@@ -183,17 +238,49 @@ class JWTAuthentication(BaseAuthentication):
     def scheme_name(self) -> str:
         return "jwt"
 
+    def _resolve_jwks(self) -> str | None:
+        """Return the JWKS document as a JSON string, or None.
+
+        A ``jwks`` dict/string is used verbatim; a ``jwks_url`` is fetched
+        once here (at server startup, when ``to_metadata`` runs) via httpx.
+        The resulting key set is parsed into per-``kid`` decoding keys in
+        Rust. Key rotation to a *new* ``kid`` is picked up on the next server
+        start — the standard trade-off for a startup-cached key set.
+        """
+        if self._jwks is not None:
+            return self._jwks if isinstance(self._jwks, str) else json.dumps(self._jwks)
+        if self.jwks_url is not None:
+            response = httpx.get(self.jwks_url, timeout=10.0)
+            response.raise_for_status()
+            return response.text
+        return None
+
     def to_metadata(self) -> dict[str, Any]:
         metadata = {
             "type": "jwt",
-            "secret": self.secret,
+            # Key material: the HMAC secret, or the PEM public key for
+            # asymmetric algorithms. Rust builds the decoding key from this
+            # once at registration, branching on the algorithm family.
+            "secret": self.public_key if self.public_key is not None else self.secret,
             "algorithms": self.algorithms,
             "header": self.header.lower(),
             "cookie": self.cookie,
             "audience": self.audience,
             "issuer": self.issuer,
+            "leeway": self.leeway,
+            "token_type": self.token_type,
+            # CSRF is only meaningful for cookie-sourced tokens (header tokens
+            # are not auto-attached by the browser). Rust checks the flag only
+            # when `cookie` is set.
+            "cookie_csrf": self.csrf,
             "require_jti": self.require_jti,
         }
+
+        # JWKS (fetched from jwks_url or supplied directly) takes precedence
+        # over a static secret; Rust builds a kid -> key map from it.
+        jwks = self._resolve_jwks()
+        if jwks is not None:
+            metadata["jwks"] = jwks
 
         # Add revocation handler reference (will be called from Rust if present)
         if self.revoked_token_handler:

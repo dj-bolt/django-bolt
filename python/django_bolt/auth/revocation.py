@@ -80,6 +80,43 @@ class RevocationStore(ABC):
         """
         raise NotImplementedError("This revocation store does not support revoke_all")
 
+    # --- Bulk primitives (optional) -------------------------------------
+    # Per-``jti`` revocation only kills a single session. Two production
+    # flows need more: "log out everywhere" (invalidate every outstanding
+    # token for a user) and refresh-token reuse detection (kill an entire
+    # rotation family when a rotated-out token is replayed). These are
+    # expressed with a per-user token *version* and a per-family revoke,
+    # both O(1) and TTL-cleaned — no key scanning required.
+
+    async def get_user_version(self, user_id: str) -> int:
+        """Current token version for a user (0 if never bumped).
+
+        A token carrying ``ver`` less than this value is stale and must be
+        rejected. Used to implement global logout without enumerating jtis.
+        """
+        raise NotImplementedError("This revocation store does not support token versioning")
+
+    async def bump_user_version(self, user_id: str) -> int:
+        """Invalidate every outstanding token for a user (global logout).
+
+        Increments and returns the user's token version. Tokens minted
+        before the bump carry a lower ``ver`` and are rejected.
+        """
+        raise NotImplementedError("This revocation store does not support token versioning")
+
+    async def revoke_family(self, fam: str, *, exp: int | None = None) -> None:
+        """Revoke an entire refresh-token rotation family (reuse detection).
+
+        When a rotated-out refresh token is replayed, revoking its ``fam``
+        invalidates the whole chain — the standard OAuth reuse-detection
+        response.
+        """
+        raise NotImplementedError("This revocation store does not support family revocation")
+
+    async def is_family_revoked(self, fam: str) -> bool:
+        """Whether a refresh-token family has been revoked."""
+        raise NotImplementedError("This revocation store does not support family revocation")
+
 
 class InMemoryRevocation(RevocationStore):
     """
@@ -116,6 +153,8 @@ class InMemoryRevocation(RevocationStore):
 
     def __init__(self):
         self._revoked: set[str] = set()
+        self._revoked_families: set[str] = set()
+        self._user_versions: dict[str, int] = {}
 
     async def is_revoked(self, jti: str) -> bool:
         return jti in self._revoked
@@ -123,9 +162,25 @@ class InMemoryRevocation(RevocationStore):
     async def revoke(self, jti: str, *, exp: int | None = None) -> None:
         self._revoked.add(jti)
 
+    async def get_user_version(self, user_id: str) -> int:
+        return self._user_versions.get(str(user_id), 0)
+
+    async def bump_user_version(self, user_id: str) -> int:
+        new_version = self._user_versions.get(str(user_id), 0) + 1
+        self._user_versions[str(user_id)] = new_version
+        return new_version
+
+    async def revoke_family(self, fam: str, *, exp: int | None = None) -> None:
+        self._revoked_families.add(fam)
+
+    async def is_family_revoked(self, fam: str) -> bool:
+        return fam in self._revoked_families
+
     def clear(self) -> None:
         """Clear all revoked tokens (useful for testing)."""
         self._revoked.clear()
+        self._revoked_families.clear()
+        self._user_versions.clear()
 
 
 class DjangoCacheRevocation(RevocationStore):
@@ -223,6 +278,27 @@ class DjangoCacheRevocation(RevocationStore):
         """
         key = f"{self.key_prefix}{jti}"
         self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl))
+
+    async def get_user_version(self, user_id: str) -> int:
+        return int(self.cache.get(f"{self.key_prefix}ver:{user_id}") or 0)
+
+    async def bump_user_version(self, user_id: str) -> int:
+        # User-version keys never expire — they are the source of truth for
+        # "log out everywhere" and must outlive any token they invalidate.
+        key = f"{self.key_prefix}ver:{user_id}"
+        try:
+            return self.cache.incr(key)
+        except ValueError:
+            # Key absent: seed it. (Django's cache.incr raises if missing.)
+            self.cache.set(key, 1, timeout=None)
+            return 1
+
+    async def revoke_family(self, fam: str, *, exp: int | None = None) -> None:
+        key = f"{self.key_prefix}fam:{fam}"
+        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl))
+
+    async def is_family_revoked(self, fam: str) -> bool:
+        return self.cache.get(f"{self.key_prefix}fam:{fam}") is not None
 
 
 class DjangoORMRevocation(RevocationStore):
