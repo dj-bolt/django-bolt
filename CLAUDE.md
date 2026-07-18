@@ -84,7 +84,17 @@ just save-bench 127.0.0.1 8001 100 50000   # positional: host port c n ...
 
 # Focused parameter/form-parsing benchmark (fast iteration)
 just bench-params
+
+# Deterministic regression gate (per-endpoint RPS AND p99 vs baseline)
+just bench-gate
+
+# Micro-benchmarks (no server, no bombardier needed)
+just bench-rust    # criterion: pure-Rust hot functions (query/cookie parsing, coercion)
+just bench-micro   # pytest-benchmark: injectors, deps, serialization (python/benchmarks/)
 ```
+
+See [docs/PROFILING.md](docs/PROFILING.md) for the full layered measurement
+strategy (micro → in-process → macro → flamegraphs → allocation counting).
 
 ### Database (Standard Django)
 
@@ -142,7 +152,7 @@ just release VERSION=0.2.2 DRY_RUN=1    # Test without changes
 2. **Python Framework (`python/django_bolt/`)**
 
    - `api.py` - BoltAPI class with decorator-based routing (`@api.get/post/put/patch/delete/head/options`)
-   - `binding.py` - Parameter extraction and type coercion
+   - `_kwargs/` - Parameter extraction, injector compilation, and type coercion (`model.py`, `extractors.py`, `runtime.py`)
    - `responses.py` - Response types (PlainText, HTML, Redirect, File, FileResponse, StreamingResponse)
    - `exceptions.py` - HTTPException and error handling
    - `params.py` - Parameter markers (Header, Cookie, Form, File, Depends)
@@ -387,7 +397,7 @@ uv run --with pytest pytest python/tests -s -vv
 
 - `api.py` - Main BoltAPI class and route decorators
 - `router.py` - Route registration and management
-- `binding.py` - Parameter extraction and type coercion from requests
+- `_kwargs/` - Parameter extraction, injector compilation, and type coercion from requests (`model.py`, `extractors.py`, `runtime.py`)
 
 ### HTTP Handling
 
@@ -514,7 +524,7 @@ uv run --with pytest pytest python/tests -s -vv
 
 ### Adding Framework Features
 
-- **New parameter types** (Query, Header, Body variants): Edit `python/django_bolt/params.py` and `python/django_bolt/binding.py`, then update `src/handler.rs` for extraction
+- **New parameter types** (Query, Header, Body variants): Edit `python/django_bolt/params.py` and `python/django_bolt/_kwargs/` (`model.py`/`extractors.py`), then update `src/handler.rs` for extraction
 - **New response types**: Add to `python/django_bolt/responses.py`, implement serialization in `python/django_bolt/serialization.py`, and if adding a new common type, add integer meta tag constant there + matching static `ResponseMeta` in `src/response_meta.rs`
 - **New authentication backend**: Extend `python/django_bolt/auth/backends.py` with new class, optionally implement validation in `src/middleware/auth.rs` for performance
 - **New guard/permission type**: Add to `python/django_bolt/auth/guards.py` and implement check in `src/permissions.rs`
@@ -578,6 +588,8 @@ The Python→Rust response wire format `(status, meta, body_kind, body)` (Respon
 - `0` (_BODY_BYTES) -- bytes payload. Rust uses `PyBackedBytes` → `Bytes::from_owner()` for zero-copy when possible, falls back to `Vec<u8>` extraction.
 - `1` (_BODY_STREAM) -- StreamingResponse object. Rust creates SSE or chunked stream from Python async generator.
 - `2` (_BODY_FILE) -- File path string. Rust opens and streams the file asynchronously via tokio.
+
+**Bare-bytes fast path (sync dispatch only):** `_sync_executor` variants may return just the encoded JSON body (`bytes`) instead of the 4-tuple when the response is (route default status, JSON meta). Rust's sync dispatch detects `PyBytes` and rebuilds the envelope from `RouteMetadata.default_status_code` + the static JSON meta — no tuple construction in Python, no tuple parsing in Rust. Any other shape (custom status, non-JSON, streams, errors) still returns the full tuple.
 
 **Middleware compatibility:** `MiddlewareResponse` class in `middleware_response.py` converts between wire tuples and middleware-friendly objects. It preserves raw cookie tuples (never serializes in Python) so Rust handles all cookie serialization.
 

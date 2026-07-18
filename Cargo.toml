@@ -6,7 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "django_bolt"
-crate-type = ["cdylib"]
+# rlib alongside cdylib so `cargo test` / `cargo bench` (criterion) can link
+# against the crate. Wheels still build the cdylib via maturin.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["mimalloc"]
@@ -17,7 +19,10 @@ jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["extension-module", "abi3-py312"] }
+# NOTE: "extension-module" is NOT hardcoded here — maturin enables it via
+# pyproject.toml's [tool.maturin] features. This lets `cargo test`/`cargo bench`
+# link libpython normally for native tests and criterion benches.
+pyo3 = { version = "0.29", features = ["abi3-py312", "chrono"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 actix-web = { version = "4", features = ["compress-gzip", "compress-brotli", "compress-zstd", "cookies"] }
 cookie = "0.18"  # RFC 6265 compliant cookie handling
@@ -60,6 +65,13 @@ log = "0.4"
 notify = "6"
 ctrlc = "3"
 libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "hot_path"
+harness = false
 
 [profile.release]
 codegen-units = 1        # Better optimization (single codegen unit allows more inlining)

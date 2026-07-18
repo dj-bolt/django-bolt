@@ -30,6 +30,17 @@ mod type_coercion;
 mod validation;
 mod websocket;
 
+/// Pure-Rust hot-path helpers re-exported for criterion benches
+/// (benches/hot_path.rs links the rlib). Not part of the Python API.
+pub mod bench_support {
+    pub use crate::router::{convert_path, parse_query_string};
+    pub use crate::type_coercion::{
+        coerce_param, CoercedValue, DEFAULT_MAX_PARAM_LENGTH, TYPE_BOOL, TYPE_DATETIME,
+        TYPE_DECIMAL, TYPE_INT, TYPE_STRING, TYPE_UUID,
+    };
+    pub use crate::validation::parse_cookies_inline;
+}
+
 // Global allocator selection (mutually exclusive features)
 // Use jemalloc for sustained loads with lower memory fragmentation
 // Use mimalloc (default) for short-lived objects - often faster for web requests

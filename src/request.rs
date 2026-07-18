@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 /// Parse host:port from Actix's connection_info().host()
@@ -35,7 +36,9 @@ fn parse_host_port<'a>(host: &'a str, scheme: &str) -> (&'a str, u16) {
 
 #[pyclass]
 pub struct PyRequest {
-    pub method: String,
+    /// HTTP method. Borrowed static for the fixed routable set (no per-request
+    /// alloc); owned only for unusual methods on test paths.
+    pub method: Cow<'static, str>,
     pub path: String,
     pub body: Vec<u8>,
     /// Path parameters - None when no path params (saves 1 PyDict alloc per request)
@@ -268,7 +271,7 @@ impl PyRequest {
         let meta = PyDict::new(py);
 
         // Standard META keys (Django HttpRequest compatible)
-        meta.set_item("REQUEST_METHOD", &self.method)?;
+        meta.set_item("REQUEST_METHOD", self.method.as_ref())?;
         meta.set_item("PATH_INFO", &self.path)?;
 
         // QUERY_STRING - reconstructed from parsed query_params.
@@ -336,7 +339,9 @@ impl PyRequest {
     /// Returns the async user callable set by Django's AuthenticationMiddleware.
     /// Use this in async handlers to load the user without blocking:
     ///
-    ///     user = await request.auser()
+    /// ```text
+    /// user = await request.auser()
+    /// ```
     ///
     /// This follows Django's pattern where `request.auser` is an async callable
     /// that loads the user from the database asynchronously.

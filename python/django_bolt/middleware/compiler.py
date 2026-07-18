@@ -246,11 +246,17 @@ def _collect_form_seq_field_names(field: Any, target: set[str]) -> None:
             target.add(field.alias or field.name)
 
 
-def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, str]] | None:
+def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Build a Rust-side argument binding plan for simple non-body handlers.
 
     The plan is used by Rust to pre-bind handler args/kwargs from request maps,
     allowing Python dispatch to skip injector execution on the no-middleware fast path.
+
+    Supports required AND optional scalar params. Optional params are always
+    bound as keywords so a missing value can either be omitted (the handler's
+    own default applies) or injected as None (Optional[T] annotation with no
+    default). When any optional param exists, ALL params are bound as keywords —
+    mixing a skipped keyword with positional args would shift positions.
     """
     fields = handler_meta.get("fields", [])
     if not fields:
@@ -260,40 +266,54 @@ def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, s
     if mode == "request_only":
         return None
 
-    bindings: list[dict[str, str]] = []
-
+    # Validate every field first; bail out entirely on anything unsupported so
+    # the Python injector keeps full ownership of the route's semantics.
     for field in fields:
-        source = field.source
-        if source not in ("path", "query", "header", "cookie"):
-            return None
-
-        # Keep semantics simple and safe: only required scalar params.
-        if field.is_optional:
+        if field.source not in ("path", "query", "header", "cookie"):
             return None
         if not field.is_simple_type:
             return None
         if field.origin is not None:
             return None
-
-        # Unsupported Python parameter kinds fall back to injector.
-        if field.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-            arg_kind = "positional"
-        elif field.kind == inspect.Parameter.KEYWORD_ONLY:
-            arg_kind = "keyword"
-        else:
+        if field.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return None
+        # Positional-only optional params can't be keyword-bound → unsupported.
+        if field.is_optional and field.kind is inspect.Parameter.POSITIONAL_ONLY:
             return None
 
-        if source == "header":
+    has_optional = any(field.is_optional for field in fields)
+    if has_optional and any(field.kind is inspect.Parameter.POSITIONAL_ONLY for field in fields):
+        # All-keyword calling convention required, but positional-only params
+        # can't participate — fall back to the injector.
+        return None
+
+    bindings: list[dict[str, Any]] = []
+
+    for field in fields:
+        arg_kind = "keyword" if has_optional or field.kind is inspect.Parameter.KEYWORD_ONLY else "positional"
+
+        if field.source == "header":
             lookup_key = (field.alias or field.name).lower().replace("_", "-")
         else:
             lookup_key = field.alias or field.name
 
+        # inject_none: Optional[T] annotation with no signature default — the
+        # extractor semantics yield None for a missing value, so Rust must pass
+        # None explicitly (omitting the kwarg would raise a TypeError).
+        inject_none = field.is_optional and field.default is inspect.Parameter.empty
+
         bindings.append(
             {
-                "source": source,
+                "source": field.source,
                 "lookup_key": lookup_key,
                 "arg_name": field.name,
                 "arg_kind": arg_kind,
+                "required": not field.is_optional,
+                "inject_none": inject_none,
             }
         )
 
@@ -329,6 +349,10 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     metadata["needs_path_params"] = handler_meta.get("needs_path_params", True)
     metadata["is_static_route"] = handler_meta.get("is_static_route", False)
     metadata["needs_form_parsing"] = handler_meta.get("needs_form_parsing", False)
+    # Default success status for the bare-bytes response fast path: sync
+    # executors may return just the encoded JSON body and Rust rebuilds the
+    # (status, JSON meta) envelope from this value.
+    metadata["default_status_code"] = handler_meta.get("default_status_code", 200)
     # Compile a Rust-side argument binding plan for simple handlers.
     # Rust uses this to pre-bind args/kwargs so Python can skip injector work.
     rust_arg_bindings = _compile_rust_arg_bindings(handler_meta)

@@ -76,6 +76,11 @@ _BODY_FILE: int = 2
 BodyKind = Literal[0, 1, 2]
 ResponseWireV1 = tuple[int, ResponseMetaTuple | int, BodyKind, bytes | StreamingResponse | str]
 
+# Bare-bytes wire fast path: _sync_executor variants (api.py) may return just the
+# encoded JSON body (bytes) instead of a ResponseWireV1 tuple when the response
+# is (route default status, JSON meta). Rust's sync dispatch rebuilds the
+# envelope from RouteMetadata.default_status_code — see src/handler.rs.
+
 
 def _build_response_meta(
     response_type: str,

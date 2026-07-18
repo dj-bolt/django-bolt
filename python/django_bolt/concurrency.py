@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from functools import partial
 
 __all__ = ("sync_to_thread",)
 
@@ -45,12 +46,11 @@ async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.
         - Enables concurrent I/O across multiple sync handlers
         - Expected 40-60% RPS improvement for I/O-bound sync handlers
     """
-    # Copy current context to preserve request-scoped variables
-    # ctx = contextvars.copy_context()
-
-    # Bind the context to the function call
-    # bound_fn = partial(ctx.run, fn, *args, **kwargs)
-
     # Run in default executor (thread pool)
     # None = use default executor (ThreadPoolExecutor with max_workers=min(32, cpu_count + 4))
-    return await asyncio.get_running_loop().run_in_executor(None, fn, *args, **kwargs)
+    # run_in_executor only forwards positional args — keyword args (e.g. Rust
+    # prebound keyword-bound params) must be bound via partial.
+    loop = asyncio.get_running_loop()
+    if kwargs:
+        return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
+    return await loop.run_in_executor(None, fn, *args)

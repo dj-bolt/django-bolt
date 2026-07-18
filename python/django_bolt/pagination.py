@@ -720,21 +720,17 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
                     f"Args: {[type(a).__name__ for a in args]}, kwargs: {list(kwargs.keys())}"
                 )
 
-            # PyRequest already supports .get() and __getitem__, no need to copy
-            if isinstance(request, dict) or hasattr(request, "get") or hasattr(request, "__getitem__"):
-                request_dict = request
-            else:
-                raise ValueError(
-                    f"Unexpected request type: {type(request)}. "
-                    f"Args: {[type(a).__name__ for a in args]}, kwargs: {list(kwargs.keys())}"
-                )
+            # PyRequest already supports .get() and __getitem__ — no per-request
+            # isinstance/hasattr type sniffing (hot-path rule). Anything the
+            # request_getter yields is used directly; a genuinely wrong object
+            # fails loudly inside paginate_queryset.
 
             # Call original handler to get queryset
             # Pass all args along (including self for methods)
             queryset = await handler(*args, **kwargs)
 
             # Apply pagination using dict version
-            paginated = await cached_paginator.paginate_queryset(queryset, request_dict)
+            paginated = await cached_paginator.paginate_queryset(queryset, request)
 
             return paginated
 

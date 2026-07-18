@@ -141,6 +141,26 @@ save-bench host=host port=port c=c n=n p=p workers=workers:
 # Build and run benchmark
 build-bench: build save-bench
 
+# Deterministic pass/fail gate: per-endpoint RPS AND p99 latency vs baseline
+bench-gate:
+    uv run python scripts/benchmark_compare.py
+
+# Rust micro-benchmarks (criterion) — pure hot-path functions
+bench-rust:
+    cargo bench
+
+# Python micro-benchmarks (pytest-benchmark) — injectors, deps, serialization
+bench-micro:
+    uv run --with pytest --with pytest-benchmark pytest python/benchmarks -q
+
+# Save a named pytest-benchmark run for later `pytest-benchmark compare`
+bench-micro-save NAME:
+    uv run --with pytest --with pytest-benchmark pytest python/benchmarks -q --benchmark-save={{NAME}}
+
+# Build with profiling profile (release + debug symbols) for flamegraphs
+build-profiling:
+    uv run maturin develop --profile profiling
+
 # Focused parameter and form parsing benchmark (fast iteration)
 bench-params host=host port=port c=c n=n p=p workers=workers:
     P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark_params.sh

@@ -1138,7 +1138,7 @@ async fn handle_test_request_internal(
         };
 
         let request = PyRequest {
-            method: method.to_string(),
+            method: crate::handler::static_method_name(method),
             path: path.to_string(),
             body: body.to_vec(),
             path_params: path_params_dict,

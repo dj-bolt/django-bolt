@@ -23,10 +23,23 @@ impl<'a> RouteMatch<'a> {
 
     /// Get owned path params when present (None for static routes)
     #[inline]
+    #[allow(dead_code)]
     pub fn path_params(self) -> Option<AHashMap<String, String>> {
         match self {
             RouteMatch::Static(_) => None,
             RouteMatch::Dynamic(_, params) => Some(params),
+        }
+    }
+
+    /// Decompose into the route reference (with the router's lifetime — 'static
+    /// for the global router) and owned path params. Lets the request handler
+    /// defer the handler `clone_ref` into the main GIL block instead of paying
+    /// an extra `Python::attach` per request.
+    #[inline]
+    pub fn into_parts(self) -> (&'a Route, Option<AHashMap<String, String>>) {
+        match self {
+            RouteMatch::Static(r) => (r, None),
+            RouteMatch::Dynamic(r, params) => (r, Some(params)),
         }
     }
 
