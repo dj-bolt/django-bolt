@@ -503,7 +503,7 @@ uv run --with pytest pytest python/tests -s -vv
 - **Dual dispatch architecture**: Handlers are dispatched via three outcomes in `src/handler.rs`, controlled by `DispatchOutcome` enum:
   - **Sync path** (`DispatchOutcome::Ready`): Calls `dispatch_sync.call1()`, parses `ResponseWireV1`, builds `HttpResponse` — all in one `Python::attach` GIL block. Used when `can_sync_dispatch` flag is set in `RouteExecutionPlan` and body is bytes.
   - **Sync + async post-processing** (`DispatchOutcome::SyncResult`): Handler runs synchronously but returns a stream/file body that needs async handling. Carries the already-parsed `ParsedResponseWire` to avoid re-acquiring GIL.
-  - **Async path** (`DispatchOutcome::Pending`): Creates coroutine via `dispatch.call1()`, converts to Rust future via `into_future_with_locals()`. Used for handlers with middleware, signals, or true async awaits.
+  - **Async path** (`DispatchOutcome::Pending`): schedules `_bridge.eager_dispatch` on the asyncio loop thread via `call_soon_threadsafe`. The dispatch coroutine's first segment runs there synchronously (loop APIs — `get_running_loop`, `create_task`, dependency `gather` — all work); an asyncio Task is only created on the first REAL suspension (`_drive_started`). Handlers whose awaits complete immediately skip Task creation entirely. `DJANGO_BOLT_EAGER_DISPATCH=0` restores the legacy Task-per-request `into_future_with_locals()` bridge. Note: `asyncio.current_task()` is `None` during the first segment (a real Task exists after the first suspension).
 - **Trivially-async handlers**: `async def` functions that never `await` are detected at registration via `dis.get_instructions()` (checking for `GET_AWAITABLE` opcode). These get a sync executor that drives the coroutine via `coro.send(None)` → `StopIteration`, avoiding the async bridge entirely.
 - **ResponseWireV1 format**: Python returns `(status, meta, body_kind, body_payload)` — meta is either an integer tag (fast path) or a 4-tuple `(response_type, custom_ct, headers, cookies)` (slow path). Body kind: 0=bytes, 1=stream, 2=file.
 - **Zero-copy response body**: `PyBackedBytes` holds a reference to Python bytes. `Bytes::from_owner()` wraps it without memcpy, used for JSON/serialized bodies.
@@ -566,13 +566,15 @@ When modifying code in the per-request dispatch path (`api.py:_dispatch`, `api.p
 
 ### PyO3 Async Bridge Optimization
 
-The `pyo3_async_runtimes::into_future_with_locals()` call adds ~6-12μs per request (coroutine creation + asyncio event loop polling). This is the single biggest per-request overhead for simple handlers. Strategies to eliminate it:
+The async bridge (coroutine creation + Task scheduling + cross-thread wakeups) is the single biggest per-request overhead for simple async handlers. Measured with the dispatch probes (`python/tests/integration/apps/dispatch_probes.py`, see docs/PROFILING.md): `ensure_future`/Task machinery was ~50% of GIL time under async load, while an actual suspend/resume cost almost nothing. Strategies used to eliminate it:
 
 1. **Sync dispatch bypass** -- For handlers with no middleware/signals, Rust calls `dispatch_sync.call1()` directly within a single `Python::attach` GIL block. Returns `DispatchOutcome::Ready(HttpResponse)` instead of `DispatchOutcome::Pending(Future)`. Controlled by `can_sync_dispatch` flag in `RouteExecutionPlan` bitfield, computed at registration.
 
 2. **Trivially-async detection** -- Use `dis.get_instructions()` at registration time to check for `GET_AWAITABLE` opcode. If absent, the `async def` never actually awaits and can be driven synchronously via `coro.send(None)` → `StopIteration`. Set `meta["_sync_executor"]` for these handlers so they go through the sync dispatch path in Rust.
 
 3. **When to use sync dispatch** -- Only when ALL conditions are met: handler has `_sync_executor`, no Python middleware (global or route), no Django middleware, no signals. If any condition fails, fall back to full async path.
+
+4. **Eager loop-thread dispatch** (`python/django_bolt/_bridge.py`) -- For genuinely-async handlers, Rust schedules `eager_dispatch` on the loop thread instead of wrapping every dispatch coroutine in a Task. The first `coro.send(None)` runs inline; handlers that never actually suspend resolve straight back to Rust (no Task, no extra loop cycle). On first real suspension, `_drive_started` (a real Task) drives the remainder with Task-equivalent semantics — including resetting `_asyncio_future_blocking` on manually-consumed yields and treating a yielded `None` as a reschedule. Kill switch: `DJANGO_BOLT_EAGER_DISPATCH=0`.
 
 ### Response Wire Format Optimization
 

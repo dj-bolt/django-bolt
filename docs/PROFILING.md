@@ -16,6 +16,22 @@ win → in-process bench shows per-request µs → `just save-bench` + `just
 bench-gate` shows it survives end-to-end → a before/after flamegraph pair as
 the narrative artifact.
 
+## Dispatch-path probes (async bridge cost)
+
+`python/tests/integration/apps/dispatch_probes.py` has one route per dispatch
+mechanism (`/t-sync`, `/t-trivial`, `/t-ready`, `/t-sleep0`, `/t-thread`, …).
+Point a `runbolt` server at it (`BOLT_API = ["tests.integration.apps.dispatch_probes:api"]`)
+and compare per-request latency over a keepalive connection:
+
+- `t_ready − t_trivial` = pure async-bridge cost (no real suspension)
+- `t_sleep0 − t_ready` = one suspend/resume cycle
+- rerun with `DJANGO_BOLT_EAGER_DISPATCH=0` for eager-vs-legacy bridge deltas
+
+Attribution tools: `py-spy record --gil` (Task machinery shows up as
+`ensure_future`), `strace -f -c -p <pid>` (cross-thread wakeup writes and
+`epoll_pwait`s per request). Disable access logging first — the Python logging
+stack is large enough (~35-40% of GIL samples) to drown the signal.
+
 ## Rust micro-benchmarks (criterion)
 
 ```bash

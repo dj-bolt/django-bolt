@@ -51,8 +51,22 @@ enum DispatchOutcome {
 }
 
 static STREAMING_RESPONSE_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static EAGER_DISPATCH_FN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 const SKIP_CORS_HEADER_NAME: HeaderName = HeaderName::from_static("x-bolt-skip-cors");
 const SKIP_CORS_HEADER_VALUE: HeaderValue = HeaderValue::from_static("true");
+
+/// Eager dispatch kill switch: DJANGO_BOLT_EAGER_DISPATCH=0 restores the
+/// Task-per-request pyo3_async_runtimes bridge. Resolved once.
+static EAGER_DISPATCH_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[inline]
+fn eager_dispatch_enabled() -> bool {
+    *EAGER_DISPATCH_ENABLED.get_or_init(|| {
+        std::env::var("DJANGO_BOLT_EAGER_DISPATCH")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
 
 fn get_streaming_response_class(py: Python<'_>) -> &Py<PyAny> {
     STREAMING_RESPONSE_CLASS.get_or_init(py, || {
@@ -62,6 +76,37 @@ fn get_streaming_response_class(py: Python<'_>) -> &Py<PyAny> {
             .unwrap()
             .unbind()
     })
+}
+
+fn get_eager_dispatch_fn(py: Python<'_>) -> PyResult<&Py<PyAny>> {
+    EAGER_DISPATCH_FN.get_or_try_init(py, || {
+        Ok(py
+            .import("django_bolt._bridge")?
+            .getattr("eager_dispatch")?
+            .unbind())
+    })
+}
+
+/// Completes the tokio-side response future from the asyncio loop thread.
+/// Python calls set_result/set_exception exactly once (extra calls are no-ops).
+#[pyclass(frozen)]
+pub struct DispatchResolver {
+    tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<PyResult<Py<PyAny>>>>>,
+}
+
+#[pymethods]
+impl DispatchResolver {
+    fn set_result(&self, value: Py<PyAny>) {
+        if let Some(tx) = self.tx.lock().unwrap().take() {
+            let _ = tx.send(Ok(value));
+        }
+    }
+
+    fn set_exception(&self, exc: Bound<'_, PyAny>) {
+        if let Some(tx) = self.tx.lock().unwrap().take() {
+            let _ = tx.send(Err(PyErr::from_value(exc)));
+        }
+    }
 }
 
 // Reuse the global Python asyncio event loop created at server startup (TASK_LOCALS)
@@ -1387,15 +1432,53 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             };
             Ok(DispatchOutcome::Ready(response))
         } else {
-            // ASYNC PATH: Create coroutine + future (existing behavior)
-            let dispatch = state.dispatch.clone_ref(py);
             let locals = TASK_LOCALS.get().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
             })?;
-            let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
-            let fut =
-                pyo3_async_runtimes::into_future_with_locals(locals, coroutine.into_bound(py))?;
-            Ok(DispatchOutcome::Pending(Box::pin(fut)))
+
+            if eager_dispatch_enabled() {
+                // ASYNC PATH (eager): schedule eager_dispatch on the loop thread.
+                // The coroutine's first segment runs there synchronously; a Task
+                // is only created on the first REAL suspension. Measured: the
+                // per-request ensure_future/Task machinery was ~50% of GIL time
+                // under async load while an actual suspend cost almost nothing.
+                let (tx, rx) = tokio::sync::oneshot::channel::<PyResult<Py<PyAny>>>();
+                let resolver = Py::new(
+                    py,
+                    DispatchResolver {
+                        tx: std::sync::Mutex::new(Some(tx)),
+                    },
+                )?;
+                let eager = get_eager_dispatch_fn(py)?;
+                locals.event_loop(py).call_method1(
+                    pyo3::intern!(py, "call_soon_threadsafe"),
+                    (
+                        eager,
+                        &state.dispatch,
+                        handler,
+                        request_obj,
+                        handler_id,
+                        resolver,
+                    ),
+                )?;
+                let fut = async move {
+                    match rx.await {
+                        Ok(result) => result,
+                        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            "Dispatch resolver dropped without a result",
+                        )),
+                    }
+                };
+                Ok(DispatchOutcome::Pending(Box::pin(fut)))
+            } else {
+                // ASYNC PATH (legacy bridge): Task-per-request via
+                // into_future_with_locals. Kept behind DJANGO_BOLT_EAGER_DISPATCH=0.
+                let dispatch = state.dispatch.clone_ref(py);
+                let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
+                let fut =
+                    pyo3_async_runtimes::into_future_with_locals(locals, coroutine.into_bound(py))?;
+                Ok(DispatchOutcome::Pending(Box::pin(fut)))
+            }
         }
     });
 
