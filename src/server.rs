@@ -260,6 +260,16 @@ pub fn start_server(
 
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.max_blocking_threads(blocking_threads);
+    // Pin a Python thread state to every tokio thread for its lifetime.
+    // Without this, each `Python::attach` from a thread with no cached state
+    // creates AND destroys a PyThreadState (PyGILState semantics), and every
+    // fresh thread state mmaps/munmaps a 16KiB frame-datastack chunk —
+    // measured as exactly one mmap+munmap pair PER REQUEST (~17% of native
+    // samples on the sync dispatch path). Pinning makes attach a cheap
+    // counter bump reusing the cached state. on_thread_stop tears the state
+    // down properly so recycled blocking-pool threads don't leak states.
+    runtime_builder.on_thread_start(crate::state::pin_python_thread_state);
+    runtime_builder.on_thread_stop(crate::state::unpin_python_thread_state);
     pyo3_async_runtimes::tokio::init(runtime_builder);
 
     let loop_obj: Py<PyAny> = {

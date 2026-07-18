@@ -803,11 +803,32 @@ pub(crate) fn content_length_exceeds_limit(
     matches!(content_length, Some(len) if len > max_payload_size)
 }
 
+thread_local! {
+    static TSTATE_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Pin a Python thread state to this (actix worker) thread on first use.
+/// Without it every `Python::attach` creates+destroys a PyThreadState, and a
+/// fresh thread state mmaps/munmaps a 16KiB frame-datastack chunk — measured
+/// as exactly one mmap+munmap syscall pair PER REQUEST. Actix worker threads
+/// live for the process lifetime, so the pinned state is never torn down.
+#[inline]
+fn ensure_pinned_thread_state() {
+    TSTATE_PINNED.with(|c| {
+        if !c.get() {
+            crate::state::pin_python_thread_state();
+            c.set(true);
+        }
+    });
+}
+
 pub async fn handle_request<const ACCESS_LOG: bool>(
     req: HttpRequest,
     mut payload: web::Payload,
     state: web::Data<Arc<AppState>>,
 ) -> HttpResponse {
+    ensure_pinned_thread_state();
+
     // Keep as &str - no allocation, only clone on error paths
     let method = req.method().as_str();
     let path = req.path();
