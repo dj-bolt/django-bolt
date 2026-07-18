@@ -132,8 +132,14 @@ class JWTAuthentication(BaseAuthentication):
         csrf: When the token is read from a ``cookie``, enforce a cross-site
             origin check on unsafe (state-changing) HTTP methods, since bolt
             bypasses Django's ``CsrfViewMiddleware`` and cookies are attached
-            automatically by the browser. Default True. Ignored for
-            header-sourced tokens (not auto-attached). Set False only for
+            automatically by the browser. Default True. The check applies
+            only to requests that actually carry the configured cookie —
+            requests credentialed via another backend on the same route, or
+            carrying no auth cookie, are exempt. Ignored for header-sourced
+            tokens (not auto-attached). Note that non-browser clients that
+            send the cookie without any origin signal (``Sec-Fetch-Site``,
+            ``Origin``, ``Referer``) are rejected with 403; have them send
+            ``Sec-Fetch-Site: none``, use header tokens, or set False for
             API-only cookie deployments that provide their own protection.
         jwks_url: URL of a JWKS endpoint (e.g. a provider's
             ``/.well-known/jwks.json``). Fetched once at server startup; the

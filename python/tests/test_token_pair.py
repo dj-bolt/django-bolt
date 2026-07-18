@@ -69,6 +69,31 @@ class TestCreateTokenPair:
         pair = create_token_pair(FakeUser(), secret=SECRET)
         assert pair.access_claims["sub"] == "7"
 
+    @pytest.mark.parametrize("reserved", ["sub", "iat", "oat", "ver", "typ", "exp", "jti", "fam"])
+    def test_reserved_claims_cannot_be_overridden(self, reserved):
+        """claims= must not overwrite lifecycle claims — e.g. ver=10**9 would
+        make a token immune to global logout, oat would defeat the session cap."""
+        with pytest.raises(ValueError, match=reserved):
+            create_token_pair("u", secret=SECRET, claims={reserved: "attacker-controlled"})
+
+    @pytest.mark.asyncio
+    async def test_reserved_claims_rejected_at_rotation(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+
+        with pytest.raises(ValueError, match="ver"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, claims={"ver": 10**9})
+
+    @pytest.mark.asyncio
+    async def test_reserved_claims_rejected_at_rotation_mode_b(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+
+        with pytest.raises(ValueError, match="oat"):
+            await rotate_refresh_token(
+                pair.refresh_claims, store=store, secret=SECRET, rotate=False, claims={"oat": 0}
+            )
+
 
 class TestRotation:
     @pytest.mark.asyncio
@@ -96,6 +121,15 @@ class TestRotation:
         assert rotated.access_claims["typ"] == "access"
         # Original refresh token is untouched (not revoked).
         assert not await store.is_revoked(pair.refresh_claims["jti"])
+
+    @pytest.mark.asyncio
+    async def test_mode_b_preserves_oat_and_amr(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET, method="pwd")
+
+        rotated = await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, rotate=False)
+        assert rotated.access_claims["oat"] == pair.refresh_claims["oat"]
+        assert rotated.access_claims["amr"] == ["pwd"]
 
     @pytest.mark.asyncio
     async def test_oat_preserved_across_rotation(self):
@@ -150,10 +184,30 @@ class TestRotation:
     async def test_new_pair_carries_current_user_version(self):
         store = InMemoryRevocation()
         await store.bump_user_version("u")  # version now 1
-        pair = create_token_pair("u", secret=SECRET)
+        pair = create_token_pair("u", secret=SECRET, version=1)
 
         rotated = await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET)
         assert rotated.access_claims["ver"] == 1
+
+    @pytest.mark.asyncio
+    async def test_stale_version_rejected(self):
+        """Global logout: after bump_user_version, refresh tokens minted with
+        the old version must not rotate into a fresh valid pair."""
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)  # ver=0
+        await store.bump_user_version("u")  # version now 1 → pair is stale
+
+        with pytest.raises(TokenRotationError, match="version"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET)
+
+    @pytest.mark.asyncio
+    async def test_stale_version_rejected_in_mode_b(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        await store.bump_user_version("u")
+
+        with pytest.raises(TokenRotationError, match="version"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, rotate=False)
 
 
 class TestStorePrimitives:

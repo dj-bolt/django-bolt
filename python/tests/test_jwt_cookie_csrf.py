@@ -64,6 +64,17 @@ def client():
     async def header_write(request: dict):
         return {"ok": True}
 
+    @api.post(
+        "/mixed-write",
+        auth=[
+            JWTAuthentication(secret=SECRET, cookie="access_token"),
+            JWTAuthentication(secret=SECRET),
+        ],
+        guards=[IsAuthenticated()],
+    )
+    async def mixed_write(request: dict):
+        return {"ok": True}
+
     with TestClient(api) as c:
         yield c
 
@@ -122,6 +133,34 @@ class TestCookieCsrf:
             headers={"Authorization": f"Bearer {make_token()}", "Sec-Fetch-Site": "cross-site"},
         )
         assert r.status_code == 200
+
+    def test_cookieless_request_fails_auth_not_csrf(self, client):
+        # No auth cookie on the request → nothing browser-attached for CSRF
+        # to protect. The request simply fails authentication (401), it is
+        # not rejected by the CSRF gate (403).
+        r = client.request("POST", "/cookie-write", headers={"Sec-Fetch-Site": "cross-site"})
+        assert r.status_code == 401
+
+    def test_mixed_route_header_auth_without_cookie_allowed(self, client):
+        # A route listing both a cookie backend and a header backend: a
+        # request credentialed only via the header carries nothing the
+        # browser auto-attached, so CSRF must not apply.
+        r = client.request(
+            "POST",
+            "/mixed-write",
+            headers={"Authorization": f"Bearer {make_token()}", "Sec-Fetch-Site": "cross-site"},
+        )
+        assert r.status_code == 200
+
+    def test_mixed_route_with_cookie_still_csrf_checked(self, client):
+        # Once the configured auth cookie is present, the CSRF gate applies
+        # even if other credentials are also on the request (fail closed).
+        r = client.request(
+            "POST",
+            "/mixed-write",
+            headers=cookie_hdr({"Authorization": f"Bearer {make_token()}", "Sec-Fetch-Site": "cross-site"}),
+        )
+        assert r.status_code == 403
 
 
 class TestSetTokenCookies:

@@ -1,4 +1,4 @@
-use crate::middleware::auth::{authenticate, AuthBackend, AuthContext};
+use crate::middleware::auth::{authenticate, find_cookie_value, AuthBackend, AuthContext};
 use crate::permissions::{evaluate_guards, Guard, GuardResult};
 /// Shared validation logic used by both production handler and test handler
 /// All functions marked #[inline(always)] for zero-cost abstraction
@@ -49,15 +49,49 @@ fn is_safe_method(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE")
 }
 
+/// Whether an unsafe request must be rejected by the cookie-CSRF gate.
+///
+/// `cookie_names` is precomputed at registration (`RouteMetadata::
+/// csrf_cookie_names`): the cookies that carry JWT credentials with CSRF
+/// enforcement enabled. The gate applies only when the request actually
+/// carries one of them — a browser-attached cookie is the CSRF vector, so
+/// requests credentialed another way (header backend on a mixed-backend
+/// route) or carrying no credential at all just proceed to normal
+/// authentication instead.
+///
+/// Returns `true` when the request must be rejected (403).
+#[inline]
+pub fn cookie_csrf_blocks(
+    method: &str,
+    headers: &AHashMap<String, String>,
+    cookie_names: &[String],
+) -> bool {
+    if cookie_names.is_empty() || is_safe_method(method) {
+        return false;
+    }
+    let raw_cookie = match headers.get("cookie") {
+        Some(c) => c.as_str(),
+        None => return false,
+    };
+    if !cookie_names
+        .iter()
+        .any(|name| find_cookie_value(raw_cookie, name).is_some())
+    {
+        return false;
+    }
+    !passes_cookie_csrf(method, headers)
+}
+
 /// Cross-site request forgery check for cookie-authenticated routes.
 ///
 /// Bolt endpoints bypass Django's `CsrfViewMiddleware`, so a JWT read from a
-/// cookie has no CSRF protection unless the framework adds it. When any JWT
-/// backend on the route sources its token from a cookie, an unsafe-method
-/// request must prove it did not originate cross-site. This is pure header
-/// inspection (no state, no body): the browser-set `Sec-Fetch-Site` is
-/// authoritative when present, falling back to an `Origin`/`Referer` host
-/// comparison against the request `Host` for older clients.
+/// cookie has no CSRF protection unless the framework adds it. When a
+/// request carries a CSRF-enforced auth cookie (see `cookie_csrf_blocks`),
+/// an unsafe-method request must prove it did not originate cross-site.
+/// This is pure header inspection (no state, no body): the browser-set
+/// `Sec-Fetch-Site` is authoritative when present, falling back to an
+/// `Origin`/`Referer` host comparison against the request `Host` for older
+/// clients.
 ///
 /// Returns `true` when the request is allowed to proceed.
 #[inline]
@@ -97,7 +131,9 @@ fn origin_host_matches(url: &str, host: &str) -> bool {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
     // Authority ends at the first '/'.
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    authority == host
+    // Host names are case-insensitive (RFC 9110 §4.2.3). Ports must match
+    // literally — an implicit-vs-explicit default port mismatch fails closed.
+    authority.eq_ignore_ascii_case(host)
 }
 
 /// Validate authentication and evaluate guards
@@ -243,6 +279,59 @@ mod tests {
         assert!(!passes_cookie_csrf(
             "POST",
             &headers_with(&[("host", "example.com")])
+        ));
+    }
+
+    #[test]
+    fn csrf_origin_host_comparison_is_case_insensitive() {
+        assert!(passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("host", "Example.com"), ("origin", "https://example.COM")])
+        ));
+    }
+
+    #[test]
+    fn csrf_gate_applies_only_when_a_configured_cookie_is_present() {
+        let names = vec!["access_token".to_string()];
+
+        // Cross-site request carrying the auth cookie → blocked.
+        assert!(cookie_csrf_blocks(
+            "POST",
+            &headers_with(&[
+                ("cookie", "access_token=tok"),
+                ("sec-fetch-site", "cross-site")
+            ]),
+            &names
+        ));
+        // No cookie header at all → exempt (fails auth instead).
+        assert!(!cookie_csrf_blocks(
+            "POST",
+            &headers_with(&[("sec-fetch-site", "cross-site")]),
+            &names
+        ));
+        // Unrelated cookies only → exempt.
+        assert!(!cookie_csrf_blocks(
+            "POST",
+            &headers_with(&[("cookie", "theme=dark"), ("sec-fetch-site", "cross-site")]),
+            &names
+        ));
+        // Safe method → exempt even with the cookie.
+        assert!(!cookie_csrf_blocks(
+            "GET",
+            &headers_with(&[
+                ("cookie", "access_token=tok"),
+                ("sec-fetch-site", "cross-site")
+            ]),
+            &names
+        ));
+        // No configured cookie names (route without cookie backends) → exempt.
+        assert!(!cookie_csrf_blocks(
+            "POST",
+            &headers_with(&[
+                ("cookie", "access_token=tok"),
+                ("sec-fetch-site", "cross-site")
+            ]),
+            &[]
         ));
     }
 }

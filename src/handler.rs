@@ -1002,11 +1002,13 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             let empty_headers = AHashMap::new();
             let headers_map = headers.as_ref().unwrap_or(&empty_headers);
             // CSRF: cookie-sourced JWT credentials are auto-attached by the
-            // browser, so state-changing requests to such routes must prove
-            // they did not originate cross-site.
-            if crate::middleware::auth::route_requires_cookie_csrf(&route_meta.auth_backends)
-                && !crate::validation::passes_cookie_csrf(method, headers_map)
-            {
+            // browser, so state-changing requests carrying such a cookie
+            // must prove they did not originate cross-site.
+            if crate::validation::cookie_csrf_blocks(
+                method,
+                headers_map,
+                &route_meta.csrf_cookie_names,
+            ) {
                 return responses::error_403();
             }
             match validate_auth_and_guards(

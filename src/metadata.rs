@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
-    build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
+    build_jwks_key_source, build_jwt_decoding_key, cookie_csrf_cookie_names, parse_jwt_algorithm,
+    AuthBackend, JwtKeySource,
 };
 use crate::permissions::Guard;
 
@@ -450,6 +451,10 @@ impl RouteMetadataStore {
 #[derive(Debug, Clone)]
 pub struct RouteMetadata {
     pub auth_backends: Vec<AuthBackend>,
+    /// Cookie names whose presence subjects unsafe requests to the CSRF
+    /// origin check. Precomputed from `auth_backends` at registration so
+    /// the hot path never re-scans the backend list.
+    pub csrf_cookie_names: Vec<String>,
     pub guards: Vec<Guard>,
     pub skip: HashSet<String>,
     pub cors_config: Option<CorsConfig>,
@@ -508,10 +513,17 @@ impl RouteMetadata {
             }
         }
 
-        // Parse auth backends. Failures propagate: a backend that fails to
-        // parse must abort startup, not leave the route unauthenticated.
+        // Parse auth backends. Failures propagate: metadata that fails to
+        // extract must abort startup, not leave the route unauthenticated.
         if let Ok(Some(auth_list)) = py_meta.get_item("auth_backends") {
-            if let Ok(py_backends) = auth_list.extract::<Vec<HashMap<String, Py<PyAny>>>>() {
+            if !auth_list.is_none() {
+                let py_backends: Vec<HashMap<String, Py<PyAny>>> =
+                    auth_list.extract().map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "Invalid 'auth_backends' route metadata: {}",
+                            e
+                        ))
+                    })?;
                 for backend_dict in py_backends {
                     auth_backends.push(parse_auth_backend(&backend_dict, py)?);
                 }
@@ -661,8 +673,11 @@ impl RouteMetadata {
         // Optional Rust-side argument binding plan.
         let rust_arg_bindings = parse_rust_arg_bindings(py_meta);
 
+        let csrf_cookie_names = cookie_csrf_cookie_names(&auth_backends);
+
         Ok(RouteMetadata {
             auth_backends,
+            csrf_cookie_names,
             guards,
             skip,
             cors_config,
@@ -824,12 +839,17 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
         .ok_or_else(|| PyValueError::new_err("Auth backend metadata missing 'type'"))?
         .extract::<String>(py)?;
 
+    // Field extraction below is fail-loud: a present-but-mistyped value is a
+    // configuration error and propagates; only an absent key (or Python
+    // None for optional fields) falls back to the default.
     match backend_type.as_str() {
         "jwt" => {
-            let algorithm_names = dict
-                .get("algorithms")
-                .and_then(|a| a.extract::<Vec<String>>(py).ok())
-                .unwrap_or_else(|| vec!["HS256".to_string()]);
+            let algorithm_names = match dict.get("algorithms") {
+                Some(a) => a
+                    .extract::<Option<Vec<String>>>(py)?
+                    .unwrap_or_else(|| vec!["HS256".to_string()]),
+                None => vec!["HS256".to_string()],
+            };
             let algorithms = algorithm_names
                 .iter()
                 .map(|name| parse_jwt_algorithm(name).map_err(PyValueError::new_err))
@@ -838,10 +858,10 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
             // path never touches the raw secret/PEM/JWKS again. A JWKS
             // document (fetched by Python from the provider's jwks_url) takes
             // precedence over a single secret when both are present.
-            let jwks = dict
-                .get("jwks")
-                .and_then(|j| j.extract::<Option<String>>(py).ok())
-                .flatten();
+            let jwks = match dict.get("jwks") {
+                Some(j) => j.extract::<Option<String>>(py)?,
+                None => None,
+            };
             let keys = if let Some(jwks_json) = jwks {
                 build_jwks_key_source(&jwks_json).map_err(PyValueError::new_err)?
             } else {
@@ -853,32 +873,36 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
                     build_jwt_decoding_key(&secret, &algorithms).map_err(PyValueError::new_err)?,
                 )
             };
-            let header = dict
-                .get("header")
-                .and_then(|h| h.extract::<String>(py).ok())
-                .unwrap_or_else(|| "authorization".to_string());
-            let cookie = dict
-                .get("cookie")
-                .and_then(|c| c.extract::<Option<String>>(py).ok())
-                .flatten();
-            let audience = dict
-                .get("audience")
-                .and_then(|a| a.extract::<String>(py).ok());
-            let issuer = dict
-                .get("issuer")
-                .and_then(|i| i.extract::<String>(py).ok());
-            let leeway = dict
-                .get("leeway")
-                .and_then(|l| l.extract::<i64>(py).ok())
-                .unwrap_or(60);
-            let token_type = dict
-                .get("token_type")
-                .and_then(|t| t.extract::<Option<String>>(py).ok())
-                .flatten();
-            let cookie_csrf = dict
-                .get("cookie_csrf")
-                .and_then(|c| c.extract::<bool>(py).ok())
-                .unwrap_or(true);
+            let header = match dict.get("header") {
+                Some(h) => h
+                    .extract::<Option<String>>(py)?
+                    .unwrap_or_else(|| "authorization".to_string()),
+                None => "authorization".to_string(),
+            };
+            let cookie = match dict.get("cookie") {
+                Some(c) => c.extract::<Option<String>>(py)?,
+                None => None,
+            };
+            let audience = match dict.get("audience") {
+                Some(a) => a.extract::<Option<String>>(py)?,
+                None => None,
+            };
+            let issuer = match dict.get("issuer") {
+                Some(i) => i.extract::<Option<String>>(py)?,
+                None => None,
+            };
+            let leeway = match dict.get("leeway") {
+                Some(l) => l.extract::<Option<i64>>(py)?.unwrap_or(60),
+                None => 60,
+            };
+            let token_type = match dict.get("token_type") {
+                Some(t) => t.extract::<Option<String>>(py)?,
+                None => None,
+            };
+            let cookie_csrf = match dict.get("cookie_csrf") {
+                Some(c) => c.extract::<Option<bool>>(py)?.unwrap_or(true),
+                None => true,
+            };
 
             Ok(AuthBackend::JWT {
                 keys,
@@ -893,21 +917,28 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
             })
         }
         "api_key" => {
-            let api_keys_list = dict
-                .get("api_keys")
-                .and_then(|k| k.extract::<Vec<String>>(py).ok())
-                .unwrap_or_default();
-            let api_keys: HashSet<String> = api_keys_list.into_iter().collect();
+            let api_keys: HashSet<String> = match dict.get("api_keys") {
+                Some(k) => k
+                    .extract::<Option<Vec<String>>>(py)?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                None => HashSet::new(),
+            };
 
-            let header = dict
-                .get("header")
-                .and_then(|h| h.extract::<String>(py).ok())
-                .unwrap_or_else(|| "x-api-key".to_string());
+            let header = match dict.get("header") {
+                Some(h) => h
+                    .extract::<Option<String>>(py)?
+                    .unwrap_or_else(|| "x-api-key".to_string()),
+                None => "x-api-key".to_string(),
+            };
 
-            let key_permissions = dict
-                .get("key_permissions")
-                .and_then(|kp| kp.extract::<HashMap<String, Vec<String>>>(py).ok())
-                .unwrap_or_default();
+            let key_permissions = match dict.get("key_permissions") {
+                Some(kp) => kp
+                    .extract::<Option<HashMap<String, Vec<String>>>>(py)?
+                    .unwrap_or_default(),
+                None => HashMap::new(),
+            };
 
             Ok(AuthBackend::APIKey {
                 api_keys,

@@ -288,26 +288,29 @@ pub fn authenticate(
     None
 }
 
-/// Whether any JWT backend on the route reads its token from a cookie with
-/// CSRF enforcement enabled. Cookie-sourced credentials are automatically
-/// attached by the browser, so state-changing requests to such routes need
-/// a cross-site origin check (see `validation::passes_cookie_csrf`).
-pub fn route_requires_cookie_csrf(backends: &[AuthBackend]) -> bool {
-    backends.iter().any(|b| {
-        matches!(
-            b,
+/// Names of cookies that carry JWT credentials with CSRF enforcement
+/// enabled, collected once at registration into `RouteMetadata`. A request
+/// is CSRF-checked only when it actually carries one of these cookies —
+/// browser-attached credentials are the thing CSRF protects, so requests
+/// credentialed another way (header backend on a mixed route) or carrying
+/// no credential at all are exempt (see `validation::cookie_csrf_blocks`).
+pub fn cookie_csrf_cookie_names(backends: &[AuthBackend]) -> Vec<String> {
+    backends
+        .iter()
+        .filter_map(|b| match b {
             AuthBackend::JWT {
-                cookie: Some(_),
+                cookie: Some(name),
                 cookie_csrf: true,
                 ..
-            }
-        )
-    })
+            } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Find a cookie value by name in a raw Cookie header string.
 /// Zero-allocation scan — returns a slice into the header value.
-fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<&'a str> {
     for pair in raw_cookie.split(';') {
         let part = pair.trim();
         if let Some(eq) = part.find('=') {

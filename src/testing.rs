@@ -865,9 +865,7 @@ async fn handle_test_request_internal(
 
     // Auth and guards
     let auth_ctx = if let Some(ref meta) = route_meta {
-        if crate::middleware::auth::route_requires_cookie_csrf(&meta.auth_backends)
-            && !crate::validation::passes_cookie_csrf(method, &headers)
-        {
+        if crate::validation::cookie_csrf_blocks(method, &headers, &meta.csrf_cookie_names) {
             return responses::error_403();
         }
         match validate_auth_and_guards(&headers, &meta.auth_backends, &meta.guards) {

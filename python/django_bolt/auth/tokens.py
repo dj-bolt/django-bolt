@@ -14,8 +14,11 @@ Design notes (from production feedback on #239):
   configured with ``token_type="refresh"`` rejects access tokens — both
   before Python runs. See ``JWTAuthentication(token_type=...)``.
 - **Global logout** uses a per-user token version (``ver``) compared against
-  the store's ``get_user_version`` — one O(1) bump invalidates every
-  outstanding token without enumerating jtis.
+  the store's ``get_user_version`` — one O(1) bump, no jti enumeration.
+  Refresh tokens minted before the bump are rejected at rotation; already
+  issued *access* tokens are not re-checked against the store (that is the
+  point of stateless access tokens), so they remain valid until ``exp`` —
+  keep access TTLs short.
 - **Reuse detection** uses a rotation family id (``fam``): replaying a
   rotated-out refresh token revokes the whole family.
 - **Absolute session cap** uses an immutable origin-auth-time (``oat``)
@@ -40,6 +43,11 @@ from django.conf import settings
 
 DEFAULT_ACCESS_TTL = 900  # 15 minutes
 DEFAULT_REFRESH_TTL = 86400 * 7  # 7 days
+
+# Lifecycle claims minted by this module. User-supplied ``claims`` may not
+# override them: ``ver`` would bypass global logout, ``oat`` the session cap,
+# ``sub`` the token's identity, and so on.
+RESERVED_CLAIMS = frozenset({"sub", "iat", "exp", "typ", "jti", "fam", "oat", "ver"})
 
 
 class TokenRotationError(Exception):
@@ -69,6 +77,15 @@ def _resolve_user_id(user: Any) -> str:
     return str(user)
 
 
+def _check_reserved(claims: dict[str, Any] | None) -> None:
+    if claims:
+        reserved = RESERVED_CLAIMS.intersection(claims)
+        if reserved:
+            raise ValueError(
+                f"claims must not override reserved lifecycle claims: {sorted(reserved)}"
+            )
+
+
 def create_token_pair(
     user: Any,
     *,
@@ -79,6 +96,7 @@ def create_token_pair(
     claims: dict[str, Any] | None = None,
     method: str | None = None,
     version: int = 0,
+    oat: int | None = None,
 ) -> TokenPair:
     """Mint a fresh access + refresh token pair.
 
@@ -89,18 +107,29 @@ def create_token_pair(
         algorithm: JWT algorithm (default ``HS256``).
         access_ttl / refresh_ttl: Lifetimes in seconds.
         claims: Extra claims copied into *both* tokens (e.g. ``role``,
-            ``tenant_id``). Reserved lifecycle claims cannot be overridden.
+            ``tenant_id``). Overriding a reserved lifecycle claim
+            (``sub``/``iat``/``exp``/``typ``/``jti``/``fam``/``oat``/``ver``)
+            raises ``ValueError``.
         method: Optional RFC 8176 auth method recorded as ``amr`` at origin
             and preserved across rotations (e.g. ``"pwd"``, ``"otp"``,
             ``"oauth"``).
         version: The user's current token version (from
             ``store.get_user_version(user_id)``); embedded as ``ver`` so a
             later version bump invalidates this pair.
+        oat: Origin auth time. Defaults to now; ``rotate_refresh_token``
+            passes the original value through so the absolute session cap
+            survives rotation.
     """
+    _check_reserved(claims)
     now = int(time.time())
     user_id = _resolve_user_id(user)
     fam = str(uuid.uuid4())
-    base: dict[str, Any] = {"sub": user_id, "iat": now, "oat": now, "ver": version}
+    base: dict[str, Any] = {
+        "sub": user_id,
+        "iat": now,
+        "oat": now if oat is None else int(oat),
+        "ver": version,
+    }
     if claims:
         base.update(claims)
     if method is not None:
@@ -148,13 +177,27 @@ async def rotate_refresh_token(
        rotated-out token (``rotate=True``) is reuse: the whole family is
        revoked and the call fails.
     3. If ``max_session_lifetime`` is set, ``now - oat`` must be within it.
-    4. On success: issue a new pair (Mode A / ``rotate=True``) and revoke the
+    4. The token's ``ver`` must equal the store's current user version — a
+       version bumped by ``bump_user_version`` ("log out everywhere")
+       invalidates every earlier refresh token here.
+    5. On success: issue a new pair (Mode A / ``rotate=True``) and revoke the
        old ``jti``, or issue only a new access token (Mode B /
        ``rotate=False``) leaving the refresh token in place.
+
+    Only ``oat`` and ``amr`` are carried across the rotation automatically.
+    Custom claims minted into the original pair (e.g. ``role``) are **not**
+    copied from the old token — they may have gone stale since issuance —
+    so re-derive and pass them via ``claims=`` on every rotation.
+
+    Note the revocation check-then-revoke is not atomic: two concurrent
+    rotations of the same token can both succeed against the built-in
+    stores. Strict single-use requires a store whose ``is_revoked``/
+    ``revoke`` is an atomic check-and-set.
 
     Raises ``TokenRotationError`` on any failure (with a generic message —
     callers should return a uniform 401 to avoid an oracle).
     """
+    _check_reserved(claims)
     jti = refresh_claims.get("jti")
     if not jti:
         raise TokenRotationError("Refresh token missing jti")
@@ -181,10 +224,14 @@ async def rotate_refresh_token(
     user_id = refresh_claims.get("sub")
     version = await _user_version(store, user_id)
 
-    # Preserve immutable origin claims across the rotation.
+    # Global logout: a version bump invalidates every refresh token minted
+    # before it. Tokens without ver (pre-lifecycle) count as version 0.
+    if int(refresh_claims.get("ver", 0)) < version:
+        raise TokenRotationError("Refresh token version is stale")
+
+    # Preserve immutable origin claims across the rotation. Custom claims
+    # are deliberately NOT copied from the old token (see docstring).
     carried: dict[str, Any] = {}
-    if oat is not None:
-        carried["oat"] = oat
     if "amr" in refresh_claims:
         carried["amr"] = refresh_claims["amr"]
     if claims:
@@ -195,14 +242,17 @@ async def rotate_refresh_token(
 
     if not rotate:
         # Mode B: new access token only; refresh token stays valid.
+        # Reserved claims come after `carried` so they always win.
         access_claims = {
+            **carried,
             "sub": user_id,
             "iat": now,
             "exp": now + access_ttl,
             "typ": "access",
             "ver": version,
-            **carried,
         }
+        if oat is not None:
+            access_claims["oat"] = int(oat)
         return TokenPair(
             access_token=jwt.encode(access_claims, key, algorithm=algorithm),
             refresh_token="",
@@ -220,6 +270,7 @@ async def rotate_refresh_token(
         refresh_ttl=refresh_ttl,
         claims=carried or None,
         version=version,
+        oat=int(oat) if oat is not None else None,
     )
     if fam is not None:
         pair.refresh_claims["fam"] = fam
