@@ -263,6 +263,7 @@ HTTP Request → Actix Web (Rust)
 - **Integer meta tags**: Common response types (JSON, plaintext, etc.) use integer tags mapped to static Rust constants — zero allocation per response
 - **Cookie serialization in Rust**: Raw cookie tuples pass from Python → Rust, eliminating Python `SimpleCookie` overhead
 - **Lazy request allocations**: Form/files/state/meta dicts use `OnceLock`, only allocated when accessed (~95% of requests save 2-4 dict allocations)
+- **Parallel QuerySet evaluation**: async handlers returning QuerySets are evaluated via `sync_to_thread` on the default (parallel) thread pool — never `sync_to_async(thread_sensitive=True)`, whose single shared thread would serialize ALL concurrent async ORM work in a process. Blocking sync handlers run handler + serialization in ONE thread hop. Avoid Django's `async for`/`acount()` on hot paths (chunked, thread-sensitive internally); return the QuerySet and let the framework evaluate it.
 - **Multi-process scaling**: SO_REUSEPORT allows kernel-level load balancing across processes
 - **msgspec serialization**: 5-10x faster than standard JSON for request/response handling
 - **Efficient compression**: Client-negotiated gzip/brotli/zstd compression in Rust

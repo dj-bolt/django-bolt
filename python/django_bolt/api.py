@@ -1791,8 +1791,12 @@ class BoltAPI:
                 if is_async:
                     return await _dispatch_multi_async(await handler(*args, **kwargs))
                 if is_blocking:
-                    result = await sync_to_thread(handler, *args, **kwargs)
-                    return await sync_to_thread(_dispatch_multi_sync, result)
+                    # ONE thread hop for handler + serialization (two hops =
+                    # double executor wait + double pool contention).
+                    def _run_blocking_multi():
+                        return _dispatch_multi_sync(handler(*args, **kwargs))
+
+                    return await sync_to_thread(_run_blocking_multi)
                 return _dispatch_multi_sync(handler(*args, **kwargs))
 
             return execute_multi
@@ -2377,7 +2381,12 @@ class BoltAPI:
                 if is_async:
                     result = await handler(request)
                 elif is_blocking:
-                    result = await sync_to_thread(handler, request)
+                    # ONE thread hop for handler + serialization — the wire
+                    # tuple comes back directly, skipping the second hop below.
+                    def _run_blocking_request_only():
+                        return serialize_response_sync(handler(request), meta)
+
+                    return await sync_to_thread(_run_blocking_request_only)
                 else:
                     result = handler(request)
             else:
@@ -2402,14 +2411,19 @@ class BoltAPI:
                 if is_async:
                     result = await handler(*args, **kwargs)
                 elif is_blocking:
-                    result = await sync_to_thread(handler, *args, **kwargs)
+                    # ONE thread hop for handler + serialization (previously
+                    # two: one for the handler, one for serialize_response_sync).
+                    def _run_blocking():
+                        return serialize_response_sync(handler(*args, **kwargs), meta)
+
+                    return await sync_to_thread(_run_blocking)
                 else:
                     result = handler(*args, **kwargs)
 
             if is_async:
                 return await serialize_response(result, meta)
 
-            if is_blocking or isinstance(result, QuerySet):
+            if isinstance(result, QuerySet):
                 return await sync_to_thread(serialize_response_sync, result, meta)
             return serialize_response_sync(result, meta)
 

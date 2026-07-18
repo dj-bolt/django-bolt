@@ -12,8 +12,8 @@ from collections.abc import Callable, Sequence
 from typing import Any, get_args, get_origin
 
 import msgspec
-from asgiref.sync import sync_to_async
 
+from ..concurrency import sync_to_thread
 from ..datastructures import UploadFile
 from ..exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
 from ..pagination import PaginatedResponse
@@ -790,11 +790,15 @@ async def coerce_to_response_type_async(value: Any, annotation: Any, meta: Handl
         # Our approach: 1 sync_to_thread call total (minimal overhead)
         # Performance gain: 100-1000x fewer context switches
         #
+        # sync_to_thread uses the default (parallel) thread pool — NOT
+        # sync_to_async's thread_sensitive single thread, which would funnel
+        # every concurrent request's QuerySet evaluation through one thread.
+        #
         # Memory tradeoff:
         #   - Paginated APIs (20-100 items/page): Trivial memory usage (~20-100KB)
         #   - Small lists (<10K items): Acceptable memory usage (<10MB)
         #   - Large unpaginated lists: Should use pagination or StreamingResponse + .iterator()
-        items = await sync_to_async(list)(values_qs)
+        items = await sync_to_thread(list, values_qs)
 
         # Let msgspec validate and convert entire list in one batch (much faster than N individual conversions)
         result = msgspec.convert(items, annotation)
