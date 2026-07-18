@@ -20,9 +20,7 @@ mimalloc = ["dep:mimalloc"]
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py312"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 actix-web = { version = "4", features = ["compress-gzip", "compress-brotli", "compress-zstd", "cookies"] }
-cookie = "0.18"  # RFC 6265 compliant cookie handling
 actix-http = "3"
-actix-cors = "0.7"
 actix-web-actors = "4"  # WebSocket support
 actix = "0.13"  # Actor framework for WebSocket
 actix-files = "0.6"
@@ -58,7 +56,7 @@ actix-multipart = "0.7"
 serde_urlencoded = "0.7"
 tempfile = "3"
 log = "0.4"
-notify = "6"
+notify = "8"
 ctrlc = "3"
 libc = "0.2"
 

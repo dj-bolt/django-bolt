@@ -3,7 +3,7 @@
 //! Uses the battle-tested `cookie` crate instead of manual string building
 //! to ensure proper validation, escaping, and security.
 
-use cookie::{Cookie, SameSite};
+use actix_web::cookie::{time, Cookie, SameSite};
 
 use crate::response_meta::CookieData;
 
@@ -37,7 +37,7 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
     }
 
     // Build cookie using the cookie crate
-    let mut cookie = Cookie::build((&c.name, &c.value)).path(&c.path);
+    let mut cookie = Cookie::build(&c.name, &c.value).path(&c.path);
 
     // Max-Age (validate non-negative)
     if let Some(max_age) = c.max_age {
@@ -46,9 +46,9 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
                 "[django-bolt] WARNING: Cookie '{}' has negative max_age ({}) - using 0",
                 c.name, max_age
             );
-            cookie = cookie.max_age(cookie::time::Duration::ZERO);
+            cookie = cookie.max_age(time::Duration::ZERO);
         } else {
-            cookie = cookie.max_age(cookie::time::Duration::seconds(max_age));
+            cookie = cookie.max_age(time::Duration::seconds(max_age));
         }
     }
 
@@ -81,7 +81,7 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
         cookie = cookie.same_site(ss);
     }
 
-    let built = cookie.build();
+    let built = cookie.finish();
     let mut result = built.to_string();
 
     // Append Expires manually if provided (cookie crate requires OffsetDateTime)
