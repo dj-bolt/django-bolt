@@ -13,7 +13,7 @@ from typing import Any, get_args, get_origin
 
 import msgspec
 
-from ..concurrency import sync_to_thread
+from ..concurrency import run_in_orm_executor
 from ..datastructures import UploadFile
 from ..exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
 from ..pagination import PaginatedResponse
@@ -798,7 +798,7 @@ async def coerce_to_response_type_async(value: Any, annotation: Any, meta: Handl
         #   - Paginated APIs (20-100 items/page): Trivial memory usage (~20-100KB)
         #   - Small lists (<10K items): Acceptable memory usage (<10MB)
         #   - Large unpaginated lists: Should use pagination or StreamingResponse + .iterator()
-        items = await sync_to_thread(list, values_qs)
+        items = await run_in_orm_executor(list, values_qs)
 
         # Let msgspec validate and convert entire list in one batch (much faster than N individual conversions)
         result = msgspec.convert(items, annotation)

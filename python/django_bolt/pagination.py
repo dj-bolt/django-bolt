@@ -32,7 +32,7 @@ from typing import Any, TypeVar, get_args, get_origin
 import msgspec
 
 from . import _json
-from .concurrency import sync_to_thread
+from .concurrency import run_in_orm_executor
 from .exceptions import UnloadedRelationError
 
 __all__ = [
@@ -191,13 +191,13 @@ class PaginationBase(ABC):
         # Django's acount() is sync_to_async(thread_sensitive=True) internally,
         # which funnels every concurrent request through ONE shared thread.
         if hasattr(queryset, "_iterable_class") and hasattr(queryset, "model"):
-            return await sync_to_thread(queryset.count)
+            return await run_in_orm_executor(queryset.count)
         # Non-Django async collections that expose acount
         if hasattr(queryset, "acount"):
             return await queryset.acount()
         # Other sync collections with a count() method
         elif hasattr(queryset, "count") and callable(queryset.count):
-            return await sync_to_thread(queryset.count)
+            return await run_in_orm_executor(queryset.count)
         # For other iterables
         else:
             return len(queryset)
@@ -289,7 +289,7 @@ class PaginationBase(ABC):
         # sync_to_async(thread_sensitive=True) hop onto one shared thread —
         # both per-chunk overhead AND a cross-request serialization point.
         if hasattr(queryset, "_iterable_class") and hasattr(queryset, "model"):
-            return await sync_to_thread(list, queryset)
+            return await run_in_orm_executor(list, queryset)
         # Non-QuerySet async iterables (has __aiter__)
         if hasattr(queryset, "__aiter__"):
             async for item in queryset:

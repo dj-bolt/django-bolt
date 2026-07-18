@@ -34,7 +34,7 @@ from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 
 from . import _json
 from ._kwargs import coerce_to_response_type, coerce_to_response_type_async
-from .concurrency import sync_to_thread
+from .concurrency import run_in_orm_executor
 from .cookies import Cookie
 from .exceptions import ResponseValidationError, UnloadedRelationError
 from .responses import (
@@ -471,10 +471,9 @@ def _compile_queryset_serializers(meta: HandlerMetadata | dict[str, Any]) -> tup
 
     async def serialize_async(queryset: QuerySet) -> list[Any]:
         values_qs = queryset.values(*field_names)
-        # sync_to_thread (default thread pool) — NOT sync_to_async with
-        # thread_sensitive=True, which funnels every concurrent request's
-        # QuerySet evaluation through ONE shared thread per process.
-        return await sync_to_thread(list, values_qs)
+        # Bounded ORM pool: parallel (unlike sync_to_async's thread_sensitive
+        # single thread) but capped so DB connection count stays small.
+        return await run_in_orm_executor(list, values_qs)
 
     return serialize_sync, serialize_async
 
@@ -804,9 +803,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             if queryset_serializer_async is not None:
                 result = await queryset_serializer_async(result)
             else:
-                # Parallel thread-pool evaluation — one shared thread_sensitive
-                # thread would serialize ALL concurrent async ORM responses.
-                result = await sync_to_thread(list, result)
+                # Bounded ORM pool — parallel, but capped connection count.
+                result = await run_in_orm_executor(list, result)
             return await _serialize_json_payload_async(result, current_status, validator_async)
 
         if isinstance(result, msgspec.Struct) or validator_async is not None:

@@ -10,10 +10,64 @@ Inspired by Litestar's concurrency module.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import logging
+import os
 from collections.abc import Callable
 from functools import partial
 
-__all__ = ("sync_to_thread",)
+logger = logging.getLogger(__name__)
+
+__all__ = ("sync_to_thread", "run_in_orm_executor")
+
+# Bounded executor for framework-initiated QuerySet evaluation (async handlers
+# returning QuerySets, pagination counts/slices). Parallel — unlike asgiref's
+# thread_sensitive single thread — but CAPPED: each executor thread holds its
+# own long-lived DB connection, and unbounded parallelism actively hurts
+# SQLite (measured: /users/full10 at C=32 was ~2x faster through one shared
+# connection than through the unbounded default pool). A small cap keeps the
+# C=1 parallelism win while bounding connection count and lock contention.
+# Tune with DJANGO_BOLT_ORM_THREADS (default 4).
+_orm_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _default_orm_workers() -> int:
+    """Vendor-aware default for the ORM pool size.
+
+    Measured on the example project (/users/full10, C=32, single process):
+    SQLite throughput scales INVERSELY with connection count — 1 thread beat
+    4 threads by ~80% and the unbounded pool by ~2.5x (file-lock contention +
+    per-connection page caches). Networked databases (Postgres/MySQL) benefit
+    from parallel connections instead. Override with DJANGO_BOLT_ORM_THREADS.
+    """
+    try:
+        from django.conf import settings  # noqa: PLC0415 — needs configured settings, resolved lazily
+
+        engines = {db.get("ENGINE", "") for db in settings.DATABASES.values()}
+        if engines and all("sqlite" in engine for engine in engines):
+            return 1
+    except Exception as exc:  # unconfigured settings etc. — fall back to the parallel default
+        logger.debug("ORM executor vendor detection failed, using default pool size: %s", exc)
+    return 4
+
+
+def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _orm_executor
+    if _orm_executor is None:
+        raw = os.environ.get("DJANGO_BOLT_ORM_THREADS")
+        try:
+            workers = int(raw) if raw else _default_orm_workers()
+        except ValueError:
+            workers = _default_orm_workers()
+        _orm_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, workers), thread_name_prefix="bolt_orm"
+        )
+    return _orm_executor
+
+
+async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
+    """Run a framework-initiated ORM evaluation in the bounded ORM pool."""
+    return await asyncio.get_running_loop().run_in_executor(_get_orm_executor(), fn, *args)
 
 
 async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:

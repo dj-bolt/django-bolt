@@ -38,7 +38,7 @@ from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler, warn_blocking_handler
 from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import default_django_user_loader, resolve_user_loader
-from .concurrency import sync_to_thread
+from .concurrency import run_in_orm_executor, sync_to_thread
 from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
 from .error_handlers import handle_exception
 from .exceptions import HTTPException
@@ -2424,7 +2424,7 @@ class BoltAPI:
                 return await serialize_response(result, meta)
 
             if isinstance(result, QuerySet):
-                return await sync_to_thread(serialize_response_sync, result, meta)
+                return await run_in_orm_executor(serialize_response_sync, result, meta)
             return serialize_response_sync(result, meta)
 
         return execute
