@@ -19,6 +19,7 @@ import httpx
 from httpx import Response
 
 from django_bolt import BoltAPI, _core
+from django_bolt._bridge import make_bound_dispatch
 from django_bolt.api import _validate_asgi_mount_conflicts
 
 try:
@@ -379,7 +380,17 @@ class TestClient(httpx.Client):
         self._validate_asgi_mount_conflicts(api)
 
         # Register routes
-        rust_routes = [(method, path, handler_id, handler) for method, path, handler_id, handler in api._routes]
+        rust_routes = [
+            (
+                method,
+                path,
+                handler_id,
+                handler,
+                make_bound_dispatch(api._dispatch, handler, handler_id),
+                make_bound_dispatch(api._dispatch_sync, handler, handler_id),
+            )
+            for method, path, handler_id, handler in api._routes
+        ]
         _core.register_test_routes(self.app_id, rust_routes)
 
         # Register WebSocket routes with pre-compiled injectors (same as production)
@@ -645,7 +656,17 @@ class AsyncTestClient(httpx.AsyncClient):
         TestClient._validate_asgi_mount_conflicts(api)
 
         # Register routes
-        rust_routes = [(method, path, handler_id, handler) for method, path, handler_id, handler in api._routes]
+        rust_routes = [
+            (
+                method,
+                path,
+                handler_id,
+                handler,
+                make_bound_dispatch(api._dispatch, handler, handler_id),
+                make_bound_dispatch(api._dispatch_sync, handler, handler_id),
+            )
+            for method, path, handler_id, handler in api._routes
+        ]
         _core.register_test_routes(self.app_id, rust_routes)
 
         # Register WebSocket routes

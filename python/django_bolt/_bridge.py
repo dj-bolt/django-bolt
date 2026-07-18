@@ -74,15 +74,17 @@ def _resolve_task(task, resolver):
         resolver.set_exception(exc)
 
 
-def eager_dispatch(dispatch, handler, request, handler_id, resolver):
+def eager_dispatch(dispatch, request, resolver):
     """Entry point scheduled on the loop thread by Rust (call_soon_threadsafe).
 
-    Creates the dispatch coroutine and eagerly runs its first segment. Resolver
-    is a Rust-backed object with set_result/set_exception that completes the
+    ``dispatch`` is the per-route bound callable (partial binding handler and
+    handler_id) stored in the Rust Route — a single-argument call. Creates the
+    dispatch coroutine and eagerly runs its first segment. Resolver is a
+    Rust-backed object with set_result/set_exception that completes the
     tokio-side response future.
     """
     try:
-        coro = dispatch(handler, request, handler_id)
+        coro = dispatch(request)
         try:
             pending = coro.send(None)
         except StopIteration as stop:
@@ -93,3 +95,17 @@ def eager_dispatch(dispatch, handler, request, handler_id, resolver):
         resolver.set_exception(exc)
         return
     task.add_done_callback(lambda t: _resolve_task(t, resolver))
+
+
+def make_bound_dispatch(dispatch, handler, handler_id):
+    """Create the per-route single-argument dispatch callable stored in Rust.
+
+    A plain closure, NOT functools.partial with a keyword: partial's stored
+    kwargs force a dict copy on every call (~279ns vs ~101ns measured for the
+    closure). The hot Rust->Python call then passes only (request,).
+    """
+
+    def bound_dispatch(request):
+        return dispatch(handler, request, handler_id)
+
+    return bound_dispatch

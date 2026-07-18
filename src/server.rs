@@ -165,11 +165,11 @@ fn read_max_age_setting(
 #[pyfunction]
 pub fn register_routes(
     _py: Python<'_>,
-    routes: Vec<(String, String, usize, Py<PyAny>)>,
+    routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
 ) -> PyResult<()> {
     let mut router = Router::new();
-    for (method, path, handler_id, handler) in routes {
-        router.register(&method, &path, handler_id, handler.into())?;
+    for (method, path, handler_id, handler, dispatch, dispatch_sync) in routes {
+        router.register(&method, &path, handler_id, handler, dispatch, dispatch_sync)?;
     }
     GLOBAL_ROUTER
         .set(Arc::new(router))

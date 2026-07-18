@@ -369,7 +369,7 @@ pub fn destroy_test_app(app_id: u64) -> PyResult<()> {
 pub fn register_test_routes(
     _py: Python<'_>,
     app_id: u64,
-    routes: Vec<(String, String, usize, Py<PyAny>)>,
+    routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
 ) -> PyResult<()> {
     let entry = registry()
         .get(&app_id)
@@ -379,8 +379,8 @@ pub fn register_test_routes(
 
     // Create a new router with the routes
     let mut router = Router::new();
-    for (method, path, handler_id, handler) in routes {
-        router.register(&method, &path, handler_id, handler)?;
+    for (method, path, handler_id, handler, dispatch, dispatch_sync) in routes {
+        router.register(&method, &path, handler_id, handler, dispatch, dispatch_sync)?;
     }
     app.router = Arc::new(router);
     Ok(())

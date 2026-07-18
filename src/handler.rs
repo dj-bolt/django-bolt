@@ -1239,10 +1239,11 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     let is_head_request = method == "HEAD";
 
     // Unified GIL block: build request + dispatch (sync or async).
-    // OPTIMIZATION: The ONLY GIL acquisition on the happy path — the handler
-    // clone_ref happens here instead of in a separate attach at route match.
+    // OPTIMIZATION: The ONLY GIL acquisition on the happy path. Dispatch goes
+    // through the per-route bound callables (partial(handler, handler_id))
+    // stored in the Route — single-argument calls, no per-request handler
+    // clone_ref or handler_id conversion.
     let dispatch_result: Result<DispatchOutcome, PyErr> = Python::attach(|py| {
-        let handler = route.handler.clone_ref(py);
 
         // Create context dict only if auth context is present
         let context = if let Some(ref auth) = auth_ctx {
@@ -1382,9 +1383,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // body bytes (not a coroutine). Parse and build the HTTP response in
             // the same GIL block. Eliminates: coroutine creation,
             // into_future_with_locals, asyncio polling.
-            let result_obj = state
-                .dispatch_sync
-                .call1(py, (handler, request_obj, handler_id))?;
+            let result_obj = route.dispatch_sync.call1(py, (request_obj,))?;
 
             // Bare-bytes fast path: sync executors return just the encoded JSON
             // body when (status, meta) == (route default, JSON). Skips the
@@ -1473,14 +1472,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 let eager = get_eager_dispatch_fn(py)?;
                 locals.event_loop(py).call_method1(
                     pyo3::intern!(py, "call_soon_threadsafe"),
-                    (
-                        eager,
-                        &state.dispatch,
-                        handler,
-                        request_obj,
-                        handler_id,
-                        resolver,
-                    ),
+                    (eager, &route.dispatch, request_obj, resolver),
                 )?;
                 let fut = async move {
                     match rx.await {
@@ -1494,8 +1486,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             } else {
                 // ASYNC PATH (legacy bridge): Task-per-request via
                 // into_future_with_locals. Kept behind DJANGO_BOLT_EAGER_DISPATCH=0.
-                let dispatch = state.dispatch.clone_ref(py);
-                let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
+                let coroutine = route.dispatch.call1(py, (request_obj,))?;
                 let fut =
                     pyo3_async_runtimes::into_future_with_locals(locals, coroutine.into_bound(py))?;
                 Ok(DispatchOutcome::Pending(Box::pin(fut)))

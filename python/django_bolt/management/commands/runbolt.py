@@ -20,6 +20,7 @@ from django.template.autoreload import get_template_directories
 from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
+from django_bolt._bridge import make_bound_dispatch
 from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts, serve_with_lifespan
 from django_bolt.workers import MIB, WorkerSupervisor
 
@@ -700,13 +701,25 @@ class Command(BaseCommand):
         # Validate ASGI mount conflicts after all framework/admin/docs routes are added.
         self.validate_asgi_mount_conflicts(merged_api._routes, merged_api._asgi_mounts)
 
-        # Register routes with Rust
+        # Register routes with Rust. Each route carries per-route bound
+        # dispatch callables (partial binding handler + handler_id) so the
+        # per-request Rust→Python call passes ONLY the request object —
+        # single-arg vectorcall instead of a 3-tuple of conversions.
         rust_routes = []
         for method, path, handler_id, handler in merged_api._routes:
             # Ensure matchit path syntax
             convert = getattr(merged_api, "_convert_path", None)
             norm_path = convert(path) if callable(convert) else path
-            rust_routes.append((method, norm_path, handler_id, handler))
+            rust_routes.append(
+                (
+                    method,
+                    norm_path,
+                    handler_id,
+                    handler,
+                    make_bound_dispatch(merged_api._dispatch, handler, handler_id),
+                    make_bound_dispatch(merged_api._dispatch_sync, handler, handler_id),
+                )
+            )
 
         _core.register_routes(rust_routes)
 
