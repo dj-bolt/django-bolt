@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import logging
 import os
 from collections.abc import Callable
@@ -88,8 +89,15 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
 
 
 async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
-    """Run a framework-initiated ORM evaluation in the bounded ORM pool."""
-    return await asyncio.get_running_loop().run_in_executor(_get_orm_executor(), fn, *args)
+    """Run a framework-initiated ORM evaluation in the bounded ORM pool.
+
+    The caller's contextvars context is carried into the pool thread —
+    request-scoped state (e.g. a tenant-aware database router) must be
+    visible while the QuerySet evaluates, exactly as it was under
+    ``sync_to_async``.
+    """
+    ctx = contextvars.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(_get_orm_executor(), ctx.run, fn, *args)
 
 
 async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
@@ -125,9 +133,11 @@ async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.
     # Run in default executor (thread pool)
     # Use Bolt's explicit shared executor so every supported loop uses one
     # bounded pool rather than creating a separate implicit default pool.
+    # The caller's contextvars context is carried into the thread via ctx.run.
     # run_in_executor only forwards positional args — keyword args (e.g. Rust
     # prebound keyword-bound params) must be bound via partial.
     loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
     if kwargs:
-        return await loop.run_in_executor(_get_default_executor(), partial(fn, *args, **kwargs))
-    return await loop.run_in_executor(_get_default_executor(), fn, *args)
+        return await loop.run_in_executor(_get_default_executor(), partial(ctx.run, fn, *args, **kwargs))
+    return await loop.run_in_executor(_get_default_executor(), ctx.run, fn, *args)
