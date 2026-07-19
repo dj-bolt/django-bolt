@@ -966,8 +966,8 @@ pub fn start_server(
                             // bare FIN before the close frame is written. Wait
                             // (bounded) for the actors to finish closing, plus
                             // a small margin for the final frame flush.
-                            let deadline = std::time::Instant::now()
-                                + std::time::Duration::from_secs(5);
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
                             while crate::websocket::ACTIVE_WS_CONNECTIONS
                                 .load(std::sync::atomic::Ordering::Relaxed)
                                 > 0
