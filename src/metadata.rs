@@ -6,7 +6,7 @@ use actix_web::http::header::HeaderValue;
 use ahash::{AHashMap, AHashSet};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyString};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
@@ -26,12 +26,39 @@ pub enum RustArgSource {
 }
 
 /// One argument binding entry used by Rust-side prebinding.
-#[derive(Debug, Clone)]
+///
+/// `lookup_key` / `arg_name` are interned Python strings created once at
+/// registration so the per-request dict lookups reuse the same object
+/// (no per-request PyString allocation or re-hashing of a fresh object).
+#[derive(Debug)]
 pub struct RustArgBinding {
     pub source: RustArgSource,
-    pub lookup_key: String,
-    pub arg_name: String,
+    pub lookup_key: Py<PyString>,
+    pub arg_name: Py<PyString>,
     pub positional: bool,
+    // (Clone is implemented manually below — Py<T> needs the GIL to clone_ref.)
+    /// Required params fall back to the Python injector when missing (which
+    /// raises the proper 422). Optional params are skipped or None-injected.
+    pub required: bool,
+    /// True when the handler signature has no plain default for this optional
+    /// param (Optional[T] annotation only) — Rust injects None explicitly.
+    /// False → the binding is simply omitted so the function default applies.
+    pub inject_none: bool,
+}
+
+impl Clone for RustArgBinding {
+    fn clone(&self) -> Self {
+        // Only exercised at startup (global-CORS metadata rebuild) and on the
+        // test-app path — never on the production request hot path.
+        Python::attach(|py| Self {
+            source: self.source,
+            lookup_key: self.lookup_key.clone_ref(py),
+            arg_name: self.arg_name.clone_ref(py),
+            positional: self.positional,
+            required: self.required,
+            inject_none: self.inject_none,
+        })
+    }
 }
 
 /// CORS configuration parsed at startup
@@ -314,6 +341,7 @@ impl RouteExecutionPlan {
     const HAS_AUTH_OR_GUARDS: u16 = 1 << 7;
     const HAS_RATE_LIMIT: u16 = 1 << 8;
     const CAN_SYNC_DISPATCH: u16 = 1 << 9;
+    const IS_ASYNC: u16 = 1 << 10;
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
@@ -327,6 +355,7 @@ impl RouteExecutionPlan {
         has_auth_or_guards: bool,
         has_rate_limit: bool,
         can_sync_dispatch: bool,
+        is_async: bool,
     ) -> Self {
         let mut bits = 0u16;
         if needs_body {
@@ -358,6 +387,9 @@ impl RouteExecutionPlan {
         }
         if can_sync_dispatch {
             bits |= Self::CAN_SYNC_DISPATCH;
+        }
+        if is_async {
+            bits |= Self::IS_ASYNC;
         }
         Self { bits }
     }
@@ -411,6 +443,11 @@ impl RouteExecutionPlan {
     pub const fn can_sync_dispatch(self) -> bool {
         (self.bits & Self::CAN_SYNC_DISPATCH) != 0
     }
+
+    #[inline]
+    pub const fn is_async(self) -> bool {
+        (self.bits & Self::IS_ASYNC) != 0
+    }
 }
 
 #[inline]
@@ -431,7 +468,7 @@ impl RouteMetadataStore {
         }
 
         let max_id = map.keys().copied().max().unwrap_or(0);
-        let mut by_handler_id = vec![None; max_id + 1];
+        let mut by_handler_id: Vec<Option<RouteMetadata>> = (0..=max_id).map(|_| None).collect();
         for (handler_id, metadata) in map {
             by_handler_id[handler_id] = Some(metadata);
         }
@@ -478,6 +515,10 @@ pub struct RouteMetadata {
     pub memory_spool_threshold: usize,
     pub rust_arg_bindings: Option<Vec<RustArgBinding>>,
     pub plan: RouteExecutionPlan,
+    /// Route's default success status code. Used by the bare-bytes response
+    /// fast path: sync executors may return just the encoded JSON body and
+    /// Rust rebuilds the (status, JSON meta) envelope from this value.
+    pub default_status_code: u16,
 }
 
 impl RouteMetadata {
@@ -622,6 +663,12 @@ impl RouteMetadata {
             .flatten()
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false);
+        let is_async = py_meta
+            .get_item("is_async")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false);
         let plan = RouteExecutionPlan::from_parts(
             needs_body,
             needs_query,
@@ -633,6 +680,7 @@ impl RouteMetadata {
             has_auth_or_guards,
             has_rate_limit,
             can_sync_dispatch,
+            is_async,
         );
 
         // Form field type hints (same format as param_types)
@@ -673,6 +721,15 @@ impl RouteMetadata {
         // Optional Rust-side argument binding plan.
         let rust_arg_bindings = parse_rust_arg_bindings(py_meta);
 
+        // Default success status (guaranteed by Python registration; 200 fallback
+        // for defensive parsing of hand-built metadata in tests).
+        let default_status_code = py_meta
+            .get_item("default_status_code")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<u16>().ok())
+            .unwrap_or(200);
+
         Ok(RouteMetadata {
             auth_backends,
             guards,
@@ -689,6 +746,7 @@ impl RouteMetadata {
             memory_spool_threshold,
             rust_arg_bindings,
             plan,
+            default_status_code,
         })
     }
 }
@@ -815,10 +873,16 @@ fn parse_rate_limit_config(
         config.burst = config.rps * 2;
     }
 
-    // Parse key_type (optional, defaults to "ip")
+    // Parse key_type (optional, defaults to "ip").
+    // Custom header keys are lowercased ONCE here so the per-request rate-limit
+    // check can look them up directly (headers are stored lowercase).
     if let Some(key_py) = dict.get("key") {
         if let Ok(key_type) = key_py.extract::<String>(py) {
-            config.key_type = key_type;
+            config.key_type = if key_type == "ip" {
+                key_type
+            } else {
+                key_type.to_lowercase()
+            };
         }
     }
 
@@ -1050,10 +1114,15 @@ fn parse_file_constraints(
 ///
 /// Expected format:
 /// [
-///   {"source": "path|query|header|cookie", "lookup_key": "...", "arg_name": "...", "arg_kind": "positional|keyword"},
+///   {"source": "path|query|header|cookie", "lookup_key": "...", "arg_name": "...",
+///    "arg_kind": "positional|keyword", "required": bool, "inject_none": bool},
 ///   ...
 /// ]
+///
+/// `required` defaults to true and `inject_none` to false so older metadata
+/// shapes keep the strict all-or-nothing behavior.
 fn parse_rust_arg_bindings(py_meta: &Bound<'_, PyDict>) -> Option<Vec<RustArgBinding>> {
+    let py = py_meta.py();
     let bindings_obj = py_meta.get_item("rust_arg_bindings").ok().flatten()?;
     let py_list = bindings_obj.cast::<PyList>().ok()?;
 
@@ -1106,11 +1175,34 @@ fn parse_rust_arg_bindings(py_meta: &Bound<'_, PyDict>) -> Option<Vec<RustArgBin
             _ => return None,
         };
 
+        let required = entry
+            .get_item("required")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(true);
+
+        let inject_none = entry
+            .get_item("inject_none")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false);
+
+        // Optional params must be keyword-bound: a skipped positional slot
+        // would shift every following positional argument.
+        if !required && positional {
+            return None;
+        }
+
+        // Intern once at registration — per-request lookups reuse the object.
         bindings.push(RustArgBinding {
             source,
-            lookup_key,
-            arg_name,
+            lookup_key: PyString::intern(py, &lookup_key).unbind(),
+            arg_name: PyString::intern(py, &arg_name).unbind(),
             positional,
+            required,
+            inject_none,
         });
     }
 

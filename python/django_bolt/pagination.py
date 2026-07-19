@@ -30,9 +30,9 @@ from functools import wraps
 from typing import Any, TypeVar, get_args, get_origin
 
 import msgspec
-from asgiref.sync import sync_to_async
 
 from . import _json
+from .concurrency import run_in_orm_executor
 from .exceptions import UnloadedRelationError
 
 __all__ = [
@@ -187,12 +187,17 @@ class PaginationBase(ABC):
         # Check if it's a plain list first (Python list.count() requires an argument)
         if isinstance(queryset, (list, tuple)):
             return len(queryset)
-        # Check if queryset has acount (async count)
+        # Django QuerySet: run COUNT(*) in the parallel default thread pool.
+        # Django's acount() is sync_to_async(thread_sensitive=True) internally,
+        # which funnels every concurrent request through ONE shared thread.
+        if hasattr(queryset, "_iterable_class") and hasattr(queryset, "model"):
+            return await run_in_orm_executor(queryset.count)
+        # Non-Django async collections that expose acount
         if hasattr(queryset, "acount"):
             return await queryset.acount()
-        # Fallback to sync count wrapped in sync_to_async (for Django QuerySet)
-        elif hasattr(queryset, "count") and callable(queryset.count):
-            return await sync_to_async(queryset.count)()
+        # Other sync collections with a count() method
+        if hasattr(queryset, "count") and callable(queryset.count):
+            return await run_in_orm_executor(queryset.count)
         # For other iterables
         else:
             return len(queryset)
@@ -279,21 +284,17 @@ class PaginationBase(ABC):
         """
         items = []
 
-        # Check if it's an async iterable (has __aiter__)
+        # Django QuerySet FIRST: evaluate with ONE parallel thread-pool call.
+        # Django's `async for` iterates in chunks of 100, each chunk a
+        # sync_to_async(thread_sensitive=True) hop onto one shared thread —
+        # both per-chunk overhead AND a cross-request serialization point.
+        if hasattr(queryset, "_iterable_class") and hasattr(queryset, "model"):
+            return await run_in_orm_executor(list, queryset)
+        # Non-QuerySet async iterables (has __aiter__)
         if hasattr(queryset, "__aiter__"):
             async for item in queryset:
                 items.append(item)
             return items
-        # Check if it's a Django QuerySet with async support
-        elif hasattr(queryset, "_iterable_class") and hasattr(queryset, "model"):
-            # It's a QuerySet - check if we can iterate async
-            try:
-                async for item in queryset:
-                    items.append(item)
-                return items
-            except TypeError:
-                # Not async iterable, use sync_to_async
-                return await sync_to_async(list)(queryset)
         # Regular iterable or list
         else:
             return list(queryset)
@@ -720,21 +721,17 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
                     f"Args: {[type(a).__name__ for a in args]}, kwargs: {list(kwargs.keys())}"
                 )
 
-            # PyRequest already supports .get() and __getitem__, no need to copy
-            if isinstance(request, dict) or hasattr(request, "get") or hasattr(request, "__getitem__"):
-                request_dict = request
-            else:
-                raise ValueError(
-                    f"Unexpected request type: {type(request)}. "
-                    f"Args: {[type(a).__name__ for a in args]}, kwargs: {list(kwargs.keys())}"
-                )
+            # PyRequest already supports .get() and __getitem__ — no per-request
+            # isinstance/hasattr type sniffing (hot-path rule). Anything the
+            # request_getter yields is used directly; a genuinely wrong object
+            # fails loudly inside paginate_queryset.
 
             # Call original handler to get queryset
             # Pass all args along (including self for methods)
             queryset = await handler(*args, **kwargs)
 
             # Apply pagination using dict version
-            paginated = await cached_paginator.paginate_queryset(queryset, request_dict)
+            paginated = await cached_paginator.paginate_queryset(queryset, request)
 
             return paginated
 

@@ -141,7 +141,9 @@ class SwaggerRenderPlugin(OpenAPIRenderPlugin):
     def __init__(
         self,
         *,
-        version: str = "5.18.2",
+        # Swagger UI versions before 5.32.0 reject OpenAPI 3.2 documents.
+        # Bolt emits 3.2.0 when an API contains the QUERY HTTP method.
+        version: str = "5.32.9",
         js_url: str | None = None,
         css_url: str | None = None,
         standalone_preset_js_url: str | None = None,

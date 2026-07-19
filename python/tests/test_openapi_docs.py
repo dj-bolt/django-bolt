@@ -5,6 +5,7 @@ These tests verify that the OpenAPI/Swagger documentation endpoints
 are working correctly and not throwing internal errors.
 """
 
+import re
 import time
 from typing import Annotated
 
@@ -104,6 +105,41 @@ def test_swagger_ui_endpoint():
         # Should contain Swagger UI indicators
         html = response.text
         assert "swagger" in html.lower() or "openapi" in html.lower()
+
+
+def test_swagger_ui_supports_openapi_3_2_query_specs():
+    """Regression: the default Swagger UI must understand schemas containing QUERY.
+
+    QUERY is an OpenAPI 3.2 operation. Swagger UI only gained OpenAPI 3.2
+    support in 5.32.0; older bundles render an "invalid version field" error
+    even though the generated document itself is valid.
+    """
+    api = BoltAPI(
+        openapi_config=OpenAPIConfig(
+            title="Query API",
+            version="1.0.0",
+            render_plugins=[SwaggerRenderPlugin(path="/")],
+        )
+    )
+
+    @api.query("/search")
+    async def search():
+        return {"results": []}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        schema_response = client.get("/docs/openapi.json")
+        docs_response = client.get("/docs")
+
+    assert schema_response.status_code == 200
+    assert schema_response.json()["openapi"] == "3.2.0"
+    assert docs_response.status_code == 200
+    assert '"openapi":"3.2.0"' in docs_response.text
+
+    bundle_version = re.search(r"swagger-ui-dist@(\d+)\.(\d+)\.(\d+)/swagger-ui-bundle", docs_response.text)
+    assert bundle_version is not None
+    assert tuple(map(int, bundle_version.groups())) >= (5, 32, 0)
 
 
 def test_openapi_root_path_serves_ui_directly():

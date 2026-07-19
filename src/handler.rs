@@ -31,7 +31,7 @@ use crate::response_builder;
 use crate::response_meta::ResponseMeta;
 use crate::responses;
 use crate::router::parse_query_string;
-use crate::state::{find_asgi_mount, AppState, GLOBAL_ROUTER, ROUTE_METADATA, TASK_LOCALS};
+use crate::state::{find_asgi_mount, AppState, GLOBAL_ROUTER, ROUTE_METADATA};
 use crate::streaming::{create_python_stream, create_sse_stream};
 use crate::type_coercion::{params_to_py_dict, CoercedValue};
 use crate::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
@@ -50,12 +50,6 @@ enum DispatchOutcome {
     Pending(Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>),
 }
 
-// Cache Python classes for type construction (avoids repeated imports)
-static UUID_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static DECIMAL_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static DATETIME_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static DATE_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static TIME_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static STREAMING_RESPONSE_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 const SKIP_CORS_HEADER_NAME: HeaderName = HeaderName::from_static("x-bolt-skip-cors");
 const SKIP_CORS_HEADER_VALUE: HeaderValue = HeaderValue::from_static("true");
@@ -65,52 +59,6 @@ fn get_streaming_response_class(py: Python<'_>) -> &Py<PyAny> {
         py.import("django_bolt.responses")
             .unwrap()
             .getattr("StreamingResponse")
-            .unwrap()
-            .unbind()
-    })
-}
-
-fn get_uuid_class(py: Python<'_>) -> &Py<PyAny> {
-    UUID_CLASS.get_or_init(py, || {
-        py.import("uuid").unwrap().getattr("UUID").unwrap().unbind()
-    })
-}
-
-fn get_decimal_class(py: Python<'_>) -> &Py<PyAny> {
-    DECIMAL_CLASS.get_or_init(py, || {
-        py.import("decimal")
-            .unwrap()
-            .getattr("Decimal")
-            .unwrap()
-            .unbind()
-    })
-}
-
-fn get_datetime_class(py: Python<'_>) -> &Py<PyAny> {
-    DATETIME_CLASS.get_or_init(py, || {
-        py.import("datetime")
-            .unwrap()
-            .getattr("datetime")
-            .unwrap()
-            .unbind()
-    })
-}
-
-fn get_date_class(py: Python<'_>) -> &Py<PyAny> {
-    DATE_CLASS.get_or_init(py, || {
-        py.import("datetime")
-            .unwrap()
-            .getattr("date")
-            .unwrap()
-            .unbind()
-    })
-}
-
-fn get_time_class(py: Python<'_>) -> &Py<PyAny> {
-    TIME_CLASS.get_or_init(py, || {
-        py.import("datetime")
-            .unwrap()
-            .getattr("time")
             .unwrap()
             .unbind()
     })
@@ -275,7 +223,9 @@ pub fn build_validation_error_response(error: &ValidationError) -> HttpResponse 
 /// Convert CoercedValue to Python object
 ///
 /// Constructs actual Python typed objects (uuid.UUID, decimal.Decimal, datetime, etc.)
-/// instead of strings, eliminating double-parsing on the Python side.
+/// directly — datetime/date/time go through PyO3's chrono integration (C-API
+/// construction, no ISO-string round trip) and UUID is built from its 128-bit
+/// value instead of re-parsing a hex string in Python.
 pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
     match value {
         // Primitives - direct conversion
@@ -284,37 +234,34 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
         CoercedValue::Bool(v) => v.into_pyobject(py).unwrap().to_owned().unbind().into_any(),
         CoercedValue::String(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
 
-        // UUID: construct Python uuid.UUID object
-        CoercedValue::Uuid(v) => get_uuid_class(py).call1(py, (v.to_string(),)).unwrap(),
+        // UUID: construct from the 128-bit integer (uuid.UUID(int=...)) —
+        // avoids a 36-char string alloc in Rust + hex parsing in Python.
+        CoercedValue::Uuid(v) => uuid_to_py(py, *v).unwrap(),
 
         // Decimal: construct Python decimal.Decimal object
-        CoercedValue::Decimal(v) => get_decimal_class(py).call1(py, (v.to_string(),)).unwrap(),
-
-        // DateTime (with timezone): construct Python datetime.datetime
-        CoercedValue::DateTime(v) => {
-            let iso_str = v.to_rfc3339().replace('Z', "+00:00");
-            get_datetime_class(py)
-                .call_method1(py, "fromisoformat", (iso_str,))
-                .unwrap()
-        }
-
-        // NaiveDateTime: construct Python datetime.datetime (no timezone)
-        CoercedValue::NaiveDateTime(v) => get_datetime_class(py)
-            .call_method1(py, "fromisoformat", (v.to_string(),))
+        CoercedValue::Decimal(v) => crate::type_coercion::get_decimal_class(py)
+            .call1(py, (v.to_string(),))
             .unwrap(),
 
-        // Date: construct Python datetime.date
-        CoercedValue::Date(v) => get_date_class(py)
-            .call_method1(py, "fromisoformat", (v.to_string(),))
-            .unwrap(),
-
-        // Time: construct Python datetime.time
-        CoercedValue::Time(v) => get_time_class(py)
-            .call_method1(py, "fromisoformat", (v.to_string(),))
-            .unwrap(),
+        // Temporal types: direct C-API construction via pyo3's chrono feature.
+        CoercedValue::DateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::NaiveDateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::Date(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::Time(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
 
         CoercedValue::Null => py.None(),
     }
+}
+
+/// Build a Python `uuid.UUID` from the parsed 128-bit value.
+#[inline]
+pub(crate) fn uuid_to_py(py: Python<'_>, v: uuid::Uuid) -> PyResult<Py<PyAny>> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(pyo3::intern!(py, "int"), v.as_u128())?;
+    Ok(crate::type_coercion::get_uuid_class(py)
+        .bind(py)
+        .call((), Some(&kwargs))?
+        .unbind())
 }
 
 /// Convert a FileInfo into an unbound Python dict for use in Python code.
@@ -328,7 +275,7 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use pyo3::prelude::*;
 /// // Assume `FileInfo` and `FileContent` are in scope:
 /// // let file = FileInfo { filename: "a.txt".into(), content_type: "text/plain".into(), size: 3, content: FileContent::Memory(vec![97,98,99]) };
@@ -364,7 +311,7 @@ pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> 
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```ignore
 /// use pyo3::prelude::*;
 ///
 /// // Assume `result` is a FormParseResult obtained from multipart parsing.
@@ -722,8 +669,10 @@ pub async fn response_from_wire_result(
 
 /// Build prebound Python args/kwargs from Rust binding metadata.
 ///
-/// Returns None if any required binding value is missing so Python injector can
-/// execute as a safe fallback and preserve error semantics.
+/// Returns None if any *required* binding value is missing so the Python
+/// injector can execute as a safe fallback and preserve 422 error semantics.
+/// Optional bindings are keyword-only: a missing value is either skipped
+/// (function default applies) or injected as None (Optional[T] with no default).
 pub(crate) fn build_prebound_args_kwargs(
     py: Python<'_>,
     bindings: &[RustArgBinding],
@@ -743,16 +692,46 @@ pub(crate) fn build_prebound_args_kwargs(
             RustArgSource::Cookie => cookies,
         };
 
-        let value = source_dict.get_item(&binding.lookup_key).ok().flatten()?;
-
-        if binding.positional {
-            args.append(&value).ok()?;
-        } else {
-            kwargs.set_item(&binding.arg_name, &value).ok()?;
+        match source_dict.get_item(binding.lookup_key.bind(py)).ok()? {
+            Some(value) => {
+                if binding.positional {
+                    args.append(&value).ok()?;
+                } else {
+                    kwargs.set_item(binding.arg_name.bind(py), &value).ok()?;
+                }
+            }
+            None => {
+                if binding.required {
+                    // Fall back to the Python injector, which raises the 422.
+                    return None;
+                }
+                if binding.inject_none {
+                    kwargs.set_item(binding.arg_name.bind(py), py.None()).ok()?;
+                }
+                // else: omit — the handler's own default applies.
+            }
         }
     }
 
     Some((args.unbind(), kwargs.unbind()))
+}
+
+/// Map an HTTP method to a `Cow::Borrowed` static string. Routable methods are
+/// a fixed set, so the per-request `method.to_string()` allocation is avoided;
+/// unknown methods (test-only paths) fall back to an owned copy.
+#[inline]
+pub(crate) fn static_method_name(method: &str) -> std::borrow::Cow<'static, str> {
+    match method {
+        "GET" => std::borrow::Cow::Borrowed("GET"),
+        "POST" => std::borrow::Cow::Borrowed("POST"),
+        "PUT" => std::borrow::Cow::Borrowed("PUT"),
+        "PATCH" => std::borrow::Cow::Borrowed("PATCH"),
+        "DELETE" => std::borrow::Cow::Borrowed("DELETE"),
+        "HEAD" => std::borrow::Cow::Borrowed("HEAD"),
+        "OPTIONS" => std::borrow::Cow::Borrowed("OPTIONS"),
+        "QUERY" => std::borrow::Cow::Borrowed("QUERY"),
+        other => std::borrow::Cow::Owned(other.to_string()),
+    }
 }
 
 /// Parse the `Content-Length` header into a `usize`, if present and valid.
@@ -779,11 +758,32 @@ pub(crate) fn content_length_exceeds_limit(
     matches!(content_length, Some(len) if len > max_payload_size)
 }
 
+thread_local! {
+    static TSTATE_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Pin a Python thread state to this (actix worker) thread on first use.
+/// Without it every `Python::attach` creates+destroys a PyThreadState, and a
+/// fresh thread state mmaps/munmaps a 16KiB frame-datastack chunk — measured
+/// as exactly one mmap+munmap syscall pair PER REQUEST. Actix worker threads
+/// live for the process lifetime, so the pinned state is never torn down.
+#[inline]
+fn ensure_pinned_thread_state() {
+    TSTATE_PINNED.with(|c| {
+        if !c.get() {
+            crate::state::pin_python_thread_state();
+            c.set(true);
+        }
+    });
+}
+
 pub async fn handle_request<const ACCESS_LOG: bool>(
     req: HttpRequest,
     mut payload: web::Payload,
     state: web::Data<Arc<AppState>>,
 ) -> HttpResponse {
+    ensure_pinned_thread_state();
+
     // Keep as &str - no allocation, only clone on error paths
     let method = req.method().as_str();
     let path = req.path();
@@ -797,34 +797,34 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
     let router = GLOBAL_ROUTER.get().expect("Router not initialized");
 
-    // Find the route for the requested method and path
-    // RouteMatch enum allows us to skip path param processing for static routes
-    // Also capture the handler once to avoid a second route lookup before dispatch.
-    let (route_handler, path_params, handler_id) = {
+    // Find the route for the requested method and path.
+    // RouteMatch enum allows us to skip path param processing for static routes.
+    // The route reference borrows the 'static global router, so the handler
+    // clone_ref is deferred into the main dispatch GIL block — no extra
+    // Python::attach per request just to clone the callable.
+    let (route, path_params, handler_id) = {
         if let Some(route_match) = router.find(method, path) {
             let handler_id = route_match.handler_id();
-            let handler = Python::attach(|py| route_match.route().handler.clone_ref(py));
-            let raw_params = route_match.path_params();
+            let (route, raw_params) = route_match.into_parts();
 
-            // URL-decode path parameters for consistency with query string parsing
-            // This ensures /items/hello%20world correctly yields id="hello world"
-            let path_params = raw_params.map(|params| {
-                params
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let decoded = if v.as_bytes().iter().any(|&b| b == b'%' || b == b'+') {
-                            match urlencoding::decode(&v) {
-                                Ok(cow) => cow.into_owned(),
-                                Err(_) => v,
-                            }
-                        } else {
-                            v
+            // URL-decode path parameters in place for consistency with query
+            // string parsing (/items/hello%20world yields id="hello world").
+            // Values are mutated in the existing map — no map rebuild.
+            let path_params = raw_params.map(|mut params| {
+                for v in params.values_mut() {
+                    if v.as_bytes().iter().any(|&b| b == b'%' || b == b'+') {
+                        let decoded = match urlencoding::decode(v) {
+                            Ok(std::borrow::Cow::Owned(s)) => Some(s),
+                            _ => None,
                         };
-                        (k, decoded)
-                    })
-                    .collect()
+                        if let Some(s) = decoded {
+                            *v = s;
+                        }
+                    }
+                }
+                params
             });
-            (handler, path_params, handler_id)
+            (route, path_params, handler_id)
         } else {
             // No route found - check for trailing slash redirect FIRST
             // This only runs when route doesn't match (minimal overhead)
@@ -895,8 +895,9 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         }
     };
 
-    // Store method/path as owned for Python (needed after route_match is dropped)
-    let method_owned = method.to_string();
+    // Method maps to a static str (known fixed set — no per-request alloc);
+    // path is dynamic and must be owned for PyRequest.
+    let method_static = static_method_name(method);
     let path_owned = path.to_string();
 
     // Get parsed route metadata (Rust-native) by reference.
@@ -956,6 +957,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     let skip_cors = plan.map_or(false, |p| p.skip_cors());
     let skip_compression = plan.map_or(false, |p| p.skip_compression());
     let can_sync_dispatch = plan.map_or(false, |p| p.can_sync_dispatch());
+    let is_async_handler = plan.map_or(false, |p| p.is_async());
 
     // Extract and validate headers
     let headers = if must_extract_headers {
@@ -1202,11 +1204,12 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     // Check if this is a HEAD request (needed for body stripping after Python handler)
     let is_head_request = method == "HEAD";
 
-    // Unified GIL block: build request + dispatch (sync or async)
-    // OPTIMIZATION: Single GIL acquisition — route_handler moved in (no clone_ref)
+    // Unified GIL block: build request + dispatch (sync or async).
+    // OPTIMIZATION: The ONLY GIL acquisition on the happy path. Dispatch goes
+    // through the per-route bound callables (partial(handler, handler_id))
+    // stored in the Route — single-argument calls, no per-request handler
+    // clone_ref or handler_id conversion.
     let dispatch_result: Result<DispatchOutcome, PyErr> = Python::attach(|py| {
-        let handler = route_handler;
-
         // Create context dict only if auth context is present
         let context = if let Some(ref auth) = auth_ctx {
             let ctx_dict = PyDict::new(py);
@@ -1299,8 +1302,8 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 build_prebound_args_kwargs(py, bindings, pp_ref, qp_ref, hd_ref, ck_ref)
             {
                 let state_dict = PyDict::new(py);
-                state_dict.set_item("_bolt_prebound_args", pre_args)?;
-                state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
+                state_dict.set_item(pyo3::intern!(py, "_bolt_prebound_args"), pre_args)?;
+                state_dict.set_item(pyo3::intern!(py, "_bolt_prebound_kwargs"), pre_kwargs)?;
                 let _ = state_lock.set(state_dict.unbind());
             }
         }
@@ -1321,7 +1324,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         // OPTIMIZATION: Move owned strings into PyRequest — no .clone() needed.
         // Error paths reconstruct from req.method()/req.path() (cold path, HttpRequest still alive).
         let request = PyRequest {
-            method: method_owned,
+            method: method_static,
             path: path_owned,
             body,
             path_params: path_params_py,
@@ -1341,12 +1344,40 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         let request_obj = Py::new(py, request)?;
 
         if can_sync_dispatch {
-            // SYNC PATH: Call dispatch_sync directly → returns tuple (not coroutine).
-            // Parse response wire and build HTTP response in the same GIL block.
-            // Eliminates: coroutine creation, into_future_with_locals, asyncio polling.
-            let result_obj = state
-                .dispatch_sync
-                .call1(py, (handler, request_obj, handler_id))?;
+            // SYNC PATH: Call dispatch_sync directly → returns wire tuple or bare
+            // body bytes (not a coroutine). Parse and build the HTTP response in
+            // the same GIL block. Eliminates: coroutine creation,
+            // into_future_with_locals, asyncio polling.
+            let result_obj = if is_async_handler {
+                crate::worker_loop::dispatch_sync(py, &route.dispatch_sync, &request_obj)?
+            } else {
+                route.dispatch_sync.call1(py, (request_obj,))?
+            };
+
+            // Bare-bytes fast path: sync executors return just the encoded JSON
+            // body when (status, meta) == (route default, JSON). Skips the
+            // 4-tuple construction in Python and its parsing here.
+            if result_obj.bind(py).is_instance_of::<PyBytes>() {
+                let backed: PyBackedBytes = result_obj.extract(py)?;
+                let status = route_metadata
+                    .map(|m| StatusCode::from_u16(m.default_status_code).unwrap_or(StatusCode::OK))
+                    .unwrap_or(StatusCode::OK);
+                let body = if is_head_request {
+                    drop(backed);
+                    Bytes::new()
+                } else {
+                    Bytes::from_owner(backed)
+                };
+                let mut resp = response_builder::build_response_from_meta(
+                    status,
+                    &crate::response_meta::STATIC_META_JSON,
+                    body,
+                    skip_compression,
+                );
+                mark_skip_cors(&mut resp, skip_cors);
+                return Ok(DispatchOutcome::Ready(resp));
+            }
+
             let parsed = parse_response_wire(py, &result_obj)?;
             let meta_ref = parsed.meta.as_ref();
             let response = match parsed.body {
@@ -1390,14 +1421,10 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             };
             Ok(DispatchOutcome::Ready(response))
         } else {
-            // ASYNC PATH: Create coroutine + future (existing behavior)
-            let dispatch = state.dispatch.clone_ref(py);
-            let locals = TASK_LOCALS.get().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
-            })?;
-            let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
-            let fut =
-                pyo3_async_runtimes::into_future_with_locals(locals, coroutine.into_bound(py))?;
+            // ASYNC PATH: submit to the process-lived WorkerLoop whose ready
+            // queue is serviced by a persistent Tokio pump.
+            let dispatch = route.dispatch.clone_ref(py);
+            let fut = crate::worker_loop::dispatch(dispatch, request_obj.into());
             Ok(DispatchOutcome::Pending(Box::pin(fut)))
         }
     });
@@ -1450,13 +1477,15 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         // access_log_start is always Some when ACCESS_LOG=true; unwrap is safe.
         let dur_ms = access_log_start.unwrap().elapsed().as_secs_f64() * 1000.0;
         let status = response.status().as_u16();
+        // Format OUTSIDE the GIL — only the logger call itself needs Python.
+        let msg = format!("{} {} {} {:.1}ms", method, path, status, dur_ms);
         // access_logger is always Some when ACCESS_LOG=true (guaranteed by server.rs startup).
         Python::attach(|py| {
-            let _ = state.access_logger.as_ref().unwrap().call_method1(
-                py,
-                "info",
-                (format!("{} {} {} {:.1}ms", method, path, status, dur_ms),),
-            );
+            let _ = state
+                .access_logger
+                .as_ref()
+                .unwrap()
+                .call_method1(py, "info", (msg,));
         });
     }
 

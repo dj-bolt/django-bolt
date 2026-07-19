@@ -165,11 +165,11 @@ fn read_max_age_setting(
 #[pyfunction]
 pub fn register_routes(
     _py: Python<'_>,
-    routes: Vec<(String, String, usize, Py<PyAny>)>,
+    routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
 ) -> PyResult<()> {
     let mut router = Router::new();
-    for (method, path, handler_id, handler) in routes {
-        router.register(&method, &path, handler_id, handler.into())?;
+    for (method, path, handler_id, handler, dispatch, dispatch_sync) in routes {
+        router.register(&method, &path, handler_id, handler, dispatch, dispatch_sync)?;
     }
     GLOBAL_ROUTER
         .set(Arc::new(router))
@@ -243,7 +243,6 @@ pub fn start_server(
     host: String,
     port: u16,
     compression_config: Option<Py<PyAny>>,
-    dispatch_sync: Py<PyAny>,
 ) -> PyResult<()> {
     if GLOBAL_ROUTER.get().is_none() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -262,6 +261,16 @@ pub fn start_server(
 
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.max_blocking_threads(blocking_threads);
+    // Pin a Python thread state to every tokio thread for its lifetime.
+    // Without this, each `Python::attach` from a thread with no cached state
+    // creates AND destroys a PyThreadState (PyGILState semantics), and every
+    // fresh thread state mmaps/munmaps a 16KiB frame-datastack chunk —
+    // measured as exactly one mmap+munmap pair PER REQUEST (~17% of native
+    // samples on the sync dispatch path). Pinning makes attach a cheap
+    // counter bump reusing the cached state. on_thread_stop tears the state
+    // down properly so recycled blocking-pool threads don't leak states.
+    runtime_builder.on_thread_start(crate::state::pin_python_thread_state);
+    runtime_builder.on_thread_stop(crate::state::unpin_python_thread_state);
     pyo3_async_runtimes::tokio::init(runtime_builder);
 
     let loop_obj: Py<PyAny> = {
@@ -781,7 +790,6 @@ pub fn start_server(
 
     let app_state = Arc::new(AppState {
         dispatch: dispatch.into(),
-        dispatch_sync: dispatch_sync.into(),
         debug,
         max_header_size,
         max_payload_size,
@@ -953,6 +961,24 @@ pub fn start_server(
                     aw::rt::spawn(async move {
                         let graceful = wait_for_shutdown_signal().await;
                         crate::websocket::begin_drain();
+                        if graceful {
+                            // The 1012 close is delivered by each actor's
+                            // drain-watch poll tick; stopping Actix immediately
+                            // races it and can tear connections down with a
+                            // bare FIN before the close frame is written. Wait
+                            // (bounded) for the actors to finish closing, plus
+                            // a small margin for the final frame flush.
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            while crate::websocket::ACTIVE_WS_CONNECTIONS
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                > 0
+                                && std::time::Instant::now() < deadline
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
                         handle.stop(graceful).await;
                     });
 

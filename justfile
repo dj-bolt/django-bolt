@@ -4,7 +4,10 @@
 host := "127.0.0.1"
 port := "8001"
 c := "100"
-n := "10000"
+# 100k requests ≈ 0.3-1s per endpoint at typical RPS. 10k finished in ~40ms on
+# fast endpoints — mostly connection-ramp transient, giving ±25% run-to-run
+# noise that made bench comparisons (and the 2% bench-gate) meaningless.
+n := "100000"
 p := "8"
 workers := "1"
 
@@ -24,6 +27,23 @@ build-release:
 # Kill any servers on PORT
 kill port=port:
     #!/usr/bin/env bash
+    # Supervisors first: runbolt respawns killed workers, so sweeping only the
+    # port listeners lets the supervisor bring them straight back. Workers are
+    # forked from the supervisor and share its argv, so one pattern catches both.
+    sups=$(pgrep -f "runbolt .*--port {{port}}( |$)" 2>/dev/null || true)
+    if [ -n "$sups" ]; then
+        echo "terminating runbolt processes: $sups"
+        kill $sups 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            pgrep -f "runbolt .*--port {{port}}( |$)" >/dev/null 2>&1 || break
+            sleep 0.25
+        done
+        left=$(pgrep -f "runbolt .*--port {{port}}( |$)" 2>/dev/null || true)
+        if [ -n "$left" ]; then
+            echo "force-killing runbolt processes: $left"
+            kill -9 $left 2>/dev/null || true
+        fi
+    fi
     pids=$(lsof -tiTCP:{{port}} -sTCP:LISTEN 2>/dev/null || true)
     if [ -n "$pids" ]; then
         echo "killing: $pids"
@@ -140,6 +160,26 @@ save-bench host=host port=port c=c n=n p=p workers=workers:
 
 # Build and run benchmark
 build-bench: build save-bench
+
+# Deterministic pass/fail gate: per-endpoint RPS AND p99 latency vs baseline
+bench-gate:
+    uv run python scripts/benchmark_compare.py
+
+# Rust micro-benchmarks (criterion) — pure hot-path functions
+bench-rust:
+    cargo bench
+
+# Python micro-benchmarks (pytest-benchmark) — injectors, deps, serialization
+bench-micro:
+    uv run --with pytest --with pytest-benchmark pytest python/benchmarks -q
+
+# Save a named pytest-benchmark run for later `pytest-benchmark compare`
+bench-micro-save NAME:
+    uv run --with pytest --with pytest-benchmark pytest python/benchmarks -q --benchmark-save={{NAME}}
+
+# Build with profiling profile (release + debug symbols) for flamegraphs
+build-profiling:
+    uv run maturin develop --profile profiling
 
 # Focused parameter and form parsing benchmark (fast iteration)
 bench-params host=host port=port c=c n=n p=p workers=workers:

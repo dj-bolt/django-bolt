@@ -117,7 +117,6 @@ pub struct TestAppState {
     pub asgi_mounts: Arc<Vec<AsgiMount>>,
     pub route_metadata: Arc<RouteMetadataStore>,
     pub dispatch: Py<PyAny>,
-    pub dispatch_sync: Py<PyAny>,
     pub global_cors_config: Option<CorsConfig>,
     /// Global compression config (mirrors production server). Drives the
     /// streaming-compression codec selection in `handler.rs`.
@@ -240,7 +239,7 @@ fn parse_cors_config_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<CorsConfig>
 
 /// Create a test app instance and return its ID
 #[pyfunction]
-#[pyo3(signature = (dispatch, debug, cors_config=None, trailing_slash=None, static_files_config=None, dispatch_sync=None, compression_config=None))]
+#[pyo3(signature = (dispatch, debug, cors_config=None, trailing_slash=None, static_files_config=None, compression_config=None))]
 pub fn create_test_app(
     py: Python<'_>,
     dispatch: Py<PyAny>,
@@ -248,7 +247,6 @@ pub fn create_test_app(
     cors_config: Option<&Bound<'_, PyDict>>,
     trailing_slash: Option<String>,
     static_files_config: Option<&Bound<'_, PyDict>>,
-    dispatch_sync: Option<Py<PyAny>>,
     compression_config: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<u64> {
     let global_cors_config = if let Some(cors_dict) = cors_config {
@@ -339,9 +337,6 @@ pub fn create_test_app(
         asgi_mounts: Arc::new(Vec::new()),
         route_metadata: Arc::new(RouteMetadataStore::default()),
         dispatch: dispatch.clone_ref(py),
-        dispatch_sync: dispatch_sync
-            .map(|ds| ds.clone_ref(py))
-            .unwrap_or_else(|| dispatch.clone_ref(py)),
         global_cors_config,
         global_compression_config,
         debug,
@@ -369,7 +364,7 @@ pub fn destroy_test_app(app_id: u64) -> PyResult<()> {
 pub fn register_test_routes(
     _py: Python<'_>,
     app_id: u64,
-    routes: Vec<(String, String, usize, Py<PyAny>)>,
+    routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
 ) -> PyResult<()> {
     let entry = registry()
         .get(&app_id)
@@ -379,8 +374,8 @@ pub fn register_test_routes(
 
     // Create a new router with the routes
     let mut router = Router::new();
-    for (method, path, handler_id, handler) in routes {
-        router.register(&method, &path, handler_id, handler)?;
+    for (method, path, handler_id, handler, dispatch, dispatch_sync) in routes {
+        router.register(&method, &path, handler_id, handler, dispatch, dispatch_sync)?;
     }
     app.router = Arc::new(router);
     Ok(())
@@ -514,7 +509,6 @@ pub fn test_request(
                 route_metadata,
                 asgi_mounts,
                 dispatch,
-                dispatch_sync,
                 global_cors_config,
                 global_compression_config,
                 debug,
@@ -530,7 +524,6 @@ pub fn test_request(
                     state.route_metadata.clone(),
                     state.asgi_mounts.clone(),
                     Python::attach(|py| state.dispatch.clone_ref(py)),
-                    Python::attach(|py| state.dispatch_sync.clone_ref(py)),
                     state.global_cors_config.clone(),
                     state.global_compression_config.clone(),
                     state.debug,
@@ -546,7 +539,6 @@ pub fn test_request(
             // Include router and route_metadata so CorsMiddleware can find route-level CORS config
             let app_state_arc = Arc::new(AppState {
                 dispatch,
-                dispatch_sync,
                 debug,
                 max_header_size: 8192,
                 max_payload_size,
@@ -1158,7 +1150,7 @@ async fn handle_test_request_internal(
         };
 
         let request = PyRequest {
-            method: method.to_string(),
+            method: crate::handler::static_method_name(method),
             path: path.to_string(),
             body: body.to_vec(),
             path_params: path_params_dict,

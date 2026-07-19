@@ -169,6 +169,76 @@ def get_free_port(host: str = DEFAULT_HOST) -> int:
         return int(sock.getsockname()[1])
 
 
+def _listening_inodes_for_port(port: int) -> set[str]:
+    """Socket inodes in LISTEN state on *port*, from /proc/net/tcp{,6} (Linux)."""
+    inodes: set[str] = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as handle:
+                lines = handle.read().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":  # 0A == TCP_LISTEN
+                continue
+            if int(fields[1].rsplit(":", 1)[1], 16) == port:
+                inodes.add(fields[9])
+    return inodes
+
+
+def _descendant_pids(root_pid: int) -> set[int]:
+    """*root_pid* plus all its descendants, walked from the /proc ppid graph."""
+    children: dict[int, list[int]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{entry}/stat").read_text()
+        except OSError:
+            continue
+        # The ppid is field 4, after the parenthesised comm — which may itself
+        # contain spaces or parentheses, so split after the LAST ')'.
+        ppid = int(stat.rpartition(")")[2].split()[1])
+        children.setdefault(ppid, []).append(int(entry))
+    pids = {root_pid}
+    stack = [root_pid]
+    while stack:
+        for child in children.get(stack.pop(), ()):
+            if child not in pids:
+                pids.add(child)
+                stack.append(child)
+    return pids
+
+
+def _process_tree_owns_listener(root_pid: int, port: int) -> bool | None:
+    """Whether *root_pid*'s process tree holds the LISTEN socket on *port*.
+
+    Guards against the stale-server flake: a lingering server from a previous
+    run answers the readiness probe while the freshly spawned runbolt dies on
+    "address in use" — every request then silently hits the wrong server.
+    Returns ``None`` where ownership can't be established (non-Linux); callers
+    must treat that as "unknown", not as confirmation.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    targets = {f"socket:[{inode}]" for inode in _listening_inodes_for_port(port)}
+    if not targets:
+        return False
+    for pid in _descendant_pids(root_pid):
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"/proc/{pid}/fd/{fd}") in targets:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def _normalize_python_source(content: str) -> str:
     return textwrap.dedent(content).lstrip()
 
@@ -259,19 +329,49 @@ class RunningServer:
 
     def wait_until_ready(self) -> None:
         deadline = time.time() + self.timeout
+        foreign_listener = False
         while time.time() < deadline:
             if self.process.poll() is not None:
-                _raise_process_failure(self.process, "runbolt exited before the server became ready")
+                _raise_process_failure(
+                    self.process,
+                    "runbolt exited before the server became ready"
+                    " (a stale server holding the port causes 'address in use' here)",
+                )
             try:
                 response = self.client.get(self.url(self.startup_path))
-                if response.status_code < 500:
-                    return
+                probe_ok = response.status_code < 500
             except httpx.HTTPError:
-                pass
+                probe_ok = False
+            if probe_ok:
+                # A 200 alone is not proof of readiness: a stale server from a
+                # previous run answers the probe just as happily while our
+                # process is still starting (or dying on "address in use").
+                # Only trust the probe once the LISTEN socket is provably held
+                # by the process tree we spawned.
+                if _process_tree_owns_listener(self.process.pid, self.port) is not False:
+                    return
+                foreign_listener = True
             time.sleep(0.2)
-        _raise_process_failure(self.process, f"Server did not become ready on {self.base_url}{self.startup_path}")
+        message = f"Server did not become ready on {self.base_url}{self.startup_path}"
+        if foreign_listener:
+            message += (
+                f" — a server IS answering on port {self.port}, but its listening socket is"
+                " not owned by the spawned runbolt process tree (stale server from a previous run?)"
+            )
+        _raise_process_failure(self.process, message)
 
     def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        if self.process.poll() is not None:
+            # Refuse to send the request: with our process dead, whatever
+            # answers on this port is a different server, and asserting against
+            # its responses is the silent-flake mode this guard exists to kill.
+            self._stdout, self._stderr = _terminate_process(self.process)
+            self.client.close()
+            raise AssertionError(
+                f"runbolt exited (code {self.process.returncode}) before {method} {path};"
+                f" refusing to talk to whatever now owns port {self.port}"
+                f"\nstdout:\n{self._stdout}\nstderr:\n{self._stderr}"
+            )
         return self.client.request(method, self.url(path), **kwargs)
 
     def get(self, path: str, **kwargs: Any) -> httpx.Response:
