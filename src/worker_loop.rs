@@ -259,7 +259,11 @@ impl WorkerLoopScheduler {
                 "timer delay must be a finite non-negative number",
             ));
         }
-        let duration = std::time::Duration::from_secs_f64(delay);
+        // try_from_secs_f64: from_secs_f64 PANICS on Duration overflow (e.g.
+        // 1e300), which aborts the process in release wheels (panic = "abort").
+        let duration = std::time::Duration::try_from_secs_f64(delay).map_err(|_| {
+            pyo3::exceptions::PyOverflowError::new_err("timer delay is too large")
+        })?;
         let deadline = std::time::Instant::now()
             .checked_add(duration)
             .ok_or_else(|| {

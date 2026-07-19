@@ -223,6 +223,12 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             assert all(response.status_code == 200 for response in pooled)
             assert all(response.json() == {"pooled": True} for response in pooled)
 
+            # A finite-but-oversized delay raises OverflowError from the Rust
+            # scheduler instead of panicking (panic = abort in release wheels).
+            # WorkerLoop-only: the stdlib loop accepts huge delays, so this is
+            # not part of the shared probe expectations.
+            assert server.get("/t-oversized-timer").json() == {"raised": "OverflowError"}
+
             # Cancelled timers are compacted out of the Rust heap rather than
             # retained until their (here: one-hour) deadlines.
             assert server.get("/t-cancelled-timers").json() == {"scheduled": 200}

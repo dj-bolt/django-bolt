@@ -100,6 +100,19 @@ async def t_timer_stats():
     return {"live": _core.worker_timer_count()}
 
 
+@api.get("/t-oversized-timer")
+async def t_oversized_timer():
+    """A finite but Duration-overflowing delay must raise OverflowError from
+    the WorkerLoop scheduler, not panic (which aborts release wheels)."""
+    loop = asyncio.get_running_loop()
+    try:
+        handle = loop.call_later(1e300, lambda: None)
+    except OverflowError:
+        return {"raised": "OverflowError"}
+    handle.cancel()
+    return {"raised": None}
+
+
 @api.get("/t-crossing-timeout")
 async def t_crossing_timeout():
     loop = asyncio.get_running_loop()
