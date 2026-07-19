@@ -714,17 +714,23 @@ class TestEdgeCases:
         """Create API (static served by the native /static scope)."""
         return BoltAPI()
 
-    @pytest.fixture(scope="class")
-    def client(self, api_with_static):
-        """Test client; the autouse fixture sets STATIC_ROOT/STATICFILES_DIRS."""
-        return TestClient(api_with_static, use_http_layer=True)
-
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(scope="class", autouse=True)
     def setup_static_dir(self):
-        """Setup static directory for tests."""
+        """Point static serving at TEST_STATIC_DIR before the client exists.
+
+        TestClient snapshots STATIC_ROOT/STATICFILES_DIRS at construction, so
+        this must be class-scoped and ordered before ``client`` — a
+        function-scoped fixture would run after the class-scoped client was
+        already built with whatever settings the previous test left behind.
+        """
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
         settings.STATIC_URL = "/static/"
+
+    @pytest.fixture(scope="class")
+    def client(self, api_with_static, setup_static_dir):
+        """Test client reading static config from the settings set above."""
+        return TestClient(api_with_static, use_http_layer=True)
 
     def test_file_with_spaces_in_name(self):
         """Test finding files with spaces in the name."""
