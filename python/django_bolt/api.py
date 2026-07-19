@@ -2148,12 +2148,7 @@ class BoltAPI:
             return execute_async_no_prebound
 
         # Fast path for sync non-blocking handler (prebound-aware via _get_args).
-        if (
-            mode != "request_only"
-            and not is_async
-            and not is_blocking
-            and not injector_is_async
-        ):
+        if mode != "request_only" and not is_async and not is_blocking and not injector_is_async:
             default_status = meta["default_status_code"]
             has_response_validation = meta["_has_response_validation"]
             _is_no_params_sync = meta.get("handler_pattern") is HandlerPattern.NO_PARAMS

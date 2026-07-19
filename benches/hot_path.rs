@@ -8,9 +8,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use django_bolt::bench_support::{
-    coerce_param, convert_path, parse_cookies_inline, parse_query_string,
-    DEFAULT_MAX_PARAM_LENGTH, TYPE_BOOL, TYPE_DATETIME, TYPE_DECIMAL, TYPE_INT, TYPE_STRING,
-    TYPE_UUID,
+    coerce_param, convert_path, parse_cookies_inline, parse_query_string, DEFAULT_MAX_PARAM_LENGTH,
+    TYPE_BOOL, TYPE_DATETIME, TYPE_DECIMAL, TYPE_INT, TYPE_STRING, TYPE_UUID,
 };
 
 fn bench_parse_query_string(c: &mut Criterion) {
@@ -53,7 +52,13 @@ fn bench_coerce_param(c: &mut Criterion) {
         b.iter(|| coerce_param(black_box("true"), TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH))
     });
     group.bench_function("string", |b| {
-        b.iter(|| coerce_param(black_box("hello-world"), TYPE_STRING, DEFAULT_MAX_PARAM_LENGTH))
+        b.iter(|| {
+            coerce_param(
+                black_box("hello-world"),
+                TYPE_STRING,
+                DEFAULT_MAX_PARAM_LENGTH,
+            )
+        })
     });
     group.bench_function("uuid", |b| {
         b.iter(|| {
@@ -74,14 +79,22 @@ fn bench_coerce_param(c: &mut Criterion) {
         })
     });
     group.bench_function("decimal", |b| {
-        b.iter(|| coerce_param(black_box("12345.6789"), TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH))
+        b.iter(|| {
+            coerce_param(
+                black_box("12345.6789"),
+                TYPE_DECIMAL,
+                DEFAULT_MAX_PARAM_LENGTH,
+            )
+        })
     });
     group.finish();
 }
 
 fn bench_convert_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("convert_path");
-    group.bench_function("static", |b| b.iter(|| convert_path(black_box("/users/list"))));
+    group.bench_function("static", |b| {
+        b.iter(|| convert_path(black_box("/users/list")))
+    });
     group.bench_function("one_param", |b| {
         b.iter(|| convert_path(black_box("/users/{user_id}")))
     });

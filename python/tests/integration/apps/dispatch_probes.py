@@ -4,9 +4,10 @@ Used two ways:
 - Correctness: the eager loop-thread dispatch integration tests drive every
   async-bridge shape through a real ``runbolt`` server (TestClient uses a
   different bridge, so only a subprocess exercises the production path).
-- Measurement: ``scripts/dispatch_probe_bench.py`` hits these routes to price
-  each dispatch stage (see docs/PROFILING.md). ``t_ready - t_trivial`` is the
-  pure async-bridge cost; ``t_sleep0 - t_ready`` is one real suspend.
+- Measurement: point a ``runbolt`` server at this module and time these routes
+  over a keepalive connection to price each dispatch stage (see
+  docs/PROFILING.md). ``t_ready - t_trivial`` is the pure async-bridge cost;
+  ``t_sleep0 - t_ready`` is one real suspend.
 
 Probe map:
 - /t-sync     sync def                    → sync-dispatch bypass

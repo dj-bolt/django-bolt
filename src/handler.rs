@@ -1244,7 +1244,6 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     // stored in the Route — single-argument calls, no per-request handler
     // clone_ref or handler_id conversion.
     let dispatch_result: Result<DispatchOutcome, PyErr> = Python::attach(|py| {
-
         // Create context dict only if auth context is present
         let context = if let Some(ref auth) = auth_ctx {
             let ctx_dict = PyDict::new(py);

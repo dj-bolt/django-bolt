@@ -807,7 +807,6 @@ class Command(BaseCommand):
                     options["host"],
                     options["port"],
                     compression_config,
-                    merged_api._dispatch_sync,
                 )
 
             with contextlib.suppress(KeyboardInterrupt):
@@ -818,7 +817,6 @@ class Command(BaseCommand):
                 options["host"],
                 options["port"],
                 compression_config,
-                merged_api._dispatch_sync,
             )
 
     # ------------------------------------------------------------------

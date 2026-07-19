@@ -241,7 +241,6 @@ pub fn start_server(
     host: String,
     port: u16,
     compression_config: Option<Py<PyAny>>,
-    dispatch_sync: Py<PyAny>,
 ) -> PyResult<()> {
     if GLOBAL_ROUTER.get().is_none() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -789,7 +788,6 @@ pub fn start_server(
 
     let app_state = Arc::new(AppState {
         dispatch: dispatch.into(),
-        dispatch_sync: dispatch_sync.into(),
         debug,
         max_header_size,
         max_payload_size,

@@ -800,7 +800,11 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     # so output is identical to the model-instance path.
     if queryset_serializer_sync is None:
         _values_serializer_cls, _values_many = _response_serializer_info(meta.get("response_type"))
-        if _values_serializer_cls is not None and _values_many and _serializer_values_path_eligible(_values_serializer_cls):
+        if (
+            _values_serializer_cls is not None
+            and _values_many
+            and _serializer_values_path_eligible(_values_serializer_cls)
+        ):
             queryset_serializer_sync, queryset_serializer_async = _compile_serializer_values_evaluators(
                 _values_serializer_cls
             )

@@ -455,8 +455,7 @@ impl RouteMetadataStore {
         }
 
         let max_id = map.keys().copied().max().unwrap_or(0);
-        let mut by_handler_id: Vec<Option<RouteMetadata>> =
-            (0..=max_id).map(|_| None).collect();
+        let mut by_handler_id: Vec<Option<RouteMetadata>> = (0..=max_id).map(|_| None).collect();
         for (handler_id, metadata) in map {
             by_handler_id[handler_id] = Some(metadata);
         }
