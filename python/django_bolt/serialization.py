@@ -28,13 +28,14 @@ from functools import cache
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, Union, get_args, get_origin
 
 import msgspec
-from asgiref.sync import sync_to_async
+from django.core.exceptions import FieldError
 from django.db.models import QuerySet
 from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 
 from . import _json
 from ._kwargs import coerce_to_response_type, coerce_to_response_type_async
+from .concurrency import run_in_orm_executor
 from .cookies import Cookie
 from .exceptions import ResponseValidationError, UnloadedRelationError
 from .responses import (
@@ -75,6 +76,11 @@ _BODY_FILE: int = 2
 
 BodyKind = Literal[0, 1, 2]
 ResponseWireV1 = tuple[int, ResponseMetaTuple | int, BodyKind, bytes | StreamingResponse | str]
+
+# Bare-bytes wire fast path: _sync_executor variants (api.py) may return just the
+# encoded JSON body (bytes) instead of a ResponseWireV1 tuple when the response
+# is (route default status, JSON meta). Rust's sync dispatch rebuilds the
+# envelope from RouteMetadata.default_status_code — see src/handler.rs.
 
 
 def _build_response_meta(
@@ -386,6 +392,54 @@ def _serializer_from_model_sync_safe(serializer_cls: Any) -> bool:
     )
 
 
+def _serializer_values_path_eligible(serializer_cls: Any) -> bool:
+    """True when a QuerySet response can be evaluated via .values(*fields).
+
+    The values() fast path skips model instantiation (`from_db`/`__init__`,
+    ~14% of ORM GIL time measured) AND per-instance `from_model` field
+    extraction (~13%) by feeding column dicts straight to the existing
+    dict-validation path. Requires a "plain" serializer: dump == plain field
+    dict (no computed/write_only/nested/excluded fields), no renames (dict
+    keys must match wire names for msgspec.convert), no source mappings, and
+    no relation-typed fields.
+    """
+    serializer_cls._ensure_from_model_ready()
+    if not getattr(serializer_cls, "__dump_fast_path__", False):
+        return False
+    if getattr(serializer_cls, "__has_rename__", False):
+        return False
+    return _serializer_from_model_sync_safe(serializer_cls)
+
+
+def _compile_serializer_values_evaluators(serializer_cls: Any) -> tuple[Any, Any]:
+    """Compile QuerySet evaluators using .values(*fields) with a per-model
+    runtime fallback: a serializer field that is not a concrete column raises
+    FieldError on first evaluation — that model is then permanently routed to
+    the model-instance path (from_model) in this process."""
+    field_names = tuple(serializer_cls.__struct_fields__)
+    # queryset.model -> True (values() works) / False (fall back to instances).
+    # Benign races under the GIL: both writers store the same verdict.
+    model_ok: dict[type, bool] = {}
+
+    def evaluate_sync(queryset: QuerySet) -> list[Any]:
+        ok = model_ok.get(queryset.model)
+        if ok is False:
+            return list(queryset)
+        try:
+            items = list(queryset.values(*field_names))
+        except FieldError:
+            # Serializer field isn't a concrete column on this model.
+            model_ok[queryset.model] = False
+            return list(queryset)
+        model_ok[queryset.model] = True
+        return items
+
+    async def evaluate_async(queryset: QuerySet) -> list[Any]:
+        return await run_in_orm_executor(evaluate_sync, queryset)
+
+    return evaluate_sync, evaluate_async
+
+
 def _compile_serializer_response_handlers(serializer_cls: Any, many: bool, validate_dicts: bool) -> tuple[Any, Any]:
     """Compile normalizers that render model/queryset output via the serializer."""
     sync_safe = _serializer_from_model_sync_safe(serializer_cls)
@@ -466,7 +520,9 @@ def _compile_queryset_serializers(meta: HandlerMetadata | dict[str, Any]) -> tup
 
     async def serialize_async(queryset: QuerySet) -> list[Any]:
         values_qs = queryset.values(*field_names)
-        return await sync_to_async(list, thread_sensitive=True)(values_qs)
+        # Bounded ORM pool: parallel (unlike sync_to_async's thread_sensitive
+        # single thread) but capped so DB connection count stays small.
+        return await run_in_orm_executor(list, values_qs)
 
     return serialize_sync, serialize_async
 
@@ -737,6 +793,21 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     validator_sync, validator_async = _compile_response_validator(meta)
     stream_validator_sync, stream_validator_async = _compile_stream_item_validators(meta)
     queryset_serializer_sync, queryset_serializer_async = _compile_queryset_serializers(meta)
+
+    # Bolt Serializer list responses: evaluate QuerySets via .values(*fields)
+    # when the serializer is plain — no model instantiation, no from_model
+    # walk. The resulting dicts flow through the existing dict-validation path
+    # so output is identical to the model-instance path.
+    if queryset_serializer_sync is None:
+        _values_serializer_cls, _values_many = _response_serializer_info(meta.get("response_type"))
+        if (
+            _values_serializer_cls is not None
+            and _values_many
+            and _serializer_values_path_eligible(_values_serializer_cls)
+        ):
+            queryset_serializer_sync, queryset_serializer_async = _compile_serializer_values_evaluators(
+                _values_serializer_cls
+            )
     model_projector = _compile_model_projector(meta)
     inline_validator = _compile_inline_response_validator(meta)
 
@@ -796,7 +867,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             if queryset_serializer_async is not None:
                 result = await queryset_serializer_async(result)
             else:
-                result = await sync_to_async(list, thread_sensitive=True)(result)
+                # Bounded ORM pool — parallel, but capped connection count.
+                result = await run_in_orm_executor(list, result)
             return await _serialize_json_payload_async(result, current_status, validator_async)
 
         if isinstance(result, msgspec.Struct) or validator_async is not None:

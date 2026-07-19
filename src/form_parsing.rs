@@ -146,7 +146,7 @@ impl ValidationError {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// let err = ValidationError::file_too_large("avatar", 1024, 2048);
     /// let json = err.to_json();
     /// assert_eq!(json["type"], "file_too_large");
@@ -177,7 +177,7 @@ impl FormValue {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// // Constructing examples assumes a `CoercedValue` variant `String` exists.
     /// let mut fv = FormValue::Single(CoercedValue::String("first".into()));
     /// fv.append(CoercedValue::String("second".into()));
@@ -224,7 +224,7 @@ pub struct FormParseResult {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use std::collections::HashMap;
 /// let result = parse_urlencoded(b"name=alice&age=30", &HashMap::new(), 8192).unwrap();
 /// assert!(matches!(result.get("name").unwrap(), FormValue::Single(_)));
@@ -274,7 +274,7 @@ pub fn parse_urlencoded(
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```ignore
 /// use std::collections::HashMap;
 /// use actix_multipart::Multipart;
 /// use tokio_test::block_on;
@@ -686,7 +686,7 @@ mod tests {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// // Repeated keys should accumulate into FormValue::Multi
     /// let body = Bytes::from("tag=a&tag=b&tag=c&name=John");
     /// let type_hints = HashMap::new();

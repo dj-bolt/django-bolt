@@ -23,10 +23,23 @@ impl<'a> RouteMatch<'a> {
 
     /// Get owned path params when present (None for static routes)
     #[inline]
+    #[allow(dead_code)]
     pub fn path_params(self) -> Option<AHashMap<String, String>> {
         match self {
             RouteMatch::Static(_) => None,
             RouteMatch::Dynamic(_, params) => Some(params),
+        }
+    }
+
+    /// Decompose into the route reference (with the router's lifetime — 'static
+    /// for the global router) and owned path params. Lets the request handler
+    /// defer the handler `clone_ref` into the main GIL block instead of paying
+    /// an extra `Python::attach` per request.
+    #[inline]
+    pub fn into_parts(self) -> (&'a Route, Option<AHashMap<String, String>>) {
+        match self {
+            RouteMatch::Static(r) => (r, None),
+            RouteMatch::Dynamic(r, params) => (r, Some(params)),
         }
     }
 
@@ -49,6 +62,13 @@ impl<'a> RouteMatch<'a> {
 #[repr(C)]
 pub struct Route {
     pub handler: Py<PyAny>,
+    /// Per-route bound async dispatch: `partial(api._dispatch, handler, handler_id=id)`.
+    /// The hot path calls it with just `(request,)` — no per-request 3-tuple
+    /// of argument conversions and no handler clone_ref (PyO3 call-args
+    /// machinery measured at ~12% of native samples on the sync path).
+    pub dispatch: Py<PyAny>,
+    /// Per-route bound sync dispatch (same shape as `dispatch`).
+    pub dispatch_sync: Py<PyAny>,
     pub handler_id: usize, // Store handler_id for middleware metadata lookup
 }
 
@@ -162,6 +182,8 @@ impl Router {
         path: &str,
         handler_id: usize,
         handler: Py<PyAny>,
+        dispatch: Py<PyAny>,
+        dispatch_sync: Py<PyAny>,
     ) -> PyResult<()> {
         let method_router = match method {
             "GET" => &mut self.get,
@@ -186,6 +208,8 @@ impl Router {
             // Static route: store in HashMap for O(1) lookup
             let route = Route {
                 handler,
+                dispatch,
+                dispatch_sync,
                 handler_id,
             };
             method_router.static_routes.insert(path.to_string(), route);
@@ -194,6 +218,8 @@ impl Router {
             let converted_path = convert_path(path);
             let route = Route {
                 handler,
+                dispatch,
+                dispatch_sync,
                 handler_id,
             };
             method_router

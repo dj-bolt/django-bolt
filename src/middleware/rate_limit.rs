@@ -56,9 +56,10 @@ pub fn check_rate_limit(
                 .unwrap_or_else(|| "unknown".to_string())
         }
         header_name => {
-            // Use custom header as key
+            // Custom header key — already lowercased once at startup when the
+            // RateLimitConfig was parsed (headers map stores lowercase names).
             headers
-                .get(&header_name.to_lowercase())
+                .get(header_name)
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_string())
         }

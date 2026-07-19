@@ -84,7 +84,6 @@ pub struct ScopeConfig {
 
 pub struct AppState {
     pub dispatch: Py<PyAny>,
-    pub dispatch_sync: Py<PyAny>,
     pub debug: bool,
     pub max_header_size: usize,
     pub max_payload_size: usize,
@@ -163,4 +162,53 @@ pub fn get_max_sync_streaming_threads() -> u64 {
     });
 
     limit.unwrap_or(1000) // Default to 1000
+}
+
+// ── Per-thread Python thread-state pinning ──────────────────────────────────
+//
+// PyGILState_Ensure creates a fresh PyThreadState for a thread that has none
+// and PyGILState_Release destroys it again when the matching Ensure created
+// it. Every fresh thread state mmaps a 16KiB frame-datastack chunk on first
+// use and munmaps it on teardown — one mmap+munmap pair per `Python::attach`
+// (i.e. per request on tokio worker threads; measured ~17% of native samples
+// on the sync dispatch path).
+//
+// `pin_python_thread_state` runs in tokio's on_thread_start: it creates the
+// thread state once and releases the GIL while KEEPING the state cached, so
+// every later attach is a counter bump on the existing state. The matching
+// on_thread_stop hook restores and properly releases it so recycled
+// blocking-pool threads don't leak thread states.
+
+thread_local! {
+    static PINNED_TSTATE: std::cell::Cell<*mut pyo3::ffi::PyThreadState> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+pub fn pin_python_thread_state() {
+    unsafe {
+        if pyo3::ffi::Py_IsInitialized() == 0 {
+            return;
+        }
+        // Creates (and caches) a thread state for this thread; GIL held after.
+        let _gstate = pyo3::ffi::PyGILState_Ensure();
+        // Release the GIL but keep the thread state alive and registered.
+        let tstate = pyo3::ffi::PyEval_SaveThread();
+        PINNED_TSTATE.with(|c| c.set(tstate));
+    }
+}
+
+pub fn unpin_python_thread_state() {
+    unsafe {
+        if pyo3::ffi::Py_IsInitialized() == 0 {
+            return;
+        }
+        let tstate = PINNED_TSTATE.with(|c| c.replace(std::ptr::null_mut()));
+        if tstate.is_null() {
+            return;
+        }
+        // Re-acquire the GIL on our pinned state, then release it through the
+        // gilstate API — the counter drops to zero and the state is destroyed.
+        pyo3::ffi::PyEval_RestoreThread(tstate);
+        pyo3::ffi::PyGILState_Release(pyo3::ffi::PyGILState_STATE::PyGILState_UNLOCKED);
+    }
 }

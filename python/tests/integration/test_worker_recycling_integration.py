@@ -45,7 +45,14 @@ _requires_posix = pytest.mark.skipif(
 
 
 def _receive_close_skipping_pings(websocket: SimpleWebSocketClient) -> tuple[int, str]:
-    """Receive frames until a close frame arrives (heartbeat pings may interleave)."""
+    """Receive frames until a close frame arrives (heartbeat pings may interleave).
+
+    Pings are answered with pongs (RFC 6455 obliges the client to). On a
+    CPU-saturated machine the drain close can arrive later than the server's
+    heartbeat client_timeout, and an unanswered ping budget gets the
+    connection dropped with a bare TCP FIN instead of the close frame this
+    test is waiting for.
+    """
     for _ in range(10):
         opcode, payload = websocket._receive_frame()
         if opcode == 0x8:
@@ -53,6 +60,8 @@ def _receive_close_skipping_pings(websocket: SimpleWebSocketClient) -> tuple[int
                 return int.from_bytes(payload[:2], "big"), payload[2:].decode("utf-8")
             return 1005, ""
         assert opcode in (0x9, 0xA), f"Unexpected frame opcode {opcode} while waiting for close"
+        if opcode == 0x9:
+            websocket._send_frame(0xA, payload)
     raise AssertionError("No close frame received")
 
 
@@ -74,7 +83,19 @@ def test_sigterm_closes_websockets_with_service_restart_code(make_server_project
         # Signal the server directly (single process == the server itself).
         os.kill(server.process.pid, signal.SIGTERM)
 
-        code, reason = _receive_close_skipping_pings(websocket)
+        try:
+            code, reason = _receive_close_skipping_pings(websocket)
+        except AssertionError as exc:
+            # A missing close frame means the server died rudely; its exit
+            # status and output say who killed it (e.g. -9 = SIGKILLed from
+            # outside, -15 = SIGTERM never reached the graceful drain path).
+            deadline = time.time() + 5.0
+            while server.process.poll() is None and time.time() < deadline:
+                time.sleep(0.1)
+            stdout, stderr = server.stop()
+            raise AssertionError(
+                f"{exc}\nserver exit code: {server.process.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ) from exc
 
     assert code == 1012, f"Expected 1012 Service Restart close, got {code} ({reason!r})"
 
@@ -82,7 +103,11 @@ def test_sigterm_closes_websockets_with_service_restart_code(make_server_project
     deadline = time.time() + 15.0
     while server.process.poll() is None and time.time() < deadline:
         time.sleep(0.1)
-    assert server.process.poll() is not None, "Server did not exit after SIGTERM"
+    exit_code = server.process.poll()
+    assert exit_code is not None, "Server did not exit after SIGTERM"
+    stdout, stderr = server.stop()
+    # -6 here means a Rust panic aborted the process during shutdown.
+    assert exit_code == 0, f"Graceful SIGTERM shutdown must exit 0, got {exit_code}\nstderr:\n{stderr}"
 
 
 def test_workers_lifetime_recycles_worker_without_downtime(make_server_project):

@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- **WorkerLoop cross-loop crossings are bounded** - Synchronous crossings between WorkerLoop and the selector loop (transport writes, `eof_received`, reader/writer removal) now raise `RuntimeError` after `DJANGO_BOLT_LOOP_CROSSING_TIMEOUT` seconds (default 30) instead of hanging forever if the two loops ever block on each other.
+- **Cancelled WorkerLoop timers are compacted early** - Cancelled timer handles (e.g. completed `asyncio.wait_for` deadlines) are dropped from the Rust timer heap once enough cancellations accumulate, instead of being retained — along with their captured arguments — until their original deadline.
+- **WorkerLoop now preserves full async handler compatibility** - Outbound selector-backed I/O such as `asyncio.open_connection()` is bridged through the full asyncio selector loop with thread-safe protocol and transport adapters, including TLS/STARTTLS, flow-control-aware writes, pipes, fd watchers, datagrams, subprocesses, and Unix signal handlers. WorkerLoop now has one process-lived identity and a persistent callback pump, so fire-and-forget tasks continue after a response and module-level locks, queues, and cached async client pools can be reused across requests. Trivially-async handlers also run with WorkerLoop installed, allowing `create_task()` even when the handler itself never awaits.
+
 ## [0.9.0]
 
 ### Added

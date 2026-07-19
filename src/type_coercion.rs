@@ -16,56 +16,20 @@ use uuid::Uuid;
 // Each import costs ~50-100ns, caching eliminates this overhead for repeated coercions
 static UUID_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static DECIMAL_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static DATETIME_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static DATE_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static TIME_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 #[inline]
-fn get_uuid_class(py: Python<'_>) -> &Py<PyAny> {
+pub(crate) fn get_uuid_class(py: Python<'_>) -> &Py<PyAny> {
     UUID_CLASS.get_or_init(py, || {
         py.import("uuid").unwrap().getattr("UUID").unwrap().unbind()
     })
 }
 
 #[inline]
-fn get_decimal_class(py: Python<'_>) -> &Py<PyAny> {
+pub(crate) fn get_decimal_class(py: Python<'_>) -> &Py<PyAny> {
     DECIMAL_CLASS.get_or_init(py, || {
         py.import("decimal")
             .unwrap()
             .getattr("Decimal")
-            .unwrap()
-            .unbind()
-    })
-}
-
-#[inline]
-fn get_datetime_class(py: Python<'_>) -> &Py<PyAny> {
-    DATETIME_CLASS.get_or_init(py, || {
-        py.import("datetime")
-            .unwrap()
-            .getattr("datetime")
-            .unwrap()
-            .unbind()
-    })
-}
-
-#[inline]
-fn get_date_class(py: Python<'_>) -> &Py<PyAny> {
-    DATE_CLASS.get_or_init(py, || {
-        py.import("datetime")
-            .unwrap()
-            .getattr("date")
-            .unwrap()
-            .unbind()
-    })
-}
-
-#[inline]
-fn get_time_class(py: Python<'_>) -> &Py<PyAny> {
-    TIME_CLASS.get_or_init(py, || {
-        py.import("datetime")
-            .unwrap()
-            .getattr("time")
             .unwrap()
             .unbind()
     })
@@ -186,7 +150,7 @@ impl std::fmt::Display for CoerceError {
 /// Coerce a string value to the specified type, with the startup-resolved
 /// length limit (`AppState.max_param_length`) so the hot path never
 /// re-resolves config.
-pub(crate) fn coerce_param(
+pub fn coerce_param(
     value: &str,
     type_hint: u8,
     max_length: usize,
@@ -364,13 +328,10 @@ pub fn coerce_to_py(
                 .into_any())
         }
         TYPE_UUID => {
-            // Parse UUID in Rust, convert to Python uuid.UUID
-            // OPTIMIZATION: Use cached UUID class (avoids py.import per call)
+            // Parse UUID in Rust, construct uuid.UUID from the 128-bit value —
+            // no 36-char string alloc, no hex re-parse on the Python side.
             match Uuid::parse_str(value) {
-                Ok(uuid) => {
-                    let py_uuid = get_uuid_class(py).call1(py, (uuid.to_string(),))?;
-                    Ok(py_uuid)
-                }
+                Ok(uuid) => crate::handler::uuid_to_py(py, uuid),
                 Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Invalid UUID '{}': {}",
                     value, e
@@ -378,24 +339,12 @@ pub fn coerce_to_py(
             }
         }
         TYPE_DATETIME => {
-            // Parse datetime in Rust, convert to Python datetime
-            // OPTIMIZATION: Use cached datetime class (avoids py.import per call)
+            // Parse datetime in Rust, construct datetime.datetime directly via
+            // pyo3's chrono integration (C-API construction, no ISO round trip).
             match parse_datetime(value) {
-                Ok(CoercedValue::DateTime(dt)) => {
-                    // Use fromisoformat for RFC3339 strings
-                    let iso_str = dt.to_rfc3339().replace('Z', "+00:00");
-                    let py_dt =
-                        get_datetime_class(py).call_method1(py, "fromisoformat", (iso_str,))?;
-                    Ok(py_dt)
-                }
+                Ok(CoercedValue::DateTime(dt)) => Ok(dt.into_pyobject(py)?.into_any().unbind()),
                 Ok(CoercedValue::NaiveDateTime(ndt)) => {
-                    // Format as ISO string for fromisoformat
-                    let py_dt = get_datetime_class(py).call_method1(
-                        py,
-                        "fromisoformat",
-                        (ndt.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),),
-                    )?;
-                    Ok(py_dt)
+                    Ok(ndt.into_pyobject(py)?.into_any().unbind())
                 }
                 Ok(_) => {
                     // Shouldn't happen, but fallback to string
@@ -424,17 +373,9 @@ pub fn coerce_to_py(
             }
         }
         TYPE_DATE => {
-            // Parse date in Rust, convert to Python date
-            // OPTIMIZATION: Use cached date class (avoids py.import per call)
+            // Parse date in Rust, construct datetime.date directly (chrono).
             match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-                Ok(date) => {
-                    let py_date = get_date_class(py).call_method1(
-                        py,
-                        "fromisoformat",
-                        (date.to_string(),),
-                    )?;
-                    Ok(py_date)
-                }
+                Ok(date) => Ok(date.into_pyobject(py)?.into_any().unbind()),
                 Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Invalid date '{}': {}",
                     value, e
@@ -442,17 +383,9 @@ pub fn coerce_to_py(
             }
         }
         TYPE_TIME => {
-            // Parse time in Rust, convert to Python time
-            // OPTIMIZATION: Use cached time class (avoids py.import per call)
+            // Parse time in Rust, construct datetime.time directly (chrono).
             match parse_time(value) {
-                Ok(CoercedValue::Time(time)) => {
-                    let py_time = get_time_class(py).call_method1(
-                        py,
-                        "fromisoformat",
-                        (time.to_string(),),
-                    )?;
-                    Ok(py_time)
-                }
+                Ok(CoercedValue::Time(time)) => Ok(time.into_pyobject(py)?.into_any().unbind()),
                 Ok(_) => {
                     // Shouldn't happen, but fallback to string
                     Ok(value
@@ -477,6 +410,11 @@ pub fn coerce_to_py(
 /// Convert a map of string params to a Python dict with type coercion.
 /// Used by both production handler and test handler.
 /// Returns PyResult to properly handle coercion errors.
+///
+/// Keys declared in `param_types` (a bounded, registration-time set) are
+/// interned so repeated requests reuse one PyString per name. Arbitrary
+/// client-supplied names are NOT interned — interned strings are effectively
+/// immortal, which would be a memory-growth vector.
 pub fn params_to_py_dict<'py>(
     py: pyo3::Python<'py>,
     params: &ahash::AHashMap<String, String>,
@@ -485,9 +423,16 @@ pub fn params_to_py_dict<'py>(
 ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
     let dict = pyo3::types::PyDict::new(py);
     for (name, value) in params {
-        let type_hint = param_types.get(name).copied().unwrap_or(TYPE_STRING);
-        let py_value = coerce_to_py(py, value, type_hint, max_param_length)?;
-        let _ = dict.set_item(name, py_value);
+        match param_types.get(name) {
+            Some(&type_hint) => {
+                let py_value = coerce_to_py(py, value, type_hint, max_param_length)?;
+                let _ = dict.set_item(pyo3::types::PyString::intern(py, name), py_value);
+            }
+            None => {
+                let py_value = coerce_to_py(py, value, TYPE_STRING, max_param_length)?;
+                let _ = dict.set_item(name, py_value);
+            }
+        }
     }
     Ok(dict)
 }

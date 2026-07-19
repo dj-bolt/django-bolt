@@ -40,9 +40,22 @@ cd "$REPO_ROOT/python/example"
 DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host "$HOST" --port "$PORT" --processes "$P" >/dev/null 2>&1 &
 SERVER_PID=$!
 
+# SIGTERM the server tree (uv wrapper, supervisor, workers) and WAIT for it to
+# die, escalating to SIGKILL — a fire-and-forget TERM leaks the tree and lets
+# the next run's server race a dying listener (`kill -TERM -$SERVER_PID` never
+# worked: setsid forks, so $! is not the new process group leader).
 cleanup() {
-    kill -TERM -"$SERVER_PID" 2>/dev/null || true
     pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+    local waited=0
+    while pgrep -f "manage.py runbolt --host $HOST --port $PORT" >/dev/null 2>&1; do
+        if [ $waited -ge 40 ]; then
+            echo "Server did not exit within 10s of SIGTERM; sending SIGKILL" >&2
+            pkill -KILL -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+            break
+        fi
+        sleep 0.25
+        waited=$((waited + 1))
+    done
 }
 trap cleanup EXIT
 

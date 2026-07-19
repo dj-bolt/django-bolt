@@ -26,6 +26,26 @@ if [ -z "$BOMBARDIER_BIN" ]; then
     exit 1
 fi
 
+RUNBOLT_PATTERN="manage.py runbolt --host $HOST --port $PORT"
+
+# SIGTERM the server tree (uv wrapper, supervisor, workers) and WAIT for it to
+# die, escalating to SIGKILL — a fire-and-forget TERM leaks the tree and lets
+# the next run's server race a dying listener (`kill -TERM -$SERVER_PID` never
+# worked: setsid forks, so $! is not the new process group leader).
+stop_server() {
+  pkill -TERM -f "$RUNBOLT_PATTERN" 2>/dev/null || true
+  local waited=0
+  while pgrep -f "$RUNBOLT_PATTERN" >/dev/null 2>&1; do
+    if [ $waited -ge 40 ]; then
+      echo "Server did not exit within 10s of SIGTERM; sending SIGKILL" >&2
+      pkill -KILL -f "$RUNBOLT_PATTERN" 2>/dev/null || true
+      break
+    fi
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+}
+
 echo "# Django-Bolt Parameter & Form Benchmark"
 echo "Generated: $(date)"
 echo "Config: $P processes x $WORKERS workers | C=$C N=$N"
@@ -40,8 +60,7 @@ sleep 2
 CODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/)
 if [ "$CODE" != "200" ]; then
   echo "Expected 200 from / but got $CODE; aborting benchmark." >&2
-  kill -TERM -$SERVER_PID 2>/dev/null || true
-  pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+  stop_server
   exit 1
 fi
 
@@ -211,8 +230,7 @@ echo ""
 rm -f "$REPEATED_MULTI"
 
 # Cleanup
-kill -TERM -$SERVER_PID 2>/dev/null || true
-pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+stop_server
 
 echo "## Summary"
 echo ""

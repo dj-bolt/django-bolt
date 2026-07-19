@@ -19,6 +19,7 @@ import httpx
 from httpx import Response
 
 from django_bolt import BoltAPI, _core
+from django_bolt._bridge import make_bound_dispatch
 from django_bolt.api import _validate_asgi_mount_conflicts
 
 try:
@@ -364,14 +365,12 @@ class TestClient(httpx.Client):
         # Pass trailing_slash setting to configure NormalizePath middleware
         trailing_slash = getattr(api, "trailing_slash", "strip")
         debug = getattr(settings, "DEBUG", False) if settings else False
-        dispatch_sync = getattr(api, "_dispatch_sync", None)
         self.app_id = _core.create_test_app(
             api._dispatch,
             debug,
             cors_config,
             trailing_slash,
             static_config,
-            dispatch_sync,
             api._rust_compression_config(),
         )
 
@@ -379,7 +378,17 @@ class TestClient(httpx.Client):
         self._validate_asgi_mount_conflicts(api)
 
         # Register routes
-        rust_routes = [(method, path, handler_id, handler) for method, path, handler_id, handler in api._routes]
+        rust_routes = [
+            (
+                method,
+                path,
+                handler_id,
+                handler,
+                make_bound_dispatch(api._dispatch, handler, handler_id),
+                make_bound_dispatch(api._dispatch_sync, handler, handler_id),
+            )
+            for method, path, handler_id, handler in api._routes
+        ]
         _core.register_test_routes(self.app_id, rust_routes)
 
         # Register WebSocket routes with pre-compiled injectors (same as production)
@@ -630,14 +639,12 @@ class AsyncTestClient(httpx.AsyncClient):
         # Create test app instance with trailing_slash setting
         trailing_slash = getattr(api, "trailing_slash", "strip")
         debug = getattr(settings, "DEBUG", False) if settings else False
-        dispatch_sync = getattr(api, "_dispatch_sync", None)
         self.app_id = _core.create_test_app(
             api._dispatch,
             debug,
             cors_config,
             trailing_slash,
             static_config,
-            dispatch_sync,
             api._rust_compression_config(),
         )
 
@@ -645,7 +652,17 @@ class AsyncTestClient(httpx.AsyncClient):
         TestClient._validate_asgi_mount_conflicts(api)
 
         # Register routes
-        rust_routes = [(method, path, handler_id, handler) for method, path, handler_id, handler in api._routes]
+        rust_routes = [
+            (
+                method,
+                path,
+                handler_id,
+                handler,
+                make_bound_dispatch(api._dispatch, handler, handler_id),
+                make_bound_dispatch(api._dispatch_sync, handler, handler_id),
+            )
+            for method, path, handler_id, handler in api._routes
+        ]
         _core.register_test_routes(self.app_id, rust_routes)
 
         # Register WebSocket routes

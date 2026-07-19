@@ -31,6 +31,11 @@ from ..websocket import WebSocket as WebSocketType
 from .extractors import create_extractor_for_field
 from .runtime import extract_parameter_value, extract_path_params
 
+# Positional parameter kinds — resolved ONCE at registration. Injector plans
+# store a precomputed bool instead of re-checking inspect.Parameter kinds on
+# every request (hot-path rule: no per-field kind checks at request time).
+_POSITIONAL_KINDS = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+
 
 def extract_response_metadata(response_type: Any) -> dict[str, Any]:
     """
@@ -469,7 +474,7 @@ async def build_handler_arguments(
             )
 
         # Respect positional-only/keyword-only kinds
-        if field.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+        if field.kind in _POSITIONAL_KINDS:
             args.append(value)
         else:
             kwargs[field.name] = value
@@ -539,15 +544,15 @@ def compile_argument_injector(
     # Uses pre-compiled extractors directly on params_map
     if pattern is HandlerPattern.PATH_ONLY:
         # Pre-compute extractors list for direct access
-        extractors = [(f.extractor, f.kind, f.name) for f in fields]
+        extractors = [(f.extractor, f.kind in _POSITIONAL_KINDS, f.name) for f in fields]
 
         def injector_path_only(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
             params_map = request["params"]
             args: list[Any] = []
             kwargs: dict[str, Any] = {}
-            for extractor, kind, name in extractors:
+            for extractor, positional, name in extractors:
                 value = extractor(params_map)
-                if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                if positional:
                     args.append(value)
                 else:
                     kwargs[name] = value
@@ -557,15 +562,15 @@ def compile_argument_injector(
 
     # Fast path 4: Query-only parameters (e.g., GET /search?q=...)
     if pattern is HandlerPattern.QUERY_ONLY:
-        extractors = [(f.extractor, f.kind, f.name) for f in fields]
+        extractors = [(f.extractor, f.kind in _POSITIONAL_KINDS, f.name) for f in fields]
 
         def injector_query_only(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
             query_map = request["query"]
             args: list[Any] = []
             kwargs: dict[str, Any] = {}
-            for extractor, kind, name in extractors:
+            for extractor, positional, name in extractors:
                 value = extractor(query_map)
-                if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                if positional:
                     args.append(value)
                 else:
                     kwargs[name] = value
@@ -577,7 +582,7 @@ def compile_argument_injector(
     if pattern is HandlerPattern.BODY_ONLY and len(fields) == 1:
         field = fields[0]
         body_extractor = field.extractor
-        is_positional = field.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        is_positional = field.kind in _POSITIONAL_KINDS
         field_name = field.name
 
         if is_positional:
@@ -600,25 +605,25 @@ def compile_argument_injector(
         # Pre-split fields by source at registration time to eliminate per-field
         # string comparisons at request time. Each list contains
         # (extractor, kind, name) tuples — source is implicit from the list.
-        _path_fields = [(f.extractor, f.kind, f.name) for f in fields if f.source == "path"]
-        _query_fields = [(f.extractor, f.kind, f.name) for f in fields if f.source == "query"]
+        _path_fields = [(f.extractor, f.kind in _POSITIONAL_KINDS, f.name) for f in fields if f.source == "path"]
+        _query_fields = [(f.extractor, f.kind in _POSITIONAL_KINDS, f.name) for f in fields if f.source == "query"]
 
         def injector_simple(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
             args: list[Any] = []
             kwargs: dict[str, Any] = {}
 
             params_map = request["params"]
-            for extractor, kind, name in _path_fields:
+            for extractor, positional, name in _path_fields:
                 value = extractor(params_map)
-                if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                if positional:
                     args.append(value)
                 else:
                     kwargs[name] = value
 
             query_map = request["query"]
-            for extractor, kind, name in _query_fields:
+            for extractor, positional, name in _query_fields:
                 value = extractor(query_map)
-                if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                if positional:
                     args.append(value)
                 else:
                     kwargs[name] = value
@@ -660,7 +665,7 @@ def compile_argument_injector(
             "dependency": _SRC_DEP,
         }
 
-        _dep_plan: list[tuple[int, Any, Any, str, bool, Any]] = []
+        _dep_plan: list[tuple[int, Any, bool, str, bool, Any]] = []
         _dep_fallback_fields: list[FieldDefinition] = []
         http_method = meta.get("http_method", "")
         path = meta.get("path", "")
@@ -668,17 +673,17 @@ def compile_argument_injector(
         for f in fields:
             src_id = _dep_source_map.get(f.source, _SRC_FALLBACK_D)
             if src_id == _SRC_DEP:
-                _dep_plan.append((src_id, None, f.kind, f.name, False, f.dependency))
+                _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, f.dependency))
             elif src_id == _SRC_REQUEST_D:
-                _dep_plan.append((src_id, None, f.kind, f.name, False, None))
+                _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, None))
             elif src_id == _SRC_FALLBACK_D or f.extractor is None:
-                _dep_plan.append((_SRC_FALLBACK_D, None, f.kind, f.name, False, None))
+                _dep_plan.append((_SRC_FALLBACK_D, None, f.kind in _POSITIONAL_KINDS, f.name, False, None))
                 _dep_fallback_fields.append(f)
             elif src_id == _SRC_FORM_D:
                 needs_files = getattr(f.extractor, "needs_files_map", False)
-                _dep_plan.append((src_id, f.extractor, f.kind, f.name, needs_files, None))
+                _dep_plan.append((src_id, f.extractor, f.kind in _POSITIONAL_KINDS, f.name, needs_files, None))
             else:
-                _dep_plan.append((src_id, f.extractor, f.kind, f.name, False, None))
+                _dep_plan.append((src_id, f.extractor, f.kind in _POSITIONAL_KINDS, f.name, False, None))
 
         _dep_fallback_by_name = {f.name: f for f in _dep_fallback_fields}
 
@@ -748,7 +753,7 @@ def compile_argument_injector(
             args: list[Any] = []
             kwargs: dict[str, Any] = {}
 
-            for plan_idx, (src_id, extractor, kind, name, needs_files, dependency) in enumerate(_dep_plan):
+            for plan_idx, (src_id, extractor, positional, name, needs_files, dependency) in enumerate(_dep_plan):
                 if src_id == _SRC_DEP:
                     if _has_parallel and _parallel_results[plan_idx] is not _UNRESOLVED:
                         value = _parallel_results[plan_idx]
@@ -804,7 +809,7 @@ def compile_argument_injector(
                         body_loaded,
                     )
 
-                if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                if positional:
                     args.append(value)
                 else:
                     kwargs[name] = value
@@ -850,22 +855,22 @@ def compile_argument_injector(
         "body": _SRC_BODY,
     }
 
-    # Pre-build extraction plan: (source_id, extractor, kind, name, needs_files)
-    _extraction_plan: list[tuple[int, Any, Any, str, bool]] = []
+    # Pre-build extraction plan: (source_id, extractor, positional, name, needs_files)
+    _extraction_plan: list[tuple[int, Any, bool, str, bool]] = []
     _fallback_fields: list[FieldDefinition] = []  # Fields needing generic extraction
 
     for f in fields:
         src_id = _SOURCE_MAP.get(f.source, _SRC_FALLBACK)
         if src_id == _SRC_REQUEST:
-            _extraction_plan.append((src_id, None, f.kind, f.name, False))
+            _extraction_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False))
         elif src_id == _SRC_FALLBACK or f.extractor is None:
-            _extraction_plan.append((_SRC_FALLBACK, None, f.kind, f.name, False))
+            _extraction_plan.append((_SRC_FALLBACK, None, f.kind in _POSITIONAL_KINDS, f.name, False))
             _fallback_fields.append(f)
         elif src_id == _SRC_FORM:
             needs_files = getattr(f.extractor, "needs_files_map", False)
-            _extraction_plan.append((src_id, f.extractor, f.kind, f.name, needs_files))
+            _extraction_plan.append((src_id, f.extractor, f.kind in _POSITIONAL_KINDS, f.name, needs_files))
         else:
-            _extraction_plan.append((src_id, f.extractor, f.kind, f.name, False))
+            _extraction_plan.append((src_id, f.extractor, f.kind in _POSITIONAL_KINDS, f.name, False))
 
     # Pre-index fallback fields by name for O(1) lookup
     _fallback_by_name = {f.name: f for f in _fallback_fields}
@@ -889,7 +894,7 @@ def compile_argument_injector(
         body_obj: Any = None
         body_loaded: bool = False
 
-        for src_id, extractor, kind, name, needs_files in _extraction_plan:
+        for src_id, extractor, positional, name, needs_files in _extraction_plan:
             if src_id == _SRC_REQUEST:
                 value = request
             elif src_id == _SRC_PATH:
@@ -926,7 +931,7 @@ def compile_argument_injector(
                     body_loaded,
                 )
 
-            if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            if positional:
                 args.append(value)
             else:
                 kwargs[name] = value

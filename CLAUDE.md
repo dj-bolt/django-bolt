@@ -79,12 +79,22 @@ Benchmark recipes need `bombardier` (`go install github.com/codesenberg/bombardi
 ```bash
 # Full benchmark suite. First run creates bench/BENCHMARK_BASELINE.md, second
 # creates bench/BENCHMARK_DEV.md + prints a comparison, third rotates dev→baseline.
-just save-bench                  # defaults: host=127.0.0.1 port=8001 c=100 n=10000 p=8 workers=1
+just save-bench                  # defaults: host=127.0.0.1 port=8001 c=100 n=100000 p=8 workers=1
 just save-bench 127.0.0.1 8001 100 50000   # positional: host port c n ...
 
 # Focused parameter/form-parsing benchmark (fast iteration)
 just bench-params
+
+# Deterministic regression gate (per-endpoint RPS AND p99 vs baseline)
+just bench-gate
+
+# Micro-benchmarks (no server, no bombardier needed)
+just bench-rust    # criterion: pure-Rust hot functions (query/cookie parsing, coercion)
+just bench-micro   # pytest-benchmark: injectors, deps, serialization (python/benchmarks/)
 ```
+
+See [docs/PROFILING.md](docs/PROFILING.md) for the full layered measurement
+strategy (micro → in-process → macro → flamegraphs → allocation counting).
 
 ### Database (Standard Django)
 
@@ -142,7 +152,7 @@ just release VERSION=0.2.2 DRY_RUN=1    # Test without changes
 2. **Python Framework (`python/django_bolt/`)**
 
    - `api.py` - BoltAPI class with decorator-based routing (`@api.get/post/put/patch/delete/head/options`)
-   - `binding.py` - Parameter extraction and type coercion
+   - `_kwargs/` - Parameter extraction, injector compilation, and type coercion (`model.py`, `extractors.py`, `runtime.py`)
    - `responses.py` - Response types (PlainText, HTML, Redirect, File, FileResponse, StreamingResponse)
    - `exceptions.py` - HTTPException and error handling
    - `params.py` - Parameter markers (Header, Cookie, Form, File, Depends)
@@ -227,7 +237,9 @@ HTTP Request → Actix Web (Rust)
       - Django ORM access (async methods)
            ↓
     Response Serialization (ResponseWireV1 format)
-      - Python returns 4-tuple: (status, meta, body_kind, body_payload)
+      - Python normally returns 4-tuple: (status, meta, body_kind, body_payload)
+      - Eligible sync routes may return an encoded JSON body as raw bytes
+      - All other response shapes continue to use the full 4-tuple
       - Integer meta tags (0-3) → static Rust ResponseMeta (zero alloc)
       - Tuple meta for custom headers/cookies → Rust parses once
       - Body kinds: 0=bytes (zero-copy via PyBackedBytes), 1=stream, 2=file
@@ -253,6 +265,7 @@ HTTP Request → Actix Web (Rust)
 - **Integer meta tags**: Common response types (JSON, plaintext, etc.) use integer tags mapped to static Rust constants — zero allocation per response
 - **Cookie serialization in Rust**: Raw cookie tuples pass from Python → Rust, eliminating Python `SimpleCookie` overhead
 - **Lazy request allocations**: Form/files/state/meta dicts use `OnceLock`, only allocated when accessed (~95% of requests save 2-4 dict allocations)
+- **Bounded executors**: async handlers returning QuerySets are evaluated on a dedicated capped thread pool (`concurrency.run_in_orm_executor`) — parallel, unlike `sync_to_async(thread_sensitive=True)`'s single shared thread, but with a bounded connection count. Default is vendor-aware (SQLite → 1 thread: measured ~2.5x faster than an unbounded pool at C=32 due to file-lock contention; other databases → 4), overridable via `DJANGO_BOLT_ORM_THREADS`. Generic `sync_to_thread` work and `WorkerLoop.run_in_executor(None, ...)` share one bounded pool (default `min(32, cpu_count + 4)`), overridable via `DJANGO_BOLT_EXECUTOR_THREADS`; do not add another implicit per-loop pool. Blocking sync handlers run handler + serialization in ONE `sync_to_thread` hop. Avoid Django's `async for`/`acount()` on hot paths (chunked, thread-sensitive internally); return the QuerySet and let the framework evaluate it.
 - **Multi-process scaling**: SO_REUSEPORT allows kernel-level load balancing across processes
 - **msgspec serialization**: 5-10x faster than standard JSON for request/response handling
 - **Efficient compression**: Client-negotiated gzip/brotli/zstd compression in Rust
@@ -387,7 +400,7 @@ uv run --with pytest pytest python/tests -s -vv
 
 - `api.py` - Main BoltAPI class and route decorators
 - `router.py` - Route registration and management
-- `binding.py` - Parameter extraction and type coercion from requests
+- `_kwargs/` - Parameter extraction, injector compilation, and type coercion from requests (`model.py`, `extractors.py`, `runtime.py`)
 
 ### HTTP Handling
 
@@ -492,7 +505,7 @@ uv run --with pytest pytest python/tests -s -vv
 - **Dual dispatch architecture**: Handlers are dispatched via three outcomes in `src/handler.rs`, controlled by `DispatchOutcome` enum:
   - **Sync path** (`DispatchOutcome::Ready`): Calls `dispatch_sync.call1()`, parses `ResponseWireV1`, builds `HttpResponse` — all in one `Python::attach` GIL block. Used when `can_sync_dispatch` flag is set in `RouteExecutionPlan` and body is bytes.
   - **Sync + async post-processing** (`DispatchOutcome::SyncResult`): Handler runs synchronously but returns a stream/file body that needs async handling. Carries the already-parsed `ParsedResponseWire` to avoid re-acquiring GIL.
-  - **Async path** (`DispatchOutcome::Pending`): Creates coroutine via `dispatch.call1()`, converts to Rust future via `into_future_with_locals()`. Used for handlers with middleware, signals, or true async awaits.
+  - **Async path** (`DispatchOutcome::Pending`): submits the per-route bound dispatch callable to the process-lived `WorkerLoop` (`_worker_loop.worker_dispatch_start`), whose ready queue is serviced by a persistent Tokio pump. Handlers whose awaits complete immediately resolve without an extra loop cycle (Python 3.12 eager-start Tasks).
 - **Trivially-async handlers**: `async def` functions that never `await` are detected at registration via `dis.get_instructions()` (checking for `GET_AWAITABLE` opcode). These get a sync executor that drives the coroutine via `coro.send(None)` → `StopIteration`, avoiding the async bridge entirely.
 - **ResponseWireV1 format**: Python returns `(status, meta, body_kind, body_payload)` — meta is either an integer tag (fast path) or a 4-tuple `(response_type, custom_ct, headers, cookies)` (slow path). Body kind: 0=bytes, 1=stream, 2=file.
 - **Zero-copy response body**: `PyBackedBytes` holds a reference to Python bytes. `Bytes::from_owner()` wraps it without memcpy, used for JSON/serialized bodies.
@@ -514,7 +527,7 @@ uv run --with pytest pytest python/tests -s -vv
 
 ### Adding Framework Features
 
-- **New parameter types** (Query, Header, Body variants): Edit `python/django_bolt/params.py` and `python/django_bolt/binding.py`, then update `src/handler.rs` for extraction
+- **New parameter types** (Query, Header, Body variants): Edit `python/django_bolt/params.py` and `python/django_bolt/_kwargs/` (`model.py`/`extractors.py`), then update `src/handler.rs` for extraction
 - **New response types**: Add to `python/django_bolt/responses.py`, implement serialization in `python/django_bolt/serialization.py`, and if adding a new common type, add integer meta tag constant there + matching static `ResponseMeta` in `src/response_meta.rs`
 - **New authentication backend**: Extend `python/django_bolt/auth/backends.py` with new class, optionally implement validation in `src/middleware/auth.rs` for performance
 - **New guard/permission type**: Add to `python/django_bolt/auth/guards.py` and implement check in `src/permissions.rs`
@@ -555,13 +568,15 @@ When modifying code in the per-request dispatch path (`api.py:_dispatch`, `api.p
 
 ### PyO3 Async Bridge Optimization
 
-The `pyo3_async_runtimes::into_future_with_locals()` call adds ~6-12μs per request (coroutine creation + asyncio event loop polling). This is the single biggest per-request overhead for simple handlers. Strategies to eliminate it:
+The async bridge (coroutine creation + Task scheduling + cross-thread wakeups) is the single biggest per-request overhead for simple async handlers. Measured with the dispatch probes (`python/tests/integration/apps/dispatch_probes.py`, see docs/PROFILING.md): `ensure_future`/Task machinery was ~50% of GIL time under async load, while an actual suspend/resume cost almost nothing. Strategies used to eliminate it:
 
 1. **Sync dispatch bypass** -- For handlers with no middleware/signals, Rust calls `dispatch_sync.call1()` directly within a single `Python::attach` GIL block. Returns `DispatchOutcome::Ready(HttpResponse)` instead of `DispatchOutcome::Pending(Future)`. Controlled by `can_sync_dispatch` flag in `RouteExecutionPlan` bitfield, computed at registration.
 
 2. **Trivially-async detection** -- Use `dis.get_instructions()` at registration time to check for `GET_AWAITABLE` opcode. If absent, the `async def` never actually awaits and can be driven synchronously via `coro.send(None)` → `StopIteration`. Set `meta["_sync_executor"]` for these handlers so they go through the sync dispatch path in Rust.
 
 3. **When to use sync dispatch** -- Only when ALL conditions are met: handler has `_sync_executor`, no Python middleware (global or route), no Django middleware, no signals. If any condition fails, fall back to full async path.
+
+4. **Worker-local loop** -- Async HTTP dispatch uses one process-lived `WorkerLoop` facade whose callback queue is serviced by a persistent Tokio pump. The stable loop identity lets detached Tasks survive their originating response and lets loop-bound locks, queues, and client pools be reused across requests. Selector-backed sockets, TLS/STARTTLS, DNS, pipes, fd watchers, datagrams, and subprocesses are delegated to the existing full asyncio loop through thread-safe protocol/transport/server adapters, while their Python Futures and callbacks remain on `WorkerLoop`; Unix signals are received by Tokio and queued onto the same pump. Transport writes cross synchronously so raw `pause_writing` state is reflected before `StreamWriter.drain()` checks it. Positive-delay timers use one process-wide, GIL-free high-resolution Rust timer thread because Tokio's ~1ms wheel measurably delayed short `asyncio.sleep()`/`wait_for()` deadlines. Moving Python work onto the HTTP worker removes wakeups but can also remove cross-core pipelining with the loop thread, so retain both C=1 and high-concurrency benchmark coverage. Three guardrails: synchronous cross-loop crossings (transport writes, `eof_received`, reader/writer removal) raise `RuntimeError` after `DJANGO_BOLT_LOOP_CROSSING_TIMEOUT` seconds (default 30) instead of deadlocking when the two loops block on each other; cancelled timers are compacted out of the Rust heap once enough cancellation notices accumulate (asyncio-style heuristic, observable via `_core.worker_timer_count()`) rather than retained until distant deadlines; and WorkerLoop callbacks may resume on a different OS thread after suspension (Tokio task migration) — contextvars are preserved via Handle contexts, but `threading.local` state is not carried across awaits.
 
 ### Response Wire Format Optimization
 
@@ -578,6 +593,8 @@ The Python→Rust response wire format `(status, meta, body_kind, body)` (Respon
 - `0` (_BODY_BYTES) -- bytes payload. Rust uses `PyBackedBytes` → `Bytes::from_owner()` for zero-copy when possible, falls back to `Vec<u8>` extraction.
 - `1` (_BODY_STREAM) -- StreamingResponse object. Rust creates SSE or chunked stream from Python async generator.
 - `2` (_BODY_FILE) -- File path string. Rust opens and streams the file asynchronously via tokio.
+
+**Bare-bytes fast path (sync dispatch only):** `_sync_executor` variants may return just the encoded JSON body (`bytes`) instead of the 4-tuple when the response is (route default status, JSON meta). Rust's sync dispatch detects `PyBytes` and rebuilds the envelope from `RouteMetadata.default_status_code` + the static JSON meta — no tuple construction in Python, no tuple parsing in Rust. Any other shape (custom status, non-JSON, streams, errors) still returns the full tuple.
 
 **Middleware compatibility:** `MiddlewareResponse` class in `middleware_response.py` converts between wire tuples and middleware-friendly objects. It preserves raw cookie tuples (never serializes in Python) so Rust handles all cookie serialization.
 
