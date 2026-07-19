@@ -53,6 +53,15 @@ async def whoami(request):
     return {"user_id": request["context"]["user_id"]}
 
 
+@api.post(
+    "/write",
+    auth=[JWTAuthentication(secret=SECRET, cookie="access_token")],
+    guards=[IsAuthenticated()],
+)
+async def write(request):
+    return {"user_id": request["context"]["user_id"]}
+
+
 @api.get(
     "/dual",
     auth=[
