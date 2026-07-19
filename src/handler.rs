@@ -1001,22 +1001,22 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         if let Some(route_meta) = route_metadata {
             let empty_headers = AHashMap::new();
             let headers_map = headers.as_ref().unwrap_or(&empty_headers);
-            // CSRF: cookie-sourced JWT credentials are auto-attached by the
-            // browser, so state-changing requests carrying such a cookie
-            // must prove they did not originate cross-site.
-            if crate::validation::cookie_csrf_blocks(
-                method,
-                headers_map,
-                &route_meta.csrf_cookie_names,
-            ) {
-                return responses::error_403();
-            }
             match validate_auth_and_guards(
                 headers_map,
                 &route_meta.auth_backends,
                 &route_meta.guards,
             ) {
-                AuthGuardResult::Allow(ctx) => ctx,
+                AuthGuardResult::Allow(ctx) => {
+                    let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
+                    if requires_csrf {
+                        let scheme = req.connection_info().scheme().to_owned();
+                        if crate::validation::cookie_csrf_blocks(method, headers_map, true, &scheme)
+                        {
+                            return responses::error_403();
+                        }
+                    }
+                    ctx
+                }
                 AuthGuardResult::Unauthorized => {
                     // CORS headers will be added by CorsMiddleware
                     return responses::error_401();

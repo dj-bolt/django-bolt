@@ -214,15 +214,19 @@ pub fn register_middleware_metadata(
         // Parse Python metadata into typed Rust metadata. Failures abort
         // startup: continuing would serve the route without its configured
         // auth/middleware, which is a silent security downgrade.
-        if let Ok(py_dict) = meta.bind(py).cast::<PyDict>() {
-            let parsed = RouteMetadata::from_python(py_dict, py).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "Failed to parse route metadata for handler {}: {}",
-                    handler_id, e
-                ))
-            })?;
-            parsed_metadata_map.insert(handler_id, parsed);
-        }
+        let py_dict = meta.bind(py).cast::<PyDict>().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Route metadata for handler {} must be a dict: {}",
+                handler_id, e
+            ))
+        })?;
+        let parsed = RouteMetadata::from_python(py_dict, py).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to parse route metadata for handler {}: {}",
+                handler_id, e
+            ))
+        })?;
+        parsed_metadata_map.insert(handler_id, parsed);
     }
 
     ROUTE_METADATA_TEMP.set(parsed_metadata_map).map_err(|_| {

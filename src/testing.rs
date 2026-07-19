@@ -440,21 +440,25 @@ pub fn register_test_middleware_metadata(
     let mut parsed_metadata: AHashMap<usize, RouteMetadata> = AHashMap::new();
 
     for (handler_id, meta) in metadata {
-        if let Ok(py_dict) = meta.bind(py).cast::<PyDict>() {
-            // Propagate parse failures so tests fail loudly instead of the
-            // route silently losing its auth/middleware config.
-            let mut route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "Failed to parse route metadata for handler {}: {}",
-                    handler_id, e
-                ))
-            })?;
-            // Inject global CORS config if route doesn't have explicit config
-            if route_meta.cors_config.is_none() && !route_meta.plan.skip_cors() {
-                route_meta.cors_config = app.global_cors_config.clone();
-            }
-            parsed_metadata.insert(handler_id, route_meta);
+        let py_dict = meta.bind(py).cast::<PyDict>().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Route metadata for handler {} must be a dict: {}",
+                handler_id, e
+            ))
+        })?;
+        // Propagate parse failures so tests fail loudly instead of the route
+        // silently losing its auth/middleware config.
+        let mut route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to parse route metadata for handler {}: {}",
+                handler_id, e
+            ))
+        })?;
+        // Inject global CORS config if route doesn't have explicit config
+        if route_meta.cors_config.is_none() && !route_meta.plan.skip_cors() {
+            route_meta.cors_config = app.global_cors_config.clone();
         }
+        parsed_metadata.insert(handler_id, route_meta);
     }
 
     app.route_metadata = Arc::new(RouteMetadataStore::from_map(parsed_metadata));
@@ -865,11 +869,19 @@ async fn handle_test_request_internal(
 
     // Auth and guards
     let auth_ctx = if let Some(ref meta) = route_meta {
-        if crate::validation::cookie_csrf_blocks(method, &headers, &meta.csrf_cookie_names) {
-            return responses::error_403();
-        }
         match validate_auth_and_guards(&headers, &meta.auth_backends, &meta.guards) {
-            AuthGuardResult::Allow(ctx) => ctx,
+            AuthGuardResult::Allow(ctx) => {
+                let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
+                if crate::validation::cookie_csrf_blocks(
+                    method,
+                    &headers,
+                    requires_csrf,
+                    &conn_scheme,
+                ) {
+                    return responses::error_403();
+                }
+                ctx
+            }
             AuthGuardResult::Unauthorized => return responses::error_401(),
             AuthGuardResult::Forbidden => return responses::error_403(),
         }

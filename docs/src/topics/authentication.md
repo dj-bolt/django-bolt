@@ -227,7 +227,11 @@ JWTAuthentication(
 )
 ```
 
-The key set is fetched once when the server starts and parsed into
+`jwks_url` must be an absolute HTTPS URL and must be paired with both
+`issuer=` and `audience=`. This binds accepted tokens to the intended
+provider and API instead of accepting another application's token merely
+because the provider signed it. The key set is fetched once when the
+server starts and parsed into
 per-`kid` verification keys; on each request, the token's `kid` header
 selects the key. If the provider rotates its signing keys to a new
 `kid`, restart the server to pick up the new set.
@@ -273,18 +277,23 @@ made from other sites. Django-Bolt endpoints do not run Django's
 `CsrfViewMiddleware`, so cookie authentication provides its own CSRF
 protection, enabled by default.
 
-When a backend reads its token from a cookie, any state-changing request
-(a method other than `GET`, `HEAD`, `OPTIONS`, or `TRACE`) that carries
-that cookie must show it originated from your own site. The check runs
-in Rust before authentication. The browser-set `Sec-Fetch-Site` header
-is used when present; otherwise the host of the `Origin` (or `Referer`)
-header is compared against the request's `Host`. Requests that fail the
-check receive a `403 Forbidden` response.
+When a backend successfully authenticates from a cookie, any
+state-changing request (a method other than `GET`, `HEAD`, `OPTIONS`, or
+`TRACE`) must show it originated from your own site. The check runs in
+Rust after selecting the accepted credential. The browser-set
+`Sec-Fetch-Site` header
+is used when present; otherwise the origin of the `Origin` (or
+`Referer`) header — scheme and host — is compared against the request's
+effective scheme (honoring `X-Forwarded-Proto` behind a proxy) and
+`Host`. HTTP and HTTPS are different origins, so an
+`Origin: http://example.com` never authorizes an HTTPS request to
+`example.com`. Requests that fail the check receive a `403 Forbidden`
+response.
 
-The check applies only to requests that actually carry the configured
-cookie. Requests authenticated some other way — for example, through the
-header backend of a route that registers both backends as above — are
-not affected.
+The check applies only when the accepted credential came from the cookie
+backend. Requests authenticated some other way — for example, through
+the header backend of a route that registers both backends as above —
+are not affected, even if the request also carries a stale cookie.
 
 !!! note "Non-browser clients"
 
@@ -381,8 +390,13 @@ async def refresh(request):
 
 By the time your handler runs, the token's signature, expiry, and type
 have already been verified in Rust. `rotate_refresh_token()` performs
-the stateful checks against the revocation store, revokes the old
-refresh token, and returns a new pair.
+the stateful checks against the revocation store, atomically consumes the
+old refresh token, and returns a new pair. A custom store used for full
+rotation must implement `consume(jti, *, exp=None)` as an atomic
+check-and-set and support family revocation; rotation fails closed if it
+cannot. If the validating `JWTAuthentication` uses a non-default `leeway`,
+pass the same value to `rotate_refresh_token()` so consumed tokens remain
+blocked throughout the validator's clock-skew window.
 
 Rotating the refresh token on every use provides **reuse detection**.
 Each pair belongs to a rotation family (the `fam` claim); a refresh
@@ -444,7 +458,12 @@ pair = await rotate_refresh_token(
 ```
 
 Once the cap is exceeded, rotation raises `TokenRotationError` and the
-user must sign in again.
+user must sign in again. Two related guarantees hold whenever the cap is
+configured: a refresh token *without* an `oat` claim (for example, one
+minted outside this module) fails closed rather than being re-minted
+with a fresh origin time, and the access token issued by a rotation is
+clamped to the session's remaining lifetime so it can never outlive the
+cap.
 
 ## API key authentication
 
@@ -759,9 +778,12 @@ store = DjangoCacheRevocation(
 )
 ```
 
-Works with any Django cache backend (Redis, Memcached, locmem, etc.).
-Recommended for multi-process deployments — entries are visible to all
-workers via the shared cache.
+Basic revocation works with any real Django cache backend. Refresh
+rotation and version bumps require atomic `add`/`incr`; use Redis or
+Memcached for multi-process production deployments. LocMem is suitable
+only for a single process. File-based, database, dummy, and other
+non-atomic caches are rejected for these operations. Configure the cache so security entries are not
+evicted before their TTL.
 
 ### Django ORM revocation
 

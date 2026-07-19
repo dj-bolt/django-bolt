@@ -12,8 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
-    build_jwks_key_source, build_jwt_decoding_key, cookie_csrf_cookie_names, parse_jwt_algorithm,
-    AuthBackend, JwtKeySource,
+    build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
 };
 use crate::permissions::Guard;
 
@@ -454,7 +453,6 @@ pub struct RouteMetadata {
     /// Cookie names whose presence subjects unsafe requests to the CSRF
     /// origin check. Precomputed from `auth_backends` at registration so
     /// the hot path never re-scans the backend list.
-    pub csrf_cookie_names: Vec<String>,
     pub guards: Vec<Guard>,
     pub skip: HashSet<String>,
     pub cors_config: Option<CorsConfig>,
@@ -515,7 +513,7 @@ impl RouteMetadata {
 
         // Parse auth backends. Failures propagate: metadata that fails to
         // extract must abort startup, not leave the route unauthenticated.
-        if let Ok(Some(auth_list)) = py_meta.get_item("auth_backends") {
+        if let Some(auth_list) = py_meta.get_item("auth_backends")? {
             if !auth_list.is_none() {
                 let py_backends: Vec<HashMap<String, Py<PyAny>>> =
                     auth_list.extract().map_err(|e| {
@@ -531,12 +529,14 @@ impl RouteMetadata {
         }
 
         // Parse guards
-        if let Ok(Some(guard_list)) = py_meta.get_item("guards") {
-            if let Ok(py_guards) = guard_list.extract::<Vec<HashMap<String, Py<PyAny>>>>() {
+        if let Some(guard_list) = py_meta.get_item("guards")? {
+            if !guard_list.is_none() {
+                let py_guards: Vec<HashMap<String, Py<PyAny>>> =
+                    guard_list.extract().map_err(|e| {
+                        PyValueError::new_err(format!("Invalid 'guards' route metadata: {}", e))
+                    })?;
                 for guard_dict in py_guards {
-                    if let Some(guard) = parse_guard(&guard_dict, py) {
-                        guards.push(guard);
-                    }
+                    guards.push(parse_guard(&guard_dict, py)?);
                 }
             }
         }
@@ -673,11 +673,8 @@ impl RouteMetadata {
         // Optional Rust-side argument binding plan.
         let rust_arg_bindings = parse_rust_arg_bindings(py_meta);
 
-        let csrf_cookie_names = cookie_csrf_cookie_names(&auth_backends);
-
         Ok(RouteMetadata {
             auth_backends,
-            csrf_cookie_names,
             guards,
             skip,
             cors_config,
@@ -899,6 +896,10 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
                 Some(t) => t.extract::<Option<String>>(py)?,
                 None => None,
             };
+            let require_jti = match dict.get("require_jti") {
+                Some(r) => r.extract::<Option<bool>>(py)?.unwrap_or(false),
+                None => false,
+            };
             let cookie_csrf = match dict.get("cookie_csrf") {
                 Some(c) => c.extract::<Option<bool>>(py)?.unwrap_or(true),
                 None => true,
@@ -913,6 +914,7 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
                 issuer,
                 leeway,
                 token_type,
+                require_jti,
                 cookie_csrf,
             })
         }
@@ -954,27 +956,46 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
 }
 
 /// Parse a single guard from Python dict
-fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<Guard> {
-    let guard_type = dict.get("type")?.extract::<String>(py).ok()?;
+fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<Guard> {
+    let guard_type = dict
+        .get("type")
+        .ok_or_else(|| PyValueError::new_err("Guard metadata missing 'type'"))?
+        .extract::<String>(py)?;
 
     match guard_type.as_str() {
-        "allow_any" => Some(Guard::AllowAny),
-        "is_authenticated" => Some(Guard::IsAuthenticated),
-        "is_superuser" => Some(Guard::IsSuperuser),
-        "is_staff" => Some(Guard::IsStaff),
+        "allow_any" => Ok(Guard::AllowAny),
+        "is_authenticated" => Ok(Guard::IsAuthenticated),
+        "is_superuser" => Ok(Guard::IsSuperuser),
+        "is_staff" => Ok(Guard::IsStaff),
         "has_permission" => {
-            let perm = dict.get("permission")?.extract::<String>(py).ok()?;
-            Some(Guard::HasPermission(perm))
+            let perm = dict
+                .get("permission")
+                .ok_or_else(|| PyValueError::new_err("has_permission guard missing 'permission'"))?
+                .extract::<String>(py)?;
+            Ok(Guard::HasPermission(perm))
         }
         "has_any_permission" => {
-            let perms = dict.get("permissions")?.extract::<Vec<String>>(py).ok()?;
-            Some(Guard::HasAnyPermission(perms))
+            let perms = dict
+                .get("permissions")
+                .ok_or_else(|| {
+                    PyValueError::new_err("has_any_permission guard missing 'permissions'")
+                })?
+                .extract::<Vec<String>>(py)?;
+            Ok(Guard::HasAnyPermission(perms))
         }
         "has_all_permissions" => {
-            let perms = dict.get("permissions")?.extract::<Vec<String>>(py).ok()?;
-            Some(Guard::HasAllPermissions(perms))
+            let perms = dict
+                .get("permissions")
+                .ok_or_else(|| {
+                    PyValueError::new_err("has_all_permissions guard missing 'permissions'")
+                })?
+                .extract::<Vec<String>>(py)?;
+            Ok(Guard::HasAllPermissions(perms))
         }
-        _ => None,
+        other => Err(PyValueError::new_err(format!(
+            "Unknown guard type '{}'",
+            other
+        ))),
     }
 }
 

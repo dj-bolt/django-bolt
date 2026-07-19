@@ -19,6 +19,7 @@ from jwt.algorithms import RSAAlgorithm
 
 from django_bolt import BoltAPI
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
+from django_bolt.auth import backends as auth_backends
 from django_bolt.testing import TestClient
 
 pytestmark = pytest.mark.django_db
@@ -112,3 +113,71 @@ class TestJwks:
     def test_jwks_with_static_key_rejected_at_construction(self):
         with pytest.raises(ImproperlyConfigured, match="JWKS"):
             JWTAuthentication(secret="x", jwks=JWKS, algorithms=["RS256"])
+
+    def test_jwks_and_jwks_url_are_mutually_exclusive(self):
+        with pytest.raises(ImproperlyConfigured, match="either 'jwks_url' or 'jwks'"):
+            JWTAuthentication(
+                jwks=JWKS,
+                jwks_url="https://issuer.example/jwks.json",
+                algorithms=["RS256"],
+                issuer="https://issuer.example/",
+                audience="api",
+            )
+
+    def test_empty_algorithm_allowlist_is_rejected(self):
+        with pytest.raises(ImproperlyConfigured, match="must not be empty"):
+            JWTAuthentication(jwks=JWKS, algorithms=[])
+
+    def test_remote_jwks_requires_https(self):
+        with pytest.raises(ImproperlyConfigured, match="HTTPS"):
+            JWTAuthentication(
+                jwks_url="http://issuer.example/jwks.json",
+                algorithms=["RS256"],
+                issuer="https://issuer.example/",
+                audience="api",
+            )
+
+    @pytest.mark.parametrize("missing", ["issuer", "audience"])
+    def test_remote_jwks_requires_issuer_and_audience(self, missing):
+        kwargs = {
+            "jwks_url": "https://issuer.example/jwks.json",
+            "algorithms": ["RS256"],
+            "issuer": "https://issuer.example/",
+            "audience": "api",
+        }
+        kwargs[missing] = None
+        with pytest.raises(ImproperlyConfigured, match="issuer.*audience"):
+            JWTAuthentication(**kwargs)
+
+
+class TestJwksUrlCaching:
+    def test_jwks_url_fetched_once_across_metadata_calls(self, monkeypatch):
+        """A backend reused as a global default or across routes runs
+        ``to_metadata()`` once per route; the fetched document must be cached
+        on the instance, not re-fetched (and its failure delay re-paid) per
+        route."""
+        calls = []
+
+        class FakeResponse:
+            text = json.dumps(JWKS)
+
+            def raise_for_status(self):
+                pass
+
+        def fake_get(url, timeout):
+            calls.append(url)
+            return FakeResponse()
+
+        monkeypatch.setattr(auth_backends.httpx, "get", fake_get)
+
+        auth = JWTAuthentication(
+            jwks_url="https://issuer.example/jwks.json",
+            algorithms=["RS256"],
+            issuer="https://issuer.example/",
+            audience="api",
+        )
+        first = auth.to_metadata()
+        second = auth.to_metadata()
+
+        assert first["jwks"] == second["jwks"] == json.dumps(JWKS)
+        assert len(calls) == 1

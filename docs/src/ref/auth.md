@@ -40,7 +40,7 @@ JWTAuthentication(
 | `leeway`           | `int`           | `60`              | Clock-skew tolerance (seconds) for `exp`/`nbf` |
 | `token_type`       | `str`           | `None`            | Required `typ` claim (e.g. `"refresh"` for a rotation endpoint); access routes reject `typ:"refresh"` |
 | `csrf`             | `bool`          | `True`            | For cookie tokens, enforce a cross-site origin check on unsafe methods that carry the auth cookie |
-| `jwks_url`         | `str`           | `None`            | JWKS endpoint URL; keys fetched at startup and selected by token `kid` |
+| `jwks_url`         | `str`           | `None`            | HTTPS JWKS endpoint; requires `issuer` and `audience`, fetched once at startup |
 | `jwks`             | `dict \| str`   | `None`            | JWKS document supplied directly (alternative to `jwks_url`) |
 | `revocation_store` | RevocationStore | `None`            | Token revocation store  |
 
@@ -314,6 +314,7 @@ pair = await rotate_refresh_token(claims, store=store)
 | `refresh_ttl`          | `int`           | `604800`          | New refresh token lifetime in seconds                |
 | `rotate`               | `bool`          | `True`            | Issue a new refresh token and revoke the old one; `False` issues an access token only |
 | `max_session_lifetime` | `int`           | `None`            | Maximum seconds since the original authentication (`oat`) |
+| `leeway`               | `int`           | `60`              | Clock-skew tolerance; must match the validating JWT backend |
 | `claims`               | `dict`          | `None`            | Extra claims for the new tokens                      |
 
 Raises `TokenRotationError` when the token has no `jti`, has been
@@ -366,6 +367,7 @@ All methods are coroutines.
 | ------------------------------- | -------------------------------------------------------------- |
 | `revoke(jti, *, exp=None)`      | Revoke a single token by its `jti` claim                       |
 | `is_revoked(jti)`               | Whether a token has been revoked                               |
+| `consume(jti, *, exp=None)`     | Atomically consume a refresh token; `True` only for the first caller |
 | `get_user_version(user_id)`     | The user's current token version (`0` if never bumped)         |
 | `bump_user_version(user_id)`    | Increment the version, invalidating earlier refresh tokens at rotation |
 | `revoke_family(fam, *, exp=None)` | Revoke an entire refresh-token rotation family               |
@@ -373,8 +375,9 @@ All methods are coroutines.
 
 The version and family methods support the [access and refresh token
 lifecycle](../topics/authentication.md#access-and-refresh-tokens). They
-are implemented by `InMemoryRevocation` and `DjangoCacheRevocation`;
-`DjangoORMRevocation` supports per-`jti` revocation only.
+are implemented by `InMemoryRevocation` and `DjangoCacheRevocation`.
+`DjangoORMRevocation` supports atomic consumption and family revocation,
+but not user-version methods.
 
 ### InMemoryRevocation
 
@@ -402,6 +405,12 @@ store = DjangoCacheRevocation(
     default_ttl=86400 * 7,  # fallback when revoke() is called without exp
 )
 ```
+
+Use Redis or Memcached when refresh rotation or user-version bumps must
+work across processes. Those operations require atomic cache `add` and
+`incr`; file-based, database, dummy, and other non-atomic caches are
+rejected. Ensure the cache does
+not evict security entries before their configured TTL.
 
 ### DjangoORMRevocation
 

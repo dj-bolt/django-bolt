@@ -7,6 +7,7 @@ logout, and the absolute session cap end to end through a real
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import jwt
@@ -90,9 +91,7 @@ class TestCreateTokenPair:
         pair = create_token_pair("u", secret=SECRET)
 
         with pytest.raises(ValueError, match="oat"):
-            await rotate_refresh_token(
-                pair.refresh_claims, store=store, secret=SECRET, rotate=False, claims={"oat": 0}
-            )
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, rotate=False, claims={"oat": 0})
 
 
 class TestRotation:
@@ -109,6 +108,56 @@ class TestRotation:
         assert rotated.refresh_claims["fam"] == pair.refresh_claims["fam"]
         # Old token now revoked.
         assert await store.is_revoked(old_jti)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_rotation_only_mints_one_descendant(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+
+        results = await asyncio.gather(
+            rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET),
+            rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET),
+            return_exceptions=True,
+        )
+
+        successes = [result for result in results if not isinstance(result, Exception)]
+        failures = [result for result in results if isinstance(result, TokenRotationError)]
+        assert len(successes) == 1
+        assert len(failures) == 1
+        assert await store.is_family_revoked(pair.refresh_claims["fam"])
+
+    @pytest.mark.asyncio
+    async def test_full_rotation_requires_family_revocation_support(self):
+        class NoFamilyStore(InMemoryRevocation):
+            async def is_family_revoked(self, fam):
+                raise NotImplementedError
+
+        pair = create_token_pair("u", secret=SECRET)
+
+        with pytest.raises(TokenRotationError, match="families"):
+            await rotate_refresh_token(pair.refresh_claims, store=NoFamilyStore(), secret=SECRET)
+
+    @pytest.mark.asyncio
+    async def test_consumed_marker_covers_validation_leeway(self):
+        recorded = {}
+
+        class SpyStore(InMemoryRevocation):
+            async def consume(self, jti, *, exp=None):
+                recorded["exp"] = exp
+                return await super().consume(jti, exp=exp)
+
+        now = int(time.time())
+        pair = create_token_pair("u", secret=SECRET)
+        pair.refresh_claims["exp"] = now
+
+        await rotate_refresh_token(
+            pair.refresh_claims,
+            store=SpyStore(),
+            secret=SECRET,
+            leeway=90,
+        )
+
+        assert recorded["exp"] >= now + 90
 
     @pytest.mark.asyncio
     async def test_mode_b_keeps_refresh_token(self):
@@ -156,6 +205,33 @@ class TestRotation:
         assert await store.is_family_revoked(fam)
 
     @pytest.mark.asyncio
+    async def test_replay_burns_family_beyond_replayed_tokens_exp(self):
+        """The family marker must outlive the newest descendant, not just the
+        replayed token: a TTL store (e.g. DjangoCacheRevocation) drops the
+        marker at ``exp``, and a descendant minted by a later rotation can
+        expire well after the replayed token's own exp — the burned family
+        must not become usable again in that window."""
+        recorded = {}
+
+        class SpyStore(InMemoryRevocation):
+            async def revoke_family(self, fam, *, exp=None):
+                recorded["exp"] = exp
+                await super().revoke_family(fam, exp=exp)
+
+        store = SpyStore()
+        pair = create_token_pair("u", secret=SECRET, refresh_ttl=1000)
+        # Simulate a token near its expiry: rotating it mints a descendant
+        # that lives ~900s longer than the replayed token itself.
+        pair.refresh_claims["exp"] = int(time.time()) + 100
+
+        rotated = await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, refresh_ttl=1000)
+
+        with pytest.raises(TokenRotationError):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, refresh_ttl=1000)
+
+        assert recorded["exp"] >= rotated.refresh_claims["exp"]
+
+    @pytest.mark.asyncio
     async def test_family_revoked_blocks_rotation(self):
         store = InMemoryRevocation()
         pair = create_token_pair("u", secret=SECRET)
@@ -171,6 +247,24 @@ class TestRotation:
             await rotate_refresh_token({"sub": "u", "typ": "refresh"}, store=store, secret=SECRET)
 
     @pytest.mark.asyncio
+    async def test_missing_family_rejected_for_full_rotation(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        del pair.refresh_claims["fam"]
+
+        with pytest.raises(TokenRotationError, match="family"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET)
+
+    @pytest.mark.asyncio
+    async def test_missing_subject_rejected(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        del pair.refresh_claims["sub"]
+
+        with pytest.raises(TokenRotationError, match="subject"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET)
+
+    @pytest.mark.asyncio
     async def test_max_session_lifetime_enforced(self):
         store = InMemoryRevocation()
         pair = create_token_pair("u", secret=SECRET)
@@ -179,6 +273,95 @@ class TestRotation:
 
         with pytest.raises(TokenRotationError, match="maximum lifetime"):
             await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, max_session_lifetime=3600)
+
+    @pytest.mark.asyncio
+    async def test_missing_oat_fails_closed_when_cap_configured(self):
+        """A refresh token without ``oat`` cannot prove its session age; with
+        a cap configured it must be rejected, not re-minted with a fresh
+        origin time that resets the cap."""
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        del pair.refresh_claims["oat"]
+
+        with pytest.raises(TokenRotationError, match="origin auth time"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, max_session_lifetime=3600)
+
+    @pytest.mark.asyncio
+    async def test_malformed_oat_is_rotation_error(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        pair.refresh_claims["oat"] = "not-an-integer"
+
+        with pytest.raises(TokenRotationError, match="invalid origin auth time"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, max_session_lifetime=3600)
+
+    @pytest.mark.asyncio
+    async def test_future_oat_is_rejected(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        pair.refresh_claims["oat"] = int(time.time()) + 3600
+
+        with pytest.raises(TokenRotationError, match="future"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET)
+
+    @pytest.mark.asyncio
+    async def test_missing_oat_allowed_when_no_cap_configured(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        del pair.refresh_claims["oat"]
+
+        rotated = await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET)
+        assert rotated.access_claims["typ"] == "access"
+
+    @pytest.mark.asyncio
+    async def test_access_token_clamped_to_remaining_session_lifetime(self):
+        """A rotation just before the cap elapses must not issue an access
+        token that outlives the absolute session cap."""
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        oat = int(time.time()) - 3000  # ~600s of a 3600s session remain
+        pair.refresh_claims["oat"] = oat
+
+        rotated = await rotate_refresh_token(
+            pair.refresh_claims,
+            store=store,
+            secret=SECRET,
+            access_ttl=900,
+            max_session_lifetime=3600,
+        )
+        assert rotated.access_claims["exp"] <= oat + 3600
+
+    @pytest.mark.asyncio
+    async def test_access_token_clamped_to_session_cap_in_mode_b(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        oat = int(time.time()) - 3000
+        pair.refresh_claims["oat"] = oat
+
+        rotated = await rotate_refresh_token(
+            pair.refresh_claims,
+            store=store,
+            secret=SECRET,
+            access_ttl=900,
+            max_session_lifetime=3600,
+            rotate=False,
+        )
+        assert rotated.access_claims["exp"] <= oat + 3600
+
+    @pytest.mark.asyncio
+    async def test_access_ttl_unclamped_while_session_is_young(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+
+        rotated = await rotate_refresh_token(
+            pair.refresh_claims,
+            store=store,
+            secret=SECRET,
+            access_ttl=900,
+            max_session_lifetime=3600,
+        )
+        # Fresh session: the full access TTL (within clock-tick tolerance).
+        assert rotated.access_claims["exp"] - rotated.access_claims["iat"] >= 899
 
     @pytest.mark.asyncio
     async def test_new_pair_carries_current_user_version(self):
@@ -208,6 +391,15 @@ class TestRotation:
 
         with pytest.raises(TokenRotationError, match="version"):
             await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, rotate=False)
+
+    @pytest.mark.asyncio
+    async def test_future_version_is_rejected(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        pair.refresh_claims["ver"] = 100
+
+        with pytest.raises(TokenRotationError, match="version"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET)
 
 
 class TestStorePrimitives:
@@ -246,7 +438,8 @@ class TestRefreshEndpointTypEnforcement:
             guards=[IsAuthenticated()],
         )
         async def refresh_route(request: dict):
-            return {"typ": request["context"]["auth_claims"]["typ"]}
+            claims = request["context"]["auth_claims"]
+            return {"typ": claims["typ"], "amr": claims.get("amr")}
 
         with TestClient(api) as c:
             yield c
@@ -271,3 +464,9 @@ class TestRefreshEndpointTypEnforcement:
         pair = create_token_pair("u", secret=SECRET)
         r = client.request("POST", "/refresh", headers={"Authorization": f"Bearer {pair.access_token}"})
         assert r.status_code == 401
+
+    def test_refresh_claims_preserve_amr_array_through_rust(self, client):
+        pair = create_token_pair("u", secret=SECRET, method="pwd")
+        r = client.request("POST", "/refresh", headers={"Authorization": f"Bearer {pair.refresh_token}"})
+        assert r.status_code == 200
+        assert r.json()["amr"] == ["pwd"]

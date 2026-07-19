@@ -32,7 +32,6 @@ Design notes (from production feedback on #239):
 
 from __future__ import annotations
 
-import contextlib
 import time
 import uuid
 from dataclasses import dataclass
@@ -81,9 +80,7 @@ def _check_reserved(claims: dict[str, Any] | None) -> None:
     if claims:
         reserved = RESERVED_CLAIMS.intersection(claims)
         if reserved:
-            raise ValueError(
-                f"claims must not override reserved lifecycle claims: {sorted(reserved)}"
-            )
+            raise ValueError(f"claims must not override reserved lifecycle claims: {sorted(reserved)}")
 
 
 def create_token_pair(
@@ -163,6 +160,7 @@ async def rotate_refresh_token(
     refresh_ttl: int = DEFAULT_REFRESH_TTL,
     rotate: bool = True,
     max_session_lifetime: int | None = None,
+    leeway: int = 60,
     claims: dict[str, Any] | None = None,
 ) -> TokenPair:
     """Exchange a validated refresh token for a new token pair.
@@ -176,7 +174,11 @@ async def rotate_refresh_token(
     2. The token, and its ``fam``, must not be revoked. Replaying a
        rotated-out token (``rotate=True``) is reuse: the whole family is
        revoked and the call fails.
-    3. If ``max_session_lifetime`` is set, ``now - oat`` must be within it.
+    3. If ``max_session_lifetime`` is set, ``oat`` must be present (a token
+       without one fails closed — it cannot prove its session age) and
+       ``now - oat`` must be within the cap. The new access token's expiry
+       is clamped to the session's remaining lifetime so it cannot outlive
+       the cap.
     4. The token's ``ver`` must equal the store's current user version — a
        version bumped by ``bump_user_version`` ("log out everywhere")
        invalidates every earlier refresh token here.
@@ -189,45 +191,100 @@ async def rotate_refresh_token(
     copied from the old token — they may have gone stale since issuance —
     so re-derive and pass them via ``claims=`` on every rotation.
 
-    Note the revocation check-then-revoke is not atomic: two concurrent
-    rotations of the same token can both succeed against the built-in
-    stores. Strict single-use requires a store whose ``is_revoked``/
-    ``revoke`` is an atomic check-and-set.
+    Full rotation requires the store's atomic ``consume`` primitive. The
+    replacement is minted only after the old token has been consumed; if a
+    concurrent caller already consumed it, the family is burned and the
+    replay is rejected. ``leeway`` must match the validating
+    ``JWTAuthentication`` backend's clock-skew tolerance so a consumed token
+    remains blocked for the entire period in which that backend accepts it.
 
     Raises ``TokenRotationError`` on any failure (with a generic message —
     callers should return a uniform 401 to avoid an oracle).
     """
     _check_reserved(claims)
     jti = refresh_claims.get("jti")
-    if not jti:
+    if not isinstance(jti, str) or not jti:
         raise TokenRotationError("Refresh token missing jti")
 
     fam = refresh_claims.get("fam")
-    if fam is not None and await _is_family_revoked(store, fam):
+    if rotate and (not isinstance(fam, str) or not fam):
+        raise TokenRotationError("Rotating refresh token missing family id")
+    if rotate and await _is_family_revoked(store, fam):
         raise TokenRotationError("Refresh token family revoked")
 
-    if await store.is_revoked(jti):
-        # A revoked-but-presented token under rotation is a replay: burn the
-        # family so the legitimate holder's chain dies too (reuse detection).
-        if rotate and fam is not None:
-            await _revoke_family(store, fam, exp=refresh_claims.get("exp"))
-        raise TokenRotationError("Refresh token revoked or already used")
+    now = int(time.time())
+    if leeway < 0:
+        raise ValueError("leeway must be >= 0")
 
-    oat = refresh_claims.get("oat")
-    if (
-        max_session_lifetime is not None
-        and oat is not None
-        and int(time.time()) - int(oat) > max_session_lifetime
-    ):
-        raise TokenRotationError("Session exceeded maximum lifetime")
+    # Mode B deliberately keeps the refresh token reusable, so it only checks
+    # ordinary revocation. Mode A consumes atomically below, immediately
+    # before minting, after all other validation has succeeded.
+    if not rotate and await store.is_revoked(jti):
+        raise TokenRotationError("Refresh token revoked")
 
     user_id = refresh_claims.get("sub")
-    version = await _user_version(store, user_id)
+    if not isinstance(user_id, str) or not user_id:
+        raise TokenRotationError("Refresh token missing subject")
 
-    # Global logout: a version bump invalidates every refresh token minted
-    # before it. Tokens without ver (pre-lifecycle) count as version 0.
-    if int(refresh_claims.get("ver", 0)) < version:
-        raise TokenRotationError("Refresh token version is stale")
+    oat = refresh_claims.get("oat")
+    parsed_oat: int | None = None
+    if oat is not None:
+        try:
+            parsed_oat = int(oat)
+        except (TypeError, ValueError) as exc:
+            raise TokenRotationError("Refresh token has invalid origin auth time") from exc
+        if parsed_oat > now:
+            raise TokenRotationError("Refresh token origin auth time is in the future")
+
+    effective_access_ttl = access_ttl
+    if max_session_lifetime is not None:
+        if max_session_lifetime < 0:
+            raise ValueError("max_session_lifetime must be >= 0")
+        if parsed_oat is None:
+            # Fail closed: without an origin-auth time the cap cannot be
+            # enforced, and re-minting with a fresh ``oat`` would silently
+            # grant the session a brand-new full lifetime.
+            raise TokenRotationError("Refresh token missing origin auth time")
+        remaining_session = parsed_oat + max_session_lifetime - now
+        if remaining_session <= 0:
+            raise TokenRotationError("Session exceeded maximum lifetime")
+        # Access tokens are never re-checked against the cap after issuance,
+        # so clamp the new one to the session's remaining lifetime.
+        effective_access_ttl = min(access_ttl, remaining_session)
+
+    version = await _user_version(store, user_id)
+    try:
+        token_version = int(refresh_claims.get("ver", 0))
+    except (TypeError, ValueError) as exc:
+        raise TokenRotationError("Refresh token has invalid version") from exc
+
+    # Require equality, not merely "not stale": a token from an ahead or
+    # inconsistent version store must not survive later logout bumps.
+    if token_version != version:
+        raise TokenRotationError("Refresh token version does not match current version")
+
+    token_exp: int | None = None
+    if rotate:
+        try:
+            token_exp = int(refresh_claims["exp"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TokenRotationError("Refresh token has invalid expiry") from exc
+
+    # The Rust validator accepts tokens for `leeway` seconds after exp. Keep
+    # the consumed marker for that same window or a near-expiry token could be
+    # replayed after its marker disappeared but while signature validation
+    # still accepts it.
+    consume_exp = None if token_exp is None else max(token_exp, now + leeway)
+    if rotate and not await _consume(store, jti, exp=consume_exp):
+        # A revoked-but-presented token under rotation is a replay: burn the
+        # family so the legitimate holder's chain dies too (reuse detection).
+        if fam is not None:
+            # The marker must outlive every descendant, not just this replayed
+            # token: a descendant minted from a later rotation can expire up to
+            # refresh_ttl from now, so retain the marker at least that long.
+            family_exp = max(now + refresh_ttl, consume_exp or 0)
+            await _revoke_family(store, fam, exp=family_exp)
+        raise TokenRotationError("Refresh token revoked or already used")
 
     # Preserve immutable origin claims across the rotation. Custom claims
     # are deliberately NOT copied from the old token (see docstring).
@@ -237,7 +294,6 @@ async def rotate_refresh_token(
     if claims:
         carried.update(claims)
 
-    now = int(time.time())
     key = _secret(secret)
 
     if not rotate:
@@ -247,12 +303,12 @@ async def rotate_refresh_token(
             **carried,
             "sub": user_id,
             "iat": now,
-            "exp": now + access_ttl,
+            "exp": now + effective_access_ttl,
             "typ": "access",
             "ver": version,
         }
-        if oat is not None:
-            access_claims["oat"] = int(oat)
+        if parsed_oat is not None:
+            access_claims["oat"] = parsed_oat
         return TokenPair(
             access_token=jwt.encode(access_claims, key, algorithm=algorithm),
             refresh_token="",
@@ -260,22 +316,21 @@ async def rotate_refresh_token(
             refresh_claims=refresh_claims,
         )
 
-    # Mode A: full rotation. Mint a new pair keeping the same family, then
-    # revoke the old jti so it can never be replayed.
+    # Mode A: the old JTI has already been consumed atomically. Mint a new
+    # pair that remains in the same rotation family.
     pair = create_token_pair(
         user_id,
         secret=secret,
         algorithm=algorithm,
-        access_ttl=access_ttl,
+        access_ttl=effective_access_ttl,
         refresh_ttl=refresh_ttl,
         claims=carried or None,
         version=version,
-        oat=int(oat) if oat is not None else None,
+        oat=parsed_oat,
     )
     if fam is not None:
         pair.refresh_claims["fam"] = fam
         pair.refresh_token = jwt.encode(pair.refresh_claims, key, algorithm=algorithm)
-    await store.revoke(jti, exp=refresh_claims.get("exp"))
     return pair
 
 
@@ -342,10 +397,22 @@ async def _user_version(store: Any, user_id: str | None) -> int:
 async def _is_family_revoked(store: Any, fam: str) -> bool:
     try:
         return await store.is_family_revoked(fam)
-    except NotImplementedError:
-        return False
+    except (AttributeError, NotImplementedError) as exc:
+        raise TokenRotationError("Revocation store does not support refresh-token families") from exc
+
+
+async def _consume(store: Any, jti: str, *, exp: int | None) -> bool:
+    consume = getattr(store, "consume", None)
+    if consume is None:
+        raise TokenRotationError("Revocation store does not support atomic refresh rotation")
+    try:
+        return bool(await consume(jti, exp=exp))
+    except NotImplementedError as exc:
+        raise TokenRotationError("Revocation store does not support atomic refresh rotation") from exc
 
 
 async def _revoke_family(store: Any, fam: str, *, exp: int | None) -> None:
-    with contextlib.suppress(NotImplementedError):
+    try:
         await store.revoke_family(fam, exp=exp)
+    except (AttributeError, NotImplementedError) as exc:
+        raise TokenRotationError("Revocation store does not support refresh-token families") from exc

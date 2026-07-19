@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from django.conf import settings
@@ -116,7 +117,8 @@ class JWTAuthentication(BaseAuthentication):
         cookie: Optional cookie name to extract the token from. When set, the
             token is read from the named cookie only (the header is ignored).
             The cookie value is the raw token (no "Bearer " prefix needed).
-        audience: Optional JWT audience claim to validate
+        audience: Optional JWT audience claim to validate. Required with
+            ``jwks_url`` to prevent cross-application token substitution.
         issuer: Optional JWT issuer claim to validate
         public_key: PEM-encoded public key for asymmetric algorithms
             (RS*/PS*/ES*/EdDSA). Preferred over passing a PEM via ``secret``
@@ -133,20 +135,21 @@ class JWTAuthentication(BaseAuthentication):
             origin check on unsafe (state-changing) HTTP methods, since bolt
             bypasses Django's ``CsrfViewMiddleware`` and cookies are attached
             automatically by the browser. Default True. The check applies
-            only to requests that actually carry the configured cookie —
-            requests credentialed via another backend on the same route, or
-            carrying no auth cookie, are exempt. Ignored for header-sourced
-            tokens (not auto-attached). Note that non-browser clients that
+            only when that cookie backend supplies the accepted credential.
+            Requests credentialed via another backend on the same route are
+            exempt, even if a stale cookie is also attached. Ignored for
+            header-sourced tokens (not auto-attached). Note that non-browser clients that
             send the cookie without any origin signal (``Sec-Fetch-Site``,
             ``Origin``, ``Referer``) are rejected with 403; have them send
             ``Sec-Fetch-Site: none``, use header tokens, or set False for
             API-only cookie deployments that provide their own protection.
-        jwks_url: URL of a JWKS endpoint (e.g. a provider's
+        jwks_url: Absolute HTTPS URL of a JWKS endpoint (e.g. a provider's
             ``/.well-known/jwks.json``). Fetched once at server startup; the
             key set is parsed into per-``kid`` decoding keys in Rust and the
             token's ``kid`` header selects the key. Use with an asymmetric
-            ``algorithms`` list (e.g. ``["RS256"]``). Rotation to a new
-            ``kid`` is picked up on the next server start.
+            ``algorithms`` list (e.g. ``["RS256"]``), plus ``issuer`` and
+            ``audience``. Rotation to a new ``kid`` is picked up on the next
+            server start.
         jwks: A JWKS document (dict or JSON string) supplied directly instead
             of fetching a ``jwks_url`` — useful for tests or air-gapped
             deployments. Mutually exclusive with ``secret``/``public_key``.
@@ -185,15 +188,28 @@ class JWTAuthentication(BaseAuthentication):
             raise ImproperlyConfigured(
                 "JWTAuthentication accepts either 'secret' (HMAC) or 'public_key' (asymmetric), not both."
             )
-        if (jwks_url or jwks) and provided_keys:
+        if jwks_url is not None and jwks is not None:
+            raise ImproperlyConfigured("JWTAuthentication accepts either 'jwks_url' or 'jwks', not both.")
+        if (jwks_url is not None or jwks is not None) and provided_keys:
             raise ImproperlyConfigured(
                 "JWTAuthentication accepts JWKS (jwks_url/jwks) or a static key (secret/public_key), not both."
             )
+        if jwks_url is not None:
+            parsed_jwks_url = urlsplit(jwks_url)
+            if parsed_jwks_url.scheme.lower() != "https" or not parsed_jwks_url.hostname:
+                raise ImproperlyConfigured("JWTAuthentication jwks_url must be an absolute HTTPS URL.")
+            if audience is None or issuer is None:
+                raise ImproperlyConfigured(
+                    "JWTAuthentication with jwks_url requires both 'issuer' and 'audience' "
+                    "to prevent cross-application token substitution."
+                )
         if leeway < 0:
             raise ImproperlyConfigured("JWTAuthentication leeway must be >= 0 seconds.")
         self.secret = secret
         self.public_key = public_key
-        self.algorithms = algorithms or ["HS256"]
+        self.algorithms = ["HS256"] if algorithms is None else algorithms
+        if not self.algorithms:
+            raise ImproperlyConfigured("JWTAuthentication algorithms must not be empty.")
         self.header = header
         self.cookie = cookie
         self.audience = audience
@@ -206,7 +222,7 @@ class JWTAuthentication(BaseAuthentication):
 
         # If no key material provided at all (and no JWKS), fall back to
         # Django's SECRET_KEY.
-        if self.secret is None and self.public_key is None and not (jwks_url or jwks):
+        if self.secret is None and self.public_key is None and jwks_url is None and jwks is None:
             try:
                 if not hasattr(settings, "SECRET_KEY"):
                     raise ImproperlyConfigured(
@@ -248,17 +264,20 @@ class JWTAuthentication(BaseAuthentication):
         """Return the JWKS document as a JSON string, or None.
 
         A ``jwks`` dict/string is used verbatim; a ``jwks_url`` is fetched
-        once here (at server startup, when ``to_metadata`` runs) via httpx.
-        The resulting key set is parsed into per-``kid`` decoding keys in
-        Rust. Key rotation to a *new* ``kid`` is picked up on the next server
-        start — the standard trade-off for a startup-cached key set.
+        once here (at server startup, when ``to_metadata`` first runs) via
+        httpx and cached on the instance — a backend shared across routes
+        does not re-fetch per route. The resulting key set is parsed into
+        per-``kid`` decoding keys in Rust. Key rotation to a *new* ``kid``
+        is picked up on the next server start — the standard trade-off for
+        a startup-cached key set.
         """
         if self._jwks is not None:
             return self._jwks if isinstance(self._jwks, str) else json.dumps(self._jwks)
         if self.jwks_url is not None:
             response = httpx.get(self.jwks_url, timeout=10.0)
             response.raise_for_status()
-            return response.text
+            self._jwks = response.text
+            return self._jwks
         return None
 
     def to_metadata(self) -> dict[str, Any]:

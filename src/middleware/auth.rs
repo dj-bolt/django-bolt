@@ -38,6 +38,10 @@ pub struct Claims {
     pub iss: Option<String>,              // Issuer
     pub jti: Option<String>,              // JWT ID
     pub typ: Option<String>,              // Token type ("access"/"refresh")
+    pub fam: Option<String>,              // Refresh-token rotation family
+    pub oat: Option<i64>,                 // Origin authentication time
+    pub ver: Option<i64>,                 // User token version
+    pub amr: Option<Vec<String>>,         // Authentication methods
     pub is_staff: Option<bool>,           // Staff status
     pub is_superuser: Option<bool>,       // Admin/superuser status
     pub is_admin: Option<bool>,           // Alternative admin field
@@ -55,10 +59,13 @@ pub struct AuthContext {
     pub backend: String,
     pub claims: Option<Claims>,
     pub permissions: HashSet<String>,
+    /// The credential that actually authenticated this request came from a
+    /// cookie backend with CSRF enforcement enabled.
+    pub cookie_csrf: bool,
 }
 
 impl AuthContext {
-    pub fn from_jwt_claims(claims: Claims, backend: &str) -> Self {
+    pub fn from_jwt_claims(claims: Claims, backend: &str, cookie_csrf: bool) -> Self {
         let user_id = claims.sub.clone();
         let is_staff = claims.is_staff.unwrap_or(false);
         let is_superuser = claims.is_superuser.unwrap_or(false);
@@ -77,6 +84,7 @@ impl AuthContext {
             backend: backend.to_string(),
             claims: Some(claims),
             permissions,
+            cookie_csrf,
         }
     }
 
@@ -95,6 +103,7 @@ impl AuthContext {
             backend: "api_key".to_string(),
             claims: None,
             permissions,
+            cookie_csrf: false,
         }
     }
 }
@@ -148,6 +157,9 @@ pub enum AuthBackend {
         /// `None` (normal access routes) rejects `typ == "refresh"` so a
         /// refresh token can never authenticate a regular endpoint.
         token_type: Option<String>,
+        /// Require a non-empty JWT ID claim, even without a Python
+        /// revocation handler.
+        require_jti: bool,
         /// Whether this cookie-sourced backend enforces CSRF on unsafe
         /// methods. Meaningful only when `cookie` is `Some`.
         cookie_csrf: bool,
@@ -258,7 +270,8 @@ pub fn authenticate(
                 issuer,
                 leeway,
                 token_type,
-                cookie_csrf: _,
+                require_jti,
+                cookie_csrf,
             } => {
                 if let Some(ctx) = try_jwt_auth(
                     headers,
@@ -270,6 +283,8 @@ pub fn authenticate(
                     issuer.as_deref(),
                     *leeway,
                     token_type.as_deref(),
+                    *require_jti,
+                    cookie.is_some() && *cookie_csrf,
                 ) {
                     return Some(ctx);
                 }
@@ -286,26 +301,6 @@ pub fn authenticate(
         }
     }
     None
-}
-
-/// Names of cookies that carry JWT credentials with CSRF enforcement
-/// enabled, collected once at registration into `RouteMetadata`. A request
-/// is CSRF-checked only when it actually carries one of these cookies —
-/// browser-attached credentials are the thing CSRF protects, so requests
-/// credentialed another way (header backend on a mixed route) or carrying
-/// no credential at all are exempt (see `validation::cookie_csrf_blocks`).
-pub fn cookie_csrf_cookie_names(backends: &[AuthBackend]) -> Vec<String> {
-    backends
-        .iter()
-        .filter_map(|b| match b {
-            AuthBackend::JWT {
-                cookie: Some(name),
-                cookie_csrf: true,
-                ..
-            } => Some(name.clone()),
-            _ => None,
-        })
-        .collect()
 }
 
 /// Find a cookie value by name in a raw Cookie header string.
@@ -473,6 +468,8 @@ fn try_jwt_auth(
     issuer: Option<&str>,
     leeway: i64,
     token_type: Option<&str>,
+    require_jti: bool,
+    cookie_csrf: bool,
 ) -> Option<AuthContext> {
     // Extract raw token: the named cookie when configured, the auth header
     // otherwise. No fallback between sources.
@@ -489,7 +486,11 @@ fn try_jwt_auth(
     let claims = decode_and_validate(
         token, keys, algorithms, audience, issuer, leeway, token_type,
     )?;
-    Some(AuthContext::from_jwt_claims(claims, "jwt"))
+    if require_jti && claims.jti.as_deref().is_none_or(str::is_empty) {
+        log::debug!("JWT rejected: missing required jti claim");
+        return None;
+    }
+    Some(AuthContext::from_jwt_claims(claims, "jwt", cookie_csrf))
 }
 
 fn try_api_key_auth(
@@ -579,6 +580,10 @@ pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: P
         set_if_some!(claims_dict, py, "iss", &claims.iss);
         set_if_some!(claims_dict, py, "jti", &claims.jti);
         set_if_some!(claims_dict, py, "typ", &claims.typ);
+        set_if_some!(claims_dict, py, "fam", &claims.fam);
+        set_if_some!(claims_dict, py, "oat", claims.oat);
+        set_if_some!(claims_dict, py, "ver", claims.ver);
+        set_if_some!(claims_dict, py, "amr", &claims.amr);
 
         // Extra claims keys come from the JWT payload — can't be interned
         // statically since the set is open. set_item(&str, ...) handles them.

@@ -1,8 +1,10 @@
-use crate::middleware::auth::{authenticate, find_cookie_value, AuthBackend, AuthContext};
+use crate::middleware::auth::{authenticate, AuthBackend, AuthContext};
 use crate::permissions::{evaluate_guards, Guard, GuardResult};
+use actix_web::http::uri::Authority;
 /// Shared validation logic used by both production handler and test handler
 /// All functions marked #[inline(always)] for zero-cost abstraction
 use ahash::AHashMap;
+use std::str::FromStr;
 
 /// Parse HTTP cookies from Cookie header
 /// Returns HashMap of cookie name -> cookie value
@@ -51,35 +53,22 @@ fn is_safe_method(method: &str) -> bool {
 
 /// Whether an unsafe request must be rejected by the cookie-CSRF gate.
 ///
-/// `cookie_names` is precomputed at registration (`RouteMetadata::
-/// csrf_cookie_names`): the cookies that carry JWT credentials with CSRF
-/// enforcement enabled. The gate applies only when the request actually
-/// carries one of them — a browser-attached cookie is the CSRF vector, so
-/// requests credentialed another way (header backend on a mixed-backend
-/// route) or carrying no credential at all just proceed to normal
-/// authentication instead.
+/// `credential_requires_csrf` comes from the authentication result, so the
+/// gate follows the credential that actually succeeded. A stale incidental
+/// cookie does not block a request authenticated through another backend.
 ///
 /// Returns `true` when the request must be rejected (403).
 #[inline]
 pub fn cookie_csrf_blocks(
     method: &str,
     headers: &AHashMap<String, String>,
-    cookie_names: &[String],
+    credential_requires_csrf: bool,
+    scheme: &str,
 ) -> bool {
-    if cookie_names.is_empty() || is_safe_method(method) {
+    if !credential_requires_csrf || is_safe_method(method) {
         return false;
     }
-    let raw_cookie = match headers.get("cookie") {
-        Some(c) => c.as_str(),
-        None => return false,
-    };
-    if !cookie_names
-        .iter()
-        .any(|name| find_cookie_value(raw_cookie, name).is_some())
-    {
-        return false;
-    }
-    !passes_cookie_csrf(method, headers)
+    !passes_cookie_csrf(method, headers, scheme)
 }
 
 /// Cross-site request forgery check for cookie-authenticated routes.
@@ -89,13 +78,18 @@ pub fn cookie_csrf_blocks(
 /// request carries a CSRF-enforced auth cookie (see `cookie_csrf_blocks`),
 /// an unsafe-method request must prove it did not originate cross-site.
 /// This is pure header inspection (no state, no body): the browser-set
-/// `Sec-Fetch-Site` is authoritative when present, falling back to an
-/// `Origin`/`Referer` host comparison against the request `Host` for older
-/// clients.
+/// `Sec-Fetch-Site` is authoritative when present, falling back to a full
+/// `Origin`/`Referer` origin comparison (scheme + authority) against the
+/// request's effective scheme and `Host` for older clients.
+///
+/// `scheme` is the request's effective scheme (`http`/`https`, honoring
+/// `X-Forwarded-Proto` behind a proxy) — HTTP and HTTPS are different
+/// origins, so `Origin: http://example.com` must not authorize a
+/// state-changing HTTPS request to `example.com`.
 ///
 /// Returns `true` when the request is allowed to proceed.
 #[inline]
-pub fn passes_cookie_csrf(method: &str, headers: &AHashMap<String, String>) -> bool {
+pub fn passes_cookie_csrf(method: &str, headers: &AHashMap<String, String>, scheme: &str) -> bool {
     if is_safe_method(method) {
         return true;
     }
@@ -107,16 +101,17 @@ pub fn passes_cookie_csrf(method: &str, headers: &AHashMap<String, String>) -> b
         return matches!(site.as_str(), "same-origin" | "none");
     }
 
-    // Fallback: compare the Origin (or Referer) host to the request Host.
+    // Fallback: compare the Origin (or Referer) origin to the request's
+    // effective scheme + Host.
     let host = match headers.get("host") {
         Some(h) => h.as_str(),
         None => return false, // No Host to compare against — refuse.
     };
     if let Some(origin) = headers.get("origin") {
-        return origin_host_matches(origin, host);
+        return origin_matches(origin, scheme, host);
     }
     if let Some(referer) = headers.get("referer") {
-        return origin_host_matches(referer, host);
+        return origin_matches(referer, scheme, host);
     }
     // No Sec-Fetch-Site, no Origin, no Referer on an unsafe request: a
     // browser would have sent at least one, so this is not a same-origin
@@ -124,16 +119,50 @@ pub fn passes_cookie_csrf(method: &str, headers: &AHashMap<String, String>) -> b
     false
 }
 
-/// Compare the host authority of a URL (`https://example.com:443/path`)
-/// against a request `Host` header value.
-fn origin_host_matches(url: &str, host: &str) -> bool {
-    // Strip scheme.
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    // Authority ends at the first '/'.
-    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    // Host names are case-insensitive (RFC 9110 §4.2.3). Ports must match
-    // literally — an implicit-vs-explicit default port mismatch fails closed.
-    authority.eq_ignore_ascii_case(host)
+/// Compare a URL's origin (`https://example.com:443/path`) against the
+/// request's effective scheme and `Host` header value.
+fn origin_matches(url: &str, scheme: &str, host: &str) -> bool {
+    // `Origin: null` (sandboxed frames, some redirects) and schemeless
+    // values carry no provable origin — refuse.
+    let (url_scheme, rest) = match url.split_once("://") {
+        Some(parts) => parts,
+        None => return false,
+    };
+    if !url_scheme.eq_ignore_ascii_case(scheme)
+        || !matches!(url_scheme.to_ascii_lowercase().as_str(), "http" | "https")
+    {
+        return false;
+    }
+
+    // Origin has no path; Referer does. Query/fragment delimiters also end
+    // the authority for defensive parsing of unusual clients.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let url_authority = &rest[..authority_end];
+    if url_authority.contains('@') {
+        return false;
+    }
+
+    let url_authority = match Authority::from_str(url_authority) {
+        Ok(authority) => authority,
+        Err(_) => return false,
+    };
+    let request_authority = match Authority::from_str(host) {
+        Ok(authority) => authority,
+        Err(_) => return false,
+    };
+
+    let default_port = if url_scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    let url_port = url_authority.port_u16().unwrap_or(default_port);
+    let request_port = request_authority.port_u16().unwrap_or(default_port);
+
+    url_authority
+        .host()
+        .eq_ignore_ascii_case(request_authority.host())
+        && url_port == request_port
 }
 
 /// Validate authentication and evaluate guards
@@ -237,40 +266,85 @@ mod tests {
     #[test]
     fn csrf_safe_methods_always_pass() {
         let headers = headers_with(&[("sec-fetch-site", "cross-site")]);
-        assert!(passes_cookie_csrf("GET", &headers));
-        assert!(passes_cookie_csrf("HEAD", &headers));
-        assert!(passes_cookie_csrf("OPTIONS", &headers));
+        assert!(passes_cookie_csrf("GET", &headers, "https"));
+        assert!(passes_cookie_csrf("HEAD", &headers, "https"));
+        assert!(passes_cookie_csrf("OPTIONS", &headers, "https"));
     }
 
     #[test]
     fn csrf_sec_fetch_site_is_authoritative() {
         assert!(passes_cookie_csrf(
             "POST",
-            &headers_with(&[("sec-fetch-site", "same-origin")])
+            &headers_with(&[("sec-fetch-site", "same-origin")]),
+            "https"
         ));
         assert!(passes_cookie_csrf(
             "POST",
-            &headers_with(&[("sec-fetch-site", "none")])
+            &headers_with(&[("sec-fetch-site", "none")]),
+            "https"
         ));
         assert!(!passes_cookie_csrf(
             "POST",
-            &headers_with(&[("sec-fetch-site", "cross-site")])
+            &headers_with(&[("sec-fetch-site", "cross-site")]),
+            "https"
         ));
         assert!(!passes_cookie_csrf(
             "POST",
-            &headers_with(&[("sec-fetch-site", "same-site")])
+            &headers_with(&[("sec-fetch-site", "same-site")]),
+            "https"
         ));
     }
 
     #[test]
-    fn csrf_origin_host_fallback() {
+    fn csrf_origin_fallback() {
         assert!(passes_cookie_csrf(
             "POST",
-            &headers_with(&[("host", "example.com"), ("origin", "https://example.com")])
+            &headers_with(&[("host", "example.com"), ("origin", "https://example.com")]),
+            "https"
         ));
         assert!(!passes_cookie_csrf(
             "POST",
-            &headers_with(&[("host", "example.com"), ("origin", "https://evil.com")])
+            &headers_with(&[("host", "example.com"), ("origin", "https://evil.com")]),
+            "https"
+        ));
+    }
+
+    #[test]
+    fn csrf_origin_scheme_must_match_request_scheme() {
+        // HTTP and HTTPS are different origins: an insecure origin must not
+        // authorize a state-changing HTTPS request to the same host.
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("host", "example.com"), ("origin", "http://example.com")]),
+            "https"
+        ));
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[
+                ("host", "example.com"),
+                ("referer", "http://example.com/form")
+            ]),
+            "https"
+        ));
+        // Matching scheme still passes on plain HTTP.
+        assert!(passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("host", "example.com"), ("origin", "http://example.com")]),
+            "http"
+        ));
+    }
+
+    #[test]
+    fn csrf_opaque_or_schemeless_origin_is_refused() {
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("host", "example.com"), ("origin", "null")]),
+            "https"
+        ));
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("host", "example.com"), ("origin", "example.com")]),
+            "https"
         ));
     }
 
@@ -278,42 +352,70 @@ mod tests {
     fn csrf_unsafe_request_without_any_origin_signal_is_refused() {
         assert!(!passes_cookie_csrf(
             "POST",
-            &headers_with(&[("host", "example.com")])
+            &headers_with(&[("host", "example.com")]),
+            "https"
         ));
     }
 
     #[test]
-    fn csrf_origin_host_comparison_is_case_insensitive() {
+    fn csrf_origin_comparison_is_case_insensitive() {
         assert!(passes_cookie_csrf(
             "POST",
-            &headers_with(&[("host", "Example.com"), ("origin", "https://example.COM")])
+            &headers_with(&[("host", "Example.com"), ("origin", "HTTPS://example.COM")]),
+            "https"
         ));
     }
 
     #[test]
-    fn csrf_gate_applies_only_when_a_configured_cookie_is_present() {
-        let names = vec!["access_token".to_string()];
+    fn csrf_origin_normalizes_default_ports() {
+        assert!(passes_cookie_csrf(
+            "POST",
+            &headers_with(&[
+                ("host", "example.com:443"),
+                ("origin", "https://example.com")
+            ]),
+            "https"
+        ));
+        assert!(passes_cookie_csrf(
+            "POST",
+            &headers_with(&[
+                ("host", "example.com"),
+                ("origin", "https://example.com:443")
+            ]),
+            "https"
+        ));
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[
+                ("host", "example.com"),
+                ("origin", "https://example.com:444")
+            ]),
+            "https"
+        ));
+    }
 
-        // Cross-site request carrying the auth cookie → blocked.
+    #[test]
+    fn csrf_gate_applies_only_when_the_accepted_credential_requires_it() {
+        // A cookie-authenticated cross-site request is blocked.
         assert!(cookie_csrf_blocks(
             "POST",
             &headers_with(&[
                 ("cookie", "access_token=tok"),
                 ("sec-fetch-site", "cross-site")
             ]),
-            &names
+            true,
+            "https"
         ));
-        // No cookie header at all → exempt (fails auth instead).
+        // A credential accepted from another source is exempt even if a
+        // stale auth cookie happens to be attached.
         assert!(!cookie_csrf_blocks(
             "POST",
-            &headers_with(&[("sec-fetch-site", "cross-site")]),
-            &names
-        ));
-        // Unrelated cookies only → exempt.
-        assert!(!cookie_csrf_blocks(
-            "POST",
-            &headers_with(&[("cookie", "theme=dark"), ("sec-fetch-site", "cross-site")]),
-            &names
+            &headers_with(&[
+                ("cookie", "access_token=stale"),
+                ("sec-fetch-site", "cross-site")
+            ]),
+            false,
+            "https"
         ));
         // Safe method → exempt even with the cookie.
         assert!(!cookie_csrf_blocks(
@@ -322,16 +424,18 @@ mod tests {
                 ("cookie", "access_token=tok"),
                 ("sec-fetch-site", "cross-site")
             ]),
-            &names
+            true,
+            "https"
         ));
-        // No configured cookie names (route without cookie backends) → exempt.
+        // A route/credential without cookie CSRF → exempt.
         assert!(!cookie_csrf_blocks(
             "POST",
             &headers_with(&[
                 ("cookie", "access_token=tok"),
                 ("sec-fetch-site", "cross-site")
             ]),
-            &[]
+            false,
+            "https"
         ));
     }
 }

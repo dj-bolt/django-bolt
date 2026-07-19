@@ -153,14 +153,29 @@ class TestCookieCsrf:
         assert r.status_code == 200
 
     def test_mixed_route_with_cookie_still_csrf_checked(self, client):
-        # Once the configured auth cookie is present, the CSRF gate applies
-        # even if other credentials are also on the request (fail closed).
+        # A valid cookie backend appears first and therefore supplies the
+        # accepted credential, so cookie CSRF still applies.
         r = client.request(
             "POST",
             "/mixed-write",
             headers=cookie_hdr({"Authorization": f"Bearer {make_token()}", "Sec-Fetch-Site": "cross-site"}),
         )
         assert r.status_code == 403
+
+    def test_mixed_route_stale_cookie_does_not_block_header_auth(self, client):
+        # CSRF follows the credential that actually authenticated. A stale
+        # incidental cookie must not turn valid bearer authentication into a
+        # pre-authentication 403.
+        r = client.request(
+            "POST",
+            "/mixed-write",
+            headers={
+                "Cookie": "access_token=stale",
+                "Authorization": f"Bearer {make_token()}",
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+        assert r.status_code == 200
 
 
 class TestSetTokenCookies:

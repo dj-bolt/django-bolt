@@ -73,6 +73,7 @@ def client():
             return {"user_id": context["user_id"], "claims": context.get("auth_claims", {})}
 
     add_route("/hs256", JWTAuthentication(secret=HS_SECRET, algorithms=["HS256"]))
+    add_route("/hs256-jti", JWTAuthentication(secret=HS_SECRET, algorithms=["HS256"], require_jti=True))
     add_route("/hs-multi", JWTAuthentication(secret=HS_SECRET, algorithms=["HS256", "HS384"]))
     add_route("/hs256-aud", JWTAuthentication(secret=HS_SECRET, algorithms=["HS256"], audience="api"))
     add_route("/rs256", JWTAuthentication(secret=RSA_PUBLIC_PEM, algorithms=["RS256"]))
@@ -203,6 +204,16 @@ class TestAlgorithmList:
         assert response.status_code == 401
 
 
+class TestRequiredJti:
+    def test_missing_jti_rejected_without_revocation_handler(self, client):
+        response = get(client, "/hs256-jti", make_token("HS256", HS_SECRET))
+        assert response.status_code == 401
+
+    def test_present_jti_accepted(self, client):
+        response = get(client, "/hs256-jti", make_token("HS256", HS_SECRET, jti="token-1"))
+        assert response.status_code == 200
+
+
 class TestPublicKeyParam:
     def test_public_key_param_verifies_rs256(self, client):
         token = make_token("RS256", RSA_PRIVATE_PEM)
@@ -281,4 +292,12 @@ class TestStartupValidation:
     def test_mixed_key_families_fail_startup(self):
         api = self._make_api(JWTAuthentication(secret=HS_SECRET, algorithms=["HS256", "RS256"]))
         with pytest.raises(Exception, match="mix key families"), TestClient(api):
+            pass
+
+    def test_unknown_guard_metadata_fails_startup(self):
+        api = self._make_api(JWTAuthentication(secret=HS_SECRET))
+        handler_id = next(iter(api._handler_middleware))
+        api._handler_middleware[handler_id]["guards"] = [{"type": "unknown-security-guard"}]
+
+        with pytest.raises(Exception, match="Unknown guard type"), TestClient(api):
             pass
