@@ -1803,7 +1803,7 @@ class BoltAPI:
                 if is_blocking:
                     # ONE thread hop for handler + serialization (two hops =
                     # double executor wait + double pool contention).
-                    def _run_blocking_multi():
+                    def _run_blocking_multi() -> ResponseWireV1:
                         return _dispatch_multi_sync(handler(*args, **kwargs))
 
                     return await sync_to_thread(_run_blocking_multi)
@@ -2388,7 +2388,7 @@ class BoltAPI:
                 elif is_blocking:
                     # ONE thread hop for handler + serialization — the wire
                     # tuple comes back directly, skipping the second hop below.
-                    def _run_blocking_request_only():
+                    def _run_blocking_request_only() -> ResponseWireV1:
                         return serialize_response_sync(handler(request), meta)
 
                     return await sync_to_thread(_run_blocking_request_only)
@@ -2418,7 +2418,7 @@ class BoltAPI:
                 elif is_blocking:
                     # ONE thread hop for handler + serialization (previously
                     # two: one for the handler, one for serialize_response_sync).
-                    def _run_blocking():
+                    def _run_blocking() -> ResponseWireV1:
                         return serialize_response_sync(handler(*args, **kwargs), meta)
 
                     return await sync_to_thread(_run_blocking)

@@ -196,7 +196,7 @@ class PaginationBase(ABC):
         if hasattr(queryset, "acount"):
             return await queryset.acount()
         # Other sync collections with a count() method
-        elif hasattr(queryset, "count") and callable(queryset.count):
+        if hasattr(queryset, "count") and callable(queryset.count):
             return await run_in_orm_executor(queryset.count)
         # For other iterables
         else:

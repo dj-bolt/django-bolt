@@ -237,7 +237,9 @@ HTTP Request → Actix Web (Rust)
       - Django ORM access (async methods)
            ↓
     Response Serialization (ResponseWireV1 format)
-      - Python returns 4-tuple: (status, meta, body_kind, body_payload)
+      - Python normally returns 4-tuple: (status, meta, body_kind, body_payload)
+      - Eligible sync routes may return an encoded JSON body as raw bytes
+      - All other response shapes continue to use the full 4-tuple
       - Integer meta tags (0-3) → static Rust ResponseMeta (zero alloc)
       - Tuple meta for custom headers/cookies → Rust parses once
       - Body kinds: 0=bytes (zero-copy via PyBackedBytes), 1=stream, 2=file
