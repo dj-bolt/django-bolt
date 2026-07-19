@@ -1826,9 +1826,7 @@ class BoltAPI:
             if _original_fn is not None:
                 try:
                     _code = _original_fn.__code__
-                    _trivially_async = not any(
-                        i.opname in _ASYNC_SUSPEND_OPNAMES for i in dis.get_instructions(_code)
-                    )
+                    _trivially_async = not any(i.opname in _ASYNC_SUSPEND_OPNAMES for i in dis.get_instructions(_code))
                 except (AttributeError, TypeError):
                     pass
 

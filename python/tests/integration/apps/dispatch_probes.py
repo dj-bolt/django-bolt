@@ -116,9 +116,7 @@ async def t_oversized_timer():
 @api.get("/t-crossing-timeout")
 async def t_crossing_timeout():
     loop = asyncio.get_running_loop()
-    reader, writer = await asyncio.open_connection(
-        "127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"])
-    )
+    reader, writer = await asyncio.open_connection("127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"]))
     try:
         await reader.readline()
         # Wedge the selector loop past the crossing timeout, then attempt a
@@ -181,9 +179,7 @@ async def t_task():
 
 @api.get("/t-socket")
 async def t_socket():
-    reader, writer = await asyncio.open_connection(
-        "127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"])
-    )
+    reader, writer = await asyncio.open_connection("127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"]))
     try:
         greeting = await reader.readline()
         writer.write(b"ping\n")
@@ -214,9 +210,7 @@ async def t_buffered_protocol():
                 received.set_result(bytes(self.buffer[:nbytes]))
                 self.transport.write(b"ping\n")
 
-    transport, _ = await loop.create_connection(
-        Protocol, "127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"])
-    )
+    transport, _ = await loop.create_connection(Protocol, "127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"]))
     try:
         return {"greeting": (await asyncio.wait_for(received, 1)).decode().strip()}
     finally:
@@ -225,9 +219,7 @@ async def t_buffered_protocol():
 
 @api.get("/t-start-tls")
 async def t_start_tls():
-    reader, writer = await asyncio.open_connection(
-        "127.0.0.1", int(os.environ["BOLT_PROBE_STARTTLS_PORT"])
-    )
+    reader, writer = await asyncio.open_connection("127.0.0.1", int(os.environ["BOLT_PROBE_STARTTLS_PORT"]))
     try:
         writer.write(b"STARTTLS\n")
         await writer.drain()
@@ -246,9 +238,7 @@ async def t_start_tls():
 
 @api.get("/t-backpressure")
 async def t_backpressure():
-    reader, writer = await asyncio.open_connection(
-        "127.0.0.1", int(os.environ["BOLT_PROBE_SLOW_SINK_PORT"])
-    )
+    reader, writer = await asyncio.open_connection("127.0.0.1", int(os.environ["BOLT_PROBE_SLOW_SINK_PORT"]))
     payload = b"x" * (8 * 1024 * 1024)
     try:
         sock = writer.transport.get_extra_info("socket")
@@ -379,15 +369,11 @@ async def t_datagram():
             if not reply.done():
                 reply.set_result(data)
 
-    server_transport, _ = await loop.create_datagram_endpoint(
-        EchoProtocol, local_addr=("127.0.0.1", 0)
-    )
+    server_transport, _ = await loop.create_datagram_endpoint(EchoProtocol, local_addr=("127.0.0.1", 0))
     client_transport = None
     try:
         port = server_transport.get_extra_info("sockname")[1]
-        client_transport, _ = await loop.create_datagram_endpoint(
-            ClientProtocol, remote_addr=("127.0.0.1", port)
-        )
+        client_transport, _ = await loop.create_datagram_endpoint(ClientProtocol, remote_addr=("127.0.0.1", port))
         client_transport.sendto(b"datagram-ok")
         return {"reply": (await asyncio.wait_for(reply, 1)).decode()}
     finally:

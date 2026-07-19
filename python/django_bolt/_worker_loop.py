@@ -179,9 +179,7 @@ class _SelectorProtocolAdapter(asyncio.Protocol):
             self.worker_loop.call_soon_threadsafe(callback, *args)
 
     def connection_made(self, transport):
-        self.transport = _ThreadsafeTransportProxy(
-            self.selector_loop, transport, self.protocol, self
-        )
+        self.transport = _ThreadsafeTransportProxy(self.selector_loop, transport, self.protocol, self)
         self._forward("connection_made", self.transport)
 
     def connection_lost(self, exc):
@@ -238,9 +236,7 @@ class _SelectorBufferedProtocolAdapter(asyncio.BufferedProtocol):
             self.worker_loop.call_soon_threadsafe(callback, *args)
 
     def connection_made(self, transport):
-        self.transport = _ThreadsafeTransportProxy(
-            self.selector_loop, transport, self.protocol, self
-        )
+        self.transport = _ThreadsafeTransportProxy(self.selector_loop, transport, self.protocol, self)
         self._forward("connection_made", self.transport)
 
     def connection_lost(self, exc):
@@ -281,9 +277,7 @@ class _SelectorBufferedProtocolAdapter(asyncio.BufferedProtocol):
 
 def _make_stream_adapter(worker_loop, selector_loop, protocol):
     adapter_type = (
-        _SelectorBufferedProtocolAdapter
-        if isinstance(protocol, asyncio.BufferedProtocol)
-        else _SelectorProtocolAdapter
+        _SelectorBufferedProtocolAdapter if isinstance(protocol, asyncio.BufferedProtocol) else _SelectorProtocolAdapter
     )
     return adapter_type(worker_loop, selector_loop, protocol)
 
@@ -311,9 +305,7 @@ class _SelectorDatagramProtocolAdapter(asyncio.DatagramProtocol):
             self.worker_loop.call_soon_threadsafe(callback, *args)
 
     def connection_made(self, transport):
-        self.transport = _ThreadsafeDatagramTransportProxy(
-            self.selector_loop, transport, self.protocol
-        )
+        self.transport = _ThreadsafeDatagramTransportProxy(self.selector_loop, transport, self.protocol)
         self._forward("connection_made", self.transport)
 
     def connection_lost(self, exc):
@@ -527,57 +519,43 @@ class WorkerLoop(asyncio.AbstractEventLoop):
     async def create_connection(self, protocol_factory, host=None, port=None, **kwargs):
         protocol = protocol_factory()
         adapter = _make_stream_adapter(self, self._selector_loop, protocol)
-        await self._submit_selector(
-            self._selector_loop.create_connection(lambda: adapter, host, port, **kwargs)
-        )
+        await self._submit_selector(self._selector_loop.create_connection(lambda: adapter, host, port, **kwargs))
         return adapter.transport, protocol
 
     async def create_unix_connection(self, protocol_factory, path=None, **kwargs):
         protocol = protocol_factory()
         adapter = _make_stream_adapter(self, self._selector_loop, protocol)
-        await self._submit_selector(
-            self._selector_loop.create_unix_connection(lambda: adapter, path, **kwargs)
-        )
+        await self._submit_selector(self._selector_loop.create_unix_connection(lambda: adapter, path, **kwargs))
         return adapter.transport, protocol
 
     async def create_server(self, protocol_factory, host=None, port=None, **kwargs):
         server = await self._submit_selector(
-            self._selector_loop.create_server(
-                self._adapt_protocol_factory(protocol_factory), host, port, **kwargs
-            )
+            self._selector_loop.create_server(self._adapt_protocol_factory(protocol_factory), host, port, **kwargs)
         )
         return _ThreadsafeServerProxy(self, server)
 
     async def create_unix_server(self, protocol_factory, path=None, **kwargs):
         server = await self._submit_selector(
-            self._selector_loop.create_unix_server(
-                self._adapt_protocol_factory(protocol_factory), path, **kwargs
-            )
+            self._selector_loop.create_unix_server(self._adapt_protocol_factory(protocol_factory), path, **kwargs)
         )
         return _ThreadsafeServerProxy(self, server)
 
     async def connect_accepted_socket(self, protocol_factory, sock, **kwargs):
         protocol = protocol_factory()
         adapter = _make_stream_adapter(self, self._selector_loop, protocol)
-        await self._submit_selector(
-            self._selector_loop.connect_accepted_socket(lambda: adapter, sock, **kwargs)
-        )
+        await self._submit_selector(self._selector_loop.connect_accepted_socket(lambda: adapter, sock, **kwargs))
         return adapter.transport, protocol
 
     async def create_datagram_endpoint(self, protocol_factory, *args, **kwargs):
         protocol = protocol_factory()
         adapter = _SelectorDatagramProtocolAdapter(self, self._selector_loop, protocol)
-        await self._submit_selector(
-            self._selector_loop.create_datagram_endpoint(lambda: adapter, *args, **kwargs)
-        )
+        await self._submit_selector(self._selector_loop.create_datagram_endpoint(lambda: adapter, *args, **kwargs))
         return adapter.transport, protocol
 
     async def sendfile(self, transport, file, offset=0, count=None, *, fallback=True):
         raw_transport = getattr(transport, "_raw_transport", transport)
         return await self._submit_selector(
-            self._selector_loop.sendfile(
-                raw_transport, file, offset=offset, count=count, fallback=fallback
-            )
+            self._selector_loop.sendfile(raw_transport, file, offset=offset, count=count, fallback=fallback)
         )
 
     async def start_tls(self, transport, protocol, sslcontext, **kwargs):
@@ -585,14 +563,10 @@ class WorkerLoop(asyncio.AbstractEventLoop):
             raise TypeError("start_tls() requires a WorkerLoop transport")
         raw_transport = transport._raw_transport
         adapter = raw_transport.get_protocol()
-        if not isinstance(
-            adapter, (_SelectorProtocolAdapter, _SelectorBufferedProtocolAdapter)
-        ):
+        if not isinstance(adapter, (_SelectorProtocolAdapter, _SelectorBufferedProtocolAdapter)):
             raise TypeError("transport protocol is not managed by WorkerLoop")
         raw_tls_transport = await self._submit_selector(
-            self._selector_loop.start_tls(
-                raw_transport, adapter, sslcontext, **kwargs
-            )
+            self._selector_loop.start_tls(raw_transport, adapter, sslcontext, **kwargs)
         )
         transport._replace_raw_transport(raw_tls_transport)
         adapter.transport = transport
@@ -601,17 +575,13 @@ class WorkerLoop(asyncio.AbstractEventLoop):
     async def connect_read_pipe(self, protocol_factory, pipe):
         protocol = protocol_factory()
         adapter = _make_stream_adapter(self, self._selector_loop, protocol)
-        await self._submit_selector(
-            self._selector_loop.connect_read_pipe(lambda: adapter, pipe)
-        )
+        await self._submit_selector(self._selector_loop.connect_read_pipe(lambda: adapter, pipe))
         return adapter.transport, protocol
 
     async def connect_write_pipe(self, protocol_factory, pipe):
         protocol = protocol_factory()
         adapter = _make_stream_adapter(self, self._selector_loop, protocol)
-        await self._submit_selector(
-            self._selector_loop.connect_write_pipe(lambda: adapter, pipe)
-        )
+        await self._submit_selector(self._selector_loop.connect_write_pipe(lambda: adapter, pipe))
         return adapter.transport, protocol
 
     async def sock_recv(self, sock, nbytes):
@@ -624,9 +594,7 @@ class WorkerLoop(asyncio.AbstractEventLoop):
         return await self._submit_selector(self._selector_loop.sock_recvfrom(sock, bufsize))
 
     async def sock_recvfrom_into(self, sock, buf, nbytes=0):
-        return await self._submit_selector(
-            self._selector_loop.sock_recvfrom_into(sock, buf, nbytes)
-        )
+        return await self._submit_selector(self._selector_loop.sock_recvfrom_into(sock, buf, nbytes))
 
     async def sock_sendall(self, sock, data):
         return await self._submit_selector(self._selector_loop.sock_sendall(sock, data))
@@ -642,30 +610,22 @@ class WorkerLoop(asyncio.AbstractEventLoop):
 
     async def sock_sendfile(self, sock, file, offset=0, count=None, *, fallback=None):
         return await self._submit_selector(
-            self._selector_loop.sock_sendfile(
-                sock, file, offset=offset, count=count, fallback=fallback
-            )
+            self._selector_loop.sock_sendfile(sock, file, offset=offset, count=count, fallback=fallback)
         )
 
     async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
         return await self._submit_selector(
-            self._selector_loop.getaddrinfo(
-                host, port, family=family, type=type, proto=proto, flags=flags
-            )
+            self._selector_loop.getaddrinfo(host, port, family=family, type=type, proto=proto, flags=flags)
         )
 
     async def getnameinfo(self, sockaddr, flags=0):
         return await self._submit_selector(self._selector_loop.getnameinfo(sockaddr, flags))
 
     async def subprocess_exec(self, protocol_factory, *args, **kwargs):
-        return await self._submit_selector(
-            self._selector_loop.subprocess_exec(protocol_factory, *args, **kwargs)
-        )
+        return await self._submit_selector(self._selector_loop.subprocess_exec(protocol_factory, *args, **kwargs))
 
     async def subprocess_shell(self, protocol_factory, cmd, **kwargs):
-        return await self._submit_selector(
-            self._selector_loop.subprocess_shell(protocol_factory, cmd, **kwargs)
-        )
+        return await self._submit_selector(self._selector_loop.subprocess_shell(protocol_factory, cmd, **kwargs))
 
     def _selector_callback(self, callback, args):
         self.call_soon_threadsafe(callback, *args)
@@ -722,9 +682,7 @@ class WorkerLoop(asyncio.AbstractEventLoop):
         if not callable(callback):
             raise TypeError(f"a callable object was expected, got {callback!r}")
         context = contextvars.copy_context()
-        schedule = functools.partial(
-            self.call_soon_threadsafe, callback, *args, context=context
-        )
+        schedule = functools.partial(self.call_soon_threadsafe, callback, *args, context=context)
         self._scheduler.add_signal_handler(sig, schedule)
 
     def remove_signal_handler(self, sig):
@@ -774,9 +732,7 @@ def worker_dispatch_start(dispatch, request, loop, resolver):
             # Python 3.12 eager-start Tasks execute inline while establishing
             # real Task identity first. AnyIO/httpx cancellation scopes depend
             # on current_task() being non-None from the first instruction.
-            task = loop.create_task(
-                coro, eager_start=loop.get_task_factory() is None
-            )
+            task = loop.create_task(coro, eager_start=loop.get_task_factory() is None)
         except BaseException as exc:
             resolver.set_exception(exc)
             return
@@ -807,6 +763,4 @@ def run_worker_handle(loop, handle):
     try:
         _with_running_loop(loop, handle._run)
     except BaseException as exc:
-        loop.call_exception_handler(
-            {"message": "Exception in WorkerLoop callback", "exception": exc, "handle": handle}
-        )
+        loop.call_exception_handler({"message": "Exception in WorkerLoop callback", "exception": exc, "handle": handle})

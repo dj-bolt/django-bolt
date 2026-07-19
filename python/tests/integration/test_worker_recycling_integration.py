@@ -94,8 +94,7 @@ def test_sigterm_closes_websockets_with_service_restart_code(make_server_project
                 time.sleep(0.1)
             stdout, stderr = server.stop()
             raise AssertionError(
-                f"{exc}\nserver exit code: {server.process.returncode}"
-                f"\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                f"{exc}\nserver exit code: {server.process.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
             ) from exc
 
     assert code == 1012, f"Expected 1012 Service Restart close, got {code} ({reason!r})"
