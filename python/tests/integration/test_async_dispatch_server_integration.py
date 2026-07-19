@@ -1,9 +1,8 @@
-"""Two-altitude coverage for all production async dispatch bridges.
+"""Two-altitude coverage for the production async dispatch path.
 
 Production dispatch only runs in a real ``runbolt`` server — TestClient bridges
-through ``run_coroutine_threadsafe``. The subprocess matrix drives every shape
-through the default worker loop, the compatibility eager loop-thread bridge,
-and the legacy Task-per-request bridge.
+through ``run_coroutine_threadsafe``. The subprocess test drives every shape
+through the process-lived worker loop.
 """
 
 from __future__ import annotations
@@ -55,20 +54,40 @@ def test_dispatch_probes_in_process():
         _assert_probes(client)
 
 
-@pytest.mark.server_integration
-def test_dispatch_probes_eager_bridge(make_server_project):
-    project = make_server_project(api_module=app_module("dispatch_probes"))
-    with project.start(env={"DJANGO_BOLT_WORKER_LOOP": "0"}) as server:
-        _assert_probes(server)
+class _EchoHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        self.wfile.write(b"hello\n")
+        # EOF is allowed: the crossing-timeout probe abandons its write.
+        assert self.rfile.readline() in (b"ping\n", b"")
 
 
 @pytest.mark.server_integration
-def test_dispatch_probes_legacy_bridge(make_server_project):
-    """DJANGO_BOLT_EAGER_DISPATCH=0 must restore the Task-per-request bridge
-    with identical observable behavior."""
+def test_crossing_timeout_guard(make_server_project):
+    """A synchronous WorkerLoop→selector-loop crossing must raise instead of
+    deadlocking once the selector loop is wedged past the crossing timeout.
+
+    Runs against its own server: the short timeout must not apply to the main
+    probe matrix, where a saturated machine can stretch healthy crossings
+    (e.g. subprocess pipe teardown) past a 2-second deadline.
+    """
     project = make_server_project(api_module=app_module("dispatch_probes"))
-    with project.start(env={"DJANGO_BOLT_WORKER_LOOP": "0", "DJANGO_BOLT_EAGER_DISPATCH": "0"}) as server:
-        _assert_probes(server)
+    echo_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _EchoHandler)
+    echo_thread = threading.Thread(target=echo_server.serve_forever, daemon=True)
+    echo_thread.start()
+    try:
+        with project.start(
+            env={
+                "BOLT_PROBE_TCP_PORT": str(echo_server.server_address[1]),
+                # Short enough to test the deadlock guard without stalling the
+                # suite; the probe wedges the selector loop for 4 seconds.
+                "DJANGO_BOLT_LOOP_CROSSING_TIMEOUT": "2",
+            }
+        ) as server:
+            assert server.get("/t-crossing-timeout").json() == {"timed_out": True}
+    finally:
+        echo_server.shutdown()
+        echo_server.server_close()
+        echo_thread.join(timeout=2)
 
 
 @pytest.mark.server_integration
@@ -100,13 +119,7 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
     tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls_context.load_cert_chain(certificate, private_key)
 
-    class EchoHandler(socketserver.StreamRequestHandler):
-        def handle(self):
-            self.wfile.write(b"hello\n")
-            # EOF is allowed: the crossing-timeout probe abandons its write.
-            assert self.rfile.readline() in (b"ping\n", b"")
-
-    echo_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), EchoHandler)
+    echo_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _EchoHandler)
     echo_thread = threading.Thread(target=echo_server.serve_forever, daemon=True)
     echo_thread.start()
 
@@ -177,9 +190,6 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
                 "BOLT_PROBE_STARTTLS_PORT": str(starttls_server.server_address[1]),
                 "BOLT_PROBE_SLOW_SINK_PORT": str(slow_sink_server.server_address[1]),
                 "BOLT_PROBE_HTTP_URL": f"https://127.0.0.1:{http_server.server_address[1]}/",
-                # Short enough to test the deadlock guard without stalling the
-                # suite; far above any healthy crossing in this test.
-                "DJANGO_BOLT_LOOP_CROSSING_TIMEOUT": "2",
             }
         ) as server:
             _assert_probes(server)
@@ -233,10 +243,6 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             # retained until their (here: one-hour) deadlines.
             assert server.get("/t-cancelled-timers").json() == {"scheduled": 200}
             server.wait_for_json("/t-timer-stats", lambda body: body["live"] <= 20)
-
-            # Last: this probe wedges the selector loop for several seconds. A
-            # synchronous crossing into it must raise, not deadlock.
-            assert server.get("/t-crossing-timeout").json() == {"timed_out": True}
     finally:
         echo_server.shutdown()
         echo_server.server_close()

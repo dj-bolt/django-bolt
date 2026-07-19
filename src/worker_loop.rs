@@ -18,21 +18,11 @@ static WORKER_SYNC_DISPATCH: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static RUN_WORKER_HANDLE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_SERVICE: std::sync::OnceLock<WorkerLoopService> = std::sync::OnceLock::new();
-static WORKER_LOOP_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 static SIGNAL_WATCHERS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<i32, tokio::sync::oneshot::Sender<()>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-#[inline]
-pub(crate) fn enabled() -> bool {
-    *WORKER_LOOP_ENABLED.get_or_init(|| {
-        std::env::var("DJANGO_BOLT_WORKER_LOOP")
-            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
-    })
-}
 
 enum WorkerLoopCommand {
     Soon(Py<PyAny>),
