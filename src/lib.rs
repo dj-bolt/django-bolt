@@ -29,6 +29,7 @@ mod testing;
 mod type_coercion;
 mod validation;
 mod websocket;
+mod worker_loop;
 
 /// Pure-Rust hot-path helpers re-exported for criterion benches
 /// (benches/hot_path.rs links the rlib). Not part of the Python API.
@@ -70,6 +71,8 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Class
     m.add_class::<PyRequest>()?;
+    m.add_class::<crate::worker_loop::WorkerLoopScheduler>()?;
+    m.add_function(wrap_pyfunction!(crate::worker_loop::worker_timer_count, m)?)?;
 
     // Production server functions
     m.add_function(wrap_pyfunction!(register_routes, m)?)?;

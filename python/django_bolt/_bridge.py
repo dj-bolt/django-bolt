@@ -1,4 +1,4 @@
-"""Loop-thread dispatch bridge: eager coroutine execution for async handlers.
+"""Async dispatch bridges for worker-local and loop-thread execution.
 
 Rust schedules ``eager_dispatch`` on the asyncio loop thread via
 ``call_soon_threadsafe`` instead of wrapping every dispatch coroutine in an
@@ -24,6 +24,10 @@ returns ``None`` inside the FIRST segment (before the first real suspension).
 After the first suspension a real Task exists. Set
 ``DJANGO_BOLT_EAGER_DISPATCH=0`` to restore the previous Task-per-request
 bridge if a library depends on that.
+
+The default HTTP path uses the process-lived facade in ``_worker_loop.py``;
+this module retains the shared coroutine driver and compatibility loop-thread
+bridge. ``DJANGO_BOLT_WORKER_LOOP=0`` selects that compatibility bridge.
 """
 
 from __future__ import annotations

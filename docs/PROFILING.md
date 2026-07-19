@@ -26,6 +26,14 @@ and compare per-request latency over a keepalive connection:
 - `t_ready − t_trivial` = pure async-bridge cost (no real suspension)
 - `t_sleep0 − t_ready` = one suspend/resume cycle
 - rerun with `DJANGO_BOLT_EAGER_DISPATCH=0` for eager-vs-legacy bridge deltas
+- rerun with `DJANGO_BOLT_WORKER_LOOP=0` for worker-local-vs-loop-thread deltas
+
+Measure worker-local results at both C=1 and high concurrency with server and
+load-generator CPU affinity. Removing the loop-thread hop may reduce latency
+while also removing cross-core pipelining between HTTP framing and Python GIL
+work. Include `/t-timer` when comparing: positive-delay timers use the
+process-wide high-resolution Rust timer dispatcher rather than Tokio's ~1ms
+timer wheel.
 
 Attribution tools: `py-spy record --gil` (Task machinery shows up as
 `ensure_future`), `strace -f -c -p <pid>` (cross-thread wakeup writes and

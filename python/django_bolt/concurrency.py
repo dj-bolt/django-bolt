@@ -20,6 +20,28 @@ logger = logging.getLogger(__name__)
 
 __all__ = ("sync_to_thread", "run_in_orm_executor")
 
+# Shared default pool for generic blocking work. Passing an explicit executor
+# keeps the compatibility asyncio loop and WorkerLoop from each lazily creating
+# a separate default pool. Thread count is bounded and independently tunable
+# from the database-aware ORM pool below.
+_default_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _get_default_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _default_executor
+    if _default_executor is None:
+        raw = os.environ.get("DJANGO_BOLT_EXECUTOR_THREADS")
+        platform_default = min(32, (os.cpu_count() or 1) + 4)
+        try:
+            workers = int(raw) if raw else platform_default
+        except ValueError:
+            workers = platform_default
+        _default_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, workers), thread_name_prefix="bolt_default"
+        )
+    return _default_executor
+
+
 # Bounded executor for framework-initiated QuerySet evaluation (async handlers
 # returning QuerySets, pagination counts/slices). Parallel — unlike asgiref's
 # thread_sensitive single thread — but CAPPED: each executor thread holds its
@@ -101,10 +123,11 @@ async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.
         - Expected 40-60% RPS improvement for I/O-bound sync handlers
     """
     # Run in default executor (thread pool)
-    # None = use default executor (ThreadPoolExecutor with max_workers=min(32, cpu_count + 4))
+    # Use Bolt's explicit shared executor so every supported loop uses one
+    # bounded pool rather than creating a separate implicit default pool.
     # run_in_executor only forwards positional args — keyword args (e.g. Rust
     # prebound keyword-bound params) must be bound via partial.
     loop = asyncio.get_running_loop()
     if kwargs:
-        return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
-    return await loop.run_in_executor(None, fn, *args)
+        return await loop.run_in_executor(_get_default_executor(), partial(fn, *args, **kwargs))
+    return await loop.run_in_executor(_get_default_executor(), fn, *args)

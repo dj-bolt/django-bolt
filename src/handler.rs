@@ -1002,6 +1002,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     let skip_cors = plan.map_or(false, |p| p.skip_cors());
     let skip_compression = plan.map_or(false, |p| p.skip_compression());
     let can_sync_dispatch = plan.map_or(false, |p| p.can_sync_dispatch());
+    let is_async_handler = plan.map_or(false, |p| p.is_async());
 
     // Extract and validate headers
     let headers = if must_extract_headers {
@@ -1382,7 +1383,11 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // body bytes (not a coroutine). Parse and build the HTTP response in
             // the same GIL block. Eliminates: coroutine creation,
             // into_future_with_locals, asyncio polling.
-            let result_obj = route.dispatch_sync.call1(py, (request_obj,))?;
+            let result_obj = if is_async_handler && crate::worker_loop::enabled() {
+                crate::worker_loop::dispatch_sync(py, &route.dispatch_sync, &request_obj)?
+            } else {
+                route.dispatch_sync.call1(py, (request_obj,))?
+            };
 
             // Bare-bytes fast path: sync executors return just the encoded JSON
             // body when (status, meta) == (route default, JSON). Skips the
@@ -1455,7 +1460,13 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
             })?;
 
-            if eager_dispatch_enabled() {
+            if crate::worker_loop::enabled() {
+                // Default async path: submit to the process-lived WorkerLoop
+                // whose ready queue is serviced by a persistent Tokio pump.
+                let dispatch = route.dispatch.clone_ref(py);
+                let fut = crate::worker_loop::dispatch(dispatch, request_obj.into());
+                Ok(DispatchOutcome::Pending(Box::pin(fut)))
+            } else if eager_dispatch_enabled() {
                 // ASYNC PATH (eager): schedule eager_dispatch on the loop thread.
                 // The coroutine's first segment runs there synchronously; a Task
                 // is only created on the first REAL suspension. Measured: the

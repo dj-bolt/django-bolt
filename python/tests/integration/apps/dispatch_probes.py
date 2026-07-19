@@ -14,6 +14,9 @@ Probe map:
 - /t-trivial  async def, no await         → trivially-async sync dispatch
 - /t-ready    awaits, never suspends      → eager dispatch completes inline
 - /t-sleep0   await asyncio.sleep(0)      → eager start + bare-yield reschedule
+- /t-timer    await asyncio.sleep(1ms)    → timer scheduling
+- /t-cancelled-timers + /t-timer-stats    → cancelled-timer heap compaction
+- /t-crossing-timeout                     → bounded cross-loop sync crossings
 - /t-thread   await sync_to_thread(...)   → eager start + real Future suspension
 - /t-exc      HTTPException after await   → exception through the driver Task
 - /t-deps     two async Depends           → asyncio.gather in the first segment
@@ -24,15 +27,26 @@ Probe map:
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import socket
+import ssl
+import sys
+import time
 from typing import Annotated
 
-from django_bolt import BoltAPI
+import httpx
+
+from django_bolt import BoltAPI, _core
 from django_bolt.concurrency import sync_to_thread
 from django_bolt.exceptions import HTTPException
 from django_bolt.params import Depends
 
 api = BoltAPI()
 PAYLOAD = {"message": "hello", "n": 1}
+_background_done = False
+_shared_lock = asyncio.Lock()
+_http_client = None
 
 
 async def _noop():
@@ -66,10 +80,62 @@ async def t_sleep0():
     return PAYLOAD
 
 
+@api.get("/t-timer")
+async def t_timer():
+    await asyncio.sleep(0.001)
+    return PAYLOAD
+
+
+@api.get("/t-cancelled-timers")
+async def t_cancelled_timers():
+    loop = asyncio.get_running_loop()
+    handles = [loop.call_later(3600, lambda: None) for _ in range(200)]
+    for handle in handles:
+        handle.cancel()
+    return {"scheduled": len(handles)}
+
+
+@api.get("/t-timer-stats")
+async def t_timer_stats():
+    return {"live": _core.worker_timer_count()}
+
+
+@api.get("/t-crossing-timeout")
+async def t_crossing_timeout():
+    loop = asyncio.get_running_loop()
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"])
+    )
+    try:
+        await reader.readline()
+        # Wedge the selector loop past the crossing timeout, then attempt a
+        # synchronous crossing (transport write). It must raise, not hang.
+        loop._selector_loop.call_soon_threadsafe(time.sleep, 4)
+        try:
+            writer.write(b"ping\n")
+        except RuntimeError as exc:
+            return {"timed_out": "did not complete within" in str(exc)}
+        return {"timed_out": False}
+    finally:
+        writer.close()
+
+
 @api.get("/t-thread")
 async def t_thread():
     value = await sync_to_thread(lambda: "from-thread")
     return {"value": value}
+
+
+@api.get("/t-subprocess")
+async def t_subprocess():
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "print('from-subprocess')",
+        stdout=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await process.communicate()
+    return {"value": stdout.decode().strip(), "returncode": process.returncode}
 
 
 @api.get("/t-exc")
@@ -98,6 +164,258 @@ async def t_task():
     loop = asyncio.get_running_loop()
     task = asyncio.create_task(_dep_a())
     return {"loop_running": loop.is_running(), "task_result": await task}
+
+
+@api.get("/t-socket")
+async def t_socket():
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"])
+    )
+    try:
+        greeting = await reader.readline()
+        writer.write(b"ping\n")
+        await writer.drain()
+        return {"greeting": greeting.decode().strip()}
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@api.get("/t-buffered-protocol")
+async def t_buffered_protocol():
+    loop = asyncio.get_running_loop()
+    received = loop.create_future()
+
+    class Protocol(asyncio.BufferedProtocol):
+        def __init__(self):
+            self.buffer = bytearray(64)
+
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def get_buffer(self, sizehint):
+            return self.buffer
+
+        def buffer_updated(self, nbytes):
+            if not received.done():
+                received.set_result(bytes(self.buffer[:nbytes]))
+                self.transport.write(b"ping\n")
+
+    transport, _ = await loop.create_connection(
+        Protocol, "127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"])
+    )
+    try:
+        return {"greeting": (await asyncio.wait_for(received, 1)).decode().strip()}
+    finally:
+        transport.close()
+
+
+@api.get("/t-start-tls")
+async def t_start_tls():
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", int(os.environ["BOLT_PROBE_STARTTLS_PORT"])
+    )
+    try:
+        writer.write(b"STARTTLS\n")
+        await writer.drain()
+        assert await reader.readline() == b"READY\n"
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        await writer.start_tls(context)
+        writer.write(b"over-tls\n")
+        await writer.drain()
+        return {"reply": (await reader.readline()).decode().strip()}
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@api.get("/t-backpressure")
+async def t_backpressure():
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", int(os.environ["BOLT_PROBE_SLOW_SINK_PORT"])
+    )
+    payload = b"x" * (8 * 1024 * 1024)
+    try:
+        sock = writer.transport.get_extra_info("socket")
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        writer.transport.set_write_buffer_limits(high=1024, low=512)
+        started = time.monotonic()
+        writer.write(len(payload).to_bytes(8, "big") + payload)
+        await writer.drain()
+        drain_seconds = time.monotonic() - started
+        received = int.from_bytes(await reader.readexactly(8), "big")
+        return {"received": received, "backpressure_observed": drain_seconds >= 0.05}
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@api.get("/t-pipes")
+async def t_pipes():
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    read_pipe = os.fdopen(read_fd, "rb", buffering=0)
+    write_pipe = os.fdopen(write_fd, "wb", buffering=0)
+    received = loop.create_future()
+
+    class ReadProtocol(asyncio.Protocol):
+        def data_received(self, data):
+            if not received.done():
+                received.set_result(data)
+
+    read_transport = write_transport = None
+    try:
+        read_transport, _ = await loop.connect_read_pipe(ReadProtocol, read_pipe)
+        write_transport, _ = await loop.connect_write_pipe(asyncio.Protocol, write_pipe)
+        write_transport.write(b"through-pipes")
+        data = await asyncio.wait_for(received, 1)
+        return {"value": data.decode()}
+    finally:
+        if write_transport is not None:
+            write_transport.close()
+        if read_transport is not None:
+            read_transport.close()
+
+
+@api.get("/t-fd-watcher")
+async def t_fd_watcher():
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    received = loop.create_future()
+    writable = loop.create_future()
+    write_sock, peer_sock = socket.socketpair()
+
+    def readable():
+        if not received.done():
+            received.set_result(os.read(read_fd, 1024))
+
+    try:
+        loop.add_reader(read_fd, readable)
+        loop.add_writer(
+            write_sock,
+            lambda: writable.set_result(True) if not writable.done() else None,
+        )
+        os.write(write_fd, b"fd-ready")
+        data = await asyncio.wait_for(received, 1)
+        await asyncio.wait_for(writable, 1)
+        return {
+            "value": data.decode(),
+            "reader_removed": loop.remove_reader(read_fd),
+            "writer_removed": loop.remove_writer(write_sock),
+        }
+    finally:
+        loop.remove_reader(read_fd)
+        loop.remove_writer(write_sock)
+        os.close(read_fd)
+        os.close(write_fd)
+        write_sock.close()
+        peer_sock.close()
+
+
+@api.get("/t-signal")
+async def t_signal():
+    loop = asyncio.get_running_loop()
+    received = asyncio.Event()
+    loop.add_signal_handler(signal.SIGUSR1, received.set)
+    try:
+        os.kill(os.getpid(), signal.SIGUSR1)
+        await asyncio.wait_for(received.wait(), 1)
+    finally:
+        removed = loop.remove_signal_handler(signal.SIGUSR1)
+    return {"received": received.is_set(), "removed": removed}
+
+
+@api.get("/t-worker-server")
+async def t_worker_server():
+    async def echo(reader, writer):
+        writer.write(await reader.readline())
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(echo, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"worker-server\n")
+        await writer.drain()
+        reply = await reader.readline()
+        writer.close()
+        await writer.wait_closed()
+        return {"reply": reply.decode().strip()}
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@api.get("/t-datagram")
+async def t_datagram():
+    loop = asyncio.get_running_loop()
+    reply = loop.create_future()
+
+    class EchoProtocol(asyncio.DatagramProtocol):
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def datagram_received(self, data, addr):
+            self.transport.sendto(data, addr)
+
+    class ClientProtocol(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            if not reply.done():
+                reply.set_result(data)
+
+    server_transport, _ = await loop.create_datagram_endpoint(
+        EchoProtocol, local_addr=("127.0.0.1", 0)
+    )
+    client_transport = None
+    try:
+        port = server_transport.get_extra_info("sockname")[1]
+        client_transport, _ = await loop.create_datagram_endpoint(
+            ClientProtocol, remote_addr=("127.0.0.1", port)
+        )
+        client_transport.sendto(b"datagram-ok")
+        return {"reply": (await asyncio.wait_for(reply, 1)).decode()}
+    finally:
+        if client_transport is not None:
+            client_transport.close()
+        server_transport.close()
+
+
+@api.get("/t-background-start")
+async def t_background_start():
+    global _background_done
+    _background_done = False
+
+    async def finish_later():
+        global _background_done
+        await asyncio.sleep(0.03)
+        _background_done = True
+
+    asyncio.create_task(finish_later())
+    return {"started": True}
+
+
+@api.get("/t-background-status")
+async def t_background_status():
+    return {"done": _background_done}
+
+
+@api.get("/t-shared-lock")
+async def t_shared_lock():
+    async with _shared_lock:
+        await asyncio.sleep(0.02)
+        return {"loop": id(asyncio.get_running_loop())}
+
+
+@api.get("/t-cached-client")
+async def t_cached_client():
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(verify=False)
+    response = await _http_client.get(os.environ["BOLT_PROBE_HTTP_URL"])
+    return response.json()
 
 
 @api.get("/t-stream")

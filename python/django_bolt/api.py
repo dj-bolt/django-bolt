@@ -1645,6 +1645,10 @@ class BoltAPI:
                 and not revocation_handlers
             )
             middleware_meta["can_sync_dispatch"] = can_sync_dispatch
+            # Rust installs WorkerLoop as the running loop while executing the
+            # trivially-async sync fast path. This keeps create_task() and
+            # get_running_loop() valid even when the coroutine never awaits.
+            middleware_meta["is_async"] = meta["is_async"]
 
             # Python middleware requires cookies and headers regardless of handler params
             # Django middleware needs cookies/headers (CSRF, session, auth, etc.)
