@@ -4,7 +4,10 @@
 host := "127.0.0.1"
 port := "8001"
 c := "100"
-n := "10000"
+# 100k requests ≈ 0.3-1s per endpoint at typical RPS. 10k finished in ~40ms on
+# fast endpoints — mostly connection-ramp transient, giving ±25% run-to-run
+# noise that made bench comparisons (and the 2% bench-gate) meaningless.
+n := "100000"
 p := "8"
 workers := "1"
 

@@ -79,7 +79,7 @@ Benchmark recipes need `bombardier` (`go install github.com/codesenberg/bombardi
 ```bash
 # Full benchmark suite. First run creates bench/BENCHMARK_BASELINE.md, second
 # creates bench/BENCHMARK_DEV.md + prints a comparison, third rotates dev→baseline.
-just save-bench                  # defaults: host=127.0.0.1 port=8001 c=100 n=10000 p=8 workers=1
+just save-bench                  # defaults: host=127.0.0.1 port=8001 c=100 n=100000 p=8 workers=1
 just save-bench 127.0.0.1 8001 100 50000   # positional: host port c n ...
 
 # Focused parameter/form-parsing benchmark (fast iteration)
