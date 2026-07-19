@@ -88,6 +88,12 @@ Response = ResponseWireV1
 # Global registry for BoltAPI instances (used by autodiscovery)
 _BOLT_API_REGISTRY = []
 
+# Opcodes that let an `async def` genuinely suspend. `await` emits
+# GET_AWAITABLE, but `async for` and async comprehensions emit only
+# GET_AITER/GET_ANEXT (+ END_ASYNC_FOR) — no GET_AWAITABLE — so
+# trivially-async detection must treat those as suspension points too.
+_ASYNC_SUSPEND_OPNAMES = frozenset({"GET_AWAITABLE", "GET_AITER", "GET_ANEXT", "END_ASYNC_FOR"})
+
 
 def _normalize_path(path: str, trailing_slash: str = "strip") -> str:
     """Normalize a path based on trailing slash mode.
@@ -1811,16 +1817,18 @@ class BoltAPI:
             default_status = meta["default_status_code"]
             has_response_validation = meta["_has_response_validation"]
 
-            # Detect trivially-async handlers: async def with no await statements.
+            # Detect trivially-async handlers: async def with no suspension points.
             # These can be dispatched synchronously by driving the coroutine inline
             # via coro.send(None) → StopIteration, avoiding the entire async bridge.
-            # Detection: check bytecode for GET_AWAITABLE opcode (emitted for every await).
+            # Detection: check bytecode for any opcode in _ASYNC_SUSPEND_OPNAMES.
             _original_fn = meta.get("_original_fn") or meta.get("handler")
             _trivially_async = False
             if _original_fn is not None:
                 try:
                     _code = _original_fn.__code__
-                    _trivially_async = not any(i.opname == "GET_AWAITABLE" for i in dis.get_instructions(_code))
+                    _trivially_async = not any(
+                        i.opname in _ASYNC_SUSPEND_OPNAMES for i in dis.get_instructions(_code)
+                    )
                 except (AttributeError, TypeError):
                     pass
 

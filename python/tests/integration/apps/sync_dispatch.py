@@ -15,6 +15,8 @@ this code; the routes are intentionally spread across the wire shapes:
 
 from __future__ import annotations
 
+import asyncio
+
 from django_bolt import BoltAPI
 from django_bolt.responses import PlainText
 
@@ -60,6 +62,24 @@ async def search(term: str | None):
     """Optional annotation with NO function default → Rust injects None
     explicitly when the query param is missing (inject_none binding)."""
     return {"term": term}
+
+
+async def _numbers():
+    """Genuinely-suspending async iterator: asyncio.sleep(0) yields once per step."""
+    for value in (1, 2, 3):
+        await asyncio.sleep(0)
+        yield value
+
+
+@api.get("/aiter")
+async def aiter_total():
+    """``async for`` with no ``await`` statement: compiles to GET_AITER/GET_ANEXT
+    with NO GET_AWAITABLE, so it must NOT be classified trivially-async — a sync
+    executor driving it via coro.send(None) would 500 on the first suspension."""
+    total = 0
+    async for value in _numbers():
+        total += value
+    return {"total": total}
 
 
 @api.get("/strict")

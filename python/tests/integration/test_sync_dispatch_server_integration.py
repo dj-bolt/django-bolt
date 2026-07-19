@@ -26,6 +26,9 @@ EXPECTATIONS = [
     ("/search?term=abc", 200, {"term": "abc"}),
     ("/search", 200, {"term": None}),
     ("/strict?token=abc", 200, {"token": "abc"}),
+    # `async for` (no `await` statement) must not be misclassified as
+    # trivially-async: its suspensions would 500 under the sync executor.
+    ("/aiter", 200, {"total": 6}),
 ]
 
 
