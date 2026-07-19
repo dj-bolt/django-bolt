@@ -24,6 +24,23 @@ build-release:
 # Kill any servers on PORT
 kill port=port:
     #!/usr/bin/env bash
+    # Supervisors first: runbolt respawns killed workers, so sweeping only the
+    # port listeners lets the supervisor bring them straight back. Workers are
+    # forked from the supervisor and share its argv, so one pattern catches both.
+    sups=$(pgrep -f "runbolt .*--port {{port}}( |$)" 2>/dev/null || true)
+    if [ -n "$sups" ]; then
+        echo "terminating runbolt processes: $sups"
+        kill $sups 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            pgrep -f "runbolt .*--port {{port}}( |$)" >/dev/null 2>&1 || break
+            sleep 0.25
+        done
+        left=$(pgrep -f "runbolt .*--port {{port}}( |$)" 2>/dev/null || true)
+        if [ -n "$left" ]; then
+            echo "force-killing runbolt processes: $left"
+            kill -9 $left 2>/dev/null || true
+        fi
+    fi
     pids=$(lsof -tiTCP:{{port}} -sTCP:LISTEN 2>/dev/null || true)
     if [ -n "$pids" ]; then
         echo "killing: $pids"

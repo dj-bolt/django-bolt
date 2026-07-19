@@ -53,9 +53,48 @@ wait_for_server() {
     elapsed=$((elapsed + 1))
   done
   echo "Server not ready after ${max_wait}s (last status: $CODE); aborting." >&2
-  kill -TERM -$SERVER_PID 2>/dev/null || true
-  pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+  stop_server
   exit 1
+}
+
+RUNBOLT_PATTERN="manage.py runbolt --host $HOST --port $PORT"
+
+# Stop the current server tree (uv wrapper, supervisor, workers) and WAIT for
+# it to die and release the port before returning. A fire-and-forget SIGTERM
+# here is how stale servers stacked up across runs — and with SO_REUSEPORT, a
+# draining worker from the previous section can still answer requests when the
+# next section starts, so bombardier silently benchmarks the wrong server.
+# Note: `kill -TERM -$SERVER_PID` was never reliable — setsid forks, so $! is
+# not the new process group leader; pkill on the full command line is.
+stop_server() {
+  pkill -TERM -f "$RUNBOLT_PATTERN" 2>/dev/null || true
+  local waited=0
+  while pgrep -f "$RUNBOLT_PATTERN" >/dev/null 2>&1; do
+    if [ $waited -ge 40 ]; then
+      echo "Server did not exit within 10s of SIGTERM; sending SIGKILL" >&2
+      pkill -KILL -f "$RUNBOLT_PATTERN" 2>/dev/null || true
+      sleep 0.5
+      break
+    fi
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+  waited=0
+  while lsof -tiTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; do
+    if [ $waited -ge 40 ]; then
+      echo "ERROR: a listener still holds port $PORT 10s after server shutdown;" \
+           "aborting instead of benchmarking a foreign server." >&2
+      exit 1
+    fi
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+}
+
+start_server() {
+  DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
+  SERVER_PID=$!
+  wait_for_server
 }
 
 echo "# Django-Bolt Benchmark"
@@ -70,9 +109,7 @@ cd python/example
 # the production flow. Without this, STATIC_ROOT is empty and the static
 # scope won't register.
 uv run python manage.py collectstatic --noinput >/dev/null 2>&1 || echo "Warning: collectstatic failed; native static benchmarks may be skipped" >&2
-DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
-SERVER_PID=$!
-wait_for_server
+start_server
 
 $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/ 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
@@ -246,8 +283,7 @@ else
 fi
 rm -f "$BODY_FILE"
 
-kill -TERM -$SERVER_PID 2>/dev/null || true
-pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+stop_server
 sleep 1
 
 echo ""
@@ -255,15 +291,13 @@ echo "## ORM Performance"
 uv run python manage.py makemigrations users --noinput >/dev/null 2>&1 || true
 uv run python manage.py migrate --noinput >/dev/null 2>&1 || true
 
-DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
-SERVER_PID=$!
-wait_for_server
+start_server
 
 # Sanity check
 UCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/users/full10)
 if [ "$UCODE" != "200" ]; then
   echo "Expected 200 from /users/full10 but got $UCODE; aborting ORM benchmark." >&2
-  kill $SERVER_PID 2>/dev/null || true
+  stop_server
   exit 1
 fi
 
@@ -301,15 +335,12 @@ $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/sync-mini10 2>&1 | tr '\
 echo "Cleaning up test users..."
 curl -s -X POST http://$HOST:$PORT/users/delete >/dev/null 2>&1
 
-kill -TERM -$SERVER_PID 2>/dev/null || true
-pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+stop_server
 
 echo ""
 echo "## Class-Based Views (CBV) Performance"
 
-DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
-SERVER_PID=$!
-wait_for_server
+start_server
 
 echo "### Simple APIView GET (/cbv-simple)"
 $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-simple 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
@@ -402,16 +433,13 @@ curl -s -X POST http://$HOST:$PORT/users/delete >/dev/null 2>&1
 
 echo ""
 
-kill -TERM -$SERVER_PID 2>/dev/null || true
-pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+stop_server
 
 echo ""
 echo "## Form and File Upload Performance"
 
 # Start server for form/file tests
-DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
-SERVER_PID=$!
-wait_for_server
+start_server
 
 echo "### Form Data (POST /form)"
 # Create form data
@@ -490,16 +518,13 @@ printf -- "--%s--\r\n" "$BOUNDARY" >> "$FORM_LIST_MULTI"
 $BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$FORM_LIST_MULTI" http://$HOST:$PORT/form-list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$FORM_LIST_MULTI"
 
-kill -TERM -$SERVER_PID 2>/dev/null || true
-pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+stop_server
 
 echo ""
 echo "## Django Middleware Performance"
 
 # Start server for middleware test
-DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
-SERVER_PID=$!
-wait_for_server
+start_server
 
 # Sanity check middleware endpoint
 MCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/middleware/demo)
@@ -511,8 +536,7 @@ else
   $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/middleware/demo 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 fi
 
-kill -TERM -$SERVER_PID 2>/dev/null || true
-pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+stop_server
 
 echo ""
 echo "## Django Ninja-style Benchmarks"
@@ -532,9 +556,7 @@ JSON
 
 echo "### JSON Parse/Validate (POST /bench/parse)"
 # Start a fresh server for this test
-DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
-SERVER_PID=$!
-wait_for_server
+start_server
 
 # Sanity check
 PCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/)
@@ -634,17 +656,14 @@ echo ""
 echo "### Feed of 100 mixed union items (/feed)"
 $BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/feed" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
-kill -TERM -$SERVER_PID 2>/dev/null || true
-pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+stop_server
 
 echo ""
 echo "## Latency Percentile Benchmarks"
 echo "Measures p50/p75/p90/p99 latency for type coercion overhead analysis"
 
 # Start server for latency tests
-DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
-SERVER_PID=$!
-wait_for_server
+start_server
 
 echo ""
 echo "### Baseline - No Parameters (/)"
@@ -674,5 +693,4 @@ else
     echo "Skipped: No valid JWT token"
 fi
 
-kill -TERM -$SERVER_PID 2>/dev/null || true
-pkill -TERM -f "manage.py runbolt --host $HOST --port $PORT" 2>/dev/null || true
+stop_server
