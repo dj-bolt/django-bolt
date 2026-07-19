@@ -959,6 +959,24 @@ pub fn start_server(
                     aw::rt::spawn(async move {
                         let graceful = wait_for_shutdown_signal().await;
                         crate::websocket::begin_drain();
+                        if graceful {
+                            // The 1012 close is delivered by each actor's
+                            // drain-watch poll tick; stopping Actix immediately
+                            // races it and can tear connections down with a
+                            // bare FIN before the close frame is written. Wait
+                            // (bounded) for the actors to finish closing, plus
+                            // a small margin for the final frame flush.
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_secs(5);
+                            while crate::websocket::ACTIVE_WS_CONNECTIONS
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                > 0
+                                && std::time::Instant::now() < deadline
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
                         handle.stop(graceful).await;
                     });
 
