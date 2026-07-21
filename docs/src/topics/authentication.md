@@ -230,11 +230,24 @@ JWTAuthentication(
 `jwks_url` must be an absolute HTTPS URL and must be paired with both
 `issuer=` and `audience=`. This binds accepted tokens to the intended
 provider and API instead of accepting another application's token merely
-because the provider signed it. The key set is fetched once when the
-server starts and parsed into
-per-`kid` verification keys; on each request, the token's `kid` header
-selects the key. If the provider rotates its signing keys to a new
-`kid`, restart the server to pick up the new set.
+because the provider signed it. The key set is fetched when the server
+starts and parsed into per-`kid` verification keys. It is refreshed every
+`jwks_refresh_interval` seconds and immediately when a token names an unknown
+`kid`. Refreshes are single-flight within a process, and a provider outage
+leaves the last known-good keys active.
+
+OIDC discovery can supply the issuer, JWKS endpoint, and signing algorithms:
+
+```python
+JWTAuthentication(
+    oidc_issuer="https://issuer.example",
+    audience="my-api",
+)
+```
+
+The issuer must be HTTPS. Django-Bolt fetches its
+`/.well-known/openid-configuration` document and rejects discovery documents
+without an issuer or JWKS URI.
 
 To supply a key set directly rather than fetching it — in tests, or in
 deployments without network access — pass the document itself as `jwks=`,
@@ -312,6 +325,21 @@ token**, sent only to a rotation endpoint, that is exchanged for fresh
 access tokens as they expire. Django-Bolt implements this pattern with
 `create_token_pair()`, `rotate_refresh_token()`, and
 `set_token_cookies()`.
+
+For the conventional password-and-cookie flow, `JWTAuthViews` registers all
+four routes and documents them in OpenAPI:
+
+```python
+from django_bolt.auth import InMemoryRevocation, JWTAuthViews
+
+auth_views = JWTAuthViews(store=InMemoryRevocation())
+auth_views.register(api)
+```
+
+This adds `POST /auth/login`, `/auth/refresh`, `/auth/logout`, and
+`/auth/logout-all`. Supply `credential_validator=` when credentials are not a
+username/password pair; lower-level helpers remain available for fully custom
+flows.
 
 ### Issuing a pair
 

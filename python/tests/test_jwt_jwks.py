@@ -151,6 +151,47 @@ class TestJwks:
 
 
 class TestJwksUrlCaching:
+    def test_unknown_kid_triggers_runtime_refresh(self, monkeypatch):
+        documents = [{"keys": [KEY1_JWK]}, {"keys": [KEY1_JWK, KEY2_JWK]}]
+
+        class FakeResponse:
+            def __init__(self, document):
+                self.document = document
+                self.text = json.dumps(document)
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self.document
+
+        def fake_get(url, timeout):
+            return FakeResponse(documents.pop(0))
+
+        monkeypatch.setattr(auth_backends.httpx, "get", fake_get)
+        api = BoltAPI()
+
+        @api.get(
+            "/rotating",
+            auth=[
+                JWTAuthentication(
+                    jwks_url="https://issuer.example/jwks.json",
+                    algorithms=["RS256"],
+                    issuer="https://issuer.example/",
+                    audience="api",
+                )
+            ],
+            guards=[IsAuthenticated()],
+        )
+        async def rotating():
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            token = make_token(KEY2_PRIV, "key-2", iss="https://issuer.example/", aud="api")
+            assert client.get("/rotating", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+
+        assert documents == []
+
     def test_jwks_url_fetched_once_across_metadata_calls(self, monkeypatch):
         """A backend reused as a global default or across routes runs
         ``to_metadata()`` once per route; the fetched document must be cached
@@ -181,3 +222,108 @@ class TestJwksUrlCaching:
 
         assert first["jwks"] == second["jwks"] == json.dumps(JWKS)
         assert len(calls) == 1
+
+    def test_remote_metadata_exposes_single_flight_refresh_callback(self, monkeypatch):
+        responses = [JWKS, {"keys": [KEY2_JWK]}]
+
+        class FakeResponse:
+            def __init__(self, document):
+                self.document = document
+                self.text = json.dumps(document)
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self.document
+
+        def next_response(_url, timeout):
+            assert timeout == 10.0
+            return FakeResponse(responses.pop(0))
+
+        monkeypatch.setattr(auth_backends.httpx, "get", next_response)
+        auth = JWTAuthentication(
+            jwks_url="https://issuer.example/jwks.json",
+            algorithms=["RS256"],
+            issuer="https://issuer.example/",
+            audience="api",
+            jwks_refresh_interval=60,
+        )
+
+        metadata = auth.to_metadata()
+        refreshed = metadata["jwks_refresh"]()
+
+        assert json.loads(refreshed) == {"keys": [KEY2_JWK]}
+        assert metadata["jwks_refresh_interval"] == 60
+
+    def test_failed_refresh_keeps_cached_jwks(self, monkeypatch):
+        class FakeResponse:
+            text = json.dumps(JWKS)
+
+            def raise_for_status(self):
+                pass
+
+        def initial_response(_url, timeout):
+            assert timeout == 10.0
+            return FakeResponse()
+
+        monkeypatch.setattr(auth_backends.httpx, "get", initial_response)
+        auth = JWTAuthentication(
+            jwks_url="https://issuer.example/jwks.json",
+            algorithms=["RS256"],
+            issuer="https://issuer.example/",
+            audience="api",
+        )
+        metadata = auth.to_metadata()
+
+        def unavailable(url, timeout):
+            raise auth_backends.httpx.ConnectError("offline")
+
+        monkeypatch.setattr(auth_backends.httpx, "get", unavailable)
+        assert metadata["jwks_refresh"]() is None
+        assert auth._resolve_jwks() == json.dumps(JWKS)
+
+
+class TestOidcDiscovery:
+    def test_discovery_configures_issuer_jwks_and_algorithms(self, monkeypatch):
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, document):
+                self.document = document
+                self.text = json.dumps(document)
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self.document
+
+        def fake_get(url, timeout):
+            calls.append(url)
+            if url.endswith("openid-configuration"):
+                return FakeResponse(
+                    {
+                        "issuer": "https://issuer.example",
+                        "jwks_uri": "https://issuer.example/keys",
+                        "id_token_signing_alg_values_supported": ["RS256", "none"],
+                    }
+                )
+            return FakeResponse(JWKS)
+
+        monkeypatch.setattr(auth_backends.httpx, "get", fake_get)
+        metadata = JWTAuthentication(
+            oidc_issuer="https://issuer.example",
+            audience="my-api",
+        ).to_metadata()
+
+        assert metadata["issuer"] == "https://issuer.example"
+        assert metadata["algorithms"] == ["RS256"]
+        assert calls == [
+            "https://issuer.example/.well-known/openid-configuration",
+            "https://issuer.example/keys",
+        ]
+
+    def test_discovery_requires_audience(self):
+        with pytest.raises(ImproperlyConfigured, match="audience"):
+            JWTAuthentication(oidc_issuer="https://issuer.example")

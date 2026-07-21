@@ -23,6 +23,8 @@ JWTAuthentication(
     audience=None,            # Required audience claim
     issuer=None,              # Required issuer claim
     revocation_store=None,    # Token revocation store
+    oidc_issuer=None,         # OIDC discovery issuer
+    jwks_refresh_interval=300,
 )
 ```
 
@@ -40,8 +42,10 @@ JWTAuthentication(
 | `leeway`           | `int`           | `60`              | Clock-skew tolerance (seconds) for `exp`/`nbf` |
 | `token_type`       | `str`           | `None`            | Required `typ` claim (e.g. `"refresh"` for a rotation endpoint); access routes reject `typ:"refresh"` |
 | `csrf`             | `bool`          | `True`            | For cookie tokens, enforce a cross-site origin check on unsafe methods that carry the auth cookie |
-| `jwks_url`         | `str`           | `None`            | HTTPS JWKS endpoint; requires `issuer` and `audience`, fetched once at startup |
+| `jwks_url`         | `str`           | `None`            | HTTPS JWKS endpoint; requires `issuer` and `audience`, refreshed at runtime |
 | `jwks`             | `dict \| str`   | `None`            | JWKS document supplied directly (alternative to `jwks_url`) |
+| `oidc_issuer`      | `str`           | `None`            | HTTPS issuer for OIDC discovery; requires `audience` |
+| `jwks_refresh_interval` | `int`       | `300`             | Periodic remote JWKS refresh interval in seconds |
 | `revocation_store` | RevocationStore | `None`            | Token revocation store  |
 
 #### Supported algorithms
@@ -265,7 +269,7 @@ tokens](../topics/authentication.md#access-and-refresh-tokens) for usage.
 ```python
 from django_bolt.auth import create_token_pair
 
-pair = create_token_pair(user, method="pwd")
+pair = create_token_pair(user, method="pwd", kid="signing-key-2026-07")
 pair.access_token     # JWT with typ "access"
 pair.refresh_token    # JWT with typ "refresh"
 pair.access_claims    # decoded claims of the access token
@@ -279,6 +283,7 @@ pair.refresh_claims   # decoded claims of the refresh token
 | `user`        | User \| `str` \| `int` | required        | Django user instance, or a bare user id        |
 | `secret`      | `str`                | Django SECRET_KEY | Signing key                                    |
 | `algorithm`   | `str`                | `"HS256"`         | JWT signing algorithm                          |
+| `kid`         | `str`                | `None`            | Optional signing-key identifier added to both JWT headers |
 | `access_ttl`  | `int`                | `900`             | Access token lifetime in seconds               |
 | `refresh_ttl` | `int`                | `604800`          | Refresh token lifetime in seconds              |
 | `claims`      | `dict`               | `None`            | Extra claims copied into both tokens           |
@@ -310,6 +315,7 @@ pair = await rotate_refresh_token(claims, store=store)
 | `store`                | RevocationStore | required          | Store used for revocation and version checks         |
 | `secret`               | `str`           | Django SECRET_KEY | Signing key for the new tokens                       |
 | `algorithm`            | `str`           | `"HS256"`         | JWT signing algorithm                                |
+| `kid`                  | `str`           | `None`            | Optional signing-key identifier added to newly issued JWT headers |
 | `access_ttl`           | `int`           | `900`             | New access token lifetime in seconds                 |
 | `refresh_ttl`          | `int`           | `604800`          | New refresh token lifetime in seconds                |
 | `rotate`               | `bool`          | `True`            | Issue a new refresh token and revoke the old one; `False` issues an access token only |

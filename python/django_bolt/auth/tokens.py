@@ -88,6 +88,7 @@ def create_token_pair(
     *,
     secret: str | None = None,
     algorithm: str = "HS256",
+    kid: str | None = None,
     access_ttl: int = DEFAULT_ACCESS_TTL,
     refresh_ttl: int = DEFAULT_REFRESH_TTL,
     claims: dict[str, Any] | None = None,
@@ -102,6 +103,9 @@ def create_token_pair(
             assume password login.
         secret: Signing key (default: Django ``SECRET_KEY``).
         algorithm: JWT algorithm (default ``HS256``).
+        kid: Optional signing-key identifier added to both JWT headers. This
+            lets verifiers select the matching public key during asymmetric
+            signing-key rotation.
         access_ttl / refresh_ttl: Lifetimes in seconds.
         claims: Extra claims copied into *both* tokens (e.g. ``role``,
             ``tenant_id``). Overriding a reserved lifecycle claim
@@ -142,9 +146,10 @@ def create_token_pair(
     }
 
     key = _secret(secret)
+    headers = {"kid": kid} if kid is not None else None
     return TokenPair(
-        access_token=jwt.encode(access_claims, key, algorithm=algorithm),
-        refresh_token=jwt.encode(refresh_claims, key, algorithm=algorithm),
+        access_token=jwt.encode(access_claims, key, algorithm=algorithm, headers=headers),
+        refresh_token=jwt.encode(refresh_claims, key, algorithm=algorithm, headers=headers),
         access_claims=access_claims,
         refresh_claims=refresh_claims,
     )
@@ -156,6 +161,7 @@ async def rotate_refresh_token(
     store: Any,
     secret: str | None = None,
     algorithm: str = "HS256",
+    kid: str | None = None,
     access_ttl: int = DEFAULT_ACCESS_TTL,
     refresh_ttl: int = DEFAULT_REFRESH_TTL,
     rotate: bool = True,
@@ -164,6 +170,9 @@ async def rotate_refresh_token(
     claims: dict[str, Any] | None = None,
 ) -> TokenPair:
     """Exchange a validated refresh token for a new token pair.
+
+    ``kid`` optionally identifies the signing key in every newly issued JWT
+    header, matching the parameter accepted by :func:`create_token_pair`.
 
     ``refresh_claims`` is the already cryptographically-validated claim dict
     from ``request["context"]["auth_claims"]`` — the Rust layer verified the
@@ -295,6 +304,7 @@ async def rotate_refresh_token(
         carried.update(claims)
 
     key = _secret(secret)
+    headers = {"kid": kid} if kid is not None else None
 
     if not rotate:
         # Mode B: new access token only; refresh token stays valid.
@@ -310,7 +320,7 @@ async def rotate_refresh_token(
         if parsed_oat is not None:
             access_claims["oat"] = parsed_oat
         return TokenPair(
-            access_token=jwt.encode(access_claims, key, algorithm=algorithm),
+            access_token=jwt.encode(access_claims, key, algorithm=algorithm, headers=headers),
             refresh_token="",
             access_claims=access_claims,
             refresh_claims=refresh_claims,
@@ -322,6 +332,7 @@ async def rotate_refresh_token(
         user_id,
         secret=secret,
         algorithm=algorithm,
+        kid=kid,
         access_ttl=effective_access_ttl,
         refresh_ttl=refresh_ttl,
         claims=carried or None,
@@ -330,7 +341,7 @@ async def rotate_refresh_token(
     )
     if fam is not None:
         pair.refresh_claims["fam"] = fam
-        pair.refresh_token = jwt.encode(pair.refresh_claims, key, algorithm=algorithm)
+        pair.refresh_token = jwt.encode(pair.refresh_claims, key, algorithm=algorithm, headers=headers)
     return pair
 
 
