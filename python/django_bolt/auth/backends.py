@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -144,15 +146,19 @@ class JWTAuthentication(BaseAuthentication):
             ``Sec-Fetch-Site: none``, use header tokens, or set False for
             API-only cookie deployments that provide their own protection.
         jwks_url: Absolute HTTPS URL of a JWKS endpoint (e.g. a provider's
-            ``/.well-known/jwks.json``). Fetched once at server startup; the
-            key set is parsed into per-``kid`` decoding keys in Rust and the
-            token's ``kid`` header selects the key. Use with an asymmetric
-            ``algorithms`` list (e.g. ``["RS256"]``), plus ``issuer`` and
-            ``audience``. Rotation to a new ``kid`` is picked up on the next
-            server start.
+            ``/.well-known/jwks.json``). The key set is parsed into per-``kid``
+            decoding keys in Rust, refreshed periodically and immediately for
+            an unknown ``kid``. Use with an asymmetric ``algorithms`` list
+            (e.g. ``["RS256"]``), plus ``issuer`` and ``audience``.
         jwks: A JWKS document (dict or JSON string) supplied directly instead
             of fetching a ``jwks_url`` — useful for tests or air-gapped
             deployments. Mutually exclusive with ``secret``/``public_key``.
+        oidc_issuer: HTTPS issuer URL used for OpenID Connect discovery. The
+            discovery document supplies ``issuer``, ``jwks_uri``, and the
+            signing algorithm allowlist. Requires ``audience``.
+        jwks_refresh_interval: Seconds between runtime refresh attempts for a
+            remote JWKS (default: 300). An unknown ``kid`` refreshes
+            immediately; failed refreshes retain the last known-good keys.
     """
 
     # Class-level cached User model - resolved once on first use
@@ -182,11 +188,17 @@ class JWTAuthentication(BaseAuthentication):
         csrf: bool = True,
         jwks_url: str | None = None,
         jwks: dict[str, Any] | str | None = None,
+        oidc_issuer: str | None = None,
+        jwks_refresh_interval: int = 300,
     ):
         provided_keys = [k for k in (secret, public_key) if k is not None]
         if len(provided_keys) > 1:
             raise ImproperlyConfigured(
                 "JWTAuthentication accepts either 'secret' (HMAC) or 'public_key' (asymmetric), not both."
+            )
+        if oidc_issuer is not None and (jwks_url is not None or jwks is not None or issuer is not None):
+            raise ImproperlyConfigured(
+                "JWTAuthentication oidc_issuer is mutually exclusive with 'issuer', 'jwks_url', and 'jwks'."
             )
         if jwks_url is not None and jwks is not None:
             raise ImproperlyConfigured("JWTAuthentication accepts either 'jwks_url' or 'jwks', not both.")
@@ -194,6 +206,29 @@ class JWTAuthentication(BaseAuthentication):
             raise ImproperlyConfigured(
                 "JWTAuthentication accepts JWKS (jwks_url/jwks) or a static key (secret/public_key), not both."
             )
+        if jwks_refresh_interval <= 0:
+            raise ImproperlyConfigured("JWTAuthentication jwks_refresh_interval must be > 0 seconds.")
+        if oidc_issuer is not None:
+            parsed_oidc_issuer = urlsplit(oidc_issuer)
+            if parsed_oidc_issuer.scheme.lower() != "https" or not parsed_oidc_issuer.hostname:
+                raise ImproperlyConfigured("JWTAuthentication oidc_issuer must be an absolute HTTPS URL.")
+            if audience is None:
+                raise ImproperlyConfigured("JWTAuthentication with oidc_issuer requires 'audience'.")
+            discovery_url = f"{oidc_issuer.rstrip('/')}/.well-known/openid-configuration"
+            discovery_response = httpx.get(discovery_url, timeout=10.0)
+            discovery_response.raise_for_status()
+            discovery = discovery_response.json()
+            discovered_issuer = discovery.get("issuer")
+            discovered_jwks_url = discovery.get("jwks_uri")
+            discovered_algorithms = discovery.get("id_token_signing_alg_values_supported")
+            if not isinstance(discovered_issuer, str) or not isinstance(discovered_jwks_url, str):
+                raise ImproperlyConfigured("OIDC discovery document must contain string 'issuer' and 'jwks_uri'.")
+            if discovered_issuer.rstrip("/") != oidc_issuer.rstrip("/"):
+                raise ImproperlyConfigured("OIDC discovery issuer does not match oidc_issuer.")
+            issuer = discovered_issuer
+            jwks_url = discovered_jwks_url
+            if algorithms is None and isinstance(discovered_algorithms, list):
+                algorithms = [value for value in discovered_algorithms if isinstance(value, str) and value != "none"]
         if jwks_url is not None:
             parsed_jwks_url = urlsplit(jwks_url)
             if parsed_jwks_url.scheme.lower() != "https" or not parsed_jwks_url.hostname:
@@ -219,6 +254,10 @@ class JWTAuthentication(BaseAuthentication):
         self.csrf = csrf
         self.jwks_url = jwks_url
         self._jwks = jwks
+        self.oidc_issuer = oidc_issuer
+        self.jwks_refresh_interval = jwks_refresh_interval
+        self._jwks_refresh_lock = threading.Lock()
+        self._jwks_refreshed_at = 0.0
 
         # If no key material provided at all (and no JWKS), fall back to
         # Django's SECRET_KEY.
@@ -264,12 +303,9 @@ class JWTAuthentication(BaseAuthentication):
         """Return the JWKS document as a JSON string, or None.
 
         A ``jwks`` dict/string is used verbatim; a ``jwks_url`` is fetched
-        once here (at server startup, when ``to_metadata`` first runs) via
-        httpx and cached on the instance — a backend shared across routes
-        does not re-fetch per route. The resulting key set is parsed into
-        per-``kid`` decoding keys in Rust. Key rotation to a *new* ``kid``
-        is picked up on the next server start — the standard trade-off for
-        a startup-cached key set.
+        here when ``to_metadata`` first runs and cached on the instance. The
+        resulting key set is parsed into per-``kid`` decoding keys in Rust;
+        remote sets are subsequently refreshed through ``_refresh_jwks``.
         """
         if self._jwks is not None:
             return self._jwks if isinstance(self._jwks, str) else json.dumps(self._jwks)
@@ -277,8 +313,30 @@ class JWTAuthentication(BaseAuthentication):
             response = httpx.get(self.jwks_url, timeout=10.0)
             response.raise_for_status()
             self._jwks = response.text
+            self._jwks_refreshed_at = time.monotonic()
             return self._jwks
         return None
+
+    def _refresh_jwks(self) -> str | None:
+        """Fetch and atomically replace remote JWKS, retaining stale keys on failure."""
+        if self.jwks_url is None:
+            return None
+        if not self._jwks_refresh_lock.acquire(blocking=False):
+            return None
+        try:
+            response = httpx.get(self.jwks_url, timeout=10.0)
+            response.raise_for_status()
+            # Validate the shape before replacing a known-good cached value.
+            document = response.json()
+            if not isinstance(document, dict) or not isinstance(document.get("keys"), list):
+                raise ValueError("JWKS response must contain a keys array")
+            self._jwks = response.text
+            self._jwks_refreshed_at = time.monotonic()
+            return self._jwks
+        except (httpx.HTTPError, ValueError):
+            return None
+        finally:
+            self._jwks_refresh_lock.release()
 
     def to_metadata(self) -> dict[str, Any]:
         metadata = {
@@ -306,6 +364,9 @@ class JWTAuthentication(BaseAuthentication):
         jwks = self._resolve_jwks()
         if jwks is not None:
             metadata["jwks"] = jwks
+            if self.jwks_url is not None:
+                metadata["jwks_refresh"] = self._refresh_jwks
+                metadata["jwks_refresh_interval"] = self.jwks_refresh_interval
 
         # Add revocation handler reference (will be called from Rust if present)
         if self.revoked_token_handler:
