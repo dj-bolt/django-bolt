@@ -560,55 +560,59 @@ pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: P
 
     // Store JWT claims if present
     if let Some(claims) = &auth_ctx.claims {
-        let claims_dict = PyDict::new(py);
-
-        set_if_some!(claims_dict, py, "sub", &claims.sub);
-        set_if_some!(claims_dict, py, "exp", claims.exp);
-        set_if_some!(claims_dict, py, "iat", claims.iat);
-        set_if_some!(claims_dict, py, "is_staff", claims.is_staff);
-        set_if_some!(claims_dict, py, "is_superuser", claims.is_superuser);
-        set_if_some!(claims_dict, py, "nbf", claims.nbf);
-        match &claims.aud {
-            Some(Audience::Single(aud)) => {
-                let _ = claims_dict.set_item(intern!(py, "aud"), aud);
-            }
-            Some(Audience::Multiple(auds)) => {
-                let _ = claims_dict.set_item(intern!(py, "aud"), auds.clone());
-            }
-            None => {}
-        }
-        set_if_some!(claims_dict, py, "iss", &claims.iss);
-        set_if_some!(claims_dict, py, "jti", &claims.jti);
-        set_if_some!(claims_dict, py, "typ", &claims.typ);
-        set_if_some!(claims_dict, py, "fam", &claims.fam);
-        set_if_some!(claims_dict, py, "oat", claims.oat);
-        set_if_some!(claims_dict, py, "ver", claims.ver);
-        set_if_some!(claims_dict, py, "amr", &claims.amr);
-
-        // Extra claims keys come from the JWT payload — can't be interned
-        // statically since the set is open. set_item(&str, ...) handles them.
-        for (key, value) in &claims.extra {
-            let py_value = match value {
-                serde_json::Value::String(s) => {
-                    s.clone().into_py_any(py).unwrap_or_else(|_| py.None())
-                }
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        i.into_py_any(py).unwrap_or_else(|_| py.None())
-                    } else if let Some(f) = n.as_f64() {
-                        f.into_py_any(py).unwrap_or_else(|_| py.None())
-                    } else {
-                        py.None()
-                    }
-                }
-                serde_json::Value::Bool(b) => (*b).into_py_any(py).unwrap_or_else(|_| py.None()),
-                _ => py.None(),
-            };
-            let _ = claims_dict.set_item(key, py_value);
-        }
-
-        let _ = dict.set_item(intern!(py, "auth_claims"), claims_dict);
+        let _ = dict.set_item(intern!(py, "auth_claims"), claims_to_dict(py, claims));
     }
+}
+
+/// Build a Python dict of a token's claims: the standard registered claims
+/// plus every extra claim from the JWT payload.
+fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
+    let claims_dict = PyDict::new(py);
+
+    set_if_some!(claims_dict, py, "sub", &claims.sub);
+    set_if_some!(claims_dict, py, "exp", claims.exp);
+    set_if_some!(claims_dict, py, "iat", claims.iat);
+    set_if_some!(claims_dict, py, "is_staff", claims.is_staff);
+    set_if_some!(claims_dict, py, "is_superuser", claims.is_superuser);
+    set_if_some!(claims_dict, py, "nbf", claims.nbf);
+    match &claims.aud {
+        Some(Audience::Single(aud)) => {
+            let _ = claims_dict.set_item(intern!(py, "aud"), aud);
+        }
+        Some(Audience::Multiple(auds)) => {
+            let _ = claims_dict.set_item(intern!(py, "aud"), auds.clone());
+        }
+        None => {}
+    }
+    set_if_some!(claims_dict, py, "iss", &claims.iss);
+    set_if_some!(claims_dict, py, "jti", &claims.jti);
+    set_if_some!(claims_dict, py, "typ", &claims.typ);
+    set_if_some!(claims_dict, py, "fam", &claims.fam);
+    set_if_some!(claims_dict, py, "oat", claims.oat);
+    set_if_some!(claims_dict, py, "ver", claims.ver);
+    set_if_some!(claims_dict, py, "amr", &claims.amr);
+
+    // Extra claims keys come from the JWT payload — can't be interned
+    // statically since the set is open. set_item(&str, ...) handles them.
+    for (key, value) in &claims.extra {
+        let py_value = match value {
+            serde_json::Value::String(s) => s.clone().into_py_any(py).unwrap_or_else(|_| py.None()),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    i.into_py_any(py).unwrap_or_else(|_| py.None())
+                } else if let Some(f) = n.as_f64() {
+                    f.into_py_any(py).unwrap_or_else(|_| py.None())
+                } else {
+                    py.None()
+                }
+            }
+            serde_json::Value::Bool(b) => (*b).into_py_any(py).unwrap_or_else(|_| py.None()),
+            _ => py.None(),
+        };
+        let _ = claims_dict.set_item(key, py_value);
+    }
+
+    claims_dict
 }
 
 #[cfg(test)]

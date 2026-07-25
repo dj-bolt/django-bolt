@@ -15,14 +15,9 @@ from django_bolt import BoltAPI
 from django_bolt.auth import (
     AllowAny,
     APIKeyAuthentication,
-    AuthContext,
-    HasAllPermissions,
-    HasAnyPermission,
-    HasPermission,
-    IsAdminUser,
     IsAuthenticated,
-    IsStaff,
     JWTAuthentication,
+    Requires,
 )
 
 
@@ -81,106 +76,44 @@ class TestAuthenticationClasses:
 
 
 class TestPermissionGuards:
-    """Test permission guard classes"""
+    """Test the guard classes: AllowAny, IsAuthenticated, and Requires."""
 
     def test_allow_any(self):
-        """Test AllowAny guard"""
-        guard = AllowAny()
-        assert guard.guard_name == "allow_any"
-        assert guard.to_metadata() == {"type": "allow_any"}
-
-        # Should allow without auth context
-        assert guard.has_permission(None)
+        assert AllowAny().to_metadata() == {"type": "allow_any"}
 
     def test_is_authenticated(self):
-        """Test IsAuthenticated guard"""
-        guard = IsAuthenticated()
-        assert guard.guard_name == "is_authenticated"
-        assert guard.to_metadata() == {"type": "is_authenticated"}
+        assert IsAuthenticated().to_metadata() == {"type": "is_authenticated"}
 
-        # Should deny without auth context
-        assert not guard.has_permission(None)
+    def test_requires_single_value(self):
+        assert Requires("role", "client").to_metadata() == {
+            "type": "requires",
+            "claim": "role",
+            "values": ["client"],
+            "match_all": False,
+        }
 
-        # Should allow with auth context
-        ctx = AuthContext(user_id="user123")
-        assert guard.has_permission(ctx)
+    def test_requires_any_of(self):
+        meta = Requires("permissions", "users.create", "users.update").to_metadata()
+        assert meta["type"] == "requires"
+        assert meta["claim"] == "permissions"
+        assert meta["values"] == ["users.create", "users.update"]
+        assert meta["match_all"] is False
 
-    def test_is_admin(self):
-        """Test IsAdminUser guard"""
-        guard = IsAdminUser()
-        assert guard.guard_name == "is_superuser"
+    def test_requires_all_of(self):
+        meta = Requires("permissions", all_of=["users.create", "users.delete"]).to_metadata()
+        assert meta["values"] == ["users.create", "users.delete"]
+        assert meta["match_all"] is True
 
-        # Should deny without auth
-        assert not guard.has_permission(None)
+    def test_requires_presence_only(self):
+        meta = Requires("tenant_id").to_metadata()
+        assert meta["values"] == []
+        assert meta["match_all"] is False
 
-        # Should deny non-admin user
-        ctx = AuthContext(user_id="user123", is_superuser=False)
-        assert not guard.has_permission(ctx)
-
-        # Should allow admin user
-        ctx = AuthContext(user_id="admin", is_superuser=True)
-        assert guard.has_permission(ctx)
-
-    def test_is_staff(self):
-        """Test IsStaff guard"""
-        guard = IsStaff()
-        assert guard.guard_name == "is_staff"
-
-        # Should deny non-staff
-        ctx = AuthContext(user_id="user", is_staff=False)
-        assert not guard.has_permission(ctx)
-
-        # Should allow staff
-        ctx = AuthContext(user_id="staff", is_staff=True)
-        assert guard.has_permission(ctx)
-
-    def test_has_permission(self):
-        """Test HasPermission guard"""
-        guard = HasPermission("users.delete")
-        assert guard.guard_name == "has_permission"
-
-        metadata = guard.to_metadata()
-        assert metadata["type"] == "has_permission"
-        assert metadata["permission"] == "users.delete"
-
-        # Should deny without permission
-        ctx = AuthContext(user_id="user", permissions={"users.view"})
-        assert not guard.has_permission(ctx)
-
-        # Should allow with permission
-        ctx = AuthContext(user_id="user", permissions={"users.delete", "users.view"})
-        assert guard.has_permission(ctx)
-
-    def test_has_any_permission(self):
-        """Test HasAnyPermission guard"""
-        guard = HasAnyPermission("users.create", "users.update")
-
-        metadata = guard.to_metadata()
-        assert metadata["type"] == "has_any_permission"
-        assert set(metadata["permissions"]) == {"users.create", "users.update"}
-
-        # Should deny without any permission
-        ctx = AuthContext(user_id="user", permissions={"users.view"})
-        assert not guard.has_permission(ctx)
-
-        # Should allow with one permission
-        ctx = AuthContext(user_id="user", permissions={"users.view", "users.create"})
-        assert guard.has_permission(ctx)
-
-    def test_has_all_permissions(self):
-        """Test HasAllPermissions guard"""
-        guard = HasAllPermissions("users.create", "users.delete")
-
-        metadata = guard.to_metadata()
-        assert metadata["type"] == "has_all_permissions"
-
-        # Should deny without all permissions
-        ctx = AuthContext(user_id="user", permissions={"users.create"})
-        assert not guard.has_permission(ctx)
-
-        # Should allow with all permissions
-        ctx = AuthContext(user_id="user", permissions={"users.create", "users.delete", "users.view"})
-        assert guard.has_permission(ctx)
+    def test_requires_named_reuse(self):
+        """The one way to define a reusable custom check: name an instance."""
+        IsClient = Requires("role", "client")
+        assert IsClient.to_metadata()["claim"] == "role"
+        assert repr(IsClient) == "Requires('role', 'client')"
 
 
 class TestRouteDecoratorAPI:
@@ -190,7 +123,7 @@ class TestRouteDecoratorAPI:
         """Test route decorator with guards parameter"""
         api = BoltAPI()
 
-        @api.get("/admin", guards=[IsAdminUser()])
+        @api.get("/admin", guards=[Requires("is_superuser", True)])
         async def admin_endpoint():
             return {"message": "admin only"}
 
@@ -202,7 +135,8 @@ class TestRouteDecoratorAPI:
         metadata = api._handler_middleware[handler_id]
         assert "guards" in metadata
         assert len(metadata["guards"]) == 1
-        assert metadata["guards"][0]["type"] == "is_superuser"
+        assert metadata["guards"][0]["type"] == "requires"
+        assert metadata["guards"][0]["claim"] == "is_superuser"
 
     def test_route_with_auth_override(self):
         """Test route with custom auth backend"""
@@ -226,7 +160,10 @@ class TestRouteDecoratorAPI:
         """Test route with multiple guards"""
         api = BoltAPI()
 
-        @api.get("/restricted", guards=[IsAuthenticated(), IsStaff(), HasPermission("users.delete")])
+        @api.get(
+            "/restricted",
+            guards=[IsAuthenticated(), Requires("is_staff", True), Requires("permissions", "users.delete")],
+        )
         async def restricted_endpoint():
             return {"message": "highly restricted"}
 
@@ -235,8 +172,8 @@ class TestRouteDecoratorAPI:
 
         assert len(metadata["guards"]) == 3
         assert metadata["guards"][0]["type"] == "is_authenticated"
-        assert metadata["guards"][1]["type"] == "is_staff"
-        assert metadata["guards"][2]["type"] == "has_permission"
+        assert metadata["guards"][1]["claim"] == "is_staff"
+        assert metadata["guards"][2]["claim"] == "permissions"
 
     def test_public_route_with_allow_any(self):
         """Test that AllowAny explicitly bypasses global defaults"""
@@ -401,7 +338,7 @@ class TestEdgeCases:
         """Test route with mix of instance and class guards"""
         api = BoltAPI()
 
-        @api.get("/mixed", guards=[IsAuthenticated(), IsStaff])
+        @api.get("/mixed", guards=[IsAuthenticated, Requires("is_staff", True)])
         async def mixed_guards():
             return {"message": "mixed guards"}
 
@@ -413,9 +350,9 @@ class TestEdgeCases:
 
     def test_permission_guard_with_special_chars(self):
         """Test permission with dots and underscores"""
-        guard = HasPermission("myapp.custom_permission.delete")
+        guard = Requires("permissions", "myapp.custom_permission.delete")
         metadata = guard.to_metadata()
-        assert metadata["permission"] == "myapp.custom_permission.delete"
+        assert metadata["values"] == ["myapp.custom_permission.delete"]
 
 
 if __name__ == "__main__":

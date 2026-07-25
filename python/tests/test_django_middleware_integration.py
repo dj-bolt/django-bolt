@@ -25,6 +25,7 @@ from django.template import RequestContext, Template
 from django.views.decorators.csrf import csrf_exempt
 
 from django_bolt import BoltAPI
+from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, TimingMiddleware
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
 from django_bolt.responses import HTML, JSON
@@ -166,6 +167,123 @@ class TestAuthMiddlewareHTTPCycle:
             assert response.status_code == 200
             # User should have been set (AnonymousUser for unauthenticated)
             assert user_set["has_user"] is True
+
+
+# =============================================================================
+# Test Bolt route auth vs Django AuthenticationMiddleware precedence
+# =============================================================================
+
+
+def _make_jwt(user) -> str:
+    return create_jwt_for_user(user, secret="test-secret")
+
+
+@pytest.mark.django_db(transaction=True)
+class TestBoltAuthUserPrecedence:
+    """Bolt route-level auth (JWT) must not be clobbered by Django's
+    session-based AuthenticationMiddleware, which sets AnonymousUser for
+    requests that carry no Django session."""
+
+    def test_jwt_user_survives_authentication_middleware(self):
+        """Regression: request.user was AnonymousUser and the backend's custom
+        get_user never ran when AuthenticationMiddleware was installed."""
+        get_user_calls: list[str] = []
+
+        class TrackingJWTAuth(JWTAuthentication):
+            async def get_user(self, user_id, auth_context):
+                get_user_calls.append(user_id)
+                return await User.objects.aget(pk=user_id)
+
+        api = BoltAPI(
+            django_middleware=[
+                "django.contrib.sessions.middleware.SessionMiddleware",
+                "django.contrib.auth.middleware.AuthenticationMiddleware",
+            ]
+        )
+
+        @api.get("/jwt-me", auth=[TrackingJWTAuth(secret="test-secret")], guards=[IsAuthenticated()])
+        async def jwt_me(request):
+            user = request.user
+            auser = await request.auser()
+            return {
+                "username": getattr(user, "username", None),
+                "is_anonymous": bool(getattr(user, "is_anonymous", True)),
+                "auser_username": getattr(auser, "username", None),
+            }
+
+        user = User.objects.create(username="jwt_user")
+
+        with TestClient(api) as client:
+            response = client.get("/jwt-me", headers={"Authorization": f"Bearer {_make_jwt(user)}"})
+            assert response.status_code == 200, response.text
+            data = response.json()
+            assert data["is_anonymous"] is False
+            assert data["username"] == "jwt_user"
+            assert data["auser_username"] == "jwt_user"
+            assert get_user_calls == [str(user.pk)]
+
+    def test_jwt_user_survives_middleware_that_evaluates_anonymous_user(self):
+        """A middleware peeking at request.user (forcing the lazy session
+        lookup to AnonymousUser) must still not clobber the Bolt user."""
+
+        peeked = {}
+
+        class PeekingMiddleware:
+            def __init__(self, get_response):
+                self.get_response = get_response
+
+            def __call__(self, request):
+                # Forces evaluation of AuthenticationMiddleware's lazy user
+                peeked["is_authenticated"] = request.user.is_authenticated
+                return self.get_response(request)
+
+        api = BoltAPI(
+            middleware=[
+                DjangoMiddlewareStack(
+                    [SessionMiddleware, AuthenticationMiddleware, PeekingMiddleware]
+                )
+            ]
+        )
+
+        @api.get("/jwt-peeked", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
+        async def jwt_peeked(request):
+            user = request.user
+            return {"username": getattr(user, "username", None)}
+
+        user = User.objects.create(username="peeked_user")
+
+        with TestClient(api) as client:
+            response = client.get("/jwt-peeked", headers={"Authorization": f"Bearer {_make_jwt(user)}"})
+            assert response.status_code == 200, response.text
+            assert response.json()["username"] == "peeked_user"
+            # Proves the middleware ran and evaluated the session-based user
+            assert peeked == {"is_authenticated": False}
+
+    def test_middleware_that_authenticates_user_still_wins(self):
+        """A middleware that explicitly sets an authenticated user
+        (login/impersonation) overrides the Bolt-auth user."""
+
+        class ImpersonationMiddleware:
+            def __init__(self, get_response):
+                self.get_response = get_response
+
+            def __call__(self, request):
+                request.user = User.objects.get(username="impersonated")
+                return self.get_response(request)
+
+        api = BoltAPI(middleware=[DjangoMiddlewareStack([ImpersonationMiddleware])])
+
+        @api.get("/impersonated", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
+        async def impersonated_route(request):
+            return {"username": request.user.username}
+
+        jwt_user = User.objects.create(username="original_jwt_user")
+        User.objects.create(username="impersonated")
+
+        with TestClient(api) as client:
+            response = client.get("/impersonated", headers={"Authorization": f"Bearer {_make_jwt(jwt_user)}"})
+            assert response.status_code == 200, response.text
+            assert response.json()["username"] == "impersonated"
 
 
 # =============================================================================

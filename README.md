@@ -82,7 +82,7 @@ export DJANGO_BOLT_MAX_PARAM_LENGTH=65536
 
 - 🚀 **High Performance** - Rust-powered HTTP server (Actix Web + Tokio + PyO3)
 - 🔐 **[Authentication](https://bolt.farhana.li/topics/authentication/)** - JWT/API Key validation in Rust without Python GIL
-- 🔒 **[Permissions & Guards](https://bolt.farhana.li/topics/permissions/)** - Route protection with IsAuthenticated, HasPermission, etc.
+- 🔒 **[Permissions & Guards](https://bolt.farhana.li/topics/permissions/)** - Route protection with IsAuthenticated and Requires claim checks
 - 🎛️ **[Middleware](https://bolt.farhana.li/topics/middleware/)** - CORS, rate limiting, compression, Django middleware integration
 - 📦 **[Serializers](https://bolt.farhana.li/topics/serializers/)** - msgspec-based validation (5-10x faster than stdlib)
 - 🎯 **[Django ORM](https://bolt.farhana.li/topics/async-orm/)** - Full async ORM support with your existing models

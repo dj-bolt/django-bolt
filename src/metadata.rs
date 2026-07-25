@@ -14,7 +14,7 @@ use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
     build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
 };
-use crate::permissions::Guard;
+use crate::permissions::{ClaimKey, Guard, GuardSet};
 
 /// Request value source for Rust-side argument prebinding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,11 +450,6 @@ impl RouteExecutionPlan {
     }
 }
 
-#[inline]
-fn has_enforcing_guards(guards: &[Guard]) -> bool {
-    guards.iter().any(|guard| !matches!(guard, Guard::AllowAny))
-}
-
 /// Dense metadata table keyed by handler_id.
 #[derive(Debug, Clone, Default)]
 pub struct RouteMetadataStore {
@@ -490,7 +485,7 @@ pub struct RouteMetadata {
     /// Cookie names whose presence subjects unsafe requests to the CSRF
     /// origin check. Precomputed from `auth_backends` at registration so
     /// the hot path never re-scans the backend list.
-    pub guards: Vec<Guard>,
+    pub guards: GuardSet,
     pub skip: HashSet<String>,
     pub cors_config: Option<CorsConfig>,
     pub rate_limit_config: Option<RateLimitConfig>,
@@ -655,7 +650,8 @@ impl RouteMetadata {
 
         let skip_cors = skip.contains("cors");
         let skip_compression = skip.contains("compression");
-        let has_auth_or_guards = !auth_backends.is_empty() || has_enforcing_guards(&guards);
+        let guards = GuardSet::from_guards(guards);
+        let has_auth_or_guards = !auth_backends.is_empty() || guards.is_enforcing();
         let has_rate_limit = rate_limit_config.is_some();
         let can_sync_dispatch = py_meta
             .get_item("can_sync_dispatch")
@@ -748,25 +744,6 @@ impl RouteMetadata {
             plan,
             default_status_code,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::has_enforcing_guards;
-    use crate::permissions::Guard;
-
-    #[test]
-    fn allow_any_only_is_not_enforcing() {
-        assert!(!has_enforcing_guards(&[Guard::AllowAny]));
-    }
-
-    #[test]
-    fn mixed_guards_are_enforcing() {
-        assert!(has_enforcing_guards(&[
-            Guard::AllowAny,
-            Guard::IsAuthenticated
-        ]));
     }
 }
 
@@ -1029,32 +1006,59 @@ fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<Guard>
     match guard_type.as_str() {
         "allow_any" => Ok(Guard::AllowAny),
         "is_authenticated" => Ok(Guard::IsAuthenticated),
-        "is_superuser" => Ok(Guard::IsSuperuser),
-        "is_staff" => Ok(Guard::IsStaff),
-        "has_permission" => {
-            let perm = dict
-                .get("permission")
-                .ok_or_else(|| PyValueError::new_err("has_permission guard missing 'permission'"))?
+        // The single permission primitive (`Requires` in Python). The claim
+        // name and expected values are extracted here, at registration, so
+        // request-time evaluation never touches Python.
+        "requires" => {
+            let claim = dict
+                .get("claim")
+                .ok_or_else(|| PyValueError::new_err("requires guard missing 'claim'"))?
                 .extract::<String>(py)?;
-            Ok(Guard::HasPermission(perm))
-        }
-        "has_any_permission" => {
-            let perms = dict
-                .get("permissions")
-                .ok_or_else(|| {
-                    PyValueError::new_err("has_any_permission guard missing 'permissions'")
-                })?
-                .extract::<Vec<String>>(py)?;
-            Ok(Guard::HasAnyPermission(perms))
-        }
-        "has_all_permissions" => {
-            let perms = dict
-                .get("permissions")
-                .ok_or_else(|| {
-                    PyValueError::new_err("has_all_permissions guard missing 'permissions'")
-                })?
-                .extract::<Vec<String>>(py)?;
-            Ok(Guard::HasAllPermissions(perms))
+            if claim.is_empty() {
+                return Err(PyValueError::new_err(
+                    "requires guard 'claim' must be a non-empty string",
+                ));
+            }
+            let match_all = dict
+                .get("match_all")
+                .ok_or_else(|| PyValueError::new_err("requires guard missing 'match_all'"))?
+                .extract::<bool>(py)?;
+            let values_py = dict
+                .get("values")
+                .ok_or_else(|| PyValueError::new_err("requires guard missing 'values'"))?
+                .extract::<Vec<Py<PyAny>>>(py)?;
+            let mut values = Vec::with_capacity(values_py.len());
+            for value in &values_py {
+                let bound = value.bind(py);
+                // bool must be checked before int: Python bool is an int subtype.
+                let json = if bound.is_instance_of::<pyo3::types::PyBool>() {
+                    serde_json::Value::Bool(bound.extract::<bool>()?)
+                } else if let Ok(i) = bound.extract::<i64>() {
+                    serde_json::Value::from(i)
+                } else if let Ok(f) = bound.extract::<f64>() {
+                    serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .ok_or_else(|| {
+                            PyValueError::new_err(format!(
+                                "requires guard '{}' has a non-finite float value",
+                                claim
+                            ))
+                        })?
+                } else if let Ok(s) = bound.extract::<String>() {
+                    serde_json::Value::String(s)
+                } else {
+                    return Err(PyValueError::new_err(format!(
+                        "requires guard '{}' values must be str, int, float, or bool",
+                        claim
+                    )));
+                };
+                values.push(json);
+            }
+            Ok(Guard::Requires {
+                claim: ClaimKey::parse(claim),
+                values,
+                match_all,
+            })
         }
         other => Err(PyValueError::new_err(format!(
             "Unknown guard type '{}'",

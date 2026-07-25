@@ -95,7 +95,7 @@ The generated token includes:
 
 !!! note "Permissions not included by default"
 
-    Permissions are NOT automatically included in the token. To use `HasPermission` guards, pass permissions via `extra_claims`:
+    Permissions are NOT automatically included in the token. To guard on them with `Requires("permissions", ...)`, pass permissions via `extra_claims`:
 
     ```python
     token = create_jwt_for_user(

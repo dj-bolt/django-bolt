@@ -7,7 +7,7 @@ class-based views (APIView, ViewSet, ModelViewSet):
 - Request validation (Body, Query, Path, Header, Cookie, Form, File)
 - Response validation and serialization
 - Authentication (JWT, APIKey, Session)
-- Guards/Permissions (IsAuthenticated, IsAdminUser, HasPermission, etc.)
+- Guards/Permissions (IsAuthenticated, Requires)
 - Dependency injection (Depends)
 - Middleware (CORS, rate limiting)
 - Error handling (HTTPException, validation errors)
@@ -24,7 +24,7 @@ from django.contrib.contenttypes.models import ContentType
 
 from django_bolt import BoltAPI, action
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
-from django_bolt.auth.guards import HasPermission, IsAdminUser
+from django_bolt.auth.guards import Requires
 from django_bolt.auth.jwt_utils import create_jwt_for_user, get_current_user
 from django_bolt.exceptions import HTTPException
 from django_bolt.middleware import cors, rate_limit, skip_middleware
@@ -368,7 +368,7 @@ def test_is_authenticated_guard_with_class_view(api):
 
 @pytest.mark.django_db
 def test_is_admin_guard_with_class_view(api):
-    """Test IsAdminUser guard with class-based views."""
+    """Test the is_superuser Requires guard with class-based views."""
 
     # Regular user
     user = User.objects.create(username="regular", is_staff=False, is_superuser=False)
@@ -381,7 +381,7 @@ def test_is_admin_guard_with_class_view(api):
     @api.view("/admin", methods=["GET"])
     class AdminView(APIView):
         auth = [JWTAuthentication(secret="test-secret")]
-        guards = [IsAdminUser()]
+        guards = [Requires("is_superuser", True)]
 
         async def get(self, request):
             return {"ok": True}
@@ -398,7 +398,7 @@ def test_is_admin_guard_with_class_view(api):
 
 @pytest.mark.django_db
 def test_has_permission_guard_with_class_view(api):
-    """Test HasPermission guard with class-based views."""
+    """Test a permissions Requires guard with class-based views."""
     from django_bolt.auth.jwt_utils import create_jwt_for_user  # noqa: PLC0415
 
     # Create permission
@@ -420,7 +420,7 @@ def test_has_permission_guard_with_class_view(api):
     @api.view("/users/{user_id}", methods=["DELETE"])
     class ProtectedView(APIView):
         auth = [JWTAuthentication(secret="test-secret")]
-        guards = [HasPermission("auth.can_delete_user")]
+        guards = [Requires("permissions", "auth.can_delete_user")]
 
         async def delete(self, request, user_id: int):
             return {"deleted": True}

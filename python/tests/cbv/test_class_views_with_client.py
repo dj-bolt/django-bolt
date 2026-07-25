@@ -23,7 +23,7 @@ import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.auth.backends import JWTAuthentication
-from django_bolt.auth.guards import IsAdminUser, IsAuthenticated
+from django_bolt.auth.guards import IsAuthenticated, Requires
 from django_bolt.exceptions import HTTPException
 from django_bolt.params import Depends
 from django_bolt.testing import TestClient
@@ -226,7 +226,7 @@ def test_bolt_api_view_route_level_guard_override():
     api = BoltAPI()
 
     # Override with admin-only guards
-    @api.view("/admin", guards=[IsAdminUser()])
+    @api.view("/admin", guards=[Requires("is_superuser", True)])
     class ViewWithClassGuards(APIView):
         auth = [JWTAuthentication(secret="test-secret")]  # Correct parameter is 'secret'
         guards = [IsAuthenticated()]

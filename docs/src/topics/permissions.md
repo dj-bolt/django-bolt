@@ -6,13 +6,21 @@ icon: lucide/shield-check
 
 Django-Bolt uses "guards" to control access to endpoints. Guards are permission checks that run in Rust after authentication but before your handler is called.
 
+There are exactly three guards:
+
+| Guard | Meaning |
+|-------|---------|
+| `IsAuthenticated()` | The request must carry a valid credential (else 401) |
+| `AllowAny()` | Explicitly public; overrides global default guards |
+| `Requires(claim, *values, all_of=...)` | **The** permission check — one primitive for roles, permissions, tenancy, flags |
+
+Every guard compiles to a native Rust check at registration — the claim name and expected values are extracted from Python exactly once, and request-time guard evaluation never touches the GIL.
+
 !!! warning "Guards enforce, `auth` doesn't"
 
     `auth=[...]` only *attempts* authentication — it never rejects a request on its own. Enforcement (401/403) is the job of guards. An endpoint declared with just `auth=[JWTAuthentication()]` and no guards will happily serve requests with missing or invalid tokens, and `request.context` will be `None`. Always pair `auth` with at least `guards=[IsAuthenticated()]` when you want to require login. See [Authentication](authentication.md#jwt-authentication) for details.
 
-## Built-in guards
-
-### IsAuthenticated
+## IsAuthenticated
 
 Requires a valid authentication token:
 
@@ -21,87 +29,14 @@ from django_bolt.auth import JWTAuthentication, IsAuthenticated
 
 @api.get("/profile", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
 async def profile(request):
-    return {"user_id": request.user.id}
+    return {"user_id": request.context["user_id"]}
 ```
 
 Returns 401 Unauthorized if authentication fails.
 
-### IsAdminUser
+## AllowAny
 
-Requires the user to be a superuser:
-
-```python
-from django_bolt.auth import IsAdminUser
-
-@api.delete("/admin/users/{user_id}", auth=[JWTAuthentication()], guards=[IsAdminUser()])
-async def delete_user(user_id: int):
-    # Only superusers can access this
-    return {"deleted": user_id}
-```
-
-Returns 403 Forbidden if the user is not a superuser.
-
-### IsStaff
-
-Requires the user to have staff status:
-
-```python
-from django_bolt.auth import IsStaff
-
-@api.get("/admin/dashboard", auth=[JWTAuthentication()], guards=[IsStaff()])
-async def admin_dashboard():
-    return {"dashboard": "staff only"}
-```
-
-### HasPermission
-
-Requires a specific Django permission:
-
-```python
-from django_bolt.auth import HasPermission
-
-@api.post("/articles", auth=[JWTAuthentication()], guards=[HasPermission("blog.add_article")])
-async def create_article():
-    return {"created": True}
-```
-
-Permission strings follow Django's format: `app_label.permission_codename`.
-
-### HasAnyPermission
-
-Requires at least one of the specified permissions (OR logic):
-
-```python
-from django_bolt.auth import HasAnyPermission
-
-@api.get(
-    "/content",
-    auth=[JWTAuthentication()],
-    guards=[HasAnyPermission(["blog.view_article", "blog.add_article"])]
-)
-async def view_content():
-    return {"content": "visible"}
-```
-
-### HasAllPermissions
-
-Requires all specified permissions (AND logic):
-
-```python
-from django_bolt.auth import HasAllPermissions
-
-@api.delete(
-    "/articles/{id}",
-    auth=[JWTAuthentication()],
-    guards=[HasAllPermissions(["blog.delete_article", "blog.change_article"])]
-)
-async def delete_article(id: int):
-    return {"deleted": id}
-```
-
-### AllowAny
-
-Explicitly allows any request, bypassing authentication:
+Explicitly allows any request, bypassing global default guards:
 
 ```python
 from django_bolt.auth import AllowAny
@@ -111,6 +46,75 @@ async def public():
     return {"message": "Anyone can see this"}
 ```
 
+## Requires
+
+`Requires` checks a token claim against expected values:
+
+```python
+from django_bolt.auth import JWTAuthentication, IsAuthenticated, Requires
+
+Requires("tenant_id")                        # claim must exist
+Requires("role", "client")                   # equals (or list contains)
+Requires("role", "client", "vip")            # any of (OR)
+Requires("is_staff", True)                   # boolean claim
+Requires("permissions", "blog.add_article")  # Django-style permission
+Requires("permissions", all_of=["blog.add_article", "blog.change_article"])  # AND
+```
+
+Give reusable checks a name by assignment — no subclassing:
+
+```python
+IsClient = Requires("role", "client")
+IsStaff = Requires("is_staff", True)
+IsSuperuser = Requires("is_superuser", True)
+
+@api.get("/orders", auth=[JWTAuthentication()], guards=[IsAuthenticated(), IsClient])
+async def list_orders():
+    return {"orders": [...]}
+```
+
+Issue tokens carrying the claims your guards read:
+
+```python
+from django_bolt.auth import create_jwt_for_user
+
+token = create_jwt_for_user(user, extra_claims={"role": "client"})
+```
+
+### Matching semantics
+
+- **Positional values are OR** — the claim must match at least one.
+- **`all_of` is AND** — the claim (a list, e.g. `permissions`) must contain every value. Positional values and `all_of` are mutually exclusive.
+- **Scalar claims match by equality; list claims by membership** — `Requires("roles", "client")` passes when `roles: ["beta", "client"]`.
+- **No values means presence** — the claim must exist and be non-null.
+- **Value types**: `str`, `int`, `bool` (and `float`). Anything else is rejected at registration.
+- **Standard claims are guardable too**: `sub`, `iss`, `aud`, `typ`, `is_staff`, `is_superuser`, ... — not just your extra claims.
+
+### The `permissions` claim
+
+`Requires("permissions", ...)` reads the **unified permission set**, which is populated from the JWT `permissions` claim *or* from `key_permissions` for API-key auth — the same guard works for every backend:
+
+```python
+from django_bolt.auth import APIKeyAuthentication
+
+@api.get(
+    "/reports",
+    auth=[APIKeyAuthentication(api_keys={"key-1"}, key_permissions={"key-1": ["reports.view"]})],
+    guards=[Requires("permissions", "reports.view")],
+)
+async def reports(): ...
+```
+
+All other claims come from the token, so backends that carry no claims (API keys) can never satisfy them.
+
+### Status codes
+
+`401` when the request is unauthenticated, `403` when the claim is missing or doesn't match. Guards evaluate in declaration order and short-circuit on the first verdict.
+
+### Registration is strict
+
+Anything that can't be compiled fails startup instead of silently leaving the route open: an empty claim name, non-scalar values, mixing positional values with `all_of`, or subclassing `BasePermission` (not a thing — name a `Requires` instance instead) all raise `ImproperlyConfigured`.
+
 ## Combining guards
 
 Use multiple guards for layered security:
@@ -119,7 +123,7 @@ Use multiple guards for layered security:
 @api.post(
     "/admin/settings",
     auth=[JWTAuthentication()],
-    guards=[IsAuthenticated(), IsStaff(), HasPermission("core.change_settings")]
+    guards=[IsAuthenticated(), Requires("is_staff", True), Requires("permissions", "core.change_settings")]
 )
 async def update_settings():
     return {"updated": True}
@@ -127,32 +131,19 @@ async def update_settings():
 
 Guards are checked in order. The request is rejected as soon as any guard fails.
 
-## Error responses
-
-Guards return appropriate HTTP status codes:
-
-| Guard | Failure Status |
-|-------|----------------|
-| `IsAuthenticated` | 401 Unauthorized |
-| `IsAdminUser` | 403 Forbidden |
-| `IsStaff` | 403 Forbidden |
-| `HasPermission` | 403 Forbidden |
-| `HasAnyPermission` | 403 Forbidden |
-| `HasAllPermissions` | 403 Forbidden |
-
 ## Permissions in JWT tokens
 
 Guards run in Rust without database access, so all permission data must be embedded in the JWT token itself.
 
 ### How it works
 
-1. When you create a JWT token, you include the user's permissions in the token claims
-2. The Rust layer validates the token and extracts permissions from claims
-3. Guards check permissions against the extracted claims - no database queries
+1. When you create a JWT token, you include the user's claims (permissions, role, ...) in the payload
+2. The Rust layer validates the token and extracts the claims
+3. Guards check against the extracted claims - no database queries
 
 ### Creating tokens with permissions
 
-The `create_jwt_for_user()` function automatically includes `is_staff` and `is_superuser`, but **permissions must be passed explicitly** via `extra_claims`:
+The `create_jwt_for_user()` function automatically includes `is_staff` and `is_superuser`, but **everything else must be passed explicitly** via `extra_claims`:
 
 ```python
 from django_bolt.auth import create_jwt_for_user
@@ -160,12 +151,13 @@ from django_bolt.auth import create_jwt_for_user
 # Basic token - includes is_staff, is_superuser, but NOT permissions
 token = create_jwt_for_user(user, expires_in=3600)
 
-# Token with permissions - required for HasPermission guards
+# Token with permissions and a role
 token = create_jwt_for_user(
     user,
     expires_in=3600,
     extra_claims={
-        "permissions": ["blog.add_article", "blog.change_article"]
+        "permissions": ["blog.add_article", "blog.change_article"],
+        "role": "client",
     }
 )
 ```
@@ -190,11 +182,12 @@ def create_token_with_permissions(user):
 
 ### Token claims reference
 
-| Claim | Included By Default | Used By Guard |
+| Claim | Included By Default | Example Guard |
 |-------|---------------------|---------------|
-| `is_staff` | Yes | `IsStaff` |
-| `is_superuser` | Yes | `IsAdminUser` |
-| `permissions` | No (use `extra_claims`) | `HasPermission`, `HasAnyPermission`, `HasAllPermissions` |
+| `is_staff` | Yes | `Requires("is_staff", True)` |
+| `is_superuser` | Yes | `Requires("is_superuser", True)` |
+| `permissions` | No (use `extra_claims`) | `Requires("permissions", "blog.add_article")` |
+| anything else | No (use `extra_claims`) | `Requires("role", "client")` |
 
 ## Per-route authentication and guards
 
@@ -212,6 +205,24 @@ async def get_data():
 @api.get("/health", guards=[AllowAny()])
 async def health():
     return {"status": "ok"}
+```
+
+## When to use a dependency instead
+
+A guard is a claim comparison — it can't `await`, query the database, or see the request body. For rules that need any of that, use a dependency (or a check in the handler, below):
+
+```python
+from django_bolt import Depends
+from django_bolt.exceptions import HTTPException
+
+async def require_active_subscription(request):
+    user_id = request.context.get("user_id")
+    if not await Subscription.objects.filter(user_id=user_id, active=True).aexists():
+        raise HTTPException(status_code=403, detail="Subscription required")
+
+@api.get("/premium", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+async def premium(_=Depends(require_active_subscription)):
+    return {"ok": True}
 ```
 
 ## Runtime permission checks
@@ -246,3 +257,5 @@ Guards run in Rust before your Python handler is called. This means:
 - Invalid requests are rejected without Python GIL overhead
 - Authentication and authorization happen in a single pass
 - Your handler only runs for authorized requests
+
+This includes `Requires`: its claim name and values are extracted from Python once at registration, so request-time evaluation is fully native.

@@ -101,7 +101,7 @@ Both sync and async functions are supported (sync tools run in a worker thread).
     title="Add numbers",              # optional human-readable title
     description="Add two integers",   # defaults to the docstring
     output_schema={...},              # optional JSON Schema for the result
-    guards=[HasPermission("calc")],   # per-tool authorization (see below)
+    guards=[Requires("permissions", "calc")],   # per-tool authorization (see below)
 )
 async def add(a: int, b: int) -> dict:
     return {"sum": a + b}
@@ -271,17 +271,17 @@ api.mount_mcp(mcp, auth=[JWTAuthentication()])   # validate tokens; don't block 
 **Per-tool guards** do the gating. A tool whose guard fails is hidden from `tools/list` *and* rejected on `tools/call`, so an anonymous client never even sees the protected tools:
 
 ```python
-from django_bolt import HasPermission, IsAdminUser, IsAuthenticated, Request
+from django_bolt import IsAuthenticated, Request, Requires
 
 @mcp.tool(guards=[IsAuthenticated()])          # any valid token
 async def whoami(request: Request) -> dict:
     return request.context                     # {user_id, is_staff, is_superuser, permissions}
 
-@mcp.tool(guards=[HasPermission("reports:read")])
+@mcp.tool(guards=[Requires("permissions", "reports:read")])
 async def read_report() -> dict:
     return {"report": "Q3 revenue up 42%"}
 
-@mcp.tool(guards=[IsAdminUser()])              # superuser only
+@mcp.tool(guards=[Requires("is_superuser", True)])  # superuser only
 async def purge_users() -> dict:
     return {"purged": 0}
 ```

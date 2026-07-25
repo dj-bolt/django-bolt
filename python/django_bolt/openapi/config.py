@@ -190,7 +190,7 @@ class OpenAPIConfig:
     Example:
         ```python
         from django_bolt.openapi import OpenAPIConfig
-        from django_bolt.auth import JWTAuthentication, IsAuthenticated, IsStaff
+        from django_bolt.auth import JWTAuthentication, IsAuthenticated, Requires
 
         # Require authentication for docs
         OpenAPIConfig(
@@ -205,7 +205,7 @@ class OpenAPIConfig:
             title="My API",
             version="1.0.0",
             auth=[JWTAuthentication()],
-            guards=[IsStaff()]
+            guards=[Requires("is_staff", True)]
         )
         ```
     """
@@ -215,7 +215,7 @@ class OpenAPIConfig:
 
     When set, these authentication backends will be used to authenticate
     requests to documentation endpoints. Required when using guards that
-    depend on authentication (e.g., IsAuthenticated, IsStaff, IsAdminUser).
+    depend on authentication (e.g., IsAuthenticated, Requires).
 
     Example:
         ```python

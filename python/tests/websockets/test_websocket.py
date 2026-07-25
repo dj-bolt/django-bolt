@@ -22,7 +22,7 @@ import jwt
 import pytest
 
 from django_bolt import BoltAPI, WebSocket
-from django_bolt.auth import HasPermission, IsAdminUser, IsAuthenticated, JWTAuthentication
+from django_bolt.auth import IsAuthenticated, JWTAuthentication, Requires
 from django_bolt.param_functions import Cookie, Header, Query
 from django_bolt.testing import ConnectionClosed, WebSocketTestClient
 from django_bolt.websocket import CloseCode
@@ -186,7 +186,7 @@ def api():
     @api.websocket(
         "/ws/admin",
         auth=[JWTAuthentication(secret=TEST_JWT_SECRET)],
-        guards=[IsAdminUser()],
+        guards=[Requires("is_superuser", True)],
     )
     async def admin_ws(websocket: WebSocket):
         await websocket.accept()
@@ -195,7 +195,7 @@ def api():
     @api.websocket(
         "/ws/permission",
         auth=[JWTAuthentication(secret=TEST_JWT_SECRET)],
-        guards=[HasPermission("api.view_data")],
+        guards=[Requires("permissions", "api.view_data")],
     )
     async def permission_ws(websocket: WebSocket):
         await websocket.accept()

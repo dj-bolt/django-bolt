@@ -18,12 +18,8 @@ from .backends import (
 from .guards import (
     AllowAny,
     BasePermission,
-    HasAllPermissions,
-    HasAnyPermission,
-    HasPermission,
-    IsAdminUser,
     IsAuthenticated,
-    IsStaff,
+    Requires,
     get_default_permission_classes,
 )
 
@@ -74,11 +70,7 @@ __all__ = [
     "BasePermission",
     "AllowAny",
     "IsAuthenticated",
-    "IsAdminUser",
-    "IsStaff",
-    "HasPermission",
-    "HasAnyPermission",
-    "HasAllPermissions",
+    "Requires",
     "get_default_permission_classes",
     # JWT
     "Token",

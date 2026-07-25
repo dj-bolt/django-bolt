@@ -16,12 +16,9 @@ from django_bolt import BoltAPI
 from django_bolt.auth import (
     AllowAny,
     APIKeyAuthentication,
-    HasAnyPermission,
-    HasPermission,
-    IsAdminUser,
     IsAuthenticated,
-    IsStaff,
     JWTAuthentication,
+    Requires,
 )
 from django_bolt.testing import TestClient
 
@@ -83,7 +80,7 @@ def api():
         }
 
     # Admin-only endpoint
-    @api.get("/admin", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAdminUser()])
+    @api.get("/admin", auth=[JWTAuthentication(secret="test-secret")], guards=[Requires("is_superuser", True)])
     async def admin_endpoint(request: dict):
         context = request["context"]
         return {
@@ -93,7 +90,7 @@ def api():
         }
 
     # Staff-only endpoint
-    @api.get("/staff", auth=[JWTAuthentication(secret="test-secret")], guards=[IsStaff()])
+    @api.get("/staff", auth=[JWTAuthentication(secret="test-secret")], guards=[Requires("is_staff", True)])
     async def staff_endpoint(request: dict):
         return {
             "message": "staff area",
@@ -101,7 +98,7 @@ def api():
         }
 
     # Permission-required endpoint
-    @api.get("/delete-users", auth=[JWTAuthentication(secret="test-secret")], guards=[HasPermission("users.delete")])
+    @api.get("/delete-users", auth=[JWTAuthentication(secret="test-secret")], guards=[Requires("permissions", "users.delete")])
     async def delete_users_endpoint():
         return {"message": "deleting users"}
 
@@ -109,7 +106,7 @@ def api():
     @api.get(
         "/moderate",
         auth=[JWTAuthentication(secret="test-secret")],
-        guards=[HasAnyPermission("users.moderate", "posts.moderate")],
+        guards=[Requires("permissions", "users.moderate", "posts.moderate")],
     )
     async def moderate_endpoint():
         return {"message": "moderating content"}
@@ -223,7 +220,7 @@ def test_permission_based_endpoint_with_permission(client):
 
 
 def test_has_any_permission_with_one_match(client):
-    """Test HasAnyPermission guard with one matching permission"""
+    """Any-of permissions: one matching permission passes"""
     token = create_token(user_id="moderator", permissions=["users.moderate"])
     response = client.get("/moderate", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
@@ -231,7 +228,7 @@ def test_has_any_permission_with_one_match(client):
 
 
 def test_has_any_permission_without_match(client):
-    """Test HasAnyPermission guard without any matching permission"""
+    """Any-of permissions: no matching permission is 403"""
     token = create_token(user_id="user", permissions=["other.permission"])
     response = client.get("/moderate", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 403

@@ -1,5 +1,5 @@
 use crate::middleware::auth::{authenticate, AuthBackend, AuthContext};
-use crate::permissions::{evaluate_guards, Guard, GuardResult};
+use crate::permissions::{evaluate_guards, GuardResult, GuardSet};
 use actix_web::http::uri::Authority;
 /// Shared validation logic used by both production handler and test handler
 /// All functions marked #[inline(always)] for zero-cost abstraction
@@ -185,7 +185,7 @@ fn origin_matches(url: &str, scheme: &str, host: &str) -> bool {
 pub fn validate_auth_and_guards(
     headers: &AHashMap<String, String>,
     auth_backends: &[AuthBackend],
-    guards: &[Guard],
+    guards: &GuardSet,
 ) -> AuthGuardResult {
     // Skip work if no auth or guards configured
     if auth_backends.is_empty() && guards.is_empty() {
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn test_validate_auth_no_config() {
         let headers = AHashMap::new();
-        let result = validate_auth_and_guards(&headers, &[], &[]);
+        let result = validate_auth_and_guards(&headers, &[], &GuardSet::default());
         matches!(result, AuthGuardResult::Allow(None));
     }
 

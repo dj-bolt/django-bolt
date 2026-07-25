@@ -147,59 +147,32 @@ from django_bolt.auth import IsAuthenticated
 
 Returns 401 if not authenticated.
 
-### IsAdminUser
+### Requires
 
-Require superuser status.
-
-```python
-from django_bolt.auth import IsAdminUser
-
-@api.get("/admin", guards=[IsAdminUser()])
-```
-
-Returns 403 if not superuser.
-
-### IsStaff
-
-Require staff status.
+The permission check: require a token claim to be present, optionally matching expected values.
 
 ```python
-from django_bolt.auth import IsStaff
+from django_bolt.auth import Requires
 
-@api.get("/staff", guards=[IsStaff()])
+Requires("tenant_id")                        # claim must exist
+Requires("role", "client")                   # equals (or list contains)
+Requires("role", "client", "vip")            # any of (OR)
+Requires("is_staff", True)                   # boolean claim
+Requires("permissions", "blog.view_article") # Django-style permission
+Requires("permissions", all_of=["blog.delete_article", "blog.change_article"])  # AND
+
+@api.get("/articles", guards=[Requires("permissions", "blog.view_article")])
 ```
 
-Returns 403 if not staff.
-
-### HasPermission
-
-Require a specific permission.
+Name reusable checks by assignment:
 
 ```python
-from django_bolt.auth import HasPermission
+IsClient = Requires("role", "client")
 
-@api.get("/articles", guards=[HasPermission("blog.view_article")])
+@api.get("/orders", guards=[IsAuthenticated(), IsClient])
 ```
 
-### HasAnyPermission
-
-Require any of the specified permissions.
-
-```python
-from django_bolt.auth import HasAnyPermission
-
-@api.get("/content", guards=[HasAnyPermission(["blog.view_article", "blog.add_article"])])
-```
-
-### HasAllPermissions
-
-Require all specified permissions.
-
-```python
-from django_bolt.auth import HasAllPermissions
-
-@api.delete("/articles/{id}", guards=[HasAllPermissions(["blog.delete_article", "blog.change_article"])])
-```
+Returns 401 if unauthenticated, 403 if the claim is missing or doesn't match. The `permissions` claim reads the unified permission set, so it also covers `key_permissions` from `APIKeyAuthentication`; every other claim comes from the JWT payload. See [Permissions](../topics/permissions.md) for full matching semantics.
 
 ## Token utilities
 

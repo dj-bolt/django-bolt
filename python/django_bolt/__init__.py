@@ -54,14 +54,10 @@ from .auth import (
     AllowAny,
     APIKeyAuthentication,
     AuthContext,
-    HasAllPermissions,
-    HasAnyPermission,
-    HasPermission,
-    IsAdminUser,
     IsAuthenticated,
-    IsStaff,
     # Authentication backends
     JWTAuthentication,
+    Requires,
     # JWT Token & Utilities
     Token,
     create_jwt_for_user,
@@ -230,11 +226,7 @@ __all__ = [
     # Auth - Guards/Permissions
     "AllowAny",
     "IsAuthenticated",
-    "IsAdminUser",
-    "IsStaff",
-    "HasPermission",
-    "HasAnyPermission",
-    "HasAllPermissions",
+    "Requires",
     # Middleware - Protocols and base classes
     "MiddlewareProtocol",
     "BaseMiddleware",
