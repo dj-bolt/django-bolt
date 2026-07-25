@@ -238,11 +238,7 @@ class TestBoltAuthUserPrecedence:
                 return self.get_response(request)
 
         api = BoltAPI(
-            middleware=[
-                DjangoMiddlewareStack(
-                    [SessionMiddleware, AuthenticationMiddleware, PeekingMiddleware]
-                )
-            ]
+            middleware=[DjangoMiddlewareStack([SessionMiddleware, AuthenticationMiddleware, PeekingMiddleware])]
         )
 
         @api.get("/jwt-peeked", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])

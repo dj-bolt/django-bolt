@@ -98,7 +98,11 @@ def api():
         }
 
     # Permission-required endpoint
-    @api.get("/delete-users", auth=[JWTAuthentication(secret="test-secret")], guards=[Requires("permissions", "users.delete")])
+    @api.get(
+        "/delete-users",
+        auth=[JWTAuthentication(secret="test-secret")],
+        guards=[Requires("permissions", "users.delete")],
+    )
     async def delete_users_endpoint():
         return {"message": "deleting users"}
 

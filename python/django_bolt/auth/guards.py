@@ -126,24 +126,17 @@ class Requires(BasePermission):
         all_of: list[str | int | float | bool] | tuple[str | int | float | bool, ...] | None = None,
     ):
         if not isinstance(claim, str) or not claim:
-            raise ImproperlyConfigured(
-                f"Requires() claim must be a non-empty string, got {claim!r}."
-            )
+            raise ImproperlyConfigured(f"Requires() claim must be a non-empty string, got {claim!r}.")
         if all_of is not None:
             if values:
                 raise ImproperlyConfigured(
-                    "Requires() takes either positional values (any-of) or "
-                    "all_of=[...] (all-of), not both."
+                    "Requires() takes either positional values (any-of) or all_of=[...] (all-of), not both."
                 )
             if isinstance(all_of, (str, bytes)):
-                raise ImproperlyConfigured(
-                    f"Requires() all_of must be a list/tuple of values, got {all_of!r}."
-                )
+                raise ImproperlyConfigured(f"Requires() all_of must be a list/tuple of values, got {all_of!r}.")
             values = tuple(all_of)
             if not values:
-                raise ImproperlyConfigured(
-                    "Requires() all_of must not be empty — omit it for a presence check."
-                )
+                raise ImproperlyConfigured("Requires() all_of must not be empty — omit it for a presence check.")
         for value in values:
             if not isinstance(value, _CLAIM_VALUE_TYPES):
                 raise ImproperlyConfigured(
