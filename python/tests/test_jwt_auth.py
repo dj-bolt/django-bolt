@@ -8,7 +8,7 @@ Uses pytest-django for proper Django configuration.
 """
 
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import jwt
 import pytest
@@ -288,10 +288,8 @@ async def test_get_user_reraises_operational_error():
     auth = JWTAuthentication(secret="test-secret")
 
     with (
-        patch.object(
-            auth._get_user_model().objects,
-            "aget",
-            new_callable=AsyncMock,
+        patch(
+            "django_bolt.auth.backends.load_user_by_pk_sync",
             side_effect=OperationalError("connection reset"),
         ),
         pytest.raises(OperationalError),
@@ -308,10 +306,8 @@ async def test_get_user_reraises_interface_error():
     auth = JWTAuthentication(secret="test-secret")
 
     with (
-        patch.object(
-            auth._get_user_model().objects,
-            "aget",
-            new_callable=AsyncMock,
+        patch(
+            "django_bolt.auth.backends.load_user_by_pk_sync",
             side_effect=InterfaceError("connection closed"),
         ),
         pytest.raises(InterfaceError),
@@ -327,9 +323,8 @@ def test_get_user_sync_reraises_operational_error():
     auth = JWTAuthentication(secret="test-secret")
 
     with (
-        patch.object(
-            auth._get_user_model().objects,
-            "get",
+        patch(
+            "django_bolt.auth.backends.load_user_by_pk_sync",
             side_effect=OperationalError("connection reset"),
         ),
         pytest.raises(OperationalError),
@@ -345,9 +340,8 @@ def test_get_user_sync_reraises_interface_error():
     auth = JWTAuthentication(secret="test-secret")
 
     with (
-        patch.object(
-            auth._get_user_model().objects,
-            "get",
+        patch(
+            "django_bolt.auth.backends.load_user_by_pk_sync",
             side_effect=InterfaceError("connection closed"),
         ),
         pytest.raises(InterfaceError),

@@ -16,6 +16,7 @@ Performance: ~60k+ RPS with JWT validation happening entirely in Rust.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import threading
@@ -32,6 +33,7 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
 from django.db import InterfaceError, OperationalError
 
+from .pk_loader import load_user_by_pk_sync
 from .revocation import create_revocation_handler
 
 # (jti) -> True if the token is revoked, False otherwise.
@@ -379,29 +381,28 @@ class JWTAuthentication(BaseAuthentication):
         Load user from database using the user_id from JWT token.
 
         The user_id should be the primary key of the user in the database.
+
+        Runs the pre-compiled pk query off the event loop. Deliberately NOT
+        ``User.objects.aget``: asgiref's thread_sensitive executor is a single
+        shared thread per process, which serializes every user load in the
+        worker (measured ~3k req/s ceiling); the default executor runs loads
+        concurrently and the compiled query skips per-call SQL compilation.
         """
         if not user_id:
             return None
 
-        User = self._get_user_model()
-
-        try:
-            return await User.objects.aget(pk=user_id)
-        except User.DoesNotExist:
-            return None
-        except (OperationalError, InterfaceError):
-            raise
-        except Exception as e:
-            print(f"Error loading user {user_id} in JWTAuthentication: {type(e).__name__}: {e}", file=sys.stderr)
-            return None
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.get_user_sync, user_id)
 
     def get_user_sync(self, user_id: str | None) -> Any | None:
         """
         Synchronously load user from database using the user_id from JWT token.
 
-        This method does the actual DB query. Thread pool wrapping is handled
-        by the loader resolved in user_loader.resolve_user_loader() based on
-        the handler's execution context.
+        This method does the actual DB query — a pk SELECT compiled once per
+        (user model, database alias), not recompiled per request. Thread pool
+        wrapping is handled by the loader resolved in
+        user_loader.resolve_user_loader() based on the handler's execution
+        context.
         """
         if not user_id:
             return None
@@ -409,9 +410,7 @@ class JWTAuthentication(BaseAuthentication):
         User = self._get_user_model()
 
         try:
-            return User.objects.get(pk=user_id)
-        except User.DoesNotExist:
-            return None
+            return load_user_by_pk_sync(User, user_id)
         except (OperationalError, InterfaceError):
             raise
         except Exception as e:
