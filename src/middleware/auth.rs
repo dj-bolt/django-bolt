@@ -8,6 +8,10 @@ use pyo3::types::PyDict;
 use pyo3::IntoPyObjectExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use parking_lot::{Mutex, RwLock};
 use std::str::FromStr;
 
 /// JWT `aud` claim: RFC 7519 §4.1.3 allows a single string or an array of
@@ -117,20 +121,93 @@ pub enum JwtKeySource {
     /// A JWKS: keys indexed by `kid`, selected per request from the token's
     /// `kid` header (RS/ES providers like Clerk, Auth0, Okta).
     Jwks(HashMap<String, DecodingKey>),
+    /// Remotely sourced JWKS. The last known-good keys remain available while
+    /// one worker refreshes them periodically or after an unknown `kid`.
+    RefreshingJwks(Arc<RefreshingJwks>),
+}
+
+pub struct RefreshingJwks {
+    keys: RwLock<HashMap<String, DecodingKey>>,
+    refresh: Py<PyAny>,
+    refresh_interval: Duration,
+    last_refresh: Mutex<Instant>,
+    refreshing: Mutex<()>,
+}
+
+impl std::fmt::Debug for RefreshingJwks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshingJwks")
+            .field("key_count", &self.keys.read().len())
+            .field("refresh_interval", &self.refresh_interval)
+            .finish_non_exhaustive()
+    }
 }
 
 impl JwtKeySource {
     /// Select the verification key for a token, given its `kid` header.
     /// For a JWKS with exactly one key the `kid` may be omitted.
-    fn select(&self, kid: Option<&str>) -> Option<&DecodingKey> {
+    fn select(&self, kid: Option<&str>) -> Option<DecodingKey> {
         match self {
-            JwtKeySource::Static(key) => Some(key),
+            JwtKeySource::Static(key) => Some(key.clone()),
             JwtKeySource::Jwks(keys) => match kid {
-                Some(kid) => keys.get(kid),
-                None if keys.len() == 1 => keys.values().next(),
+                Some(kid) => keys.get(kid).cloned(),
+                None if keys.len() == 1 => keys.values().next().cloned(),
                 None => None,
             },
+            JwtKeySource::RefreshingJwks(remote) => remote.select(kid),
         }
+    }
+}
+
+impl RefreshingJwks {
+    pub fn new(
+        keys: HashMap<String, DecodingKey>,
+        refresh: Py<PyAny>,
+        refresh_interval: Duration,
+    ) -> Self {
+        Self {
+            keys: RwLock::new(keys),
+            refresh,
+            refresh_interval,
+            last_refresh: Mutex::new(Instant::now()),
+            refreshing: Mutex::new(()),
+        }
+    }
+
+    fn cached(&self, kid: Option<&str>) -> Option<DecodingKey> {
+        let keys = self.keys.read();
+        match kid {
+            Some(kid) => keys.get(kid).cloned(),
+            None if keys.len() == 1 => keys.values().next().cloned(),
+            None => None,
+        }
+    }
+
+    fn select(&self, kid: Option<&str>) -> Option<DecodingKey> {
+        let cached = self.cached(kid);
+        let due = self.last_refresh.lock().elapsed() >= self.refresh_interval;
+        if cached.is_some() && !due {
+            return cached;
+        }
+
+        // try_lock provides single-flight refresh: other workers immediately
+        // continue with cached keys instead of piling onto the provider.
+        if let Some(_guard) = self.refreshing.try_lock() {
+            let result = Python::attach(|py| {
+                self.refresh
+                    .call0(py)
+                    .ok()
+                    .and_then(|value| value.extract::<Option<String>>(py).ok())
+                    .flatten()
+            });
+            *self.last_refresh.lock() = Instant::now();
+            if let Some(document) = result {
+                if let Ok(JwtKeySource::Jwks(keys)) = build_jwks_key_source(&document) {
+                    *self.keys.write() = keys;
+                }
+            }
+        }
+        self.cached(kid).or(cached)
     }
 }
 
@@ -376,7 +453,7 @@ fn decode_and_validate(
         }
     };
 
-    match crypto::verify(signature, message.as_bytes(), key, alg) {
+    match crypto::verify(signature, message.as_bytes(), &key, alg) {
         Ok(true) => {}
         Ok(false) => {
             log::debug!("JWT rejected: invalid signature");

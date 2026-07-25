@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
     build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
+    RefreshingJwks,
 };
 use crate::permissions::{ClaimKey, Guard, GuardSet};
 
@@ -901,7 +902,24 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
                 None => None,
             };
             let keys = if let Some(jwks_json) = jwks {
-                build_jwks_key_source(&jwks_json).map_err(PyValueError::new_err)?
+                let parsed = build_jwks_key_source(&jwks_json).map_err(PyValueError::new_err)?;
+                match dict.get("jwks_refresh") {
+                    Some(callback) if !callback.is_none(py) => {
+                        let interval = match dict.get("jwks_refresh_interval") {
+                            Some(value) => value.extract::<Option<u64>>(py)?.unwrap_or(300),
+                            None => 300,
+                        };
+                        let JwtKeySource::Jwks(initial_keys) = parsed else {
+                            unreachable!("build_jwks_key_source always returns Jwks")
+                        };
+                        JwtKeySource::RefreshingJwks(std::sync::Arc::new(RefreshingJwks::new(
+                            initial_keys,
+                            callback.clone_ref(py),
+                            std::time::Duration::from_secs(interval),
+                        )))
+                    }
+                    _ => parsed,
+                }
             } else {
                 let secret = dict
                     .get("secret")

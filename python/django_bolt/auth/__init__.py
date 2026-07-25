@@ -58,6 +58,7 @@ from .user_loader import (
     load_user,
     register_auth_backend,
 )
+from .views import JWTAuthViews, LoginCredentials
 
 __all__ = [
     # Authentication
@@ -94,4 +95,7 @@ __all__ = [
     "register_auth_backend",
     "get_registered_backend",
     "load_user",
+    # Ready-made lifecycle endpoints
+    "JWTAuthViews",
+    "LoginCredentials",
 ]

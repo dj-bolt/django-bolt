@@ -63,6 +63,12 @@ class TestCreateTokenPair:
         assert pair.access_claims["role"] == "admin"
         assert pair.refresh_claims["role"] == "admin"
 
+    def test_kid_added_to_both_token_headers(self):
+        pair = create_token_pair("u", secret=SECRET, kid="signing-key-2026-07")
+
+        assert jwt.get_unverified_header(pair.access_token)["kid"] == "signing-key-2026-07"
+        assert jwt.get_unverified_header(pair.refresh_token)["kid"] == "signing-key-2026-07"
+
     def test_accepts_django_user_pk(self):
         class FakeUser:
             pk = 7
@@ -95,6 +101,21 @@ class TestCreateTokenPair:
 
 
 class TestRotation:
+    @pytest.mark.asyncio
+    async def test_rotation_adds_kid_to_new_tokens(self):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+
+        rotated = await rotate_refresh_token(
+            pair.refresh_claims,
+            store=store,
+            secret=SECRET,
+            kid="replacement-key",
+        )
+
+        assert jwt.get_unverified_header(rotated.access_token)["kid"] == "replacement-key"
+        assert jwt.get_unverified_header(rotated.refresh_token)["kid"] == "replacement-key"
+
     @pytest.mark.asyncio
     async def test_full_rotation_issues_new_pair_and_revokes_old(self):
         store = InMemoryRevocation()
