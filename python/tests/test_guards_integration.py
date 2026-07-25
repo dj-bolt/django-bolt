@@ -128,6 +128,15 @@ def api():
             "backend": request["context"].get("auth_backend"),
         }
 
+    # Presence check on a boolean claim: present means true
+    @api.get(
+        "/staff-presence",
+        auth=[JWTAuthentication(secret="test-secret")],
+        guards=[Requires("is_staff")],
+    )
+    async def staff_presence_endpoint():
+        return {"message": "staff flag set"}
+
     # Full context inspection endpoint
     @api.get("/context", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
     async def context_endpoint(request: dict):
@@ -206,6 +215,20 @@ def test_staff_endpoint_with_staff_token(client):
     assert response.status_code == 200
     data = response.json()
     assert data["message"] == "staff area"
+
+
+def test_boolean_presence_check_rejects_false_claim(client):
+    """Requires("is_staff") with no values must reject a token carrying is_staff: false"""
+    token = create_token(user_id="regular-user", is_staff=False)
+    response = client.get("/staff-presence", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 403
+
+
+def test_boolean_presence_check_accepts_true_claim(client):
+    """Requires("is_staff") with no values passes when the claim is true"""
+    token = create_token(user_id="staff-user", is_staff=True)
+    response = client.get("/staff-presence", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
 
 
 def test_permission_based_endpoint_without_permission(client):

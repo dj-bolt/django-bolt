@@ -242,6 +242,10 @@ impl ClaimValue<'_> {
         match self {
             ClaimValue::Absent => false,
             ClaimValue::Permissions(perms) => !perms.is_empty(),
+            // A bare `Requires("flag")` on a boolean claim means "the flag is
+            // set" — `flag: false` must not satisfy a presence check.
+            ClaimValue::Bool(v) => *v,
+            ClaimValue::Json(Json::Bool(v)) => *v,
             _ => true,
         }
     }
@@ -423,6 +427,51 @@ mod tests {
         assert_eq!(
             evaluate_guards(&any_of("tenant", &[]), Some(&ctx)),
             GuardResult::Forbidden
+        );
+    }
+
+    #[test]
+    fn presence_check_on_false_boolean_claim_is_forbidden() {
+        // `Requires("beta")` on a boolean claim means "the flag is set" — a
+        // token carrying `beta: false` must not pass a bare presence check.
+        let ctx = jwt_ctx(&[], &[("beta", Json::from(false))]);
+        assert_eq!(
+            evaluate_guards(&any_of("beta", &[]), Some(&ctx)),
+            GuardResult::Forbidden
+        );
+        let ctx = jwt_ctx(&[], &[("beta", Json::from(true))]);
+        assert_eq!(
+            evaluate_guards(&any_of("beta", &[]), Some(&ctx)),
+            GuardResult::Allow
+        );
+    }
+
+    #[test]
+    fn presence_check_on_typed_boolean_claim_requires_true() {
+        // Same rule for the typed standard claims (is_staff/is_superuser/is_admin):
+        // jwt_ctx sets is_staff=true and leaves is_superuser unset.
+        let ctx = jwt_ctx(&[], &[]);
+        assert_eq!(
+            evaluate_guards(&any_of("is_staff", &[]), Some(&ctx)),
+            GuardResult::Allow
+        );
+        assert_eq!(
+            evaluate_guards(&any_of("is_superuser", &[]), Some(&ctx)),
+            GuardResult::Forbidden
+        );
+        // An explicitly-false typed claim is not "present" either.
+        let mut ctx = jwt_ctx(&[], &[]);
+        if let Some(claims) = ctx.claims.as_mut() {
+            claims.is_superuser = Some(false);
+        }
+        assert_eq!(
+            evaluate_guards(&any_of("is_superuser", &[]), Some(&ctx)),
+            GuardResult::Forbidden
+        );
+        // But a false boolean still matches an explicit `Requires("x", False)`.
+        assert_eq!(
+            evaluate_guards(&any_of("is_superuser", &[Json::from(false)]), Some(&ctx)),
+            GuardResult::Allow
         );
     }
 

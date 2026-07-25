@@ -103,7 +103,9 @@ class Requires(BasePermission):
       contain every value. Positional values and ``all_of`` are mutually
       exclusive.
     - A scalar claim matches by equality; a list claim matches by membership.
-    - No values at all means "the claim must be present and non-null".
+    - No values at all means "the claim must be present and non-null". For a
+      boolean claim, present means true — ``Requires("is_admin")`` rejects a
+      token carrying ``is_admin: false``.
     - The ``permissions`` claim is special-cased to the unified permission
       set, so it also covers ``key_permissions`` from API-key auth.
 

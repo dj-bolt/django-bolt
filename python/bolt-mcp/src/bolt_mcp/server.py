@@ -78,17 +78,52 @@ def principal(request: Any) -> dict:
     return {}
 
 
-class _GuardAuthContext:
-    """Adapts the request's auth-context dict to the attribute shape guards expect."""
+def _scalar_matches(value: Any, expected: Any) -> bool:
+    # bool is an int subclass in Python — keep bool/int distinct so a token
+    # claim of `1` never satisfies `Requires("flag", True)` (and vice versa),
+    # matching the type-strict Rust comparison.
+    if isinstance(value, bool) or isinstance(expected, bool):
+        return isinstance(value, bool) and isinstance(expected, bool) and value == expected
+    return value == expected
 
-    __slots__ = ("user_id", "is_staff", "is_superuser", "permissions")
 
-    def __init__(self, ctx: dict | None) -> None:
-        ctx = ctx or {}
-        self.user_id = ctx.get("user_id")
-        self.is_staff = bool(ctx.get("is_staff"))
-        self.is_superuser = bool(ctx.get("is_superuser"))
-        self.permissions = ctx.get("permissions")
+def _claim_matches(value: Any, expected: Any) -> bool:
+    """A scalar claim matches by equality; a list claim by membership."""
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_scalar_matches(item, expected) for item in value)
+    return _scalar_matches(value, expected)
+
+
+def _guard_allows(meta: dict, ctx: dict) -> bool:
+    """Evaluate one compiled guard (``guard.to_metadata()``) against the principal dict.
+
+    HTTP-route guards are evaluated natively in Rust (src/permissions.rs); MCP
+    tools are dispatched in Python, so this mirrors those semantics against the
+    auth-context dict — including the rules that a bare presence check on a
+    boolean claim requires ``true`` and that ``permissions`` presence means
+    the unified permission set is non-empty.
+    """
+    kind = meta["type"]
+    if kind == "allow_any":
+        return True
+    if kind == "is_authenticated":
+        return bool(ctx)
+    # "requires": an unauthenticated request never satisfies a claim check.
+    if not ctx:
+        return False
+    values = meta["values"]
+    combine = all if meta["match_all"] else any
+    if meta["claim"] == "permissions":
+        granted = set(ctx.get("permissions") or ())
+        if not values:
+            return bool(granted)
+        return combine(v in granted for v in values)
+    resolved = (ctx.get("auth_claims") or {}).get(meta["claim"])
+    if not values:
+        return resolved is not None and resolved is not False
+    return combine(_claim_matches(resolved, v) for v in values)
 
 
 def _arguments_from_signature(fn: Callable) -> list[dict[str, Any]]:
@@ -320,8 +355,8 @@ class MCP:
     def _guards_pass(self, guards: list[Any], request: Any) -> bool:
         if not guards:
             return True
-        adapter = _GuardAuthContext(principal(request))
-        return all(g.has_permission(adapter) for g in guards)
+        ctx = principal(request)
+        return all(_guard_allows(g.to_metadata(), ctx) for g in guards)
 
     # ── Tools ─────────────────────────────────────────────────────────────────
     def _tool_dict(self, tool: ToolDef) -> dict[str, Any]:

@@ -86,7 +86,7 @@ token = create_jwt_for_user(user, extra_claims={"role": "client"})
 - **Positional values are OR** — the claim must match at least one.
 - **`all_of` is AND** — the claim (a list, e.g. `permissions`) must contain every value. Positional values and `all_of` are mutually exclusive.
 - **Scalar claims match by equality; list claims by membership** — `Requires("roles", "client")` passes when `roles: ["beta", "client"]`.
-- **No values means presence** — the claim must exist and be non-null.
+- **No values means presence** — the claim must exist and be non-null. A boolean claim must be `true`: `Requires("is_admin")` rejects a token carrying `is_admin: false`.
 - **Value types**: `str`, `int`, `bool` (and `float`). Anything else is rejected at registration.
 - **Standard claims are guardable too**: `sub`, `iss`, `aud`, `typ`, `is_staff`, `is_superuser`, ... — not just your extra claims.
 
