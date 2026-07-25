@@ -5,7 +5,7 @@ from __future__ import annotations
 from _helpers import initialize, mint_jwt, parse_rpc, post_rpc
 from bolt_mcp import MCP, mount_mcp
 
-from django_bolt import BoltAPI, HasPermission, IsAuthenticated, JWTAuthentication, Request
+from django_bolt import BoltAPI, IsAuthenticated, JWTAuthentication, Request, Requires
 from django_bolt.testing import TestClient
 
 SECRET = "tier1-secret-key-0123456789-abcdefgh"
@@ -21,7 +21,7 @@ def _build():
         ctx = request.context or {}
         return {"user_id": ctx.get("user_id")}
 
-    @mcp.tool(guards=[HasPermission("items:read")])
+    @mcp.tool(guards=[Requires("permissions", "items:read")])
     async def admin_only() -> dict:
         return {"ok": True}
 

@@ -25,6 +25,17 @@ from typing import Any
 from django.contrib.auth import get_user_model
 
 from .backends import BaseAuthentication, JWTAuthentication
+from .pk_loader import load_user_by_pk_sync
+
+__all__ = [
+    "load_user_by_pk_sync",
+    "register_auth_backend",
+    "get_registered_backend",
+    "resolve_user_loader",
+    "load_user",
+    "load_user_sync",
+    "default_django_user_loader",
+]
 
 # Framework-provided implementations. A backend method that is one of these
 # was NOT overridden by the user — only genuine overrides take priority.
@@ -112,19 +123,16 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
 
 def default_django_user_loader(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
     """Default user query for schemes with no backend instance on the route
-    (e.g. Rust-side session auth): ``User.objects.get(pk=user_id)``.
+    (e.g. Rust-side session auth), via the pre-compiled pk query.
 
     Returns None for a stale user_id (user deleted after the session/token
     was issued), mirroring the framework get_user/get_user_sync defaults.
     """
     User = get_user_model()
 
-    try:
-        if is_async_context:
-            return _get_executor().submit(User.objects.get, pk=user_id).result()
-        return User.objects.get(pk=user_id)
-    except User.DoesNotExist:
-        return None
+    if is_async_context:
+        return _get_executor().submit(load_user_by_pk_sync, User, user_id).result()
+    return load_user_by_pk_sync(User, user_id)
 
 
 def register_auth_backend(backend_name: str, backend_instance: Any) -> None:

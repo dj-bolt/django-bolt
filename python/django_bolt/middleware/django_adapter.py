@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import functools
 import io
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,7 @@ from ..middleware_response import (
 try:
     from asgiref.sync import async_to_sync, iscoroutinefunction, markcoroutinefunction, sync_to_async
     from django.http import HttpRequest, HttpResponse, QueryDict
+    from django.utils.functional import LazyObject, empty
     from django.utils.module_loading import import_string
 
     DJANGO_AVAILABLE = True
@@ -44,6 +46,8 @@ except ImportError:
     sync_to_async = None
     iscoroutinefunction = None
     markcoroutinefunction = None
+    LazyObject = None
+    empty = None
 
 # Lazy singleton for empty QueryDict - avoids requiring Django settings at import time
 _EMPTY_QUERYDICT = None
@@ -845,6 +849,39 @@ def _build_meta(request: Request) -> dict:
     return meta
 
 
+def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
+    """
+    Decide whether a user set on the Django request should replace
+    bolt_request.user.
+
+    Bolt route-level auth (JWT/API key, validated in Rust) attaches a lazy
+    user in _dispatch BEFORE the Django middleware chain runs. Django's
+    AuthenticationMiddleware then unconditionally sets its own session-based
+    user — AnonymousUser for requests authenticated only via Bolt auth —
+    which must not clobber the Bolt user (the backend's get_user would then
+    never run).
+
+    Rules:
+    - No Bolt user set → adopt Django's user (plain Django behavior).
+    - Django user is AuthenticationMiddleware's still-unevaluated lazy
+      default → keep the Bolt user (also avoids forcing a session query).
+    - Django user was evaluated or explicitly assigned (login(),
+      impersonation middleware) → adopt it only if it is actually
+      authenticated; an anonymous result never overrides Bolt auth.
+    """
+    if bolt_request.user is None:
+        return True
+    if isinstance(django_user, LazyObject) and django_user._wrapped is empty:
+        return False
+    return bool(getattr(django_user, "is_authenticated", False))
+
+
+async def _static_auser(user):
+    """Module-level `auser` replacement bound via functools.partial — avoids
+    allocating a fresh coroutine function per request."""
+    return user
+
+
 def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request) -> None:
     """
     Sync attributes added by Django middleware to Bolt request.
@@ -863,12 +900,18 @@ def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request)
     """
     # Sync user (SimpleLazyObject) for sync access - this is a writable attribute on PyRequest
     user = getattr(django_request, "user", None)
-    if user is not None:
-        bolt_request.user = user
-
-    # Sync auser (async callable) for async access via `await request.state["auser"]()`
     auser = getattr(django_request, "auser", None)
-    if auser is not None:
+    if user is not None:
+        if _should_adopt_django_user(user, bolt_request):
+            bolt_request.user = user
+            # Sync auser (async callable) for async access via `await request.auser()`
+            if auser is not None:
+                bolt_request.state["auser"] = auser
+        else:
+            # Keep the Bolt-auth user and make auser consistent with it,
+            # instead of Django's session-based (anonymous) auser.
+            bolt_request.state["auser"] = functools.partial(_static_auser, bolt_request.user)
+    elif auser is not None:
         bolt_request.state["auser"] = auser
 
     # Sync session to state

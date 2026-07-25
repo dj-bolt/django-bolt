@@ -4,14 +4,18 @@
 /// Rust enums at registration time, eliminating per-request GIL overhead.
 use actix_web::http::header::HeaderValue;
 use ahash::{AHashMap, AHashSet};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
 use crate::form_parsing::FileFieldConstraints;
-use crate::middleware::auth::AuthBackend;
-use crate::permissions::Guard;
+use crate::middleware::auth::{
+    build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
+    RefreshingJwks,
+};
+use crate::permissions::{ClaimKey, Guard, GuardSet};
 
 /// Request value source for Rust-side argument prebinding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,11 +451,6 @@ impl RouteExecutionPlan {
     }
 }
 
-#[inline]
-fn has_enforcing_guards(guards: &[Guard]) -> bool {
-    guards.iter().any(|guard| !matches!(guard, Guard::AllowAny))
-}
-
 /// Dense metadata table keyed by handler_id.
 #[derive(Debug, Clone, Default)]
 pub struct RouteMetadataStore {
@@ -484,7 +483,10 @@ impl RouteMetadataStore {
 #[derive(Debug, Clone)]
 pub struct RouteMetadata {
     pub auth_backends: Vec<AuthBackend>,
-    pub guards: Vec<Guard>,
+    /// Cookie names whose presence subjects unsafe requests to the CSRF
+    /// origin check. Precomputed from `auth_backends` at registration so
+    /// the hot path never re-scans the backend list.
+    pub guards: GuardSet,
     pub skip: HashSet<String>,
     pub cors_config: Option<CorsConfig>,
     pub rate_limit_config: Option<RateLimitConfig>,
@@ -546,24 +548,32 @@ impl RouteMetadata {
             }
         }
 
-        // Parse auth backends
-        if let Ok(Some(auth_list)) = py_meta.get_item("auth_backends") {
-            if let Ok(py_backends) = auth_list.extract::<Vec<HashMap<String, Py<PyAny>>>>() {
+        // Parse auth backends. Failures propagate: metadata that fails to
+        // extract must abort startup, not leave the route unauthenticated.
+        if let Some(auth_list) = py_meta.get_item("auth_backends")? {
+            if !auth_list.is_none() {
+                let py_backends: Vec<HashMap<String, Py<PyAny>>> =
+                    auth_list.extract().map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "Invalid 'auth_backends' route metadata: {}",
+                            e
+                        ))
+                    })?;
                 for backend_dict in py_backends {
-                    if let Some(backend) = parse_auth_backend(&backend_dict, py) {
-                        auth_backends.push(backend);
-                    }
+                    auth_backends.push(parse_auth_backend(&backend_dict, py)?);
                 }
             }
         }
 
         // Parse guards
-        if let Ok(Some(guard_list)) = py_meta.get_item("guards") {
-            if let Ok(py_guards) = guard_list.extract::<Vec<HashMap<String, Py<PyAny>>>>() {
+        if let Some(guard_list) = py_meta.get_item("guards")? {
+            if !guard_list.is_none() {
+                let py_guards: Vec<HashMap<String, Py<PyAny>>> =
+                    guard_list.extract().map_err(|e| {
+                        PyValueError::new_err(format!("Invalid 'guards' route metadata: {}", e))
+                    })?;
                 for guard_dict in py_guards {
-                    if let Some(guard) = parse_guard(&guard_dict, py) {
-                        guards.push(guard);
-                    }
+                    guards.push(parse_guard(&guard_dict, py)?);
                 }
             }
         }
@@ -641,7 +651,8 @@ impl RouteMetadata {
 
         let skip_cors = skip.contains("cors");
         let skip_compression = skip.contains("compression");
-        let has_auth_or_guards = !auth_backends.is_empty() || has_enforcing_guards(&guards);
+        let guards = GuardSet::from_guards(guards);
+        let has_auth_or_guards = !auth_backends.is_empty() || guards.is_enforcing();
         let has_rate_limit = rate_limit_config.is_some();
         let can_sync_dispatch = py_meta
             .get_item("can_sync_dispatch")
@@ -734,25 +745,6 @@ impl RouteMetadata {
             plan,
             default_status_code,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::has_enforcing_guards;
-    use crate::permissions::Guard;
-
-    #[test]
-    fn allow_any_only_is_not_enforcing() {
-        assert!(!has_enforcing_guards(&[Guard::AllowAny]));
-    }
-
-    #[test]
-    fn mixed_guards_are_enforcing() {
-        assert!(has_enforcing_guards(&[
-            Guard::AllowAny,
-            Guard::IsAuthenticated
-        ]));
     }
 }
 
@@ -875,90 +867,221 @@ fn parse_rate_limit_config(
     Some(config)
 }
 
-/// Parse a single auth backend from Python dict
-fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<AuthBackend> {
-    let backend_type = dict.get("type")?.extract::<String>(py).ok()?;
+/// Parse a single auth backend from Python dict.
+///
+/// Invalid auth configuration is a hard error, not a skip: silently dropping
+/// a backend would leave the route serving without the authentication the
+/// user configured.
+fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<AuthBackend> {
+    let backend_type = dict
+        .get("type")
+        .ok_or_else(|| PyValueError::new_err("Auth backend metadata missing 'type'"))?
+        .extract::<String>(py)?;
 
+    // Field extraction below is fail-loud: a present-but-mistyped value is a
+    // configuration error and propagates; only an absent key (or Python
+    // None for optional fields) falls back to the default.
     match backend_type.as_str() {
         "jwt" => {
-            let secret = dict.get("secret")?.extract::<String>(py).ok()?;
-            let algorithms = dict
-                .get("algorithms")
-                .and_then(|a| a.extract::<Vec<String>>(py).ok())
-                .unwrap_or_else(|| vec!["HS256".to_string()]);
-            let header = dict
-                .get("header")
-                .and_then(|h| h.extract::<String>(py).ok())
-                .unwrap_or_else(|| "authorization".to_string());
-            let cookie = dict
-                .get("cookie")
-                .and_then(|c| c.extract::<Option<String>>(py).ok())
-                .flatten();
-            let audience = dict
-                .get("audience")
-                .and_then(|a| a.extract::<String>(py).ok());
-            let issuer = dict
-                .get("issuer")
-                .and_then(|i| i.extract::<String>(py).ok());
+            let algorithm_names = match dict.get("algorithms") {
+                Some(a) => a
+                    .extract::<Option<Vec<String>>>(py)?
+                    .unwrap_or_else(|| vec!["HS256".to_string()]),
+                None => vec!["HS256".to_string()],
+            };
+            let algorithms = algorithm_names
+                .iter()
+                .map(|name| parse_jwt_algorithm(name).map_err(PyValueError::new_err))
+                .collect::<PyResult<Vec<_>>>()?;
+            // Key material is validated and parsed once here — the request
+            // path never touches the raw secret/PEM/JWKS again. A JWKS
+            // document (fetched by Python from the provider's jwks_url) takes
+            // precedence over a single secret when both are present.
+            let jwks = match dict.get("jwks") {
+                Some(j) => j.extract::<Option<String>>(py)?,
+                None => None,
+            };
+            let keys = if let Some(jwks_json) = jwks {
+                let parsed = build_jwks_key_source(&jwks_json).map_err(PyValueError::new_err)?;
+                match dict.get("jwks_refresh") {
+                    Some(callback) if !callback.is_none(py) => {
+                        let interval = match dict.get("jwks_refresh_interval") {
+                            Some(value) => value.extract::<Option<u64>>(py)?.unwrap_or(300),
+                            None => 300,
+                        };
+                        let JwtKeySource::Jwks(initial_keys) = parsed else {
+                            unreachable!("build_jwks_key_source always returns Jwks")
+                        };
+                        JwtKeySource::RefreshingJwks(std::sync::Arc::new(RefreshingJwks::new(
+                            initial_keys,
+                            callback.clone_ref(py),
+                            std::time::Duration::from_secs(interval),
+                        )))
+                    }
+                    _ => parsed,
+                }
+            } else {
+                let secret = dict
+                    .get("secret")
+                    .ok_or_else(|| PyValueError::new_err("JWT auth backend missing 'secret'"))?
+                    .extract::<String>(py)?;
+                JwtKeySource::Static(
+                    build_jwt_decoding_key(&secret, &algorithms).map_err(PyValueError::new_err)?,
+                )
+            };
+            let header = match dict.get("header") {
+                Some(h) => h
+                    .extract::<Option<String>>(py)?
+                    .unwrap_or_else(|| "authorization".to_string()),
+                None => "authorization".to_string(),
+            };
+            let cookie = match dict.get("cookie") {
+                Some(c) => c.extract::<Option<String>>(py)?,
+                None => None,
+            };
+            let audience = match dict.get("audience") {
+                Some(a) => a.extract::<Option<String>>(py)?,
+                None => None,
+            };
+            let issuer = match dict.get("issuer") {
+                Some(i) => i.extract::<Option<String>>(py)?,
+                None => None,
+            };
+            let leeway = match dict.get("leeway") {
+                Some(l) => l.extract::<Option<i64>>(py)?.unwrap_or(60),
+                None => 60,
+            };
+            let token_type = match dict.get("token_type") {
+                Some(t) => t.extract::<Option<String>>(py)?,
+                None => None,
+            };
+            let require_jti = match dict.get("require_jti") {
+                Some(r) => r.extract::<Option<bool>>(py)?.unwrap_or(false),
+                None => false,
+            };
+            let cookie_csrf = match dict.get("cookie_csrf") {
+                Some(c) => c.extract::<Option<bool>>(py)?.unwrap_or(true),
+                None => true,
+            };
 
-            Some(AuthBackend::JWT {
-                secret,
+            Ok(AuthBackend::JWT {
+                keys,
                 algorithms,
                 header,
                 cookie,
                 audience,
                 issuer,
+                leeway,
+                token_type,
+                require_jti,
+                cookie_csrf,
             })
         }
         "api_key" => {
-            let api_keys_list = dict
-                .get("api_keys")
-                .and_then(|k| k.extract::<Vec<String>>(py).ok())
-                .unwrap_or_default();
-            let api_keys: HashSet<String> = api_keys_list.into_iter().collect();
+            let api_keys: HashSet<String> = match dict.get("api_keys") {
+                Some(k) => k
+                    .extract::<Option<Vec<String>>>(py)?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                None => HashSet::new(),
+            };
 
-            let header = dict
-                .get("header")
-                .and_then(|h| h.extract::<String>(py).ok())
-                .unwrap_or_else(|| "x-api-key".to_string());
+            let header = match dict.get("header") {
+                Some(h) => h
+                    .extract::<Option<String>>(py)?
+                    .unwrap_or_else(|| "x-api-key".to_string()),
+                None => "x-api-key".to_string(),
+            };
 
-            let key_permissions = dict
-                .get("key_permissions")
-                .and_then(|kp| kp.extract::<HashMap<String, Vec<String>>>(py).ok())
-                .unwrap_or_default();
+            let key_permissions = match dict.get("key_permissions") {
+                Some(kp) => kp
+                    .extract::<Option<HashMap<String, Vec<String>>>>(py)?
+                    .unwrap_or_default(),
+                None => HashMap::new(),
+            };
 
-            Some(AuthBackend::APIKey {
+            Ok(AuthBackend::APIKey {
                 api_keys,
                 header,
                 key_permissions,
             })
         }
-        _ => None,
+        other => Err(PyValueError::new_err(format!(
+            "Unknown auth backend type '{}'",
+            other
+        ))),
     }
 }
 
 /// Parse a single guard from Python dict
-fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<Guard> {
-    let guard_type = dict.get("type")?.extract::<String>(py).ok()?;
+fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<Guard> {
+    let guard_type = dict
+        .get("type")
+        .ok_or_else(|| PyValueError::new_err("Guard metadata missing 'type'"))?
+        .extract::<String>(py)?;
 
     match guard_type.as_str() {
-        "allow_any" => Some(Guard::AllowAny),
-        "is_authenticated" => Some(Guard::IsAuthenticated),
-        "is_superuser" => Some(Guard::IsSuperuser),
-        "is_staff" => Some(Guard::IsStaff),
-        "has_permission" => {
-            let perm = dict.get("permission")?.extract::<String>(py).ok()?;
-            Some(Guard::HasPermission(perm))
+        "allow_any" => Ok(Guard::AllowAny),
+        "is_authenticated" => Ok(Guard::IsAuthenticated),
+        // The single permission primitive (`Requires` in Python). The claim
+        // name and expected values are extracted here, at registration, so
+        // request-time evaluation never touches Python.
+        "requires" => {
+            let claim = dict
+                .get("claim")
+                .ok_or_else(|| PyValueError::new_err("requires guard missing 'claim'"))?
+                .extract::<String>(py)?;
+            if claim.is_empty() {
+                return Err(PyValueError::new_err(
+                    "requires guard 'claim' must be a non-empty string",
+                ));
+            }
+            let match_all = dict
+                .get("match_all")
+                .ok_or_else(|| PyValueError::new_err("requires guard missing 'match_all'"))?
+                .extract::<bool>(py)?;
+            let values_py = dict
+                .get("values")
+                .ok_or_else(|| PyValueError::new_err("requires guard missing 'values'"))?
+                .extract::<Vec<Py<PyAny>>>(py)?;
+            let mut values = Vec::with_capacity(values_py.len());
+            for value in &values_py {
+                let bound = value.bind(py);
+                // bool must be checked before int: Python bool is an int subtype.
+                let json = if bound.is_instance_of::<pyo3::types::PyBool>() {
+                    serde_json::Value::Bool(bound.extract::<bool>()?)
+                } else if let Ok(i) = bound.extract::<i64>() {
+                    serde_json::Value::from(i)
+                } else if let Ok(f) = bound.extract::<f64>() {
+                    serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .ok_or_else(|| {
+                            PyValueError::new_err(format!(
+                                "requires guard '{}' has a non-finite float value",
+                                claim
+                            ))
+                        })?
+                } else if let Ok(s) = bound.extract::<String>() {
+                    serde_json::Value::String(s)
+                } else {
+                    return Err(PyValueError::new_err(format!(
+                        "requires guard '{}' values must be str, int, float, or bool",
+                        claim
+                    )));
+                };
+                values.push(json);
+            }
+            Ok(Guard::Requires {
+                claim: ClaimKey::parse(claim),
+                values,
+                match_all,
+            })
         }
-        "has_any_permission" => {
-            let perms = dict.get("permissions")?.extract::<Vec<String>>(py).ok()?;
-            Some(Guard::HasAnyPermission(perms))
-        }
-        "has_all_permissions" => {
-            let perms = dict.get("permissions")?.extract::<Vec<String>>(py).ok()?;
-            Some(Guard::HasAllPermissions(perms))
-        }
-        _ => None,
+        other => Err(PyValueError::new_err(format!(
+            "Unknown guard type '{}'",
+            other
+        ))),
     }
 }
 

@@ -89,6 +89,7 @@ dev = [
     "nanodjango>=0.16",
     "openapi-spec-validator>=0.8.5",
     "zstandard>=0.25.0", # for testing with zstd-compressed payloads
+    "cryptography>=42", # RSA/EC keypair generation for asymmetric JWT tests
     "bolt-mcp", # workspace member: MCP server support (editable)
 ]
 docs = [

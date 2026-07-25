@@ -3,7 +3,7 @@ from __future__ import annotations
 from bolt_mcp import MCP, mount_mcp, principal
 from bolt_mcp.oauth import AuthorizationServer
 
-from django_bolt import BoltAPI, HasPermission, IsAuthenticated, Request
+from django_bolt import BoltAPI, IsAuthenticated, Request, Requires
 
 ISSUER = "http://testserver"
 
@@ -26,7 +26,7 @@ async def whoami(request: Request) -> dict:
     return principal(request)
 
 
-@mcp.tool(guards=[HasPermission("reports:read")])
+@mcp.tool(guards=[Requires("permissions", "reports:read")])
 async def read_report() -> dict:
     return {"report": "Q3 up 42%"}
 

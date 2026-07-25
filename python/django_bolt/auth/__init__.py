@@ -18,12 +18,8 @@ from .backends import (
 from .guards import (
     AllowAny,
     BasePermission,
-    HasAllPermissions,
-    HasAnyPermission,
-    HasPermission,
-    IsAdminUser,
     IsAuthenticated,
-    IsStaff,
+    Requires,
     get_default_permission_classes,
 )
 
@@ -47,12 +43,22 @@ from .revocation import (
 # JWT Token handling
 from .token import Token
 
+# Access + refresh token lifecycle
+from .tokens import (
+    TokenPair,
+    TokenRotationError,
+    create_token_pair,
+    rotate_refresh_token,
+    set_token_cookies,
+)
+
 # User loading for request.user
 from .user_loader import (
     get_registered_backend,
     load_user,
     register_auth_backend,
 )
+from .views import JWTAuthViews, LoginCredentials
 
 __all__ = [
     # Authentication
@@ -65,11 +71,7 @@ __all__ = [
     "BasePermission",
     "AllowAny",
     "IsAuthenticated",
-    "IsAdminUser",
-    "IsStaff",
-    "HasPermission",
-    "HasAnyPermission",
-    "HasAllPermissions",
+    "Requires",
     "get_default_permission_classes",
     # JWT
     "Token",
@@ -77,6 +79,12 @@ __all__ = [
     "get_current_user",
     "extract_user_id_from_context",
     "get_auth_context",
+    # Token pair lifecycle (access + refresh)
+    "TokenPair",
+    "TokenRotationError",
+    "create_token_pair",
+    "rotate_refresh_token",
+    "set_token_cookies",
     # Revocation (optional)
     "RevocationStore",
     "InMemoryRevocation",
@@ -87,4 +95,7 @@ __all__ = [
     "register_auth_backend",
     "get_registered_backend",
     "load_user",
+    # Ready-made lifecycle endpoints
+    "JWTAuthViews",
+    "LoginCredentials",
 ]

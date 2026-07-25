@@ -7,6 +7,7 @@ extract user information from request context.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -15,6 +16,8 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 
 from django_bolt.types import Request
+
+from .pk_loader import load_user_by_pk_sync
 
 
 def create_jwt_for_user(
@@ -145,12 +148,11 @@ async def get_current_user(request: Request):
     if not user_id:
         return None
 
-    try:
-        # Fetch User from database using async ORM
-        user = await User.objects.aget(pk=user_id)
-        return user
-    except (User.DoesNotExist, ValueError, TypeError):
-        return None
+    # Pre-compiled pk query on the default executor. Deliberately NOT
+    # `User.objects.aget`: asgiref's thread_sensitive executor is one shared
+    # thread per process, which serializes every user load in the worker.
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, load_user_by_pk_sync, User, user_id)
 
 
 def extract_user_id_from_context(request: Request) -> str | None:

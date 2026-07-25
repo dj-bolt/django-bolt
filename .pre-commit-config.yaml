@@ -24,6 +24,9 @@ repos:
       # Block accidental commits of conflict markers and private keys.
       - id: check-merge-conflict
       - id: detect-private-key
+        # Intentional, non-production key used only to sign RS256 integration
+        # test tokens; keep the exclusion anchored to this one fixture.
+        exclude: '^python/tests/integration/apps/jwt_rs256_provider\.py$'
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: 3b3f7c3f57fe9925356faf5fe6230835138be230  # frozen: v0.15.17

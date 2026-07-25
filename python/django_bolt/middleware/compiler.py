@@ -5,19 +5,17 @@ from __future__ import annotations
 import datetime
 import decimal
 import inspect
-import logging
 import uuid
 from collections.abc import Callable
 from typing import Annotated, Any, get_args, get_origin
 
 import msgspec
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 
 from ..auth.backends import get_default_authentication_classes
-from ..auth.guards import get_default_permission_classes
+from ..auth.guards import BasePermission, get_default_permission_classes
 from ..typing import is_msgspec_struct, unwrap_optional
-
-logger = logging.getLogger(__name__)
 
 # Type hint constants - MUST match src/type_coercion.rs
 TYPE_INT = 1
@@ -86,6 +84,35 @@ def get_type_hint_id(annotation: Any) -> int:
         return TYPE_STRING
 
 
+def _compile_guard(guard: Any, method: str, path: str) -> dict[str, Any]:
+    """Compile one guard (instance or class) to Rust metadata.
+
+    Guards may be passed as instances (`IsAuthenticated()`) or as bare classes
+    (`IsAuthenticated`). Anything that cannot be compiled raises: a guard that
+    silently fails to register would leave the route unprotected while looking
+    protected in the source.
+    """
+    instance = guard
+    if isinstance(guard, type):
+        try:
+            instance = guard()
+        except TypeError as e:
+            raise ImproperlyConfigured(
+                f"Guard {guard.__name__} on {method} {path} could not be instantiated: {e}. "
+                f"Guards that take arguments must be passed as instances, "
+                f"e.g. guards=[{guard.__name__}(...)]."
+            ) from e
+
+    if not isinstance(instance, BasePermission):
+        raise ImproperlyConfigured(
+            f"Guard {type(instance).__name__} on {method} {path} is not a guard. "
+            f"Guards must subclass django_bolt.auth.BasePermission — use AllowAny, "
+            f"IsAuthenticated, or Requires."
+        )
+
+    return instance.to_metadata()
+
+
 def compile_middleware_meta(
     handler: Callable,
     method: str,
@@ -138,41 +165,11 @@ def compile_middleware_meta(
     if guards is not None:
         # Per-route guards override
         for guard in guards:
-            # Check if it's an instance with to_metadata method
-            if hasattr(guard, "to_metadata") and callable(getattr(guard, "to_metadata", None)):
-                try:
-                    # Try calling as instance method
-                    guard_list.append(guard.to_metadata())
-                except TypeError:
-                    # If it fails, might be a class, try instantiating
-                    try:
-                        instance = guard()
-                        guard_list.append(instance.to_metadata())
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to instantiate guard class %s for metadata compilation. "
-                            "Guard will be skipped. Error: %s",
-                            guard.__class__.__name__ if hasattr(guard, "__class__") else type(guard).__name__,
-                            e,
-                        )
-            elif isinstance(guard, type):
-                # It's a class reference, instantiate it
-                try:
-                    instance = guard()
-                    if hasattr(instance, "to_metadata"):
-                        guard_list.append(instance.to_metadata())
-                except Exception as e:
-                    logger.warning(
-                        "Failed to instantiate guard class %s for metadata compilation. "
-                        "Guard will be skipped. Error: %s",
-                        guard.__name__ if hasattr(guard, "__name__") else str(guard),
-                        e,
-                    )
+            guard_list.append(_compile_guard(guard, method, path))
     else:
         # Use global default permission classes
         for guard in get_default_permission_classes():
-            if hasattr(guard, "to_metadata"):
-                guard_list.append(guard.to_metadata())
+            guard_list.append(_compile_guard(guard, method, path))
 
     # Only include metadata if something is configured
     # Note: include result even when only skip flags are present so Rust can

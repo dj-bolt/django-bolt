@@ -1,51 +1,60 @@
 """
 Permission/guard system for Django-Bolt.
 
-Provides DRF-inspired permission classes (called "guards" in Litestar terminology)
-that are compiled to Rust types for zero-GIL performance.
+There are exactly three guards:
+
+- ``IsAuthenticated()`` — the request must carry a valid credential (401).
+- ``AllowAny()`` — explicitly public; overrides global default guards.
+- ``Requires(claim, *values, all_of=...)`` — THE permission check. One
+  primitive for roles, permissions, tenancy, feature flags — anything the
+  token carries.
+
+Every guard compiles to a native Rust check at registration (the claim name
+and expected values are extracted from Python exactly once), so request-time
+guard evaluation never touches the GIL. Logic that cannot be expressed as a
+claim comparison (database lookups, cross-field rules) belongs in a
+dependency that raises ``HTTPException(status_code=403)``, not in a guard.
 """
 
-from abc import ABC, abstractmethod
 from typing import Any
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
+# Claim values a guard may match against. These are the JSON scalar types, so
+# they can be extracted into Rust once at registration and compared natively
+# per request. (bool is accepted implicitly: it is a subclass of int.)
+_CLAIM_VALUE_TYPES = (str, int, float)
 
-class BasePermission(ABC):
+
+class BasePermission:
     """
-    Base class for permission guards.
+    Internal base for the built-in guards.
 
-    Guards are evaluated in Rust after authentication to determine if
-    a request should be allowed. This happens before the Python handler
-    is called, enabling early 403 responses without GIL overhead.
+    Do not subclass this to build custom checks — declare them with
+    ``Requires`` and give them a name by assignment:
+
+        IsClient = Requires("role", "client")
+        IsStaff = Requires("is_staff", True)
+
+        @api.get("/orders", auth=[...], guards=[IsAuthenticated(), IsClient])
     """
 
     __slots__ = ()
 
-    @property
-    @abstractmethod
-    def guard_name(self) -> str:
-        """Return the guard type name for Rust compilation"""
-        pass
-
-    @abstractmethod
     def to_metadata(self) -> dict[str, Any]:
         """
-        Compile this permission guard into metadata for Rust.
+        Compile this guard into metadata for Rust.
 
-        Returns a dict that will be parsed by Rust into typed enums.
+        Each built-in guard overrides this. A subclass that doesn't is a
+        configuration error caught at registration — guards run natively in
+        Rust, so there is nothing a bare subclass could enforce.
         """
-        pass
-
-    def has_permission(self, auth_context: Any | None) -> bool:
-        """
-        Check if the authenticated user has permission (Python fallback).
-
-        This is primarily for documentation/compatibility. The actual check
-        happens in Rust for performance.
-        """
-        return True
+        raise ImproperlyConfigured(
+            f"{type(self).__name__} is not a usable guard. Custom checks are "
+            f"declared with Requires, not by subclassing: "
+            f'{type(self).__name__} = Requires("<claim>", <value>, ...)'
+        )
 
 
 class AllowAny(BasePermission):
@@ -58,15 +67,8 @@ class AllowAny(BasePermission):
 
     __slots__ = ()
 
-    @property
-    def guard_name(self) -> str:
-        return "allow_any"
-
     def to_metadata(self) -> dict[str, Any]:
         return {"type": "allow_any"}
-
-    def has_permission(self, auth_context: Any | None) -> bool:
-        return True
 
 
 class IsAuthenticated(BasePermission):
@@ -78,147 +80,90 @@ class IsAuthenticated(BasePermission):
 
     __slots__ = ()
 
-    @property
-    def guard_name(self) -> str:
-        return "is_authenticated"
-
     def to_metadata(self) -> dict[str, Any]:
         return {"type": "is_authenticated"}
 
-    def has_permission(self, auth_context: Any | None) -> bool:
-        return auth_context is not None and auth_context.user_id is not None
 
-
-class IsAdminUser(BasePermission):
+class Requires(BasePermission):
     """
-    Require that the authenticated user is an admin/superuser.
+    The permission check: require a token claim to be present, optionally
+    matching expected values.
 
-    Returns 403 if user is not a superuser.
-    Requires JWT token to include 'is_superuser' claim.
-    """
+        Requires("tenant_id")                       # claim must exist
+        Requires("role", "client")                  # equals (or list contains)
+        Requires("role", "client", "vip")           # any of
+        Requires("is_staff", True)                  # boolean claim
+        Requires("permissions", "blog.add_article") # Django-style permission
+        Requires("permissions", all_of=["blog.add_article", "blog.change_article"])
 
-    __slots__ = ()
+    Semantics:
 
-    @property
-    def guard_name(self) -> str:
-        return "is_superuser"
+    - Positional ``values`` are OR — the claim must match at least one.
+    - ``all_of`` is AND — the claim (a list, e.g. ``permissions``) must
+      contain every value. Positional values and ``all_of`` are mutually
+      exclusive.
+    - A scalar claim matches by equality; a list claim matches by membership.
+    - No values at all means "the claim must be present and non-null". For a
+      boolean claim, present means true — ``Requires("is_admin")`` rejects a
+      token carrying ``is_admin: false``.
+    - The ``permissions`` claim is special-cased to the unified permission
+      set, so it also covers ``key_permissions`` from API-key auth.
 
-    def to_metadata(self) -> dict[str, Any]:
-        return {"type": "is_superuser"}
+    Name reusable checks by assignment — no subclassing:
 
-    def has_permission(self, auth_context: Any | None) -> bool:
-        return auth_context is not None and auth_context.is_superuser
+        IsClient = Requires("role", "client")
 
-
-class IsStaff(BasePermission):
-    """
-    Require that the authenticated user is staff.
-
-    Returns 403 if user is not staff.
-    Requires JWT token to include 'is_staff' claim.
-    """
-
-    __slots__ = ()
-
-    @property
-    def guard_name(self) -> str:
-        return "is_staff"
-
-    def to_metadata(self) -> dict[str, Any]:
-        return {"type": "is_staff"}
-
-    def has_permission(self, auth_context: Any | None) -> bool:
-        return auth_context is not None and auth_context.is_staff
-
-
-class HasPermission(BasePermission):
-    """
-    Require that the authenticated user has a specific permission.
-
-    Args:
-        permission: Permission string (e.g., "app.view_model", "api.create_resource")
-
-    For JWT: token should include "permissions" claim as list of strings
-    For API keys: configured via key_permissions mapping in APIKeyAuthentication
+    Compiled to a native Rust check at registration — the claim name and
+    values are extracted from Python exactly once, and request-time
+    evaluation never touches the GIL. Returns 401 when unauthenticated,
+    403 when the claim is missing or doesn't match.
     """
 
-    __slots__ = ("permission",)
+    __slots__ = ("claim", "values", "match_all")
 
-    def __init__(self, permission: str):
-        self.permission = permission
+    def __init__(
+        self,
+        claim: str,
+        *values: str | int | float | bool,
+        all_of: list[str | int | float | bool] | tuple[str | int | float | bool, ...] | None = None,
+    ):
+        if not isinstance(claim, str) or not claim:
+            raise ImproperlyConfigured(f"Requires() claim must be a non-empty string, got {claim!r}.")
+        if all_of is not None:
+            if values:
+                raise ImproperlyConfigured(
+                    "Requires() takes either positional values (any-of) or all_of=[...] (all-of), not both."
+                )
+            if isinstance(all_of, (str, bytes)):
+                raise ImproperlyConfigured(f"Requires() all_of must be a list/tuple of values, got {all_of!r}.")
+            values = tuple(all_of)
+            if not values:
+                raise ImproperlyConfigured("Requires() all_of must not be empty — omit it for a presence check.")
+        for value in values:
+            if not isinstance(value, _CLAIM_VALUE_TYPES):
+                raise ImproperlyConfigured(
+                    f"Requires({claim!r}) got value {value!r} ({type(value).__name__}); "
+                    f"claim values must be str, int, float, or bool so they can be "
+                    f"compiled into the Rust guard at registration."
+                )
 
-    @property
-    def guard_name(self) -> str:
-        return "has_permission"
-
-    def to_metadata(self) -> dict[str, Any]:
-        return {
-            "type": "has_permission",
-            "permission": self.permission,
-        }
-
-    def has_permission(self, auth_context: Any | None) -> bool:
-        if auth_context is None or auth_context.permissions is None:
-            return False
-        return self.permission in auth_context.permissions
-
-
-class HasAnyPermission(BasePermission):
-    """
-    Require that the authenticated user has at least one of the specified permissions.
-
-    Args:
-        permissions: List of permission strings
-    """
-
-    __slots__ = ("permissions",)
-
-    def __init__(self, *permissions: str):
-        self.permissions = list(permissions)
-
-    @property
-    def guard_name(self) -> str:
-        return "has_any_permission"
+        self.claim = claim
+        self.values = values
+        self.match_all = all_of is not None
 
     def to_metadata(self) -> dict[str, Any]:
         return {
-            "type": "has_any_permission",
-            "permissions": self.permissions,
+            "type": "requires",
+            "claim": self.claim,
+            "values": list(self.values),
+            "match_all": self.match_all,
         }
 
-    def has_permission(self, auth_context: Any | None) -> bool:
-        if auth_context is None or auth_context.permissions is None:
-            return False
-        return any(perm in auth_context.permissions for perm in self.permissions)
-
-
-class HasAllPermissions(BasePermission):
-    """
-    Require that the authenticated user has all of the specified permissions.
-
-    Args:
-        permissions: List of permission strings
-    """
-
-    __slots__ = ("permissions",)
-
-    def __init__(self, *permissions: str):
-        self.permissions = list(permissions)
-
-    @property
-    def guard_name(self) -> str:
-        return "has_all_permissions"
-
-    def to_metadata(self) -> dict[str, Any]:
-        return {
-            "type": "has_all_permissions",
-            "permissions": self.permissions,
-        }
-
-    def has_permission(self, auth_context: Any | None) -> bool:
-        if auth_context is None or auth_context.permissions is None:
-            return False
-        return all(perm in auth_context.permissions for perm in self.permissions)
+    def __repr__(self) -> str:
+        if self.match_all:
+            return f"Requires({self.claim!r}, all_of={list(self.values)!r})"
+        args = ", ".join(repr(v) for v in (self.claim, *self.values))
+        return f"Requires({args})"
 
 
 def get_default_permission_classes() -> list[BasePermission]:

@@ -21,7 +21,7 @@ from bolt_mcp.oauth.tokens import sha256_hex
 from django.conf import settings
 from django.contrib.auth import get_user_model
 
-from django_bolt import BoltAPI, HasPermission
+from django_bolt import BoltAPI, Requires
 from django_bolt.testing import TestClient
 
 ISSUER = "http://localhost:8000"
@@ -45,7 +45,7 @@ def _build(**server_kwargs):
     async def greet(name: str) -> dict:
         return {"greeting": f"Hello, {name}!"}
 
-    @mcp.tool(guards=[HasPermission("reports:read")])
+    @mcp.tool(guards=[Requires("permissions", "reports:read")])
     async def secret() -> dict:
         return {"ok": True}
 

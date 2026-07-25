@@ -58,6 +58,76 @@ def test_cookie_jwt_over_real_server(make_server_project):
         assert via_header.status_code == 200, via_header.text
 
 
+def test_cookie_csrf_over_real_server(make_server_project):
+    """Cookie CSRF uses the effective request origin on the real HTTP path."""
+    project = make_server_project(api_module=app_module("jwt_cookie_user"))
+    token = make_token("cookie-user")
+
+    with project.start() as server:
+        cookie = {"Cookie": f"access_token={token}"}
+        http_origin = server.base_url
+        https_origin = f"https://{server.host}:{server.port}"
+
+        cross_site = server.request(
+            "POST",
+            "/write",
+            headers={**cookie, "Sec-Fetch-Site": "cross-site"},
+        )
+        assert cross_site.status_code == 403, cross_site.text
+
+        same_origin = server.request(
+            "POST",
+            "/write",
+            headers={**cookie, "Sec-Fetch-Site": "same-origin"},
+        )
+        assert same_origin.status_code == 200, same_origin.text
+
+        matching_origin = server.request(
+            "POST",
+            "/write",
+            headers={**cookie, "Origin": http_origin},
+        )
+        assert matching_origin.status_code == 200, matching_origin.text
+
+        referer_only = server.request(
+            "POST",
+            "/write",
+            headers={**cookie, "Referer": f"{http_origin}/some/page"},
+        )
+        assert referer_only.status_code == 200, referer_only.text
+
+        same_site = server.request(
+            "POST",
+            "/write",
+            headers={**cookie, "Sec-Fetch-Site": "same-site"},
+        )
+        assert same_site.status_code == 403, same_site.text
+
+        wrong_scheme = server.request(
+            "POST",
+            "/write",
+            headers={**cookie, "Origin": https_origin},
+        )
+        assert wrong_scheme.status_code == 403, wrong_scheme.text
+
+        forwarded_scheme = server.request(
+            "POST",
+            "/write",
+            headers={
+                **cookie,
+                "Origin": https_origin,
+                "X-Forwarded-Proto": "https",
+            },
+        )
+        assert forwarded_scheme.status_code == 200, forwarded_scheme.text
+
+        no_origin_signal = server.request("POST", "/write", headers=cookie)
+        assert no_origin_signal.status_code == 403, no_origin_signal.text
+
+        safe_method = server.get("/whoami", headers=cookie)
+        assert safe_method.status_code == 200, safe_method.text
+
+
 def test_custom_get_user_over_real_server(make_server_project):
     """request.user loads via the subclass's get_user in a real server.
 

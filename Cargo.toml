@@ -25,9 +25,7 @@ mimalloc = ["dep:mimalloc"]
 pyo3 = { version = "0.29", features = ["abi3-py312", "chrono"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 actix-web = { version = "4", features = ["compress-gzip", "compress-brotli", "compress-zstd", "cookies"] }
-cookie = "0.18"  # RFC 6265 compliant cookie handling
 actix-http = "3"
-actix-cors = "0.7"
 actix-web-actors = "4"  # WebSocket support
 actix = "0.13"  # Actor framework for WebSocket
 actix-files = "0.6"
@@ -36,7 +34,8 @@ socket2 = { version = "0.6", features = ["all"] }
 matchit = "0.9"
 # Middleware dependencies
 governor = "0.10"  # Rate limiting
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }  # JWT authentication
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }  # JWT authentication
+base64 = "0.22"  # base64url token-segment decoding for the JWT validation loop
 dashmap = "6"  # Fast concurrent hashmap for rate limiting
 parking_lot = "0.12"  # Fast RwLock for shared state
 serde = { version = "1", features = ["derive"] }
@@ -62,7 +61,7 @@ actix-multipart = "0.7"
 serde_urlencoded = "0.7"
 tempfile = "3"
 log = "0.4"
-notify = "6"
+notify = "8"
 ctrlc = "3"
 libc = "0.2"
 

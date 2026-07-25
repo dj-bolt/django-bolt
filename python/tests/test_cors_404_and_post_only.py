@@ -15,7 +15,7 @@ import jwt
 import pytest
 
 from django_bolt import BoltAPI
-from django_bolt.auth import IsAdminUser, IsAuthenticated, JWTAuthentication
+from django_bolt.auth import IsAuthenticated, JWTAuthentication, Requires
 from django_bolt.middleware import cors
 from django_bolt.testing import TestClient
 
@@ -428,7 +428,7 @@ class TestCorsOnErrorResponses:
         @api.get(
             "/admin-only",
             auth=[JWTAuthentication(secret="test-secret")],
-            guards=[IsAdminUser()],
+            guards=[Requires("is_superuser", True)],
         )
         async def admin_endpoint():
             return {"message": "admin only"}
@@ -500,7 +500,7 @@ class TestCorsOnErrorResponses:
         @api.get(
             "/admin-with-cors",
             auth=[JWTAuthentication(secret="test-secret")],
-            guards=[IsAdminUser()],
+            guards=[Requires("is_superuser", True)],
         )
         @cors(origins=["https://route-level.com"])
         async def admin_with_cors():

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from django.db import IntegrityError
 
 from django_bolt.auth.revocation import (
     _DEFAULT_TTL_SECONDS,
@@ -44,6 +45,12 @@ def test_in_memory_accepts_exp_kwarg():
     store = InMemoryRevocation()
     asyncio.run(store.revoke("tok", exp=int(time.time()) + 3600))
     assert asyncio.run(store.is_revoked("tok")) is True
+
+
+def test_in_memory_consume_is_single_use():
+    store = InMemoryRevocation()
+    assert asyncio.run(store.consume("tok")) is True
+    assert asyncio.run(store.consume("tok")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +146,39 @@ def test_cache_revocation_per_call_exp_beats_per_instance_default():
     assert 3598 <= timeout <= 3600
 
 
+def test_cache_consume_uses_atomic_add():
+    store, mock_cache = _make_cache_revocation()
+    mock_cache.add.side_effect = [True, False]
+
+    assert asyncio.run(store.consume("single-use")) is True
+    assert asyncio.run(store.consume("single-use")) is False
+    assert mock_cache.add.call_count == 2
+
+
+def test_cache_first_version_bump_seeds_with_atomic_add():
+    store, mock_cache = _make_cache_revocation()
+    mock_cache.incr.side_effect = [ValueError, 2]
+    mock_cache.add.return_value = False
+
+    assert asyncio.run(store.bump_user_version("u")) == 2
+    mock_cache.add.assert_called_once_with("revoked:ver:u", 1, timeout=None)
+
+
+def test_file_cache_is_rejected_for_atomic_operations():
+    store = DjangoCacheRevocation()
+
+    class FileCache:
+        def add(self, *args, **kwargs):
+            return True
+
+    FileCache.__module__ = "django.core.cache.backends.filebased"
+    mock_cache = FileCache()
+    store._cache = mock_cache
+
+    with pytest.raises(NotImplementedError, match="atomic"):
+        asyncio.run(store.consume("tok"))
+
+
 # ---------------------------------------------------------------------------
 # DjangoORMRevocation – revoke() behavior
 # ---------------------------------------------------------------------------
@@ -216,6 +256,14 @@ def test_orm_revocation_per_instance_default_ttl():
     expected_min = before + timedelta(seconds=900)
     expected_max = after + timedelta(seconds=900)
     assert expected_min <= expires_at <= expected_max
+
+
+def test_orm_consume_returns_false_on_duplicate():
+    store, mock_model = _make_orm_revocation()
+    mock_model.objects.acreate = AsyncMock(side_effect=[None, IntegrityError])
+
+    assert asyncio.run(store.consume("single-use")) is True
+    assert asyncio.run(store.consume("single-use")) is False
 
 
 # ---------------------------------------------------------------------------

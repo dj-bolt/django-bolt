@@ -54,8 +54,12 @@ pub fn get_rate_limit_body(retry_after: u64) -> Vec<u8> {
 /// The benefit: no heap allocation for the response body
 #[inline]
 pub fn error_401() -> HttpResponse {
+    // RFC 6750 §3: a 401 to a request for a Bearer-protected resource
+    // carries a WWW-Authenticate challenge. No error attribute is included
+    // (the failure reason is deliberately not disclosed to clients).
     HttpResponse::Unauthorized()
         .content_type("application/json")
+        .insert_header(("WWW-Authenticate", "Bearer"))
         .body(ERROR_BODY_401)
 }
 

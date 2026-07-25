@@ -95,7 +95,7 @@ The generated token includes:
 
 !!! note "Permissions not included by default"
 
-    Permissions are NOT automatically included in the token. To use `HasPermission` guards, pass permissions via `extra_claims`:
+    Permissions are NOT automatically included in the token. To guard on them with `Requires("permissions", ...)`, pass permissions via `extra_claims`:
 
     ```python
     token = create_jwt_for_user(
@@ -186,9 +186,72 @@ JWTAuthentication(
 
 Supported algorithms:
 
-- `HS256`, `HS384`, `HS512` - HMAC with SHA-2
-- `RS256`, `RS384`, `RS512` - RSA with SHA-2
-- `ES256`, `ES384`, `ES512` - ECDSA with SHA-2
+- `HS256`, `HS384`, `HS512` - HMAC with SHA-2 (`secret` is the shared secret)
+- `RS256`, `RS384`, `RS512` - RSA with SHA-2 (`secret` is a PEM public key)
+- `PS256`, `PS384`, `PS512` - RSA-PSS with SHA-2 (`secret` is a PEM public key)
+- `ES256`, `ES384` - ECDSA with SHA-2 (`secret` is a PEM public key)
+- `EdDSA` - Ed25519 (`secret` is a PEM public key)
+
+All algorithms configured on a single backend must use the same kind of
+key; you cannot mix `HS256` with `RS256`. Configuration errors — an
+unknown algorithm name, algorithms from different key families, or a key
+that is not valid PEM — stop the server at startup with a descriptive
+error, rather than silently rejecting every token at runtime.
+
+### Verifying tokens from an identity provider
+
+If your users sign in through an external identity provider such as
+Clerk, Auth0, or Okta, the provider signs its tokens with an asymmetric
+algorithm and publishes the corresponding public key. Pass the key with
+`public_key=` and name the matching algorithm:
+
+```python
+JWTAuthentication(
+    public_key=CLERK_PEM_PUBLIC_KEY,  # from the provider's dashboard
+    algorithms=["RS256"],
+    issuer="https://your-app.clerk.accounts.dev",
+)
+```
+
+Most providers also publish their keys as a JSON Web Key Set and rotate
+them periodically, identifying each key with a `kid` header on the token.
+To use the key set instead of a single key, point `jwks_url=` at the
+provider's JWKS endpoint:
+
+```python
+JWTAuthentication(
+    jwks_url="https://your-tenant.auth0.com/.well-known/jwks.json",
+    algorithms=["RS256"],
+    issuer="https://your-tenant.auth0.com/",
+    audience="https://api.example.com",
+)
+```
+
+`jwks_url` must be an absolute HTTPS URL and must be paired with both
+`issuer=` and `audience=`. This binds accepted tokens to the intended
+provider and API instead of accepting another application's token merely
+because the provider signed it. The key set is fetched when the server
+starts and parsed into per-`kid` verification keys. It is refreshed every
+`jwks_refresh_interval` seconds and immediately when a token names an unknown
+`kid`. Refreshes are single-flight within a process, and a provider outage
+leaves the last known-good keys active.
+
+OIDC discovery can supply the issuer, JWKS endpoint, and signing algorithms:
+
+```python
+JWTAuthentication(
+    oidc_issuer="https://issuer.example",
+    audience="my-api",
+)
+```
+
+The issuer must be HTTPS. Django-Bolt fetches its
+`/.well-known/openid-configuration` document and rejects discovery documents
+without an issuer or JWKS URI.
+
+To supply a key set directly rather than fetching it — in tests, or in
+deployments without network access — pass the document itself as `jwks=`,
+either as a dict or a JSON string.
 
 ### Cookie-based tokens
 
@@ -219,6 +282,216 @@ auth=[
     JWTAuthentication(),
 ]
 ```
+
+### Cross-site request forgery protection
+
+Browsers attach cookies to requests automatically, including requests
+made from other sites. Django-Bolt endpoints do not run Django's
+`CsrfViewMiddleware`, so cookie authentication provides its own CSRF
+protection, enabled by default.
+
+When a backend successfully authenticates from a cookie, any
+state-changing request (a method other than `GET`, `HEAD`, `OPTIONS`, or
+`TRACE`) must show it originated from your own site. The check runs in
+Rust after selecting the accepted credential. The browser-set
+`Sec-Fetch-Site` header
+is used when present; otherwise the origin of the `Origin` (or
+`Referer`) header — scheme and host — is compared against the request's
+effective scheme (honoring `X-Forwarded-Proto` behind a proxy) and
+`Host`. HTTP and HTTPS are different origins, so an
+`Origin: http://example.com` never authorizes an HTTPS request to
+`example.com`. Requests that fail the check receive a `403 Forbidden`
+response.
+
+The check applies only when the accepted credential came from the cookie
+backend. Requests authenticated some other way — for example, through
+the header backend of a route that registers both backends as above —
+are not affected, even if the request also carries a stale cookie.
+
+!!! note "Non-browser clients"
+
+    Clients other than browsers do not usually send `Sec-Fetch-Site`,
+    `Origin`, or `Referer`, so their state-changing requests with the
+    cookie will be rejected. Have such clients send the token in the
+    `Authorization` header instead. If that isn't possible, disable the
+    check with `csrf=False` and provide equivalent protection yourself.
+
+## Access and refresh tokens
+
+Issuing a single long-lived token means a stolen token stays valid until
+it expires. The usual remedy is the dual-token pattern: a short-lived
+**access token** sent on every request, and a long-lived **refresh
+token**, sent only to a rotation endpoint, that is exchanged for fresh
+access tokens as they expire. Django-Bolt implements this pattern with
+`create_token_pair()`, `rotate_refresh_token()`, and
+`set_token_cookies()`.
+
+For the conventional password-and-cookie flow, `JWTAuthViews` registers all
+four routes and documents them in OpenAPI:
+
+```python
+from django_bolt.auth import InMemoryRevocation, JWTAuthViews
+
+auth_views = JWTAuthViews(store=InMemoryRevocation())
+auth_views.register(api)
+```
+
+This adds `POST /auth/login`, `/auth/refresh`, `/auth/logout`, and
+`/auth/logout-all`. Supply `credential_validator=` when credentials are not a
+username/password pair; lower-level helpers remain available for fully custom
+flows.
+
+### Issuing a pair
+
+Call `create_token_pair()` once the user has proved who they are — by
+password, magic link, OAuth callback, or any other flow:
+
+```python
+from django.contrib.auth import aauthenticate
+from django_bolt.auth import create_token_pair, set_token_cookies
+from django_bolt.exceptions import Unauthorized
+from django_bolt.responses import JSON
+
+@api.post("/auth/login")
+async def login(credentials: LoginRequest):
+    user = await aauthenticate(
+        username=credentials.username,
+        password=credentials.password,
+    )
+    if user is None:
+        raise Unauthorized(detail="Invalid credentials")
+
+    pair = create_token_pair(user, method="pwd")
+    response = JSON({"status": "ok"})
+    return set_token_cookies(response, pair, refresh_path="/auth/refresh")
+```
+
+`set_token_cookies()` attaches both tokens as `HttpOnly`, `Secure`,
+`SameSite=Lax` cookies. Pass `refresh_path=` with the path of your
+rotation endpoint: the refresh cookie is then scoped to that path, so
+the browser sends it only when refreshing, never on ordinary API
+requests.
+
+Access tokens live for 15 minutes by default and refresh tokens for 7
+days; change these with `access_ttl=` and `refresh_ttl=`. Add extra
+claims with `claims=`. The lifecycle claims the pair is built on —
+`sub`, `iat`, `exp`, `typ`, `jti`, `fam`, `oat`, and `ver` — are
+reserved, and attempting to override one raises `ValueError`.
+
+### The rotation endpoint
+
+The rotation endpoint authenticates with `token_type="refresh"`, which
+accepts only tokens carrying the claim `typ: "refresh"`. Conversely,
+every route configured *without* `token_type=` rejects refresh tokens,
+so a refresh token can never authenticate a normal endpoint. Both checks
+run in Rust before your handler is called.
+
+```python
+from django_bolt.auth import (
+    DjangoCacheRevocation,
+    IsAuthenticated,
+    JWTAuthentication,
+    TokenRotationError,
+    rotate_refresh_token,
+    set_token_cookies,
+)
+from django_bolt.exceptions import Unauthorized
+from django_bolt.responses import JSON
+
+store = DjangoCacheRevocation()
+
+@api.post(
+    "/auth/refresh",
+    auth=[JWTAuthentication(cookie="refresh_token", token_type="refresh")],
+    guards=[IsAuthenticated()],
+)
+async def refresh(request):
+    claims = request["context"]["auth_claims"]
+    try:
+        pair = await rotate_refresh_token(claims, store=store)
+    except TokenRotationError:
+        raise Unauthorized(detail="Invalid refresh token")
+
+    response = JSON({"status": "ok"})
+    return set_token_cookies(response, pair, refresh_path="/auth/refresh")
+```
+
+By the time your handler runs, the token's signature, expiry, and type
+have already been verified in Rust. `rotate_refresh_token()` performs
+the stateful checks against the revocation store, atomically consumes the
+old refresh token, and returns a new pair. A custom store used for full
+rotation must implement `consume(jti, *, exp=None)` as an atomic
+check-and-set and support family revocation; rotation fails closed if it
+cannot. If the validating `JWTAuthentication` uses a non-default `leeway`,
+pass the same value to `rotate_refresh_token()` so consumed tokens remain
+blocked throughout the validator's clock-skew window.
+
+Rotating the refresh token on every use provides **reuse detection**.
+Each pair belongs to a rotation family (the `fam` claim); a refresh
+token presented again after it has been rotated out is treated as
+stolen, and the whole family is revoked, ending the session for whoever
+holds any of its tokens. If you prefer to issue only new access tokens
+and leave the refresh token in place, pass `rotate=False`; this mode
+gives up reuse detection.
+
+Custom claims are not copied from the old token during rotation, since
+they may have gone stale since the original login. Re-derive any claims
+you need and pass them with `claims=`.
+
+!!! note "Return a generic error"
+
+    Catch `TokenRotationError` and return a uniform `401`. The exception
+    message records why rotation failed — revoked, reused, stale
+    version, or an expired session — and that detail should not reach
+    the client.
+
+### Logging a user out everywhere
+
+Revocation stores keep a version number for each user, and every token
+pair records the version it was minted under (the `ver` claim). Calling
+`bump_user_version()` increments the stored version; refresh tokens
+minted before the bump fail rotation from then on:
+
+```python
+@api.post("/auth/logout-all", auth=[jwt_auth], guards=[IsAuthenticated()])
+async def logout_all(request):
+    await store.bump_user_version(request["context"]["user_id"])
+    return {"status": "logged out everywhere"}
+```
+
+This is a single O(1) write; you do not need to find and revoke each
+outstanding token.
+
+!!! note "Access tokens run out their lifetime"
+
+    Access tokens are deliberately not checked against the store on each
+    request — that is what makes them cheap to validate. A user who is
+    "logged out everywhere" can therefore keep using an existing access
+    token until it expires. Keep access lifetimes short; with the
+    default 15 minutes, that is the longest such a token can survive.
+
+### Limiting total session length
+
+Every pair carries an `oat` (origin auth time) claim recording when the
+user originally authenticated. The value is copied unchanged across
+rotations, so it can bound the total length of a session no matter how
+many times the session refreshes:
+
+```python
+pair = await rotate_refresh_token(
+    claims,
+    store=store,
+    max_session_lifetime=86400 * 30,  # require sign-in again after 30 days
+)
+```
+
+Once the cap is exceeded, rotation raises `TokenRotationError` and the
+user must sign in again. Two related guarantees hold whenever the cap is
+configured: a refresh token *without* an `oat` claim (for example, one
+minted outside this module) fails closed rather than being re-minted
+with a fresh origin time, and the access token issued by a rotation is
+clamped to the session's remaining lifetime so it can never outlive the
+cap.
 
 ## API key authentication
 
@@ -533,9 +806,12 @@ store = DjangoCacheRevocation(
 )
 ```
 
-Works with any Django cache backend (Redis, Memcached, locmem, etc.).
-Recommended for multi-process deployments — entries are visible to all
-workers via the shared cache.
+Basic revocation works with any real Django cache backend. Refresh
+rotation and version bumps require atomic `add`/`incr`; use Redis or
+Memcached for multi-process production deployments. LocMem is suitable
+only for a single process. File-based, database, dummy, and other
+non-atomic caches are rejected for these operations. Configure the cache so security entries are not
+evicted before their TTL.
 
 ### Django ORM revocation
 

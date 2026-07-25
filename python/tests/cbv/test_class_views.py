@@ -240,10 +240,10 @@ def test_bolt_api_view_class_level_guards(api):
 
 def test_bolt_api_view_route_level_guard_override(api):
     """Test route-level guards override class-level guards."""
-    from django_bolt.auth.guards import IsAdminUser  # noqa: PLC0415
+    from django_bolt.auth.guards import Requires  # noqa: PLC0415
 
     # Override with route-level guards
-    @api.view("/admin", guards=[IsAdminUser()])
+    @api.view("/admin", guards=[Requires("is_superuser", True)])
     class ViewWithClassGuards(APIView):
         guards = [IsAuthenticated()]
 
@@ -255,8 +255,9 @@ def test_bolt_api_view_route_level_guard_override(api):
     middleware_meta = api._handler_middleware.get(handler_id)
     assert middleware_meta is not None
     assert len(middleware_meta["guards"]) == 1
-    # Should be is_superuser (IsAdminUser's guard_name), not is_authenticated
-    assert middleware_meta["guards"][0]["type"] == "is_superuser"
+    # Should be the is_superuser Requires check, not is_authenticated
+    assert middleware_meta["guards"][0]["type"] == "requires"
+    assert middleware_meta["guards"][0]["claim"] == "is_superuser"
 
 
 def test_bolt_api_view_class_level_auth(api):

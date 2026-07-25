@@ -312,14 +312,14 @@ api = BoltAPI(
 For staff-only API access:
 
 ```python
-from django_bolt.auth import JWTAuthentication, IsStaff
+from django_bolt.auth import JWTAuthentication, Requires
 
 api = BoltAPI(
     openapi_config=OpenAPIConfig(
         title="My API",
         version="1.0.0",
         auth=[JWTAuthentication()],
-        guards=[IsStaff()],
+        guards=[Requires("is_staff", True)],
     )
 )
 ```

@@ -25,7 +25,7 @@ import msgspec
 from bolt_mcp import MCP, AuthorizationServer, Context, principal
 from users.models import User
 
-from django_bolt import BoltAPI, HasPermission, IsAdminUser, IsAuthenticated, Request
+from django_bolt import BoltAPI, IsAuthenticated, Request, Requires
 
 api = BoltAPI()
 # Stateful (the default): required by the sample/elicit tools below. Run --processes 1.
@@ -138,7 +138,7 @@ async def show_settings(ctx: Context) -> dict:
 #
 #   whoami       — any signed-in user (IsAuthenticated)
 #   read_report  — needs the "reports:read" permission  → make the user is_staff
-#   purge_users  — needs a superuser (IsAdminUser)       → make the user is_superuser
+#   purge_users  — needs a superuser                     → make the user is_superuser
 @mcp.tool(guards=[IsAuthenticated()])
 async def whoami(request: Request) -> dict:
     """Return the authenticated principal — requires any signed-in user (IsAuthenticated)."""
@@ -151,15 +151,15 @@ async def whoami(request: Request) -> dict:
     }
 
 
-@mcp.tool(guards=[HasPermission("reports:read")])
+@mcp.tool(guards=[Requires("permissions", "reports:read")])
 async def read_report() -> dict:
     """Return a confidential report — requires the 'reports:read' permission."""
     return {"report": "Q3 revenue up 42%", "classification": "confidential"}
 
 
-@mcp.tool(guards=[IsAdminUser()])
+@mcp.tool(guards=[Requires("is_superuser", True)])
 async def purge_users() -> dict:
-    """Admin-only tool — requires a superuser (IsAdminUser)."""
+    """Admin-only tool — requires a superuser."""
     return {"purged": 0, "note": "demo: no users were harmed"}
 
 

@@ -1008,7 +1008,17 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 &route_meta.auth_backends,
                 &route_meta.guards,
             ) {
-                AuthGuardResult::Allow(ctx) => ctx,
+                AuthGuardResult::Allow(ctx) => {
+                    let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
+                    if requires_csrf {
+                        let scheme = req.connection_info().scheme().to_owned();
+                        if crate::validation::cookie_csrf_blocks(method, headers_map, true, &scheme)
+                        {
+                            return responses::error_403();
+                        }
+                    }
+                    ctx
+                }
                 AuthGuardResult::Unauthorized => {
                     // CORS headers will be added by CorsMiddleware
                     return responses::error_401();
