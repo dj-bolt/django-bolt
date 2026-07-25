@@ -89,6 +89,20 @@ def test_cookie_csrf_over_real_server(make_server_project):
         )
         assert matching_origin.status_code == 200, matching_origin.text
 
+        referer_only = server.request(
+            "POST",
+            "/write",
+            headers={**cookie, "Referer": f"{http_origin}/some/page"},
+        )
+        assert referer_only.status_code == 200, referer_only.text
+
+        same_site = server.request(
+            "POST",
+            "/write",
+            headers={**cookie, "Sec-Fetch-Site": "same-site"},
+        )
+        assert same_site.status_code == 403, same_site.text
+
         wrong_scheme = server.request(
             "POST",
             "/write",
