@@ -262,6 +262,16 @@ class TestRotation:
             await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET)
 
     @pytest.mark.asyncio
+    async def test_family_revoked_blocks_mode_b(self):
+        """A burned family must not keep minting access tokens via rotate=False."""
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        await store.revoke_family(pair.refresh_claims["fam"])
+
+        with pytest.raises(TokenRotationError, match="family"):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, rotate=False)
+
+    @pytest.mark.asyncio
     async def test_missing_jti_rejected(self):
         store = InMemoryRevocation()
         with pytest.raises(TokenRotationError, match="jti"):

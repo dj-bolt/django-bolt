@@ -218,16 +218,19 @@ async def rotate_refresh_token(
     fam = refresh_claims.get("fam")
     if rotate and (not isinstance(fam, str) or not fam):
         raise TokenRotationError("Rotating refresh token missing family id")
-    if rotate and await _is_family_revoked(store, fam):
+    # A revoked family blocks both modes: family revocation is the "kill this
+    # session" switch, and a reusable (Mode B) token must not outlive it.
+    if isinstance(fam, str) and fam and await _is_family_revoked(store, fam):
         raise TokenRotationError("Refresh token family revoked")
 
     now = int(time.time())
     if leeway < 0:
         raise ValueError("leeway must be >= 0")
 
-    # Mode B deliberately keeps the refresh token reusable, so it only checks
-    # ordinary revocation. Mode A consumes atomically below, immediately
-    # before minting, after all other validation has succeeded.
+    # Mode B deliberately keeps the refresh token reusable, so it checks only
+    # revocation state (jti here, family above). Mode A consumes atomically
+    # below, immediately before minting, after all other validation has
+    # succeeded.
     if not rotate and await store.is_revoked(jti):
         raise TokenRotationError("Refresh token revoked")
 
