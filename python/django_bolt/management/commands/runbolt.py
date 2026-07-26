@@ -9,8 +9,9 @@ import importlib.util
 import os
 import signal
 import sys
+import time
 import traceback
-import warnings
+from datetime import datetime
 from pathlib import Path
 
 from django.apps import apps
@@ -39,7 +40,42 @@ except ImportError:
 
 _ENV_DEV_WORKER = "DJANGO_BOLT_DEV_WORKER"
 _ENV_DEV_RELOAD_COUNT = "DJANGO_BOLT_DEV_RELOAD_COUNT"
+_ENV_DEV_SPAWN_MS = "DJANGO_BOLT_DEV_SPAWN_UNIX_MS"
 DEV_RELOAD_DEBOUNCE_MS = 50
+
+
+class _Ansi:
+    """Minimal ANSI palette; every attribute is '' when colors are disabled."""
+
+    __slots__ = ("bold", "dim", "cyan", "green", "reset")
+
+    def __init__(self, enabled: bool) -> None:
+        self.bold = "\033[1m" if enabled else ""
+        self.dim = "\033[2m" if enabled else ""
+        self.cyan = "\033[36m" if enabled else ""
+        self.green = "\033[32m" if enabled else ""
+        self.reset = "\033[0m" if enabled else ""
+
+
+_GLYPHS_UNICODE = {"bolt": "⚡ ", "arrow": "➜", "check": "✓", "sep": " · "}
+_GLYPHS_ASCII = {"bolt": "", "arrow": "->", "check": "*", "sep": " - "}
+
+
+def _pick_glyphs(stream) -> dict[str, str]:
+    """Unicode glyphs when the output encoding supports them, ASCII otherwise."""
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        "⚡➜✓·".encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return _GLYPHS_ASCII
+    return _GLYPHS_UNICODE
+
+
+def _format_elapsed(ms: float) -> str:
+    if ms < 1000:
+        return f"{ms:.0f} ms"
+    return f"{ms / 1000:.1f} s"
+
 
 DEV_RELOAD_IGNORE_DIRS = (
     ".git",
@@ -96,13 +132,55 @@ def _collapse_watch_paths(paths: set[Path]) -> list[Path]:
     return collapsed
 
 
-def _build_dev_worker_command(argv: list[str] | None = None, executable: str | None = None) -> list[str]:
+_UNSET = object()
+
+
+def _dev_worker_main_module(main_module=_UNSET) -> str | None:
+    """Return the ``-m`` module the process was started with, or ``None``.
+
+    ``python -m pkg.manage`` rewrites ``sys.argv[0]`` to manage.py's resolved
+    file path, so the ``-m`` context survives only on ``__main__.__spec__``.
+    Plain ``python manage.py`` runs leave ``__spec__`` as ``None`` (some
+    environments omit the attribute entirely), which means script mode.
+    """
+    if main_module is _UNSET:
+        main_module = sys.modules.get("__main__")
+
+    spec = getattr(main_module, "__spec__", None)
+    if spec is None:
+        return None
+
+    name = getattr(spec, "name", None) or ""
+    parent = getattr(spec, "parent", None) or ""
+
+    # `python -m pkg` executes pkg/__main__.py; respawn the package, not the file.
+    if (name == "__main__" or name.endswith(".__main__")) and parent:
+        return parent
+
+    return name or None
+
+
+def _build_dev_worker_command(
+    argv: list[str] | None = None,
+    executable: str | None = None,
+    main_module: str | None = None,
+) -> list[str]:
+    """Rebuild this process's command line for the dev worker.
+
+    ``main_module`` is the ``-m`` module name from
+    :func:`_dev_worker_main_module` (``None`` for script invocations). It must be
+    preserved: re-running a ``-m``-launched manage.py as a script puts the
+    script's own directory at the head of ``sys.path`` instead of the cwd, so a
+    project whose manage.py lives inside the package it imports from (a "src
+    layout", ``src/manage.py`` with ``src.project.settings``) can no longer
+    import its own settings module.
+    """
     argv = sys.argv if argv is None else argv
     executable = sys.executable if executable is None else executable
 
-    command = [executable]
+    command = [executable, "-m", main_module] if main_module else [executable, *argv[:1]]
     saw_processes = False
-    it = iter(argv)
+    it = iter(argv[1:])
 
     for arg in it:
         if arg == "--dev" or arg.startswith("--dev="):
@@ -190,6 +268,10 @@ def _module_spec_watch_paths(module_name: str) -> set[Path]:
 def _collect_autodiscovery_python_paths() -> set[Path]:
     module_names: set[str] = set()
 
+    for api_path in getattr(settings, "BOLT_API", None) or ():
+        if ":" in api_path:
+            module_names.add(api_path.split(":", 1)[0])
+
     settings_module = getattr(settings, "SETTINGS_MODULE", None)
     if settings_module:
         module_names.add(settings_module)
@@ -221,7 +303,65 @@ def _collect_autodiscovery_python_paths() -> set[Path]:
     return project_paths
 
 
-def _collect_dev_watch_paths() -> list[str]:
+def _autodiscovery_import_module_names() -> list[str]:
+    """Module names that autodiscover_apis() will import at worker startup.
+
+    Explicit BOLT_API entries win, mirroring autodiscovery. Otherwise the
+    project-level and per-app api module candidates are gated by the same AST
+    scan autodiscovery uses, so modules without a BoltAPI assignment are never
+    imported here either.
+    """
+    bolt_api_paths = getattr(settings, "BOLT_API", None)
+    if bolt_api_paths:
+        return [api_path.split(":", 1)[0] for api_path in bolt_api_paths if ":" in api_path]
+
+    module_names: list[str] = []
+
+    root_urlconf = getattr(settings, "ROOT_URLCONF", None)
+    if root_urlconf:
+        for module_name in _project_api_module_names(root_urlconf):
+            if find_bolt_api_names(module_name):
+                module_names.append(module_name)
+
+    if apps.ready:
+        for app_config in apps.get_app_configs():
+            if app_config.name == "django_bolt":
+                continue
+            if hasattr(app_config, "bolt_api") and ":" in app_config.bolt_api:
+                module_names.append(app_config.bolt_api.split(":", 1)[0])
+                continue
+            for module_suffix in ("api", "bolt_api"):
+                module_name = f"{app_config.name}.{module_suffix}"
+                if find_bolt_api_names(module_name):
+                    module_names.append(module_name)
+
+    return module_names
+
+
+def _prime_dev_watch_imports() -> None:
+    """Import discovered API modules so their transitive imports get watched.
+
+    The dev supervisor never runs autodiscovery itself, so sys.modules only
+    holds what django.setup() loaded — without these imports the watch list
+    misses everything api.py imports (helpers, service layers) and edits to
+    those files never trigger a reload. Import failures are non-fatal: the
+    worker surfaces the real error on its own startup, and the api module file
+    itself stays watched (via its module spec) so fixing it triggers a reload.
+    """
+    for module_name in _autodiscovery_import_module_names():
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001 - user code can raise anything at import
+            print(
+                f"[bolt] Warning: failed to import {module_name!r} while building the "
+                f"dev watch list ({exc}); files it imports won't trigger auto-reload",
+                file=sys.stderr,
+            )
+
+
+def _collect_dev_watch_paths(reload_dirs: list[str] | None = None) -> list[str]:
+    _prime_dev_watch_imports()
+
     watch_paths: set[Path] = set(_collect_loaded_python_paths())
     watch_paths.update(_collect_autodiscovery_python_paths())
 
@@ -230,12 +370,27 @@ def _collect_dev_watch_paths() -> list[str]:
         if path is not None and path.exists():
             watch_paths.add(path)
 
-    if not watch_paths:
-        base_dir = _coerce_path(getattr(settings, "BASE_DIR", None))
-        if base_dir is not None and base_dir.exists():
-            watch_paths.add(base_dir)
+    # Escape hatch for code outside both the project root and the import
+    # graph (e.g. a shared library next to the project).
+    for reload_dir in reload_dirs or ():
+        path = _coerce_path(reload_dir)
+        if path is not None and path.exists():
+            watch_paths.add(path)
         else:
-            watch_paths.add(Path.cwd().resolve())
+            print(
+                f"[bolt] Warning: --reload-dir {str(reload_dir)!r} "
+                "does not exist; it will not be watched for auto-reload",
+                file=sys.stderr,
+            )
+
+    # Uvicorn-style default: always watch the project root recursively so
+    # newly created modules and packages reload without a dev-server restart.
+    # Import-graph entries inside the root collapse into it; entries outside
+    # (PYTHONPATH apps, editable installs) stay individually watched.
+    project_root = _coerce_path(getattr(settings, "BASE_DIR", None))
+    if project_root is None or not project_root.exists():
+        project_root = Path.cwd().resolve()
+    watch_paths.add(project_root)
 
     return [str(path) for path in _collapse_watch_paths(watch_paths)]
 
@@ -385,6 +540,19 @@ class Command(BaseCommand):
             help="Disable Django admin integration (admin enabled by default)",
         )
         parser.add_argument("--dev", action="store_true", help="Enable auto-reload on file changes (development mode)")
+        parser.add_argument(
+            "--reload-dir",
+            action="append",
+            default=[],
+            dest="reload_dirs",
+            metavar="PATH",
+            help=(
+                "Watch this extra directory (or file) for --dev auto-reload; "
+                "repeatable. The project root and the app's import graph are "
+                "watched by default, so this is only needed for code outside "
+                "both, e.g. a shared library next to the project."
+            ),
+        )
         parser.add_argument("--backlog", type=int, default=1024, help="Socket listen backlog size (default: 1024)")
         parser.add_argument(
             "--keep-alive", type=int, default=None, help="HTTP keep-alive timeout in seconds (default: OS setting)"
@@ -427,10 +595,14 @@ class Command(BaseCommand):
         return bool(options["max_rss"] or options["workers_lifetime"] or options["respawn_failed_workers"])
 
     def handle(self, *args, **options):
+        self._handle_started = time.monotonic()
         processes = options["processes"]
         dev_mode = options.get("dev", False)
         dev_worker_mode = os.environ.get(_ENV_DEV_WORKER) == "1"
         effective_dev_mode = dev_mode or dev_worker_mode
+
+        if options["reload_dirs"] and not effective_dev_mode:
+            self.stdout.write(self.style.WARNING("  Warning: --reload-dir is ignored without --dev"))
 
         # Dev mode: force single process + enable auto-reload
         if dev_mode and not dev_worker_mode:
@@ -451,8 +623,8 @@ class Command(BaseCommand):
 
     def run_with_autoreload(self, options):
         """Run the server behind the native dev supervisor."""
-        worker_command = _build_dev_worker_command()
-        watch_paths = _collect_dev_watch_paths()
+        worker_command = _build_dev_worker_command(main_module=_dev_worker_main_module())
+        watch_paths = _collect_dev_watch_paths(options["reload_dirs"])
         ignore_paths = _collect_dev_ignore_paths()
         force_polling = getattr(settings, "BOLT_DEV_FORCE_POLLING", False)
 
@@ -525,7 +697,7 @@ class Command(BaseCommand):
             lifetime_seconds=float(options["workers_lifetime"]) if options["workers_lifetime"] else None,
             respawn_failed=options["respawn_failed_workers"],
             kill_timeout=float(kill_timeout),
-            log=lambda message: self.stdout.write(f"  {message}"),
+            log=self._runtime_log,
         )
 
         def signal_handler(signum, frame):
@@ -568,7 +740,7 @@ class Command(BaseCommand):
                 if openapi_config.enabled:
                     merged_api._openapi_config = openapi_config
                     merged_api._register_openapi_routes()
-                    features.append(("OpenAPI", f"{banner_base_url}{openapi_config.path}"))
+                    features.append(("Docs", f"{banner_base_url}{openapi_config.path}"))
                 break
 
         # Check admin
@@ -627,13 +799,6 @@ class Command(BaseCommand):
         """Start a single process server"""
         is_dev_reload_restart = _is_dev_reload_restart()
 
-        if is_dev_reload_restart:
-            warnings.filterwarnings(
-                "ignore",
-                message=r"Sync handler '.*' at .* uses ORM operations .*Running in thread pool\.",
-                category=UserWarning,
-            )
-
         # Setup Django logging once at server startup (one-shot, respects existing LOGGING)
         if setup_django_logging is not None:
             setup_django_logging()
@@ -680,7 +845,7 @@ class Command(BaseCommand):
             # Transfer OpenAPI config to merged API
             merged_api._openapi_config = openapi_config
             merged_api._register_openapi_routes()
-            features.append(("OpenAPI", f"{banner_base_url}{openapi_config.path}"))
+            features.append(("Docs", f"{banner_base_url}{openapi_config.path}"))
 
         # Register Django admin routes if not disabled
         # Admin is controlled solely by --no-admin command-line flag
@@ -780,7 +945,14 @@ class Command(BaseCommand):
         # Print structured startup banner (only for main process or single-process mode)
         if process_id is None:
             if is_dev_reload_restart:
-                self.stdout.write(f"  ✨ Reloaded on {banner_base_url}")
+                c = self._ansi()
+                g = _pick_glyphs(self.stdout)
+                elapsed = self._startup_elapsed_ms()
+                timing = f" {c.dim}in {_format_elapsed(elapsed)}{c.reset}" if elapsed is not None else ""
+                self.stdout.write(
+                    f"  {c.green}{g['check']}{c.reset} {c.bold}Reloaded{c.reset}{timing}"
+                    f"  {c.cyan}{banner_base_url}{c.reset}"
+                )
             else:
                 self._print_startup_banner(
                     options=options,
@@ -831,6 +1003,36 @@ class Command(BaseCommand):
         except importlib.metadata.PackageNotFoundError:
             return "dev"
 
+    def _ansi(self) -> _Ansi:
+        """Palette derived from Django's own color handling (--no-color, --force-color)."""
+        cached = getattr(self, "_ansi_cache", None)
+        if cached is None:
+            enabled = self.style.SUCCESS("x") != "x" and "NO_COLOR" not in os.environ
+            cached = self._ansi_cache = _Ansi(enabled)
+        return cached
+
+    def _startup_elapsed_ms(self) -> float | None:
+        """Wall time since the process was spawned (dev worker) or handle() began."""
+        spawn_ms = os.environ.get(_ENV_DEV_SPAWN_MS)
+        if spawn_ms:
+            try:
+                elapsed = time.time() * 1000.0 - float(spawn_ms)
+            except ValueError:
+                elapsed = -1.0
+            # Guard against clock skew between the supervisor and worker.
+            if 0 <= elapsed < 600_000:
+                return elapsed
+        started = getattr(self, "_handle_started", None)
+        if started is None:
+            return None
+        return (time.monotonic() - started) * 1000.0
+
+    def _runtime_log(self, message: str) -> None:
+        """Timestamped post-startup log line (worker recycling, shutdown, ...)."""
+        c = self._ansi()
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.stdout.write(f"  {c.dim}{timestamp}{c.reset} {c.cyan}[bolt]{c.reset} {message}")
+
     def _print_startup_banner(
         self,
         *,
@@ -843,53 +1045,68 @@ class Command(BaseCommand):
         api_count: int,
         features: list[tuple[str, str]],
     ) -> None:
-        """Print a clean, structured startup banner."""
+        """Print a Vite-style startup banner: brand + timing, URL rows, dim meta rows."""
         version = self._get_version()
-        host = options["host"]
-        port = options["port"]
+        c = self._ansi()
+        g = _pick_glyphs(self.stdout)
+        sep = g["sep"]
         processes = options["processes"]
+        url = _build_display_url(options["host"], options["port"], dev_mode=dev_mode)
+
+        # Split features into URL rows (arrow lines) and meta rows (dim lines).
+        links: list[tuple[str, str]] = [("Local", url)]
+        meta_rows: list[tuple[str, str]] = []
+        for label, value in features:
+            if value.startswith("http"):
+                links.append((label, value))
+            else:
+                meta_rows.append((label, value))
+
         mode = "development" if dev_mode else "production"
-        url = _build_display_url(host, port, dev_mode=dev_mode)
+        if dev_mode:
+            mode += f"{sep}auto-reload"
 
-        # Determine label width for alignment
-        _LABEL_W = 16
-
-        def _line(label: str, value: str) -> str:
-            return f"  {label:<{_LABEL_W}}{value}"
-
-        lines: list[str] = []
-
-        # Header
-        lines.append("")
-        lines.append(self.style.SUCCESS(f"  Django Bolt v{version}"))
-        lines.append("")
-
-        # Server section
-        lines.append(self.style.MIGRATE_HEADING("  Server"))
-        lines.append(_line("URL", url))
-        lines.append(_line("Processes", str(processes)))
-        lines.append(_line("Mode", mode))
-        lines.append("")
-
-        # Routes section
-        lines.append(self.style.MIGRATE_HEADING("  Routes"))
-        lines.append(_line("API", f"{api_routes} routes from {api_count} app{'s' if api_count != 1 else ''}"))
+        route_bits = [f"{api_routes} API"]
         if ws_routes:
-            lines.append(_line("WebSocket", f"{ws_routes} routes"))
+            route_bits.append(f"{ws_routes} WebSocket")
         if asgi_mounts:
-            lines.append(_line("ASGI", f"{asgi_mounts} mounts"))
+            route_bits.append(f"{asgi_mounts} ASGI")
         if framework_routes:
-            lines.append(_line("Framework", f"+{framework_routes} (admin, docs)"))
+            route_bits.append(f"+{framework_routes} framework")
+        route_bits.append(f"{api_count} app{'s' if api_count != 1 else ''}")
+
+        meta_rows = [
+            ("Mode", mode),
+            ("Routes", sep.join(route_bits)),
+            ("Workers", f"{processes} process{'es' if processes != 1 else ''}"),
+            *meta_rows,
+        ]
+
+        header = f"  {g['bolt']}{c.bold}{c.cyan}Django Bolt{c.reset} {c.cyan}v{version}{c.reset}"
+        elapsed = self._startup_elapsed_ms()
+        if elapsed is not None:
+            header += f"  {c.dim}ready in{c.reset} {c.bold}{_format_elapsed(elapsed)}{c.reset}"
+
+        lines: list[str] = ["", header, ""]
+
+        link_w = max(len(label) for label, _ in links) + 2
+        for label, value in links:
+            lines.append(
+                f"  {c.green}{g['arrow']}{c.reset}  {c.bold}{label + ':':<{link_w}}{c.reset}{c.cyan}{value}{c.reset}"
+            )
         lines.append("")
 
-        # Features section (only if there are features)
-        if features:
-            lines.append(self.style.MIGRATE_HEADING("  Features"))
-            for label, value in features:
-                lines.append(_line(label, value))
-            lines.append("")
+        meta_w = max(len(label) for label, _ in meta_rows) + 4
+        for label, value in meta_rows:
+            lines.append(f"  {c.dim}{label:<{meta_w}}{c.reset}{value}")
+        lines.append("")
 
-        self.stdout.write("\n".join(lines))
+        lines.append(f"  {c.dim}press CTRL+C to stop{c.reset}")
+
+        # OutputWrapper adds the final newline; the extra "" keeps one blank
+        # line between the banner and whatever the app logs next.
+        lines.append("")
+        self.stdout.write("\n".join(lines) + "\n")
 
     def autodiscover_apis(self):
         """Discover BoltAPI instances from installed apps.

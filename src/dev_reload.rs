@@ -1,16 +1,84 @@
 use notify::{Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use pyo3::prelude::*;
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WORKER_STOP_TIMEOUT_RELOAD: Duration = Duration::from_millis(100);
 const WORKER_STOP_TIMEOUT_SHUTDOWN: Duration = Duration::from_millis(1200);
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Minimal ANSI painter for supervisor log lines; no-op when stderr is not a
+/// terminal, `NO_COLOR` is set, or `TERM=dumb` (matching the Python banner).
+struct Paint {
+    enabled: bool,
+}
+
+impl Paint {
+    fn detect() -> Self {
+        let enabled = std::io::stderr().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM")
+                .map(|term| term != "dumb")
+                .unwrap_or(true);
+        Self { enabled }
+    }
+
+    fn wrap(&self, code: &str, text: &str) -> String {
+        if self.enabled {
+            format!("\x1b[{}m{}\x1b[0m", code, text)
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn dim(&self, text: &str) -> String {
+        self.wrap("2", text)
+    }
+
+    fn cyan(&self, text: &str) -> String {
+        self.wrap("36", text)
+    }
+
+    fn green(&self, text: &str) -> String {
+        self.wrap("32", text)
+    }
+
+    fn yellow(&self, text: &str) -> String {
+        self.wrap("33", text)
+    }
+
+    fn red(&self, text: &str) -> String {
+        self.wrap("31", text)
+    }
+
+    /// `HH:MM:SS [bolt] <body>` — Vite-style timestamped supervisor line.
+    fn log(&self, body: &str) {
+        let timestamp = chrono::Local::now().format("%H:%M:%S");
+        eprintln!(
+            "  {} {} {}",
+            self.dim(&timestamp.to_string()),
+            self.cyan("[bolt]"),
+            body
+        );
+    }
+}
+
+/// Render a path relative to the current directory when possible; developers
+/// read `testproject/api.py` faster than an absolute path.
+fn display_path(path: &Path) -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(&cwd).ok())
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
 
 #[derive(Debug, Clone)]
 struct ReloadFilter {
@@ -101,7 +169,8 @@ fn py_runtime_error(message: impl Into<String>) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(message.into())
 }
 
-// Keep in sync with _ENV_DEV_WORKER / _ENV_DEV_RELOAD_COUNT in runbolt.py
+// Keep in sync with _ENV_DEV_WORKER / _ENV_DEV_RELOAD_COUNT /
+// _ENV_DEV_SPAWN_MS in runbolt.py
 fn spawn_worker(command: &[String], reload_count: u64) -> PyResult<Child> {
     let Some(program) = command.first() else {
         return Err(py_runtime_error("Dev worker command cannot be empty"));
@@ -112,9 +181,17 @@ fn spawn_worker(command: &[String], reload_count: u64) -> PyResult<Child> {
         child.arg(arg);
     }
 
+    // Spawn timestamp lets the worker print an honest "ready in N ms" that
+    // includes interpreter startup and django.setup(), not just route setup.
+    let spawn_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().to_string())
+        .unwrap_or_default();
+
     child
         .env("DJANGO_BOLT_DEV_WORKER", "1")
         .env("DJANGO_BOLT_DEV_RELOAD_COUNT", reload_count.to_string())
+        .env("DJANGO_BOLT_DEV_SPAWN_UNIX_MS", spawn_unix_ms)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -224,6 +301,32 @@ fn format_exit_status(status: std::process::ExitStatus) -> String {
     }
 }
 
+/// Exit code to propagate when a worker exit is terminal, or `None` when the
+/// supervisor should keep watching for changes.
+///
+/// A worker that dies *after* a reload usually died on the edit the developer
+/// is still making (SyntaxError, bad import), so the session must survive: the
+/// next save fixes it. A worker that fails on its very first start died on
+/// something no file change can fix — the port is taken, settings are broken,
+/// migrations are missing — so waiting there would leave a live-looking
+/// supervisor that never serves and a zero exit status. Propagate instead,
+/// matching `runserver`, where only Django's reload signal (exit code 3)
+/// respawns and every other code exits.
+///
+/// Signal-terminated first starts stay non-terminal: Ctrl-C before the Rust
+/// server installs its own handlers kills the worker by SIGINT, and that must
+/// not be reported as a startup failure.
+fn terminal_worker_exit_code(status: std::process::ExitStatus, reload_count: u64) -> Option<i32> {
+    if reload_count > 0 {
+        return None;
+    }
+
+    match status.code() {
+        Some(0) | None => None,
+        Some(code) => Some(code),
+    }
+}
+
 fn run_dev_reloader_inner(
     command: Vec<String>,
     watch_paths: Vec<String>,
@@ -285,8 +388,10 @@ fn run_dev_reloader_inner(
         )
     };
 
+    let paint = Paint::detect();
+
     if force_polling {
-        eprintln!("[django-bolt] Dev reload using PollWatcher (interval=500ms)");
+        paint.log(&paint.dim("watching via stat() polling (interval 500ms)"));
     }
 
     let mut watched = 0usize;
@@ -330,18 +435,34 @@ fn run_dev_reloader_inner(
                 .map_err(|err| py_runtime_error(format!("Failed to poll dev worker: {}", err)))?
             {
                 let exit_detail = format_exit_status(status);
-                eprintln!(
-                    "[django-bolt] Dev worker exited with {}. Waiting for changes...",
-                    exit_detail
-                );
-                worker_exited = true;
                 worker = None;
+
+                if !shutdown.load(Ordering::SeqCst) {
+                    if let Some(code) = terminal_worker_exit_code(status, reload_count) {
+                        paint.log(&paint.red(&format!(
+                            "server failed to start ({}); a startup failure cannot be \
+                             fixed by editing a file, exiting",
+                            exit_detail
+                        )));
+                        return Ok(code);
+                    }
+                }
+
+                paint.log(&paint.yellow(&format!(
+                    "server exited with {}. Waiting for changes...",
+                    exit_detail
+                )));
+                worker_exited = true;
             }
         }
 
         match recv_change(&rx, &filter, debounce, recv_timeout) {
             Ok(Some(changed_path)) => {
-                eprintln!("[django-bolt] 🔄 Reloading ({})", changed_path.display());
+                paint.log(&format!(
+                    "{} {}",
+                    paint.green("reloading"),
+                    display_path(&changed_path)
+                ));
                 reload_count += 1;
                 stop_worker(&mut worker, WORKER_STOP_TIMEOUT_RELOAD)?;
                 worker = Some(spawn_worker(&command, reload_count)?);
@@ -358,7 +479,7 @@ fn run_dev_reloader_inner(
                     continue;
                 }
 
-                eprintln!("[django-bolt] Dev reload watcher error: {}", err);
+                paint.log(&paint.yellow(&format!("watcher error: {}", err)));
             }
         }
     }
@@ -388,9 +509,51 @@ pub fn run_dev_reloader(
 
 #[cfg(test)]
 mod tests {
-    use super::{first_relevant_path, is_temporary_path, ReloadFilter};
+    use super::{first_relevant_path, is_temporary_path, terminal_worker_exit_code, ReloadFilter};
     use notify::{event::CreateKind, Event, EventKind};
     use std::path::PathBuf;
+    use std::process::{Command, ExitStatus};
+
+    fn exit_status(code: i32) -> ExitStatus {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {}", code))
+            .status()
+            .expect("failed to run sh for a real ExitStatus")
+    }
+
+    #[test]
+    fn failed_first_start_propagates_its_exit_code() {
+        // Port already in use, broken settings: nothing an edit can fix, so the
+        // supervisor must exit instead of waiting for changes forever.
+        assert_eq!(terminal_worker_exit_code(exit_status(1), 0), Some(1));
+        assert_eq!(terminal_worker_exit_code(exit_status(2), 0), Some(2));
+    }
+
+    #[test]
+    fn crash_after_a_reload_keeps_the_session_alive() {
+        // The developer saved a broken file; the next save must be able to fix it.
+        assert_eq!(terminal_worker_exit_code(exit_status(1), 1), None);
+        assert_eq!(terminal_worker_exit_code(exit_status(1), 7), None);
+    }
+
+    #[test]
+    fn clean_first_exit_is_not_a_startup_failure() {
+        assert_eq!(terminal_worker_exit_code(exit_status(0), 0), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_terminated_first_start_is_not_a_startup_failure() {
+        // Ctrl-C before the Rust server installs its handlers kills the worker
+        // by SIGINT; that is a shutdown, not a failed start.
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(
+            terminal_worker_exit_code(ExitStatus::from_raw(libc::SIGINT), 0),
+            None
+        );
+    }
 
     #[test]
     fn ignores_paths_inside_ignored_directories() {

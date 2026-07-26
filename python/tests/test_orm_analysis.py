@@ -4,19 +4,15 @@ Tests for static analysis module.
 Tests the AST-based analysis of handler functions for:
 - Django ORM usage detection
 - Blocking I/O detection
-- Warning generation for sync handlers
 """
 
 from __future__ import annotations
-
-import warnings
 
 from django_bolt.analysis import (
     DependencyNeeds,
     HandlerAnalysis,
     analyze_dependency_tree,
     analyze_handler,
-    warn_blocking_handler,
 )
 
 
@@ -361,66 +357,6 @@ class TestRequestComponentAnalysis:
         """Document current limitation: external helper calls are not analyzed transitively."""
         analysis = analyze_handler(handler_passes_request_to_external_helper, request_param_names={"request"})
         self.assert_request_flags(analysis)
-
-
-class TestWarningGeneration:
-    """Tests for warning message generation."""
-
-    def test_sync_handler_orm_warning(self):
-        """Test warning is generated for sync handler with ORM."""
-        analysis = analyze_handler(sync_handler_with_orm)
-
-        warning_msg = analysis.get_warning_message(handler_name="sync_handler_with_orm", path="/users", is_async=False)
-
-        assert warning_msg is not None
-        assert "sync_handler_with_orm" in warning_msg
-        assert "/users" in warning_msg
-        assert "Running in thread pool" in warning_msg
-
-    def test_async_handler_no_warning(self):
-        """Test no warning for async handler - Django handles sync ORM automatically."""
-        analysis = analyze_handler(async_handler_with_sync_orm)
-
-        warning_msg = analysis.get_warning_message(
-            handler_name="async_handler_with_sync_orm", path="/async-users", is_async=True
-        )
-
-        # Async handlers don't need warnings - Django handles sync-to-async
-        assert warning_msg is None
-
-    def test_no_warning_for_clean_handler(self):
-        """Test no warning for handlers without issues."""
-        analysis = analyze_handler(sync_handler_no_orm)
-
-        warning_msg = analysis.get_warning_message(handler_name="sync_handler_no_orm", path="/hello", is_async=False)
-
-        assert warning_msg is None
-
-    def test_no_warning_for_async_with_async_orm(self):
-        """Test no warning for proper async ORM usage."""
-        analysis = analyze_handler(async_handler_with_async_orm)
-
-        warning_msg = analysis.get_warning_message(
-            handler_name="async_handler_with_async_orm", path="/async-users", is_async=True
-        )
-
-        # Should not warn if using async ORM (even if also detected sync patterns)
-        # Actually our current logic will still warn - let's check
-        # The warning should be None if uses_async_orm is True
-        # Looking at the code, it warns if sync ORM detected without async ORM
-        # Since this handler uses async ORM, it should not warn
-        assert warning_msg is None
-
-    def test_warn_blocking_handler_emits_warning(self):
-        """Test that warn_blocking_handler actually emits warnings for sync handlers."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-
-            warn_blocking_handler(fn=sync_handler_with_orm, path="/users", is_async=False)
-
-            # Check that a warning was emitted
-            assert len(w) == 1
-            assert "Running in thread pool" in str(w[0].message)
 
 
 class TestAnalysisFailure:

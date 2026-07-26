@@ -15,6 +15,10 @@ f-strings with ``{{}}``-escaped braces.
 
 Modules must stay self-contained — no relative imports — so they copy cleanly
 into the subprocess project as ``<package>/api.py``.
+
+Underscore-prefixed modules (e.g. ``_reload_helper``) are support files, not
+app fixtures: plain data a fixture imports once installed in a temp project.
+``test_apps_smoke`` skips them instead of demanding an ``api`` attribute.
 """
 
 from __future__ import annotations
