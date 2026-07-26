@@ -10,7 +10,6 @@ import os
 import signal
 import sys
 import traceback
-import warnings
 from pathlib import Path
 
 from django.apps import apps
@@ -96,13 +95,55 @@ def _collapse_watch_paths(paths: set[Path]) -> list[Path]:
     return collapsed
 
 
-def _build_dev_worker_command(argv: list[str] | None = None, executable: str | None = None) -> list[str]:
+_UNSET = object()
+
+
+def _dev_worker_main_module(main_module=_UNSET) -> str | None:
+    """Return the ``-m`` module the process was started with, or ``None``.
+
+    ``python -m pkg.manage`` rewrites ``sys.argv[0]`` to manage.py's resolved
+    file path, so the ``-m`` context survives only on ``__main__.__spec__``.
+    Plain ``python manage.py`` runs leave ``__spec__`` as ``None`` (some
+    environments omit the attribute entirely), which means script mode.
+    """
+    if main_module is _UNSET:
+        main_module = sys.modules.get("__main__")
+
+    spec = getattr(main_module, "__spec__", None)
+    if spec is None:
+        return None
+
+    name = getattr(spec, "name", None) or ""
+    parent = getattr(spec, "parent", None) or ""
+
+    # `python -m pkg` executes pkg/__main__.py; respawn the package, not the file.
+    if (name == "__main__" or name.endswith(".__main__")) and parent:
+        return parent
+
+    return name or None
+
+
+def _build_dev_worker_command(
+    argv: list[str] | None = None,
+    executable: str | None = None,
+    main_module: str | None = None,
+) -> list[str]:
+    """Rebuild this process's command line for the dev worker.
+
+    ``main_module`` is the ``-m`` module name from
+    :func:`_dev_worker_main_module` (``None`` for script invocations). It must be
+    preserved: re-running a ``-m``-launched manage.py as a script puts the
+    script's own directory at the head of ``sys.path`` instead of the cwd, so a
+    project whose manage.py lives inside the package it imports from (a "src
+    layout", ``src/manage.py`` with ``src.project.settings``) can no longer
+    import its own settings module.
+    """
     argv = sys.argv if argv is None else argv
     executable = sys.executable if executable is None else executable
 
-    command = [executable]
+    command = [executable, "-m", main_module] if main_module else [executable, *argv[:1]]
     saw_processes = False
-    it = iter(argv)
+    it = iter(argv[1:])
 
     for arg in it:
         if arg == "--dev" or arg.startswith("--dev="):
@@ -190,6 +231,10 @@ def _module_spec_watch_paths(module_name: str) -> set[Path]:
 def _collect_autodiscovery_python_paths() -> set[Path]:
     module_names: set[str] = set()
 
+    for api_path in getattr(settings, "BOLT_API", None) or ():
+        if ":" in api_path:
+            module_names.add(api_path.split(":", 1)[0])
+
     settings_module = getattr(settings, "SETTINGS_MODULE", None)
     if settings_module:
         module_names.add(settings_module)
@@ -221,7 +266,65 @@ def _collect_autodiscovery_python_paths() -> set[Path]:
     return project_paths
 
 
-def _collect_dev_watch_paths() -> list[str]:
+def _autodiscovery_import_module_names() -> list[str]:
+    """Module names that autodiscover_apis() will import at worker startup.
+
+    Explicit BOLT_API entries win, mirroring autodiscovery. Otherwise the
+    project-level and per-app api module candidates are gated by the same AST
+    scan autodiscovery uses, so modules without a BoltAPI assignment are never
+    imported here either.
+    """
+    bolt_api_paths = getattr(settings, "BOLT_API", None)
+    if bolt_api_paths:
+        return [api_path.split(":", 1)[0] for api_path in bolt_api_paths if ":" in api_path]
+
+    module_names: list[str] = []
+
+    root_urlconf = getattr(settings, "ROOT_URLCONF", None)
+    if root_urlconf:
+        for module_name in _project_api_module_names(root_urlconf):
+            if find_bolt_api_names(module_name):
+                module_names.append(module_name)
+
+    if apps.ready:
+        for app_config in apps.get_app_configs():
+            if app_config.name == "django_bolt":
+                continue
+            if hasattr(app_config, "bolt_api") and ":" in app_config.bolt_api:
+                module_names.append(app_config.bolt_api.split(":", 1)[0])
+                continue
+            for module_suffix in ("api", "bolt_api"):
+                module_name = f"{app_config.name}.{module_suffix}"
+                if find_bolt_api_names(module_name):
+                    module_names.append(module_name)
+
+    return module_names
+
+
+def _prime_dev_watch_imports() -> None:
+    """Import discovered API modules so their transitive imports get watched.
+
+    The dev supervisor never runs autodiscovery itself, so sys.modules only
+    holds what django.setup() loaded — without these imports the watch list
+    misses everything api.py imports (helpers, service layers) and edits to
+    those files never trigger a reload. Import failures are non-fatal: the
+    worker surfaces the real error on its own startup, and the api module file
+    itself stays watched (via its module spec) so fixing it triggers a reload.
+    """
+    for module_name in _autodiscovery_import_module_names():
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001 - user code can raise anything at import
+            print(
+                f"[django-bolt] Warning: failed to import {module_name!r} while building the "
+                f"dev watch list ({exc}); files it imports won't trigger auto-reload",
+                file=sys.stderr,
+            )
+
+
+def _collect_dev_watch_paths(reload_dirs: list[str] | None = None) -> list[str]:
+    _prime_dev_watch_imports()
+
     watch_paths: set[Path] = set(_collect_loaded_python_paths())
     watch_paths.update(_collect_autodiscovery_python_paths())
 
@@ -230,12 +333,27 @@ def _collect_dev_watch_paths() -> list[str]:
         if path is not None and path.exists():
             watch_paths.add(path)
 
-    if not watch_paths:
-        base_dir = _coerce_path(getattr(settings, "BASE_DIR", None))
-        if base_dir is not None and base_dir.exists():
-            watch_paths.add(base_dir)
+    # Escape hatch for code outside both the project root and the import
+    # graph (e.g. a shared library next to the project).
+    for reload_dir in reload_dirs or ():
+        path = _coerce_path(reload_dir)
+        if path is not None and path.exists():
+            watch_paths.add(path)
         else:
-            watch_paths.add(Path.cwd().resolve())
+            print(
+                f"[django-bolt] Warning: --reload-dir {str(reload_dir)!r} "
+                "does not exist; it will not be watched for auto-reload",
+                file=sys.stderr,
+            )
+
+    # Uvicorn-style default: always watch the project root recursively so
+    # newly created modules and packages reload without a dev-server restart.
+    # Import-graph entries inside the root collapse into it; entries outside
+    # (PYTHONPATH apps, editable installs) stay individually watched.
+    project_root = _coerce_path(getattr(settings, "BASE_DIR", None))
+    if project_root is None or not project_root.exists():
+        project_root = Path.cwd().resolve()
+    watch_paths.add(project_root)
 
     return [str(path) for path in _collapse_watch_paths(watch_paths)]
 
@@ -385,6 +503,19 @@ class Command(BaseCommand):
             help="Disable Django admin integration (admin enabled by default)",
         )
         parser.add_argument("--dev", action="store_true", help="Enable auto-reload on file changes (development mode)")
+        parser.add_argument(
+            "--reload-dir",
+            action="append",
+            default=[],
+            dest="reload_dirs",
+            metavar="PATH",
+            help=(
+                "Watch this extra directory (or file) for --dev auto-reload; "
+                "repeatable. The project root and the app's import graph are "
+                "watched by default, so this is only needed for code outside "
+                "both, e.g. a shared library next to the project."
+            ),
+        )
         parser.add_argument("--backlog", type=int, default=1024, help="Socket listen backlog size (default: 1024)")
         parser.add_argument(
             "--keep-alive", type=int, default=None, help="HTTP keep-alive timeout in seconds (default: OS setting)"
@@ -432,6 +563,9 @@ class Command(BaseCommand):
         dev_worker_mode = os.environ.get(_ENV_DEV_WORKER) == "1"
         effective_dev_mode = dev_mode or dev_worker_mode
 
+        if options["reload_dirs"] and not effective_dev_mode:
+            self.stdout.write(self.style.WARNING("  Warning: --reload-dir is ignored without --dev"))
+
         # Dev mode: force single process + enable auto-reload
         if dev_mode and not dev_worker_mode:
             if processes > 1:
@@ -451,8 +585,8 @@ class Command(BaseCommand):
 
     def run_with_autoreload(self, options):
         """Run the server behind the native dev supervisor."""
-        worker_command = _build_dev_worker_command()
-        watch_paths = _collect_dev_watch_paths()
+        worker_command = _build_dev_worker_command(main_module=_dev_worker_main_module())
+        watch_paths = _collect_dev_watch_paths(options["reload_dirs"])
         ignore_paths = _collect_dev_ignore_paths()
         force_polling = getattr(settings, "BOLT_DEV_FORCE_POLLING", False)
 
@@ -626,13 +760,6 @@ class Command(BaseCommand):
     def start_single_process(self, options, process_id=None, dev_mode=False):
         """Start a single process server"""
         is_dev_reload_restart = _is_dev_reload_restart()
-
-        if is_dev_reload_restart:
-            warnings.filterwarnings(
-                "ignore",
-                message=r"Sync handler '.*' at .* uses ORM operations .*Running in thread pool\.",
-                category=UserWarning,
-            )
 
         # Setup Django logging once at server startup (one-shot, respects existing LOGGING)
         if setup_django_logging is not None:

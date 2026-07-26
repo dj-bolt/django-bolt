@@ -6,7 +6,7 @@ Performs AST-based analysis of handler source code to detect:
 - Blocking I/O operations
 
 This enables compile-time optimization decisions (e.g., running sync handlers
-with ORM usage in a thread pool) and developer warnings.
+with ORM usage in a thread pool).
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -255,35 +254,6 @@ class HandlerAnalysis:
     def is_blocking(self) -> bool:
         """Whether handler is likely to block (any ORM usage or blocking I/O)."""
         return self.uses_orm or self.has_blocking_io
-
-    def get_warning_message(self, handler_name: str, path: str, is_async: bool) -> str | None:
-        """
-        Generate warning message if handler has potential issues.
-
-        Only warns for sync handlers that use ORM - they will be run in a thread pool.
-        Async handlers don't need warnings - Django/Python handles sync ORM automatically.
-
-        Args:
-            handler_name: Name of the handler function
-            path: Route path
-            is_async: Whether handler is defined as async
-
-        Returns:
-            Warning message string or None if no warning needed
-        """
-        # Only warn for sync handlers that use ORM operations
-        # These will be automatically run in a thread pool to avoid blocking
-        if not is_async and self.uses_orm:
-            ops = ", ".join(sorted(self.orm_operations)[:5])
-            if len(self.orm_operations) > 5:
-                ops += f", ... ({len(self.orm_operations)} total)"
-
-            return (
-                f"Sync handler '{handler_name}' at {path} uses ORM operations "
-                f"(detected: {ops}). Running in thread pool."
-            )
-
-        return None
 
 
 class OrmVisitor(ast.NodeVisitor):
@@ -596,29 +566,3 @@ def _walk_dep_tree(
             acc.needs_cookies |= dep_analysis.request_needs_cookies
 
         _walk_dep_tree(dep_meta, compile_dep_fn, acc, visited)
-
-
-def warn_blocking_handler(
-    fn: Callable[..., Any],
-    path: str,
-    is_async: bool,
-    analysis: HandlerAnalysis | None = None,
-) -> None:
-    """
-    Emit warning if handler has blocking operations.
-
-    Args:
-        fn: Handler function
-        path: Route path
-        is_async: Whether handler is async
-        analysis: Pre-computed analysis (will compute if None)
-    """
-    if analysis is None:
-        analysis = analyze_handler(fn)
-
-    if analysis.analysis_failed:
-        return
-
-    warning_msg = analysis.get_warning_message(fn.__name__, path, is_async)
-    if warning_msg:
-        warnings.warn(warning_msg, stacklevel=3)

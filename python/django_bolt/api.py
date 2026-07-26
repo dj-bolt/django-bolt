@@ -35,7 +35,7 @@ from ._kwargs import (
 )
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
-from .analysis import analyze_dependency_tree, analyze_handler, warn_blocking_handler
+from .analysis import analyze_dependency_tree, analyze_handler
 from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import default_django_user_loader, resolve_user_loader
 from .concurrency import run_in_orm_executor, sync_to_thread
@@ -1426,9 +1426,6 @@ class BoltAPI:
                     meta[needs_key] = True
 
             meta["is_blocking"] = handler_analysis.is_blocking
-
-            # Emit warning for sync handlers with ORM (will run in thread pool)
-            warn_blocking_handler(fn, full_path, is_async, handler_analysis)
 
             # Determine final response type with proper priority:
             # 1. response_model parameter (explicit, takes precedence)

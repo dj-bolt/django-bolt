@@ -520,7 +520,7 @@ class ServerProject:
     def read_file(self, relative_path: str) -> str:
         return self.path(relative_path).read_text()
 
-    def start(
+    def spawn(
         self,
         *,
         dev: bool = False,
@@ -528,10 +528,15 @@ class ServerProject:
         extra_args: list[str] | None = None,
         host: str = DEFAULT_HOST,
         port: int | None = None,
-        startup_path: str = "/health",
-        timeout: float = DEFAULT_TIMEOUT,
         env: dict[str, str] | None = None,
-    ) -> RunningServer:
+    ) -> tuple[subprocess.Popen[str], int]:
+        """Spawn ``runbolt`` and return the process plus the port it was given.
+
+        Unlike :meth:`start`, this does not wait for readiness — so tests can
+        assert on startup *failures* (the process must exit, with which code,
+        saying what) instead of having the readiness probe turn them into an
+        AssertionError first.
+        """
         if dev and not (self.root / self.package_name / "api.py").exists():
             raise ValueError(
                 "runbolt --dev watches files in the temp project, but this project has no "
@@ -564,7 +569,28 @@ class ServerProject:
             pythonpath_parts.append(existing_pythonpath)
         process_env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
 
-        process = _spawn_process(command, cwd=self.root, env=process_env)
+        return _spawn_process(command, cwd=self.root, env=process_env), port
+
+    def start(
+        self,
+        *,
+        dev: bool = False,
+        processes: int = 1,
+        extra_args: list[str] | None = None,
+        host: str = DEFAULT_HOST,
+        port: int | None = None,
+        startup_path: str = "/health",
+        timeout: float = DEFAULT_TIMEOUT,
+        env: dict[str, str] | None = None,
+    ) -> RunningServer:
+        process, port = self.spawn(
+            dev=dev,
+            processes=processes,
+            extra_args=extra_args,
+            host=host,
+            port=port,
+            env=env,
+        )
         return RunningServer(
             project=self,
             process=process,

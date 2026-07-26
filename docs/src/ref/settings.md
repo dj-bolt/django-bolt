@@ -287,6 +287,19 @@ See [Django Signals](../topics/signals.md) for detailed documentation.
 
 ## Dev reload settings
 
+`runbolt --dev` watches two things and restarts the server when a `.py` or `.html` file changes in either:
+
+- **The project root** (`BASE_DIR`, falling back to the working directory), recursively — so newly created files, modules, and packages reload without restarting the dev server. Virtualenvs and common build/cache directories (`.git`, `__pycache__`, `node_modules`, `target`, …) are excluded.
+- **The app's import graph** — every module loaded by Django setup plus your discovered API modules and everything they transitively import, along with template directories and `manage.py`. This covers code living *outside* the project root, such as apps on `PYTHONPATH` or editable-installed packages.
+
+To watch extra locations outside both — for example a shared library next to the project that isn't imported at startup — pass `--reload-dir` (repeatable, same shape as uvicorn's flag):
+
+```bash
+python manage.py runbolt --dev --reload-dir ../shared-lib
+```
+
+Each entry is a directory (watched recursively) or a single file, resolved relative to the working directory. Entries that don't exist are skipped with a warning.
+
 ### BOLT_DEV_FORCE_POLLING
 
 Force the `--dev` auto-reloader to use file-system polling instead of native OS file events.
