@@ -310,9 +310,7 @@ def test_collect_dev_watch_paths_survives_broken_api_module(settings, tmp_path, 
     still triggers a reload."""
     (tmp_path / "urls.py").write_text("urlpatterns = []\n")
     api_module = tmp_path / "api.py"
-    api_module.write_text(
-        "from django_bolt.api import BoltAPI\nraise RuntimeError('boom')\napi = BoltAPI()\n"
-    )
+    api_module.write_text("from django_bolt.api import BoltAPI\nraise RuntimeError('boom')\napi = BoltAPI()\n")
 
     monkeypatch.syspath_prepend(str(tmp_path))
     _clear_modules(monkeypatch, "urls", "api")
