@@ -9,7 +9,9 @@ import importlib.util
 import os
 import signal
 import sys
+import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 from django.apps import apps
@@ -38,7 +40,42 @@ except ImportError:
 
 _ENV_DEV_WORKER = "DJANGO_BOLT_DEV_WORKER"
 _ENV_DEV_RELOAD_COUNT = "DJANGO_BOLT_DEV_RELOAD_COUNT"
+_ENV_DEV_SPAWN_MS = "DJANGO_BOLT_DEV_SPAWN_UNIX_MS"
 DEV_RELOAD_DEBOUNCE_MS = 50
+
+
+class _Ansi:
+    """Minimal ANSI palette; every attribute is '' when colors are disabled."""
+
+    __slots__ = ("bold", "dim", "cyan", "green", "reset")
+
+    def __init__(self, enabled: bool) -> None:
+        self.bold = "\033[1m" if enabled else ""
+        self.dim = "\033[2m" if enabled else ""
+        self.cyan = "\033[36m" if enabled else ""
+        self.green = "\033[32m" if enabled else ""
+        self.reset = "\033[0m" if enabled else ""
+
+
+_GLYPHS_UNICODE = {"bolt": "⚡ ", "arrow": "➜", "check": "✓", "sep": " · "}
+_GLYPHS_ASCII = {"bolt": "", "arrow": "->", "check": "*", "sep": " - "}
+
+
+def _pick_glyphs(stream) -> dict[str, str]:
+    """Unicode glyphs when the output encoding supports them, ASCII otherwise."""
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        "⚡➜✓·".encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return _GLYPHS_ASCII
+    return _GLYPHS_UNICODE
+
+
+def _format_elapsed(ms: float) -> str:
+    if ms < 1000:
+        return f"{ms:.0f} ms"
+    return f"{ms / 1000:.1f} s"
+
 
 DEV_RELOAD_IGNORE_DIRS = (
     ".git",
@@ -316,7 +353,7 @@ def _prime_dev_watch_imports() -> None:
             importlib.import_module(module_name)
         except Exception as exc:  # noqa: BLE001 - user code can raise anything at import
             print(
-                f"[django-bolt] Warning: failed to import {module_name!r} while building the "
+                f"[bolt] Warning: failed to import {module_name!r} while building the "
                 f"dev watch list ({exc}); files it imports won't trigger auto-reload",
                 file=sys.stderr,
             )
@@ -341,7 +378,7 @@ def _collect_dev_watch_paths(reload_dirs: list[str] | None = None) -> list[str]:
             watch_paths.add(path)
         else:
             print(
-                f"[django-bolt] Warning: --reload-dir {str(reload_dir)!r} "
+                f"[bolt] Warning: --reload-dir {str(reload_dir)!r} "
                 "does not exist; it will not be watched for auto-reload",
                 file=sys.stderr,
             )
@@ -558,6 +595,7 @@ class Command(BaseCommand):
         return bool(options["max_rss"] or options["workers_lifetime"] or options["respawn_failed_workers"])
 
     def handle(self, *args, **options):
+        self._handle_started = time.monotonic()
         processes = options["processes"]
         dev_mode = options.get("dev", False)
         dev_worker_mode = os.environ.get(_ENV_DEV_WORKER) == "1"
@@ -659,7 +697,7 @@ class Command(BaseCommand):
             lifetime_seconds=float(options["workers_lifetime"]) if options["workers_lifetime"] else None,
             respawn_failed=options["respawn_failed_workers"],
             kill_timeout=float(kill_timeout),
-            log=lambda message: self.stdout.write(f"  {message}"),
+            log=self._runtime_log,
         )
 
         def signal_handler(signum, frame):
@@ -702,7 +740,7 @@ class Command(BaseCommand):
                 if openapi_config.enabled:
                     merged_api._openapi_config = openapi_config
                     merged_api._register_openapi_routes()
-                    features.append(("OpenAPI", f"{banner_base_url}{openapi_config.path}"))
+                    features.append(("Docs", f"{banner_base_url}{openapi_config.path}"))
                 break
 
         # Check admin
@@ -807,7 +845,7 @@ class Command(BaseCommand):
             # Transfer OpenAPI config to merged API
             merged_api._openapi_config = openapi_config
             merged_api._register_openapi_routes()
-            features.append(("OpenAPI", f"{banner_base_url}{openapi_config.path}"))
+            features.append(("Docs", f"{banner_base_url}{openapi_config.path}"))
 
         # Register Django admin routes if not disabled
         # Admin is controlled solely by --no-admin command-line flag
@@ -907,7 +945,14 @@ class Command(BaseCommand):
         # Print structured startup banner (only for main process or single-process mode)
         if process_id is None:
             if is_dev_reload_restart:
-                self.stdout.write(f"  ✨ Reloaded on {banner_base_url}")
+                c = self._ansi()
+                g = _pick_glyphs(self.stdout)
+                elapsed = self._startup_elapsed_ms()
+                timing = f" {c.dim}in {_format_elapsed(elapsed)}{c.reset}" if elapsed is not None else ""
+                self.stdout.write(
+                    f"  {c.green}{g['check']}{c.reset} {c.bold}Reloaded{c.reset}{timing}"
+                    f"  {c.cyan}{banner_base_url}{c.reset}"
+                )
             else:
                 self._print_startup_banner(
                     options=options,
@@ -958,6 +1003,36 @@ class Command(BaseCommand):
         except importlib.metadata.PackageNotFoundError:
             return "dev"
 
+    def _ansi(self) -> _Ansi:
+        """Palette derived from Django's own color handling (--no-color, --force-color)."""
+        cached = getattr(self, "_ansi_cache", None)
+        if cached is None:
+            enabled = self.style.SUCCESS("x") != "x" and "NO_COLOR" not in os.environ
+            cached = self._ansi_cache = _Ansi(enabled)
+        return cached
+
+    def _startup_elapsed_ms(self) -> float | None:
+        """Wall time since the process was spawned (dev worker) or handle() began."""
+        spawn_ms = os.environ.get(_ENV_DEV_SPAWN_MS)
+        if spawn_ms:
+            try:
+                elapsed = time.time() * 1000.0 - float(spawn_ms)
+            except ValueError:
+                elapsed = -1.0
+            # Guard against clock skew between the supervisor and worker.
+            if 0 <= elapsed < 600_000:
+                return elapsed
+        started = getattr(self, "_handle_started", None)
+        if started is None:
+            return None
+        return (time.monotonic() - started) * 1000.0
+
+    def _runtime_log(self, message: str) -> None:
+        """Timestamped post-startup log line (worker recycling, shutdown, ...)."""
+        c = self._ansi()
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.stdout.write(f"  {c.dim}{timestamp}{c.reset} {c.cyan}[bolt]{c.reset} {message}")
+
     def _print_startup_banner(
         self,
         *,
@@ -970,53 +1045,68 @@ class Command(BaseCommand):
         api_count: int,
         features: list[tuple[str, str]],
     ) -> None:
-        """Print a clean, structured startup banner."""
+        """Print a Vite-style startup banner: brand + timing, URL rows, dim meta rows."""
         version = self._get_version()
-        host = options["host"]
-        port = options["port"]
+        c = self._ansi()
+        g = _pick_glyphs(self.stdout)
+        sep = g["sep"]
         processes = options["processes"]
+        url = _build_display_url(options["host"], options["port"], dev_mode=dev_mode)
+
+        # Split features into URL rows (arrow lines) and meta rows (dim lines).
+        links: list[tuple[str, str]] = [("Local", url)]
+        meta_rows: list[tuple[str, str]] = []
+        for label, value in features:
+            if value.startswith("http"):
+                links.append((label, value))
+            else:
+                meta_rows.append((label, value))
+
         mode = "development" if dev_mode else "production"
-        url = _build_display_url(host, port, dev_mode=dev_mode)
+        if dev_mode:
+            mode += f"{sep}auto-reload"
 
-        # Determine label width for alignment
-        _LABEL_W = 16
-
-        def _line(label: str, value: str) -> str:
-            return f"  {label:<{_LABEL_W}}{value}"
-
-        lines: list[str] = []
-
-        # Header
-        lines.append("")
-        lines.append(self.style.SUCCESS(f"  Django Bolt v{version}"))
-        lines.append("")
-
-        # Server section
-        lines.append(self.style.MIGRATE_HEADING("  Server"))
-        lines.append(_line("URL", url))
-        lines.append(_line("Processes", str(processes)))
-        lines.append(_line("Mode", mode))
-        lines.append("")
-
-        # Routes section
-        lines.append(self.style.MIGRATE_HEADING("  Routes"))
-        lines.append(_line("API", f"{api_routes} routes from {api_count} app{'s' if api_count != 1 else ''}"))
+        route_bits = [f"{api_routes} API"]
         if ws_routes:
-            lines.append(_line("WebSocket", f"{ws_routes} routes"))
+            route_bits.append(f"{ws_routes} WebSocket")
         if asgi_mounts:
-            lines.append(_line("ASGI", f"{asgi_mounts} mounts"))
+            route_bits.append(f"{asgi_mounts} ASGI")
         if framework_routes:
-            lines.append(_line("Framework", f"+{framework_routes} (admin, docs)"))
+            route_bits.append(f"+{framework_routes} framework")
+        route_bits.append(f"{api_count} app{'s' if api_count != 1 else ''}")
+
+        meta_rows = [
+            ("Mode", mode),
+            ("Routes", sep.join(route_bits)),
+            ("Workers", f"{processes} process{'es' if processes != 1 else ''}"),
+            *meta_rows,
+        ]
+
+        header = f"  {g['bolt']}{c.bold}{c.cyan}Django Bolt{c.reset} {c.cyan}v{version}{c.reset}"
+        elapsed = self._startup_elapsed_ms()
+        if elapsed is not None:
+            header += f"  {c.dim}ready in{c.reset} {c.bold}{_format_elapsed(elapsed)}{c.reset}"
+
+        lines: list[str] = ["", header, ""]
+
+        link_w = max(len(label) for label, _ in links) + 2
+        for label, value in links:
+            lines.append(
+                f"  {c.green}{g['arrow']}{c.reset}  {c.bold}{label + ':':<{link_w}}{c.reset}{c.cyan}{value}{c.reset}"
+            )
         lines.append("")
 
-        # Features section (only if there are features)
-        if features:
-            lines.append(self.style.MIGRATE_HEADING("  Features"))
-            for label, value in features:
-                lines.append(_line(label, value))
-            lines.append("")
+        meta_w = max(len(label) for label, _ in meta_rows) + 4
+        for label, value in meta_rows:
+            lines.append(f"  {c.dim}{label:<{meta_w}}{c.reset}{value}")
+        lines.append("")
 
-        self.stdout.write("\n".join(lines))
+        lines.append(f"  {c.dim}press CTRL+C to stop{c.reset}")
+
+        # OutputWrapper adds the final newline; the extra "" keeps one blank
+        # line between the banner and whatever the app logs next.
+        lines.append("")
+        self.stdout.write("\n".join(lines) + "\n")
 
     def autodiscover_apis(self):
         """Discover BoltAPI instances from installed apps.
