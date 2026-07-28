@@ -106,7 +106,10 @@ pub struct AppState {
 pub static GLOBAL_ROUTER: OnceCell<Arc<Router>> = OnceCell::new();
 pub static GLOBAL_WEBSOCKET_ROUTER: OnceCell<Arc<WebSocketRouter>> = OnceCell::new();
 pub static GLOBAL_ASGI_MOUNTS: OnceCell<Arc<Vec<AsgiMount>>> = OnceCell::new();
-pub static TASK_LOCALS: OnceCell<TaskLocals> = OnceCell::new(); // reuse global python event loop
+// The startup/selector loop. Bolt route coroutines run on the WorkerLoop
+// instead (see `worker_loop::worker_task_locals`); this loop backs the
+// WorkerLoop's delegated selector work and mounted ASGI apps.
+pub static TASK_LOCALS: OnceCell<TaskLocals> = OnceCell::new();
 pub static ROUTE_METADATA: OnceCell<Arc<RouteMetadataStore>> = OnceCell::new();
 pub static ROUTE_METADATA_TEMP: OnceCell<AHashMap<usize, RouteMetadata>> = OnceCell::new(); // Temporary storage before CORS injection
 

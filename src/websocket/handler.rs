@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use crate::handler::coerced_value_to_py;
 use crate::metadata::CorsConfig;
 use crate::middleware::rate_limit::check_rate_limit;
-use crate::state::{AppState, ROUTE_METADATA, TASK_LOCALS};
+use crate::state::{AppState, ROUTE_METADATA};
 use crate::type_coercion::{coerce_param, CoerceError, TYPE_STRING};
 use crate::validation::{validate_auth_and_guards, AuthGuardResult};
 
@@ -650,10 +650,14 @@ pub async fn handle_websocket_upgrade_with_handler(
                     handler.call1(py, (&websocket,))?
                 };
 
-                // Reuse the global event loop locals initialized at server startup (same as HTTP handlers)
-                let locals = TASK_LOCALS.get().ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
-                })?;
+                // Run the handler on the WorkerLoop — the same loop as async
+                // HTTP dispatch — so futures/queues/locks shared between a
+                // WebSocket handler and an HTTP handler stay same-loop.
+                // (Cross-loop, `set_result` queues a wakeup that never rouses
+                // the foreign selector and the WebSocket side hangs.) The
+                // receive/send futures created by `future_into_py` follow the
+                // running loop, so they migrate with the handler.
+                let locals = crate::worker_loop::worker_task_locals(py)?;
 
                 // Convert Python coroutine to Rust future using the shared event loop
                 pyo3_async_runtimes::into_future_with_locals(locals, coro.bind(py).clone())

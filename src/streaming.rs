@@ -13,14 +13,12 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
-use crate::state::{get_max_sync_streaming_threads, ACTIVE_SYNC_STREAMING_THREADS, TASK_LOCALS};
+use crate::state::{get_max_sync_streaming_threads, ACTIVE_SYNC_STREAMING_THREADS};
 // Streaming uses direct_stream only in higher-level handler; not directly here
 
 // Buffer pool imports removed (unused)
 
 // Note: buffer pool removed during modularization; reintroduce if needed for micro-alloc tuning
-
-// Reuse the global Python asyncio event loop created at server startup (TASK_LOCALS)
 
 #[inline(always)]
 pub fn convert_python_chunk(value: &Bound<'_, PyAny>) -> Option<Bytes> {
@@ -162,10 +160,16 @@ fn schedule_async_stream_forwarder(
     content: &Py<PyAny>,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> PyResult<()> {
-    let locals = TASK_LOCALS
-        .get()
-        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized"))?
-        .clone();
+    // The forwarder MUST run on the WorkerLoop — the same loop that runs
+    // async HTTP dispatch — not on the selector/compat loop. A streaming
+    // generator awaiting an asyncio primitive (future, queue, lock) that a
+    // normally-dispatched handler resolves would otherwise wait on a
+    // cross-loop wakeup that never fires: `Future.set_result` wakes waiters
+    // via a plain same-loop `call_soon`, which does not rouse a foreign
+    // loop's selector. (Regression seen as bolt-mcp sampling hanging: the
+    // SSE tool's future lived on uvloop, the client's reply POST ran on the
+    // WorkerLoop.)
+    let locals = crate::worker_loop::worker_task_locals(py)?.clone();
     let sender = Py::new(
         py,
         AsyncStreamSender {
