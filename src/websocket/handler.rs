@@ -542,8 +542,8 @@ pub async fn handle_websocket_upgrade_with_handler(
                 AuthGuardResult::Unauthorized => {
                     return Ok(crate::responses::error_401());
                 }
-                AuthGuardResult::Forbidden => {
-                    return Ok(crate::responses::error_403());
+                AuthGuardResult::Forbidden(denial) => {
+                    return Ok(crate::responses::error_403_denial(denial.as_deref()));
                 }
             }
         }

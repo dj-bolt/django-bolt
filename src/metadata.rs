@@ -9,13 +9,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
     build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
     RefreshingJwks,
 };
-use crate::permissions::{ClaimKey, Guard, GuardSet};
+use crate::permissions::{ClaimKey, Guard, GuardDenial, GuardSet, Quantifier};
 
 /// Request value source for Rust-side argument prebinding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1037,10 +1038,28 @@ fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<Guard>
                     "requires guard 'claim' must be a non-empty string",
                 ));
             }
-            let match_all = dict
-                .get("match_all")
-                .ok_or_else(|| PyValueError::new_err("requires guard missing 'match_all'"))?
-                .extract::<bool>(py)?;
+            let quantifier = match dict
+                .get("quantifier")
+                .ok_or_else(|| PyValueError::new_err("requires guard missing 'quantifier'"))?
+                .extract::<u8>(py)?
+            {
+                0 => Quantifier::Any,
+                1 => Quantifier::All,
+                2 => Quantifier::None,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "requires guard '{}' has unknown quantifier {}",
+                        claim, other
+                    )))
+                }
+            };
+            // Always present (may be None). Serialized to response bytes here,
+            // at registration, so a denial costs no formatting per request.
+            let denial = dict
+                .get("message")
+                .ok_or_else(|| PyValueError::new_err("requires guard missing 'message'"))?
+                .extract::<Option<String>>(py)?
+                .map(|message| Arc::new(GuardDenial::new(message)));
             let values_py = dict
                 .get("values")
                 .ok_or_else(|| PyValueError::new_err("requires guard missing 'values'"))?
@@ -1075,7 +1094,8 @@ fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<Guard>
             Ok(Guard::Requires {
                 claim: ClaimKey::parse(claim),
                 values,
-                match_all,
+                quantifier,
+                denial,
             })
         }
         other => Err(PyValueError::new_err(format!(

@@ -1,10 +1,11 @@
 use crate::middleware::auth::{authenticate, AuthBackend, AuthContext};
-use crate::permissions::{evaluate_guards, GuardResult, GuardSet};
+use crate::permissions::{evaluate_guards, GuardDenial, GuardResult, GuardSet};
 use actix_web::http::uri::Authority;
 /// Shared validation logic used by both production handler and test handler
 /// All functions marked #[inline(always)] for zero-cost abstraction
 use ahash::AHashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// Parse HTTP cookies from Cookie header
 /// Returns HashMap of cookie name -> cookie value
@@ -40,8 +41,9 @@ pub enum AuthGuardResult {
     Allow(Option<AuthContext>),
     /// Authentication required (401)
     Unauthorized,
-    /// Permission denied (403)
-    Forbidden,
+    /// Permission denied (403), with the failing guard's custom detail if it
+    /// declared one.
+    Forbidden(Option<Arc<GuardDenial>>),
 }
 
 /// Whether an HTTP method is "safe" (RFC 9110 §9.2.1) — read-only and thus
@@ -208,8 +210,8 @@ pub fn validate_auth_and_guards(
             GuardResult::Unauthorized => {
                 return AuthGuardResult::Unauthorized;
             }
-            GuardResult::Forbidden => {
-                return AuthGuardResult::Forbidden;
+            GuardResult::Forbidden(denial) => {
+                return AuthGuardResult::Forbidden(denial);
             }
         }
     }

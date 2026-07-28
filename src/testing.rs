@@ -875,7 +875,9 @@ async fn handle_test_request_internal(
                 ctx
             }
             AuthGuardResult::Unauthorized => return responses::error_401(),
-            AuthGuardResult::Forbidden => return responses::error_403(),
+            AuthGuardResult::Forbidden(denial) => {
+                return responses::error_403_denial(denial.as_deref())
+            }
         }
     } else {
         None
@@ -1317,9 +1319,12 @@ pub fn handle_test_websocket(
                         "Authentication required",
                     ));
                 }
-                GuardResult::Forbidden => {
+                GuardResult::Forbidden(denial) => {
                     return Err(pyo3::exceptions::PyPermissionError::new_err(
-                        "Permission denied",
+                        denial.map_or_else(
+                            || "Permission denied".to_string(),
+                            |denial| denial.text.clone(),
+                        ),
                     ));
                 }
             }

@@ -1023,9 +1023,9 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                     // CORS headers will be added by CorsMiddleware
                     return responses::error_401();
                 }
-                AuthGuardResult::Forbidden => {
+                AuthGuardResult::Forbidden(denial) => {
                     // CORS headers will be added by CorsMiddleware
-                    return responses::error_403();
+                    return responses::error_403_denial(denial.as_deref());
                 }
             }
         } else {

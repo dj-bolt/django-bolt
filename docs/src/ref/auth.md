@@ -164,6 +164,8 @@ Requires("role", "client", "vip")            # any of (OR)
 Requires("is_staff", True)                   # boolean claim
 Requires("permissions", "blog.view_article") # Django-style permission
 Requires("permissions", all_of=["blog.delete_article", "blog.change_article"])  # AND
+Requires("role", none_of=["banned", "suspended"])                              # NOR
+Requires("role", "client", message="Client accounts only")                     # custom 403 detail
 
 @api.get("/articles", guards=[Requires("permissions", "blog.view_article")])
 ```
@@ -176,7 +178,7 @@ IsClient = Requires("role", "client")
 @api.get("/orders", guards=[IsAuthenticated(), IsClient])
 ```
 
-Returns 401 if unauthenticated, 403 if the claim is missing or doesn't match. The `permissions` claim reads the unified permission set, so it also covers `key_permissions` from `APIKeyAuthentication`; every other claim comes from the JWT payload. See [Permissions](../topics/permissions.md) for full matching semantics.
+Returns 401 if unauthenticated, 403 if the claim is missing or doesn't match — including for `none_of`, so an anonymous request can never satisfy an exclusion. `message=` replaces the 403 `detail` (never the 401's). The `permissions` claim reads the unified permission set, so it also covers `key_permissions` from `APIKeyAuthentication`; every other claim comes from the JWT payload. See [Permissions](../topics/permissions.md) for full matching semantics.
 
 ## Token utilities
 

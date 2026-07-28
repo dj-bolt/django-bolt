@@ -75,6 +75,29 @@ _route(
 )
 _route("/key-role", [Requires("role", "client")], auth=[APIKeyAuthentication(api_keys={"key-1"})])
 
+# none_of: the claim must match none of the listed values.
+_route("/role-not-banned", [Requires("role", none_of=["banned", "suspended"])])
+_route("/roles-not-banned", [Requires("roles", none_of=["banned"])])
+_route("/perm-not-delete", [Requires("permissions", none_of=["users.delete"])])
+_route("/authed-not-banned", [IsAuthenticated(), Requires("role", none_of=["banned"])])
+# Guards are cumulative, so "has X but not Y" is two guards.
+_route(
+    "/perm-add-not-admin",
+    [Requires("permissions", "blog.add"), Requires("permissions", none_of=["blog.admin"])],
+)
+
+# message: the detail returned with the 403.
+_route("/client-msg", [Requires("role", "client", message="Client accounts only")])
+_route("/not-banned-msg", [Requires("role", none_of=["banned"], message="Your account is restricted")])
+_route(
+    "/two-messages",
+    [
+        Requires("role", "client", message="first guard"),
+        Requires("tenant_id", message="second guard"),
+    ],
+)
+_route("/quoted-msg", [Requires("role", "client", message='Say "no" — \\ ok')])
+
 
 @pytest.fixture(scope="module")
 def client():
@@ -214,6 +237,94 @@ class TestPermissionsClaim:
         assert resp.status_code == 403
 
 
+class TestNoneOf:
+    """`none_of` is the third quantifier: the claim must match none of them."""
+
+    def test_allows_unlisted_value(self, client, user):
+        resp = client.get("/role-not-banned", headers=bearer(user, role="client"))
+        assert resp.status_code == 200
+
+    def test_denies_listed_value(self, client, user):
+        for role in ("banned", "suspended"):
+            resp = client.get("/role-not-banned", headers=bearer(user, role=role))
+            assert resp.status_code == 403, role
+
+    def test_absent_claim_passes(self, client, user):
+        """A user with no role is not the banned role."""
+        resp = client.get("/role-not-banned", headers=bearer(user))
+        assert resp.status_code == 200
+
+    def test_unauthenticated_is_401_not_allowed_through(self, client):
+        """The security property: no credential can never satisfy none_of.
+
+        A naive 'doesn't match' implementation would let anonymous requests
+        through, since a request with no claims matches nothing.
+        """
+        assert client.get("/role-not-banned").status_code == 401
+        assert client.get("/authed-not-banned").status_code == 401
+
+    def test_list_claim_membership(self, client, user):
+        clean = client.get("/roles-not-banned", headers=bearer(user, roles=["a", "b"]))
+        dirty = client.get("/roles-not-banned", headers=bearer(user, roles=["a", "banned"]))
+        assert clean.status_code == 200
+        assert dirty.status_code == 403
+
+    def test_permissions_claim(self, client, user):
+        ok = client.get("/perm-not-delete", headers=bearer(user, permissions=["users.view"]))
+        bad = client.get("/perm-not-delete", headers=bearer(user, permissions=["users.delete"]))
+        assert ok.status_code == 200
+        assert bad.status_code == 403
+
+    def test_composes_with_a_positive_guard(self, client, user):
+        """Guards are cumulative, so 'has X but not Y' is two guards."""
+        path = "/perm-add-not-admin"
+        allowed = client.get(path, headers=bearer(user, permissions=["blog.add"]))
+        blocked = client.get(path, headers=bearer(user, permissions=["blog.add", "blog.admin"]))
+        missing = client.get(path, headers=bearer(user, permissions=["other"]))
+        assert allowed.status_code == 200
+        assert blocked.status_code == 403
+        assert missing.status_code == 403
+
+
+class TestDenialMessage:
+    """`message=` customises the 403 detail without any per-request Python."""
+
+    def test_default_detail_unchanged(self, client, user):
+        resp = client.get("/client", headers=bearer(user, role="vendor"))
+        assert resp.status_code == 403
+        assert resp.json() == {"detail": "Permission denied"}
+
+    def test_custom_detail_on_requires(self, client, user):
+        resp = client.get("/client-msg", headers=bearer(user, role="vendor"))
+        assert resp.status_code == 403
+        assert resp.json() == {"detail": "Client accounts only"}
+
+    def test_custom_detail_on_none_of(self, client, user):
+        resp = client.get("/not-banned-msg", headers=bearer(user, role="banned"))
+        assert resp.status_code == 403
+        assert resp.json() == {"detail": "Your account is restricted"}
+
+    def test_not_leaked_on_401(self, client):
+        """An unauthenticated request must not learn why it would be denied."""
+        resp = client.get("/client-msg")
+        assert resp.status_code == 401
+        assert resp.json() == {"detail": "Authentication required"}
+
+    def test_first_failing_guard_wins(self, client, user):
+        """Guards short-circuit in declaration order."""
+        first = client.get("/two-messages", headers=bearer(user, role="vendor"))
+        second = client.get("/two-messages", headers=bearer(user, role="client"))
+        assert first.json() == {"detail": "first guard"}
+        assert second.json() == {"detail": "second guard"}
+
+    def test_message_is_json_escaped(self, client, user):
+        """A quote or backslash in the message must not emit broken JSON."""
+        resp = client.get("/quoted-msg", headers=bearer(user, role="vendor"))
+        assert resp.status_code == 403
+        assert resp.headers["content-type"].startswith("application/json")
+        assert resp.json() == {"detail": 'Say "no" — \\ ok'}
+
+
 # --- Registration-time failures: never silently leave a route open ---------
 
 
@@ -238,6 +349,31 @@ class TestRegistrationFailures:
         """all_of='perm' would iterate characters — reject it."""
         with pytest.raises(ImproperlyConfigured, match="list/tuple"):
             Requires("permissions", all_of="users.delete")
+
+    def test_none_of_and_values_are_mutually_exclusive(self):
+        with pytest.raises(ImproperlyConfigured, match="not both"):
+            Requires("role", "client", none_of=["banned"])
+
+    def test_none_of_and_all_of_are_mutually_exclusive(self):
+        with pytest.raises(ImproperlyConfigured, match="not both"):
+            Requires("permissions", all_of=["a"], none_of=["b"])
+
+    def test_empty_none_of_rejected(self):
+        with pytest.raises(ImproperlyConfigured, match="must not be empty"):
+            Requires("role", none_of=[])
+
+    def test_string_none_of_rejected(self):
+        """none_of='banned' would iterate characters — reject it."""
+        with pytest.raises(ImproperlyConfigured, match="list/tuple"):
+            Requires("role", none_of="banned")
+
+    def test_non_string_message_rejected(self):
+        with pytest.raises(ImproperlyConfigured, match="message"):
+            Requires("role", "client", message=object())
+
+    def test_empty_message_rejected(self):
+        with pytest.raises(ImproperlyConfigured, match="message"):
+            Requires("role", "client", message="")
 
     def test_base_permission_subclass_is_not_a_guard(self):
         """Subclassing is not the way to build checks — Requires is."""
