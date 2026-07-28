@@ -306,8 +306,8 @@ async def main() -> None:
         "-b",
         "--batch-size",
         type=int,
-        default=10,
-        help="Launch batch size (default: 10, use -1 for all at once)",
+        default=-1,
+        help="Launch batch size (default: -1, use -1 for all at once)",
     )
     parser.add_argument(
         "-i",

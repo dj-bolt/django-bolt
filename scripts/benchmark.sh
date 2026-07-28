@@ -11,6 +11,9 @@ PORT=${PORT:-8000}
 SLOW_MS=${SLOW_MS:-100}
 SLOW_CONC=${SLOW_CONC:-50}
 SLOW_DURATION=${SLOW_DURATION:-5}
+# Benchmarks do not need production-length graceful draining between sections.
+# Keep this configurable for shutdown testing, but fail fast by default.
+SHUTDOWN_GRACE=${SHUTDOWN_GRACE:-1}
 
 # Check if bombardier is available
 BOMBARDIER_BIN=""
@@ -57,28 +60,39 @@ wait_for_server() {
   exit 1
 }
 
-RUNBOLT_PATTERN="manage.py runbolt --host $HOST --port $PORT"
-
 # Stop the current server tree (uv wrapper, supervisor, workers) and WAIT for
 # it to die and release the port before returning. A fire-and-forget SIGTERM
 # here is how stale servers stacked up across runs — and with SO_REUSEPORT, a
 # draining worker from the previous section can still answer requests when the
 # next section starts, so bombardier silently benchmarks the wrong server.
-# Note: `kill -TERM -$SERVER_PID` was never reliable — setsid forks, so $! is
-# not the new process group leader; pkill on the full command line is.
 stop_server() {
-  pkill -TERM -f "$RUNBOLT_PATTERN" 2>/dev/null || true
+  if [ -z "${SERVER_PGID:-}" ]; then
+    return
+  fi
+
+  kill -TERM -- "-$SERVER_PGID" 2>/dev/null || true
   local waited=0
-  while pgrep -f "$RUNBOLT_PATTERN" >/dev/null 2>&1; do
-    if [ $waited -ge 40 ]; then
-      echo "Server did not exit within 10s of SIGTERM; sending SIGKILL" >&2
-      pkill -KILL -f "$RUNBOLT_PATTERN" 2>/dev/null || true
-      sleep 0.5
+  local max_waits=$((SHUTDOWN_GRACE * 4))
+  while ps -eo pgid=,stat= | awk -v pgid="$SERVER_PGID" \
+    '$1 == pgid && $2 !~ /^Z/ { found=1 } END { exit !found }'
+  do
+    if [ $waited -ge $max_waits ]; then
+      echo "Server did not exit within ${SHUTDOWN_GRACE}s of SIGTERM; sending SIGKILL" >&2
+      kill -KILL -- "-$SERVER_PGID" 2>/dev/null || true
       break
     fi
     sleep 0.25
     waited=$((waited + 1))
   done
+
+  # Reap the background launcher. Without this, Bash prints a noisy
+  # "<pid> Killed" job diagnostic at an unrelated line in the benchmark.
+  if [ -n "${SERVER_PID:-}" ]; then
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=
+  fi
+  SERVER_PGID=
+
   waited=0
   while lsof -tiTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; do
     if [ $waited -ge 40 ]; then
@@ -91,9 +105,20 @@ stop_server() {
   done
 }
 
+# Every abnormal exit — a failed readiness check, a `set -e` trip, Ctrl-C —
+# would otherwise leave the current section's server group running.
+trap stop_server EXIT INT TERM
+
 start_server() {
   DJANGO_BOLT_WORKERS=$WORKERS $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P >/dev/null 2>&1 &
   SERVER_PID=$!
+  SERVER_PGID=$(ps -o pgid= -p "$SERVER_PID" | tr -d ' ')
+  if [ -z "$SERVER_PGID" ] || [ "$SERVER_PGID" != "$SERVER_PID" ]; then
+    echo "ERROR: benchmark server did not start in an isolated process group." >&2
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    exit 1
+  fi
   wait_for_server
 }
 
