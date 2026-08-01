@@ -13,6 +13,32 @@ use actix_web::http::header::{
 use crate::metadata::CorsConfig;
 use crate::state::AppState;
 
+/// Whether an Origin header value denotes the same origin as the request's
+/// Host header (browsers ALWAYS send Origin on WebSocket handshakes, even for
+/// same-origin connections, so equality with Host means "not cross-origin").
+///
+/// Compares the origin's authority (scheme stripped) case-insensitively
+/// against the Host value, tolerating an explicit default port on either side
+/// (`:80` for http, `:443` for https).
+pub fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let (authority, default_port) = if let Some(rest) = origin.strip_prefix("https://") {
+        (rest, ":443")
+    } else if let Some(rest) = origin.strip_prefix("http://") {
+        (rest, ":80")
+    } else {
+        // Opaque origins ("null") or exotic schemes are never same-origin.
+        return false;
+    };
+    if authority.is_empty() {
+        return false;
+    }
+    let normalize = |value: &str| -> String {
+        let trimmed = value.strip_suffix(default_port).unwrap_or(value);
+        trimmed.to_ascii_lowercase()
+    };
+    normalize(authority) == normalize(host)
+}
+
 /// Add CORS headers to a HeaderMap using CorsConfig (supports regex patterns)
 /// This is the core function used by CorsMiddleware
 /// Returns true if CORS headers were added (origin was allowed), false otherwise
@@ -137,5 +163,61 @@ pub fn add_preflight_headers_with_config(headers: &mut HeaderMap, cors_config: &
                 "Access-Control-Request-Method, Access-Control-Request-Headers",
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_matches_host;
+
+    #[test]
+    fn same_origin_with_explicit_port() {
+        assert!(origin_matches_host(
+            "http://127.0.0.1:8000",
+            "127.0.0.1:8000"
+        ));
+        assert!(origin_matches_host(
+            "https://app.example.com:8443",
+            "app.example.com:8443"
+        ));
+    }
+
+    #[test]
+    fn same_origin_with_default_ports() {
+        assert!(origin_matches_host("http://example.com", "example.com"));
+        assert!(origin_matches_host("http://example.com:80", "example.com"));
+        assert!(origin_matches_host(
+            "https://example.com",
+            "example.com:443"
+        ));
+    }
+
+    #[test]
+    fn host_comparison_is_case_insensitive() {
+        assert!(origin_matches_host(
+            "http://Example.COM:8000",
+            "example.com:8000"
+        ));
+    }
+
+    #[test]
+    fn cross_origin_is_rejected() {
+        assert!(!origin_matches_host("https://evil.example", "example.com"));
+        assert!(!origin_matches_host(
+            "http://example.com:9000",
+            "example.com:8000"
+        ));
+        // http vs https on the same host is a different origin (default ports differ)
+        assert!(!origin_matches_host(
+            "https://example.com",
+            "example.com:80"
+        ));
+    }
+
+    #[test]
+    fn opaque_and_exotic_origins_are_rejected() {
+        assert!(!origin_matches_host("null", "example.com"));
+        assert!(!origin_matches_host("file://example.com", "example.com"));
+        assert!(!origin_matches_host("http://", "example.com"));
     }
 }

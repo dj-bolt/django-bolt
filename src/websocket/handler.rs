@@ -374,10 +374,13 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
 /// Uses the same CORS configuration as HTTP requests (like FastAPI)
 ///
 /// Security behavior:
+/// - Same-origin requests are always allowed: either no Origin header
+///   (non-browser clients), or an Origin whose authority matches the Host
+///   header (browsers ALWAYS send Origin on WebSocket handshakes, including
+///   same-origin ones)
 /// - If CORS is configured with allow_all_origins=true: allow all origins
 /// - If CORS is configured with specific origins: only allow those origins
 /// - If NO CORS is configured: DENY all cross-origin requests (fail-secure)
-/// - Same-origin requests (no Origin header) are always allowed
 fn validate_origin(req: &HttpRequest, state: &AppState) -> bool {
     // Get origin header from request
     let origin = match req.headers().get("origin") {
@@ -389,11 +392,18 @@ fn validate_origin(req: &HttpRequest, state: &AppState) -> bool {
             }
         },
         None => {
-            // No origin header - allow for same-origin requests
-            // (browsers don't send Origin for same-origin WebSocket connections)
+            // No Origin header - a non-browser same-origin client
             return true;
         }
     };
+
+    // Same-origin browser handshake (Origin authority == Host) is always
+    // allowed; CORS allowlists only govern cross-origin access.
+    if let Some(host) = req.headers().get("host").and_then(|h| h.to_str().ok()) {
+        if crate::cors::origin_matches_host(origin, host) {
+            return true;
+        }
+    }
 
     // Check global CORS config (same as HTTP)
     if let Some(ref cors_config) = state.global_cors_config {

@@ -69,6 +69,7 @@ django-bolt = "django_bolt.nanodjango"
 features = ["pyo3/extension-module"]
 module-name = "django_bolt._core"
 python-source = "python"
+include = [{ path = "python/django_bolt/microreflex/runtime.js", format = ["wheel", "sdist"] }]
 
 [tool.uv.workspace]
 members = ["python/bolt-mcp"]

@@ -132,6 +132,29 @@ async def test_websocket_no_cors_config_denies_cross_origin():
 
 
 @pytest.mark.asyncio
+async def test_websocket_no_cors_config_allows_browser_same_origin():
+    """Browsers ALWAYS send Origin on WebSocket handshakes; an Origin whose
+    authority matches the Host header is same-origin and must be allowed even
+    without CORS config."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/echo")
+    async def echo_handler(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    async with WebSocketTestClient(
+        api,
+        "/ws/echo",
+        headers={"Origin": "http://127.0.0.1:8000", "Host": "127.0.0.1:8000"},
+        cors_allowed_origins=None,  # No CORS config
+        read_django_settings=False,
+    ) as ws:
+        msg = await ws.receive_text()
+        assert msg == "connected"
+
+
+@pytest.mark.asyncio
 async def test_websocket_no_cors_config_allows_same_origin():
     """Test WebSocket without CORS config allows same-origin requests (no Origin header)."""
     api = BoltAPI()

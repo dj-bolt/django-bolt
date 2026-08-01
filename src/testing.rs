@@ -1242,10 +1242,17 @@ pub fn handle_test_websocket(
         header_map.insert(name.to_lowercase(), value.clone());
     }
 
-    // Origin validation for WebSocket
+    // Origin validation for WebSocket (mirrors websocket/handler.rs):
+    // same-origin (Origin authority == Host) is always allowed; CORS
+    // allowlists only govern cross-origin access.
     let origin = header_map.get("origin");
     if let Some(origin_value) = origin {
-        let origin_allowed = if let Some(ref cors_config) = app.global_cors_config {
+        let same_origin = header_map
+            .get("host")
+            .is_some_and(|host| crate::cors::origin_matches_host(origin_value, host));
+        let origin_allowed = if same_origin {
+            true
+        } else if let Some(ref cors_config) = app.global_cors_config {
             if cors_config.allow_all_origins {
                 true
             } else {
