@@ -100,21 +100,26 @@ must be JSON-serializable constants, foreach items, or plain state fields.
 
 ## Performance notes
 
-Numbers from the in-process test harness on the CI container
-(`python/tests/test_microreflex.py`, printed by the throughput smoke test):
+Measured against a real Reflex 0.9.7 backend (backend-only mode, its
+production socket.io event path) on the same 4-core container, same
+counter-increment workload, same client — full methodology, tables, and the
+WorkerLoop ablation in [bench/microreflex/README.md](../bench/microreflex/README.md):
 
-- **Page GET**: a pre-rendered string through the Rust sync-dispatch path —
-  same cost as any static django-bolt HTML endpoint.
-- **Event round-trip** (event → handler → diff → patch): ~90µs each,
-  ~11,000/s on a single connection, through the real Rust WebSocket pipeline.
+- **Event round-trips over real TCP**: parity at 1 connection (~1ms RTT —
+  transport-bound on both sides), **1.3–1.5x Reflex's throughput at 8–32
+  connections** with ~30% lower p50 and tighter p99. The counter's tiny state
+  flatters Reflex: its per-event cost grows with the state tree, micro-reflex's
+  only with the page's dynamic slots.
+- **Pure dispatch cost** (in-process, no TCP): ~90µs per event round-trip,
+  ~11,000/s on one connection (`python/tests/test_microreflex.py` throughput
+  smoke test).
+- **Page GET**: the whole interactive page is one pre-rendered string through
+  the Rust sync-dispatch path — p50 589µs at 1 connection, ~2,600 pages/s at
+  32 connections with the benchmark client itself as the ceiling. Reflex has
+  no comparable single-request page: it ships a Next.js bundle, hydrates, and
+  round-trips a hydrate event.
 
-For comparison, a stock Reflex event round-trip crosses a Node/Next.js
-frontend, a socket.io layer, and a Python backend that serializes full state
-deltas — typically single-digit milliseconds at best. The PoC point: with
-routing, HTTP, WebSocket framing, and middleware in Rust, the per-event
-budget is dominated by the user's handler, not the framework.
-
-Run it yourself:
+Run the in-process figure yourself:
 
 ```bash
 uv run --with pytest --with pytest-asyncio pytest \
