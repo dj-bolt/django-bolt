@@ -366,6 +366,10 @@ fn build_scope(py: Python<'_>, req: &HttpRequest, mount: &AsgiMount) -> PyResult
 
 /// Submit a coroutine to the Python asyncio event loop via `run_coroutine_threadsafe`.
 /// Returns the `concurrent.futures.Future` wrapping the asyncio task.
+///
+/// Mounted ASGI apps run on the startup/selector loop, not the WorkerLoop that
+/// owns Bolt route coroutines (see `worker_loop::get_loop`) — so a mount cannot
+/// share an asyncio future, queue, or lock with a Bolt handler.
 fn submit_to_event_loop(py: Python<'_>, coroutine: Py<PyAny>) -> PyResult<Py<PyAny>> {
     let locals = TASK_LOCALS
         .get()

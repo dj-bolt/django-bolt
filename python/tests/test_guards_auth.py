@@ -89,7 +89,8 @@ class TestPermissionGuards:
             "type": "requires",
             "claim": "role",
             "values": ["client"],
-            "match_all": False,
+            "quantifier": 0,
+            "message": None,
         }
 
     def test_requires_any_of(self):
@@ -97,17 +98,17 @@ class TestPermissionGuards:
         assert meta["type"] == "requires"
         assert meta["claim"] == "permissions"
         assert meta["values"] == ["users.create", "users.update"]
-        assert meta["match_all"] is False
+        assert meta["quantifier"] == 0
 
     def test_requires_all_of(self):
         meta = Requires("permissions", all_of=["users.create", "users.delete"]).to_metadata()
         assert meta["values"] == ["users.create", "users.delete"]
-        assert meta["match_all"] is True
+        assert meta["quantifier"] == 1
 
     def test_requires_presence_only(self):
         meta = Requires("tenant_id").to_metadata()
         assert meta["values"] == []
-        assert meta["match_all"] is False
+        assert meta["quantifier"] == 0
 
     def test_requires_named_reuse(self):
         """The one way to define a reusable custom check: name an instance."""

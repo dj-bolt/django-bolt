@@ -12,7 +12,7 @@ There are exactly three guards:
 |-------|---------|
 | `IsAuthenticated()` | The request must carry a valid credential (else 401) |
 | `AllowAny()` | Explicitly public; overrides global default guards |
-| `Requires(claim, *values, all_of=...)` | **The** permission check — one primitive for roles, permissions, tenancy, flags |
+| `Requires(claim, *values, all_of=..., none_of=..., message=...)` | **The** permission check — one primitive for roles, permissions, tenancy, flags |
 
 Every guard compiles to a native Rust check at registration — the claim name and expected values are extracted from Python exactly once, and request-time guard evaluation never touches the GIL.
 
@@ -59,6 +59,8 @@ Requires("role", "client", "vip")            # any of (OR)
 Requires("is_staff", True)                   # boolean claim
 Requires("permissions", "blog.add_article")  # Django-style permission
 Requires("permissions", all_of=["blog.add_article", "blog.change_article"])  # AND
+Requires("role", none_of=["banned", "suspended"])                            # NOR
+Requires("role", "client", message="Client accounts only")                   # custom 403 detail
 ```
 
 Give reusable checks a name by assignment — no subclassing:
@@ -84,7 +86,10 @@ token = create_jwt_for_user(user, extra_claims={"role": "client"})
 ### Matching semantics
 
 - **Positional values are OR** — the claim must match at least one.
-- **`all_of` is AND** — the claim (a list, e.g. `permissions`) must contain every value. Positional values and `all_of` are mutually exclusive.
+- **`all_of` is AND** — the claim (a list, e.g. `permissions`) must contain every value.
+- **`none_of` is NOR** — the claim must match none of the values. Use it to exclude a few values instead of listing every allowed one.
+- **The three are mutually exclusive** — they are the same quantifier slot. Guards are cumulative, so "has X but not Y" is two guards: `[Requires("permissions", "blog.add"), Requires("permissions", none_of=["blog.admin"])]`.
+- **An unauthenticated request fails every `Requires` with a 401** — including a `none_of` one. A request carrying no claims matches nothing, so without this it would satisfy an exclusion and walk straight through the guard.
 - **Scalar claims match by equality; list claims by membership** — `Requires("roles", "client")` passes when `roles: ["beta", "client"]`.
 - **No values means presence** — the claim must exist and be non-null. A boolean claim must be `true`: `Requires("is_admin")` rejects a token carrying `is_admin: false`.
 - **Value types**: `str`, `int`, `bool` (and `float`). Anything else is rejected at registration.
@@ -111,9 +116,19 @@ All other claims come from the token, so backends that carry no claims (API keys
 
 `401` when the request is unauthenticated, `403` when the claim is missing or doesn't match. Guards evaluate in declaration order and short-circuit on the first verdict.
 
+`message=` sets the `detail` returned with the 403:
+
+```python
+@api.get("/orders", guards=[Requires("role", "client", message="Client accounts only")])
+async def list_orders(): ...
+# 403 → {"detail": "Client accounts only"}
+```
+
+The message is serialized into the response body once at registration, so a custom message costs nothing per request. It is never used for the 401 — an unauthenticated caller is not told why it would have been denied.
+
 ### Registration is strict
 
-Anything that can't be compiled fails startup instead of silently leaving the route open: an empty claim name, non-scalar values, mixing positional values with `all_of`, or subclassing `BasePermission` (not a thing — name a `Requires` instance instead) all raise `ImproperlyConfigured`.
+Anything that can't be compiled fails startup instead of silently leaving the route open: an empty claim name, non-scalar values, combining positional values with `all_of`/`none_of`, an empty or string `all_of`/`none_of`, an empty `message`, or subclassing `BasePermission` (not a thing — name a `Requires` instance instead) all raise `ImproperlyConfigured`.
 
 ## Combining guards
 

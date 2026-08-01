@@ -6,11 +6,13 @@ import asyncio
 import contextlib
 import inspect
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any, get_type_hints
 from urllib.parse import unquote
 
 import msgspec
+
+from django_bolt.auth.guards import QUANT_ALL, QUANT_NONE
 
 from . import schema
 from ._execute import error_result, execute_tool
@@ -96,6 +98,15 @@ def _claim_matches(value: Any, expected: Any) -> bool:
     return _scalar_matches(value, expected)
 
 
+def _combine(quantifier: int, matches: Iterable[bool]) -> bool:
+    """Apply a guard's quantifier over its per-value match results."""
+    if quantifier == QUANT_ALL:
+        return all(matches)
+    if quantifier == QUANT_NONE:
+        return not any(matches)
+    return any(matches)
+
+
 def _guard_allows(meta: dict, ctx: dict) -> bool:
     """Evaluate one compiled guard (``guard.to_metadata()``) against the principal dict.
 
@@ -110,20 +121,27 @@ def _guard_allows(meta: dict, ctx: dict) -> bool:
         return True
     if kind == "is_authenticated":
         return bool(ctx)
-    # "requires": an unauthenticated request never satisfies a claim check.
+    # "requires": an unauthenticated request never satisfies a claim check --
+    # including a none_of one, which a caller carrying no claims would
+    # otherwise satisfy by matching nothing.
     if not ctx:
         return False
     values = meta["values"]
-    combine = all if meta["match_all"] else any
+    quantifier = meta["quantifier"]
+    # A bare presence check. `none_of` cannot be empty (Requires rejects it),
+    # so this is never an exclusion in practice; inverting anyway keeps
+    # "none of nothing" coherent and matches requires_matches() in Rust.
+    inverted = quantifier == QUANT_NONE
     if meta["claim"] == "permissions":
         granted = set(ctx.get("permissions") or ())
         if not values:
-            return bool(granted)
-        return combine(v in granted for v in values)
+            return not granted if inverted else bool(granted)
+        return _combine(quantifier, (v in granted for v in values))
     resolved = (ctx.get("auth_claims") or {}).get(meta["claim"])
     if not values:
-        return resolved is not None and resolved is not False
-    return combine(_claim_matches(resolved, v) for v in values)
+        present = resolved is not None and resolved is not False
+        return not present if inverted else present
+    return _combine(quantifier, (_claim_matches(resolved, v) for v in values))
 
 
 def _arguments_from_signature(fn: Callable) -> list[dict[str, Any]]:

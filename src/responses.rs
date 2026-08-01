@@ -2,6 +2,7 @@
 ///
 /// Inspired by Bun/uWebSockets zero-copy patterns, these responses are
 /// stored as static byte slices to eliminate allocations in hot paths.
+use crate::permissions::GuardDenial;
 use actix_web::HttpResponse;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -68,6 +69,20 @@ pub fn error_403() -> HttpResponse {
     HttpResponse::Forbidden()
         .content_type("application/json")
         .body(ERROR_BODY_403)
+}
+
+/// A 403 carrying a guard's custom `detail`, falling back to the static body.
+///
+/// The custom body was serialized at registration, so this clones a `Bytes`
+/// handle rather than formatting anything.
+#[inline]
+pub fn error_403_denial(denial: Option<&GuardDenial>) -> HttpResponse {
+    match denial {
+        None => error_403(),
+        Some(denial) => HttpResponse::Forbidden()
+            .content_type("application/json")
+            .body(denial.body.clone()),
+    }
 }
 
 #[inline]

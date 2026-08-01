@@ -55,6 +55,17 @@ fn get_worker_fn<'py>(
     })
 }
 
+/// The process-lived WorkerLoop. Every Python coroutine belonging to a Bolt
+/// route — HTTP dispatch, streaming response generators, WebSocket handlers —
+/// must run here, so that futures, queues, and locks shared between handlers
+/// always live on one loop. A coroutine driven on the selector loop instead
+/// would deadlock the moment a WorkerLoop-dispatched handler resolves one of
+/// its futures (asyncio wakes waiters via a same-loop `call_soon`).
+///
+/// Rust outside this module reaches the loop through `worker_task_locals`.
+/// The one deliberate exception is `asgi_http::submit_to_event_loop`: mounted
+/// ASGI apps stay on the startup/selector loop (`state::TASK_LOCALS`), so they
+/// cannot share asyncio primitives with Bolt handlers.
 fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     WORKER_LOOP.get_or_try_init(py, || {
         let locals = TASK_LOCALS.get().ok_or_else(|| {
@@ -70,6 +81,28 @@ fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
         factory
             .call1(py, (scheduler, locals.event_loop(py)))
             .map(Into::into)
+    })
+}
+
+/// TaskLocals bound to the WorkerLoop, for Rust code that schedules Python
+/// coroutines or resolves Python futures on the HTTP dispatch loop
+/// (e.g. the streaming forwarder and its backpressure futures).
+///
+/// The context is the startup one, not a fresh `copy_context()`: this snapshot
+/// is initialized lazily from whichever request first streams or upgrades, and
+/// is then inherited by every stream/WebSocket task for the process lifetime —
+/// so copying here would pin that request's contextvars forever.
+pub(crate) fn worker_task_locals(
+    py: Python<'_>,
+) -> PyResult<&'static pyo3_async_runtimes::TaskLocals> {
+    static WORKER_TASK_LOCALS: PyOnceLock<pyo3_async_runtimes::TaskLocals> = PyOnceLock::new();
+    WORKER_TASK_LOCALS.get_or_try_init(py, || {
+        let event_loop = get_loop(py)?.bind(py).clone();
+        // `get_loop` already errored if TASK_LOCALS was unset.
+        let startup = TASK_LOCALS.get().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
+        })?;
+        Ok(pyo3_async_runtimes::TaskLocals::new(event_loop).with_context(startup.context(py)))
     })
 }
 
