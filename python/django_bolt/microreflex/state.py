@@ -178,13 +178,18 @@ class State(metaclass=StateMeta):
 
 
 class Session:
-    """Per-connection state container + render cache for slot diffing."""
+    """Per-connection state container.
 
-    __slots__ = ("states", "cache")
+    ``rx`` is the Rust-side render cache (`_core.RxSession`): it remembers the
+    last value sent to this client for every slot, diffs, and encodes patch
+    frames. Attached by ``Page.prime()`` at connection setup.
+    """
+
+    __slots__ = ("states", "rx")
 
     def __init__(self) -> None:
         self.states: dict[type[State], State] = {}
-        self.cache: dict[str, Any] = {}
+        self.rx: Any = None
 
     def get(self, cls: type[State]) -> State:
         instance = self.states.get(cls)

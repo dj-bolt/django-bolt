@@ -8,11 +8,13 @@ Covers the three layers:
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
 
 import django_bolt.microreflex as rx
+from django_bolt import _core
 from django_bolt.microreflex.compiler import Page
 from django_bolt.microreflex.components import normalize_child
 from django_bolt.microreflex.state import Session
@@ -310,3 +312,59 @@ async def test_ws_event_roundtrip_throughput_smoke():
     rate = rounds / elapsed
     print(f"\nmicro-reflex event round-trips: {rate:,.0f}/s ({elapsed * 1e6 / rounds:.0f}µs each)")
     assert rate > 50, "event dispatch should comfortably exceed 50 round-trips/s"
+
+
+# ---------------------------------------------------------------------------
+# Rust-side state synchronization (session cache + diff + patch encoding)
+# ---------------------------------------------------------------------------
+
+
+def test_rust_diff_engine_is_engaged():
+    """State sync must run in Rust: pages compile to a _core.RxPage and
+    sessions hold a _core.RxSession render cache."""
+    page = _compile(rx.text(RenderState.message))
+    assert isinstance(page._rx_page, _core.RxPage)
+    session = Session()
+    page.prime(session)
+    assert isinstance(session.rx, _core.RxSession)
+
+
+def test_rust_patch_frame_encoding():
+    """The Rust differ emits the complete wire frame with correct JSON
+    escaping, and only for slots that changed."""
+    page = _compile(
+        rx.vstack(
+            rx.text(RenderState.message),
+            rx.cond(RenderState.on, rx.text("yes"), rx.text("no")),
+        )
+    )
+    session = Session()
+    page.prime(session)
+    assert page.compute_patch_frame(session) is None
+
+    session.get(RenderState).message = 'quote " and <tag>'
+    frame = page.compute_patch_frame(session)
+    assert isinstance(frame, str)
+    parsed = json.loads(frame)
+    assert parsed == {"t": "p", "p": [{"k": "t", "i": 0, "v": 'quote " and <tag>'}]}
+    # unchanged on repeat, everything on force
+    assert page.compute_patch_frame(session) is None
+    assert len(json.loads(page.compute_patch_frame(session, force=True))["p"]) == 2
+
+
+def test_rust_attr_patch_value_types():
+    """Attr slot values keep their JSON types (bool/None/str) through Rust."""
+
+    class AttrState(rx.State):
+        text: str = ""
+        busy: bool = False
+
+    page = _compile(rx.input(value=AttrState.text, disabled=AttrState.busy))
+    session = Session()
+    page.prime(session)
+    state = session.get(AttrState)
+    state.busy = True
+    state.text = "go"
+    parsed = json.loads(page.compute_patch_frame(session))
+    by_attr = {p["a"]: p["v"] for p in parsed["p"]}
+    assert by_attr == {"value": "go", "disabled": True}

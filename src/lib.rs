@@ -12,6 +12,7 @@ mod form_parsing;
 mod handler;
 mod json;
 mod metadata;
+mod microreflex;
 mod middleware;
 mod permissions;
 mod request;
@@ -72,6 +73,8 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Class
     m.add_class::<PyRequest>()?;
     m.add_class::<crate::worker_loop::WorkerLoopScheduler>()?;
+    m.add_class::<crate::microreflex::RxPage>()?;
+    m.add_class::<crate::microreflex::RxSession>()?;
     m.add_function(wrap_pyfunction!(crate::worker_loop::worker_timer_count, m)?)?;
 
     // Production server functions

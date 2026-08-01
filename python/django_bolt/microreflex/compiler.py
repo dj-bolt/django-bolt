@@ -22,6 +22,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from django_bolt import _core
+
 from .state import Session
 from .vars import Var
 
@@ -29,8 +31,6 @@ if TYPE_CHECKING:
     from .components import Component, Element, TextNode
 
 _RUNTIME_JS = (Path(__file__).parent / "runtime.js").read_text(encoding="utf-8")
-
-_MISSING = object()
 
 DEFAULT_CSS = """
 *,*::before,*::after{box-sizing:border-box}
@@ -47,49 +47,46 @@ hr{border:none;border-top:1px solid #e5e5e5;width:100%}
 
 
 class TextSlot:
-    __slots__ = ("slot_id", "node", "key")
+    __slots__ = ("slot_id", "node")
 
     def __init__(self, slot_id: int, node: TextNode):
         self.slot_id = slot_id
         self.node = node
-        self.key = f"t{slot_id}"
 
     def render_value(self, session: Session) -> str:
         return self.node.render_text(session)
 
-    def patch(self, value: str) -> dict[str, Any]:
-        return {"k": "t", "i": self.slot_id, "v": value}
+    def rx_spec(self) -> tuple[int, int, str | None, int]:
+        return (0, self.slot_id, None, 0)
 
 
 class HtmlSlot:
-    __slots__ = ("slot_id", "node", "key")
+    __slots__ = ("slot_id", "node")
 
     def __init__(self, slot_id: int, node: Component):
         self.slot_id = slot_id
         self.node = node
-        self.key = f"h{slot_id}"
 
     def render_value(self, session: Session) -> str:
         return self.node.render_content(session)  # type: ignore[attr-defined]
 
-    def patch(self, value: str) -> dict[str, Any]:
-        return {"k": "h", "i": self.slot_id, "v": value}
+    def rx_spec(self) -> tuple[int, int, str | None, int]:
+        return (1, self.slot_id, None, 0)
 
 
 class AttrSlot:
-    __slots__ = ("elem_id", "attr", "evaluator", "key")
+    __slots__ = ("elem_id", "attr", "evaluator")
 
     def __init__(self, elem_id: int, attr: str, evaluator: Callable[[Session], Any]):
         self.elem_id = elem_id
         self.attr = attr
         self.evaluator = evaluator
-        self.key = f"a{elem_id}:{attr}"
 
     def render_value(self, session: Session) -> Any:
         return self.evaluator(session)
 
-    def patch(self, value: Any) -> dict[str, Any]:
-        return {"k": "a", "e": self.elem_id, "a": self.attr, "v": value}
+    def rx_spec(self) -> tuple[int, int, str | None, int]:
+        return (2, 0, self.attr, self.elem_id)
 
 
 class Page:
@@ -104,6 +101,8 @@ class Page:
         "_text_counter",
         "_html_counter",
         "_elem_counter",
+        "_evaluators",
+        "_rx_page",
         "document",
     )
 
@@ -118,6 +117,10 @@ class Page:
         self._elem_counter = 0
 
         root.compile(self, inline=False)
+        # Registration-time precompute: the flat evaluator list Python runs
+        # per event, and the Rust slot table (patch prefixes + cache layout).
+        self._evaluators = [slot.render_value for slot in self.slots]
+        self._rx_page = _core.RxPage([slot.rx_spec() for slot in self.slots])
         initial = root.render(Session())
         self.document = self._build_document(initial, ws_path)
 
@@ -144,18 +147,21 @@ class Page:
 
     # -- request-time --------------------------------------------------------
     def prime(self, session: Session) -> None:
-        """Fill the session's slot cache to match the initial document."""
-        for slot in self.slots:
-            session.cache[slot.key] = slot.render_value(session)
+        """Attach a Rust render cache filled to match the initial document."""
+        session.rx = self._rx_page.new_session()
+        session.rx.prime([evaluator(session) for evaluator in self._evaluators])
+
+    def compute_patch_frame(self, session: Session, force: bool = False) -> str | None:
+        """Diff and encode in Rust: returns the complete `{"t":"p","p":[...]}`
+        wire frame, or None when no slot changed."""
+        return session.rx.diff([evaluator(session) for evaluator in self._evaluators], force)
 
     def compute_patches(self, session: Session, force: bool = False) -> list[dict[str, Any]]:
-        patches = []
-        for slot in self.slots:
-            value = slot.render_value(session)
-            if force or session.cache.get(slot.key, _MISSING) != value:
-                session.cache[slot.key] = value
-                patches.append(slot.patch(value))
-        return patches
+        """Patch list view of the Rust-encoded frame (tests/introspection)."""
+        frame = self.compute_patch_frame(session, force)
+        if frame is None:
+            return []
+        return json.loads(frame)["p"]
 
     def _build_document(self, body: str, ws_path: str) -> str:
         boot = f"window.__RX_PAGE={json.dumps(self.route)};window.__RX_WS={json.dumps(ws_path)};"

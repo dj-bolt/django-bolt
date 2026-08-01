@@ -123,14 +123,16 @@ class App:
                 if kind == "e":
                     await app._dispatch(page, session, websocket, message)
                 elif kind == "sync":
-                    patches = page.compute_patches(session, force=True)
-                    await websocket.send_json({"t": "p", "p": patches})
+                    frame = page.compute_patch_frame(session, force=True)
+                    await websocket.send_text(frame if frame is not None else '{"t":"p","p":[]}')
 
     # --------------------------------------------------------------- dispatch
     async def _flush(self, page: Page, session: Session, websocket: WebSocket) -> None:
-        patches = page.compute_patches(session)
-        if patches:
-            await websocket.send_json({"t": "p", "p": patches})
+        # Diffing and wire-frame encoding happen in Rust (_core.RxSession);
+        # the frame is already a complete JSON message.
+        frame = page.compute_patch_frame(session)
+        if frame is not None:
+            await websocket.send_text(frame)
 
     async def _drive(self, result: Any, page: Page, session: Session, websocket: WebSocket) -> None:
         """Await/iterate a handler result, flushing patches at each yield."""
