@@ -91,20 +91,32 @@ def in_orm_executor_thread() -> bool:
     return getattr(_orm_thread_state, "in_pool", False)
 
 
+# Guards lazy construction. Check-then-create was safe while the only caller
+# ran on the event loop thread; user loading forces `request.user` from
+# arbitrary threads, where two racing callers would each build a pool and the
+# loser would leak its threads and their database connections — precisely the
+# accounting this pool exists to enforce.
+_orm_executor_lock = threading.Lock()
+
+
 def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _orm_executor
-    if _orm_executor is None:
-        raw = os.environ.get("DJANGO_BOLT_ORM_THREADS")
-        try:
-            workers = int(raw) if raw else _default_orm_workers()
-        except ValueError:
-            workers = _default_orm_workers()
-        _orm_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, workers),
-            thread_name_prefix="bolt_orm",
-            initializer=_mark_orm_thread,
-        )
-    return _orm_executor
+    executor = _orm_executor
+    if executor is not None:
+        return executor
+    with _orm_executor_lock:
+        if _orm_executor is None:
+            raw = os.environ.get("DJANGO_BOLT_ORM_THREADS")
+            try:
+                workers = int(raw) if raw else _default_orm_workers()
+            except ValueError:
+                workers = _default_orm_workers()
+            _orm_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, workers),
+                thread_name_prefix="bolt_orm",
+                initializer=_mark_orm_thread,
+            )
+        return _orm_executor
 
 
 def get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
@@ -124,7 +136,15 @@ async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
     request-scoped state (e.g. a tenant-aware database router) must be
     visible while the QuerySet evaluates, exactly as it was under
     ``sync_to_async``.
+
+    A caller already running on a pool thread executes inline. This reaches
+    here through a loop nested inside a pool worker (a custom async
+    ``get_user`` driven by ``asyncio.run`` during user loading): submitting
+    back into the pool would wait on the slot that worker is holding, which
+    on a one-thread pool never resolves.
     """
+    if in_orm_executor_thread():
+        return fn(*args)
     ctx = contextvars.copy_context()
     return await asyncio.get_running_loop().run_in_executor(_get_orm_executor(), ctx.run, fn, *args)
 

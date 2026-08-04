@@ -16,8 +16,10 @@ file-lock contention the ORM pool is sized to avoid.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import threading
+import time
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -207,3 +209,71 @@ def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
         f"query ran on {seen!r} instead of inline on {pool_thread!r}; "
         "re-submitting into the ORM pool from its own worker deadlocks a one-thread pool"
     )
+
+
+def test_run_in_orm_executor_from_orm_thread_runs_inline(fresh_orm_executor):
+    """The reentrancy guard belongs to the pool, not only to the user loader.
+
+    A custom async `get_user` is driven by `asyncio.run` on a pool worker, so
+    any ORM work it awaits re-enters `run_in_orm_executor` from inside the
+    pool. Guarding only the loader leaves that one level down unprotected.
+    """
+    fresh_orm_executor(workers=1)
+
+    def nested_orm_work():
+        return threading.current_thread().name
+
+    def drive_nested_loop():
+        assert concurrency.in_orm_executor_thread()
+        outer = threading.current_thread().name
+        # Mirrors load_via_async: a nested event loop on a pool worker.
+        inner = asyncio.run(concurrency.run_in_orm_executor(nested_orm_work))
+        return outer, inner
+
+    outer, inner = concurrency._get_orm_executor().submit(drive_nested_loop).result(timeout=5)
+    assert inner == outer, (
+        f"nested ORM work hopped from {outer!r} to {inner!r}; submitting into the "
+        "pool from one of its own workers deadlocks a one-thread pool"
+    )
+
+
+def test_orm_executor_is_built_once_under_concurrent_first_use(fresh_orm_executor, monkeypatch):
+    """Racing first callers must share one pool.
+
+    Lazy construction is now reached from arbitrary threads forcing
+    `request.user`, not just from the event loop. Two callers that both see
+    `None` would each build a pool, and the loser's threads — and their
+    database connections — leak outside the budget.
+    """
+    monkeypatch.setenv("DJANGO_BOLT_ORM_THREADS", "2")
+    concurrency._orm_executor = None
+
+    built: list[concurrent.futures.ThreadPoolExecutor] = []
+    built_lock = threading.Lock()
+    real_ctor = concurrent.futures.ThreadPoolExecutor
+
+    def counting_ctor(*args, **kwargs):
+        # Widen the check-then-create window deterministically. Unsynchronized
+        # lazy construction is a race whether or not the interpreter happens to
+        # switch threads inside those few bytecodes; holding construction open
+        # makes the outcome depend on the lock rather than on scheduling luck.
+        time.sleep(0.05)
+        executor = real_ctor(*args, **kwargs)
+        with built_lock:
+            built.append(executor)
+        return executor
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", counting_ctor)
+
+    racers = 16
+    start = threading.Barrier(racers)
+
+    def first_use():
+        start.wait(timeout=5)
+        return concurrency._get_orm_executor()
+
+    with real_ctor(max_workers=racers) as callers:
+        pools = [f.result(timeout=10) for f in [callers.submit(first_use) for _ in range(racers)]]
+
+    assert len({id(p) for p in pools}) == 1, "racing callers received different ORM pools"
+    assert len(built) == 1, f"{len(built)} ORM pools were constructed; the loser's threads leak"
