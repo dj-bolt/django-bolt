@@ -14,12 +14,13 @@ import concurrent.futures
 import contextvars
 import logging
 import os
+import threading
 from collections.abc import Callable
 from functools import partial
 
 logger = logging.getLogger(__name__)
 
-__all__ = ("sync_to_thread", "run_in_orm_executor")
+__all__ = ("sync_to_thread", "run_in_orm_executor", "get_orm_executor", "in_orm_executor_thread")
 
 # Shared default pool for generic blocking work. Passing an explicit executor
 # keeps the compatibility asyncio loop and WorkerLoop from each lazily creating
@@ -74,6 +75,22 @@ def _default_orm_workers() -> int:
     return 4
 
 
+# Set on every ORM pool thread so callers already running inside the pool can
+# detect it. Blocking on the pool from one of its own threads would wait on a
+# slot the caller is itself holding — with the SQLite default of one thread,
+# that never resolves.
+_orm_thread_state = threading.local()
+
+
+def _mark_orm_thread() -> None:
+    _orm_thread_state.in_pool = True
+
+
+def in_orm_executor_thread() -> bool:
+    """Whether the calling thread is an ORM pool worker."""
+    return getattr(_orm_thread_state, "in_pool", False)
+
+
 def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _orm_executor
     if _orm_executor is None:
@@ -83,9 +100,21 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
         except ValueError:
             workers = _default_orm_workers()
         _orm_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, workers), thread_name_prefix="bolt_orm"
+            max_workers=max(1, workers),
+            thread_name_prefix="bolt_orm",
+            initializer=_mark_orm_thread,
         )
     return _orm_executor
+
+
+def get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """The bounded ORM pool, for callers that must block on it synchronously.
+
+    Async callers should use :func:`run_in_orm_executor` instead. This exists
+    for the synchronous user-loading path, where ``request.user`` is a
+    ``SimpleLazyObject`` forced from code that cannot await.
+    """
+    return _get_orm_executor()
 
 
 async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
