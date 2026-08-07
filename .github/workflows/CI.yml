@@ -408,7 +408,11 @@ jobs:
           # RUSTSEC-2023-0071 (rsa Marvin attack): no fixed release exists. rsa is
           # transitive via jsonwebtoken, and the timing oracle targets RSA
           # private-key decryption, not the public-key path JWT verification uses.
-          cargo audit --ignore RUSTSEC-2023-0071
+          # RUSTSEC-2026-0235 (rkyv OOB read): rkyv is a disabled optional dep of
+          # rust_decimal (we enable only its "serde" feature), so it is locked but
+          # never compiled — `cargo tree -i rkyv` is empty. The fix (0.8.17) is
+          # semver-major; drop this ignore when rust_decimal sheds rkyv 0.7.
+          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0235
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
