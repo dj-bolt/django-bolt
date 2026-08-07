@@ -8,8 +8,6 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyDictMethods};
 use pyo3::{IntoPyObject, Py, PyAny, Python};
-use bigdecimal::BigDecimal;
-use std::str::FromStr;
 use uuid::Uuid;
 
 // OPTIMIZATION: Cache Python classes for type construction (avoids repeated imports)
@@ -69,6 +67,57 @@ pub fn resolve_max_param_length() -> usize {
     )
 }
 
+/// Validate a decimal literal without parsing it into a numeric value.
+///
+/// Grammar (a strict subset of what Python's `decimal.Decimal` accepts, so any
+/// accepted string constructs cleanly on the Python side):
+///     [+|-] ( digits [. digits] | digits . | . digits ) [ (e|E) [+|-] digits ]
+///
+/// NaN/Infinity are rejected (HTTP parameters should be finite numbers), as are
+/// whitespace and underscores. Validation-only keeps this zero-alloc and lets
+/// the exponent stay textual: "1e999999999" is never expanded into its digit
+/// string, and Python's Decimal stores the exponent compactly.
+#[inline]
+fn is_valid_decimal_literal(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    if let Some(&c) = b.first() {
+        if c == b'+' || c == b'-' {
+            i = 1;
+        }
+    }
+    let mut mantissa_digits = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+        mantissa_digits += 1;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+            mantissa_digits += 1;
+        }
+    }
+    if mantissa_digits == 0 {
+        return false;
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let mut exponent_digits = 0;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+            exponent_digits += 1;
+        }
+        if exponent_digits == 0 {
+            return false;
+        }
+    }
+    i == b.len()
+}
+
 /// Type hint constants (must match Python's get_type_hint_id() in compiler.py)
 pub const TYPE_INT: u8 = 1;
 pub const TYPE_FLOAT: u8 = 2;
@@ -92,10 +141,10 @@ pub enum CoercedValue {
     NaiveDateTime(NaiveDateTime),
     Date(NaiveDate),
     Time(NaiveTime),
-    // Holds the original input string, validated by BigDecimal parsing. Python's
-    // decimal.Decimal is constructed from this string directly: rendering a
-    // BigDecimal with a large exponent (e.g. "1e999999999") would expand it to
-    // its full digit string in Rust, while the string form stays compact.
+    // Holds the original input string, validated by is_valid_decimal_literal().
+    // Python's decimal.Decimal is constructed from this string directly, so a
+    // large exponent (e.g. "1e999999999") is never expanded into its full digit
+    // string in Rust.
     Decimal(String),
     #[allow(dead_code)]
     Null,
@@ -211,9 +260,13 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
 
         TYPE_DATETIME => parse_datetime(value),
 
-        TYPE_DECIMAL => BigDecimal::from_str(value)
-            .map(|_| CoercedValue::Decimal(value.to_string()))
-            .map_err(|e| format!("Invalid decimal '{}': {}", value, e)),
+        TYPE_DECIMAL => {
+            if is_valid_decimal_literal(value) {
+                Ok(CoercedValue::Decimal(value.to_string()))
+            } else {
+                Err(format!("Invalid decimal '{}'", value))
+            }
+        }
 
         TYPE_DATE => NaiveDate::parse_from_str(value, "%Y-%m-%d")
             .map(CoercedValue::Date)
@@ -365,17 +418,15 @@ pub fn coerce_to_py(
         TYPE_DECIMAL => {
             // Validate decimal in Rust, convert to Python Decimal
             // OPTIMIZATION: Use cached Decimal class (avoids py.import per call)
-            match BigDecimal::from_str(value) {
-                Ok(_) => {
-                    // Pass the original validated string: Python's Decimal
-                    // normalizes it, and this avoids expanding large exponents.
-                    let py_decimal = get_decimal_class(py).call1(py, (value,))?;
-                    Ok(py_decimal)
-                }
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid decimal '{}': {}",
-                    value, e
-                ))),
+            if is_valid_decimal_literal(value) {
+                // Pass the original validated string: Python's Decimal
+                // normalizes it, and this avoids expanding large exponents.
+                Ok(get_decimal_class(py).call1(py, (value,))?)
+            } else {
+                Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid decimal '{}'",
+                    value
+                )))
             }
         }
         TYPE_DATE => {
@@ -572,6 +623,42 @@ mod tests {
             Ok(CoercedValue::Decimal(_))
         ));
         assert!(coerce_param("not_decimal", TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH).is_err());
+    }
+
+    #[test]
+    fn test_decimal_literal_grammar() {
+        for valid in [
+            "0",
+            "5.",
+            ".5",
+            "+1.5",
+            "-99.99",
+            "1e5",
+            "1E+5",
+            "1.5e-3",
+            "+.5e2",
+            // Arbitrary precision and huge exponents are valid (Python Decimal
+            // semantics); the value is validated textually, never expanded.
+            "999999999999999999999999999999999999999999",
+            "1e999999999",
+        ] {
+            assert!(
+                matches!(
+                    coerce_param(valid, TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH),
+                    Ok(CoercedValue::Decimal(_))
+                ),
+                "expected '{valid}' to be a valid decimal"
+            );
+        }
+        for invalid in [
+            "", ".", "+", "-", "e5", "1e", "1e+", "--1", "1..2", "1.2.3", "1_000", "NaN", "inf",
+            " 1", "1 ", "0x10",
+        ] {
+            assert!(
+                coerce_param(invalid, TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH).is_err(),
+                "expected '{invalid}' to be rejected"
+            );
+        }
     }
 
     #[test]

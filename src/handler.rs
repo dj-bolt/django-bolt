@@ -239,8 +239,8 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
         CoercedValue::Uuid(v) => uuid_to_py(py, *v).unwrap(),
 
         // Decimal: construct Python decimal.Decimal from the validated input
-        // string (kept as-is; rendering a parsed BigDecimal could expand large
-        // exponents to their full digit string).
+        // string (kept as-is so large exponents are never expanded into their
+        // full digit string in Rust).
         CoercedValue::Decimal(v) => crate::type_coercion::get_decimal_class(py)
             .call1(py, (v.as_str(),))
             .unwrap(),
