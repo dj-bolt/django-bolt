@@ -8,7 +8,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyDictMethods};
 use pyo3::{IntoPyObject, Py, PyAny, Python};
-use rust_decimal::Decimal;
+use bigdecimal::BigDecimal;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -92,7 +92,11 @@ pub enum CoercedValue {
     NaiveDateTime(NaiveDateTime),
     Date(NaiveDate),
     Time(NaiveTime),
-    Decimal(Decimal),
+    // Holds the original input string, validated by BigDecimal parsing. Python's
+    // decimal.Decimal is constructed from this string directly: rendering a
+    // BigDecimal with a large exponent (e.g. "1e999999999") would expand it to
+    // its full digit string in Rust, while the string form stays compact.
+    Decimal(String),
     #[allow(dead_code)]
     Null,
 }
@@ -111,7 +115,7 @@ impl CoercedValue {
             CoercedValue::NaiveDateTime(v) => v.to_string(),
             CoercedValue::Date(v) => v.to_string(),
             CoercedValue::Time(v) => v.to_string(),
-            CoercedValue::Decimal(v) => v.to_string(),
+            CoercedValue::Decimal(v) => v.clone(),
             CoercedValue::Null => "null".to_string(),
         }
     }
@@ -207,8 +211,8 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
 
         TYPE_DATETIME => parse_datetime(value),
 
-        TYPE_DECIMAL => Decimal::from_str(value)
-            .map(CoercedValue::Decimal)
+        TYPE_DECIMAL => BigDecimal::from_str(value)
+            .map(|_| CoercedValue::Decimal(value.to_string()))
             .map_err(|e| format!("Invalid decimal '{}': {}", value, e)),
 
         TYPE_DATE => NaiveDate::parse_from_str(value, "%Y-%m-%d")
@@ -361,9 +365,11 @@ pub fn coerce_to_py(
         TYPE_DECIMAL => {
             // Validate decimal in Rust, convert to Python Decimal
             // OPTIMIZATION: Use cached Decimal class (avoids py.import per call)
-            match Decimal::from_str(value) {
-                Ok(d) => {
-                    let py_decimal = get_decimal_class(py).call1(py, (d.to_string(),))?;
+            match BigDecimal::from_str(value) {
+                Ok(_) => {
+                    // Pass the original validated string: Python's Decimal
+                    // normalizes it, and this avoids expanding large exponents.
+                    let py_decimal = get_decimal_class(py).call1(py, (value,))?;
                     Ok(py_decimal)
                 }
                 Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(

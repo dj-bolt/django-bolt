@@ -238,9 +238,11 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
         // avoids a 36-char string alloc in Rust + hex parsing in Python.
         CoercedValue::Uuid(v) => uuid_to_py(py, *v).unwrap(),
 
-        // Decimal: construct Python decimal.Decimal object
+        // Decimal: construct Python decimal.Decimal from the validated input
+        // string (kept as-is; rendering a parsed BigDecimal could expand large
+        // exponents to their full digit string).
         CoercedValue::Decimal(v) => crate::type_coercion::get_decimal_class(py)
-            .call1(py, (v.to_string(),))
+            .call1(py, (v.as_str(),))
             .unwrap(),
 
         // Temporal types: direct C-API construction via pyo3's chrono feature.

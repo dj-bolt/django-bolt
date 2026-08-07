@@ -775,24 +775,38 @@ class TestDecimalEdgeCases:
         assert response.status_code == 200, f"Expected 200 for very high precision, got {response.status_code}"
 
     def test_decimal_max_representable(self, client):
-        """Test maximum representable decimal (within rust_decimal limits)."""
-        # rust_decimal max is approximately 79228162514264337593543950335
+        """Test a 29-digit decimal (former rust_decimal 96-bit ceiling)."""
         value = "79228162514264337593543950335"
         response = client.get(f"/decimal/{value}")
-        # May succeed or fail depending on exact limits
-        assert response.status_code in (200, 422)
+        assert response.status_code == 200, f"Expected 200 for 29-digit decimal, got {response.status_code}"
+        assert Decimal(response.json()["value"]) == Decimal(value)
 
-    def test_decimal_overflow_rejected(self, client):
+    def test_decimal_arbitrary_precision_accepted(self, client):
         """
-        Test decimal overflow returns 422.
+        Test a decimal beyond 28 significant digits is accepted losslessly.
 
-        Security: Prevents overflow attacks on decimal type.
+        Python's decimal.Decimal is arbitrary precision, so coercion must not
+        impose a narrower numeric range than the handler's own type.
         """
-        # Beyond rust_decimal max (add extra digits)
         value = "999999999999999999999999999999999999999999"
         response = client.get(f"/decimal/{value}")
-        # Should fail due to overflow
-        assert response.status_code == 422, f"Expected 422 for decimal overflow, got {response.status_code}"
+        assert response.status_code == 200, f"Expected 200 for 42-digit decimal, got {response.status_code}"
+        assert Decimal(response.json()["value"]) == Decimal(value)
+
+    def test_decimal_huge_exponent_stays_compact(self, client):
+        """
+        Test a huge exponent is accepted without digit expansion.
+
+        Security: coercion passes the validated input string to decimal.Decimal
+        instead of rendering the parsed value, so "1e999999999" must never be
+        expanded into its ~1GB digit string on the server.
+        """
+        response = client.get("/decimal/1e999999999")
+        assert response.status_code == 200, f"Expected 200 for huge exponent, got {response.status_code}"
+        data = response.json()
+        assert Decimal(data["value"]) == Decimal("1e999999999")
+        # The wire representation itself must stay in exponent form.
+        assert len(data["value"]) < 32
 
     def test_decimal_currency_precision(self, client):
         """Test typical currency precision (2 decimal places)."""

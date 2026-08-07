@@ -54,7 +54,7 @@ zstd = "0.13"
 regex = "1"
 # Type coercion dependencies (for path/query param parsing)
 chrono = { version = "0.4", features = ["serde"] }
-rust_decimal = { version = "1", features = ["serde"] }
+bigdecimal = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 # Form parsing dependencies
 actix-multipart = "0.7"
