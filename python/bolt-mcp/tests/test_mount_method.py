@@ -6,8 +6,8 @@ import pytest
 from _helpers import INITIALIZE_PARAMS, initialize, mcp_headers, parse_rpc, post_rpc, rpc_body
 from bolt_mcp import MCP, AuthorizationServer, expose_as_tool
 
-from django_bolt import BoltAPI
-from django_bolt.testing import TestClient
+from django_bolt import BoltAPI, _core
+from django_bolt.testing import AsyncTestClient, TestClient
 
 
 def _tools(api) -> set[str]:
@@ -119,6 +119,18 @@ def test_child_mcp_mount_is_available_under_parent_prefix():
     assert parent._mcp_mounts[0]["path"] == "/child/mcp"
 
 
+def test_child_oauth_mcp_mount_is_rejected_before_parent_mutation():
+    child = BoltAPI()
+    child.mount_mcp(MCP("child"), oauth=AuthorizationServer(issuer="https://api.example.test"))
+    parent = BoltAPI()
+
+    with pytest.raises(ValueError, match="OAuth-protected MCP server"):
+        parent.mount("/child", child)
+
+    assert parent._routes == []
+    assert parent._mcp_mounts == []
+
+
 def test_testclient_rejects_mcp_http_route_collision():
     api = BoltAPI()
     api.mount_mcp(MCP("server"))
@@ -141,3 +153,20 @@ def test_testclient_rejects_mcp_asgi_mount_collision():
     api.mount_asgi("/mcp", asgi_app)
     with pytest.raises(ValueError, match="ASGI mount"):
         TestClient(api)
+
+
+@pytest.mark.parametrize("client_type", [TestClient, AsyncTestClient])
+def test_testclient_rejects_mount_collision_before_native_app_allocation(monkeypatch, client_type):
+    api = BoltAPI()
+    api.mount_mcp(MCP("server"))
+
+    @api.post("/mcp")
+    async def route():
+        return {"ok": True}
+
+    def fail_create_test_app(*args, **kwargs):
+        pytest.fail("native test app was allocated before mount validation")
+
+    monkeypatch.setattr(_core, "create_test_app", fail_create_test_app)
+    with pytest.raises(ValueError, match="HTTP route"):
+        client_type(api)

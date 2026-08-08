@@ -402,6 +402,8 @@ async def t_server_api():
     loop = asyncio.get_running_loop()
 
     async def hold_open(reader, writer):
+        writer.write(b"\0")
+        await writer.drain()
         try:
             await reader.read()
         finally:
@@ -415,12 +417,14 @@ async def t_server_api():
         port = server.sockets[0].getsockname()[1]
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
+            await asyncio.wait_for(reader.readexactly(1), 1)
             try:
-                server.close_clients()
+                close_clients = server.close_clients
             except AttributeError:
-                # uvloop does not yet implement Python 3.13's Server API.
+                # Older event loops may not implement Python 3.13's Server API.
                 close_clients_supported = False
             else:
+                close_clients()
                 close_clients_eof = await asyncio.wait_for(reader.read(), 1) == b""
         finally:
             writer.close()

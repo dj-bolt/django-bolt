@@ -420,13 +420,15 @@ class _ThreadsafeServerProxy:
     def close(self):
         self._loop._selector_loop.call_soon_threadsafe(self._server.close)
 
+    @property
     def close_clients(self):
         close_clients = self._server.close_clients  # AttributeError before 3.13
-        self._loop._selector_loop.call_soon_threadsafe(close_clients)
+        return functools.partial(self._loop._selector_loop.call_soon_threadsafe, close_clients)
 
+    @property
     def abort_clients(self):
         abort_clients = self._server.abort_clients  # AttributeError before 3.13
-        self._loop._selector_loop.call_soon_threadsafe(abort_clients)
+        return functools.partial(self._loop._selector_loop.call_soon_threadsafe, abort_clients)
 
     async def start_serving(self):
         await self._loop._submit_selector(self._server.start_serving())

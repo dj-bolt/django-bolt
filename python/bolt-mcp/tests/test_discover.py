@@ -71,8 +71,14 @@ def test_invalid_cache_scope_rejected_at_registration():
 
 
 def test_negative_list_ttl_rejected_at_registration():
-    with pytest.raises(ValueError, match="list_ttl_ms must be >= 0"):
+    with pytest.raises(ValueError, match="list_ttl_ms must be a non-negative integer"):
         MCP("bad", list_ttl_ms=-1)
+
+
+@pytest.mark.parametrize("ttl", [False, True, 1.0, "1000", None])
+def test_non_integer_list_ttl_rejected_at_registration(ttl):
+    with pytest.raises(ValueError, match="list_ttl_ms must be a non-negative integer"):
+        MCP("bad", list_ttl_ms=ttl)
 
 
 @pytest.mark.parametrize("ttl", [0, 1])

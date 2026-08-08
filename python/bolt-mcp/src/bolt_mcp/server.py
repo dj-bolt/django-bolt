@@ -110,8 +110,8 @@ class MCP:
         """
         if list_cache_scope not in _CACHE_SCOPES:
             raise ValueError(f"list_cache_scope must be 'public' or 'private', got {list_cache_scope!r}")
-        if list_ttl_ms < 0:
-            raise ValueError(f"list_ttl_ms must be >= 0, got {list_ttl_ms!r}")
+        if not isinstance(list_ttl_ms, int) or isinstance(list_ttl_ms, bool) or list_ttl_ms < 0:
+            raise ValueError(f"list_ttl_ms must be a non-negative integer, got {list_ttl_ms!r}")
         self.name = name
         self.version = version
         self.title = title

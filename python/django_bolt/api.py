@@ -2908,6 +2908,11 @@ class BoltAPI:
         child_mcp_mounts: list[dict[str, Any]] = []
         existing_mcp_paths = {definition["path"] for definition in self._mcp_mounts}
         for definition in app._mcp_mounts:
+            if definition.get("verify_token") is not None:
+                raise ValueError(
+                    "Cannot mount a child BoltAPI containing an OAuth-protected MCP server. "
+                    "Mount it directly at its final path so its OAuth audience and resource metadata remain valid."
+                )
             child_definition = definition.copy()
             child_path = definition["path"]
             child_definition["path"] = _normalize_mount_prefix(mount_path + child_path)

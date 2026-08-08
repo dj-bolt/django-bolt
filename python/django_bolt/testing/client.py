@@ -383,6 +383,11 @@ class TestClient(httpx.Client):
         if static_config is None and read_django_settings:
             static_config = self._read_static_files_settings_from_django()
 
+        # Validate before allocating native test-app state. A failed constructor
+        # has no client instance available to release that state.
+        self._validate_asgi_mount_conflicts(api)
+        self._validate_mcp_mount_conflicts(api)
+
         # Create test app instance with full CORS config
         # Pass trailing_slash setting to configure NormalizePath middleware
         trailing_slash = getattr(api, "trailing_slash", "strip")
@@ -395,10 +400,6 @@ class TestClient(httpx.Client):
             static_config,
             api._rust_compression_config(),
         )
-
-        # Validate mount collisions to mirror production startup behavior.
-        self._validate_asgi_mount_conflicts(api)
-        self._validate_mcp_mount_conflicts(api)
 
         # Register routes
         rust_routes = [
@@ -663,6 +664,11 @@ class AsyncTestClient(httpx.AsyncClient):
         if static_config is None and read_django_settings:
             static_config = TestClient._read_static_files_settings_from_django()
 
+        # Validate before allocating native test-app state. A failed constructor
+        # has no client instance available to release that state.
+        TestClient._validate_asgi_mount_conflicts(api)
+        TestClient._validate_mcp_mount_conflicts(api)
+
         # Create test app instance with trailing_slash setting
         trailing_slash = getattr(api, "trailing_slash", "strip")
         debug = getattr(settings, "DEBUG", False) if settings else False
@@ -674,10 +680,6 @@ class AsyncTestClient(httpx.AsyncClient):
             static_config,
             api._rust_compression_config(),
         )
-
-        # Validate mount collisions to mirror production startup behavior.
-        TestClient._validate_asgi_mount_conflicts(api)
-        TestClient._validate_mcp_mount_conflicts(api)
 
         # Register routes
         rust_routes = [
