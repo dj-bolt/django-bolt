@@ -32,6 +32,7 @@ EXPECTATIONS = [
     ("/t-timer", 200, PAYLOAD),
     ("/t-thread", 200, {"value": "from-thread"}),
     ("/t-subprocess", 200, {"value": "from-subprocess", "returncode": 0}),
+    ("/t-subprocess-wait", 200, {"returncode": 0}),
     ("/t-exc", 418, {"detail": "teapot-after-await"}),
     ("/t-deps", 200, {"a": "a", "b": "b"}),
     ("/t-task", 200, {"loop_running": True, "task_result": "a"}),

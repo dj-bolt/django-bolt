@@ -18,6 +18,7 @@ Probe map:
 - /t-cancelled-timers + /t-timer-stats    → cancelled-timer heap compaction
 - /t-crossing-timeout                     → bounded cross-loop sync crossings
 - /t-thread   await sync_to_thread(...)   → eager start + real Future suspension
+- /t-subprocess-wait  wait() on live child → pending exit waiter crosses loops
 - /t-exc      HTTPException after await   → exception through the driver Task
 - /t-deps     two async Depends           → asyncio.gather in the first segment
 - /t-task     create_task in first segment → loop APIs during eager execution
@@ -147,6 +148,17 @@ async def t_subprocess():
     )
     stdout, _ = await process.communicate()
     return {"value": stdout.decode().strip(), "returncode": process.returncode}
+
+
+@api.get("/t-subprocess-wait")
+async def t_subprocess_wait():
+    # wait() runs while the child is still alive, forcing the pending
+    # exit-waiter path in the subprocess transport. /t-subprocess only hits
+    # that path when wait() overtakes child reaping (a load-dependent race);
+    # this probe covers it deterministically.
+    process = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(0.3)")
+    returncode = await process.wait()
+    return {"returncode": returncode}
 
 
 @api.get("/t-exc")

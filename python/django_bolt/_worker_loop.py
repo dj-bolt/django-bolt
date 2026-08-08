@@ -318,6 +318,67 @@ class _SelectorDatagramProtocolAdapter(asyncio.DatagramProtocol):
         self._forward("error_received", exc)
 
 
+class _ThreadsafeSubprocessTransportProxy(asyncio.SubprocessTransport):
+    """Subprocess transport facade whose exit wait crosses to the selector loop.
+
+    ``BaseSubprocessTransport._wait()`` creates its exit waiter on the loop
+    that owns the transport (the selector loop).  Awaiting that future from a
+    WorkerLoop task raises "attached to a different loop" whenever ``wait()``
+    overtakes child reaping, so the wait runs on the selector loop and its
+    completion is bridged back like every other selector-backed operation.
+    """
+
+    __slots__ = ("_transport", "_worker_loop")
+
+    def __init__(self, worker_loop, transport):
+        self._worker_loop = worker_loop
+        self._transport = transport
+
+    async def _wait(self):
+        returncode = self._transport.get_returncode()
+        if returncode is not None:
+            return returncode
+        return await self._worker_loop._submit_selector(self._wait_on_selector_loop())
+
+    async def _wait_on_selector_loop(self):
+        # Runs on the selector loop: stdlib _wait() returns a coroutine while
+        # uvloop's returns a Future, and both must be awaited on the loop that
+        # owns the transport.
+        return await self._transport._wait()
+
+    def get_extra_info(self, name, default=None):
+        return self._transport.get_extra_info(name, default)
+
+    def is_closing(self):
+        return self._transport.is_closing()
+
+    def close(self):
+        # close() cascades into pipe-transport close() calls that schedule on
+        # the owning loop, so it must run on the selector thread.
+        self._worker_loop._selector_loop.call_soon_threadsafe(self._transport.close)
+
+    def get_pid(self):
+        return self._transport.get_pid()
+
+    def get_returncode(self):
+        return self._transport.get_returncode()
+
+    def get_pipe_transport(self, fd):
+        return self._transport.get_pipe_transport(fd)
+
+    def send_signal(self, signal):
+        self._transport.send_signal(signal)
+
+    def terminate(self):
+        self._transport.terminate()
+
+    def kill(self):
+        self._transport.kill()
+
+    def __getattr__(self, name):
+        return getattr(self._transport, name)
+
+
 class _ThreadsafeServerProxy:
     __slots__ = ("_loop", "_server")
 
@@ -622,10 +683,16 @@ class WorkerLoop(asyncio.AbstractEventLoop):
         return await self._submit_selector(self._selector_loop.getnameinfo(sockaddr, flags))
 
     async def subprocess_exec(self, protocol_factory, *args, **kwargs):
-        return await self._submit_selector(self._selector_loop.subprocess_exec(protocol_factory, *args, **kwargs))
+        transport, protocol = await self._submit_selector(
+            self._selector_loop.subprocess_exec(protocol_factory, *args, **kwargs)
+        )
+        return _ThreadsafeSubprocessTransportProxy(self, transport), protocol
 
     async def subprocess_shell(self, protocol_factory, cmd, **kwargs):
-        return await self._submit_selector(self._selector_loop.subprocess_shell(protocol_factory, cmd, **kwargs))
+        transport, protocol = await self._submit_selector(
+            self._selector_loop.subprocess_shell(protocol_factory, cmd, **kwargs)
+        )
+        return _ThreadsafeSubprocessTransportProxy(self, transport), protocol
 
     def _selector_callback(self, callback, args):
         self.call_soon_threadsafe(callback, *args)
