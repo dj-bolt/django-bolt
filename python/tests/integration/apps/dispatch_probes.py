@@ -23,6 +23,9 @@ Probe map:
 - /t-deps     two async Depends           → asyncio.gather in the first segment
 - /t-task     create_task in first segment → loop APIs during eager execution
 - /t-stream   async generator (NDJSON)    → streaming wire through async path
+- /t-server-api                           → Server.get_loop()/close_clients() proxying
+- /t-datagram-flow-control                → pause/resume_writing reaches datagram protocols
+- /t-call-soon-coroutine                  → debug-mode call_soon(coroutine) rejection
 """
 
 from __future__ import annotations
@@ -392,6 +395,83 @@ async def t_datagram():
         if client_transport is not None:
             client_transport.close()
         server_transport.close()
+
+
+@api.get("/t-server-api")
+async def t_server_api():
+    loop = asyncio.get_running_loop()
+
+    async def hold_open(reader, writer):
+        try:
+            await reader.read()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(hold_open, "127.0.0.1", 0)
+    try:
+        get_loop_ok = server.get_loop() is loop
+        close_clients_eof = None
+        if sys.version_info >= (3, 13):
+            port = server.sockets[0].getsockname()[1]
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            try:
+                server.close_clients()
+                close_clients_eof = await asyncio.wait_for(reader.read(), 1) == b""
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        return {"get_loop_is_running_loop": get_loop_ok, "close_clients_eof": close_clients_eof}
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@api.get("/t-datagram-flow-control")
+async def t_datagram_flow_control():
+    loop = asyncio.get_running_loop()
+    paused = loop.create_future()
+    resumed = loop.create_future()
+
+    class Protocol(asyncio.DatagramProtocol):
+        def pause_writing(self):
+            if not paused.done():
+                paused.set_result(True)
+
+        def resume_writing(self):
+            if not resumed.done():
+                resumed.set_result(True)
+
+    transport, _ = await loop.create_datagram_endpoint(Protocol, local_addr=("127.0.0.1", 0))
+    try:
+        # Kernel UDP send buffers cannot be filled deterministically, so
+        # trigger the flow-control callbacks the way the selector transport
+        # does: from the selector thread, against the protocol object the raw
+        # transport owns (the WorkerLoop adapter, which must forward them).
+        raw_transport = getattr(transport, "_raw_transport", transport)
+        selector_protocol = raw_transport.get_protocol()
+        selector_loop = getattr(loop, "_selector_loop", loop)
+        selector_loop.call_soon_threadsafe(selector_protocol.pause_writing)
+        await asyncio.wait_for(paused, 1)
+        selector_loop.call_soon_threadsafe(selector_protocol.resume_writing)
+        await asyncio.wait_for(resumed, 1)
+        return {"paused": True, "resumed": True}
+    finally:
+        transport.close()
+
+
+@api.get("/t-call-soon-coroutine")
+async def t_call_soon_coroutine():
+    loop = asyncio.get_running_loop()
+    coro = _noop()
+    loop.set_debug(True)
+    try:
+        loop.call_soon(coro)
+    except TypeError:
+        return {"raised": "TypeError"}
+    finally:
+        loop.set_debug(False)
+        coro.close()
+    return {"raised": None}
 
 
 @api.get("/t-background-start")

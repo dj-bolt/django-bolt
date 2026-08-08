@@ -33,6 +33,11 @@ struct WorkerLoopService {
 }
 
 impl WorkerLoopService {
+    /// Invariant: the pump task lives in whichever Tokio runtime first calls
+    /// this, but the statics are process-level. Every entry point (server and
+    /// TestClient) must therefore share one process-lived runtime — if that
+    /// runtime were torn down, every later `call_soon` would fail with
+    /// "worker asyncio loop is unavailable" with no recovery path.
     fn get() -> &'static Self {
         WORKER_SERVICE.get_or_init(|| {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -106,6 +111,11 @@ pub(crate) fn worker_task_locals(
     })
 }
 
+/// Ready handles run per drain batch before the pump yields back to Tokio.
+/// Bounds GIL-attached bursts: a self-rescheduling callback chain would
+/// otherwise pin this worker thread (and its GIL attachment) forever.
+const READY_QUEUE_DRAIN_LIMIT: usize = 128;
+
 async fn run_ready_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkerLoopCommand>) {
     while let Some(WorkerLoopCommand::Soon(first)) = rx.recv().await {
         Python::attach(|py| {
@@ -117,12 +127,19 @@ async fn run_ready_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkerLoop
             };
 
             // Future chaining commonly produces several immediately-ready
-            // handles. Drain them under one GIL attachment.
+            // handles. Drain them under one GIL attachment, bounded so the
+            // outer `recv().await` stays a scheduler yield point (leftover
+            // handles are picked up immediately, FIFO order preserved).
+            let mut drained = 0usize;
             let mut next = Some(first);
             loop {
                 if let Some(handle) = next.take() {
                     if let Err(error) = run.call1(py, (loop_obj, handle)) {
                         error.print(py);
+                    }
+                    drained += 1;
+                    if drained >= READY_QUEUE_DRAIN_LIMIT {
+                        break;
                     }
                 }
                 match rx.try_recv() {
@@ -355,6 +372,9 @@ impl WorkerLoopScheduler {
 
     #[cfg(unix)]
     fn remove_signal_handler(&self, sig: i32) -> bool {
+        // Cancels delivery to Python only. Tokio's process-level signal
+        // handler cannot be uninstalled, so unlike stdlib loops this does not
+        // restore SIG_DFL — the signal is ignored from here on.
         SIGNAL_WATCHERS
             .lock()
             .unwrap()
@@ -389,6 +409,9 @@ impl WorkerDispatchResolver {
     }
 }
 
+/// Deliberate: if the caller's future is dropped (client disconnect), the
+/// Python task is NOT cancelled — it runs to completion and its result is
+/// discarded, consistent with tasks being allowed to outlive responses.
 pub(crate) async fn dispatch(dispatch: Py<PyAny>, request: Py<PyAny>) -> PyResult<Py<PyAny>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     Python::attach(|py| {

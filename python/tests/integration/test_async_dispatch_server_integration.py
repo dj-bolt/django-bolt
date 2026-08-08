@@ -10,6 +10,7 @@ from __future__ import annotations
 import socketserver
 import ssl
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,7 @@ EXPECTATIONS = [
     ("/t-exc", 418, {"detail": "teapot-after-await"}),
     ("/t-deps", 200, {"a": "a", "b": "b"}),
     ("/t-task", 200, {"loop_running": True, "task_result": "a"}),
+    ("/t-call-soon-coroutine", 200, {"raised": "TypeError"}),
 ]
 
 
@@ -213,7 +215,12 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             }
             assert server.get("/t-signal").json() == {"received": True, "removed": True}
             assert server.get("/t-worker-server").json() == {"reply": "worker-server"}
+            assert server.get("/t-server-api").json() == {
+                "get_loop_is_running_loop": True,
+                "close_clients_eof": True if sys.version_info >= (3, 13) else None,
+            }
             assert server.get("/t-datagram").json() == {"reply": "datagram-ok"}
+            assert server.get("/t-datagram-flow-control").json() == {"paused": True, "resumed": True}
 
             # A detached Task survives the response that created it.
             assert server.get("/t-background-start").json() == {"started": True}

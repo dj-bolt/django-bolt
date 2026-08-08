@@ -12,6 +12,11 @@ Synchronous crossings between the two loops (transport writes, ``eof_received``,
 reader/writer removal) are bounded by ``DJANGO_BOLT_LOOP_CROSSING_TIMEOUT``
 seconds (default 30) so a cross-blocked pair of loops surfaces as a
 ``RuntimeError`` instead of a silent deadlock.
+
+Known deviation from stdlib loops: ``remove_signal_handler`` stops delivering
+the signal to Python but cannot restore the default disposition — Tokio's
+process-level signal handler stays installed for the process lifetime, so a
+"removed" signal is effectively ignored rather than reset to ``SIG_DFL``.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import functools
+import inspect
 import logging
 import os
 import time
@@ -100,6 +106,10 @@ class _ThreadsafeTransportProxy(asyncio.Transport):
     def abort(self):
         self._call("abort")
 
+    # Writes cross synchronously so pause_writing state is reflected before
+    # StreamWriter.drain() checks it. The round-trip runs on the pump thread,
+    # so every write briefly stalls all WorkerLoop callbacks process-wide —
+    # the first place to look if chatty stream protocols regress.
     def write(self, data):
         self._call_sync("write", data)
 
@@ -317,6 +327,15 @@ class _SelectorDatagramProtocolAdapter(asyncio.DatagramProtocol):
     def error_received(self, exc):
         self._forward("error_received", exc)
 
+    # Unlike the stream adapters there is no synchronous write crossing here
+    # (sendto is fire-and-forget, and datagrams have no drain() race), so
+    # plain queue forwarding preserves pause/resume ordering.
+    def pause_writing(self):
+        self._forward("pause_writing")
+
+    def resume_writing(self):
+        self._forward("resume_writing")
+
 
 class _ThreadsafeSubprocessTransportProxy(asyncio.SubprocessTransport):
     """Subprocess transport facade whose exit wait crosses to the selector loop.
@@ -390,11 +409,24 @@ class _ThreadsafeServerProxy:
     def sockets(self):
         return self._server.sockets
 
+    def get_loop(self):
+        # Futures and waiters interacting with this server must live on the
+        # WorkerLoop, not on the selector loop that owns the raw server.
+        return self._loop
+
     def is_serving(self):
         return self._server.is_serving()
 
     def close(self):
         self._loop._selector_loop.call_soon_threadsafe(self._server.close)
+
+    def close_clients(self):
+        close_clients = self._server.close_clients  # AttributeError before 3.13
+        self._loop._selector_loop.call_soon_threadsafe(close_clients)
+
+    def abort_clients(self):
+        abort_clients = self._server.abort_clients  # AttributeError before 3.13
+        self._loop._selector_loop.call_soon_threadsafe(abort_clients)
 
     async def start_serving(self):
         await self._loop._submit_selector(self._server.start_serving())
@@ -488,6 +520,11 @@ class WorkerLoop(asyncio.AbstractEventLoop):
 
     def call_soon(self, callback, *args, context=None):
         self._check_closed()
+        # Stdlib loops reject coroutines unconditionally; this loop only pays
+        # for the check in debug mode because call_soon is on the per-wakeup
+        # hot path (a queued coroutine still fails, just later and noisier).
+        if self._debug and (asyncio.iscoroutine(callback) or inspect.iscoroutinefunction(callback)):
+            raise TypeError(f"coroutines cannot be used with call_soon(): {callback!r}")
         handle = asyncio.Handle(callback, args, self, context=context)
         self._scheduler.call_soon(handle)
         return handle
@@ -498,10 +535,11 @@ class WorkerLoop(asyncio.AbstractEventLoop):
     def call_at(self, when, callback, *args, context=None):
         self._check_closed()
         handle = asyncio.TimerHandle(when, callback, args, self, context=context)
-        if when <= self.time():
+        delay = when - self.time()
+        if delay <= 0.0:
             self._scheduler.call_soon(handle)
         else:
-            self._scheduler.call_later(max(0.0, when - self.time()), handle)
+            self._scheduler.call_later(delay, handle)
         return handle
 
     def call_later(self, delay, callback, *args, context=None):
