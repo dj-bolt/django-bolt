@@ -28,8 +28,8 @@ from django.contrib.auth import get_user_model
 
 from django_bolt import concurrency
 from django_bolt.auth import JWTAuthentication, user_loader
-from django_bolt.auth.user_loader import default_django_user_loader, resolve_user_loader
 from django_bolt.auth.pk_loader import load_user_by_pk_sync
+from django_bolt.auth.user_loader import default_django_user_loader, resolve_user_loader
 
 # Loads are asserted from other threads, which cannot see rows held open in an
 # uncommitted test transaction — these tests need real committed data.
