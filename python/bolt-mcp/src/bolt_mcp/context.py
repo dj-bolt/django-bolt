@@ -82,7 +82,7 @@ class Context:
         return self._rust.is_replay
 
     @property
-    def progress_token(self) -> bool:
+    def has_progress_token(self) -> bool:
         """Whether the client asked for progress (sent a ``progressToken``)."""
         return self._rust.has_progress_token
 

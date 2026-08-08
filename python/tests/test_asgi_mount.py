@@ -410,6 +410,24 @@ def test_runbolt_allows_prefix_overlap_without_exact_collision():
     command.validate_asgi_mount_conflicts(routes, asgi_mounts)
 
 
+def test_runbolt_rejects_mcp_http_route_collision():
+    command = Command()
+    routes = [("POST", "/mcp", 1, lambda: None)]
+    mcp_mounts = [{"path": "/mcp"}]
+
+    with pytest.raises(CommandError, match="HTTP route"):
+        command.validate_mcp_mount_conflicts(routes, [], mcp_mounts)
+
+
+def test_runbolt_rejects_mcp_asgi_mount_collision():
+    command = Command()
+    asgi_mounts = [("/mcp", lambda _scope, _receive, _send: None)]
+    mcp_mounts = [{"path": "/mcp"}]
+
+    with pytest.raises(CommandError, match="ASGI mount"):
+        command.validate_mcp_mount_conflicts([], asgi_mounts, mcp_mounts)
+
+
 class _CustomConfigError(Exception):
     pass
 

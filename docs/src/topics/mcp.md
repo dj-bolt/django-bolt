@@ -487,7 +487,7 @@ If you don't want to be the authorization server, stay a pure Resource Server (T
 - **JSON response** answers legacy POSTs with a single `application/json` object when the response is just a result; a tool that emits notifications first automatically falls back to SSE so they are preserved.
 - **Stateless** drops legacy sessions entirely. Use it for plain request/response tools that don't need legacy callbacks.
 
-`mount_mcp(..., allowed_hosts=[...], allowed_origins=[...])` opts into the transport's DNS-rebinding protection (403 on Host/Origin mismatch). For a server bound to localhost, pass `allowed_hosts=["localhost", "127.0.0.1", "::1"]`; deployed servers normally pin Host/Origin at the proxy.
+The transport defaults to localhost-only Host validation for DNS-rebinding protection (403 on mismatch). Deployed servers must pass their public authorities with `mount_mcp(..., allowed_hosts=[...])`; `allowed_origins=[...]` additionally validates browser origins. Pass an empty `allowed_hosts` list only when a trusted proxy already enforces Host validation.
 
 ## Testing
 

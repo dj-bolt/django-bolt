@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from _helpers import PROTOCOL_MODERN, make_server, parse_rpc, post_rpc_modern
 from bolt_mcp import MCP, mount_mcp
 
@@ -67,3 +68,13 @@ def test_invalid_cache_scope_rejected_at_registration():
         assert "public" in str(exc)
     else:
         raise AssertionError("expected ValueError for invalid list_cache_scope")
+
+
+def test_negative_list_ttl_rejected_at_registration():
+    with pytest.raises(ValueError, match="list_ttl_ms must be >= 0"):
+        MCP("bad", list_ttl_ms=-1)
+
+
+@pytest.mark.parametrize("ttl", [0, 1])
+def test_non_negative_list_ttl_is_accepted(ttl):
+    assert MCP("ok", list_ttl_ms=ttl).list_ttl_ms == ttl

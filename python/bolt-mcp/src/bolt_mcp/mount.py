@@ -61,6 +61,12 @@ def _resolve_oauth(api: BoltAPI, oauth: Any, mount_path: str) -> ProtectedResour
         from .oauth.endpoints import register_oauth_endpoints  # noqa: PLC0415
         from .oauth.tokens import make_token_verifier  # noqa: PLC0415
 
+        bound_path = getattr(oauth, "_mcp_mount_path", None)
+        if bound_path is not None and bound_path != mount_path:
+            raise ValueError(
+                f"This AuthorizationServer is already bound to the MCP mount at {bound_path!r}; "
+                "use a separate AuthorizationServer for a different mount path"
+            )
         if oauth.resource_url is None:
             # The canonical MCP resource URI is the endpoint URL (issuer +
             # mount path). Strict clients canonicalize the URL they connect
@@ -68,9 +74,18 @@ def _resolve_oauth(api: BoltAPI, oauth: Any, mount_path: str) -> ProtectedResour
             # origin would mismatch. Set before minting/verifier wiring so
             # the token audience uses the same value.
             oauth.resource_url = oauth.effective_issuer() + mount_path
+        resource_url = oauth.effective_resource_url()
+        bound_resource_url = getattr(oauth, "_mcp_resource_url", None)
+        if bound_resource_url is not None and bound_resource_url != resource_url:
+            raise ValueError(
+                f"This AuthorizationServer is already bound to the MCP resource {bound_resource_url!r}; "
+                f"its current resource URL is {resource_url!r}"
+            )
+        oauth._mcp_mount_path = mount_path
+        oauth._mcp_resource_url = resource_url
         register_oauth_endpoints(api, oauth)
         return ProtectedResource(
-            resource_url=oauth.effective_resource_url(),
+            resource_url=resource_url,
             authorization_servers=[oauth.effective_issuer()],
             required_scopes=oauth.required_scopes,
             token_verifier=make_token_verifier(oauth),
@@ -117,13 +132,15 @@ def mount_mcp(
     Django-backed OAuth 2.1 server). ``oauth`` and ``guards`` are mutually
     exclusive on the mount.
 
-    ``allowed_hosts``/``allowed_origins`` opt into the transport's
-    DNS-rebinding protection (Host/Origin allowlists; 403 on mismatch). For a
-    server bound to localhost, pass
-    ``allowed_hosts=["localhost", "127.0.0.1", "::1"]`` — that is the
-    deployment shape DNS rebinding actually attacks. Deployed servers
-    normally pin Host/Origin at the proxy layer instead.
+    DNS-rebinding protection defaults to localhost-only Host validation.
+    Deployed servers must pass their public authorities in ``allowed_hosts``;
+    ``allowed_origins`` optionally enables Origin validation too. Passing an
+    empty ``allowed_hosts`` list explicitly disables Host validation when a
+    trusted proxy already enforces it.
     """
+    if any(existing["path"] == path for existing in api._mcp_mounts):
+        raise ValueError(f"An MCP server is already mounted at {path!r} on this API")
+
     from django_bolt import _core  # noqa: PLC0415 — verify the Rust core at mount time
 
     if not hasattr(_core, "register_mcp_mounts"):
@@ -193,6 +210,4 @@ def mount_mcp(
         allowed_hosts=list(allowed_hosts) if allowed_hosts is not None else None,
         allowed_origins=list(allowed_origins) if allowed_origins is not None else None,
     )
-    if any(existing["path"] == path for existing in api._mcp_mounts):
-        raise ValueError(f"An MCP server is already mounted at {path!r} on this API")
     api._mcp_mounts.append(definition)

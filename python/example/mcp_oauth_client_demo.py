@@ -188,7 +188,7 @@ def main() -> None:
 
     # ── 6. speak MCP with the Bearer token ─────────────────────────────────────
     step(6, "MCP: initialize / tools/list / tools/call")
-    mcp_url = f"{base}/mcp"  # pr["resource"] is the token-audience origin, not the mount path
+    mcp_url = pr["resource"]
     mcp_headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",

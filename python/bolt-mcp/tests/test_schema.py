@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
 from _helpers import initialize, make_server, parse_rpc, post_rpc
+from bolt_mcp import MCP
 
 from django_bolt.testing import TestClient
 
@@ -51,3 +53,22 @@ def test_no_arg_tool_has_empty_object_schema():
         boom_schema = tools["boom"]["inputSchema"]
         assert boom_schema["type"] == "object"
         assert boom_schema.get("properties", {}) == {}
+
+
+def test_unknown_output_schema_string_rejected_at_registration():
+    mcp = MCP()
+    with pytest.raises(ValueError, match="output_schema"):
+
+        @mcp.tool(output_schema="Auto")
+        def bad() -> dict:
+            return {}
+
+
+def test_auto_output_schema_still_derives_object_schema():
+    mcp = MCP()
+
+    @mcp.tool(output_schema="auto")
+    def good() -> dict[str, int]:
+        return {"answer": 42}
+
+    assert mcp._tools["good"].output_schema["type"] == "object"

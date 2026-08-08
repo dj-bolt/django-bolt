@@ -112,7 +112,10 @@ pub async fn handle_mcp_request(
     if let Some(oauth) = &mount.oauth {
         let bearer = headers
             .get("authorization")
-            .and_then(|value| value.strip_prefix("Bearer "))
+            .and_then(|value| {
+                let (scheme, token) = value.split_once(' ')?;
+                (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+            })
             .map(str::to_owned);
         let Some(token) = bearer else {
             return oauth_401(&oauth.www_authenticate);

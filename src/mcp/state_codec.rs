@@ -107,6 +107,7 @@ pub fn open_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn codec() -> RequestStateCodec {
         RequestStateCodec::new(vec![7u8; 32])
@@ -152,6 +153,22 @@ mod tests {
         let mut args = rmcp::model::JsonObject::new();
         args.insert("k".into(), Value::from(1));
         assert!(open_verified(&c, &sealed, "t", Some(&args), None).is_err());
+    }
+
+    #[test]
+    fn wrong_principal_rejected() {
+        let c = codec();
+        let sealed = seal(&c, &state()).unwrap();
+        let other = crate::middleware::auth::AuthContext {
+            user_id: Some("other-user".to_string()),
+            is_staff: false,
+            is_superuser: false,
+            backend: "test".to_string(),
+            claims: None,
+            permissions: HashSet::new(),
+            cookie_csrf: false,
+        };
+        assert!(open_verified(&c, &sealed, "t", None, Some(&other)).is_err());
     }
 
     #[test]

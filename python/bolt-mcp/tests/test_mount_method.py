@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import pytest
-from _helpers import initialize, parse_rpc, post_rpc
-from bolt_mcp import MCP, expose_as_tool
+from _helpers import INITIALIZE_PARAMS, initialize, mcp_headers, parse_rpc, post_rpc, rpc_body
+from bolt_mcp import MCP, AuthorizationServer, expose_as_tool
 
 from django_bolt import BoltAPI
 from django_bolt.testing import TestClient
@@ -67,3 +67,77 @@ def test_unsupported_oauth_value_is_rejected_at_mount_time():
     mcp = MCP("mount-method-server")
     with pytest.raises(TypeError, match="ProtectedResource"):
         api.mount_mcp(mcp, oauth=object())
+
+
+def test_duplicate_mount_rejected_before_oauth_routes_are_registered():
+    api = BoltAPI()
+    api.mount_mcp(MCP("first"))
+    route_count = len(api._routes)
+
+    with pytest.raises(ValueError, match="already mounted"):
+        api.mount_mcp(MCP("second"), oauth=AuthorizationServer())
+
+    assert len(api._routes) == route_count
+
+
+def test_authorization_server_cannot_be_reused_at_a_different_mount_path():
+    server = AuthorizationServer(issuer="https://api.example.test")
+    first = BoltAPI()
+    first.mount_mcp(MCP("first"), path="/one", oauth=server)
+
+    second = BoltAPI()
+    with pytest.raises(ValueError, match="already bound"):
+        second.mount_mcp(MCP("second"), path="/two", oauth=server)
+    assert second._routes == []
+
+
+def test_authorization_server_reuse_requires_the_same_resource_url():
+    server = AuthorizationServer(issuer="https://api.example.test")
+    first = BoltAPI()
+    first.mount_mcp(MCP("first"), oauth=server)
+    server.resource_url = "https://other.example.test/mcp"
+
+    second = BoltAPI()
+    with pytest.raises(ValueError, match="already bound to the MCP resource"):
+        second.mount_mcp(MCP("second"), oauth=server)
+    assert second._routes == []
+
+
+def test_child_mcp_mount_is_available_under_parent_prefix():
+    child = BoltAPI()
+    child.mount_mcp(MCP("child"))
+    parent = BoltAPI()
+    parent.mount("/child", child)
+
+    with TestClient(parent) as client:
+        response = client.post(
+            "/child/mcp",
+            content=rpc_body("initialize", INITIALIZE_PARAMS),
+            headers=mcp_headers(),
+        )
+    assert response.status_code == 200
+    assert parent._mcp_mounts[0]["path"] == "/child/mcp"
+
+
+def test_testclient_rejects_mcp_http_route_collision():
+    api = BoltAPI()
+    api.mount_mcp(MCP("server"))
+
+    @api.post("/mcp")
+    async def route():
+        return {"ok": True}
+
+    with pytest.raises(ValueError, match="HTTP route"):
+        TestClient(api)
+
+
+def test_testclient_rejects_mcp_asgi_mount_collision():
+    api = BoltAPI()
+    api.mount_mcp(MCP("server"))
+
+    async def asgi_app(scope, receive, send):
+        pass
+
+    api.mount_asgi("/mcp", asgi_app)
+    with pytest.raises(ValueError, match="ASGI mount"):
+        TestClient(api)

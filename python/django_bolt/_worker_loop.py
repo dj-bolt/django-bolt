@@ -828,9 +828,7 @@ def _with_running_loop(loop, callback, *args):
         asyncio.events._set_running_loop(previous)
 
 
-def worker_dispatch_start(dispatch, request, loop, resolver):
-    """Start one request and arrange for its resolver to complete."""
-
+def _worker_dispatch_start(dispatch, request, loop, resolver, task_sink=None):
     def start():
         try:
             coro = dispatch(request)
@@ -841,12 +839,19 @@ def worker_dispatch_start(dispatch, request, loop, resolver):
         except BaseException as exc:
             resolver.set_exception(exc)
             return
+        if task_sink is not None:
+            task_sink.set_task(task)
         if task.done():
             _resolve_task(task, resolver)
         else:
             task.add_done_callback(lambda done: _resolve_task(done, resolver))
 
     _with_running_loop(loop, start)
+
+
+def worker_dispatch_start(dispatch, request, loop, resolver):
+    """Start one request and arrange for its resolver to complete."""
+    _worker_dispatch_start(dispatch, request, loop, resolver)
 
 
 def worker_dispatch_start_cancellable(dispatch, request, loop, resolver, task_sink):
@@ -857,20 +862,7 @@ def worker_dispatch_start_cancellable(dispatch, request, loop, resolver, task_si
     task's loop. Plain HTTP routes deliberately keep the non-cancelling path.
     """
 
-    def start():
-        try:
-            coro = dispatch(request)
-            task = loop.create_task(coro, eager_start=loop.get_task_factory() is None)
-        except BaseException as exc:
-            resolver.set_exception(exc)
-            return
-        task_sink.set_task(task)
-        if task.done():
-            _resolve_task(task, resolver)
-        else:
-            task.add_done_callback(lambda done: _resolve_task(done, resolver))
-
-    _with_running_loop(loop, start)
+    _worker_dispatch_start(dispatch, request, loop, resolver, task_sink)
 
 
 def worker_sync_dispatch(dispatch, request, loop):

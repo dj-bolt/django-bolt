@@ -14,7 +14,8 @@ JSON as ``bytes`` — or a tagged envelope:
 
 from __future__ import annotations
 
-import contextlib
+import logging
+from collections.abc import Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from .server import MCP
 
 _KIND_METHOD = {"elicitation": "elicitation/create", "sampling": "sampling/createMessage"}
+logger = logging.getLogger(__name__)
 
 
 class McpRequest:
@@ -170,15 +172,25 @@ def make_verify_token(oauth_resource: Any) -> Any:
 
     def verify(token: str) -> dict[str, Any] | None:
         claims = oauth_resource.token_verifier(token) if oauth_resource.token_verifier else None
-        if claims is None:
+        if not isinstance(claims, Mapping):
             return None
         if oauth_resource.required_scopes:
-            granted = set((claims.get("scope") or "").split())
+            raw_scope = claims.get("scope")
+            if raw_scope is None:
+                raw_scope = claims.get("scp")
+            if isinstance(raw_scope, str):
+                granted = set(raw_scope.split())
+            elif isinstance(raw_scope, (list, tuple)) and all(isinstance(scope, str) for scope in raw_scope):
+                granted = set(raw_scope)
+            else:
+                return None
             if not granted.issuperset(oauth_resource.required_scopes):
                 return None
         claims_json: str | None = None
-        with contextlib.suppress(Exception):
+        try:
             claims_json = json_encode(claims).decode()
+        except Exception:
+            logger.exception("Failed to encode OAuth token claims")
         return {
             "user_id": str(claims["sub"]) if claims.get("sub") is not None else None,
             "is_staff": bool(claims.get("is_staff")),

@@ -110,6 +110,8 @@ class MCP:
         """
         if list_cache_scope not in _CACHE_SCOPES:
             raise ValueError(f"list_cache_scope must be 'public' or 'private', got {list_cache_scope!r}")
+        if list_ttl_ms < 0:
+            raise ValueError(f"list_ttl_ms must be >= 0, got {list_ttl_ms!r}")
         self.name = name
         self.version = version
         self.title = title
@@ -146,6 +148,8 @@ class MCP:
         etc.). ``guards`` are evaluated natively in Rust, both for
         ``tools/call`` denial and per-principal ``tools/list`` filtering.
         """
+        if isinstance(output_schema, str) and output_schema != "auto":
+            raise ValueError(f"output_schema must be a JSON Schema dict, 'auto', or None, got {output_schema!r}")
 
         def register(fn: Callable) -> Callable:
             tool_name = name or getattr(fn, "__name__", "tool")

@@ -61,6 +61,13 @@ def test_ctx_param_excluded_from_input_schema():
     assert set(schema["properties"]) == {"n"}
 
 
+def test_context_boolean_progress_property_is_explicitly_named():
+    rust_ctx = type("RustContext", (), {"has_progress_token": True})()
+    ctx = Context(rust_ctx)
+    assert ctx.has_progress_token is True
+    assert not hasattr(ctx, "progress_token")
+
+
 def test_context_read_resource_resolves_own_resources():
     api, _ = _build()
     with TestClient(api) as client:

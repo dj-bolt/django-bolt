@@ -187,13 +187,9 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
         .with_legacy_session_mode(legacy_sessions)
         .with_json_response(json_response)
         .with_max_request_body_bytes(max_body_bytes);
-    config = match allowed_hosts {
-        // None -> deployment host filtering is handled by Django ALLOWED_HOSTS
-        // upstream (or explicitly disabled); rmcp's localhost-only default
-        // would 403 every deployed request.
-        None => config.disable_allowed_hosts(),
-        Some(hosts) => config.with_allowed_hosts(hosts),
-    };
+    if let Some(hosts) = allowed_hosts {
+        config = config.with_allowed_hosts(hosts);
+    }
     if let Some(origins) = allowed_origins {
         config = config.with_allowed_origins(origins);
     }

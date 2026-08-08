@@ -22,7 +22,7 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
-from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts, serve_with_lifespan
+from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts, _validate_mcp_mount_conflicts, serve_with_lifespan
 from django_bolt.workers import MIB, WorkerSupervisor
 
 try:
@@ -865,6 +865,11 @@ class Command(BaseCommand):
 
         # Validate ASGI mount conflicts after all framework/admin/docs routes are added.
         self.validate_asgi_mount_conflicts(merged_api._routes, merged_api._asgi_mounts)
+        self.validate_mcp_mount_conflicts(
+            merged_api._routes,
+            merged_api._asgi_mounts,
+            merged_api._mcp_mounts,
+        )
 
         # Register routes with Rust. Each route carries per-route bound
         # dispatch callables (partial binding handler + handler_id) so the
@@ -1365,6 +1370,13 @@ class Command(BaseCommand):
                 route_map[mcp_key] = api_path
                 merged._mcp_mounts.append(mcp_mount)
 
+        _validate_mcp_mount_conflicts(
+            merged._routes,
+            merged._asgi_mounts,
+            merged._mcp_mounts,
+            error_cls=CommandError,
+        )
+
         # Update next handler ID
         merged._next_handler_id = next_handler_id
 
@@ -1376,3 +1388,7 @@ class Command(BaseCommand):
     def validate_asgi_mount_conflicts(self, routes, asgi_mounts):
         """Validate exact-path conflicts for ASGI mounts."""
         _validate_asgi_mount_conflicts(routes, asgi_mounts, error_cls=CommandError)
+
+    def validate_mcp_mount_conflicts(self, routes, asgi_mounts, mcp_mounts):
+        """Validate MCP paths against routes and ASGI mounts."""
+        _validate_mcp_mount_conflicts(routes, asgi_mounts, mcp_mounts, error_cls=CommandError)

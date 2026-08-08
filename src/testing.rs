@@ -429,10 +429,6 @@ pub fn register_test_mcp_mounts(
     app_id: u64,
     mounts: Vec<Py<PyAny>>,
 ) -> PyResult<()> {
-    let entry = registry()
-        .get(&app_id)
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
-
     let mut parsed = Vec::with_capacity(mounts.len());
     for mount in &mounts {
         let dict = mount.bind(py);
@@ -442,6 +438,9 @@ pub fn register_test_mcp_mounts(
         parsed.push(crate::mcp::parse_mount(py, dict)?);
     }
 
+    let entry = registry()
+        .get(&app_id)
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
     let mut app = entry.write();
     app.mcp_mounts = Arc::new(parsed);
     Ok(())

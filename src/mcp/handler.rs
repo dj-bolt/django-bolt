@@ -323,8 +323,9 @@ impl McpHandler {
                     tokio::select! {
                         result = &mut dispatch_fut => break result,
                         event = rx.recv() => {
-                            if let Some(event) = event {
-                                self.pump_event(ctx, event).await;
+                            match event {
+                                Some(event) => self.pump_event(ctx, event).await,
+                                None => break dispatch_fut.await,
                             }
                         }
                     }

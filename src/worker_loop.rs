@@ -440,12 +440,19 @@ pub(crate) async fn dispatch(dispatch: Py<PyAny>, request: Py<PyAny>) -> PyResul
 #[pyclass(frozen)]
 pub(crate) struct WorkerTaskHandle {
     task: std::sync::Mutex<Option<Py<PyAny>>>,
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 #[pymethods]
 impl WorkerTaskHandle {
     fn set_task(&self, task: Bound<'_, PyAny>) {
-        *self.task.lock().unwrap() = Some(task.unbind());
+        let mut slot = self.task.lock().unwrap();
+        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(slot);
+            let _ = task.call_method0("cancel");
+        } else {
+            *slot = Some(task.unbind());
+        }
     }
 }
 
@@ -472,6 +479,7 @@ pub(crate) async fn dispatch_cancellable(
             py,
             WorkerTaskHandle {
                 task: std::sync::Mutex::new(None),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
             },
         )?;
         let start = get_worker_fn(
@@ -501,7 +509,9 @@ pub(crate) async fn dispatch_cancellable(
         },
         _ = ct.cancelled() => {
             Python::attach(|py| {
-                if let Some(task) = handle.bind(py).get().task.lock().unwrap().take() {
+                let inner = handle.bind(py).get();
+                inner.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(task) = inner.task.lock().unwrap().take() {
                     // Schedule `.cancel()` on the task's own loop; calling it
                     // from this thread directly is not loop-safe.
                     let task = task.bind(py);

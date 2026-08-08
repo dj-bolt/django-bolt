@@ -155,8 +155,9 @@ protocol revisions `2024-11-05` through `2026-07-28` are served dual-era. Implem
 top of it: tools/resources/prompts with msgspec schemas, MRTR elicitation with replay and
 signed `requestState`, per-request log gating, SEP-2549 `ttlMs`/`cacheScope` hints,
 SEP-2243 routing-header validation, Rust-evaluated per-tool guards, all three auth tiers
-(with RFC 9207 `iss` and DCR `application_type`), auto-expose, and opt-in Host/Origin
-DNS-rebinding protection (`mount_mcp(allowed_hosts=..., allowed_origins=...)`).
+(with RFC 9207 `iss` and DCR `application_type`), auto-expose, localhost-only Host
+validation by default, and configurable Host/Origin DNS-rebinding protection
+(`mount_mcp(allowed_hosts=..., allowed_origins=...)`).
 
 Not yet: `completion/complete`, the tasks extension (`io.modelcontextprotocol/tasks`),
 list-changed notifications (catalogs are static), and CIMD client registration in the
