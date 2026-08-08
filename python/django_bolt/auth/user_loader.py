@@ -17,13 +17,13 @@ different get_user overrides.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import inspect
 from collections.abc import Callable
 from typing import Any
 
 from django.contrib.auth import get_user_model
 
+from ..concurrency import _run_default_blocking, run_in_orm_executor, run_orm_blocking
 from .backends import BaseAuthentication, JWTAuthentication
 from .pk_loader import load_user_by_pk_sync
 
@@ -48,18 +48,6 @@ _auth_backend_registry: dict[str, Any] = {}
 # (backend_name) -> resolved loader (user_id, auth_context, is_async_context) -> user,
 # or None when the backend has no user resolution. Built at registration time.
 _resolved_loader_registry: dict[str, Callable[[str, dict | None, bool], Any] | None] = {}
-
-# Global shared thread pool for user loading - avoids expensive pool creation per request
-# Using max_workers=4 to limit resource usage while allowing concurrent user loads
-_user_loader_executor: concurrent.futures.ThreadPoolExecutor | None = None
-
-
-def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
-    """Get or create the shared thread pool executor."""
-    global _user_loader_executor
-    if _user_loader_executor is None:
-        _user_loader_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="user_loader")
-    return _user_loader_executor
 
 
 def _has_custom_get_user_sync(cls: type) -> bool:
@@ -91,7 +79,7 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
 
         def load_via_sync(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
             if is_async_context:
-                return _get_executor().submit(backend.get_user_sync, user_id).result()
+                return run_orm_blocking(backend.get_user_sync, user_id)
             return backend.get_user_sync(user_id)
 
         return load_via_sync
@@ -103,18 +91,24 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
 
             def load_via_plain(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
                 if is_async_context:
-                    return _get_executor().submit(get_user, user_id, auth_context or {}).result()
+                    return run_orm_blocking(get_user, user_id, auth_context or {})
                 return get_user(user_id, auth_context or {})
 
             return load_via_plain
 
         def load_via_async(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
-            # asyncio.run needs a thread without a running loop — always use
-            # the executor, regardless of handler context.
+            # asyncio.run needs a thread without a running loop — always cross,
+            # regardless of handler context. The shim goes to the generic
+            # default pool, not the ORM pool: the coroutine may await
+            # non-database work (an external identity provider), and parking
+            # its whole lifetime on a bounded ORM slot would queue every
+            # QuerySet evaluation behind it. The database work the coroutine
+            # awaits still reaches the bounded pool through its own hand-off
+            # (run_in_orm_executor, or the async ORM's executor).
             def run_async_get_user():
                 return asyncio.run(get_user(user_id, auth_context or {}))
 
-            return _get_executor().submit(run_async_get_user).result()
+            return _run_default_blocking(run_async_get_user)
 
         return load_via_async
 
@@ -131,7 +125,7 @@ def default_django_user_loader(user_id: str, auth_context: dict | None, is_async
     User = get_user_model()
 
     if is_async_context:
-        return _get_executor().submit(load_user_by_pk_sync, User, user_id).result()
+        return run_orm_blocking(load_user_by_pk_sync, User, user_id)
     return load_user_by_pk_sync(User, user_id)
 
 
@@ -179,8 +173,10 @@ async def load_user(user_id: str | None, backend_name: str | None, auth_context:
 
     cls = type(backend)
     if _has_custom_get_user_sync(cls) and not _has_custom_get_user(cls):
-        # Only the sync variant was customized — run it off the event loop
-        return await asyncio.to_thread(backend.get_user_sync, user_id)
+        # Only the sync variant was customized — run it off the event loop, on
+        # the ORM pool rather than the generic default one: it is a query, and
+        # its connection use belongs to the same budget as every other query.
+        return await run_in_orm_executor(backend.get_user_sync, user_id)
 
     return await backend.get_user(user_id, auth_context or {})
 
