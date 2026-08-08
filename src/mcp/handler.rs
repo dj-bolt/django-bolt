@@ -18,7 +18,7 @@ use pyo3::types::{PyDict, PyString};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
     ErrorCode, ErrorData as McpError, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
-    InputRequest, InputRequiredResult, InputRequests, ListPromptsResult,
+    InputRequest, InputRequests, InputRequiredResult, ListPromptsResult,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
     ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
     ResultType, ServerInfo, Tool,
@@ -140,7 +140,10 @@ fn extract_result_string(result: PyResult<Py<PyAny>>) -> Result<String, McpError
                 Ok(s.to_string_lossy().into_owned())
             } else if let Ok(b) = bound.extract::<Vec<u8>>() {
                 String::from_utf8(b).map_err(|e| {
-                    McpError::internal_error(format!("MCP dispatch returned non-UTF8 bytes: {e}"), None)
+                    McpError::internal_error(
+                        format!("MCP dispatch returned non-UTF8 bytes: {e}"),
+                        None,
+                    )
                 })
             } else {
                 Err(McpError::internal_error(
@@ -151,17 +154,17 @@ fn extract_result_string(result: PyResult<Py<PyAny>>) -> Result<String, McpError
         }),
         Err(err) => {
             log::error!("MCP Python dispatch raised: {err}");
-            Err(McpError::internal_error(format!("MCP dispatch failed: {err}"), None))
+            Err(McpError::internal_error(
+                format!("MCP dispatch failed: {err}"),
+                None,
+            ))
         }
     }
 }
 
 /// Build the single payload dict handed to a Python dispatch callable.
 /// Every key is always present (registration-time-guarantee rule).
-fn build_payload(
-    py: Python<'_>,
-    fields: &[(&str, Py<PyAny>)],
-) -> PyResult<Py<PyAny>> {
+fn build_payload(py: Python<'_>, fields: &[(&str, Py<PyAny>)]) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     for (key, value) in fields {
         dict.set_item(*key, value)?;
@@ -275,12 +278,7 @@ impl McpHandler {
                 rx = Some(receiver);
                 let replay_map: std::collections::HashMap<String, String> = responses
                     .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            serde_json::json!({ "result": v }).to_string(),
-                        )
-                    })
+                    .map(|(k, v)| (k.clone(), serde_json::json!({ "result": v }).to_string()))
                     .collect();
                 Py::new(
                     py,
@@ -303,7 +301,10 @@ impl McpHandler {
             let payload = build_payload(
                 py,
                 &[
-                    ("arguments_json", PyString::new(py, &arguments_json).into_any().unbind()),
+                    (
+                        "arguments_json",
+                        PyString::new(py, &arguments_json).into_any().unbind(),
+                    ),
                     ("ctx", ctx_obj),
                     ("auth", auth_dict(py, auth.as_deref())?),
                 ],
@@ -406,13 +407,12 @@ impl McpHandler {
                 logger,
             } => {
                 #[allow(deprecated)]
-                let Ok(level) = serde_json::from_value::<rmcp::model::LoggingLevel>(
-                    Value::String(level),
-                ) else {
+                let Ok(level) =
+                    serde_json::from_value::<rmcp::model::LoggingLevel>(Value::String(level))
+                else {
                     return;
                 };
-                let data =
-                    serde_json::from_str(&data_json).unwrap_or(Value::String(data_json));
+                let data = serde_json::from_str(&data_json).unwrap_or(Value::String(data_json));
                 #[allow(deprecated)]
                 let mut params = rmcp::model::LoggingMessageNotificationParam::new(level, data);
                 if let Some(logger) = logger {
@@ -479,7 +479,10 @@ impl rmcp::ServerHandler for McpHandler {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.registry.tools.get(name).map(|entry| entry.tool.clone())
+        self.registry
+            .tools
+            .get(name)
+            .map(|entry| entry.tool.clone())
     }
 
     async fn discover(
@@ -578,11 +581,7 @@ impl rmcp::ServerHandler for McpHandler {
     ) -> Result<ReadResourceResponse, McpError> {
         let dispatch = Python::attach(|py| self.registry.resource_dispatch.clone_ref(py));
         let mut result: ReadResourceResult = self
-            .dispatch_simple(
-                &dispatch,
-                vec![("uri", request.uri.clone())],
-                &context,
-            )
+            .dispatch_simple(&dispatch, vec![("uri", request.uri.clone())], &context)
             .await?;
         if result.ttl_ms.is_none() {
             result.ttl_ms = Some(self.registry.list_ttl_ms);

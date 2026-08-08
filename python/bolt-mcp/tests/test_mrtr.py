@@ -208,9 +208,9 @@ def test_user_except_blocks_do_not_swallow_input_required():
 
     mount_mcp(api, mcp)
     with TestClient(api) as client:
-        result = parse_rpc(post_rpc_modern(client, "tools/call", {"name": "greedy", "arguments": {}}, capabilities=ELICIT_CAPS))[
-            "result"
-        ]
+        result = parse_rpc(
+            post_rpc_modern(client, "tools/call", {"name": "greedy", "arguments": {}}, capabilities=ELICIT_CAPS)
+        )["result"]
         assert result["resultType"] == "input_required"
 
 

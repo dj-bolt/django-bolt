@@ -193,7 +193,6 @@ impl McpPyContext {
                 )
             })
     }
-
 }
 
 static MCP_RESOLVE_FUTURE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();

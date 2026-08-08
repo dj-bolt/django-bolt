@@ -136,9 +136,7 @@ def post_rpc_modern(
 ):
     """POST one 2026-07-28 request: required headers + per-request _meta."""
     params = dict(params or {})
-    params["_meta"] = modern_meta(
-        capabilities=capabilities, log_level=log_level, progress_token=progress_token
-    )
+    params["_meta"] = modern_meta(capabilities=capabilities, log_level=log_level, progress_token=progress_token)
     headers = {
         "Accept": DUAL_ACCEPT,
         "Content-Type": JSON_CONTENT_TYPE,

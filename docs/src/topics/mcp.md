@@ -201,14 +201,25 @@ async def summarize_with_llm(text: str, ctx: Context) -> dict:
 
 @mcp.tool
 async def deploy(target: str, ctx: Context) -> dict:
-    answer = await ctx.elicit(
-        f"Deploy to {target!r}?",
-        schema={"type": "object", "properties": {"confirm": {"type": "boolean"}}},
-    )
+    answer = await ctx.elicit(f"Deploy to {target!r}?")
     if answer.get("action") != "accept":
         return {"deployed": False, "reason": "cancelled by user"}
     return {"deployed": True, "target": target}
 ```
+
+An elicitation reply has two independent parts. `action` (`accept` / `decline` / `cancel`) is always present, so the client always offers an accept/decline choice — for a plain confirmation like `deploy` above, pass **no** `schema` and the client renders just the message and those two buttons. `content` is the filled-in form, built from the `schema` you pass; add one only when you want data back, and then actually read it:
+
+```python
+answer = await ctx.elicit(
+    f"Deploy to {target!r}?",
+    schema={"type": "object", "properties": {"version": {"type": "string"}}},
+)
+if answer.get("action") != "accept":
+    return {"deployed": False, "reason": "cancelled by user"}
+return {"deployed": True, "target": target, "version": answer["content"]["version"]}
+```
+
+Asking for a boolean `confirm` field *and* relying on `action` duplicates the same question: the user can leave the box unset, press **Accept**, and the tool still proceeds.
 
 How `elicit` reaches the client depends on the client's protocol era:
 

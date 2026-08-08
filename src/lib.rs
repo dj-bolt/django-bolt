@@ -90,7 +90,10 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(register_test_routes, m)?)?;
     m.add_function(wrap_pyfunction!(register_test_websocket_routes, m)?)?;
     m.add_function(wrap_pyfunction!(register_test_asgi_mounts, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::testing::register_test_mcp_mounts, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::testing::register_test_mcp_mounts,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(register_test_middleware_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(test_request, m)?)?;
     m.add_function(wrap_pyfunction!(handle_test_websocket, m)?)?;

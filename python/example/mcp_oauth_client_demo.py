@@ -239,7 +239,7 @@ def main() -> None:
     print(f"    whoami() → {result['structuredContent']}")
 
     print("\nDone. Reuse the token with any MCP client, e.g.:\n")
-    print(f'  claude mcp add --transport http bolt-example {mcp_url} \\')
+    print(f"  claude mcp add --transport http bolt-example {mcp_url} \\")
     print(f'      --header "Authorization: Bearer {token}"')
 
 

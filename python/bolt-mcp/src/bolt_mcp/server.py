@@ -159,9 +159,7 @@ class MCP:
             ctx_param = _find_context_param(fn)
             exclude = schema.INJECTED_PARAMS | ({ctx_param} if ctx_param else set())
             args_struct = schema.struct_from_signature(fn, exclude=exclude)
-            resolved_output = (
-                schema.output_schema_from_return(fn) if output_schema == "auto" else output_schema
-            )
+            resolved_output = schema.output_schema_from_return(fn) if output_schema == "auto" else output_schema
             self._tools[tool_name] = ToolDef(
                 name=tool_name,
                 fn=fn,

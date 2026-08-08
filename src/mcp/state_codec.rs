@@ -69,7 +69,10 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-pub fn seal(codec: &RequestStateCodec, state: &McpRequestState) -> Result<String, RequestStateError> {
+pub fn seal(
+    codec: &RequestStateCodec,
+    state: &McpRequestState,
+) -> Result<String, RequestStateError> {
     codec.seal_json_with(
         state,
         &SealOptions::new().ttl(std::time::Duration::from_secs(STATE_TTL_SECS)),

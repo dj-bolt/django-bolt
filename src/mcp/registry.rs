@@ -112,7 +112,8 @@ impl McpRegistry {
         })?;
 
         let mut tool_order = Vec::with_capacity(catalog.tools.len());
-        let mut tools: AHashMap<String, McpToolEntry> = AHashMap::with_capacity(catalog.tools.len());
+        let mut tools: AHashMap<String, McpToolEntry> =
+            AHashMap::with_capacity(catalog.tools.len());
         for tool in catalog.tools {
             let name = tool.name.to_string();
             let cfg = tools_cfg.get_item(&name)?.ok_or_else(|| {

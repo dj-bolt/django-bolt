@@ -110,10 +110,10 @@ async def summarize_with_llm(text: str, ctx: Context) -> dict:
 @mcp.tool
 async def deploy(target: str, ctx: Context) -> dict:
     """Ask the user to confirm before deploying (MCP elicitation)."""
-    answer = await ctx.elicit(
-        f"Deploy to {target!r}?",
-        schema={"type": "object", "properties": {"confirm": {"type": "boolean"}}},
-    )
+    # No schema: the reply's accept/decline action *is* the answer, so the client renders
+    # just the message and the two buttons. Pass a schema only when you want data back
+    # (e.g. {"version": {"type": "string"}}) — then read it from answer["content"].
+    answer = await ctx.elicit(f"Deploy to {target!r}?")
     if answer.get("action") != "accept":
         return {"deployed": False, "reason": "cancelled by user"}
     return {"deployed": True, "target": target}
