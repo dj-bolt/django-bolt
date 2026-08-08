@@ -83,13 +83,18 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv pip install -e ".[dev]"
+          uv pip install -e ".[dev]" -e python/bolt-mcp
 
       - name: Build extension
         run: uv run maturin develop --release
 
       - name: Run tests
         run: uv run --with pytest pytest python/tests -m "not server_integration and not artifact_smoke" -s -vv
+
+      # Separate invocation: bolt-mcp's conftest configures Django (OAuth app,
+      # file-backed sqlite) incompatibly with the main suite's settings.
+      - name: Run bolt-mcp tests
+        run: uv run --with pytest pytest python/bolt-mcp/tests -m "not server_integration and not artifact_smoke" -s -vv
 
   server_smoke_linux:
     name: Server Smoke Linux
@@ -169,13 +174,16 @@ jobs:
           rustflags: "" # action defaults to -D warnings; don't block tests on warnings
 
       - name: Install dependencies
-        run: uv pip install -e ".[dev]"
+        run: uv pip install -e ".[dev]" -e python/bolt-mcp
 
       - name: Build extension
         run: uv run maturin develop --release
 
       - name: Run server integration tests
         run: uv run pytest python/tests/integration -m "server_integration and not artifact_smoke" -s -vv
+
+      - name: Run bolt-mcp server integration tests
+        run: uv run pytest python/bolt-mcp/tests/integration -m "server_integration and not artifact_smoke" -s -vv
 
   platform_smoke:
     name: Platform Smoke ${{ matrix.os }}

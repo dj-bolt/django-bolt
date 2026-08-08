@@ -25,6 +25,9 @@ class OAuthClient(models.Model):
     grant_types = models.JSONField(default=list)
     scope = models.TextField(blank=True, default="")
     token_endpoint_auth_method = models.CharField(max_length=64, default="none")
+    # OIDC application_type ("web" | "native"); native clients may register
+    # loopback/custom-scheme redirect URIs (MCP 2026-07-28, SEP-837).
+    application_type = models.CharField(max_length=16, default="web")
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self) -> str:

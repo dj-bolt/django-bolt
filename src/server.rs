@@ -801,6 +801,7 @@ pub fn start_server(
         router: None,         // Production uses GLOBAL_ROUTER
         route_metadata: None, // Production uses ROUTE_METADATA
         asgi_mounts: None,    // Production uses GLOBAL_ASGI_MOUNTS
+        mcp_mounts: None,     // Production uses mcp::GLOBAL_MCP_MOUNTS
         static_files_config: static_files_config.clone(),
         media_files_config: media_files_config.clone(),
         access_logger: access_logger_obj,

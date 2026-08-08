@@ -1,8 +1,12 @@
 # bolt-mcp
 
 Build [MCP (Model Context Protocol)](https://modelcontextprotocol.io) servers on top of
-[django-bolt](https://github.com/FarhanAliRaza/django-bolt), served natively over the MCP
-**Streamable HTTP** transport by django-bolt's Rust pipeline — no Starlette/`mcp`-SDK stack.
+[django-bolt](https://github.com/FarhanAliRaza/django-bolt), served over the MCP
+**Streamable HTTP** transport by the official MCP Rust SDK
+([rmcp](https://github.com/modelcontextprotocol/rust-sdk)) embedded in django-bolt's Rust
+core — no Starlette or Python-SDK stack in the request path. Dual-era: speaks the
+**2026-07-28** revision (stateless, MRTR elicitation, `server/discover`) and the earlier
+session-based revisions on the same endpoint.
 
 ```python
 from django_bolt import BoltAPI
@@ -144,11 +148,16 @@ uv sync                                                  # install workspace (ed
 uv run pytest python/bolt-mcp/tests -s -vv        # full suite (incl. subprocess integration)
 ```
 
-## Status / v1 scope
+## Status / scope (0.2)
 
-Implemented: `initialize`/`ping`, `tools/{list,call}`, `resources/{list,read,templates/list}`,
-`prompts/{list,get}`, Streamable HTTP (POST/GET/DELETE), sessions, both auth tiers, auto-expose,
-and streaming tools (progress/logging/sampling/elicitation) via a tool `Context`.
+The protocol core is the official MCP Rust SDK (rmcp), embedded in django-bolt >= 0.10 —
+protocol revisions `2024-11-05` through `2026-07-28` are served dual-era. Implemented on
+top of it: tools/resources/prompts with msgspec schemas, MRTR elicitation with replay and
+signed `requestState`, per-request log gating, SEP-2549 `ttlMs`/`cacheScope` hints,
+SEP-2243 routing-header validation, Rust-evaluated per-tool guards, all three auth tiers
+(with RFC 9207 `iss` and DCR `application_type`), auto-expose, and opt-in Host/Origin
+DNS-rebinding protection (`mount_mcp(allowed_hosts=..., allowed_origins=...)`).
 
-Not yet (v2): `completion/complete`, `logging/setLevel`, resumability (`Last-Event-ID`), and
-Host/Origin DNS-rebinding protection.
+Not yet: `completion/complete`, the tasks extension (`io.modelcontextprotocol/tasks`),
+list-changed notifications (catalogs are static), and CIMD client registration in the
+built-in Authorization Server.

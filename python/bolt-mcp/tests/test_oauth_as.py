@@ -138,12 +138,17 @@ def test_authorization_server_metadata():
     assert md["response_types_supported"] == ["code"]
 
 
-def test_protected_resource_metadata_points_at_builtin_issuer():
+def test_protected_resource_metadata_advertises_mcp_endpoint():
+    # The canonical MCP resource URI is the endpoint URL (issuer + mount
+    # path), not the bare origin — strict clients compare it against the URL
+    # they connect to. The document lives at the RFC 9728 path-aware
+    # location, derived by inserting the well-known segment between the
+    # origin and the resource path.
     api, _, _ = _build()
     with TestClient(api) as client:
-        md = client.get("/.well-known/oauth-protected-resource").json()
+        md = client.get("/.well-known/oauth-protected-resource/mcp").json()
     assert md["authorization_servers"] == [ISSUER]
-    assert md["resource"] == ISSUER
+    assert md["resource"] == f"{ISSUER}/mcp"
 
 
 def test_missing_token_challenges_with_www_authenticate():
@@ -443,7 +448,7 @@ def test_subclass_overrides_get_extra_claims_with_scope_and_client():
     with TestClient(api) as client:
         tokens = _obtain_tokens(client, is_staff=True, scope="mcp")
     claims = jwt.decode(
-        tokens["access_token"], settings.SECRET_KEY, algorithms=["HS256"], audience=ISSUER, issuer=ISSUER
+        tokens["access_token"], settings.SECRET_KEY, algorithms=["HS256"], audience=f"{ISSUER}/mcp", issuer=ISSUER
     )
     assert claims["tenant_id"] == "acme"
     assert claims["permissions"] == ["reports:read"]
@@ -466,3 +471,74 @@ def test_subclass_overrides_render_login():
         r = client.get("/oauth/authorize", params=_authorize_params(client_id, challenge), follow_redirects=False)
     assert r.status_code == 200
     assert "WELCOME TO ACME" in r.text
+
+
+# ── MCP 2026-07-28 hardening: RFC 9207 iss + application_type ─────────────────--
+def test_as_metadata_advertises_iss_parameter_support():
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        md = client.get("/.well-known/oauth-authorization-server").json()
+    assert md["authorization_response_iss_parameter_supported"] is True
+
+
+def test_authorization_code_redirect_carries_iss():
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        _make_user()
+        client_id = _register_client(client)
+        _, challenge = _pkce()
+        q = _get_code(client, _authorize_params(client_id, challenge))
+    assert q["iss"] == [ISSUER]
+    assert "code" in q
+
+
+def test_denied_consent_redirect_carries_iss():
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        _make_user()
+        client_id = _register_client(client)
+        _, challenge = _pkce()
+        r = client.post(
+            "/oauth/authorize",
+            data={**_authorize_params(client_id, challenge), "decision": "deny"},
+            headers={**_session_cookie(), "Origin": ISSUER},
+            follow_redirects=False,
+        )
+    assert r.status_code == 302
+    q = parse_qs(urlsplit(r.headers["location"]).query)
+    assert q["error"] == ["access_denied"]
+    assert q["iss"] == [ISSUER]
+
+
+def test_registration_persists_application_type_native():
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        r = client.post(
+            "/oauth/register",
+            json={
+                "redirect_uris": ["http://127.0.0.1:33418/callback"],
+                "client_name": "CLI App",
+                "application_type": "native",
+            },
+        )
+    assert r.status_code == 201
+    assert r.json()["application_type"] == "native"
+
+
+def test_registration_defaults_application_type_web():
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        r = client.post("/oauth/register", json={"redirect_uris": [REDIRECT_URI], "client_name": "Web App"})
+    assert r.status_code == 201
+    assert r.json()["application_type"] == "web"
+
+
+def test_registration_rejects_invalid_application_type():
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        r = client.post(
+            "/oauth/register",
+            json={"redirect_uris": [REDIRECT_URI], "application_type": "desktop"},
+        )
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_client_metadata"

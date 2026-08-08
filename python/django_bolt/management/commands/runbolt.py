@@ -892,6 +892,10 @@ class Command(BaseCommand):
         if merged_api._asgi_mounts:
             _core.register_asgi_mounts(merged_api._asgi_mounts)
 
+        # Register MCP mounts with Rust (rmcp protocol core)
+        if merged_api._mcp_mounts:
+            _core.register_mcp_mounts(merged_api._mcp_mounts)
+
         # Register WebSocket routes with Rust (including pre-compiled injectors)
         ws_routes = []
         for path, handler_id, handler in merged_api._websocket_routes:
@@ -1350,6 +1354,16 @@ class Command(BaseCommand):
 
                 route_map[asgi_key] = api_path
                 merged._asgi_mounts.append((asgi_prefix, asgi_app))
+
+            # Merge MCP mounts from this API
+            for mcp_mount in getattr(api, "_mcp_mounts", []):
+                mcp_key = f"MCP {mcp_mount['path']}"
+                if mcp_key in route_map:
+                    raise CommandError(
+                        f"MCP mount conflict: {mcp_mount['path']} defined in both {route_map[mcp_key]} and {api_path}"
+                    )
+                route_map[mcp_key] = api_path
+                merged._mcp_mounts.append(mcp_mount)
 
         # Update next handler ID
         merged._next_handler_id = next_handler_id

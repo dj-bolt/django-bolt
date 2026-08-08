@@ -115,6 +115,7 @@ pub struct TestAppState {
     pub router: Arc<Router>,
     pub websocket_router: Arc<WebSocketRouter>,
     pub asgi_mounts: Arc<Vec<AsgiMount>>,
+    pub mcp_mounts: Arc<Vec<crate::mcp::McpMount>>,
     pub route_metadata: Arc<RouteMetadataStore>,
     pub dispatch: Py<PyAny>,
     pub global_cors_config: Option<CorsConfig>,
@@ -335,6 +336,7 @@ pub fn create_test_app(
         router: Arc::new(Router::new()),
         websocket_router: Arc::new(WebSocketRouter::new()),
         asgi_mounts: Arc::new(Vec::new()),
+        mcp_mounts: Arc::new(Vec::new()),
         route_metadata: Arc::new(RouteMetadataStore::default()),
         dispatch: dispatch.clone_ref(py),
         global_cors_config,
@@ -416,6 +418,32 @@ pub fn register_test_asgi_mounts(
     let mut app = entry.write();
     let asgi_mounts = validate_and_sort_asgi_mounts(mounts)?;
     app.asgi_mounts = Arc::new(asgi_mounts);
+    Ok(())
+}
+
+/// Register MCP mounts for a test app. Same mount-definition dicts as the
+/// production `register_mcp_mounts`.
+#[pyfunction]
+pub fn register_test_mcp_mounts(
+    py: Python<'_>,
+    app_id: u64,
+    mounts: Vec<Py<PyAny>>,
+) -> PyResult<()> {
+    let entry = registry()
+        .get(&app_id)
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
+
+    let mut parsed = Vec::with_capacity(mounts.len());
+    for mount in &mounts {
+        let dict = mount.bind(py);
+        let dict = dict.cast::<PyDict>().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err("MCP mount definition must be a dict")
+        })?;
+        parsed.push(crate::mcp::parse_mount(py, dict)?);
+    }
+
+    let mut app = entry.write();
+    app.mcp_mounts = Arc::new(parsed);
     Ok(())
 }
 
@@ -508,6 +536,7 @@ pub fn test_request(
                 router,
                 route_metadata,
                 asgi_mounts,
+                mcp_mounts,
                 dispatch,
                 global_cors_config,
                 global_compression_config,
@@ -523,6 +552,7 @@ pub fn test_request(
                     state.router.clone(),
                     state.route_metadata.clone(),
                     state.asgi_mounts.clone(),
+                    state.mcp_mounts.clone(),
                     Python::attach(|py| state.dispatch.clone_ref(py)),
                     state.global_cors_config.clone(),
                     state.global_compression_config.clone(),
@@ -550,6 +580,7 @@ pub fn test_request(
                 router: Some(router.clone()),
                 route_metadata: Some(route_metadata.clone()),
                 asgi_mounts: Some(asgi_mounts.clone()),
+                mcp_mounts: Some(mcp_mounts.clone()),
                 static_files_config: static_files_config.clone(),
                 media_files_config: None,
                 access_logger: None,
@@ -746,6 +777,13 @@ async fn handle_test_request_internal(
                         .insert_header(("Content-Type", "application/json"))
                         .finish();
                 }
+            }
+
+            // MCP mount check (mirrors production handle_request): only on
+            // router miss, before the ASGI fallback.
+            if let Some(mcp_mount) = crate::mcp::find_mcp_mount(&state, path) {
+                return crate::mcp::bridge::handle_mcp_request(req, payload, mcp_mount, &state)
+                    .await;
             }
 
             // HTTP ASGI mount fallback:

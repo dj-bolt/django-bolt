@@ -405,6 +405,10 @@ class TestClient(httpx.Client):
         if api._asgi_mounts:
             _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
 
+        # Register MCP mounts (served by the Rust rmcp core, like production)
+        if api._mcp_mounts:
+            _core.register_test_mcp_mounts(self.app_id, list(api._mcp_mounts))
+
         # Register middleware metadata if any exists
         if api._handler_middleware:
             middleware_data = [(handler_id, meta) for handler_id, meta in api._handler_middleware.items()]
@@ -677,6 +681,10 @@ class AsyncTestClient(httpx.AsyncClient):
         # Register HTTP ASGI mounts
         if api._asgi_mounts:
             _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
+
+        # Register MCP mounts (served by the Rust rmcp core, like production)
+        if api._mcp_mounts:
+            _core.register_test_mcp_mounts(self.app_id, list(api._mcp_mounts))
 
         # Register middleware metadata
         if api._handler_middleware:

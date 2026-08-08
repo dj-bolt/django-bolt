@@ -11,7 +11,9 @@ from django_bolt.testing import TestClient
 
 SECRET = "tier2-secret-key-0123456789-abcdefgh"
 RESOURCE_URL = "https://api.test/mcp"
-WELL_KNOWN = "/.well-known/oauth-protected-resource"
+# RFC 9728 location for a resource with path /mcp: the well-known segment is
+# inserted between the origin and the resource path.
+WELL_KNOWN = "/.well-known/oauth-protected-resource/mcp"
 
 
 def _verify(token: str):
@@ -58,7 +60,8 @@ def test_missing_token_challenges_with_www_authenticate():
         assert resp.status_code == 401
         challenge = resp.headers.get("www-authenticate", "")
         assert "Bearer" in challenge
-        assert "resource_metadata=" in challenge
+        # The challenge points at the RFC 9728 path-aware location.
+        assert 'resource_metadata="https://api.test/.well-known/oauth-protected-resource/mcp"' in challenge
 
 
 def test_valid_token_allows_initialize():

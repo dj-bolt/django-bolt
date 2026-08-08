@@ -20,13 +20,20 @@ from .tokens import new_secret, sha256_hex
 
 
 # ── clients (Dynamic Client Registration) ──────────────────────────────────────
-def _create_client(client_name: str, redirect_uris: list[str], grant_types: list[str], scope: str) -> dict[str, Any]:
+def _create_client(
+    client_name: str,
+    redirect_uris: list[str],
+    grant_types: list[str],
+    scope: str,
+    application_type: str = "web",
+) -> dict[str, Any]:
     client = OAuthClient.objects.create(
         client_id=new_secret(24),
         client_name=client_name or "",
         redirect_uris=list(redirect_uris),
         grant_types=list(grant_types) or ["authorization_code", "refresh_token"],
         scope=scope or "",
+        application_type=application_type,
     )
     return {
         "pk": client.pk,
@@ -36,6 +43,7 @@ def _create_client(client_name: str, redirect_uris: list[str], grant_types: list
         "grant_types": client.grant_types,
         "scope": client.scope,
         "token_endpoint_auth_method": client.token_endpoint_auth_method,
+        "application_type": client.application_type,
     }
 
 

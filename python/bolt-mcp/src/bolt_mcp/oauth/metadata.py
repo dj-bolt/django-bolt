@@ -24,6 +24,8 @@ def authorization_server_metadata(server: AuthorizationServer) -> dict[str, Any]
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
+        # RFC 9207: authorization responses carry the iss parameter.
+        "authorization_response_iss_parameter_supported": True,
     }
     if server.allow_dynamic_registration:
         md["registration_endpoint"] = ep["register"]

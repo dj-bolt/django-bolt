@@ -14,6 +14,7 @@ use crate::state::TASK_LOCALS;
 
 static WORKER_LOOP_FACTORY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_DISPATCH_START: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static WORKER_DISPATCH_START_CANCELLABLE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_SYNC_DISPATCH: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static RUN_WORKER_HANDLE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -431,6 +432,90 @@ pub(crate) async fn dispatch(dispatch: Py<PyAny>, request: Py<PyAny>) -> PyResul
         Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
             "worker dispatch resolver dropped without a result",
         )),
+    }
+}
+
+/// Holds the asyncio Task created by `worker_dispatch_start_cancellable` so a
+/// later cancellation can reach it. Filled from the WorkerLoop thread.
+#[pyclass(frozen)]
+pub(crate) struct WorkerTaskHandle {
+    task: std::sync::Mutex<Option<Py<PyAny>>>,
+}
+
+#[pymethods]
+impl WorkerTaskHandle {
+    fn set_task(&self, task: Bound<'_, PyAny>) {
+        *self.task.lock().unwrap() = Some(task.unbind());
+    }
+}
+
+/// Cancellable variant of [`dispatch`], used by MCP tool calls: rmcp fires the
+/// request's `CancellationToken` when the client closes the SSE response
+/// stream (the 2026-07-28 cancellation signal) or sends
+/// `notifications/cancelled` (legacy sessions). Plain routes keep the
+/// non-cancelling `dispatch` semantics deliberately (tasks may outlive
+/// responses); MCP semantics require the tool to actually stop.
+pub(crate) async fn dispatch_cancellable(
+    dispatch: Py<PyAny>,
+    payload: Py<PyAny>,
+    ct: tokio_util::sync::CancellationToken,
+) -> PyResult<Py<PyAny>> {
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let handle = Python::attach(|py| {
+        let resolver = Py::new(
+            py,
+            WorkerDispatchResolver {
+                tx: std::sync::Mutex::new(Some(tx)),
+            },
+        )?;
+        let handle = Py::new(
+            py,
+            WorkerTaskHandle {
+                task: std::sync::Mutex::new(None),
+            },
+        )?;
+        let start = get_worker_fn(
+            py,
+            &WORKER_DISPATCH_START_CANCELLABLE,
+            "worker_dispatch_start_cancellable",
+        )?;
+        start.call1(
+            py,
+            (
+                dispatch,
+                payload,
+                get_loop(py)?,
+                resolver,
+                handle.clone_ref(py),
+            ),
+        )?;
+        Ok::<_, PyErr>(handle)
+    })?;
+
+    tokio::select! {
+        result = &mut rx => match result {
+            Ok(result) => result,
+            Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "worker dispatch resolver dropped without a result",
+            )),
+        },
+        _ = ct.cancelled() => {
+            Python::attach(|py| {
+                if let Some(task) = handle.bind(py).get().task.lock().unwrap().take() {
+                    // Schedule `.cancel()` on the task's own loop; calling it
+                    // from this thread directly is not loop-safe.
+                    let task = task.bind(py);
+                    if let (Ok(task_loop), Ok(cancel)) =
+                        (task.call_method0("get_loop"), task.getattr("cancel"))
+                    {
+                        let _ = task_loop.call_method1("call_soon_threadsafe", (cancel,));
+                    }
+                }
+            });
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "MCP request cancelled by client",
+            ))
+        }
     }
 }
 

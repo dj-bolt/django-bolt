@@ -59,6 +59,32 @@ def struct_from_fields(name: str, fields: list[Any]) -> type[msgspec.Struct]:
     return msgspec.defstruct(f"{name}_Args", required + optional)
 
 
+def output_schema_from_return(fn: Callable) -> dict[str, Any] | None:
+    """Derive an MCP ``outputSchema`` from ``fn``'s return annotation (opt-in).
+
+    Only object-shaped returns get a schema: MCP ``structuredContent`` is an
+    object, so scalar/str annotations yield ``None`` rather than a misleading
+    schema. Raises for annotations msgspec cannot represent.
+    """
+    hints = get_type_hints(fn, include_extras=True)
+    annotation = hints.get("return")
+    if annotation is None or annotation is type(None):
+        return None
+    raw = msgspec.json.schema(annotation)
+    schema = raw
+    if "$ref" in raw:
+        defs = raw.get("$defs") or {}
+        ref = raw["$ref"].rsplit("/", 1)[-1]
+        schema = dict(defs.get(ref, {}))
+        others = {k: v for k, v in defs.items() if k != ref}
+        if others:
+            schema["$defs"] = others
+    if schema.get("type") != "object":
+        return None
+    schema.pop("title", None)
+    return schema
+
+
 def input_schema_for(struct_type: type[msgspec.Struct]) -> dict[str, Any]:
     """Return a top-level ``type:"object"`` JSON Schema for an args struct.
 

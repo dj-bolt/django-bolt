@@ -45,7 +45,7 @@ def test_initialize_handshake_and_capabilities(feature_server):
     assert result["serverInfo"] == {"name": "features-itest", "version": "2.0"}
     assert result["protocolVersion"] == PROTOCOL
     # Capabilities reflect what was registered: tools, resources, and prompts.
-    assert set(result["capabilities"]) == {"tools", "resources", "prompts"}
+    assert {"tools", "resources", "prompts"} <= set(result["capabilities"])  # rmcp also advertises logging
 
 
 def test_ping(feature_server):
@@ -107,7 +107,9 @@ def test_context_tool_streams_progress_then_result(feature_server):
     assert [p["params"]["progress"] for p in progress] == [0, 1, 2]
     assert all(p["params"]["progressToken"] == "tok1" for p in progress)
     assert progress[0]["params"]["total"] == 3
-    assert len(logs) == 1 and logs[0]["params"]["data"] == "almost done"
+    # Session-model routing: legacy notifications/message goes to the
+    # standalone GET stream, not the POST stream (see test_streaming.py).
+    assert logs == []
     assert len(results) == 1
     assert results[0]["id"] == 9
     assert results[0]["result"]["structuredContent"] == {"done": 3}

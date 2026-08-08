@@ -445,6 +445,9 @@ class BoltAPI:
         # Django admin configuration (controlled by --no-admin flag)
         self._admin_routes_registered = False
         self._asgi_mounts: list[tuple[str, Callable[..., Any]]] = []
+        # MCP mount definitions (dicts consumed by _core.register_mcp_mounts).
+        # Populated by bolt_mcp.mount_mcp; empty for APIs without MCP.
+        self._mcp_mounts: list[dict[str, Any]] = []
         self._asgi_mount_prefixes: set[str] = set()
 
         # Middleware chain (built lazily on first request)
@@ -3003,6 +3006,8 @@ class BoltAPI:
         guards: list[Any] | None = None,
         oauth: Any | None = None,
         expose: Any | None = None,
+        allowed_hosts: list[str] | None = None,
+        allowed_origins: list[str] | None = None,
     ) -> None:
         """Serve an MCP (Model Context Protocol) server over Streamable HTTP on this API.
 
@@ -3026,7 +3031,17 @@ class BoltAPI:
             raise ImportError(
                 "api.mount_mcp(...) requires the optional 'bolt-mcp' package. Install it with `pip install 'django-bolt[mcp]'`."
             ) from exc
-        mount_mcp(self, mcp, path, auth=auth, guards=guards, oauth=oauth, expose=expose)
+        mount_mcp(
+            self,
+            mcp,
+            path,
+            auth=auth,
+            guards=guards,
+            oauth=oauth,
+            expose=expose,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        )
 
     def include_router(self, router: Router, prefix: str = "") -> None:
         """

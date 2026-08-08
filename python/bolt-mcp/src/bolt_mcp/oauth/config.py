@@ -43,7 +43,10 @@ class AuthorizationServer:
     Configuration — set as class attributes in a subclass or pass as constructor kwargs:
         issuer: absolute origin of this server (e.g. ``https://api.example.com``). REQUIRED
             in production; defaults to ``http://localhost:8000`` (with a warning) if unset.
-        resource_url: OAuth resource id + token audience. Defaults to ``issuer``.
+        resource_url: OAuth resource id + token audience. Defaults to
+            ``issuer`` + the MCP mount path (e.g. ``https://api.example.com/mcp``),
+            filled in by ``mount_mcp`` — the canonical MCP resource URI clients
+            compare against and bind tokens to.
         scopes_supported / required_scopes: advertised vs enforced-on-``/mcp`` scopes.
         access_token_ttl / refresh_token_ttl / auth_code_ttl: lifetimes (seconds).
         jwt_secret / jwt_algorithm: signing key/alg (default Django ``SECRET_KEY`` / HS256).

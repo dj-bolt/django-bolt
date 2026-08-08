@@ -19,7 +19,9 @@ classifiers = [
 dependencies = [
     # bolt-mcp reads django-bolt internals (FieldDefinition, handler metadata), so it is
     # version-coupled — keep this floor in lockstep with django-bolt releases.
-    "django-bolt>=0.8.1",
+    # Hard floor: the MCP protocol core (rmcp) lives in django-bolt's Rust
+    # extension from 0.10; bolt-mcp >= 0.2 cannot serve without it.
+    "django-bolt>=0.10.0",
     "msgspec>=0.20",
     # The built-in OAuth Authorization Server (bolt_mcp.oauth) signs/validates JWTs with
     # PyJWT. django-bolt already imports it transitively; declared here for hygiene.

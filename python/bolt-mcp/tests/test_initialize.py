@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from _helpers import initialize, make_server, parse_rpc, post_rpc
-from bolt_mcp.types import METHOD_NOT_FOUND, SUPPORTED_PROTOCOL_VERSIONS
 
 from django_bolt.testing import TestClient
+
+METHOD_NOT_FOUND = -32601
+SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28")
 
 
 def test_initialize_returns_session_and_capabilities():
@@ -50,12 +52,14 @@ def test_unknown_session_returns_404():
         assert resp.status_code == 404
 
 
-def test_missing_session_on_non_init_returns_400():
+def test_missing_session_on_non_init_rejected():
     api, _ = make_server()
     with TestClient(api) as client:
         initialize(client)
         resp = post_rpc(client, "ping", session_id=None)
-        assert resp.status_code == 400
+        # Pre-0.2 answered 400; the rmcp core answers 422. Either way the
+        # request must be rejected client-side (4xx), never served.
+        assert resp.status_code in (400, 422)
 
 
 def test_unsupported_protocol_version_returns_400():

@@ -64,12 +64,23 @@ def _append_query(url: str, params: dict[str, str]) -> str:
     return url + ("&" if "?" in url else "?") + urlencode(params)
 
 
-def _redirect_error(redirect_uri: str, state: str | None, error: str, description: str | None = None) -> Redirect:
+def _redirect_error(
+    redirect_uri: str,
+    state: str | None,
+    error: str,
+    description: str | None = None,
+    *,
+    iss: str | None = None,
+) -> Redirect:
     params = {"error": error}
     if description:
         params["error_description"] = description
     if state:
         params["state"] = state
+    if iss:
+        # RFC 9207: identify the issuer in every authorization response so
+        # clients can detect mix-up attacks before redeeming the code.
+        params["iss"] = iss
     return Redirect(_append_query(redirect_uri, params), status_code=302)
 
 
@@ -77,6 +88,7 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
     """Register the AS discovery, registration, authorize, token, and revoke routes."""
 
     _mint = sync_to_async(tokens.mint_access_token, thread_sensitive=True)
+    _issuer = server.effective_issuer()
 
     def _apply_session_cookie(response: Any, session_key: str) -> Any:
         return response.set_cookie(sessions.session_cookie_name(), session_key, **sessions.session_cookie_kwargs())
@@ -106,7 +118,11 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
             return _html_error("redirect_uri does not match a registered value")
         if p.get("code_challenge_method") != "S256" or not p.get("code_challenge"):
             return _redirect_error(
-                redirect_uri, p.get("state"), "invalid_request", "PKCE with S256 code_challenge is required"
+                redirect_uri,
+                p.get("state"),
+                "invalid_request",
+                "PKCE with S256 code_challenge is required",
+                iss=_issuer,
             )
         return client
 
@@ -120,7 +136,8 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
             scope=p.get("scope", ""),
             ttl=server.auth_code_ttl,
         )
-        params = {"code": code}
+        # RFC 9207: bind the response to this issuer (mix-up defense).
+        params = {"code": code, "iss": _issuer}
         if p.get("state"):
             params["state"] = p["state"]
         resp = Redirect(_append_query(p["redirect_uri"], params), status_code=302)
@@ -178,7 +195,11 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
                 return HTML(server.render_login(p, error="Session expired — sign in again"))
             if decision != "approve":
                 return _redirect_error(
-                    p["redirect_uri"], p.get("state"), "access_denied", "The user denied the request"
+                    p["redirect_uri"],
+                    p.get("state"),
+                    "access_denied",
+                    "The user denied the request",
+                    iss=_issuer,
                 )
             return await _issue_code_redirect(p, client, user, session_key=None)
 
@@ -252,11 +273,17 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
             or not all(isinstance(u, str) for u in redirect_uris)
         ):
             return _json_error("invalid_redirect_uri", "redirect_uris must be a non-empty array of strings")
+        # OIDC application_type (MCP 2026-07-28 requires clients to send it;
+        # SEP-837). "native" permits loopback/custom-scheme redirect URIs.
+        application_type = body.get("application_type", "web")
+        if application_type not in ("web", "native"):
+            return _json_error("invalid_client_metadata", "application_type must be 'web' or 'native'")
         client = await store.create_client(
             client_name=body.get("client_name", ""),
             redirect_uris=redirect_uris,
             grant_types=body.get("grant_types") or [],
             scope=body.get("scope", ""),
+            application_type=application_type,
         )
         return JSON(
             {
@@ -266,6 +293,7 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
                 "grant_types": client["grant_types"],
                 "token_endpoint_auth_method": client["token_endpoint_auth_method"],
                 "scope": client["scope"],
+                "application_type": client["application_type"],
             },
             status_code=201,
             headers=_NO_STORE,
