@@ -10,7 +10,6 @@ from __future__ import annotations
 import socketserver
 import ssl
 import subprocess
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -215,10 +214,12 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             }
             assert server.get("/t-signal").json() == {"received": True, "removed": True}
             assert server.get("/t-worker-server").json() == {"reply": "worker-server"}
-            assert server.get("/t-server-api").json() == {
-                "get_loop_is_running_loop": True,
-                "close_clients_eof": True if sys.version_info >= (3, 13) else None,
-            }
+            server_api = server.get("/t-server-api").json()
+            assert server_api["get_loop_is_running_loop"] is True
+            if server_api["close_clients_supported"]:
+                assert server_api["close_clients_eof"] is True
+            else:
+                assert server_api["close_clients_eof"] is None
             assert server.get("/t-datagram").json() == {"reply": "datagram-ok"}
             assert server.get("/t-datagram-flow-control").json() == {"paused": True, "resumed": True}
 
