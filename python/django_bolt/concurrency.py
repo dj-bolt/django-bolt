@@ -20,7 +20,7 @@ from functools import partial
 
 logger = logging.getLogger(__name__)
 
-__all__ = ("sync_to_thread", "run_in_orm_executor", "get_orm_executor", "in_orm_executor_thread")
+__all__ = ("in_orm_executor_thread", "run_in_orm_executor", "run_orm_blocking", "sync_to_thread")
 
 # Shared default pool for generic blocking work. Passing an explicit executor
 # keeps the compatibility asyncio loop and WorkerLoop from each lazily creating
@@ -111,6 +111,11 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
                 workers = int(raw) if raw else _default_orm_workers()
             except ValueError:
                 workers = _default_orm_workers()
+                logger.warning(
+                    "Ignoring invalid DJANGO_BOLT_ORM_THREADS=%r; using the default of %d",
+                    raw,
+                    workers,
+                )
             _orm_executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(1, workers),
                 thread_name_prefix="bolt_orm",
@@ -119,14 +124,46 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
         return _orm_executor
 
 
-def get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
-    """The bounded ORM pool, for callers that must block on it synchronously.
+def _submit_blocking(
+    executor: concurrent.futures.ThreadPoolExecutor, fn: Callable[..., object], *args: object
+) -> object:
+    """Submit ``fn`` to ``executor`` with the caller's context and block on it."""
+    ctx = contextvars.copy_context()
+    return executor.submit(ctx.run, fn, *args).result()
 
-    Async callers should use :func:`run_in_orm_executor` instead. This exists
-    for the synchronous user-loading path, where ``request.user`` is a
-    ``SimpleLazyObject`` forced from code that cannot await.
+
+def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
+    """Blocking counterpart of :func:`run_in_orm_executor` for callers that cannot await.
+
+    Exists for the synchronous user-loading path: ``request.user`` is a
+    ``SimpleLazyObject`` forced from code that cannot await. Same contract as
+    the async variant — the query runs on the bounded ORM pool with the
+    caller's contextvars visible, so a request-scoped database router applies
+    to user loading exactly as it does to QuerySet evaluation.
+
+    A caller already on an ORM pool worker (a lazy ``request.user`` forced
+    while a QuerySet evaluates) runs inline: blocking on the pool would wait
+    on a slot this thread is holding. The inline call still runs in a copied
+    context so ContextVar writes stay scoped the same way as on the
+    executor path.
     """
-    return _get_orm_executor()
+    if in_orm_executor_thread():
+        return contextvars.copy_context().run(fn, *args)
+    return _submit_blocking(_get_orm_executor(), fn, *args)
+
+
+def _run_default_blocking[T](fn: Callable[..., T], *args: object) -> T:
+    """Blocking hand-off to the generic default pool (internal).
+
+    Hosts the ``asyncio.run`` shim for a custom async ``get_user``: the
+    coroutine may await non-database work, which must not pin a bounded ORM
+    slot for its full duration. A caller already on an ORM worker runs the
+    shim inline instead — blocking on another pool while holding an ORM slot
+    would let the coroutine's own ORM submission deadlock against that slot.
+    """
+    if in_orm_executor_thread():
+        return contextvars.copy_context().run(fn, *args)
+    return _submit_blocking(_get_default_executor(), fn, *args)
 
 
 async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
@@ -137,16 +174,22 @@ async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
     visible while the QuerySet evaluates, exactly as it was under
     ``sync_to_async``.
 
-    A caller already running on a pool thread executes inline. This reaches
-    here through a loop nested inside a pool worker (a custom async
-    ``get_user`` driven by ``asyncio.run`` during user loading): submitting
-    back into the pool would wait on the slot that worker is holding, which
-    on a one-thread pool never resolves.
+    A caller already on a pool thread — reached through a loop nested inside
+    a pool worker, i.e. a custom async ``get_user`` driven by ``asyncio.run``
+    while a lazy ``request.user`` is forced from ORM work — cannot use the
+    pool: submitting waits on the slot that worker is holding (never resolves
+    on a one-thread pool), and running inline is impossible because the
+    worker now has a running event loop, so sync ORM raises Django's
+    ``SynchronousOnlyOperation``. That reentrant case crosses to the generic
+    default pool instead: one transient connection outside the ORM budget on
+    a rare path, in exchange for neither deadlocking nor tripping the
+    async-unsafe check.
     """
-    if in_orm_executor_thread():
-        return fn(*args)
     ctx = contextvars.copy_context()
-    return await asyncio.get_running_loop().run_in_executor(_get_orm_executor(), ctx.run, fn, *args)
+    loop = asyncio.get_running_loop()
+    if in_orm_executor_thread():
+        return await loop.run_in_executor(_get_default_executor(), ctx.run, fn, *args)
+    return await loop.run_in_executor(_get_orm_executor(), ctx.run, fn, *args)
 
 
 async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:

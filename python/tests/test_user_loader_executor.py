@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
+import logging
 import threading
 import time
 
@@ -27,6 +29,7 @@ from django.contrib.auth import get_user_model
 from django_bolt import concurrency
 from django_bolt.auth import JWTAuthentication, user_loader
 from django_bolt.auth.user_loader import default_django_user_loader, resolve_user_loader
+from django_bolt.auth.pk_loader import load_user_by_pk_sync
 
 # Loads are asserted from other threads, which cannot see rows held open in an
 # uncommitted test transaction — these tests need real committed data.
@@ -35,6 +38,7 @@ pytestmark = pytest.mark.django_db(transaction=True)
 User = get_user_model()
 
 ORM_THREAD_PREFIX = "bolt_orm"
+DEFAULT_THREAD_PREFIX = "bolt_default"
 
 
 @pytest.fixture
@@ -43,25 +47,33 @@ def fresh_orm_executor(monkeypatch):
 
     The executor is a module-level singleton built on first use; tests that
     assert on its size must build it themselves rather than inherit whatever
-    an earlier test created.
+    an earlier test created. Every pool built here is drained with
+    ``shutdown(wait=True)`` before the fixture returns: workers hold database
+    connections, and the transactional teardown truncates tables right after.
     """
+    built: list[concurrent.futures.ThreadPoolExecutor] = []
 
-    def _build(workers: int | None = None) -> concurrent.futures.ThreadPoolExecutor:
+    def _build(workers: int | str | None = None) -> concurrent.futures.ThreadPoolExecutor:
         if workers is None:
             monkeypatch.delenv("DJANGO_BOLT_ORM_THREADS", raising=False)
         else:
             monkeypatch.setenv("DJANGO_BOLT_ORM_THREADS", str(workers))
         concurrency._orm_executor = None
-        return concurrency._get_orm_executor()
+        executor = concurrency._get_orm_executor()
+        built.append(executor)
+        return executor
 
     previous = concurrency._orm_executor
     concurrency._orm_executor = None
     try:
         yield _build
     finally:
-        created = concurrency._orm_executor
-        if created is not None and created is not previous:
-            created.shutdown(wait=False)
+        current = concurrency._orm_executor
+        if current is not None and current not in built:
+            built.append(current)
+        for executor in built:
+            if executor is not previous:
+                executor.shutdown(wait=True)
         concurrency._orm_executor = previous
 
 
@@ -86,11 +98,34 @@ class RecordingJWTAuth(JWTAuthentication):
         try:
             # Held open only by the concurrency test, which needs both loads
             # to be in flight at once before either returns.
-            self.release.wait(timeout=5)
+            assert self.release.wait(timeout=5), "release was never set; the test parked this user load"
             return super().get_user_sync(user_id)
         finally:
             with self._lock:
                 self.in_flight -= 1
+
+
+class AsyncGetUserAuth(JWTAuthentication):
+    """Backend with a custom async get_user, recording where each part runs.
+
+    ``shim_threads`` records the thread hosting the coroutine (the
+    ``asyncio.run`` shim); ``orm_threads`` records where the database query
+    itself lands.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shim_threads: list[str] = []
+        self.orm_threads: list[str] = []
+
+    async def get_user(self, user_id, auth_context):
+        self.shim_threads.append(threading.current_thread().name)
+
+        def query():
+            self.orm_threads.append(threading.current_thread().name)
+            return load_user_by_pk_sync(User, user_id)
+
+        return await concurrency.run_in_orm_executor(query)
 
 
 def _make_user(username: str = "orm-pool"):
@@ -211,29 +246,43 @@ def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
     )
 
 
-def test_run_in_orm_executor_from_orm_thread_runs_inline(fresh_orm_executor):
-    """The reentrancy guard belongs to the pool, not only to the user loader.
+def test_run_in_orm_executor_reentry_leaves_the_callers_pool(fresh_orm_executor):
+    """Reentrant ORM work leaves the caller's pool — and the caller's thread.
 
     A custom async `get_user` is driven by `asyncio.run` on a pool worker, so
-    any ORM work it awaits re-enters `run_in_orm_executor` from inside the
-    pool. Guarding only the loader leaves that one level down unprotected.
+    ORM work it awaits re-enters `run_in_orm_executor` from inside the pool.
+    Submitting back into the pool waits on the slot that worker holds (a
+    deadlock on a one-thread pool), and running inline is impossible: the
+    worker now has a running event loop, so a real query raises Django's
+    SynchronousOnlyOperation. The work must cross to the default pool.
+
+    Bounded by result(timeout=...) so a deadlock regression fails instead of
+    wedging the run; the query is real so an async-unsafe regression fails
+    loudly too.
     """
     fresh_orm_executor(workers=1)
+    user = _make_user("nested")
 
     def nested_orm_work():
-        return threading.current_thread().name
+        return threading.current_thread().name, load_user_by_pk_sync(User, str(user.pk))
 
     def drive_nested_loop():
         assert concurrency.in_orm_executor_thread()
         outer = threading.current_thread().name
         # Mirrors load_via_async: a nested event loop on a pool worker.
-        inner = asyncio.run(concurrency.run_in_orm_executor(nested_orm_work))
-        return outer, inner
+        inner, loaded = asyncio.run(concurrency.run_in_orm_executor(nested_orm_work))
+        return outer, inner, loaded
 
-    outer, inner = concurrency._get_orm_executor().submit(drive_nested_loop).result(timeout=5)
-    assert inner == outer, (
-        f"nested ORM work hopped from {outer!r} to {inner!r}; submitting into the "
-        "pool from one of its own workers deadlocks a one-thread pool"
+    outer, inner, loaded = concurrency._get_orm_executor().submit(drive_nested_loop).result(timeout=10)
+    assert loaded is not None
+    assert loaded.pk == user.pk
+    assert inner != outer, (
+        "nested ORM work ran on the pool worker that holds the slot; a real query "
+        "there runs under the nested event loop and raises SynchronousOnlyOperation"
+    )
+    assert inner.startswith(DEFAULT_THREAD_PREFIX), (
+        f"nested ORM work ran on {inner!r}; expected the default pool — submitting "
+        "into the ORM pool from one of its own workers deadlocks a one-thread pool"
     )
 
 
@@ -277,3 +326,110 @@ def test_orm_executor_is_built_once_under_concurrent_first_use(fresh_orm_executo
 
     assert len({id(p) for p in pools}) == 1, "racing callers received different ORM pools"
     assert len(built) == 1, f"{len(built)} ORM pools were constructed; the loser's threads leak"
+
+
+def test_custom_async_get_user_shim_runs_off_the_orm_pool(fresh_orm_executor):
+    """The asyncio.run shim for a custom async get_user must not hold an ORM slot.
+
+    The coroutine may await non-database work (an external identity provider);
+    parking its whole lifetime on a bounded ORM slot queues every QuerySet
+    evaluation behind it — on the SQLite one-thread default, all of them. The
+    shim belongs on the generic default pool; only the database portions the
+    coroutine hands to `run_in_orm_executor` may occupy ORM slots.
+    """
+    fresh_orm_executor(workers=1)
+    user = _make_user("async-shim")
+
+    backend = AsyncGetUserAuth(secret="user-loader-orm-pool-test-secret", algorithms=["HS256"])
+    loader = resolve_user_loader(backend)
+    assert loader is not None
+
+    loaded = loader(str(user.pk), None, True)
+    assert loaded is not None
+    assert loaded.pk == user.pk
+
+    assert backend.shim_threads, "get_user never ran"
+    assert backend.shim_threads[0].startswith(DEFAULT_THREAD_PREFIX), (
+        f"the asyncio.run shim ran on {backend.shim_threads[0]!r}; expected the default pool. "
+        "Hosting the coroutine on an ORM slot blocks QuerySet evaluation for its full "
+        "duration, including non-database awaits."
+    )
+    assert backend.orm_threads[0].startswith(ORM_THREAD_PREFIX), (
+        f"the database query ran on {backend.orm_threads[0]!r}; expected the bounded ORM pool."
+    )
+
+
+def test_custom_async_get_user_forced_from_orm_worker_keeps_the_shim_inline(fresh_orm_executor):
+    """Reentry guard for the shim: a load forced from an ORM worker hosts it inline.
+
+    If the shim crossed to the default pool here, this worker would block on
+    the default pool while the coroutine's own ORM hand-off waits for the
+    slot this worker is holding — a cycle that never resolves on a one-thread
+    pool. Bounded by result(timeout=...) so a regression fails instead of
+    wedging the run.
+    """
+    fresh_orm_executor(workers=1)
+    user = _make_user("async-reentrant")
+
+    backend = AsyncGetUserAuth(secret="user-loader-orm-pool-test-secret", algorithms=["HS256"])
+    loader = resolve_user_loader(backend)
+
+    def force_inside_pool():
+        assert concurrency.in_orm_executor_thread()
+        return threading.current_thread().name, loader(str(user.pk), None, True)
+
+    outer, loaded = concurrency._get_orm_executor().submit(force_inside_pool).result(timeout=10)
+
+    assert loaded is not None
+    assert loaded.pk == user.pk
+    assert backend.shim_threads == [outer], (
+        f"shim ran on {backend.shim_threads!r} instead of inline on {outer!r}; "
+        "crossing pools while holding the only ORM slot deadlocks"
+    )
+    # The coroutine's own ORM hand-off cannot use the pool (this worker holds
+    # the only slot) nor this thread (its loop is running) — it crosses to the
+    # default pool.
+    assert backend.orm_threads and backend.orm_threads[0].startswith(DEFAULT_THREAD_PREFIX), (
+        f"nested query ran on {backend.orm_threads!r}; expected the default pool"
+    )
+
+
+def test_inline_reentry_runs_in_a_context_copy(fresh_orm_executor):
+    """The inline branch must scope ContextVar writes like the executor branch.
+
+    The executor path runs the callable inside a copied context, so mutations
+    stay invisible to the caller. The inline reentrant path must behave the
+    same — otherwise the same handler observes different contextvar semantics
+    depending on which thread forced the load.
+    """
+    fresh_orm_executor(workers=1)
+    probe = contextvars.ContextVar("bolt_inline_probe", default="outer")
+
+    def mutate():
+        probe.set("mutated")
+        return probe.get()
+
+    def driver():
+        assert concurrency.in_orm_executor_thread()
+        assert concurrency.run_orm_blocking(mutate) == "mutated"
+        return probe.get()
+
+    seen_after = concurrency._get_orm_executor().submit(driver).result(timeout=5)
+    assert seen_after == "outer", (
+        f"caller observed {seen_after!r}; the inline reentrant path leaked a "
+        "ContextVar mutation that the executor path would have scoped"
+    )
+
+
+def test_invalid_orm_threads_value_is_reported(fresh_orm_executor, caplog):
+    """A bad DJANGO_BOLT_ORM_THREADS value is a deployment error — say so.
+
+    Falling back silently hides a misconfigured budget behind default
+    behavior; the fallback must be reported.
+    """
+    with caplog.at_level(logging.WARNING, logger="django_bolt.concurrency"):
+        fresh_orm_executor(workers="not-a-number")
+
+    assert any("DJANGO_BOLT_ORM_THREADS" in record.getMessage() for record in caplog.records), (
+        "invalid DJANGO_BOLT_ORM_THREADS fell back to the default without a warning"
+    )

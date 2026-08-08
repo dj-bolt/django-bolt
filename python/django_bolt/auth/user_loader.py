@@ -17,14 +17,13 @@ different get_user overrides.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import inspect
 from collections.abc import Callable
 from typing import Any
 
 from django.contrib.auth import get_user_model
 
-from ..concurrency import get_orm_executor, in_orm_executor_thread, run_in_orm_executor
+from ..concurrency import _run_default_blocking, run_in_orm_executor, run_orm_blocking
 from .backends import BaseAuthentication, JWTAuthentication
 from .pk_loader import load_user_by_pk_sync
 
@@ -49,25 +48,6 @@ _auth_backend_registry: dict[str, Any] = {}
 # (backend_name) -> resolved loader (user_id, auth_context, is_async_context) -> user,
 # or None when the backend has no user resolution. Built at registration time.
 _resolved_loader_registry: dict[str, Callable[[str, dict | None, bool], Any] | None] = {}
-
-
-def _run_orm_blocking(fn: Callable[..., Any], *args: Any) -> Any:
-    """Run a blocking user query on the framework's bounded ORM pool.
-
-    Loading ``request.user`` is a database query, so it shares the ORM pool's
-    connection budget and vendor-aware sizing (``DJANGO_BOLT_ORM_THREADS``,
-    one thread on SQLite) rather than opening connections from a pool of its
-    own. Contextvars are carried across, so a request-scoped database router
-    stays visible exactly as it is for QuerySet evaluation.
-
-    When the caller is already an ORM pool worker — a lazy ``request.user``
-    forced while a QuerySet evaluates — the query runs inline. Submitting
-    back into the pool would block on a slot this thread already holds.
-    """
-    if in_orm_executor_thread():
-        return fn(*args)
-    ctx = contextvars.copy_context()
-    return get_orm_executor().submit(ctx.run, fn, *args).result()
 
 
 def _has_custom_get_user_sync(cls: type) -> bool:
@@ -99,7 +79,7 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
 
         def load_via_sync(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
             if is_async_context:
-                return _run_orm_blocking(backend.get_user_sync, user_id)
+                return run_orm_blocking(backend.get_user_sync, user_id)
             return backend.get_user_sync(user_id)
 
         return load_via_sync
@@ -111,18 +91,24 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
 
             def load_via_plain(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
                 if is_async_context:
-                    return _run_orm_blocking(get_user, user_id, auth_context or {})
+                    return run_orm_blocking(get_user, user_id, auth_context or {})
                 return get_user(user_id, auth_context or {})
 
             return load_via_plain
 
         def load_via_async(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
-            # asyncio.run needs a thread without a running loop — always cross
-            # into the pool, regardless of handler context.
+            # asyncio.run needs a thread without a running loop — always cross,
+            # regardless of handler context. The shim goes to the generic
+            # default pool, not the ORM pool: the coroutine may await
+            # non-database work (an external identity provider), and parking
+            # its whole lifetime on a bounded ORM slot would queue every
+            # QuerySet evaluation behind it. The database work the coroutine
+            # awaits still reaches the bounded pool through its own hand-off
+            # (run_in_orm_executor, or the async ORM's executor).
             def run_async_get_user():
                 return asyncio.run(get_user(user_id, auth_context or {}))
 
-            return _run_orm_blocking(run_async_get_user)
+            return _run_default_blocking(run_async_get_user)
 
         return load_via_async
 
@@ -139,7 +125,7 @@ def default_django_user_loader(user_id: str, auth_context: dict | None, is_async
     User = get_user_model()
 
     if is_async_context:
-        return _run_orm_blocking(load_user_by_pk_sync, User, user_id)
+        return run_orm_blocking(load_user_by_pk_sync, User, user_id)
     return load_user_by_pk_sync(User, user_id)
 
 
