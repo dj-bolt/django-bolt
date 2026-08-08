@@ -28,20 +28,35 @@ __all__ = ("in_orm_executor_thread", "run_in_orm_executor", "run_orm_blocking", 
 # from the database-aware ORM pool below.
 _default_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
+# Guards lazy construction, like the ORM pool's lock below. First use was once
+# confined to event loop threads; the user-load shim and the reentrant ORM
+# hand-off now reach this from arbitrary threads, where two racing callers
+# would each build a pool and the loser's threads would leak.
+_default_executor_lock = threading.Lock()
+
 
 def _get_default_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _default_executor
-    if _default_executor is None:
-        raw = os.environ.get("DJANGO_BOLT_EXECUTOR_THREADS")
-        platform_default = min(32, (os.cpu_count() or 1) + 4)
-        try:
-            workers = int(raw) if raw else platform_default
-        except ValueError:
-            workers = platform_default
-        _default_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, workers), thread_name_prefix="bolt_default"
-        )
-    return _default_executor
+    executor = _default_executor
+    if executor is not None:
+        return executor
+    with _default_executor_lock:
+        if _default_executor is None:
+            raw = os.environ.get("DJANGO_BOLT_EXECUTOR_THREADS")
+            platform_default = min(32, (os.cpu_count() or 1) + 4)
+            try:
+                workers = int(raw) if raw else platform_default
+            except ValueError:
+                workers = platform_default
+                logger.warning(
+                    "Ignoring invalid DJANGO_BOLT_EXECUTOR_THREADS=%r; using the default of %d",
+                    raw,
+                    workers,
+                )
+            _default_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, workers), thread_name_prefix="bolt_default"
+            )
+        return _default_executor
 
 
 # Bounded executor for framework-initiated QuerySet evaluation (async handlers

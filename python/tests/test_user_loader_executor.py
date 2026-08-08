@@ -328,6 +328,56 @@ def test_orm_executor_is_built_once_under_concurrent_first_use(fresh_orm_executo
     assert len(built) == 1, f"{len(built)} ORM pools were constructed; the loser's threads leak"
 
 
+def test_default_executor_is_built_once_under_concurrent_first_use(monkeypatch):
+    """Racing first callers of the default pool must share one pool.
+
+    The default executor's lazy construction was reachable only from event
+    loop threads; the user-load shim and reentrant ORM hand-off now reach it
+    from arbitrary threads, so it needs the same lock as the ORM pool — two
+    callers that both see `None` would each build a pool and the loser's
+    threads leak.
+    """
+    previous = concurrency._default_executor
+    concurrency._default_executor = None
+
+    built: list[concurrent.futures.ThreadPoolExecutor] = []
+    built_lock = threading.Lock()
+    real_ctor = concurrent.futures.ThreadPoolExecutor
+
+    def counting_ctor(*args, **kwargs):
+        # Widen the check-then-create window deterministically, as in the ORM
+        # pool race test: the outcome must depend on the lock, not on
+        # scheduling luck.
+        time.sleep(0.05)
+        executor = real_ctor(*args, **kwargs)
+        with built_lock:
+            built.append(executor)
+        return executor
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", counting_ctor)
+
+    racers = 16
+    start = threading.Barrier(racers)
+
+    def first_use():
+        start.wait(timeout=5)
+        return concurrency._get_default_executor()
+
+    try:
+        with real_ctor(max_workers=racers) as callers:
+            pools = [f.result(timeout=10) for f in [callers.submit(first_use) for _ in range(racers)]]
+    finally:
+        for executor in built:
+            if executor is not concurrency._default_executor:
+                executor.shutdown(wait=True)
+        if concurrency._default_executor is not previous and concurrency._default_executor is not None:
+            concurrency._default_executor.shutdown(wait=True)
+        concurrency._default_executor = previous
+
+    assert len({id(p) for p in pools}) == 1, "racing callers received different default pools"
+    assert len(built) == 1, f"{len(built)} default pools were constructed; the loser's threads leak"
+
+
 def test_custom_async_get_user_shim_runs_off_the_orm_pool(fresh_orm_executor):
     """The asyncio.run shim for a custom async get_user must not hold an ORM slot.
 
