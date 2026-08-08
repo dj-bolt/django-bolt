@@ -98,6 +98,7 @@ pub struct AppState {
     pub router: Option<Arc<Router>>, // Router (used by test infrastructure, optional in production)
     pub route_metadata: Option<Arc<RouteMetadataStore>>, // Route metadata (used by test infrastructure)
     pub asgi_mounts: Option<Arc<Vec<AsgiMount>>>, // ASGI mounts (tests). Production uses GLOBAL_ASGI_MOUNTS.
+    pub mcp_mounts: Option<Arc<Vec<crate::mcp::McpMount>>>, // MCP mounts (tests). Production uses mcp::GLOBAL_MCP_MOUNTS.
     pub static_files_config: Option<Arc<ScopeConfig>>,
     pub media_files_config: Option<Arc<ScopeConfig>>,
     pub access_logger: Option<Py<PyAny>>, // Python logger instance for access logging (django.server). None when disabled.

@@ -117,8 +117,9 @@ def test_oauth_authorization_code_flow_end_to_end(make_server_project):
         assert md["issuer"] == ISSUER
         assert md["registration_endpoint"].endswith("/oauth/register")
         assert md["code_challenge_methods_supported"] == ["S256"]
-        prm = c.get(server.url("/.well-known/oauth-protected-resource")).json()
+        prm = c.get(server.url("/.well-known/oauth-protected-resource/mcp")).json()
         assert prm["authorization_servers"] == [ISSUER]
+        assert prm["resource"] == f"{ISSUER}/mcp"
 
         # 2. Unauthenticated /mcp is challenged with WWW-Authenticate (this is what makes
         #    an OAuth client start the flow).

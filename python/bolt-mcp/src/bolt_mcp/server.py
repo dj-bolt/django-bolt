@@ -1,36 +1,26 @@
-"""The ``MCP`` server object: component registration + JSON-RPC dispatch."""
+"""The ``MCP`` server object: component registration.
+
+Pure registry — decorators collect tools/resources/prompts and pre-compute
+their schemas. The protocol itself (JSON-RPC dispatch, sessions, catalog
+serving, guard evaluation) lives in django-bolt's Rust core (rmcp): at mount
+time the registry is compiled into a catalog + dispatch surface (see
+``_catalog.py`` / ``_dispatch.py``) and handed to Rust.
+"""
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import inspect
 import re
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import Callable
 from typing import Any, get_type_hints
-from urllib.parse import unquote
-
-import msgspec
-
-from django_bolt.auth.guards import QUANT_ALL, QUANT_NONE
 
 from . import schema
-from ._execute import error_result, execute_tool
 from .context import Context
 from .registry import PromptDef, ResourceDef, ResourceTemplateDef, ToolDef
-from .sessions import SessionManager, StatelessSessions
-from .types import (
-    INVALID_PARAMS,
-    METHOD_NOT_FOUND,
-    PROTOCOL_VERSION,
-    SUPPORTED_PROTOCOL_VERSIONS,
-    Incoming,
-)
-
-# Sentinel queued after a streaming tool finishes; carries its final ("result", ...) item.
-_STREAM_DONE = "__stream_done__"
 
 _TEMPLATE_VAR = re.compile(r"\{(\w+)\}")
+
+_CACHE_SCOPES = frozenset({"public", "private"})
 
 
 def _compile_uri_template(uri_template: str) -> tuple[re.Pattern[str], list[str]]:
@@ -52,22 +42,13 @@ def _compile_uri_template(uri_template: str) -> tuple[re.Pattern[str], list[str]
     return re.compile(f"^{''.join(parts)}$"), names
 
 
-class McpError(Exception):
-    """A JSON-RPC-level error (becomes a JSON-RPC error response, not in-band)."""
-
-    def __init__(self, code: int, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-
-
 def principal(request: Any) -> dict:
     """Return the authenticated principal dict for ``request``, regardless of auth tier.
 
-    Tier-1 (Rust) auth populates ``request.context``; the Python OAuth path populates
-    ``request.state["context"]`` (``request.context`` is read-only from Python). Tools and
-    guards should use this helper instead of reading ``request.context`` directly so they
-    work under both. Returns ``{}`` when unauthenticated.
+    All auth tiers (Rust JWT/API-key and OAuth) resolve the principal in Rust
+    before a tool runs, and it arrives as ``request.context``. The
+    ``request.state["context"]`` fallback is kept for compatibility with code
+    written against bolt-mcp < 0.2. Returns ``{}`` when unauthenticated.
     """
     ctx = getattr(request, "context", None)
     if isinstance(ctx, dict):
@@ -80,70 +61,6 @@ def principal(request: Any) -> dict:
     return {}
 
 
-def _scalar_matches(value: Any, expected: Any) -> bool:
-    # bool is an int subclass in Python — keep bool/int distinct so a token
-    # claim of `1` never satisfies `Requires("flag", True)` (and vice versa),
-    # matching the type-strict Rust comparison.
-    if isinstance(value, bool) or isinstance(expected, bool):
-        return isinstance(value, bool) and isinstance(expected, bool) and value == expected
-    return value == expected
-
-
-def _claim_matches(value: Any, expected: Any) -> bool:
-    """A scalar claim matches by equality; a list claim by membership."""
-    if value is None:
-        return False
-    if isinstance(value, (list, tuple)):
-        return any(_scalar_matches(item, expected) for item in value)
-    return _scalar_matches(value, expected)
-
-
-def _combine(quantifier: int, matches: Iterable[bool]) -> bool:
-    """Apply a guard's quantifier over its per-value match results."""
-    if quantifier == QUANT_ALL:
-        return all(matches)
-    if quantifier == QUANT_NONE:
-        return not any(matches)
-    return any(matches)
-
-
-def _guard_allows(meta: dict, ctx: dict) -> bool:
-    """Evaluate one compiled guard (``guard.to_metadata()``) against the principal dict.
-
-    HTTP-route guards are evaluated natively in Rust (src/permissions.rs); MCP
-    tools are dispatched in Python, so this mirrors those semantics against the
-    auth-context dict — including the rules that a bare presence check on a
-    boolean claim requires ``true`` and that ``permissions`` presence means
-    the unified permission set is non-empty.
-    """
-    kind = meta["type"]
-    if kind == "allow_any":
-        return True
-    if kind == "is_authenticated":
-        return bool(ctx)
-    # "requires": an unauthenticated request never satisfies a claim check --
-    # including a none_of one, which a caller carrying no claims would
-    # otherwise satisfy by matching nothing.
-    if not ctx:
-        return False
-    values = meta["values"]
-    quantifier = meta["quantifier"]
-    # A bare presence check. `none_of` cannot be empty (Requires rejects it),
-    # so this is never an exclusion in practice; inverting anyway keeps
-    # "none of nothing" coherent and matches requires_matches() in Rust.
-    inverted = quantifier == QUANT_NONE
-    if meta["claim"] == "permissions":
-        granted = set(ctx.get("permissions") or ())
-        if not values:
-            return not granted if inverted else bool(granted)
-        return _combine(quantifier, (v in granted for v in values))
-    resolved = (ctx.get("auth_claims") or {}).get(meta["claim"])
-    if not values:
-        present = resolved is not None and resolved is not False
-        return not present if inverted else present
-    return _combine(quantifier, (_claim_matches(resolved, v) for v in values))
-
-
 def _arguments_from_signature(fn: Callable) -> list[dict[str, Any]]:
     args: list[dict[str, Any]] = []
     for p in inspect.signature(fn).parameters.values():
@@ -151,11 +68,6 @@ def _arguments_from_signature(fn: Callable) -> list[dict[str, Any]]:
             continue
         args.append({"name": p.name, "required": p.default is inspect.Parameter.empty})
     return args
-
-
-async def _invoke(fn: Callable, is_async: bool, /, **kwargs: Any) -> Any:
-    """Call a registered resource/prompt handler, awaiting it when registered async."""
-    return await fn(**kwargs) if is_async else fn(**kwargs)
 
 
 def _find_context_param(fn: Callable) -> str | None:
@@ -176,18 +88,44 @@ class MCP:
         name: str = "django-bolt",
         version: str = "0.1.0",
         *,
+        title: str | None = None,
+        instructions: str | None = None,
+        website_url: str | None = None,
+        icons: list[dict[str, Any]] | None = None,
         stateless: bool = False,
         json_response: bool = False,
+        list_ttl_ms: int = 0,
+        list_cache_scope: str = "private",
     ) -> None:
+        """Declare an MCP server.
+
+        ``stateless``/``json_response`` shape how *legacy* (pre-2026-07-28)
+        clients are served: ``stateless=True`` disables sessions (multi-worker
+        safe, no server->client requests), ``json_response=True`` answers
+        legacy POSTs with plain JSON instead of SSE. 2026-07-28 clients are
+        always served statelessly regardless.
+
+        ``list_ttl_ms``/``list_cache_scope`` are the SEP-2549 caching hints
+        stamped on every list result (``0``/``"private"`` = no caching).
+        """
+        if list_cache_scope not in _CACHE_SCOPES:
+            raise ValueError(f"list_cache_scope must be 'public' or 'private', got {list_cache_scope!r}")
+        if not isinstance(list_ttl_ms, int) or isinstance(list_ttl_ms, bool) or list_ttl_ms < 0:
+            raise ValueError(f"list_ttl_ms must be a non-negative integer, got {list_ttl_ms!r}")
         self.name = name
         self.version = version
+        self.title = title
+        self.instructions = instructions
+        self.website_url = website_url
+        self.icons = icons
         self.stateless = stateless
         self.json_response = json_response
+        self.list_ttl_ms = list_ttl_ms
+        self.list_cache_scope = list_cache_scope
         self._tools: dict[str, ToolDef] = {}
         self._resources: dict[str, ResourceDef] = {}
         self._resource_templates: dict[str, ResourceTemplateDef] = {}
         self._prompts: dict[str, PromptDef] = {}
-        self.sessions: SessionManager | StatelessSessions = StatelessSessions() if stateless else SessionManager()
 
     # ── Registration decorators ──────────────────────────────────────────────
     def tool(
@@ -197,9 +135,22 @@ class MCP:
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
-        output_schema: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | str | None = None,
+        annotations: dict[str, Any] | None = None,
+        icons: list[dict[str, Any]] | None = None,
         guards: list[Any] | None = None,
     ):
+        """Register a tool.
+
+        ``output_schema`` is a JSON Schema dict, or the string ``"auto"`` to
+        derive it from the return annotation (msgspec-representable types
+        only). ``annotations`` is an MCP ToolAnnotations dict (``readOnlyHint``
+        etc.). ``guards`` are evaluated natively in Rust, both for
+        ``tools/call`` denial and per-principal ``tools/list`` filtering.
+        """
+        if isinstance(output_schema, str) and output_schema != "auto":
+            raise ValueError(f"output_schema must be a JSON Schema dict, 'auto', or None, got {output_schema!r}")
+
         def register(fn: Callable) -> Callable:
             tool_name = name or getattr(fn, "__name__", "tool")
             if inspect.isasyncgenfunction(fn):
@@ -212,12 +163,15 @@ class MCP:
             ctx_param = _find_context_param(fn)
             exclude = schema.INJECTED_PARAMS | ({ctx_param} if ctx_param else set())
             args_struct = schema.struct_from_signature(fn, exclude=exclude)
+            resolved_output = schema.output_schema_from_return(fn) if output_schema == "auto" else output_schema
             self._tools[tool_name] = ToolDef(
                 name=tool_name,
                 fn=fn,
                 title=title,
                 description=description or inspect.getdoc(fn),
-                output_schema=output_schema,
+                output_schema=resolved_output,
+                annotations=annotations,
+                icons=icons,
                 guards=list(guards or []),
                 args_struct=args_struct,
                 input_schema=schema.input_schema_for(args_struct),
@@ -308,247 +262,3 @@ class MCP:
         if isinstance(name_or_fn, str):
             name = name_or_fn
         return register
-
-    # ── Capabilities ─────────────────────────────────────────────────────────
-    def capabilities(self) -> dict[str, Any]:
-        cap: dict[str, Any] = {}
-        if self._tools:
-            cap["tools"] = {"listChanged": False}
-        if self._resources or self._resource_templates:
-            cap["resources"] = {"listChanged": False, "subscribe": False}
-        if self._prompts:
-            cap["prompts"] = {"listChanged": False}
-        return cap
-
-    # ── JSON-RPC dispatch (transport-agnostic) ───────────────────────────────
-    async def dispatch(
-        self, msg: Incoming, *, session: Any = None, request: Any = None
-    ) -> dict | AsyncIterator[tuple] | None:
-        """Handle one JSON-RPC request.
-
-        Returns a result ``dict`` for ordinary methods. A ``tools/call`` for a streaming
-        (Context-taking) tool instead returns an async iterator of tagged items — the
-        transport frames each as its own SSE event — so the streaming decision lives here,
-        not in the transport.
-        """
-        method = msg.method
-        params = msg.params or {}
-        if method == "initialize":
-            return self._on_initialize(params, session)
-        if method == "ping":
-            return {}
-        if method == "tools/list":
-            return self._list_tools(request)
-        if method == "tools/call":
-            if not self.json_response and self._is_streaming_tool(params.get("name")):
-                return self.stream_call(params, request, session=session, request_id=msg.id)
-            return await self._call_tool(params, request, session=session, request_id=msg.id)
-        if method == "resources/list":
-            return self._list_resources()
-        if method == "resources/read":
-            return await self._read_resource(params)
-        if method == "resources/templates/list":
-            return self._list_resource_templates()
-        if method == "prompts/list":
-            return self._list_prompts()
-        if method == "prompts/get":
-            return await self._get_prompt(params)
-        if method.startswith("notifications/"):
-            return None
-        raise McpError(METHOD_NOT_FOUND, f"Method not found: {method}")
-
-    def _on_initialize(self, params: dict, session: Any) -> dict:
-        requested = params.get("protocolVersion")
-        version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
-        if session is not None:
-            session.protocol_version = version
-            session.client_capabilities = params.get("capabilities") or {}
-        return {
-            "protocolVersion": version,
-            "capabilities": self.capabilities(),
-            "serverInfo": {"name": self.name, "version": self.version},
-        }
-
-    # ── Guards ────────────────────────────────────────────────────────────────
-    def _guards_pass(self, guards: list[Any], request: Any) -> bool:
-        if not guards:
-            return True
-        ctx = principal(request)
-        return all(_guard_allows(g.to_metadata(), ctx) for g in guards)
-
-    # ── Tools ─────────────────────────────────────────────────────────────────
-    def _tool_dict(self, tool: ToolDef) -> dict[str, Any]:
-        d: dict[str, Any] = {"name": tool.name, "inputSchema": tool.input_schema}
-        if tool.title:
-            d["title"] = tool.title
-        if tool.description:
-            d["description"] = tool.description
-        if tool.output_schema:
-            d["outputSchema"] = tool.output_schema
-        return d
-
-    def _list_tools(self, request: Any) -> dict:
-        tools = [self._tool_dict(t) for t in self._tools.values() if self._guards_pass(t.guards, request)]
-        return {"tools": tools}
-
-    def _is_streaming_tool(self, name: str | None) -> bool:
-        """A tool that streams over SSE — one taking a Context (its notifications drive the stream)."""
-        tool = self._tools.get(name)
-        return tool is not None and tool.ctx_param is not None
-
-    def _resolve_tool(self, params: dict, request: Any) -> tuple[ToolDef | None, Any]:
-        """Resolve + authorize a tool and build its kwargs.
-
-        Returns ``(tool, kwargs)`` on success, or ``(None, error_result_dict)`` for
-        unknown tool / failed guard / invalid arguments (all in-band errors).
-        """
-        name = params.get("name")
-        tool = self._tools.get(name)
-        if tool is None:
-            return None, error_result(f"Unknown tool: {name!r}")
-        if not self._guards_pass(tool.guards, request):
-            return None, error_result(f"Permission denied for tool {name!r}")
-        try:
-            args = msgspec.convert(params.get("arguments") or {}, tool.args_struct)
-        except msgspec.ValidationError as exc:
-            return None, error_result(f"Invalid arguments: {exc}")
-        kwargs = msgspec.structs.asdict(args)
-        if tool.injects_request:
-            kwargs["request"] = request
-        return tool, kwargs
-
-    def _make_context(self, params: dict, request: Any, session: Any, request_id: Any, outgoing: Any) -> Context:
-        return Context(
-            mcp=self,
-            request=request,
-            session=session,
-            request_id=request_id,
-            progress_token=(params.get("_meta") or {}).get("progressToken"),
-            outgoing=outgoing,
-        )
-
-    async def _call_tool(self, params: dict, request: Any, *, session: Any = None, request_id: Any = None) -> dict:
-        tool, prepared = self._resolve_tool(params, request)
-        if tool is None:
-            return prepared  # in-band error result
-        if tool.ctx_param:
-            # Non-streaming path (json_response): notifications are dropped (outgoing=None),
-            # sample/elicit raise — they require the streaming SSE path.
-            prepared[tool.ctx_param] = self._make_context(params, request, session, request_id, None)
-        return await execute_tool(tool, prepared)
-
-    async def stream_call(self, params: dict, request: Any, *, session: Any = None, request_id: Any = None):
-        """Drive a Context-taking tool, yielding tagged items as the tool produces them.
-
-        The tool's Context pushes ``("notification", method, params)`` and
-        ``("request", id, method, params)`` onto the queue as side effects; once the tool
-        returns, a single ``("result", call_tool_result)`` follows. The transport wraps each
-        item as an SSE ``message`` event.
-        """
-        tool, prepared = self._resolve_tool(params, request)
-        if tool is None:
-            yield ("result", prepared)
-            return
-
-        outgoing: asyncio.Queue = asyncio.Queue()
-        prepared[tool.ctx_param] = self._make_context(params, request, session, request_id, outgoing)
-
-        async def _run_and_signal() -> None:
-            result = await execute_tool(tool, prepared)
-            await outgoing.put((_STREAM_DONE, ("result", result)))
-
-        task = asyncio.create_task(_run_and_signal())
-        try:
-            while True:
-                item = await outgoing.get()
-                if item[0] == _STREAM_DONE:
-                    yield item[1]
-                    return
-                yield item
-        finally:
-            # On normal completion the task is already done; on client disconnect
-            # (GeneratorExit) it may be blocked awaiting a sample/elicit reply that
-            # will never come — cancel it so cleanup can't hang.
-            if not task.done():
-                task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-
-    # ── Resources ───────────────────────────────────────────────────────────--
-    def _list_resources(self) -> dict:
-        resources = []
-        for r in self._resources.values():
-            entry: dict[str, Any] = {"uri": r.uri, "name": r.name, "mimeType": r.mime_type}
-            if r.description:
-                entry["description"] = r.description
-            resources.append(entry)
-        return {"resources": resources}
-
-    def _list_resource_templates(self) -> dict:
-        templates = []
-        for t in self._resource_templates.values():
-            entry: dict[str, Any] = {"uriTemplate": t.uri_template, "name": t.name, "mimeType": t.mime_type}
-            if t.description:
-                entry["description"] = t.description
-            templates.append(entry)
-        return {"resourceTemplates": templates}
-
-    async def _resolve_resource(self, uri: str) -> tuple[str, str] | None:
-        """Resolve a URI to ``(text, mime_type)``, trying static resources then templates.
-
-        Returns ``None`` when nothing matches. May raise ``msgspec.ValidationError`` if a
-        template matches but its extracted ``{vars}`` don't coerce to the handler's types.
-        Shared by ``resources/read`` and ``Context.read_resource`` so both honor templates.
-        """
-        resource = self._resources.get(uri)
-        if resource is not None:
-            return await _invoke(resource.fn, resource.is_async), resource.mime_type
-        for tmpl in self._resource_templates.values():
-            match = tmpl.pattern.match(uri)
-            if match is None:
-                continue
-            raw = {k: unquote(v) for k, v in match.groupdict().items()}
-            kwargs = msgspec.structs.asdict(msgspec.convert(raw, tmpl.args_struct, strict=False))
-            return await _invoke(tmpl.fn, tmpl.is_async, **kwargs), tmpl.mime_type
-        return None
-
-    async def _read_resource(self, params: dict) -> dict:
-        uri = params.get("uri")
-        try:
-            resolved = await self._resolve_resource(uri)
-        except msgspec.ValidationError as exc:
-            raise McpError(INVALID_PARAMS, f"Invalid resource URI {uri!r}: {exc}") from exc
-        if resolved is None:
-            raise McpError(INVALID_PARAMS, f"Unknown resource: {uri!r}")
-        text, mime_type = resolved
-        return {"contents": [{"uri": uri, "mimeType": mime_type, "text": text}]}
-
-    # ── Prompts ──────────────────────────────────────────────────────────────
-    def _list_prompts(self) -> dict:
-        prompts = []
-        for p in self._prompts.values():
-            entry: dict[str, Any] = {"name": p.name, "arguments": p.arguments}
-            if p.description:
-                entry["description"] = p.description
-            prompts.append(entry)
-        return {"prompts": prompts}
-
-    async def _get_prompt(self, params: dict) -> dict:
-        name = params.get("name")
-        prompt = self._prompts.get(name)
-        if prompt is None:
-            raise McpError(INVALID_PARAMS, f"Unknown prompt: {name!r}")
-        try:
-            args = msgspec.convert(params.get("arguments") or {}, prompt.args_struct)
-        except msgspec.ValidationError as exc:
-            raise McpError(INVALID_PARAMS, f"Invalid arguments: {exc}") from exc
-        kwargs = msgspec.structs.asdict(args)
-        rendered = await _invoke(prompt.fn, prompt.is_async, **kwargs)
-        if isinstance(rendered, str):
-            messages = [{"role": "user", "content": {"type": "text", "text": rendered}}]
-        else:
-            messages = rendered
-        result: dict[str, Any] = {"messages": messages}
-        if prompt.description:
-            result["description"] = prompt.description
-        return result

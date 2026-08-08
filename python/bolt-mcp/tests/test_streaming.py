@@ -54,8 +54,13 @@ def test_context_tool_streams_progress_then_result():
         assert all(p["params"]["progressToken"] == "tok1" for p in progress)
         assert progress[0]["params"]["total"] == 3
 
-        assert len(logs) == 1
-        assert logs[0]["params"]["data"] == "almost done"
+        # Session-model routing (SEP-2260): only progress (matched by
+        # progressToken) rides the originating POST stream for legacy peers.
+        # notifications/message goes to the session's standalone GET stream —
+        # pre-0.2 bolt-mcp delivered them on the POST stream, which was a
+        # local quirk. Modern (2026-07-28) requests get logs per-request,
+        # gated by _meta logLevel (see test_modern_logging.py).
+        assert logs == []
 
         # Exactly one final result, carrying the request id and the returned value.
         assert len(results) == 1
@@ -81,16 +86,21 @@ def test_progress_omitted_without_progress_token():
         assert results[0]["result"]["structuredContent"] == {"done": 2}
 
 
-def test_context_tool_json_response_returns_final_result_only():
-    # json_response mode can't stream: the Context drops notifications (outgoing=None)
-    # and the tool's return value is sent as the single result.
+def test_context_tool_json_response_falls_back_to_sse():
+    # json_response mode prefers a single application/json object (see
+    # test_tools_call.py) but a tool that emits notifications before its
+    # result downgrades to SSE so the notifications are preserved — pre-0.2
+    # silently dropped them instead.
     api = _build(json_response=True)
     with TestClient(api) as client:
         _, sid = initialize(client)
         resp = _call_crunch(client, sid)
-        assert resp.headers["content-type"].startswith("application/json")
-        body = resp.json()
-        assert body["result"]["structuredContent"] == {"done": 3}
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        events = _parse_all_sse(resp.content)
+        results = [e for e in events if "result" in e]
+        assert results[0]["result"]["structuredContent"] == {"done": 3}
+        progress = [e for e in events if e.get("method") == "notifications/progress"]
+        assert len(progress) == 3
 
 
 def test_async_generator_tool_is_rejected_at_registration():

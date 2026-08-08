@@ -402,6 +402,8 @@ async def t_server_api():
     loop = asyncio.get_running_loop()
 
     async def hold_open(reader, writer):
+        writer.write(b"\0")
+        await writer.drain()
         try:
             await reader.read()
         finally:
@@ -410,17 +412,28 @@ async def t_server_api():
     server = await asyncio.start_server(hold_open, "127.0.0.1", 0)
     try:
         get_loop_ok = server.get_loop() is loop
+        close_clients_supported = True
         close_clients_eof = None
-        if sys.version_info >= (3, 13):
-            port = server.sockets[0].getsockname()[1]
-            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        port = server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            await asyncio.wait_for(reader.readexactly(1), 1)
             try:
-                server.close_clients()
+                close_clients = server.close_clients
+            except AttributeError:
+                # Older event loops may not implement Python 3.13's Server API.
+                close_clients_supported = False
+            else:
+                close_clients()
                 close_clients_eof = await asyncio.wait_for(reader.read(), 1) == b""
-            finally:
-                writer.close()
-                await writer.wait_closed()
-        return {"get_loop_is_running_loop": get_loop_ok, "close_clients_eof": close_clients_eof}
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        return {
+            "get_loop_is_running_loop": get_loop_ok,
+            "close_clients_supported": close_clients_supported,
+            "close_clients_eof": close_clients_eof,
+        }
     finally:
         server.close()
         await server.wait_closed()

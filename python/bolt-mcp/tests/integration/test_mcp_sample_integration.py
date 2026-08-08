@@ -47,7 +47,10 @@ def _round_trip(server, session_id, *, tool, arguments, expect_method, client_re
         for line in r.iter_lines():
             if not line.startswith("data:"):
                 continue
-            msg = json.loads(line[len("data:") :].strip())
+            payload = line[len("data:") :].strip()
+            if not payload:
+                continue  # SSE priming event (empty data + retry interval)
+            msg = json.loads(payload)
             if msg.get("method") == expect_method:
                 server_request_id = msg["id"]
                 # The client replies on a *separate* connection.

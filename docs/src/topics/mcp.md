@@ -1,6 +1,8 @@
 # MCP Server (bolt-mcp)
 
-[Model Context Protocol (MCP)](https://modelcontextprotocol.io) is the open standard for exposing tools, data, and prompts to LLM clients (Claude Desktop, Claude Code, MCP Inspector, …). **bolt-mcp** lets you build an MCP server on top of Django-Bolt and serve it natively over the MCP **Streamable HTTP** transport — driven by Django-Bolt's Rust pipeline, with no Starlette or `mcp`-SDK stack in the request path.
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io) is the open standard for exposing tools, data, and prompts to LLM clients (Claude Desktop, Claude Code, MCP Inspector, …). **bolt-mcp** lets you build an MCP server on top of Django-Bolt, served over the MCP **Streamable HTTP** transport by the official MCP Rust SDK ([rmcp](https://github.com/modelcontextprotocol/rust-sdk)) embedded in Django-Bolt's Rust core — no Starlette or Python-SDK stack in the request path.
+
+The server is **dual-era**: it speaks the current **2026-07-28** revision (stateless, per-request metadata, MRTR elicitation, `server/discover`, required routing headers) *and* the earlier session-based revisions (`initialize` handshake, `Mcp-Session-Id`) on the same endpoint. 2026-07-28 requests are always served statelessly, so they are multi-worker safe.
 
 `bolt-mcp` is a **separate, pure-Python package** (it depends on `django-bolt`), released on its own cadence. Install it only when you need MCP.
 
@@ -174,7 +176,9 @@ async def crunch(steps: int, ctx: Context) -> dict:
     return {"processed": steps}
 ```
 
-`ctx.report_progress(...)` and `ctx.debug/info/warning/error(...)` push live `notifications/progress` and `notifications/message` events onto the POST SSE stream as the tool runs, then the return value is sent as the final result. (Progress is only emitted when the client included a `progressToken`.)
+`ctx.report_progress(...)` pushes live `notifications/progress` events onto the POST SSE stream as the tool runs, then the return value is sent as the final result. (Progress is only emitted when the client included a `progressToken`.)
+
+`ctx.debug/info/warning/error(...)` emit `notifications/message` log lines. For **2026-07-28 clients**, they are sent on the request's own stream, but only when the request carried `io.modelcontextprotocol/logLevel` in `_meta` — and only at or above that severity (per spec). For **legacy session clients**, they are delivered on the session's standalone GET stream, following the classic session model. Logging is deprecated by the 2026-07-28 spec (SEP-2577) but stays fully functional.
 
 The `Context` can also **read this server's own resources** locally (no client round-trip):
 
@@ -197,18 +201,38 @@ async def summarize_with_llm(text: str, ctx: Context) -> dict:
 
 @mcp.tool
 async def deploy(target: str, ctx: Context) -> dict:
-    answer = await ctx.elicit(
-        f"Deploy to {target!r}?",
-        schema={"type": "object", "properties": {"confirm": {"type": "boolean"}}},
-    )
+    answer = await ctx.elicit(f"Deploy to {target!r}?")
     if answer.get("action") != "accept":
         return {"deployed": False, "reason": "cancelled by user"}
     return {"deployed": True, "target": target}
 ```
 
-!!! warning "sample/elicit require stateful streaming + a capable client"
+An elicitation reply has two independent parts. `action` (`accept` / `decline` / `cancel`) is always present, so the client always offers an accept/decline choice — for a plain confirmation like `deploy` above, pass **no** `schema` and the client renders just the message and those two buttons. `content` is the filled-in form, built from the `schema` you pass; add one only when you want data back, and then actually read it:
 
-    These are bidirectional: the server sends a request on the SSE stream and the client replies on a separate POST (correlated by id). They require the default **stateful streaming** mode (`MCP(stateless=False, json_response=False)`) run with a **single worker**, and a client that advertised the `sampling`/`elicitation` capability at `initialize` — otherwise they raise (surfaced as an in-band tool error). `report_progress` and logging work in stateless streaming mode too.
+```python
+answer = await ctx.elicit(
+    f"Deploy to {target!r}?",
+    schema={"type": "object", "properties": {"version": {"type": "string"}}},
+)
+if answer.get("action") != "accept":
+    return {"deployed": False, "reason": "cancelled by user"}
+return {"deployed": True, "target": target, "version": answer["content"]["version"]}
+```
+
+Asking for a boolean `confirm` field *and* relying on `action` duplicates the same question: the user can leave the box unset, press **Accept**, and the tool still proceeds.
+
+How `elicit` reaches the client depends on the client's protocol era:
+
+- **2026-07-28 clients** use **MRTR** (Multi Round-Trip Requests): the tool call ends with an `input_required` result carrying the elicitation request and a signed, opaque `requestState`; the client gathers the answer and retries the call with `inputResponses` attached. **The tool function re-runs from the top on each retry** — earlier `elicit` calls return instantly from the replayed answers. This works statelessly across any number of workers.
+- **Legacy session clients** get the live path: the server sends the request on the tool call's SSE stream and the tool suspends until the client replies on a separate POST. This requires the default stateful mode and a single worker.
+
+!!! warning "MRTR replay: write idempotent pre-elicit code"
+
+    On 2026-07-28 clients, code **before** an `elicit` call runs once per round trip. Keep side effects after the last `elicit`, make them idempotent, or guard them with `ctx.is_replay`. If the *sequence* of `elicit` calls is not deterministic for the same arguments, name each input point with `ctx.elicit(..., key="...")`. The `requestState` is HMAC-sealed (keyed from `SECRET_KEY`) and bound to the tool, its arguments, and the authenticated principal — a tampered or replayed state is rejected.
+
+!!! note "sampling is deprecated"
+
+    `ctx.sample` (asking the client's LLM to generate) is deprecated by the 2026-07-28 spec (SEP-2577). It still works for legacy session clients that advertised the `sampling` capability; on 2026-07-28 clients it raises, surfaced as an in-band tool error — integrate with an LLM provider API directly instead. A client that never advertised the capability also gets a clear in-band error.
 
 ## Exposing existing REST routes as tools
 
@@ -409,7 +433,7 @@ For trivial cases set attributes inline instead of subclassing: `AuthorizationSe
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/.well-known/oauth-authorization-server` | AS metadata (RFC 8414) |
-| `GET` | `/.well-known/oauth-protected-resource` | resource metadata (RFC 9728) |
+| `GET` | `/.well-known/oauth-protected-resource/mcp` | resource metadata (RFC 9728, path-aware for the `/mcp` resource) |
 | `POST` | `/oauth/register` | Dynamic Client Registration (RFC 7591) |
 | `GET` / `POST` | `/oauth/authorize` | login + consent (Authorization Code + PKCE) |
 | `POST` | `/oauth/token` | `authorization_code` and `refresh_token` grants |
@@ -449,16 +473,21 @@ If you don't want to be the authorization server, stay a pure Resource Server (T
 
 ## Deployment modes
 
-The `MCP(...)` constructor selects how the transport behaves:
+**2026-07-28 clients are always served statelessly** — every request is self-contained, MRTR elicitation works, and any worker can answer it. The `MCP(...)` constructor selects how **legacy** (session-era) clients are served:
 
-| Mode | Constructor | Sessions / GET channel | Live progress & logs | sample / elicit | Multi-worker |
+| Mode | Constructor | Legacy sessions / GET channel | Live progress | Live sample / elicit (legacy) | Multi-worker |
 | --- | --- | --- | --- | --- | --- |
-| **Stateful streaming** (default) | `MCP(...)` | ✅ | ✅ | ✅ | ❌ single worker |
-| **JSON response** | `MCP(json_response=True)` | ✅ | ❌ (final result only) | ❌ | ❌ single worker |
+| **Stateful streaming** (default) | `MCP(...)` | ✅ | ✅ | ✅ | ❌ single worker¹ |
+| **JSON response** | `MCP(json_response=True)` | ❌ (sessionless) | ✅ (SSE fallback) | ❌ | ✅ |
 | **Stateless** | `MCP(stateless=True)` | ❌ | ✅ (per-request SSE) | ❌ | ✅ |
 
-- **Stateful streaming** is the default and the most capable — required for `sample`/`elicit` and the GET listen channel. Run with `runbolt --processes 1` (or sticky sessions) so a session always lands on the process that owns it.
-- **Stateless** drops sessions entirely (each POST is self-contained), making it safe across multiple worker processes. Use it for plain request/response tools that don't need callbacks.
+¹ Only legacy sessions pin a process. Modern traffic on the same mount is multi-worker safe regardless.
+
+- **Stateful streaming** is the default and the most capable for legacy clients — required for live `sample`/`elicit` and the GET listen channel. Run with `runbolt --processes 1` (or sticky sessions) so a session always lands on the process that owns it.
+- **JSON response** answers legacy POSTs with a single `application/json` object when the response is just a result; a tool that emits notifications first automatically falls back to SSE so they are preserved.
+- **Stateless** drops legacy sessions entirely. Use it for plain request/response tools that don't need legacy callbacks.
+
+The transport defaults to localhost-only Host validation for DNS-rebinding protection (403 on mismatch). Deployed servers must pass their public authorities with `mount_mcp(..., allowed_hosts=[...])`; `allowed_origins=[...]` additionally validates browser origins. Pass an empty `allowed_hosts` list only when a trusted proxy already enforces Host validation.
 
 ## Testing
 
@@ -496,6 +525,6 @@ See the [Testing guide](testing.md) for more on `TestClient`.
 
 ## Supported MCP methods
 
-`initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, `prompts/get`, and the Streamable HTTP transport (`POST`/`GET`/`DELETE`) with sessions, all three auth tiers, route auto-exposure, and streaming tools (progress / logging / sampling / elicitation) via a tool `Context`. With the built-in Authorization Server (Tier 3) it additionally serves `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, and `/oauth/{register,authorize,token,revoke}`.
+The protocol is implemented by the official MCP Rust SDK (rmcp) embedded in Django-Bolt. Served methods: `server/discover`, `tools/list`, `tools/call` (with MRTR `input_required` results), `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, `prompts/get`, `subscriptions/listen` — plus, for legacy-era clients, `initialize`, `ping`, and the session `GET`/`DELETE` endpoints. List results carry the SEP-2549 `ttlMs`/`cacheScope` caching hints (configure with `MCP(list_ttl_ms=..., list_cache_scope=...)`), and the SEP-2243 routing headers (`Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`) are validated against the body. With the built-in Authorization Server (Tier 3) it additionally serves `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, and `/oauth/{register,authorize,token,revoke}`, with RFC 9207 `iss` on authorization responses. The advertised `resource` (and token audience) is the full MCP endpoint URL — issuer + mount path.
 
-The server advertises protocol version `2025-06-18` and negotiates with clients on several recent versions.
+The server advertises protocol version **2026-07-28** and negotiates every earlier revision back to `2024-11-05` with legacy clients.

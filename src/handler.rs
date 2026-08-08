@@ -865,6 +865,19 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 }
             }
 
+            // MCP mount check: only on router miss, so the non-MCP hot path
+            // pays nothing. Before the ASGI fallback so an overlapping prefix
+            // cannot shadow an MCP endpoint.
+            if let Some(mcp_mount) = crate::mcp::find_mcp_mount(state.get_ref(), path) {
+                return crate::mcp::bridge::handle_mcp_request(
+                    req,
+                    payload,
+                    mcp_mount,
+                    state.get_ref(),
+                )
+                .await;
+            }
+
             // HTTP ASGI mount fallback:
             // - only after Bolt route miss
             // - only after trailing-slash/API-method near-miss checks above

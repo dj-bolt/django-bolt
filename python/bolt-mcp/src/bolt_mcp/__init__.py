@@ -20,9 +20,9 @@ from __future__ import annotations
 
 from .autoexpose import expose_as_tool, expose_routes
 from .context import Context
+from .mount import ProtectedResource, mount_mcp
 from .oauth import AuthorizationServer
 from .server import MCP, principal
-from .transport import ProtectedResource, mount_mcp
 
 __all__ = [
     "MCP",

@@ -1,8 +1,8 @@
 """Live Streamable HTTP SSE behavior over a real runbolt server.
 
 Covers the parts the buffered in-process TestClient cannot: the POST→SSE
-response framing, the long-lived GET listen channel, single-stream-per-session
-(409), and DELETE terminating the session.
+response framing, the long-lived GET listen channel, and DELETE terminating
+the session.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def test_tool_call_streams_sse_response(make_server_project):
         assert any('"sum": 5' in line or '"sum":5' in line for line in data_lines)
 
 
-def test_get_listen_channel_single_stream_and_delete(make_server_project):
+def test_get_listen_channel_and_delete(make_server_project):
     project = make_server_project(api_source=mcp_app_source("sse"))
     with project.start() as server:
         session_id = _initialize(server)
@@ -48,11 +48,11 @@ def test_get_listen_channel_single_stream_and_delete(make_server_project):
         with server.client.stream("GET", server.url("/mcp"), headers=sse_headers) as listen:
             assert listen.status_code == 200
             assert listen.headers["content-type"].startswith("text/event-stream")
+            # Note: the spec lets a server either reject a second listen
+            # stream (409, pre-0.2 behavior) or accept it; the rmcp core
+            # accepts and replaces it, so no 409 assertion here.
 
-            # A second concurrent listen stream for the same session is rejected.
-            second = server.client.get(server.url("/mcp"), headers=sse_headers)
-            assert second.status_code == 409
-
-            # Terminating the session is accepted and unblocks the listener.
+            # Terminating the session is accepted and unblocks the listener
+            # (pre-0.2 answered 200; the rmcp core answers 202 Accepted).
             deleted = server.client.request("DELETE", server.url("/mcp"), headers={"Mcp-Session-Id": session_id})
-            assert deleted.status_code == 200
+            assert deleted.status_code in (200, 202, 204)

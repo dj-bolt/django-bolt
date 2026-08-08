@@ -420,13 +420,15 @@ class _ThreadsafeServerProxy:
     def close(self):
         self._loop._selector_loop.call_soon_threadsafe(self._server.close)
 
+    @property
     def close_clients(self):
         close_clients = self._server.close_clients  # AttributeError before 3.13
-        self._loop._selector_loop.call_soon_threadsafe(close_clients)
+        return functools.partial(self._loop._selector_loop.call_soon_threadsafe, close_clients)
 
+    @property
     def abort_clients(self):
         abort_clients = self._server.abort_clients  # AttributeError before 3.13
-        self._loop._selector_loop.call_soon_threadsafe(abort_clients)
+        return functools.partial(self._loop._selector_loop.call_soon_threadsafe, abort_clients)
 
     async def start_serving(self):
         await self._loop._submit_selector(self._server.start_serving())
@@ -828,9 +830,7 @@ def _with_running_loop(loop, callback, *args):
         asyncio.events._set_running_loop(previous)
 
 
-def worker_dispatch_start(dispatch, request, loop, resolver):
-    """Start one request and arrange for its resolver to complete."""
-
+def _worker_dispatch_start(dispatch, request, loop, resolver, task_sink=None):
     def start():
         try:
             coro = dispatch(request)
@@ -841,12 +841,30 @@ def worker_dispatch_start(dispatch, request, loop, resolver):
         except BaseException as exc:
             resolver.set_exception(exc)
             return
+        if task_sink is not None:
+            task_sink.set_task(task)
         if task.done():
             _resolve_task(task, resolver)
         else:
             task.add_done_callback(lambda done: _resolve_task(done, resolver))
 
     _with_running_loop(loop, start)
+
+
+def worker_dispatch_start(dispatch, request, loop, resolver):
+    """Start one request and arrange for its resolver to complete."""
+    _worker_dispatch_start(dispatch, request, loop, resolver)
+
+
+def worker_dispatch_start_cancellable(dispatch, request, loop, resolver, task_sink):
+    """Like worker_dispatch_start, but hands the created Task to `task_sink`.
+
+    Used by MCP dispatch: rmcp cancels the request's CancellationToken on
+    client disconnect, and Rust then schedules `task.cancel()` through the
+    task's loop. Plain HTTP routes deliberately keep the non-cancelling path.
+    """
+
+    _worker_dispatch_start(dispatch, request, loop, resolver, task_sink)
 
 
 def worker_sync_dispatch(dispatch, request, loop):
@@ -859,6 +877,17 @@ def _resolve_task(task, resolver):
         resolver.set_result(task.result())
     except BaseException as exc:
         resolver.set_exception(exc)
+
+
+def mcp_resolve_future(fut, value):
+    """Resolve an MCP reply future from Rust, tolerating late resolution.
+
+    Runs on the future's own loop via call_soon_threadsafe. A future belonging
+    to a cancelled tool call is already done — resolving it then would raise
+    InvalidStateError into the loop's exception handler, so skip it.
+    """
+    if not fut.done():
+        fut.set_result(value)
 
 
 def run_worker_handle(loop, handle):

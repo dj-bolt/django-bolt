@@ -59,6 +59,37 @@ def struct_from_fields(name: str, fields: list[Any]) -> type[msgspec.Struct]:
     return msgspec.defstruct(f"{name}_Args", required + optional)
 
 
+def _inline_root_ref(raw: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a top-level ``$ref`` while retaining definitions it depends on."""
+    if "$ref" not in raw:
+        return raw
+    defs = raw.get("$defs") or {}
+    ref = raw["$ref"].rsplit("/", 1)[-1]
+    schema = dict(defs.get(ref, {}))
+    others = {key: value for key, value in defs.items() if key != ref}
+    if others:
+        schema["$defs"] = others
+    return schema
+
+
+def output_schema_from_return(fn: Callable) -> dict[str, Any] | None:
+    """Derive an MCP ``outputSchema`` from ``fn``'s return annotation (opt-in).
+
+    Only object-shaped returns get a schema: MCP ``structuredContent`` is an
+    object, so scalar/str annotations yield ``None`` rather than a misleading
+    schema. Raises for annotations msgspec cannot represent.
+    """
+    hints = get_type_hints(fn, include_extras=True)
+    annotation = hints.get("return")
+    if annotation is None or annotation is type(None):
+        return None
+    schema = _inline_root_ref(msgspec.json.schema(annotation))
+    if schema.get("type") != "object":
+        return None
+    schema.pop("title", None)
+    return schema
+
+
 def input_schema_for(struct_type: type[msgspec.Struct]) -> dict[str, Any]:
     """Return a top-level ``type:"object"`` JSON Schema for an args struct.
 
@@ -66,15 +97,7 @@ def input_schema_for(struct_type: type[msgspec.Struct]) -> dict[str, Any]:
     MCP requires a top-level object schema, so resolve the root ``$ref`` and inline
     it, carrying along any remaining ``$defs`` for nested structs to reference.
     """
-    raw = msgspec.json.schema(struct_type)
-    defs = raw.get("$defs") or {}
-    schema = raw
-    if "$ref" in raw:
-        ref = raw["$ref"].rsplit("/", 1)[-1]
-        schema = dict(defs.get(ref, {}))
-        others = {k: v for k, v in defs.items() if k != ref}
-        if others:
-            schema["$defs"] = others
+    schema = _inline_root_ref(msgspec.json.schema(struct_type))
     schema.pop("title", None)
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})

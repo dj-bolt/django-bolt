@@ -63,6 +63,15 @@ log = "0.4"
 notify = "8"
 ctrlc = "3"
 libc = "0.2"
+# MCP protocol core (official Rust SDK). Trimmed features: no axum/hyper/reqwest.
+# actix uses `http` 0.2; rmcp uses `http` 1.x — both coexist, the MCP bridge
+# rebuilds requests across the version boundary (src/mcp/bridge.rs).
+rmcp = { version = "3.1.2", default-features = false, features = ["server", "transport-streamable-http-server", "elicitation", "request-state"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tokio-util = "0.7"
+sha2 = "0.10"  # MRTR requestState digests (args/principal)
 
 [dev-dependencies]
 criterion = "0.5"

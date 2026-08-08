@@ -873,7 +873,10 @@ fn parse_rate_limit_config(
 /// Invalid auth configuration is a hard error, not a skip: silently dropping
 /// a backend would leave the route serving without the authentication the
 /// user configured.
-fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<AuthBackend> {
+pub(crate) fn parse_auth_backend(
+    dict: &HashMap<String, Py<PyAny>>,
+    py: Python,
+) -> PyResult<AuthBackend> {
     let backend_type = dict
         .get("type")
         .ok_or_else(|| PyValueError::new_err("Auth backend metadata missing 'type'"))?
@@ -1016,7 +1019,7 @@ fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult
 }
 
 /// Parse a single guard from Python dict
-fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<Guard> {
+pub(crate) fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<Guard> {
     let guard_type = dict
         .get("type")
         .ok_or_else(|| PyValueError::new_err("Guard metadata missing 'type'"))?

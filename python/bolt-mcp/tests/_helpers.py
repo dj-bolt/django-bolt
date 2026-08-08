@@ -14,7 +14,11 @@ from django_bolt import BoltAPI
 
 DUAL_ACCEPT = "application/json, text/event-stream"
 JSON_CONTENT_TYPE = "application/json"
+# Legacy era: session-based clients (initialize handshake).
 PROTOCOL = "2025-06-18"
+PROTOCOL_LEGACY = PROTOCOL
+# Modern era: stateless per-request-_meta clients.
+PROTOCOL_MODERN = "2026-07-28"
 _MCP_APPS_DIR = Path(__file__).resolve().parent / "integration" / "apps"
 
 
@@ -95,6 +99,60 @@ INITIALIZE_PARAMS = {
 }
 
 
+# ── modern era (2026-07-28): stateless, per-request _meta + routing headers ──
+def modern_meta(
+    *,
+    capabilities: dict | None = None,
+    log_level: str | None = None,
+    progress_token: str | int | None = None,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "io.modelcontextprotocol/protocolVersion": PROTOCOL_MODERN,
+        "io.modelcontextprotocol/clientInfo": {"name": "pytest", "version": "1.0"},
+        "io.modelcontextprotocol/clientCapabilities": capabilities or {},
+    }
+    if log_level is not None:
+        meta["io.modelcontextprotocol/logLevel"] = log_level
+    if progress_token is not None:
+        meta["progressToken"] = progress_token
+    return meta
+
+
+# Methods whose Mcp-Name header mirrors params.name / params.uri (SEP-2243).
+_NAME_HEADER_KEYS = {"tools/call": "name", "resources/read": "uri", "prompts/get": "name"}
+
+
+def post_rpc_modern(
+    client,
+    method: str,
+    params: dict | None = None,
+    *,
+    id: int | str = 1,
+    capabilities: dict | None = None,
+    log_level: str | None = None,
+    progress_token: str | int | None = None,
+    authorization: str | None = None,
+    headers_override: dict[str, str] | None = None,
+):
+    """POST one 2026-07-28 request: required headers + per-request _meta."""
+    params = dict(params or {})
+    params["_meta"] = modern_meta(capabilities=capabilities, log_level=log_level, progress_token=progress_token)
+    headers = {
+        "Accept": DUAL_ACCEPT,
+        "Content-Type": JSON_CONTENT_TYPE,
+        "MCP-Protocol-Version": PROTOCOL_MODERN,
+        "Mcp-Method": method,
+    }
+    name_key = _NAME_HEADER_KEYS.get(method)
+    if name_key is not None and name_key in params:
+        headers["Mcp-Name"] = str(params[name_key])
+    if authorization is not None:
+        headers["Authorization"] = authorization
+    if headers_override:
+        headers.update(headers_override)
+    return client.post("/mcp", content=rpc_body(method, params, id=id), headers=headers)
+
+
 def initialize(client, *, authorization: str | None = None):
     """Run the initialize handshake; return (response, session_id)."""
     resp = post_rpc(client, "initialize", INITIALIZE_PARAMS, authorization=authorization)
@@ -102,25 +160,28 @@ def initialize(client, *, authorization: str | None = None):
     return resp, session_id
 
 
-def _parse_sse(body: bytes) -> dict:
-    """Extract the single JSON-RPC message from a finite SSE response body."""
-    text = body.decode("utf-8").replace("\r\n", "\n")
-    for block in text.split("\n\n"):
-        data = [line[len("data:") :].lstrip() for line in block.split("\n") if line.startswith("data:")]
-        if data:
-            return msgspec.json.decode("\n".join(data).encode())
-    raise AssertionError(f"no SSE data frame found in response: {text!r}")
-
-
 def _parse_all_sse(body: bytes) -> list[dict]:
-    """Return every JSON-RPC message carried by a (finite) SSE response body."""
+    """Return every JSON-RPC message carried by a (finite) SSE response body.
+
+    Skips non-JSON frames: the transport primes streams with an empty
+    ``data:`` event carrying the SSE ``retry`` interval.
+    """
     text = body.decode("utf-8").replace("\r\n", "\n")
     out: list[dict] = []
     for block in text.split("\n\n"):
         data = [line[len("data:") :].lstrip() for line in block.split("\n") if line.startswith("data:")]
-        if data:
-            out.append(msgspec.json.decode("\n".join(data).encode()))
+        payload = "\n".join(data).strip()
+        if payload:
+            out.append(msgspec.json.decode(payload.encode()))
     return out
+
+
+def _parse_sse(body: bytes) -> dict:
+    """Extract the final JSON-RPC message from a finite SSE response body."""
+    messages = _parse_all_sse(body)
+    if not messages:
+        raise AssertionError(f"no SSE data frame found in response: {body!r}")
+    return messages[-1]
 
 
 def parse_rpc(resp) -> dict:

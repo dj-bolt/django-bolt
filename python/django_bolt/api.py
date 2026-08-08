@@ -157,6 +157,29 @@ def _validate_asgi_mount_conflicts(
             )
 
 
+def _validate_mcp_mount_conflicts(
+    routes: list[tuple[str, str, int, Any]],
+    asgi_mounts: list[tuple[str, Any]],
+    mcp_mounts: list[dict[str, Any]],
+    *,
+    error_cls: type[Exception] = ValueError,
+) -> None:
+    """Reject MCP paths that duplicate or exactly collide with another endpoint."""
+    route_paths = {path for _method, path, _handler_id, _handler in routes}
+    asgi_paths = {path for path, _app in asgi_mounts}
+    seen_mcp: set[str] = set()
+
+    for mount in mcp_mounts:
+        path = mount["path"]
+        if path in seen_mcp:
+            raise error_cls(f"An MCP server is already mounted at {path!r} on this API")
+        seen_mcp.add(path)
+        if path in route_paths:
+            raise error_cls(f"MCP mount path {path!r} conflicts with an existing HTTP route")
+        if path in asgi_paths:
+            raise error_cls(f"MCP mount path {path!r} conflicts with an existing ASGI mount")
+
+
 def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
     """Prepend root_path to scope["path"] so Django derives path_info correctly.
 
@@ -445,6 +468,9 @@ class BoltAPI:
         # Django admin configuration (controlled by --no-admin flag)
         self._admin_routes_registered = False
         self._asgi_mounts: list[tuple[str, Callable[..., Any]]] = []
+        # MCP mount definitions (dicts consumed by _core.register_mcp_mounts).
+        # Populated by bolt_mcp.mount_mcp; empty for APIs without MCP.
+        self._mcp_mounts: list[dict[str, Any]] = []
         self._asgi_mount_prefixes: set[str] = set()
 
         # Middleware chain (built lazily on first request)
@@ -2876,6 +2902,25 @@ class BoltAPI:
         # Normalize path prefix: ensure leading slash, strip trailing slash
         mount_path = "/" + path.strip("/") if path else ""
 
+        # Prepare MCP definitions before mutating the parent. A mounted child
+        # is removed from global discovery below, so its MCP endpoints must be
+        # copied just like its HTTP, WebSocket, and ASGI endpoints.
+        child_mcp_mounts: list[dict[str, Any]] = []
+        existing_mcp_paths = {definition["path"] for definition in self._mcp_mounts}
+        for definition in app._mcp_mounts:
+            if definition.get("verify_token") is not None:
+                raise ValueError(
+                    "Cannot mount a child BoltAPI containing an OAuth-protected MCP server. "
+                    "Mount it directly at its final path so its OAuth audience and resource metadata remain valid."
+                )
+            child_definition = definition.copy()
+            child_path = definition["path"]
+            child_definition["path"] = _normalize_mount_prefix(mount_path + child_path)
+            if child_definition["path"] in existing_mcp_paths:
+                raise ValueError(f"An MCP server is already mounted at {child_definition['path']!r} on this API")
+            existing_mcp_paths.add(child_definition["path"])
+            child_mcp_mounts.append(child_definition)
+
         # Copy routes from sub-app to this app with path prefix
         for method, route_path, handler_id, handler in app._routes:
             # Compute new path with mount prefix and normalize using parent's trailing_slash setting
@@ -2941,6 +2986,8 @@ class BoltAPI:
             self._asgi_mount_prefixes.add(new_asgi_prefix)
             self._asgi_mounts.append((new_asgi_prefix, asgi_app))
 
+        self._mcp_mounts.extend(child_mcp_mounts)
+
         # Remove sub-app from global registry (parent handles its routes now)
         if app in _BOLT_API_REGISTRY:
             _BOLT_API_REGISTRY.remove(app)
@@ -3003,6 +3050,8 @@ class BoltAPI:
         guards: list[Any] | None = None,
         oauth: Any | None = None,
         expose: Any | None = None,
+        allowed_hosts: list[str] | None = None,
+        allowed_origins: list[str] | None = None,
     ) -> None:
         """Serve an MCP (Model Context Protocol) server over Streamable HTTP on this API.
 
@@ -3026,7 +3075,17 @@ class BoltAPI:
             raise ImportError(
                 "api.mount_mcp(...) requires the optional 'bolt-mcp' package. Install it with `pip install 'django-bolt[mcp]'`."
             ) from exc
-        mount_mcp(self, mcp, path, auth=auth, guards=guards, oauth=oauth, expose=expose)
+        mount_mcp(
+            self,
+            mcp,
+            path,
+            auth=auth,
+            guards=guards,
+            oauth=oauth,
+            expose=expose,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        )
 
     def include_router(self, router: Router, prefix: str = "") -> None:
         """

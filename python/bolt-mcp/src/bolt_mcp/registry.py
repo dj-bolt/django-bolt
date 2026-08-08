@@ -19,6 +19,8 @@ class ToolDef:
     title: str | None = None
     description: str | None = None
     output_schema: dict[str, Any] | None = None
+    annotations: dict[str, Any] | None = None  # MCP ToolAnnotations (readOnlyHint, ...)
+    icons: list[dict[str, Any]] | None = None
     guards: list[Any] = field(default_factory=list)
     # Computed at registration:
     args_struct: Any = None
