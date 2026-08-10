@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import logging
+import warnings
 from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urlsplit
@@ -23,10 +25,65 @@ from django_bolt import BoltAPI, _core
 from django_bolt._bridge import make_bound_dispatch
 from django_bolt.api import _validate_asgi_mount_conflicts, _validate_mcp_mount_conflicts
 
+logger = logging.getLogger(__name__)
+
 try:
     from django.conf import settings
+    from django.db import connections
 except ImportError:
     settings = None  # type: ignore
+    connections = None  # type: ignore
+
+
+class BoltTestClientWarning(RuntimeWarning):
+    """Advisory about a test setup that TestClient cannot serve correctly.
+
+    Its own category so it can be silenced with
+    ``warnings.simplefilter("ignore", BoltTestClientWarning)``.
+    """
+
+
+# Emitted at most once per process. The point is to explain a confusing
+# failure mode once, not to annotate every call site: a suite that mixes
+# database-free TestClient tests with a transactional marker would otherwise
+# repeat this on every one of them.
+_atomic_block_warning_emitted = False
+
+
+def _warn_if_inside_atomic_block() -> None:
+    """Warn when the entering test is holding an open transaction.
+
+    Requests run through the Rust pipeline, so handlers execute on framework
+    threads with their own database connections. A test that wraps itself in a
+    transaction — Django's ``TestCase``, or pytest-django's plain ``django_db``
+    — never commits, so those rows are invisible to the handler, and on SQLite
+    the write lock the test holds turns the handler's query into ``database
+    table is locked``. Either way the symptom is an opaque 500 with nothing
+    pointing at the cause.
+
+    Advisory only: a test whose handlers never touch the database works fine
+    inside a transaction, so this must not fail the run.
+    """
+    global _atomic_block_warning_emitted
+    if connections is None or _atomic_block_warning_emitted:
+        return
+    try:
+        open_aliases = [conn.alias for conn in connections.all(initialized_only=True) if conn.in_atomic_block]
+    except Exception as exc:  # unconfigured settings, no databases, etc.
+        logger.debug("Could not inspect database transaction state: %s", exc)
+        return
+    if not open_aliases:
+        return
+    _atomic_block_warning_emitted = True
+    warnings.warn(
+        f"TestClient entered inside an open database transaction on: {', '.join(open_aliases)}. "
+        "Handlers run on framework threads with their own database connections, so they "
+        "cannot see rows this test has created, and on SQLite the lock it holds surfaces "
+        "as an opaque 500. Use TransactionTestCase (or pytest-django's "
+        "django_db(transaction=True)) for tests whose handlers touch the database.",
+        BoltTestClientWarning,
+        stacklevel=3,
+    )
 
 
 class BoltTestTransport(httpx.BaseTransport):
@@ -451,6 +508,7 @@ class TestClient(httpx.Client):
 
     def __enter__(self):
         """Enter context manager — runs lifespan startup if configured."""
+        _warn_if_inside_atomic_block()
         if self.api._has_lifespan:
             loop = asyncio.new_event_loop()
             cm = self.api._lifespan_context(self.api)
@@ -729,6 +787,7 @@ class AsyncTestClient(httpx.AsyncClient):
 
     async def __aenter__(self):
         """Enter async context manager — runs lifespan startup if configured."""
+        _warn_if_inside_atomic_block()
         if self.api._has_lifespan:
             cm = self.api._lifespan_context(self.api)
             await cm.__aenter__()

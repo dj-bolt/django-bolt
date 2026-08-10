@@ -393,6 +393,64 @@ def test_article_viewset(api):
         assert response.json()["title"] == "Test Article"
 ```
 
+## Using Django's test runner
+
+Everything above uses pytest, but `manage.py test` works too — with two
+adjustments.
+
+**Django's own test client does not see Bolt routes.** `self.client` resolves
+against `ROOT_URLCONF`, and your Bolt handlers live in the Rust router, not in
+Django's URL configuration. A request for a route that exists returns 404:
+
+```python
+class Wrong(TestCase):
+    def test_slides(self):
+        response = self.client.get("/slides/")
+        assert response.status_code == 404  # not registered in ROOT_URLCONF
+```
+
+Use `TestClient` instead. It goes through the real Rust pipeline, so routing,
+middleware, and auth all behave as they do in production.
+
+**Use `TransactionTestCase`, not `TestCase`,** whenever your handlers touch the
+database. This is the same constraint as
+[`transaction=True`](#why-transactiontrue-is-required) above, for the same
+reason: `TestCase` wraps each test in a transaction it never commits, so the
+handler's connection cannot see your rows. On SQLite it is worse than an empty
+result — the write lock your test holds blocks the handler's query, and you get
+`database table is locked` surfacing as a bare 500:
+
+```python
+from django.test import TransactionTestCase
+from django_bolt.testing import TestClient
+
+from .api import api
+from .models import Slide
+
+
+class TestSlides(TransactionTestCase):
+    def test_lists_slides(self):
+        Slide.objects.create(description="hello")
+
+        with TestClient(api) as client:
+            response = client.get("/slides/")
+            assert response.status_code == 200
+            assert response.json() == [{"id": 1, "description": "hello"}]
+```
+
+Entering a `TestClient` inside an open transaction emits a
+`BoltTestClientWarning` pointing at this section. It is advisory, not an error —
+handlers that never touch the database are fine under `TestCase` — and fires at
+most once per process. Silence it with:
+
+```python
+warnings.simplefilter("ignore", BoltTestClientWarning)
+```
+
+Unlike pytest's `transaction=True`, `TransactionTestCase` truncates tables
+after each test, so the [manual cleanup](#cleaning-up-between-tests) described
+above is not needed here.
+
 ## Authenticated endpoints
 
 You don't need a login flow to test a protected route.
