@@ -149,6 +149,18 @@ def msgspec_validation_error_to_dict(error: msgspec.ValidationError) -> list[dic
     Returns:
         List of error dictionaries with 'loc', 'msg', 'type' fields
     """
+    # A Serializer's own validators raise RequestValidationError from
+    # __post_init__, with one entry per failing field. msgspec catches that
+    # during decoding and re-raises it as a plain ValidationError carrying
+    # str(exc) — every field's message joined with "; " — which would otherwise
+    # be reported as a single error located at ["body"]. The original survives
+    # on the exception chain, so use it rather than parsing the joined string.
+    original = error.__cause__ if error.__cause__ is not None else error.__context__
+    if isinstance(original, RequestValidationError):
+        structured = [err for err in original.errors() if isinstance(err, dict)]
+        if structured:
+            return structured
+
     error_msg = str(error)
 
     # Try to extract field location with pre-compiled regex

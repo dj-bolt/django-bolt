@@ -41,6 +41,38 @@ ComputedFieldMethod = Callable[[Any], Any]
 FieldValidatorFunc = Callable[[type["Serializer"], Any], Any]
 ModelValidatorFunc = Callable[["Serializer"], "Serializer"]
 
+# Decorated symbols keep their own type. A validator is written as an ordinary
+# method body, which a type checker infers as an instance method (`cls: Self`);
+# requiring it to be assignable to FieldValidatorFunc made Pylance report
+# `type[Serializer]` incompatible with `Self@<Model>` on every validator. The
+# aliases above stay for the runtime protocols and for documentation.
+DecoratedT = TypeVar("DecoratedT")
+
+
+def _unwrap_descriptor(func: Any) -> Any:
+    """The plain function behind a classmethod/staticmethod, if any.
+
+    Validators are collected out of the class `__dict__`, where a
+    `@classmethod` is still a descriptor object rather than the function.
+    """
+    return func.__func__ if isinstance(func, (classmethod, staticmethod)) else func
+
+
+def _reject_descriptor(func: Any) -> None:
+    """Refuse a classmethod/staticmethod model validator instead of ignoring it.
+
+    A model validator receives the constructed instance, so neither descriptor
+    can express one. Silently collecting nothing would leave a serializer that
+    looks validated and is not.
+    """
+    if isinstance(func, (classmethod, staticmethod)):
+        kind = type(func).__name__
+        raise TypeError(
+            f"@model_validator cannot wrap a {kind}: a model validator receives the "
+            f"constructed instance, not the class. Drop the @{kind} decorator."
+        )
+
+
 # Marker attributes for storing validators on classes
 FIELD_VALIDATORS_ATTR = "__field_validators__"
 MODEL_VALIDATORS_ATTR = "__model_validators__"
@@ -154,7 +186,7 @@ def computed_field(
 def field_validator(
     field_name: str,
     mode: ValidatorMode = "after",
-) -> Callable[[FieldValidatorFunc], FieldValidatorFunc]:
+) -> Callable[[DecoratedT], DecoratedT]:
     """
     Decorator to validate a specific field in a Serializer.
 
@@ -173,11 +205,11 @@ def field_validator(
                 return value.lower()
     """
 
-    def decorator(
-        func: FieldValidatorFunc,
-    ) -> FieldValidatorFunc:
-        # Store validator metadata on the function
-        typed_func = cast(_FieldValidatorCallable, func)
+    def decorator(func: DecoratedT) -> DecoratedT:
+        # Mark the underlying function, not the descriptor: `@classmethod` is
+        # the form type checkers accept, and attributes set on the classmethod
+        # object are invisible once the descriptor is resolved.
+        typed_func = cast(_FieldValidatorCallable, _unwrap_descriptor(func))
         typed_func.__validator_field__ = field_name
         typed_func.__validator_mode__ = mode
         return func
@@ -221,6 +253,7 @@ def model_validator(
     def decorator(
         validator_func: ModelValidatorFunc,
     ) -> ModelValidatorFunc:
+        _reject_descriptor(validator_func)
         # Store validator metadata on the function
         typed_validator = cast(_ModelValidatorCallable, validator_func)
         typed_validator.__model_validator__ = True
@@ -232,6 +265,7 @@ def model_validator(
         return decorator
     else:
         # Called without parentheses: @model_validator
+        _reject_descriptor(func)
         typed_func = cast(_ModelValidatorCallable, func)
         typed_func.__model_validator__ = True
         typed_func.__validator_mode__ = mode
@@ -251,7 +285,11 @@ def collect_field_validators(cls: type[Serializer]) -> dict[str, list[FieldValid
         if not hasattr(base, "__dict__"):
             continue
 
-        for _name, value in base.__dict__.items():
+        for _name, raw in base.__dict__.items():
+            # `@classmethod` leaves a descriptor in __dict__, which is not
+            # callable — filtering on callable(raw) dropped such validators
+            # silently, so the serializer ran with no validation at all.
+            value = _unwrap_descriptor(raw)
             if callable(value) and hasattr(value, "__validator_field__"):
                 validator = cast(_FieldValidatorCallable, value)
                 field_name = validator.__validator_field__
@@ -275,7 +313,8 @@ def collect_model_validators(cls: type[Serializer]) -> list[ModelValidatorFunc]:
         if not hasattr(base, "__dict__"):
             continue
 
-        for _name, value in base.__dict__.items():
+        for _name, raw in base.__dict__.items():
+            value = _unwrap_descriptor(raw)
             if callable(value) and hasattr(value, "__model_validator__"):
                 validators.append(cast(ModelValidatorFunc, value))
 

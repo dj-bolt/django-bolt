@@ -146,6 +146,26 @@ Invalid data raises `msgspec.ValidationError`:
 UserSerializer(email="invalid")  # Raises ValidationError
 ```
 
+A validator may also be declared as a `@classmethod`. Type checkers infer the
+first parameter of an undecorated method as the instance type, so a plain
+`def validate_email(cls, value)` is reported as incompatible with the
+decorator's signature; `@classmethod` states the intent and silences it. Put
+`@field_validator` on top:
+
+```python
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value):
+        if "@" not in value:
+            raise ValueError("Invalid email")
+        return value
+```
+
+Both forms behave identically at runtime. `@model_validator` is the exception —
+it receives the constructed instance rather than the class, so wrapping one in
+`@classmethod` raises `TypeError` rather than leaving a validator that never
+runs.
+
 ### Transforming values
 
 Validators can transform values before storage:
@@ -219,6 +239,18 @@ except RequestValidationError as e:
 ```
 
 This matches Pydantic's behavior and provides a better user experience - users can fix all issues at once instead of discovering them one at a time.
+
+A request that fails these validators returns the same structure as `422`, one
+entry per field:
+
+```json
+{
+  "detail": [
+    {"loc": ["body", "email"], "msg": "Invalid email", "type": "value_error"},
+    {"loc": ["body", "password"], "msg": "Password too short", "type": "value_error"}
+  ]
+}
+```
 
 ### Understanding validation layers
 
