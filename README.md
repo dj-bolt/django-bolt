@@ -209,7 +209,7 @@ Django-Bolt stands on the shoulders of giants. We're grateful to the following p
 
 - **[Django REST Framework](https://github.com/encode/django-rest-framework)** - Our syntax, ViewSet patterns, and permission system are heavily inspired by DRF's elegant API design. The class-based views and guard system follow DRF's philosophy of making common patterns simple.
 
-- **[FastAPI](https://github.com/tivy520/fastapi)** - We drew extensive inspiration from FastAPI's dependency injection system, parameter extraction patterns, and modern Python type hints usage. The codebase structure and async patterns heavily influenced our implementation.
+- **[FastAPI](https://github.com/fastapi/fastapi)** - We drew extensive inspiration from FastAPI's dependency injection system, parameter extraction patterns, and modern Python type hints usage. The codebase structure and async patterns heavily influenced our implementation.
 
 - **[Litestar](https://github.com/litestar-org/litestar)** - Our OpenAPI plugin system is adapted from Litestar's excellent architecture. Many architectural decisions around middleware, guards, and route handling were inspired by Litestar's design philosophy.
 
