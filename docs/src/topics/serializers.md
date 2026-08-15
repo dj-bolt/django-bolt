@@ -146,11 +146,9 @@ Invalid data raises `msgspec.ValidationError`:
 UserSerializer(email="invalid")  # Raises ValidationError
 ```
 
-A validator may also be declared as a `@classmethod`. Type checkers infer the
-first parameter of an undecorated method as the instance type, so a plain
-`def validate_email(cls, value)` is reported as incompatible with the
-decorator's signature; `@classmethod` states the intent and silences it. Put
-`@field_validator` on top:
+A validator may also be declared as a `@classmethod` — the form Pydantic uses,
+and the one that makes the `cls` parameter explicit to type checkers. Both
+forms are accepted, in either decorator order:
 
 ```python
     @field_validator("email")
@@ -161,7 +159,7 @@ decorator's signature; `@classmethod` states the intent and silences it. Put
         return value
 ```
 
-Both forms behave identically at runtime, in either decorator order.
+Both forms behave identically at runtime.
 `@staticmethod` is not accepted (a field validator is called with the class),
 and `@model_validator` accepts neither — it receives the constructed instance.
 Those combinations raise `TypeError` at class creation rather than leaving a

@@ -287,7 +287,7 @@ def collect_field_validators(cls: type[Serializer]) -> dict[str, list[FieldValid
         if not hasattr(base, "__dict__"):
             continue
 
-        for _name, raw in base.__dict__.items():
+        for raw in base.__dict__.values():
             value = _marked_validator(raw, "__validator_field__", allow_classmethod=True)
             if value is not None:
                 validator = cast(_FieldValidatorCallable, value)
@@ -312,7 +312,7 @@ def collect_model_validators(cls: type[Serializer]) -> list[ModelValidatorFunc]:
         if not hasattr(base, "__dict__"):
             continue
 
-        for _name, raw in base.__dict__.items():
+        for raw in base.__dict__.values():
             value = _marked_validator(raw, "__model_validator__", allow_classmethod=False)
             if value is not None:
                 validators.append(cast(ModelValidatorFunc, value))
