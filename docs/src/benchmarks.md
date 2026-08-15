@@ -66,7 +66,7 @@ The ORM rows are bounded by SQLite's single-writer file lock and by the ORM's ow
 
 ## Against JavaScript runtimes
 
-Same JSON payloads, same machine, same load generator, byte-identical response bodies checked on every run. Harness and full tables: [`bench/js`](https://github.com/dj-bolt/django-bolt/tree/master/bench/js). `C=100`, `N=100000`.
+Same JSON payloads, same machine, same load generator, byte-identical response bodies checked on every run. `C=100`, `N=100000`.
 
 **8 processes each** (Bolt: `--processes 8`; Hono/Node: `node:cluster`; Bun: 8 processes with `reusePort`):
 
@@ -106,7 +106,6 @@ go install github.com/codesenberg/bombardier@latest
 
 just save-bench                    # full suite → bench/BENCHMARK_BASELINE.md
 just save-bench 127.0.0.1 8001 100 100000 8   # host port C N processes
-just bench-js                      # Bolt vs Hono vs Elysia
 ```
 
 ## How to quote these numbers

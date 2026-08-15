@@ -56,4 +56,3 @@ Key facts (as of August 2026, version 0.10.x):
 - [Source repository](https://github.com/dj-bolt/django-bolt)
 - [CHANGELOG](https://github.com/dj-bolt/django-bolt/blob/master/CHANGELOG.md)
 - [Benchmark results file](https://github.com/dj-bolt/django-bolt/blob/master/bench/BENCHMARK_BASELINE.md)
-- [JS runtime comparison harness](https://github.com/dj-bolt/django-bolt/tree/master/bench/js)

@@ -521,13 +521,6 @@ async def bench_parse(req: Request, payload: BenchPayload):
     return {"ok": True, "n": len(payload.items), "count": payload.count}
 
 
-@api.query("/bench/query")
-async def bench_query(req: Request, payload: BenchPayload):
-    # Byte-identical work to /bench/parse (POST). The only difference is the
-    # HTTP QUERY method, so diffing RPS isolates the method's routing cost.
-    return {"ok": True, "n": len(payload.items), "count": payload.count}
-
-
 # ==== Benchmark endpoints for Header/Cookie/Exception/HTML/Redirect ====
 @api.get("/header")
 async def get_header(x: Annotated[str, Header(alias="x-test")]):

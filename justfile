@@ -126,28 +126,9 @@ save-bench host=host port=port c=c n=n p=p workers=workers:
 # Build and run benchmark
 build-bench: build save-bench
 
-# WorkerLoop vs uvloop vs stdlib: µs per call_soon / sleep(0) / fd event / socket round trip
-bench-loop *ARGS:
-    uv run --with uvloop python scripts/benchmark_loop.py {{ARGS}}
-
 # Build with profiling profile (release + debug symbols) for flamegraphs
 build-profiling:
     uv run maturin develop --profile profiling
-
-# Cross-framework comparison: Django-Bolt vs Hono (node + bun) vs Elysia (bun)
-# Runtimes: `just bench-js` (all) or RUNTIMES="bolt elysia-bun" just bench-js
-bench-js host=host port=port c=c n=n p="1":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ ! -d bench/js/node_modules ]; then
-        echo "Installing JS benchmark dependencies..."
-        (cd bench/js && { command -v bun >/dev/null && bun install || npm install; })
-    fi
-    PROCESSES={{p}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./bench/js/compare.sh
-
-# Focused HTTP QUERY method benchmark (QUERY vs POST, identical work)
-bench-query host=host port=port c=c n=n p=p workers=workers:
-    P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark_query.sh
 
 # Release new version
 # Usage: just release 0.2.2

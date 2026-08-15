@@ -1,8 +1,4 @@
-"""Fixed JSON payloads served by the example's /1k-json and /10k-json routes.
-
-bench/js/ serves the same files so every runtime in the comparison puts
-identical bytes on the wire.
-"""
+"""Fixed JSON payloads served by the example's /1k-json and /10k-json routes."""
 
 import json
 from pathlib import Path

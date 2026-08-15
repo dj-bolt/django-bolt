@@ -290,7 +290,7 @@ Measured with [bombardier](https://github.com/codesenberg/bombardier) on a singl
 
 ### Against JavaScript runtimes
 
-The same JSON payloads served by Django-Bolt, [Elysia](https://elysiajs.com) (Bun), and [Hono](https://hono.dev) (Bun & Node), 8 processes each — see [`bench/js`](bench/js/README.md):
+The same JSON payloads served by Django-Bolt, [Elysia](https://elysiajs.com) (Bun), and [Hono](https://hono.dev) (Bun & Node), 8 processes each:
 
 | Payload | Django-Bolt | Elysia / Bun | Hono / Bun | Hono / Node |
 | --- | ---: | ---: | ---: | ---: |
