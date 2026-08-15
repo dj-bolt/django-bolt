@@ -25,12 +25,23 @@ static SIGNAL_WATCHERS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<i32, tokio::sync::oneshot::Sender<()>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-enum WorkerLoopCommand {
+pub(crate) enum WorkerLoopCommand {
     Soon(Py<PyAny>),
+    /// File-descriptor readiness: run the handle, then tell the watcher it
+    /// may re-arm (see `worker_fd`).
+    #[cfg(unix)]
+    Ready(
+        std::sync::Arc<Py<PyAny>>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
 }
 
 struct WorkerLoopService {
     tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
+    #[cfg(unix)]
+    runtime: tokio::runtime::Handle,
+    #[cfg(unix)]
+    fd_watchers: crate::worker_fd::FdWatchers,
 }
 
 impl WorkerLoopService {
@@ -43,7 +54,13 @@ impl WorkerLoopService {
         WORKER_SERVICE.get_or_init(|| {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(run_ready_queue(rx));
-            Self { tx }
+            Self {
+                tx,
+                #[cfg(unix)]
+                runtime: tokio::runtime::Handle::current(),
+                #[cfg(unix)]
+                fd_watchers: crate::worker_fd::FdWatchers::default(),
+            }
         })
     }
 }
@@ -74,9 +91,6 @@ fn get_worker_fn<'py>(
 /// cannot share asyncio primitives with Bolt handlers.
 fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     WORKER_LOOP.get_or_try_init(py, || {
-        let locals = TASK_LOCALS.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
-        })?;
         let scheduler = Py::new(
             py,
             WorkerLoopScheduler {
@@ -84,9 +98,7 @@ fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
             },
         )?;
         let factory = get_worker_fn(py, &WORKER_LOOP_FACTORY, "make_worker_loop")?;
-        factory
-            .call1(py, (scheduler, locals.event_loop(py)))
-            .map(Into::into)
+        factory.call1(py, (scheduler,)).map(Into::into)
     })
 }
 
@@ -117,8 +129,25 @@ pub(crate) fn worker_task_locals(
 /// otherwise pin this worker thread (and its GIL attachment) forever.
 const READY_QUEUE_DRAIN_LIMIT: usize = 128;
 
+fn run_command(py: Python<'_>, run: &Py<PyAny>, loop_obj: &Py<PyAny>, command: WorkerLoopCommand) {
+    match command {
+        WorkerLoopCommand::Soon(handle) => {
+            if let Err(error) = run.call1(py, (loop_obj, handle)) {
+                error.print(py);
+            }
+        }
+        #[cfg(unix)]
+        WorkerLoopCommand::Ready(handle, ack) => {
+            if let Err(error) = run.call1(py, (loop_obj, &*handle)) {
+                error.print(py);
+            }
+            let _ = ack.send(());
+        }
+    }
+}
+
 async fn run_ready_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkerLoopCommand>) {
-    while let Some(WorkerLoopCommand::Soon(first)) = rx.recv().await {
+    while let Some(first) = rx.recv().await {
         Python::attach(|py| {
             let Ok(loop_obj) = get_loop(py) else {
                 return;
@@ -134,17 +163,15 @@ async fn run_ready_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkerLoop
             let mut drained = 0usize;
             let mut next = Some(first);
             loop {
-                if let Some(handle) = next.take() {
-                    if let Err(error) = run.call1(py, (loop_obj, handle)) {
-                        error.print(py);
-                    }
+                if let Some(command) = next.take() {
+                    run_command(py, run, loop_obj, command);
                     drained += 1;
                     if drained >= READY_QUEUE_DRAIN_LIMIT {
                         break;
                     }
                 }
                 match rx.try_recv() {
-                    Ok(WorkerLoopCommand::Soon(handle)) => next = Some(handle),
+                    Ok(command) => next = Some(command),
                     Err(_) => break,
                 }
             }
@@ -319,6 +346,68 @@ impl WorkerLoopScheduler {
             .map_err(|_| {
                 pyo3::exceptions::PyRuntimeError::new_err("worker timer thread is unavailable")
             })
+    }
+
+    #[cfg(unix)]
+    fn add_reader(&self, fd: i32, handle: Py<PyAny>) -> PyResult<()> {
+        let service = WorkerLoopService::get();
+        service.fd_watchers.add(
+            &service.runtime,
+            &self.tx,
+            fd,
+            crate::worker_fd::Direction::Read,
+            handle,
+        )
+    }
+
+    #[cfg(unix)]
+    fn add_writer(&self, fd: i32, handle: Py<PyAny>) -> PyResult<()> {
+        let service = WorkerLoopService::get();
+        service.fd_watchers.add(
+            &service.runtime,
+            &self.tx,
+            fd,
+            crate::worker_fd::Direction::Write,
+            handle,
+        )
+    }
+
+    #[cfg(unix)]
+    fn remove_reader(&self, fd: i32) -> bool {
+        WorkerLoopService::get()
+            .fd_watchers
+            .remove(fd, crate::worker_fd::Direction::Read)
+    }
+
+    #[cfg(unix)]
+    fn remove_writer(&self, fd: i32) -> bool {
+        WorkerLoopService::get()
+            .fd_watchers
+            .remove(fd, crate::worker_fd::Direction::Write)
+    }
+
+    #[cfg(not(unix))]
+    fn add_reader(&self, _fd: i32, _handle: Py<PyAny>) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "WorkerLoop file-descriptor watching requires Unix",
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn add_writer(&self, _fd: i32, _handle: Py<PyAny>) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "WorkerLoop file-descriptor watching requires Unix",
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn remove_reader(&self, _fd: i32) -> bool {
+        false
+    }
+
+    #[cfg(not(unix))]
+    fn remove_writer(&self, _fd: i32) -> bool {
+        false
     }
 
     fn timer_cancelled(&self) {

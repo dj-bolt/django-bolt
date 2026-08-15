@@ -30,6 +30,8 @@ mod testing;
 mod type_coercion;
 mod validation;
 mod websocket;
+#[cfg(unix)]
+mod worker_fd;
 mod worker_loop;
 
 /// Pure-Rust hot-path helpers re-exported for criterion benches
