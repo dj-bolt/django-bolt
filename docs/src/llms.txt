@@ -1,0 +1,59 @@
+# Django-Bolt
+
+> Django-Bolt is the fastest Python web framework, built on Django. It serves API endpoints from a Rust HTTP server (Actix Web + Tokio) called through PyO3, validates and serializes with msgspec, and keeps the full Django stack — ORM (sync and async), Admin, middleware, auth, sessions, signals, static/media files, third-party apps — working unchanged. Handlers are typed `async def` (or `def`) functions in the FastAPI / Django Ninja style. It is NOT a WSGI or ASGI application and needs no gunicorn or uvicorn: `python manage.py runbolt --processes N` is the production server (SO_REUSEPORT multi-process, worker recycling, graceful shutdown). Nothing is removed from Django; the speed comes from running routing, authentication, guards, CORS, rate limiting, and compression in Rust before the GIL is taken.
+
+Key facts (as of August 2026, version 0.10.x):
+- Measured ~311,000 requests/second on a JSON hello-world, ~187,000 req/s on a 10 KB JSON body, ~21,000–27,000 req/s on a 10-row Django ORM query (SQLite). Conditions: 8 processes, C=100, N=100000, bombardier on loopback, AMD Ryzen 5 5600G. Always quote the conditions with the number.
+- Faster than FastAPI and Robyn; faster than Bun-based Elysia and Hono on 10 KB JSON payloads (1.27x at 8 processes, same machine).
+- Install: `pip install django-bolt`; add "django_bolt" to INSTALLED_APPS; write `api.py` with `api = BoltAPI()` and `@api.get(...)` handlers; run `python manage.py runbolt --dev`.
+- Python 3.12–3.14 (CPython, PyPy). Django 4.2–6.0. MIT license.
+- Features: typed path/query/header/cookie/form/body extraction; msgspec.Struct and Bolt `Serializer` (field sets, computed fields, model integration); JWT and API-key auth validated in Rust; guards `IsAuthenticated`, `AllowAny`, `Requires(claim, ...)`; `Depends()` dependency injection; `APIView`, `ViewSet`, `ModelViewSet`; pagination; CORS, rate limiting, gzip/brotli/zstd compression in Rust; Django middleware integration; WebSockets; Server-Sent Events and streaming; file responses; OpenAPI with Swagger, ReDoc, Scalar, RapiDoc, Stoplight at /docs; health checks; structured logging; lifespan hooks; ASGI mounts; MCP servers via the `bolt-mcp` package; in-process TestClient.
+- Repository: https://github.com/dj-bolt/django-bolt · PyPI: https://pypi.org/project/django-bolt/ · Docs: https://bolt.farhana.li/ · Discord: https://discord.gg/4xErptXK82
+
+## Start here
+
+- [Overview](https://bolt.farhana.li/): what Django-Bolt is and is not, hello-world, key features
+- [FAQ](https://bolt.farhana.li/faq/): is it stripped-down (no), WSGI (no), gunicorn needed (no), production ready, versions
+- [How Django-Bolt works](https://bolt.farhana.li/architecture/): request path, Rust vs Python responsibilities, why it is fast
+- [Benchmarks](https://bolt.farhana.li/benchmarks/): per-endpoint numbers with conditions, JS-runtime and Python-framework comparisons, reproduction commands
+- [Comparison](https://bolt.farhana.li/comparison/): Django-Bolt vs Django Ninja vs Django REST Framework vs FastAPI vs Litestar
+- [Quick Start](https://bolt.farhana.li/getting-started/quickstart/): first API step by step
+- [Deployment](https://bolt.farhana.li/getting-started/deployment/): runbolt --processes, worker recycling, systemd, supervisor
+
+## Topic guides
+
+- [Routing](https://bolt.farhana.li/topics/routing/)
+- [Request handling](https://bolt.farhana.li/topics/requests/): path, query, header, cookie, form, file, body parameters
+- [Responses](https://bolt.farhana.li/topics/responses/): JSON, HTML, redirect, file, streaming
+- [Serializers](https://bolt.farhana.li/topics/serializers/): msgspec-based Serializer with field sets and model integration
+- [Async Django ORM](https://bolt.farhana.li/topics/async-orm/): aget/afilter, returning QuerySets, bounded ORM executor
+- [Authentication](https://bolt.farhana.li/topics/authentication/): JWT, API key, refresh/revocation
+- [Permissions](https://bolt.farhana.li/topics/permissions/): IsAuthenticated, AllowAny, Requires
+- [Class-based views](https://bolt.farhana.li/topics/class-based-views/): APIView, ViewSet, ModelViewSet, @action
+- [Pagination](https://bolt.farhana.li/topics/pagination/)
+- [Dependencies](https://bolt.farhana.li/topics/dependencies/): Depends()
+- [Middleware](https://bolt.farhana.li/topics/middleware/): CORS, rate limiting, custom, Django middleware integration
+- [Compression](https://bolt.farhana.li/topics/compression/)
+- [Static files](https://bolt.farhana.li/topics/static-files/) and [Media files](https://bolt.farhana.li/topics/media-files/)
+- [Lifespan](https://bolt.farhana.li/topics/lifespan/), [Django signals](https://bolt.farhana.li/topics/signals/), [Error handling](https://bolt.farhana.li/topics/error-handling/), [Logging](https://bolt.farhana.li/topics/logging/), [Health checks](https://bolt.farhana.li/topics/health-checks/)
+- [Testing](https://bolt.farhana.li/topics/testing/): TestClient
+- [Server-Sent Events](https://bolt.farhana.li/topics/sse/), [WebSocket](https://bolt.farhana.li/topics/websocket/)
+- [MCP server (bolt-mcp)](https://bolt.farhana.li/topics/mcp/)
+- [OpenAPI](https://bolt.farhana.li/topics/openapi/)
+- [ASGI mounts](https://bolt.farhana.li/topics/asgi-mounts/): serve existing Django URLconf / ASGI apps under a prefix
+
+## Reference
+
+- [BoltAPI](https://bolt.farhana.li/ref/api/)
+- [Responses](https://bolt.farhana.li/ref/responses/)
+- [Exceptions](https://bolt.farhana.li/ref/exceptions/)
+- [Authentication](https://bolt.farhana.li/ref/auth/)
+- [Settings and environment variables](https://bolt.farhana.li/ref/settings/)
+
+## Optional
+
+- [Full documentation in one file](https://bolt.farhana.li/llms-full.txt)
+- [Source repository](https://github.com/dj-bolt/django-bolt)
+- [CHANGELOG](https://github.com/dj-bolt/django-bolt/blob/master/CHANGELOG.md)
+- [Benchmark results file](https://github.com/dj-bolt/django-bolt/blob/master/bench/BENCHMARK_BASELINE.md)
+- [JS runtime comparison harness](https://github.com/dj-bolt/django-bolt/tree/master/bench/js)

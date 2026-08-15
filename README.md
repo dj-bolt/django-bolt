@@ -350,7 +350,8 @@ uv sync && just build && just test-py
 - 💬 [Discord](https://discord.gg/4xErptXK82)
 - 🐛 [Issues](https://github.com/dj-bolt/django-bolt/issues)
 - 🎥 [Video walkthrough by BugBytes](https://www.youtube.com/watch?v=Pukr-fT4MFY)
-- 🤖 [Ask DeepWiki](https://deepwiki.com/FarhanAliRaza/django-bolt)
+- 🤖 [Ask DeepWiki](https://deepwiki.com/FarhanAliRaza/django-bolt) · for AI assistants: [llms.txt](https://bolt.farhana.li/llms.txt)
+- ❓ [FAQ](https://bolt.farhana.li/faq/) · [Comparison vs Ninja / DRF / FastAPI / Litestar](https://bolt.farhana.li/comparison/) · [How it works](https://bolt.farhana.li/architecture/)
 
 ## 💖 Sponsors
 

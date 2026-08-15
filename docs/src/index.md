@@ -4,7 +4,9 @@ icon: lucide/zap
 
 # Django-Bolt
 
-Django-Bolt is a high-performance API framework for Django. It lets you build APIs using familiar Django patterns while leveraging Rust for speed.
+Django-Bolt is the fastest Python web framework, built on Django. It serves your endpoints from a Rust HTTP server (Actix Web + Tokio) and validates with msgspec, while the full Django stack — ORM, Admin, middleware, auth, signals, third-party apps — keeps working unchanged. Handlers are typed `async def` functions in the FastAPI/Django Ninja style; no gunicorn or uvicorn is needed.
+
+**Measured:** ~311,000 requests/second on a JSON hello-world (8 processes, C=100, Ryzen 5 5600G, loopback) — see [Benchmarks](benchmarks.md).
 
 ## Installation
 
@@ -67,6 +69,23 @@ Django-Bolt is designed for developers who:
 - Prefer async/await for I/O-bound operations
 - Need incremental migration from existing Django REST APIs—all Django features (ORM, authentication, middleware, signals, admin) work out of the box
 
+## What Django-Bolt is — and is not
+
+Django-Bolt **replaces the HTTP server and the API view layer**. It does **not** remove anything from Django.
+
+| | Django-Bolt |
+| --- | --- |
+| Django ORM (sync + async), migrations, models | ✅ unchanged |
+| Django Admin | ✅ auto-mounted, served by `runbolt` |
+| Django middleware (sessions, CSRF, auth, messages, CSP, custom) | ✅ `BoltAPI(django_middleware=True)` |
+| Django signals, settings, `INSTALLED_APPS`, third-party apps | ✅ unchanged |
+| Static & media files | ✅ served from Rust, no WhiteNoise |
+| HTTP server | Rust (Actix Web + Tokio) — **not** WSGI, **not** ASGI, no gunicorn/uvicorn |
+| Handlers | `async def` (or `def`), typed parameters, msgspec validation |
+| Auth, guards, CORS, rate limiting, compression | Run in Rust before the GIL |
+
+Details: [FAQ](faq.md) · [How it works](architecture.md) · [Comparison with Django Ninja, DRF, FastAPI, Litestar](comparison.md).
+
 ## Key features
 
 **Simple routing** - Decorator-based routing similar to FastAPI, Litestar and Flask:
@@ -98,8 +117,7 @@ from myapp.models import User
 
 @api.get("/users")
 async def list_users():
-    users = await User.objects.all().acount()
-    return {"count": users}
+    return User.objects.all()[:20]   # QuerySet is evaluated and serialized for you
 ```
 
 **Built-in authentication** - JWT and API key authentication out of the box:
@@ -130,6 +148,9 @@ api.mount_mcp(mcp)
 
 - **[Quick Start](getting-started/quickstart.md)** - Build your first API
 - **[Deployment](getting-started/deployment.md)** - Deploy with multiple processes
+- **[Benchmarks](benchmarks.md)** - Numbers, conditions, and how to reproduce them
+- **[Comparison](comparison.md)** - Django-Bolt vs Django Ninja, DRF, FastAPI, Litestar
+- **[FAQ](faq.md)** - Production readiness, admin/ORM support, WSGI, gunicorn
 
 ## Getting help
 

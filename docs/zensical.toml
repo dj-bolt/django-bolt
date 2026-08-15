@@ -17,7 +17,7 @@ site_name = "Django-Bolt"
 # meaningful description of the site content for use by search engines.
 #
 # Read more: https://zensical.org/docs/setup/basics/#site_description
-site_description = "High-performance API framework for Django with Rust-powered endpoints delivering 60k+ RPS"
+site_description = "Django-Bolt: the fastest Python web framework, built on Django. Rust (Actix Web) HTTP server, async typed handlers, msgspec validation — with the full Django ORM, Admin, middleware and auth. 300k+ req/s, no gunicorn or uvicorn."
 
 # The site_author attribute. This is used in the HTML head element.
 #
@@ -34,7 +34,7 @@ repo_name = "FarhanAliRaza/django-bolt"
 # The site_url is the canonical URL for your site. When building online
 # documentation you should set this.
 # Read more: https://zensical.org/docs/setup/basics/#site_url
-#site_url = "https://www.example.com/"
+site_url = "https://bolt.farhana.li/"
 
 # The copyright notice appears in the page footer and can contain an HTML
 # fragment.
@@ -56,6 +56,10 @@ nav = [
     { "Overview" = "index.md" },
     { "Quick Start" = "getting-started/quickstart.md" },
     { "Deployment" = "getting-started/deployment.md" },
+    { "How It Works" = "architecture.md" },
+    { "Benchmarks" = "benchmarks.md" },
+    { "Comparison" = "comparison.md" },
+    { "FAQ" = "faq.md" },
   ]},
   { "Topic Guides" = [
     { "Routing" = "topics/routing.md" },
