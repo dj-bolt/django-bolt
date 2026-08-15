@@ -657,7 +657,7 @@ pub async fn handle_websocket_upgrade_with_handler(
                 // the foreign selector and the WebSocket side hangs.) The
                 // receive/send futures created by `future_into_py` follow the
                 // running loop, so they migrate with the handler.
-                let locals = crate::worker_loop::worker_task_locals(py)?;
+                let locals = crate::state::worker_task_locals(py)?;
 
                 // Convert Python coroutine to Rust future using the shared event loop
                 pyo3_async_runtimes::into_future_with_locals(locals, coro.bind(py).clone())

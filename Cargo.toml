@@ -18,7 +18,11 @@ default = ["mimalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 
+[workspace]
+members = ["crates/bolt-loop"]
+
 [dependencies]
+bolt-loop = { path = "crates/bolt-loop" }
 # NOTE: "extension-module" is NOT hardcoded here — maturin enables it via
 # pyproject.toml's [tool.maturin] features. This lets `cargo test`/`cargo bench`
 # link libpython normally for native tests and criterion benches.

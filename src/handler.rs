@@ -1364,7 +1364,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // the same GIL block. Eliminates: coroutine creation,
             // into_future_with_locals, asyncio polling.
             let result_obj = if is_async_handler {
-                crate::worker_loop::dispatch_sync(py, &route.dispatch_sync, &request_obj)?
+                bolt_loop::dispatch_sync(py, &route.dispatch_sync, request_obj.bind(py))?
             } else {
                 route.dispatch_sync.call1(py, (request_obj,))?
             };
@@ -1439,7 +1439,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // ASYNC PATH: submit to the process-lived WorkerLoop whose ready
             // queue is serviced by a persistent Tokio pump.
             let dispatch = route.dispatch.clone_ref(py);
-            let fut = crate::worker_loop::dispatch(dispatch, request_obj.into());
+            let fut = bolt_loop::dispatch(dispatch, request_obj.into());
             Ok(DispatchOutcome::Pending(Box::pin(fut)))
         }
     });

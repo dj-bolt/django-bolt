@@ -169,7 +169,7 @@ fn schedule_async_stream_forwarder(
     // loop's selector. (Regression seen as bolt-mcp sampling hanging: the
     // SSE tool's future lived on uvloop, the client's reply POST ran on the
     // WorkerLoop.)
-    let locals = crate::worker_loop::worker_task_locals(py)?.clone();
+    let locals = crate::state::worker_task_locals(py)?.clone();
     let sender = Py::new(
         py,
         AsyncStreamSender {

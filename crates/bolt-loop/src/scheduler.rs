@@ -10,15 +10,22 @@ use pyo3::sync::PyOnceLock;
 #[cfg(unix)]
 use std::collections::HashMap;
 
-use crate::request::PyRequest;
-use crate::state::TASK_LOCALS;
-
 static WORKER_LOOP_FACTORY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static WORKER_DISPATCH_START: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static WORKER_DISPATCH_START_CANCELLABLE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static WORKER_SYNC_DISPATCH: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_HANDLE_FAILED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static PYTHON_MODULE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+pub(crate) fn set_python_module(name: &'static str) {
+    let _ = PYTHON_MODULE.set(name);
+}
+
+fn python_module() -> PyResult<&'static str> {
+    PYTHON_MODULE.get().copied().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "bolt_loop::init(python_module) must be called before the loop is used",
+        )
+    })
+}
 static WORKER_SERVICE: std::sync::OnceLock<WorkerLoopService> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
@@ -32,7 +39,7 @@ pub(crate) enum WorkerLoopCommand {
     /// either requeue while the descriptor stays ready, tell the watcher to
     /// re-arm, or drop it when the handle was cancelled.
     #[cfg(unix)]
-    Ready(crate::worker_fd::Ready),
+    Ready(crate::fd::Ready),
 }
 
 struct WorkerLoopService {
@@ -40,7 +47,7 @@ struct WorkerLoopService {
     #[cfg(unix)]
     runtime: tokio::runtime::Handle,
     #[cfg(unix)]
-    fd_watchers: crate::worker_fd::FdWatchers,
+    fd_watchers: crate::fd::FdWatchers,
 }
 
 impl WorkerLoopService {
@@ -58,22 +65,19 @@ impl WorkerLoopService {
                 #[cfg(unix)]
                 runtime: tokio::runtime::Handle::current(),
                 #[cfg(unix)]
-                fd_watchers: crate::worker_fd::FdWatchers::default(),
+                fd_watchers: crate::fd::FdWatchers::default(),
             }
         })
     }
 }
 
-fn get_worker_fn<'py>(
+pub(crate) fn get_worker_fn<'py>(
     py: Python<'py>,
     slot: &'static PyOnceLock<Py<PyAny>>,
     name: &str,
 ) -> PyResult<&'static Py<PyAny>> {
     slot.get_or_try_init(py, || {
-        Ok(py
-            .import("django_bolt._worker_loop")?
-            .getattr(name)?
-            .unbind())
+        Ok(py.import(python_module()?)?.getattr(name)?.unbind())
     })
 }
 
@@ -84,11 +88,9 @@ fn get_worker_fn<'py>(
 /// would deadlock the moment a WorkerLoop-dispatched handler resolves one of
 /// its futures (asyncio wakes waiters via a same-loop `call_soon`).
 ///
-/// Rust outside this module reaches the loop through `worker_task_locals`.
-/// The one deliberate exception is `asgi_http::submit_to_event_loop`: mounted
-/// ASGI apps stay on the startup/selector loop (`state::TASK_LOCALS`), so they
-/// cannot share asyncio primitives with Bolt handlers.
-fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
+/// Hosts that need `pyo3_async_runtimes::TaskLocals` build them from this
+/// loop (django-bolt: `state::worker_task_locals`).
+pub fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     WORKER_LOOP.get_or_try_init(py, || {
         let scheduler = Py::new(
             py,
@@ -98,28 +100,6 @@ fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
         )?;
         let factory = get_worker_fn(py, &WORKER_LOOP_FACTORY, "make_worker_loop")?;
         factory.call1(py, (scheduler,)).map(Into::into)
-    })
-}
-
-/// TaskLocals bound to the WorkerLoop, for Rust code that schedules Python
-/// coroutines or resolves Python futures on the HTTP dispatch loop
-/// (e.g. the streaming forwarder and its backpressure futures).
-///
-/// The context is the startup one, not a fresh `copy_context()`: this snapshot
-/// is initialized lazily from whichever request first streams or upgrades, and
-/// is then inherited by every stream/WebSocket task for the process lifetime —
-/// so copying here would pin that request's contextvars forever.
-pub(crate) fn worker_task_locals(
-    py: Python<'_>,
-) -> PyResult<&'static pyo3_async_runtimes::TaskLocals> {
-    static WORKER_TASK_LOCALS: PyOnceLock<pyo3_async_runtimes::TaskLocals> = PyOnceLock::new();
-    WORKER_TASK_LOCALS.get_or_try_init(py, || {
-        let event_loop = get_loop(py)?.bind(py).clone();
-        // `get_loop` already errored if TASK_LOCALS was unset.
-        let startup = TASK_LOCALS.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
-        })?;
-        Ok(pyo3_async_runtimes::TaskLocals::new(event_loop).with_context(startup.context(py)))
     })
 }
 
@@ -293,19 +273,19 @@ const TIMER_COMPACTION_MIN_CANCELLED: usize = 64;
 /// (e.g. completed `asyncio.wait_for` deadlines) would be counted here until
 /// their deadline passes.
 #[pyfunction]
-pub(crate) fn worker_timer_count() -> usize {
+pub fn worker_timer_count() -> usize {
     WORKER_TIMER_LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(unix)]
-pub(crate) fn fd_watchers() -> &'static crate::worker_fd::FdWatchers {
+pub(crate) fn fd_watchers() -> &'static crate::fd::FdWatchers {
     &WorkerLoopService::get().fd_watchers
 }
 
 /// Test/introspection hook: descriptor watchers whose Tokio task is still
 /// running. A watcher for a cancelled handle must exit rather than spin.
 #[pyfunction]
-pub(crate) fn worker_fd_watcher_count() -> usize {
+pub fn worker_fd_watcher_count() -> usize {
     #[cfg(unix)]
     {
         WorkerLoopService::get().fd_watchers.live_count()
@@ -392,7 +372,7 @@ fn run_worker_timers(rx: std::sync::mpsc::Receiver<TimerCommand>) {
 }
 
 #[pyclass(frozen)]
-pub(crate) struct WorkerLoopScheduler {
+pub struct WorkerLoopScheduler {
     tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
 }
 
@@ -438,7 +418,7 @@ impl WorkerLoopScheduler {
             &service.runtime,
             &self.tx,
             fd,
-            crate::worker_fd::Direction::Read,
+            crate::fd::Direction::Read,
             handle,
         )
     }
@@ -450,7 +430,7 @@ impl WorkerLoopScheduler {
             &service.runtime,
             &self.tx,
             fd,
-            crate::worker_fd::Direction::Write,
+            crate::fd::Direction::Write,
             handle,
         )
     }
@@ -459,14 +439,14 @@ impl WorkerLoopScheduler {
     fn remove_reader(&self, fd: i32) -> bool {
         WorkerLoopService::get()
             .fd_watchers
-            .remove(fd, crate::worker_fd::Direction::Read)
+            .remove(fd, crate::fd::Direction::Read)
     }
 
     #[cfg(unix)]
     fn remove_writer(&self, fd: i32) -> bool {
         WorkerLoopService::get()
             .fd_watchers
-            .remove(fd, crate::worker_fd::Direction::Write)
+            .remove(fd, crate::fd::Direction::Write)
     }
 
     #[cfg(not(unix))]
@@ -560,152 +540,4 @@ impl WorkerLoopScheduler {
     fn remove_signal_handler(&self, _sig: i32) -> bool {
         false
     }
-}
-
-#[pyclass(frozen)]
-struct WorkerDispatchResolver {
-    tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<PyResult<Py<PyAny>>>>>,
-}
-
-#[pymethods]
-impl WorkerDispatchResolver {
-    fn set_result(&self, value: Py<PyAny>) {
-        if let Some(tx) = self.tx.lock().unwrap().take() {
-            let _ = tx.send(Ok(value));
-        }
-    }
-
-    fn set_exception(&self, exc: Bound<'_, PyAny>) {
-        if let Some(tx) = self.tx.lock().unwrap().take() {
-            let _ = tx.send(Err(PyErr::from_value(exc)));
-        }
-    }
-}
-
-/// Deliberate: if the caller's future is dropped (client disconnect), the
-/// Python task is NOT cancelled — it runs to completion and its result is
-/// discarded, consistent with tasks being allowed to outlive responses.
-pub(crate) async fn dispatch(dispatch: Py<PyAny>, request: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    Python::attach(|py| {
-        let resolver = Py::new(
-            py,
-            WorkerDispatchResolver {
-                tx: std::sync::Mutex::new(Some(tx)),
-            },
-        )?;
-        let start = get_worker_fn(py, &WORKER_DISPATCH_START, "worker_dispatch_start")?;
-        start.call1(py, (dispatch, request, get_loop(py)?, resolver))?;
-        Ok::<_, PyErr>(())
-    })?;
-
-    match rx.await {
-        Ok(result) => result,
-        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "worker dispatch resolver dropped without a result",
-        )),
-    }
-}
-
-/// Holds the asyncio Task created by `worker_dispatch_start_cancellable` so a
-/// later cancellation can reach it. Filled from the WorkerLoop thread.
-#[pyclass(frozen)]
-pub(crate) struct WorkerTaskHandle {
-    task: std::sync::Mutex<Option<Py<PyAny>>>,
-    cancelled: std::sync::atomic::AtomicBool,
-}
-
-#[pymethods]
-impl WorkerTaskHandle {
-    fn set_task(&self, task: Bound<'_, PyAny>) {
-        let mut slot = self.task.lock().unwrap();
-        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-            drop(slot);
-            let _ = task.call_method0("cancel");
-        } else {
-            *slot = Some(task.unbind());
-        }
-    }
-}
-
-/// Cancellable variant of [`dispatch`], used by MCP tool calls: rmcp fires the
-/// request's `CancellationToken` when the client closes the SSE response
-/// stream (the 2026-07-28 cancellation signal) or sends
-/// `notifications/cancelled` (legacy sessions). Plain routes keep the
-/// non-cancelling `dispatch` semantics deliberately (tasks may outlive
-/// responses); MCP semantics require the tool to actually stop.
-pub(crate) async fn dispatch_cancellable(
-    dispatch: Py<PyAny>,
-    payload: Py<PyAny>,
-    ct: tokio_util::sync::CancellationToken,
-) -> PyResult<Py<PyAny>> {
-    let (tx, mut rx) = tokio::sync::oneshot::channel();
-    let handle = Python::attach(|py| {
-        let resolver = Py::new(
-            py,
-            WorkerDispatchResolver {
-                tx: std::sync::Mutex::new(Some(tx)),
-            },
-        )?;
-        let handle = Py::new(
-            py,
-            WorkerTaskHandle {
-                task: std::sync::Mutex::new(None),
-                cancelled: std::sync::atomic::AtomicBool::new(false),
-            },
-        )?;
-        let start = get_worker_fn(
-            py,
-            &WORKER_DISPATCH_START_CANCELLABLE,
-            "worker_dispatch_start_cancellable",
-        )?;
-        start.call1(
-            py,
-            (
-                dispatch,
-                payload,
-                get_loop(py)?,
-                resolver,
-                handle.clone_ref(py),
-            ),
-        )?;
-        Ok::<_, PyErr>(handle)
-    })?;
-
-    tokio::select! {
-        result = &mut rx => match result {
-            Ok(result) => result,
-            Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "worker dispatch resolver dropped without a result",
-            )),
-        },
-        _ = ct.cancelled() => {
-            Python::attach(|py| {
-                let inner = handle.bind(py).get();
-                inner.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(task) = inner.task.lock().unwrap().take() {
-                    // Schedule `.cancel()` on the task's own loop; calling it
-                    // from this thread directly is not loop-safe.
-                    let task = task.bind(py);
-                    if let (Ok(task_loop), Ok(cancel)) =
-                        (task.call_method0("get_loop"), task.getattr("cancel"))
-                    {
-                        let _ = task_loop.call_method1("call_soon_threadsafe", (cancel,));
-                    }
-                }
-            });
-            Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "MCP request cancelled by client",
-            ))
-        }
-    }
-}
-
-pub(crate) fn dispatch_sync(
-    py: Python<'_>,
-    dispatch: &Py<PyAny>,
-    request: &Py<PyRequest>,
-) -> PyResult<Py<PyAny>> {
-    let call = get_worker_fn(py, &WORKER_SYNC_DISPATCH, "worker_sync_dispatch")?;
-    call.call1(py, (dispatch, request, get_loop(py)?))
 }

@@ -1,0 +1,13 @@
+[package]
+name = "bolt-loop"
+version = "0.1.0"
+edition = "2021"
+description = "asyncio event loop driven by a Tokio runtime: ready queue, timers, signals, and fd readiness for a Python SelectorEventLoop subclass"
+license = "MIT"
+publish = false
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["abi3-py312"] }
+tokio = { version = "1", features = ["rt", "sync", "signal", "net", "macros"] }
+tokio-util = "0.7"
+libc = "0.2"

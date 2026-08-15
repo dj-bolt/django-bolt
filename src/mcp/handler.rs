@@ -33,7 +33,6 @@ use crate::mcp::state_codec;
 use crate::mcp::McpAuthExt;
 use crate::middleware::auth::{populate_auth_context, AuthContext};
 use crate::permissions::{evaluate_guards, GuardResult};
-use crate::worker_loop;
 
 #[derive(Clone)]
 pub struct McpHandler {
@@ -202,7 +201,7 @@ impl McpHandler {
         })
         .map_err(|e| McpError::internal_error(format!("MCP payload build failed: {e}"), None))?;
 
-        let result = worker_loop::dispatch_cancellable(callable, payload, ctx.ct.clone()).await;
+        let result = bolt_loop::dispatch_cancellable(callable, payload, ctx.ct.clone()).await;
         let raw = extract_result_string(result)?;
         match parse_py_result::<T>(&raw, mode) {
             PyOutcome::Ok(value) => Ok(value),
@@ -314,7 +313,7 @@ impl McpHandler {
         .map_err(|e| McpError::internal_error(format!("MCP payload build failed: {e}"), None))?;
 
         // ---- Run + notification pump ----
-        let dispatch_fut = worker_loop::dispatch_cancellable(callable, payload, ctx.ct.clone());
+        let dispatch_fut = bolt_loop::dispatch_cancellable(callable, payload, ctx.ct.clone());
         let result = match rx {
             None => dispatch_fut.await,
             Some(mut rx) => {

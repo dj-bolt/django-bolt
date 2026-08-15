@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
-use crate::worker_loop::WorkerLoopCommand;
+use crate::scheduler::WorkerLoopCommand;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Direction {
@@ -169,7 +169,7 @@ struct Retire {
 
 impl Drop for Retire {
     fn drop(&mut self) {
-        crate::worker_loop::fd_watchers().retire(self.fd, self.direction, tokio::task::id());
+        crate::scheduler::fd_watchers().retire(self.fd, self.direction, tokio::task::id());
     }
 }
 

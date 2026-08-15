@@ -108,9 +108,34 @@ pub static GLOBAL_ROUTER: OnceCell<Arc<Router>> = OnceCell::new();
 pub static GLOBAL_WEBSOCKET_ROUTER: OnceCell<Arc<WebSocketRouter>> = OnceCell::new();
 pub static GLOBAL_ASGI_MOUNTS: OnceCell<Arc<Vec<AsgiMount>>> = OnceCell::new();
 // The startup/selector loop. Bolt route coroutines run on the WorkerLoop
-// instead (see `worker_loop::worker_task_locals`); this loop backs the
-// WorkerLoop's delegated selector work and mounted ASGI apps.
+// instead (see `worker_task_locals`); this loop backs mounted ASGI apps.
 pub static TASK_LOCALS: OnceCell<TaskLocals> = OnceCell::new();
+
+/// TaskLocals bound to the WorkerLoop (`bolt_loop::get_loop`), for Rust code
+/// that schedules Python coroutines or resolves Python futures on the HTTP
+/// dispatch loop (e.g. the streaming forwarder and its backpressure futures).
+///
+/// Every Python coroutine belonging to a Bolt route — HTTP dispatch, streaming
+/// response generators, WebSocket handlers — must run on the WorkerLoop, so
+/// that futures, queues, and locks shared between handlers always live on one
+/// loop. The one deliberate exception is `asgi_http::submit_to_event_loop`:
+/// mounted ASGI apps stay on the startup/selector loop (`TASK_LOCALS`), so
+/// they cannot share asyncio primitives with Bolt handlers.
+///
+/// The context is the startup one, not a fresh `copy_context()`: this snapshot
+/// is initialized lazily from whichever request first streams or upgrades, and
+/// is then inherited by every stream/WebSocket task for the process lifetime —
+/// so copying here would pin that request's contextvars forever.
+pub(crate) fn worker_task_locals(py: Python<'_>) -> PyResult<&'static TaskLocals> {
+    static WORKER_TASK_LOCALS: pyo3::sync::PyOnceLock<TaskLocals> = pyo3::sync::PyOnceLock::new();
+    WORKER_TASK_LOCALS.get_or_try_init(py, || {
+        let event_loop = bolt_loop::get_loop(py)?.bind(py).clone();
+        let startup = TASK_LOCALS.get().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
+        })?;
+        Ok(TaskLocals::new(event_loop).with_context(startup.context(py)))
+    })
+}
 pub static ROUTE_METADATA: OnceCell<Arc<RouteMetadataStore>> = OnceCell::new();
 pub static ROUTE_METADATA_TEMP: OnceCell<AHashMap<usize, RouteMetadata>> = OnceCell::new(); // Temporary storage before CORS injection
 

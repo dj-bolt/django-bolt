@@ -4,7 +4,7 @@ The loop keeps one identity for the life of the process.  It is a real
 ``asyncio.SelectorEventLoop`` subclass, so transports, ``sock_*`` helpers,
 DNS, pipes, TLS, and subprocesses come from the stdlib; the ready queue,
 timers, signals, and file-descriptor readiness are driven by Rust/Tokio
-(see ``src/worker_loop.rs`` and ``src/worker_fd.rs``).
+(see the ``bolt-loop`` crate under ``crates/bolt-loop``).
 
 Callbacks may resume on a different OS thread after a suspension (the Tokio
 pump task can migrate between worker threads).  Contextvars are preserved via

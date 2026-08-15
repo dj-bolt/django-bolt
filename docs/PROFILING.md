@@ -44,8 +44,8 @@ stack is large enough (~35-40% of GIL samples) to drown the signal.
 worker (WorkerLoop), under uvloop, and under the stdlib selector loop, and
 prints µs per operation: `call_soon` chain, `sleep(0)` chain, one
 `add_reader` readiness event, a `sock_recv`/`sock_sendall` round trip, and a
-StreamReader/Writer round trip. Use it when touching `src/worker_loop.rs`,
-`src/worker_fd.rs`, or `_worker_loop.py`. `TestClient` is not a substitute:
+StreamReader/Writer round trip. Use it when touching `crates/bolt-loop/`
+or `_worker_loop.py`. `TestClient` is not a substitute:
 it dispatches async handlers on a stdlib background loop, so its numbers are
 the stdlib column. Reference (12-core Linux, Python 3.12): WorkerLoop is
 ~0.75-0.8x of uvloop on the ready-queue paths, ~1.1x on raw fd events, and at

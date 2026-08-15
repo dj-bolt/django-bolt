@@ -469,6 +469,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bolt-loop"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "pyo3",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -963,6 +973,7 @@ dependencies = [
  "actix-web-actors",
  "ahash",
  "base64 0.22.1",
+ "bolt-loop",
  "brotli",
  "bytes",
  "chrono",
