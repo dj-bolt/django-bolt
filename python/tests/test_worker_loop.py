@@ -8,12 +8,10 @@ this test fails loudly if a future CPython moves them.
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 
-from django_bolt._worker_loop import _ThreadsafeServerProxy, _with_running_loop
+from django_bolt._worker_loop import _with_running_loop
 
 
 def test_with_running_loop_installs_and_restores():
@@ -39,21 +37,3 @@ def test_with_running_loop_restores_on_exception():
             asyncio.get_running_loop()
     finally:
         loop.close()
-
-
-def test_server_proxy_close_clients_is_detected_and_dispatched():
-    selector_loop = Mock()
-    raw_server = Mock()
-    proxy = _ThreadsafeServerProxy(SimpleNamespace(_selector_loop=selector_loop), raw_server)
-
-    close_clients = proxy.close_clients
-    close_clients()
-
-    selector_loop.call_soon_threadsafe.assert_called_once_with(raw_server.close_clients)
-
-
-def test_server_proxy_close_clients_lookup_preserves_missing_attribute():
-    proxy = _ThreadsafeServerProxy(SimpleNamespace(_selector_loop=Mock()), object())
-
-    with pytest.raises(AttributeError):
-        _ = proxy.close_clients

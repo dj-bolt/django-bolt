@@ -16,14 +16,14 @@ Probe map:
 - /t-sleep0   await asyncio.sleep(0)      → eager start + bare-yield reschedule
 - /t-timer    await asyncio.sleep(1ms)    → timer scheduling
 - /t-cancelled-timers + /t-timer-stats    → cancelled-timer heap compaction
-- /t-crossing-timeout                     → bounded cross-loop sync crossings
 - /t-thread   await sync_to_thread(...)   → eager start + real Future suspension
-- /t-subprocess-wait  wait() on live child → pending exit waiter crosses loops
+- /t-subprocess-wait  wait() on live child → pending exit waiter on the child watcher
 - /t-exc      HTTPException after await   → exception through the driver Task
 - /t-deps     two async Depends           → asyncio.gather in the first segment
 - /t-task     create_task in first segment → loop APIs during eager execution
 - /t-stream   async generator (NDJSON)    → streaming wire through async path
-- /t-server-api                           → Server.get_loop()/close_clients() proxying
+- /t-server-api                           → Server.get_loop()/close_clients() on the WorkerLoop
+- /t-fd-cancelled-handle                 → cancelled reader Handle stops its Rust watcher
 - /t-datagram-flow-control                → pause/resume_writing reaches datagram protocols
 - /t-call-soon-coroutine                  → debug-mode call_soon(coroutine) rejection
 """
@@ -115,24 +115,6 @@ async def t_oversized_timer():
         return {"raised": "OverflowError"}
     handle.cancel()
     return {"raised": None}
-
-
-@api.get("/t-crossing-timeout")
-async def t_crossing_timeout():
-    loop = asyncio.get_running_loop()
-    reader, writer = await asyncio.open_connection("127.0.0.1", int(os.environ["BOLT_PROBE_TCP_PORT"]))
-    try:
-        await reader.readline()
-        # Wedge the selector loop past the crossing timeout, then attempt a
-        # synchronous crossing (transport write). It must raise, not hang.
-        loop._selector_loop.call_soon_threadsafe(time.sleep, 4)
-        try:
-            writer.write(b"ping\n")
-        except RuntimeError as exc:
-            return {"timed_out": "did not complete within" in str(exc)}
-        return {"timed_out": False}
-    finally:
-        writer.close()
 
 
 @api.get("/t-thread")
@@ -332,6 +314,82 @@ async def t_fd_watcher():
         peer_sock.close()
 
 
+@api.get("/t-fd-level-triggered")
+async def t_fd_level_triggered():
+    """A reader that drains only part of the pending bytes must be called
+    again (asyncio's selector is level-triggered; Tokio's reactor is not)."""
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    done = loop.create_future()
+    chunks = []
+
+    def readable():
+        chunks.append(os.read(read_fd, 1))
+        if len(chunks) == 4 and not done.done():
+            done.set_result(True)
+
+    try:
+        loop.add_reader(read_fd, readable)
+        os.write(write_fd, b"abcd")
+        await asyncio.wait_for(done, 1)
+        return {"chunks": [c.decode() for c in chunks]}
+    finally:
+        loop.remove_reader(read_fd)
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@api.get("/t-fd-cancelled-handle")
+async def t_fd_cancelled_handle():
+    """A reader whose Handle was cancelled directly (not via remove_reader)
+    must stop its Rust watcher; the stdlib selector loop drops such readers.
+    Otherwise a permanently readable descriptor requeues the no-op forever."""
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    calls = []
+    try:
+        handle = loop._add_reader(read_fd, lambda: calls.append(os.read(read_fd, 1)))
+        before = _core.worker_fd_watcher_count()
+        handle.cancel()
+        os.write(write_fd, b"x")
+        deadline = loop.time() + 2
+        while _core.worker_fd_watcher_count() != before - 1 and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        return {"watcher_stopped": _core.worker_fd_watcher_count() == before - 1, "calls": len(calls)}
+    finally:
+        loop.remove_reader(read_fd)
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@api.get("/t-fd-read-write")
+async def t_fd_read_write():
+    """Reader and writer registered on the same descriptor at once (psycopg's
+    ``Wait.RW``) must both fire and be removable independently."""
+    loop = asyncio.get_running_loop()
+    sock, peer = socket.socketpair()
+    readable = loop.create_future()
+    writable = loop.create_future()
+    try:
+        loop.add_reader(sock, lambda: readable.set_result(sock.recv(16)) if not readable.done() else None)
+        loop.add_writer(sock, lambda: writable.set_result(True) if not writable.done() else None)
+        await asyncio.wait_for(writable, 1)
+        writer_removed = loop.remove_writer(sock)
+        peer.send(b"rw")
+        data = await asyncio.wait_for(readable, 1)
+        return {
+            "value": data.decode(),
+            "writer_removed": writer_removed,
+            "reader_removed": loop.remove_reader(sock),
+            "writer_removed_again": loop.remove_writer(sock),
+        }
+    finally:
+        loop.remove_reader(sock)
+        loop.remove_writer(sock)
+        sock.close()
+        peer.close()
+
+
 @api.get("/t-signal")
 async def t_signal():
     loop = asyncio.get_running_loop()
@@ -457,15 +515,12 @@ async def t_datagram_flow_control():
     transport, _ = await loop.create_datagram_endpoint(Protocol, local_addr=("127.0.0.1", 0))
     try:
         # Kernel UDP send buffers cannot be filled deterministically, so
-        # trigger the flow-control callbacks the way the selector transport
-        # does: from the selector thread, against the protocol object the raw
-        # transport owns (the WorkerLoop adapter, which must forward them).
-        raw_transport = getattr(transport, "_raw_transport", transport)
-        selector_protocol = raw_transport.get_protocol()
-        selector_loop = getattr(loop, "_selector_loop", loop)
-        selector_loop.call_soon_threadsafe(selector_protocol.pause_writing)
+        # trigger the flow-control callbacks the way the transport does:
+        # scheduled on the loop against the protocol the transport owns.
+        protocol = transport.get_protocol()
+        loop.call_soon_threadsafe(protocol.pause_writing)
         await asyncio.wait_for(paused, 1)
-        selector_loop.call_soon_threadsafe(selector_protocol.resume_writing)
+        loop.call_soon_threadsafe(protocol.resume_writing)
         await asyncio.wait_for(resumed, 1)
         return {"paused": True, "resumed": True}
     finally:

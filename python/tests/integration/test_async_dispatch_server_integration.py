@@ -14,6 +14,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 import pytest
 
@@ -57,39 +58,23 @@ def test_dispatch_probes_in_process():
 
 
 class _EchoHandler(socketserver.StreamRequestHandler):
+    # Lines received from the probes; asserted on the main thread because an
+    # AssertionError raised here is swallowed by socketserver.handle_error.
+    received: ClassVar[list[bytes]] = []
+    line_received: ClassVar[threading.Condition] = threading.Condition()
+
     def handle(self):
         self.wfile.write(b"hello\n")
-        # EOF is allowed: the crossing-timeout probe abandons its write.
-        assert self.rfile.readline() in (b"ping\n", b"")
+        line = self.rfile.readline()
+        with self.line_received:
+            self.received.append(line)
+            self.line_received.notify_all()
 
-
-@pytest.mark.server_integration
-def test_crossing_timeout_guard(make_server_project):
-    """A synchronous WorkerLoop→selector-loop crossing must raise instead of
-    deadlocking once the selector loop is wedged past the crossing timeout.
-
-    Runs against its own server: the short timeout must not apply to the main
-    probe matrix, where a saturated machine can stretch healthy crossings
-    (e.g. subprocess pipe teardown) past a 2-second deadline.
-    """
-    project = make_server_project(api_module=app_module("dispatch_probes"))
-    echo_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _EchoHandler)
-    echo_thread = threading.Thread(target=echo_server.serve_forever, daemon=True)
-    echo_thread.start()
-    try:
-        with project.start(
-            env={
-                "BOLT_PROBE_TCP_PORT": str(echo_server.server_address[1]),
-                # Short enough to test the deadlock guard without stalling the
-                # suite; the probe wedges the selector loop for 4 seconds.
-                "DJANGO_BOLT_LOOP_CROSSING_TIMEOUT": "2",
-            }
-        ) as server:
-            assert server.get("/t-crossing-timeout").json() == {"timed_out": True}
-    finally:
-        echo_server.shutdown()
-        echo_server.server_close()
-        echo_thread.join(timeout=2)
+    @classmethod
+    def wait_for_lines(cls, count: int, timeout: float = 5) -> list[bytes]:
+        with cls.line_received:
+            cls.line_received.wait_for(lambda: len(cls.received) >= count, timeout)
+            return list(cls.received)
 
 
 @pytest.mark.server_integration
@@ -121,6 +106,7 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
     tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls_context.load_cert_chain(certificate, private_key)
 
+    _EchoHandler.received.clear()
     echo_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _EchoHandler)
     echo_thread = threading.Thread(target=echo_server.serve_forever, daemon=True)
     echo_thread.start()
@@ -201,6 +187,7 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             assert response.status_code == 200
             assert response.json() == {"greeting": "hello"}
             assert server.get("/t-buffered-protocol").json() == {"greeting": "hello"}
+            assert _EchoHandler.wait_for_lines(2) == [b"ping\n", b"ping\n"]
             assert server.get("/t-start-tls").json() == {"reply": "tls-ok"}
             assert server.get("/t-backpressure").json() == {
                 "received": 8 * 1024 * 1024,
@@ -221,6 +208,14 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             else:
                 assert server_api["close_clients_eof"] is None
             assert server.get("/t-datagram").json() == {"reply": "datagram-ok"}
+            assert server.get("/t-fd-level-triggered").json() == {"chunks": ["a", "b", "c", "d"]}
+            assert server.get("/t-fd-cancelled-handle").json() == {"watcher_stopped": True, "calls": 0}
+            assert server.get("/t-fd-read-write").json() == {
+                "value": "rw",
+                "writer_removed": True,
+                "reader_removed": True,
+                "writer_removed_again": False,
+            }
             assert server.get("/t-datagram-flow-control").json() == {"paused": True, "resumed": True}
 
             # A detached Task survives the response that created it.
