@@ -24,4 +24,3 @@ pnpm-lock.yaml
 .claude/settings.local.json
 docs/src/llms-full.txt
 
-bench/.BENCHMARK_HEAD.md

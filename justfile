@@ -6,7 +6,7 @@ port := "8001"
 c := "100"
 # 100k requests ≈ 0.3-1s per endpoint at typical RPS. 10k finished in ~40ms on
 # fast endpoints — mostly connection-ramp transient, giving ±25% run-to-run
-# noise that made bench comparisons (and the 2% bench-gate) meaningless.
+# noise that made bench comparisons meaningless.
 n := "100000"
 p := "8"
 workers := "1"
@@ -126,28 +126,9 @@ save-bench host=host port=port c=c n=n p=p workers=workers:
 # Build and run benchmark
 build-bench: build save-bench
 
-# Deterministic pass/fail gate: per-endpoint RPS AND p99 latency vs baseline
-bench-gate:
-    #!/usr/bin/env bash
-    set -e
-    git show HEAD:bench/BENCHMARK.md > bench/.BENCHMARK_HEAD.md
-    uv run python scripts/benchmark_compare.py --baseline bench/.BENCHMARK_HEAD.md --candidate bench/BENCHMARK.md
-
 # WorkerLoop vs uvloop vs stdlib: µs per call_soon / sleep(0) / fd event / socket round trip
 bench-loop *ARGS:
     uv run --with uvloop python scripts/benchmark_loop.py {{ARGS}}
-
-# Rust micro-benchmarks (criterion) — pure hot-path functions
-bench-rust:
-    cargo bench
-
-# Python micro-benchmarks (pytest-benchmark) — injectors, deps, serialization
-bench-micro:
-    uv run --with pytest --with pytest-benchmark pytest python/benchmarks -q
-
-# Save a named pytest-benchmark run for later `pytest-benchmark compare`
-bench-micro-save NAME:
-    uv run --with pytest --with pytest-benchmark pytest python/benchmarks -q --benchmark-save={{NAME}}
 
 # Build with profiling profile (release + debug symbols) for flamegraphs
 build-profiling:

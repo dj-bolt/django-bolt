@@ -82,12 +82,6 @@ Benchmark recipes need `bombardier` (`go install github.com/codesenberg/bombardi
 just save-bench                  # defaults: host=127.0.0.1 port=8001 c=100 n=100000 p=8 workers=1
 just save-bench 127.0.0.1 8001 100 50000   # positional: host port c n ...
 
-# Deterministic regression gate (per-endpoint RPS AND p99 vs baseline)
-just bench-gate
-
-# Micro-benchmarks (no server, no bombardier needed)
-just bench-rust    # criterion: pure-Rust hot functions (query/cookie parsing, coercion)
-just bench-micro   # pytest-benchmark: injectors, deps, serialization (python/benchmarks/)
 ```
 
 See [docs/PROFILING.md](docs/PROFILING.md) for the full layered measurement

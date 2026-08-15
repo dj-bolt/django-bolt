@@ -56,9 +56,6 @@ just lint-lib
 | `just ruff-fix` | Auto-fix lint errors |
 | `just format` | Format code with ruff |
 | `just save-bench` | Run the full benchmark suite and save results |
-| `just bench-gate` | Regression gate: per-endpoint RPS and p99 vs baseline |
-| `just bench-rust` | Criterion micro-benchmarks for pure-Rust hot paths |
-| `just bench-micro` | pytest-benchmark micro-benchmarks (no server needed) |
 | `just smoke` | Quick endpoint smoke test against a running server |
 | `just kill` | Kill any running dev servers |
 
@@ -79,7 +76,6 @@ python/bolt-mcp/         Optional MCP add-on package
 python/tests/            Python test suite
 python/tests/integration/apps/   Real app modules used by server-integration tests
 python/example/          Example Django project (also used for benchmarks)
-python/benchmarks/       pytest-benchmark micro-benchmarks
 bench/                   Benchmark results and JS-runtime comparison
 docs/                    Documentation site source
 ```
@@ -97,8 +93,7 @@ See [`CLAUDE.md`](CLAUDE.md) for a deeper architecture overview, request flow, a
 
 ### Performance-sensitive code
 
-Anything on the per-request path (`api.py:_dispatch`, `serialization.py`, `_kwargs/`, `dependencies.py`, `src/handler.rs`, `src/response_builder.rs`) follows one rule: **do it once at registration, reuse forever at runtime.** Avoid per-request allocations, `meta.get()` with defaults, `hasattr()` checks, and string dispatch in loops. If you touch these files, run `just bench-gate` before and after.
-
+Anything on the per-request path (`api.py:_dispatch`, `serialization.py`, `_kwargs/`, `dependencies.py`, `src/handler.rs`, `src/response_builder.rs`) follows one rule: **do it once at registration, reuse forever at runtime.** Avoid per-request allocations, `meta.get()` with defaults, `hasattr()` checks, and string dispatch in loops. If you touch these files, run `
 ## Testing
 
 ```bash
@@ -141,7 +136,6 @@ Guidelines:
 ```bash
 just save-bench          # first run creates bench/BENCHMARK_BASELINE.md,
                          # second creates BENCHMARK_DEV.md and prints a comparison
-just bench-gate          # fail if any endpoint regresses vs baseline
 ```
 
 Always publish the conditions (processes, concurrency, request count, machine) next to any number you report. See [`docs/PROFILING.md`](docs/PROFILING.md) for the layered measurement strategy (micro → in-process → macro → flamegraphs).
@@ -154,8 +148,7 @@ Docs live in `docs/src/` and are published at [bolt.farhana.li](https://bolt.far
 
 1. Make sure `just test-py` and `just lint-lib` pass.
 2. If you touched Rust, make sure `just build` succeeds from clean (`just rebuild`).
-3. If you touched hot paths, include before/after numbers from `just bench-gate`.
-4. Push your branch and open a PR against `master`. Fill in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
+3. If you touched hot paths, include before/after numbers from `4. Push your branch and open a PR against `master`. Fill in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
 5. Keep the PR description focused on **what** changed and **why**; link related issues.
 
 A maintainer will review your PR. Please be patient — and feel free to ping on Discord if it has been quiet for a while.

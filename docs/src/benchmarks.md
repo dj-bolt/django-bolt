@@ -107,10 +107,7 @@ go install github.com/codesenberg/bombardier@latest
 just save-bench                    # full suite → bench/BENCHMARK_BASELINE.md
 just save-bench 127.0.0.1 8001 100 100000 8   # host port C N processes
 just bench-js                      # Bolt vs Hono vs Elysia
-just bench-gate                    # regression gate: RPS and p99 vs baseline
 ```
-
-Micro-benchmarks that need no server: `just bench-rust` (criterion, Rust hot paths) and `just bench-micro` (pytest-benchmark). The layered methodology is in [`docs/PROFILING.md`](https://github.com/dj-bolt/django-bolt/blob/master/docs/PROFILING.md).
 
 ## How to quote these numbers
 

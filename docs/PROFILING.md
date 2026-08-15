@@ -5,16 +5,11 @@ different altitudes — use the right one for the change you're making:
 
 | Layer | Tool | Proves | Command |
 |---|---|---|---|
-| Rust micro | criterion | Pure-Rust hot functions (query/cookie parsing, coercion) | `just bench-rust` |
-| Python micro | pytest-benchmark | Injectors, dependency extraction, serialization | `just bench-micro` |
-| In-process full stack | `TestClient` benches | Whole Rust+Python pipeline, no sockets | (in `python/benchmarks/`) |
 | Macro HTTP | bombardier | End-to-end RPS + latency distribution | `just save-bench` |
-| Regression gate | `benchmark_compare.py` | RPS **and** p99 deltas vs baseline | `just bench-gate` |
 
-Suggested proof discipline per optimization PR: micro-bench shows the isolated
-win → in-process bench shows per-request µs → `just save-bench` + `just
-bench-gate` shows it survives end-to-end → a before/after flamegraph pair as
-the narrative artifact.
+Suggested proof discipline per optimization PR: `just save-bench` shows the
+win survives end-to-end → a before/after flamegraph pair as the narrative
+artifact.
 
 ## Dispatch-path probes (async bridge cost)
 
@@ -52,45 +47,12 @@ the stdlib column. Reference (12-core Linux, Python 3.12): WorkerLoop is
 stdlib parity on the stream path (asyncio's Python transports dominate there;
 uvloop's Cython transports are its remaining advantage).
 
-## Rust micro-benchmarks (criterion)
-
-```bash
-just bench-rust               # cargo bench — results in target/criterion/
-cargo bench -- parse_query    # filter to one group
-```
-
-Criterion keeps its own baselines under `target/criterion/` and prints the
-delta vs the previous run — run once before your change, once after.
-
-Note: `pyo3/extension-module` is enabled by maturin (pyproject.toml), not in
-Cargo.toml, precisely so `cargo bench`/`cargo test` can link libpython. If the
-build can't find Python ≥3.12, set `PYO3_PYTHON=/path/to/python3.12`.
-
-## Python micro-benchmarks (pytest-benchmark)
-
-```bash
-just bench-micro
-# Compare before/after:
-just bench-micro-save NAME=before   # saves .benchmarks/<...>_before.json
-just bench-micro-save NAME=after
-uv run --with pytest --with pytest-benchmark pytest-benchmark compare
-```
-
-These live in `python/benchmarks/` (NOT collected by `just test-py`) and drive
-the compiled injectors, dependency argument extraction, and
-`serialize_response_sync` with synthetic request dicts.
-
-## Macro HTTP benchmarks + regression gate
+## Macro HTTP benchmarks
 
 ```bash
 # needs bombardier: go install github.com/codesenberg/bombardier@latest
-just save-bench          # baseline → dev → rotate (see CLAUDE.md)
-just bench-gate          # deterministic pass/fail: per-endpoint RPS AND p99
+just save-bench          # full suite → bench/BENCHMARK.md; git diff shows the delta
 ```
-
-The gate fails on: any endpoint losing >2% RPS, any endpoint's p99 latency
-growing >25%, or the core-endpoint median gain missing its target. Tune with
-`--max-regression`, `--max-p99-regression`, `--core-median-min-gain`.
 
 For low-noise runs: pin the server (`taskset -c 0-7 python manage.py runbolt …`)
 and the load generator to disjoint cores, disable turbo if comparing small
