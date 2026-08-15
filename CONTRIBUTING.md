@@ -134,8 +134,7 @@ Guidelines:
 ## Benchmarking
 
 ```bash
-just save-bench          # first run creates bench/BENCHMARK_BASELINE.md,
-                         # second creates BENCHMARK_DEV.md and prints a comparison
+just save-bench          # full suite → python/benchmark/BENCHMARK.md; git diff shows the delta
 ```
 
 Always publish the conditions (processes, concurrency, request count, machine) next to any number you report. See [`docs/PROFILING.md`](docs/PROFILING.md) for the layered measurement strategy (micro → in-process → macro → flamegraphs).

@@ -24,3 +24,6 @@ pnpm-lock.yaml
 .claude/settings.local.json
 docs/src/llms-full.txt
 
+
+# Local benchmark scratch runs; the published run is python/benchmark/BENCHMARK.md
+python/benchmark/BENCHMARK_DEV.md

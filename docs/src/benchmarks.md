@@ -19,7 +19,7 @@ description: Django-Bolt benchmarks — 300k+ requests/second measured with bomb
 | Concurrency | `C=100` connections, `N=100000` requests per endpoint |
 | Server | `python manage.py runbolt --processes 8` (8 processes × 1 Actix worker, `SO_REUSEPORT`) |
 | App | [`python/example`](https://github.com/dj-bolt/django-bolt/tree/master/python/example) — full Django project with admin, sessions, CSRF, messages, CSP middleware installed |
-| Django-Bolt | 0.10.0 · results file: [`bench/BENCHMARK_BASELINE.md`](https://github.com/dj-bolt/django-bolt/blob/master/bench/BENCHMARK_BASELINE.md) (2026-07-28) |
+| Django-Bolt | 0.10.0 · results file: [`python/benchmark/BENCHMARK.md`](https://github.com/dj-bolt/django-bolt/blob/master/python/benchmark/BENCHMARK.md) (2026-07-28) |
 
 Because bombardier shares the 12 cores with the 8 server processes, the load generator is part of the system under test. Read the numbers as a **floor**, not a ceiling.
 
@@ -104,7 +104,7 @@ git clone https://github.com/dj-bolt/django-bolt.git && cd django-bolt
 uv sync && just build
 go install github.com/codesenberg/bombardier@latest
 
-just save-bench                    # full suite → bench/BENCHMARK_BASELINE.md
+just save-bench                    # full suite → python/benchmark/BENCHMARK.md
 just save-bench 127.0.0.1 8001 100 100000 8   # host port C N processes
 ```
 

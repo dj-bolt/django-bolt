@@ -37,7 +37,7 @@ stack is large enough (~35-40% of GIL samples) to drown the signal.
 
 ```bash
 # needs bombardier: go install github.com/codesenberg/bombardier@latest
-just save-bench          # full suite → bench/BENCHMARK.md; git diff shows the delta
+just save-bench          # full suite → python/benchmark/BENCHMARK.md; git diff shows the delta
 ```
 
 For low-noise runs: pin the server (`taskset -c 0-7 python manage.py runbolt …`)

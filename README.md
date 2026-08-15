@@ -271,7 +271,7 @@ All runtime settings and environment variables are listed in the [Settings refer
 
 ## 📊 Benchmarks
 
-Measured with [bombardier](https://github.com/codesenberg/bombardier) on a single 12-core desktop (Ryzen 5 5600G), loopback, `C=100`, `N=100000`, **8 processes × 1 worker** (`runbolt --processes 8`). Absolute numbers are hardware-specific; run `just save-bench` to reproduce on your machine. Full results: [`bench/BENCHMARK_BASELINE.md`](bench/BENCHMARK_BASELINE.md).
+Measured with [bombardier](https://github.com/codesenberg/bombardier) on a single 12-core desktop (Ryzen 5 5600G), loopback, `C=100`, `N=100000`, **8 processes × 1 worker** (`runbolt --processes 8`). Absolute numbers are hardware-specific; run `just save-bench` to reproduce on your machine. Full results: [`python/benchmark/BENCHMARK.md`](python/benchmark/BENCHMARK.md).
 
 | Endpoint | Requests/sec | p99 latency |
 | --- | ---: | ---: |

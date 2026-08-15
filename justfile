@@ -113,15 +113,15 @@ seed-data host=host port=port:
     echo "Seeding database..."
     curl -s http://{{host}}:{{port}}/users/seed | head -1
 
-# Run the full benchmark suite; overwrites bench/BENCHMARK.md (git diff shows the change vs the committed run)
+# Run the full benchmark suite; overwrites python/benchmark/BENCHMARK.md (git diff shows the change vs the committed run)
 save-bench host=host port=port c=c n=n p=p workers=workers:
     #!/usr/bin/env bash
-    mkdir -p bench
-    P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark.sh > bench/BENCHMARK.md
-    echo "✅ Results saved to bench/BENCHMARK.md"
+    mkdir -p python/benchmark
+    P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark.sh > python/benchmark/BENCHMARK.md
+    echo "✅ Results saved to python/benchmark/BENCHMARK.md"
     echo ""
     echo "=== ROOT RPS ==="
-    grep "Reqs/sec" bench/BENCHMARK.md | head -2
+    grep "Reqs/sec" python/benchmark/BENCHMARK.md | head -2
 
 # Build and run benchmark
 build-bench: build save-bench
