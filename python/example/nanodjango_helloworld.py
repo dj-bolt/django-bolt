@@ -7,12 +7,12 @@
 Minimal django-bolt + nanodjango single-file example.
 
 Run via nanodjango's CLI:
-    nanodjango manage examples/nanodjango/helloworld.py runbolt --port 8000
+    nanodjango manage python/example/nanodjango_helloworld.py runbolt --port 8000
 
 or
 
 run with automatic dependency downloads and virtenv creation:
-    uv run examples/nanodjango/helloworld.py runbolt --port 8000
+    uv run python/example/nanodjango_helloworld.py runbolt --port 8000
 """
 
 from __future__ import annotations

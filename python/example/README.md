@@ -2,7 +2,8 @@
 
 A Django project exercising django-bolt features: REST APIs (`core`, `users`,
 `missions`), middleware demos, and an MCP server (`mcp_demo`) built with
-bolt-mcp.
+bolt-mcp. `nanodjango_helloworld.py` is a standalone single-file app
+(`uv run python/example/nanodjango_helloworld.py runbolt`).
 
 ## Setup
 
