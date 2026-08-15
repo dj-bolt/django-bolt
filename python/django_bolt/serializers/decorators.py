@@ -58,19 +58,26 @@ def _unwrap_descriptor(func: Any) -> Any:
     return func.__func__ if isinstance(func, (classmethod, staticmethod)) else func
 
 
-def _reject_descriptor(func: Any) -> None:
-    """Refuse a classmethod/staticmethod model validator instead of ignoring it.
+def _marked_validator(raw: Any, marker: str, *, allow_classmethod: bool) -> Any | None:
+    """The validator function behind a class `__dict__` entry, or None.
 
-    A model validator receives the constructed instance, so neither descriptor
-    can express one. Silently collecting nothing would leave a serializer that
-    looks validated and is not.
+    Decorators mark the underlying function, so this is the one place that
+    decides which descriptor forms are legal — regardless of decorator order.
+    A field validator is called as ``func(cls, value)``, so ``@classmethod``
+    is accepted; ``@staticmethod`` has the wrong arity. A model validator
+    receives the constructed instance, so no descriptor can express one.
+    Rejecting loudly here matters: silently collecting nothing leaves a
+    serializer that looks validated and is not.
     """
-    if isinstance(func, (classmethod, staticmethod)):
-        kind = type(func).__name__
+    func = _unwrap_descriptor(raw)
+    if not (callable(func) and hasattr(func, marker)):
+        return None
+    if isinstance(raw, staticmethod) or (isinstance(raw, classmethod) and not allow_classmethod):
+        kind = type(raw).__name__
         raise TypeError(
-            f"@model_validator cannot wrap a {kind}: a model validator receives the "
-            f"constructed instance, not the class. Drop the @{kind} decorator."
+            f"{func.__qualname__}: a validator cannot be a {kind}. Drop the @{kind} decorator."
         )
+    return func
 
 
 # Marker attributes for storing validators on classes
@@ -199,6 +206,7 @@ def field_validator(
             email: str
 
             @field_validator('email')
+            @classmethod
             def validate_email(cls, value):
                 if '@' not in value:
                     raise ValueError('Invalid email')
@@ -253,9 +261,8 @@ def model_validator(
     def decorator(
         validator_func: ModelValidatorFunc,
     ) -> ModelValidatorFunc:
-        _reject_descriptor(validator_func)
-        # Store validator metadata on the function
-        typed_validator = cast(_ModelValidatorCallable, validator_func)
+        # Mark the underlying function; the collector rejects descriptors.
+        typed_validator = cast(_ModelValidatorCallable, _unwrap_descriptor(validator_func))
         typed_validator.__model_validator__ = True
         typed_validator.__validator_mode__ = mode
         return validator_func
@@ -263,13 +270,8 @@ def model_validator(
     if func is None:
         # Called with parentheses: @model_validator()
         return decorator
-    else:
-        # Called without parentheses: @model_validator
-        _reject_descriptor(func)
-        typed_func = cast(_ModelValidatorCallable, func)
-        typed_func.__model_validator__ = True
-        typed_func.__validator_mode__ = mode
-        return func
+    # Called without parentheses: @model_validator
+    return decorator(func)
 
 
 def collect_field_validators(cls: type[Serializer]) -> dict[str, list[FieldValidatorFunc]]:
@@ -286,11 +288,8 @@ def collect_field_validators(cls: type[Serializer]) -> dict[str, list[FieldValid
             continue
 
         for _name, raw in base.__dict__.items():
-            # `@classmethod` leaves a descriptor in __dict__, which is not
-            # callable — filtering on callable(raw) dropped such validators
-            # silently, so the serializer ran with no validation at all.
-            value = _unwrap_descriptor(raw)
-            if callable(value) and hasattr(value, "__validator_field__"):
+            value = _marked_validator(raw, "__validator_field__", allow_classmethod=True)
+            if value is not None:
                 validator = cast(_FieldValidatorCallable, value)
                 field_name = validator.__validator_field__
                 if field_name not in validators:
@@ -314,8 +313,8 @@ def collect_model_validators(cls: type[Serializer]) -> list[ModelValidatorFunc]:
             continue
 
         for _name, raw in base.__dict__.items():
-            value = _unwrap_descriptor(raw)
-            if callable(value) and hasattr(value, "__model_validator__"):
+            value = _marked_validator(raw, "__model_validator__", allow_classmethod=False)
+            if value is not None:
                 validators.append(cast(ModelValidatorFunc, value))
 
     return validators

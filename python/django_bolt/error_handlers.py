@@ -137,7 +137,12 @@ def http_exception_handler(exc: HTTPException) -> tuple[int, list[tuple[str, str
 # Pre-compiled regex patterns for validation error parsing
 _RE_AT_LOCATION = re.compile(r" - at `(.+?)`$")
 _RE_FIELD_NAME = re.compile(r"`(\w+)`")
-_RE_LOC_CLEAN = re.compile(r"[\$\[\]]")
+_RE_PATH_SPLIT = re.compile(r"[.\[]")
+
+
+def _loc_segments(path: str) -> list[str]:
+    """Split a msgspec path like ``$.items[1].age`` into ``["items", "1", "age"]``."""
+    return [seg for seg in _RE_PATH_SPLIT.split(path.replace("]", "")) if seg and seg != "$"]
 
 
 def msgspec_validation_error_to_dict(error: msgspec.ValidationError) -> list[dict[str, Any]]:
@@ -149,28 +154,26 @@ def msgspec_validation_error_to_dict(error: msgspec.ValidationError) -> list[dic
     Returns:
         List of error dictionaries with 'loc', 'msg', 'type' fields
     """
-    # A Serializer's own validators raise RequestValidationError from
-    # __post_init__, with one entry per failing field. msgspec catches that
-    # during decoding and re-raises it as a plain ValidationError carrying
-    # str(exc) — every field's message joined with "; " — which would otherwise
-    # be reported as a single error located at ["body"]. The original survives
-    # on the exception chain, so use it rather than parsing the joined string.
-    original = error.__cause__ if error.__cause__ is not None else error.__context__
-    if isinstance(original, RequestValidationError):
-        structured = [err for err in original.errors() if isinstance(err, dict)]
-        if structured:
-            return structured
-
     error_msg = str(error)
+
+    # A Serializer's own validators raise RequestValidationError from
+    # __post_init__, one entry per failing field. msgspec catches that during
+    # decoding and re-raises a plain ValidationError whose message is str(exc)
+    # (every field joined with "; ") plus " - at `$.path`" when the struct is
+    # nested. The original survives on __cause__: keep its per-field entries
+    # and prefix each loc with the container path msgspec appended.
+    cause = error.__cause__
+    if isinstance(cause, RequestValidationError):
+        suffix = error_msg[len(str(cause)) :]
+        loc_match = _RE_AT_LOCATION.search(suffix)
+        prefix = _loc_segments(loc_match.group(1)) if loc_match else []
+        return [{**err, "loc": ["body", *prefix, *err["loc"][1:]]} for err in cause.errors()]
 
     # Try to extract field location with pre-compiled regex
     loc_match = _RE_AT_LOCATION.search(error_msg)
     if loc_match:
-        loc_path = loc_match.group(1)
         msg_part = error_msg[: loc_match.start()]
-        # Parse location like $[0].age into ["body", "0.age"]
-        cleaned = _RE_LOC_CLEAN.sub("", loc_path).strip(".")
-        loc_parts = ["body", cleaned] if cleaned else ["body"]
+        loc_parts = ["body", *_loc_segments(loc_match.group(1))]
         return [{"loc": loc_parts, "msg": msg_part, "type": "validation_error"}]
 
     if "missing required field" in error_msg.lower():

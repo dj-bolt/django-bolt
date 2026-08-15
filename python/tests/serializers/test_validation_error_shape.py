@@ -22,6 +22,7 @@ from __future__ import annotations
 import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.exceptions import RequestValidationError
 from django_bolt.serializers import Serializer, field_validator, model_validator
 from django_bolt.testing import TestClient
 
@@ -137,9 +138,9 @@ def test_classmethod_field_validator_reports_failures():
         def reject(cls, v: str) -> str:
             raise ValueError(f"nope: {v}")
 
-    with pytest.raises(Exception) as exc_info:
+    with pytest.raises(RequestValidationError) as exc_info:
         WithClassmethod(a="anything")
-    assert "nope: anything" in str(exc_info.value)
+    assert exc_info.value.errors() == [{"loc": ["body", "a"], "msg": "nope: anything", "type": "value_error"}]
 
 
 def test_classmethod_below_decorator_also_runs():
@@ -159,9 +160,9 @@ def test_classmethod_below_decorator_also_runs():
 def test_classmethod_model_validator_is_rejected_not_ignored():
     """A model validator takes the instance, so `@classmethod` cannot work.
 
-    It must say so at decoration time. Silently collecting nothing would leave
-    a serializer that looks validated and is not — the failure mode this whole
-    issue is about.
+    It must say so at class creation, in either decorator order. Silently
+    collecting nothing would leave a serializer that looks validated and is
+    not — the failure mode this whole issue is about.
     """
     with pytest.raises(TypeError, match="classmethod"):
 
@@ -172,3 +173,57 @@ def test_classmethod_model_validator_is_rejected_not_ignored():
             @classmethod
             def check(cls, instance):
                 return instance
+
+    with pytest.raises(TypeError, match="classmethod"):
+
+        class BrokenReversed(Serializer):
+            a: str
+
+            @classmethod
+            @model_validator
+            def check(cls, instance):
+                return instance
+
+
+def test_staticmethod_field_validator_is_rejected_not_ignored():
+    """Field validators are called as `func(cls, value)`; a staticmethod has the wrong arity."""
+    with pytest.raises(TypeError, match="staticmethod"):
+
+        class Broken(Serializer):
+            a: str
+
+            @field_validator("a")
+            @staticmethod
+            def upper(v: str) -> str:
+                return v.upper()
+
+
+class Inner(Serializer):
+    email: str
+
+    @field_validator("email")
+    def validate_email(cls, v: str) -> str:
+        if "@" not in v:
+            raise ValueError("Invalid email")
+        return v
+
+
+class Outer(Serializer):
+    inner: Inner
+
+
+def test_nested_serializer_errors_keep_the_container_path():
+    """msgspec reports the nested location; the per-field errors must sit under it."""
+    api = BoltAPI()
+
+    @api.post("/outer")
+    async def outer(payload: Outer):
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        response = client.post("/outer", json={"inner": {"email": "x"}})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == [
+        {"loc": ["body", "inner", "email"], "msg": "Invalid email", "type": "value_error"}
+    ]

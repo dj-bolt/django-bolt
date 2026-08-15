@@ -161,10 +161,11 @@ decorator's signature; `@classmethod` states the intent and silences it. Put
         return value
 ```
 
-Both forms behave identically at runtime. `@model_validator` is the exception —
-it receives the constructed instance rather than the class, so wrapping one in
-`@classmethod` raises `TypeError` rather than leaving a validator that never
-runs.
+Both forms behave identically at runtime, in either decorator order.
+`@staticmethod` is not accepted (a field validator is called with the class),
+and `@model_validator` accepts neither — it receives the constructed instance.
+Those combinations raise `TypeError` at class creation rather than leaving a
+validator that never runs.
 
 ### Transforming values
 
@@ -241,7 +242,8 @@ except RequestValidationError as e:
 This matches Pydantic's behavior and provides a better user experience - users can fix all issues at once instead of discovering them one at a time.
 
 A request that fails these validators returns the same structure as `422`, one
-entry per field:
+entry per field. For nested serializers and list bodies, `loc` includes the
+container path (`["body", "items", "1", "email"]`):
 
 ```json
 {
