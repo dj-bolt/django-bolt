@@ -31,6 +31,9 @@ def _exercise(post, put, patch):
         "bulk_ok": post("/register/bulk", [GOOD, GOOD]),
         "nested": post("/profile", {"register": BAD}),
         "nested_type_error": post("/profile", {"register": {"collage_code": 1, "phone_number": "ok"}}),
+        "double_nested": post("/account", {"profile": {"register": BAD}}),
+        "double_nested_ok": post("/account", {"profile": {"register": GOOD}}),
+        "bulk_nested": post("/profile/bulk", [{"register": GOOD}, {"register": BAD}]),
     }
     return {k: (r.status_code, r.json().get("detail")) for k, r in responses.items()}
 
@@ -45,6 +48,9 @@ def _assert_shape(results):
     assert results["bulk"] == (422, _under(["1"], COLLAGE_ERR, PHONE_ERR))
     assert results["bulk_ok"] == (200, None)
     assert results["nested"] == (422, _under(["register"], COLLAGE_ERR, PHONE_ERR))
+    assert results["double_nested"] == (422, _under(["profile", "register"], COLLAGE_ERR, PHONE_ERR))
+    assert results["double_nested_ok"] == (200, None)
+    assert results["bulk_nested"] == (422, _under(["1", "register"], COLLAGE_ERR, PHONE_ERR))
     assert results["nested_type_error"] == (
         422,
         [{"loc": ["body", "register", "collage_code"], "msg": "Expected `str`, got `int`", "type": "validation_error"}],

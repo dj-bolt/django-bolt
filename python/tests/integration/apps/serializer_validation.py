@@ -62,6 +62,10 @@ class Profile(Serializer):
     register: RegisterRequest
 
 
+class Account(Serializer):
+    profile: Profile
+
+
 @api.post("/register")
 async def create(payload: RegisterRequest):
     return {"ok": True}
@@ -85,3 +89,13 @@ async def bulk_create(payload: Annotated[list[RegisterRequest], Body()]):
 @api.post("/profile")
 async def create_profile(payload: Profile):
     return {"ok": True}
+
+
+@api.post("/account")
+async def create_account(payload: Account):
+    return {"ok": True}
+
+
+@api.post("/profile/bulk")
+async def bulk_profiles(payload: Annotated[list[Profile], Body()]):
+    return {"ok": len(payload)}

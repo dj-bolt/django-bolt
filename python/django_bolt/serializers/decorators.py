@@ -74,9 +74,7 @@ def _marked_validator(raw: Any, marker: str, *, allow_classmethod: bool) -> Any 
         return None
     if isinstance(raw, staticmethod) or (isinstance(raw, classmethod) and not allow_classmethod):
         kind = type(raw).__name__
-        raise TypeError(
-            f"{func.__qualname__}: a validator cannot be a {kind}. Drop the @{kind} decorator."
-        )
+        raise TypeError(f"{func.__qualname__}: a validator cannot be a {kind}. Drop the @{kind} decorator.")
     return func
 
 
