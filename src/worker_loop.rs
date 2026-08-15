@@ -4,6 +4,7 @@
 //! the ready queue independently of request futures, so detached tasks keep
 //! running after their originating response has completed.
 
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 #[cfg(unix)]
@@ -16,7 +17,7 @@ static WORKER_LOOP_FACTORY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_DISPATCH_START: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_DISPATCH_START_CANCELLABLE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_SYNC_DISPATCH: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static RUN_WORKER_HANDLE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static WORKER_HANDLE_FAILED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_SERVICE: std::sync::OnceLock<WorkerLoopService> = std::sync::OnceLock::new();
 
@@ -27,14 +28,11 @@ static SIGNAL_WATCHERS: std::sync::LazyLock<
 
 pub(crate) enum WorkerLoopCommand {
     Soon(Py<PyAny>),
-    /// File-descriptor readiness: run the handle, then tell the watcher
-    /// whether it may re-arm (`false` when the handle was cancelled; see
-    /// `worker_fd`).
+    /// File-descriptor readiness (see `worker_fd`): run the handle, then
+    /// either requeue while the descriptor stays ready, tell the watcher to
+    /// re-arm, or drop it when the handle was cancelled.
     #[cfg(unix)]
-    Ready(
-        std::sync::Arc<Py<PyAny>>,
-        tokio::sync::oneshot::Sender<bool>,
-    ),
+    Ready(crate::worker_fd::Ready),
 }
 
 struct WorkerLoopService {
@@ -54,7 +52,7 @@ impl WorkerLoopService {
     fn get() -> &'static Self {
         WORKER_SERVICE.get_or_init(|| {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            tokio::spawn(run_ready_queue(rx));
+            tokio::spawn(run_ready_queue(tx.clone(), rx));
             Self {
                 tx,
                 #[cfg(unix)]
@@ -130,36 +128,93 @@ pub(crate) fn worker_task_locals(
 /// otherwise pin this worker thread (and its GIL attachment) forever.
 const READY_QUEUE_DRAIN_LIMIT: usize = 128;
 
-fn run_command(py: Python<'_>, run: &Py<PyAny>, loop_obj: &Py<PyAny>, command: WorkerLoopCommand) {
+/// Run one ready Handle. Mirrors `BaseEventLoop._run_once`: skip cancelled
+/// handles, otherwise call `Handle._run()` (which routes callback exceptions
+/// to the loop's exception handler itself). Returns whether the handle ran.
+fn run_handle(py: Python<'_>, loop_obj: &Py<PyAny>, handle: &Py<PyAny>) -> bool {
+    let handle = handle.bind(py);
+    match handle.getattr(intern!(py, "_cancelled")) {
+        Ok(cancelled) if cancelled.is_truthy().unwrap_or(false) => return false,
+        Ok(_) => {}
+        Err(error) => {
+            error.print(py);
+            return false;
+        }
+    }
+    if let Err(error) = handle.call_method0(intern!(py, "_run")) {
+        // `Handle._run` only lets SystemExit/KeyboardInterrupt (or a broken
+        // handle) escape; report those like any other callback failure.
+        let failed = get_worker_fn(py, &WORKER_HANDLE_FAILED, "worker_handle_failed");
+        if let Err(report_error) = failed.and_then(|f| f.call1(py, (loop_obj, handle, error))) {
+            report_error.print(py);
+        }
+    }
+    true
+}
+
+fn run_command(
+    py: Python<'_>,
+    loop_obj: &Py<PyAny>,
+    tx: &tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
+    command: WorkerLoopCommand,
+) {
     match command {
         WorkerLoopCommand::Soon(handle) => {
-            if let Err(error) = run.call1(py, (loop_obj, handle)) {
-                error.print(py);
-            }
+            run_handle(py, loop_obj, &handle);
         }
         #[cfg(unix)]
-        WorkerLoopCommand::Ready(handle, ack) => {
-            let keep_watching = match run.call1(py, (loop_obj, &*handle)) {
-                Ok(ran) => ran.extract::<bool>(py).unwrap_or(true),
-                Err(error) => {
-                    error.print(py);
-                    true
-                }
-            };
-            let _ = ack.send(keep_watching);
+        WorkerLoopCommand::Ready(ready) => {
+            if run_handle(py, loop_obj, &ready.handle) {
+                ready.after_callback(tx);
+            }
         }
     }
 }
 
-async fn run_ready_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkerLoopCommand>) {
+/// `asyncio.events._get_running_loop` / `_set_running_loop`: the running
+/// loop is thread-local and the pump task can run on any Tokio worker
+/// thread, so it is installed once per drain batch and restored afterwards
+/// (other Python work on that thread must not observe a running loop).
+static GET_RUNNING_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SET_RUNNING_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn running_loop_fn(
+    py: Python<'_>,
+    slot: &'static PyOnceLock<Py<PyAny>>,
+    name: &str,
+) -> PyResult<&'static Py<PyAny>> {
+    slot.get_or_try_init(py, || {
+        Ok(py.import("asyncio.events")?.getattr(name)?.unbind())
+    })
+}
+
+async fn run_ready_queue(
+    tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkerLoopCommand>,
+) {
+    let tx = &tx;
     while let Some(first) = rx.recv().await {
         Python::attach(|py| {
             let Ok(loop_obj) = get_loop(py) else {
                 return;
             };
-            let Ok(run) = get_worker_fn(py, &RUN_WORKER_HANDLE, "run_worker_handle") else {
+            let (Ok(get_running), Ok(set_running)) = (
+                running_loop_fn(py, &GET_RUNNING_LOOP, "_get_running_loop"),
+                running_loop_fn(py, &SET_RUNNING_LOOP, "_set_running_loop"),
+            ) else {
                 return;
             };
+            let previous = match get_running.call0(py) {
+                Ok(previous) => previous,
+                Err(error) => {
+                    error.print(py);
+                    return;
+                }
+            };
+            if let Err(error) = set_running.call1(py, (loop_obj,)) {
+                error.print(py);
+                return;
+            }
 
             // Future chaining commonly produces several immediately-ready
             // handles. Drain them under one GIL attachment, bounded so the
@@ -169,7 +224,7 @@ async fn run_ready_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkerLoop
             let mut next = Some(first);
             loop {
                 if let Some(command) = next.take() {
-                    run_command(py, run, loop_obj, command);
+                    run_command(py, loop_obj, tx, command);
                     drained += 1;
                     if drained >= READY_QUEUE_DRAIN_LIMIT {
                         break;
@@ -179,6 +234,10 @@ async fn run_ready_queue(mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkerLoop
                     Ok(command) => next = Some(command),
                     Err(_) => break,
                 }
+            }
+
+            if let Err(error) = set_running.call1(py, (previous,)) {
+                error.print(py);
             }
         });
     }
@@ -272,7 +331,7 @@ fn compact_cancelled_timers(timers: &mut std::collections::BinaryHeap<WorkerTime
             .drain()
             .filter(|timer| {
                 // On any error reading the bit, keep the timer: firing a
-                // cancelled handle is safe (run_worker_handle re-checks).
+                // cancelled handle is safe (the pump re-checks `_cancelled`).
                 !timer
                     .handle
                     .call_method0(py, "cancelled")

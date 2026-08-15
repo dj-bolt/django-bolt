@@ -285,16 +285,10 @@ def mcp_resolve_future(fut, value):
         fut.set_result(value)
 
 
-def run_worker_handle(loop, handle):
-    """Execute one ready Handle with the WorkerLoop installed as running.
-
-    Returns False when the handle was cancelled so descriptor watchers can
-    stop instead of re-arming for a callback that will never run.
-    """
-    if handle.cancelled():
-        return False
-    try:
-        _with_running_loop(loop, handle._run)
-    except BaseException as exc:
-        loop.call_exception_handler({"message": "Exception in WorkerLoop callback", "exception": exc, "handle": handle})
-    return True
+def worker_handle_failed(loop, handle, exc):
+    """Cold path for the Rust pump, which runs ready handles directly
+    (``_cancelled`` check, then ``Handle._run``) with the WorkerLoop installed
+    as the running loop for a whole drain batch. ``Handle._run`` reports
+    ordinary callback exceptions itself; this catches what it lets escape
+    (SystemExit, KeyboardInterrupt, a broken handle)."""
+    loop.call_exception_handler({"message": "Exception in WorkerLoop callback", "exception": exc, "handle": handle})

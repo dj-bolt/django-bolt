@@ -7,11 +7,12 @@
 //! pump that services `call_soon`, so callbacks stay FIFO with other handles.
 //!
 //! asyncio's selector is level-triggered while Tokio's reactor is
-//! edge-triggered. The watcher re-checks the descriptor with a zero-timeout
-//! `poll(2)` after each callback and only clears Tokio's cached readiness when
-//! the kernel says the descriptor is no longer ready, so a callback that
-//! consumes only part of the pending data (a stdlib transport reading one
-//! `max_size` chunk) is called again instead of stalling.
+//! edge-triggered. After each callback the pump re-checks the descriptor with
+//! a zero-timeout `poll(2)` and requeues the callback while the kernel still
+//! reports it ready, so a callback that consumes only part of the pending
+//! data (a stdlib transport reading one `max_size` chunk) is called again
+//! instead of stalling; the watcher only wakes to clear Tokio's cached
+//! readiness once the descriptor is drained.
 //!
 //! Each registration watches its own `dup(2)` of the descriptor: epoll and
 //! kqueue key registrations by descriptor number, so an independent reader
@@ -113,6 +114,30 @@ impl FdWatchers {
     }
 }
 
+/// One readiness delivery. The pump owns the level-trigger re-check: after
+/// the callback it polls the descriptor and requeues itself while the
+/// descriptor stays ready, and only wakes the watcher (to clear Tokio's
+/// cached readiness and re-arm) once the kernel says it is drained.
+pub(crate) struct Ready {
+    pub(crate) handle: Arc<Py<PyAny>>,
+    fd: RawFd,
+    direction: Direction,
+    rearm: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Ready {
+    /// Called by the pump after the callback ran. Dropping `self` without
+    /// re-arming (cancelled handle: the pump never calls this) stops the
+    /// watcher, as the stdlib selector loop drops cancelled readers.
+    pub(crate) fn after_callback(self, tx: &tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>) {
+        if still_ready(self.fd, self.direction) {
+            let _ = tx.send(WorkerLoopCommand::Ready(self));
+        } else {
+            let _ = self.rearm.send(());
+        }
+    }
+}
+
 fn still_ready(fd: RawFd, direction: Direction) -> bool {
     let mut pollfd = libc::pollfd {
         fd,
@@ -132,29 +157,27 @@ async fn watch(
     handle: Arc<Py<PyAny>>,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
 ) {
-    let raw = async_fd.get_ref().as_raw_fd();
+    let fd = async_fd.get_ref().as_raw_fd();
     loop {
         let mut guard = match async_fd.ready(direction.interest()).await {
             Ok(guard) => guard,
             Err(_) => return,
         };
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        if tx
-            .send(WorkerLoopCommand::Ready(Arc::clone(&handle), ack_tx))
-            .is_err()
-        {
+        let (rearm_tx, rearm_rx) = tokio::sync::oneshot::channel();
+        let ready = Ready {
+            handle: Arc::clone(&handle),
+            fd,
+            direction,
+            rearm: rearm_tx,
+        };
+        if tx.send(WorkerLoopCommand::Ready(ready)).is_err() {
             return;
         }
-        // Wait until the callback ran before re-arming: firing again while it
-        // is still queued would run it twice for one readiness event. A
-        // cancelled handle stops the watcher (as the stdlib selector loop
-        // drops cancelled readers) instead of requeueing while the
-        // descriptor stays ready.
-        if !matches!(ack_rx.await, Ok(true)) {
+        // The pump requeues itself while the descriptor stays ready and
+        // re-arms us once it is drained; a cancelled handle drops the sender.
+        if rearm_rx.await.is_err() {
             return;
         }
-        if !still_ready(raw, direction) {
-            guard.clear_ready();
-        }
+        guard.clear_ready();
     }
 }

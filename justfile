@@ -165,6 +165,10 @@ build-bench: build save-bench
 bench-gate:
     uv run python scripts/benchmark_compare.py
 
+# WorkerLoop vs uvloop vs stdlib: µs per call_soon / sleep(0) / fd event / socket round trip
+bench-loop *ARGS:
+    uv run --with uvloop python scripts/benchmark_loop.py {{ARGS}}
+
 # Rust micro-benchmarks (criterion) — pure hot-path functions
 bench-rust:
     cargo bench
