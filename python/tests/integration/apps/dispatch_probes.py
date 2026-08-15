@@ -352,7 +352,9 @@ async def t_fd_cancelled_handle():
         before = _core.worker_fd_watcher_count()
         handle.cancel()
         os.write(write_fd, b"x")
-        await asyncio.sleep(0.05)
+        deadline = loop.time() + 2
+        while _core.worker_fd_watcher_count() != before - 1 and loop.time() < deadline:
+            await asyncio.sleep(0.01)
         return {"watcher_stopped": _core.worker_fd_watcher_count() == before - 1, "calls": len(calls)}
     finally:
         loop.remove_reader(read_fd)

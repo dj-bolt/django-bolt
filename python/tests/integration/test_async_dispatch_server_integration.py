@@ -14,6 +14,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 import pytest
 
@@ -59,11 +60,21 @@ def test_dispatch_probes_in_process():
 class _EchoHandler(socketserver.StreamRequestHandler):
     # Lines received from the probes; asserted on the main thread because an
     # AssertionError raised here is swallowed by socketserver.handle_error.
-    received: list[bytes] = []
+    received: ClassVar[list[bytes]] = []
+    line_received: ClassVar[threading.Condition] = threading.Condition()
 
     def handle(self):
         self.wfile.write(b"hello\n")
-        self.received.append(self.rfile.readline())
+        line = self.rfile.readline()
+        with self.line_received:
+            self.received.append(line)
+            self.line_received.notify_all()
+
+    @classmethod
+    def wait_for_lines(cls, count: int, timeout: float = 5) -> list[bytes]:
+        with cls.line_received:
+            cls.line_received.wait_for(lambda: len(cls.received) >= count, timeout)
+            return list(cls.received)
 
 
 @pytest.mark.server_integration
@@ -95,6 +106,7 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
     tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls_context.load_cert_chain(certificate, private_key)
 
+    _EchoHandler.received.clear()
     echo_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _EchoHandler)
     echo_thread = threading.Thread(target=echo_server.serve_forever, daemon=True)
     echo_thread.start()
@@ -175,7 +187,7 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             assert response.status_code == 200
             assert response.json() == {"greeting": "hello"}
             assert server.get("/t-buffered-protocol").json() == {"greeting": "hello"}
-            assert _EchoHandler.received == [b"ping\n", b"ping\n"]
+            assert _EchoHandler.wait_for_lines(2) == [b"ping\n", b"ping\n"]
             assert server.get("/t-start-tls").json() == {"reply": "tls-ok"}
             assert server.get("/t-backpressure").json() == {
                 "received": 8 * 1024 * 1024,

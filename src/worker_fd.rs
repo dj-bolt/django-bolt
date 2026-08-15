@@ -17,7 +17,11 @@
 //! kqueue key registrations by descriptor number, so an independent reader
 //! and writer registration on one socket needs two descriptors, and a
 //! replaced registration can be torn down asynchronously without racing the
-//! new one for the same number.
+//! new one for the same number. Consequently a descriptor must be removed
+//! (`remove_reader`/`remove_writer`) before it is closed: closing the
+//! caller's descriptor does not close the duplicate, so the watcher keeps the
+//! open file description alive and keeps reporting readiness. asyncio's own
+//! transports and `sock_*` helpers already remove before closing.
 
 use pyo3::prelude::*;
 use std::collections::HashMap;
