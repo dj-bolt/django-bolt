@@ -76,6 +76,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRequest>()?;
     m.add_class::<crate::worker_loop::WorkerLoopScheduler>()?;
     m.add_function(wrap_pyfunction!(crate::worker_loop::worker_timer_count, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::worker_loop::worker_fd_watcher_count, m)?)?;
 
     // Production server functions
     m.add_function(wrap_pyfunction!(register_routes, m)?)?;

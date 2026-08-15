@@ -57,9 +57,13 @@ def test_dispatch_probes_in_process():
 
 
 class _EchoHandler(socketserver.StreamRequestHandler):
+    # Lines received from the probes; asserted on the main thread because an
+    # AssertionError raised here is swallowed by socketserver.handle_error.
+    received: list[bytes] = []
+
     def handle(self):
         self.wfile.write(b"hello\n")
-        assert self.rfile.readline() == b"ping\n"
+        self.received.append(self.rfile.readline())
 
 
 @pytest.mark.server_integration
@@ -171,6 +175,7 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             assert response.status_code == 200
             assert response.json() == {"greeting": "hello"}
             assert server.get("/t-buffered-protocol").json() == {"greeting": "hello"}
+            assert _EchoHandler.received == [b"ping\n", b"ping\n"]
             assert server.get("/t-start-tls").json() == {"reply": "tls-ok"}
             assert server.get("/t-backpressure").json() == {
                 "received": 8 * 1024 * 1024,
@@ -192,6 +197,7 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
                 assert server_api["close_clients_eof"] is None
             assert server.get("/t-datagram").json() == {"reply": "datagram-ok"}
             assert server.get("/t-fd-level-triggered").json() == {"chunks": ["a", "b", "c", "d"]}
+            assert server.get("/t-fd-cancelled-handle").json() == {"watcher_stopped": True, "calls": 0}
             assert server.get("/t-fd-read-write").json() == {
                 "value": "rw",
                 "writer_removed": True,

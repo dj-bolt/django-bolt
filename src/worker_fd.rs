@@ -88,6 +88,16 @@ impl FdWatchers {
         Ok(())
     }
 
+    /// Number of watcher tasks that are still running (test hook).
+    pub(crate) fn live_count(&self) -> usize {
+        self.tasks
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|task| !task.is_finished())
+            .count()
+    }
+
     pub(crate) fn remove(&self, fd: RawFd, direction: Direction) -> bool {
         match self.tasks.lock().unwrap().remove(&(fd, direction)) {
             Some(task) => {
@@ -132,8 +142,11 @@ async fn watch(
             return;
         }
         // Wait until the callback ran before re-arming: firing again while it
-        // is still queued would run it twice for one readiness event.
-        if ack_rx.await.is_err() {
+        // is still queued would run it twice for one readiness event. A
+        // cancelled handle stops the watcher (as the stdlib selector loop
+        // drops cancelled readers) instead of requeueing while the
+        // descriptor stays ready.
+        if !matches!(ack_rx.await, Ok(true)) {
             return;
         }
         if !still_ready(raw, direction) {

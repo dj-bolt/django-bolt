@@ -27,12 +27,13 @@ static SIGNAL_WATCHERS: std::sync::LazyLock<
 
 pub(crate) enum WorkerLoopCommand {
     Soon(Py<PyAny>),
-    /// File-descriptor readiness: run the handle, then tell the watcher it
-    /// may re-arm (see `worker_fd`).
+    /// File-descriptor readiness: run the handle, then tell the watcher
+    /// whether it may re-arm (`false` when the handle was cancelled; see
+    /// `worker_fd`).
     #[cfg(unix)]
     Ready(
         std::sync::Arc<Py<PyAny>>,
-        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Sender<bool>,
     ),
 }
 
@@ -138,10 +139,14 @@ fn run_command(py: Python<'_>, run: &Py<PyAny>, loop_obj: &Py<PyAny>, command: W
         }
         #[cfg(unix)]
         WorkerLoopCommand::Ready(handle, ack) => {
-            if let Err(error) = run.call1(py, (loop_obj, &*handle)) {
-                error.print(py);
-            }
-            let _ = ack.send(());
+            let keep_watching = match run.call1(py, (loop_obj, &*handle)) {
+                Ok(ran) => ran.extract::<bool>(py).unwrap_or(true),
+                Err(error) => {
+                    error.print(py);
+                    true
+                }
+            };
+            let _ = ack.send(keep_watching);
         }
     }
 }
@@ -231,6 +236,20 @@ const TIMER_COMPACTION_MIN_CANCELLED: usize = 64;
 #[pyfunction]
 pub(crate) fn worker_timer_count() -> usize {
     WORKER_TIMER_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test/introspection hook: descriptor watchers whose Tokio task is still
+/// running. A watcher for a cancelled handle must exit rather than spin.
+#[pyfunction]
+pub(crate) fn worker_fd_watcher_count() -> usize {
+    #[cfg(unix)]
+    {
+        WorkerLoopService::get().fd_watchers.live_count()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 fn worker_timer_tx() -> &'static std::sync::mpsc::Sender<TimerCommand> {

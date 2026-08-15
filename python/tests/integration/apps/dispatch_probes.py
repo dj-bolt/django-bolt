@@ -23,6 +23,7 @@ Probe map:
 - /t-task     create_task in first segment → loop APIs during eager execution
 - /t-stream   async generator (NDJSON)    → streaming wire through async path
 - /t-server-api                           → Server.get_loop()/close_clients() on the WorkerLoop
+- /t-fd-cancelled-handle                 → cancelled reader Handle stops its Rust watcher
 - /t-datagram-flow-control                → pause/resume_writing reaches datagram protocols
 - /t-call-soon-coroutine                  → debug-mode call_soon(coroutine) rejection
 """
@@ -332,6 +333,27 @@ async def t_fd_level_triggered():
         os.write(write_fd, b"abcd")
         await asyncio.wait_for(done, 1)
         return {"chunks": [c.decode() for c in chunks]}
+    finally:
+        loop.remove_reader(read_fd)
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@api.get("/t-fd-cancelled-handle")
+async def t_fd_cancelled_handle():
+    """A reader whose Handle was cancelled directly (not via remove_reader)
+    must stop its Rust watcher; the stdlib selector loop drops such readers.
+    Otherwise a permanently readable descriptor requeues the no-op forever."""
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    calls = []
+    try:
+        handle = loop._add_reader(read_fd, lambda: calls.append(os.read(read_fd, 1)))
+        before = _core.worker_fd_watcher_count()
+        handle.cancel()
+        os.write(write_fd, b"x")
+        await asyncio.sleep(0.05)
+        return {"watcher_stopped": _core.worker_fd_watcher_count() == before - 1, "calls": len(calls)}
     finally:
         loop.remove_reader(read_fd)
         os.close(read_fd)
