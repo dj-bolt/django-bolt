@@ -81,7 +81,7 @@ impl FdWatchers {
             let _guard = runtime.enter();
             AsyncFd::with_interest(owned, direction.interest()).map_err(PyErr::from)?
         };
-        let task = runtime.spawn(watch(async_fd, direction, Arc::new(handle), tx.clone()));
+        let task = runtime.spawn(watch(async_fd, fd, direction, Arc::new(handle), tx.clone()));
         if let Some(previous) = self
             .tasks
             .lock()
@@ -93,14 +93,23 @@ impl FdWatchers {
         Ok(())
     }
 
-    /// Number of watcher tasks that are still running (test hook).
+    /// Number of registered watchers (test hook). Watchers unregister
+    /// themselves on exit, so this is the live count.
     pub(crate) fn live_count(&self) -> usize {
-        self.tasks
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|task| !task.is_finished())
-            .count()
+        self.tasks.lock().unwrap().len()
+    }
+
+    /// Drop the entry for `(fd, direction)` if it still belongs to the task
+    /// `id` (an exiting watcher must not remove a replacement registered
+    /// under the same key).
+    fn retire(&self, fd: RawFd, direction: Direction, id: tokio::task::Id) {
+        let mut tasks = self.tasks.lock().unwrap();
+        if tasks
+            .get(&(fd, direction))
+            .is_some_and(|task| task.id() == id)
+        {
+            tasks.remove(&(fd, direction));
+        }
     }
 
     pub(crate) fn remove(&self, fd: RawFd, direction: Direction) -> bool {
@@ -151,12 +160,30 @@ fn still_ready(fd: RawFd, direction: Direction) -> bool {
     rc != 0
 }
 
+/// Unregisters the watcher's map entry however the task ends: readiness
+/// error, closed pump, a cancelled handle stopping it, or abort.
+struct Retire {
+    fd: RawFd,
+    direction: Direction,
+}
+
+impl Drop for Retire {
+    fn drop(&mut self) {
+        crate::worker_loop::fd_watchers().retire(self.fd, self.direction, tokio::task::id());
+    }
+}
+
 async fn watch(
     async_fd: AsyncFd<OwnedFd>,
+    key_fd: RawFd,
     direction: Direction,
     handle: Arc<Py<PyAny>>,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
 ) {
+    let _retire = Retire {
+        fd: key_fd,
+        direction,
+    };
     let fd = async_fd.get_ref().as_raw_fd();
     loop {
         let mut guard = match async_fd.ready(direction.interest()).await {

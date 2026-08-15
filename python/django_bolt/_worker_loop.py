@@ -285,7 +285,7 @@ def mcp_resolve_future(fut, value):
         fut.set_result(value)
 
 
-def worker_handle_failed(loop, handle, exc):
+def worker_handle_failed(loop, handle, exc) -> None:
     """Cold path for the Rust pump, which runs ready handles directly
     (``_cancelled`` check, then ``Handle._run``) with the WorkerLoop installed
     as the running loop for a whole drain batch. ``Handle._run`` reports

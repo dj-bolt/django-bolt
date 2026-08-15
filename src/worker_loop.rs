@@ -297,6 +297,11 @@ pub(crate) fn worker_timer_count() -> usize {
     WORKER_TIMER_LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(unix)]
+pub(crate) fn fd_watchers() -> &'static crate::worker_fd::FdWatchers {
+    &WorkerLoopService::get().fd_watchers
+}
+
 /// Test/introspection hook: descriptor watchers whose Tokio task is still
 /// running. A watcher for a cancelled handle must exit rather than spin.
 #[pyfunction]
