@@ -210,6 +210,26 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             assert server.get("/t-datagram").json() == {"reply": "datagram-ok"}
             assert server.get("/t-fd-level-triggered").json() == {"chunks": ["a", "b", "c", "d"]}
             assert server.get("/t-fd-cancelled-handle").json() == {"watcher_stopped": True, "calls": 0}
+
+            # TCP transports are the native Rust SocketTransport on both ends.
+            native = server.get("/t-transport-native").json()
+            assert native == {
+                "kinds": {"client": "SocketTransport", "server": "SocketTransport"},
+                "reply": "got:abc\n",
+                "peer_port_matches": True,
+                "can_write_eof": True,
+                "limits": [16 * 1024, 64 * 1024],
+            }
+            assert server.get("/t-transport-large-read").json() == {"ok": True}
+            assert server.get("/t-transport-pause-reading").json() == {
+                "while_paused": 1,
+                "is_reading_paused": False,
+                "got": ["1", "2"],
+            }
+            sendfile = server.get("/t-transport-sendfile").json()
+            assert sendfile == {"sent": sendfile["size"], "ok": True, "size": sendfile["size"]}
+            abort = server.get("/t-transport-abort").json()
+            assert abort == {"lost_exc": "None", "is_closing": True, "peer": True}
             assert server.get("/t-fd-read-write").json() == {
                 "value": "rw",
                 "writer_removed": True,

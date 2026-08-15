@@ -33,6 +33,8 @@ mod websocket;
 #[cfg(unix)]
 mod worker_fd;
 mod worker_loop;
+#[cfg(unix)]
+mod worker_transport;
 
 /// Pure-Rust hot-path helpers re-exported for criterion benches
 /// (benches/hot_path.rs links the rlib). Not part of the Python API.
@@ -75,6 +77,8 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Class
     m.add_class::<PyRequest>()?;
     m.add_class::<crate::worker_loop::WorkerLoopScheduler>()?;
+    #[cfg(unix)]
+    m.add_class::<crate::worker_transport::SocketTransport>()?;
     m.add_function(wrap_pyfunction!(crate::worker_loop::worker_timer_count, m)?)?;
     m.add_function(wrap_pyfunction!(
         crate::worker_loop::worker_fd_watcher_count,

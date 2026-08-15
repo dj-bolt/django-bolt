@@ -33,6 +33,27 @@ use tokio::io::Interest;
 
 use crate::worker_loop::WorkerLoopCommand;
 
+/// What the pump runs when a descriptor is ready.
+#[derive(Clone)]
+pub(crate) enum FdCallback {
+    /// An asyncio `Handle` from `add_reader`/`add_writer` (opaque callback:
+    /// level triggering is emulated with `poll(2)` afterwards).
+    Handle(Arc<Py<PyAny>>),
+    /// A native `SocketTransport`; its read/write result says whether the
+    /// descriptor is drained, so no `poll(2)` is needed.
+    Transport(Arc<Py<crate::worker_transport::SocketTransport>>),
+}
+
+/// Result of one readiness callback, decided by the pump.
+pub(crate) enum ReadyOutcome {
+    /// Kernel may still have data/space: requeue without waking the watcher.
+    StillReady,
+    /// Descriptor drained: the watcher clears Tokio's readiness and re-arms.
+    Drained,
+    /// Registration is over (cancelled handle, transport closed/paused/eof).
+    Stop,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Direction {
     Read,
@@ -70,7 +91,7 @@ impl FdWatchers {
         tx: &tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
         fd: RawFd,
         direction: Direction,
-        handle: Py<PyAny>,
+        callback: FdCallback,
     ) -> PyResult<()> {
         // SAFETY: the descriptor is owned by Python for the duration of this
         // call; the borrow only lives long enough to dup it.
@@ -81,7 +102,7 @@ impl FdWatchers {
             let _guard = runtime.enter();
             AsyncFd::with_interest(owned, direction.interest()).map_err(PyErr::from)?
         };
-        let task = runtime.spawn(watch(async_fd, direction, Arc::new(handle), tx.clone()));
+        let task = runtime.spawn(watch(async_fd, direction, callback, tx.clone()));
         if let Some(previous) = self
             .tasks
             .lock()
@@ -119,21 +140,47 @@ impl FdWatchers {
 /// descriptor stays ready, and only wakes the watcher (to clear Tokio's
 /// cached readiness and re-arm) once the kernel says it is drained.
 pub(crate) struct Ready {
-    pub(crate) handle: Arc<Py<PyAny>>,
+    callback: FdCallback,
     fd: RawFd,
     direction: Direction,
     rearm: tokio::sync::oneshot::Sender<()>,
 }
 
 impl Ready {
-    /// Called by the pump after the callback ran. Dropping `self` without
-    /// re-arming (cancelled handle: the pump never calls this) stops the
-    /// watcher, as the stdlib selector loop drops cancelled readers.
-    pub(crate) fn after_callback(self, tx: &tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>) {
-        if still_ready(self.fd, self.direction) {
-            let _ = tx.send(WorkerLoopCommand::Ready(self));
-        } else {
-            let _ = self.rearm.send(());
+    /// Run the callback on the pump thread (GIL held), then requeue, re-arm,
+    /// or stop. Dropping `self` without re-arming stops the watcher, as the
+    /// stdlib selector loop drops cancelled readers.
+    pub(crate) fn run(
+        self,
+        py: Python<'_>,
+        loop_obj: &Py<PyAny>,
+        tx: &tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
+    ) {
+        let outcome = match &self.callback {
+            FdCallback::Handle(handle) => {
+                if crate::worker_loop::run_handle(py, loop_obj, handle) {
+                    if still_ready(self.fd, self.direction) {
+                        ReadyOutcome::StillReady
+                    } else {
+                        ReadyOutcome::Drained
+                    }
+                } else {
+                    ReadyOutcome::Stop
+                }
+            }
+            FdCallback::Transport(transport) => match self.direction {
+                Direction::Read => transport.get().on_readable(transport, py),
+                Direction::Write => transport.get().on_writable(transport, py),
+            },
+        };
+        match outcome {
+            ReadyOutcome::StillReady => {
+                let _ = tx.send(WorkerLoopCommand::Ready(self));
+            }
+            ReadyOutcome::Drained => {
+                let _ = self.rearm.send(());
+            }
+            ReadyOutcome::Stop => {}
         }
     }
 }
@@ -154,7 +201,7 @@ fn still_ready(fd: RawFd, direction: Direction) -> bool {
 async fn watch(
     async_fd: AsyncFd<OwnedFd>,
     direction: Direction,
-    handle: Arc<Py<PyAny>>,
+    callback: FdCallback,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
 ) {
     let fd = async_fd.get_ref().as_raw_fd();
@@ -165,7 +212,7 @@ async fn watch(
         };
         let (rearm_tx, rearm_rx) = tokio::sync::oneshot::channel();
         let ready = Ready {
-            handle: Arc::clone(&handle),
+            callback: callback.clone(),
             fd,
             direction,
             rearm: rearm_tx,

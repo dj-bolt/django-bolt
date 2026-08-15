@@ -24,6 +24,8 @@ Probe map:
 - /t-stream   async generator (NDJSON)    → streaming wire through async path
 - /t-server-api                           → Server.get_loop()/close_clients() on the WorkerLoop
 - /t-fd-cancelled-handle                 → cancelled reader Handle stops its Rust watcher
+- /t-transport-*                          → native Rust TCP transport: EOF, writelines, large reads,
+                                            pause/resume_reading, sendfile, abort
 - /t-datagram-flow-control                → pause/resume_writing reaches datagram protocols
 - /t-call-soon-coroutine                  → debug-mode call_soon(coroutine) rejection
 """
@@ -31,6 +33,7 @@ Probe map:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import socket
@@ -420,6 +423,197 @@ async def t_worker_server():
         writer.close()
         await writer.wait_closed()
         return {"reply": reply.decode().strip()}
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@api.get("/t-transport-native")
+async def t_transport_native():
+    """WorkerLoop's TCP transport is the Rust one on both ends of a
+    connection, and honours write_eof/eof_received (keep-open), writelines,
+    get_extra_info, and write-after-close being dropped silently."""
+    kinds = {}
+    server_reply = asyncio.get_running_loop().create_future()
+
+    async def handle(reader, writer):
+        kinds["server"] = type(writer.transport).__name__
+        data = await reader.read()  # until the client's EOF
+        writer.writelines([b"got:", data, b"\n"])
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        writer.write(b"dropped after close")  # conn_lost path: no exception
+        if not server_reply.done():
+            server_reply.set_result(True)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        kinds["client"] = type(writer.transport).__name__
+        peer_port = writer.get_extra_info("peername")[1]
+        writer.write(b"abc")
+        writer.write_eof()
+        reply = await asyncio.wait_for(reader.read(), 2)
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.wait_for(server_reply, 2)
+        return {
+            "kinds": kinds,
+            "reply": reply.decode(),
+            "peer_port_matches": peer_port == port,
+            "can_write_eof": writer.can_write_eof(),
+            "limits": list(writer.transport.get_write_buffer_limits()),
+        }
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@api.get("/t-transport-large-read")
+async def t_transport_large_read():
+    """A single 1 MiB write is delivered in full: the reader is re-run while
+    the socket still holds data (max_size chunks) and the writer drains its
+    buffer through writable events."""
+    payload = os.urandom(1024 * 1024)
+    received = asyncio.get_running_loop().create_future()
+
+    async def handle(reader, writer):
+        data = await reader.readexactly(len(payload))
+        received.set_result(data == payload)
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(payload)
+        await writer.drain()
+        ok = await asyncio.wait_for(received, 5)
+        writer.close()
+        await writer.wait_closed()
+        return {"ok": ok}
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@api.get("/t-transport-pause-reading")
+async def t_transport_pause_reading():
+    """pause_reading() stops delivery; resume_reading() delivers what queued
+    up meanwhile."""
+    loop = asyncio.get_running_loop()
+    got = []
+    connected = loop.create_future()
+    first = loop.create_future()
+    second = loop.create_future()
+
+    class Protocol(asyncio.Protocol):
+        def connection_made(self, transport):
+            self.transport = transport
+            connected.set_result(transport)
+
+        def data_received(self, data):
+            got.append(data)
+            if len(got) == 1 and not first.done():
+                first.set_result(True)
+            if len(got) == 2 and not second.done():
+                second.set_result(True)
+
+    async def handle(reader, writer):
+        await reader.readexactly(1)
+        writer.write(b"1")
+        await reader.readexactly(1)
+        writer.write(b"2")
+        await reader.readexactly(1)
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        transport, _ = await loop.create_connection(Protocol, "127.0.0.1", port)
+        await connected
+        transport.write(b"a")
+        await asyncio.wait_for(first, 2)
+        transport.pause_reading()
+        transport.write(b"b")
+        await asyncio.sleep(0.05)
+        while_paused = len(got)
+        is_reading_paused = transport.is_reading()
+        transport.resume_reading()
+        await asyncio.wait_for(second, 2)
+        transport.write(b"c")
+        transport.close()
+        return {
+            "while_paused": while_paused,
+            "is_reading_paused": is_reading_paused,
+            "got": [g.decode() for g in got],
+        }
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@api.get("/t-transport-sendfile")
+async def t_transport_sendfile():
+    """loop.sendfile() over the native transport (TRY_NATIVE hooks:
+    _make_empty_waiter/_reset_empty_waiter/_sock)."""
+    loop = asyncio.get_running_loop()
+    payload = b"sendfile-payload " * 4096
+    path = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"bolt-sendfile-{os.getpid()}.bin")
+    with open(path, "wb") as f:
+        f.write(payload)
+    received = loop.create_future()
+
+    async def handle(reader, writer):
+        received.set_result(await reader.read() == payload)
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        with open(path, "rb") as f:
+            sent = await loop.sendfile(writer.transport, f)
+        writer.write_eof()
+        ok = await asyncio.wait_for(received, 5)
+        writer.close()
+        await writer.wait_closed()
+        return {"sent": sent, "ok": ok, "size": len(payload)}
+    finally:
+        os.unlink(path)
+        server.close()
+        await server.wait_closed()
+
+
+@api.get("/t-transport-abort")
+async def t_transport_abort():
+    """abort() drops the connection: connection_lost(None) locally, EOF or
+    reset on the peer, and get_extra_info still answers afterwards."""
+    loop = asyncio.get_running_loop()
+    lost = loop.create_future()
+    peer_closed = loop.create_future()
+
+    class Protocol(asyncio.Protocol):
+        def connection_lost(self, exc):
+            lost.set_result(exc)
+
+    async def handle(reader, writer):
+        with contextlib.suppress(ConnectionError):
+            await reader.read()
+        peer_closed.set_result(True)
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        transport, _ = await loop.create_connection(Protocol, "127.0.0.1", port)
+        transport.write(b"x")
+        transport.abort()
+        exc = await asyncio.wait_for(lost, 2)
+        await asyncio.wait_for(peer_closed, 2)
+        return {"lost_exc": repr(exc), "is_closing": transport.is_closing(), "peer": transport.get_extra_info("peername") is not None}
     finally:
         server.close()
         await server.wait_closed()

@@ -131,7 +131,7 @@ const READY_QUEUE_DRAIN_LIMIT: usize = 128;
 /// Run one ready Handle. Mirrors `BaseEventLoop._run_once`: skip cancelled
 /// handles, otherwise call `Handle._run()` (which routes callback exceptions
 /// to the loop's exception handler itself). Returns whether the handle ran.
-fn run_handle(py: Python<'_>, loop_obj: &Py<PyAny>, handle: &Py<PyAny>) -> bool {
+pub(crate) fn run_handle(py: Python<'_>, loop_obj: &Py<PyAny>, handle: &Py<PyAny>) -> bool {
     let handle = handle.bind(py);
     match handle.getattr(intern!(py, "_cancelled")) {
         Ok(cancelled) if cancelled.is_truthy().unwrap_or(false) => return false,
@@ -163,11 +163,7 @@ fn run_command(
             run_handle(py, loop_obj, &handle);
         }
         #[cfg(unix)]
-        WorkerLoopCommand::Ready(ready) => {
-            if run_handle(py, loop_obj, &ready.handle) {
-                ready.after_callback(tx);
-            }
-        }
+        WorkerLoopCommand::Ready(ready) => ready.run(py, loop_obj, tx),
     }
 }
 
@@ -295,6 +291,25 @@ const TIMER_COMPACTION_MIN_CANCELLED: usize = 64;
 #[pyfunction]
 pub(crate) fn worker_timer_count() -> usize {
     WORKER_TIMER_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Register a descriptor watcher on the worker service (see `worker_fd`).
+#[cfg(unix)]
+pub(crate) fn add_fd_watch(
+    _py: Python<'_>,
+    fd: i32,
+    direction: crate::worker_fd::Direction,
+    callback: crate::worker_fd::FdCallback,
+) -> PyResult<()> {
+    let service = WorkerLoopService::get();
+    service
+        .fd_watchers
+        .add(&service.runtime, &service.tx, fd, direction, callback)
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_fd_watch(fd: i32, direction: crate::worker_fd::Direction) -> bool {
+    WorkerLoopService::get().fd_watchers.remove(fd, direction)
 }
 
 /// Test/introspection hook: descriptor watchers whose Tokio task is still
@@ -427,41 +442,33 @@ impl WorkerLoopScheduler {
     }
 
     #[cfg(unix)]
-    fn add_reader(&self, fd: i32, handle: Py<PyAny>) -> PyResult<()> {
-        let service = WorkerLoopService::get();
-        service.fd_watchers.add(
-            &service.runtime,
-            &self.tx,
+    fn add_reader(&self, py: Python<'_>, fd: i32, handle: Py<PyAny>) -> PyResult<()> {
+        add_fd_watch(
+            py,
             fd,
             crate::worker_fd::Direction::Read,
-            handle,
+            crate::worker_fd::FdCallback::Handle(std::sync::Arc::new(handle)),
         )
     }
 
     #[cfg(unix)]
-    fn add_writer(&self, fd: i32, handle: Py<PyAny>) -> PyResult<()> {
-        let service = WorkerLoopService::get();
-        service.fd_watchers.add(
-            &service.runtime,
-            &self.tx,
+    fn add_writer(&self, py: Python<'_>, fd: i32, handle: Py<PyAny>) -> PyResult<()> {
+        add_fd_watch(
+            py,
             fd,
             crate::worker_fd::Direction::Write,
-            handle,
+            crate::worker_fd::FdCallback::Handle(std::sync::Arc::new(handle)),
         )
     }
 
     #[cfg(unix)]
     fn remove_reader(&self, fd: i32) -> bool {
-        WorkerLoopService::get()
-            .fd_watchers
-            .remove(fd, crate::worker_fd::Direction::Read)
+        remove_fd_watch(fd, crate::worker_fd::Direction::Read)
     }
 
     #[cfg(unix)]
     fn remove_writer(&self, fd: i32) -> bool {
-        WorkerLoopService::get()
-            .fd_watchers
-            .remove(fd, crate::worker_fd::Direction::Write)
+        remove_fd_watch(fd, crate::worker_fd::Direction::Write)
     }
 
     #[cfg(not(unix))]

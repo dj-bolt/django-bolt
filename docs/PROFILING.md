@@ -48,9 +48,11 @@ StreamReader/Writer round trip. Use it when touching `src/worker_loop.rs`,
 `src/worker_fd.rs`, or `_worker_loop.py`. `TestClient` is not a substitute:
 it dispatches async handlers on a stdlib background loop, so its numbers are
 the stdlib column. Reference (12-core Linux, Python 3.12): WorkerLoop is
-~0.75-0.8x of uvloop on the ready-queue paths, ~1.1x on raw fd events, and at
-stdlib parity on the stream path (asyncio's Python transports dominate there;
-uvloop's Cython transports are its remaining advantage).
+~0.75-0.85x of uvloop on the ready-queue paths, ~1.1x on raw `add_reader`
+events and `sock_*` round trips (opaque callbacks still need a `poll(2)` per
+event for level triggering), and ~1.04x on the StreamReader/Writer path,
+where the native Rust TCP transport (`src/worker_transport.rs`) reads and
+writes without Python frames or the `poll(2)` re-check.
 
 ## Rust micro-benchmarks (criterion)
 

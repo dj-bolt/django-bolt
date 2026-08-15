@@ -13,8 +13,8 @@ Workloads:
 - sleep0_chain      one suspend/resume per iteration
 - reader_events     one add_reader readiness event per iteration (pipe)
 - sock_pingpong     sock_sendall/sock_recv on a socketpair (add/remove_reader churn)
-- stream_pingpong   StreamReader/Writer echo over loopback TCP (asyncio's Python
-                    transports; uvloop's Cython transports are its main win here)
+- stream_pingpong   StreamReader/Writer echo over loopback TCP (the native Rust
+                    transport on WorkerLoop vs uvloop's Cython one)
 """
 
 from __future__ import annotations

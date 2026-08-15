@@ -1,10 +1,12 @@
 """Process-lived asyncio loop used by Bolt's worker-local HTTP dispatch.
 
 The loop keeps one identity for the life of the process.  It is a real
-``asyncio.SelectorEventLoop`` subclass, so transports, ``sock_*`` helpers,
-DNS, pipes, TLS, and subprocesses come from the stdlib; the ready queue,
-timers, signals, and file-descriptor readiness are driven by Rust/Tokio
-(see ``src/worker_loop.rs`` and ``src/worker_fd.rs``).
+``asyncio.SelectorEventLoop`` subclass, so ``sock_*`` helpers, DNS, pipes,
+datagrams, and subprocesses come from the stdlib; the ready queue, timers,
+signals, and file-descriptor readiness are driven by Rust/Tokio (see
+``src/worker_loop.rs`` and ``src/worker_fd.rs``), and TCP transports are
+native (``src/worker_transport.rs``) with TLS layered on top by the stdlib
+``sslproto``.
 
 Callbacks may resume on a different OS thread after a suspension (the Tokio
 pump task can migrate between worker threads).  Contextvars are preserved via
@@ -23,8 +25,15 @@ import contextvars
 import functools
 import inspect
 import selectors
+import sys
+from asyncio import base_events, constants, sslproto, trsock
 
+from . import _core
 from .concurrency import _get_default_executor
+
+# Server._attach/_detach take the transport since Python 3.13 (Server.close_clients()).
+_SERVER_ATTACH_TAKES_TRANSPORT = len(inspect.signature(base_events.Server._attach).parameters) > 1
+_HAS_NATIVE_TRANSPORT = sys.platform != "win32"
 
 
 class _NoSelector(selectors.BaseSelector):
@@ -48,11 +57,12 @@ class WorkerLoop(asyncio.SelectorEventLoop):
 
     There is one instance per process, so tasks may outlive an HTTP response
     and loop-bound objects can safely be reused by later requests.  The stdlib
-    selector loop supplies transports, ``sock_*`` helpers, DNS, pipes, TLS,
-    and subprocesses; this subclass replaces the four primitives they are all
-    built on (``_add_reader``/``_add_writer``/``_remove_reader``/
-    ``_remove_writer``) with Rust-side descriptor watchers, and the ready
-    queue and timers with the Rust pump.
+    selector loop supplies ``sock_*`` helpers, DNS, pipes, datagrams, TLS
+    (``sslproto``), and subprocesses; this subclass replaces the four
+    primitives they are built on (``_add_reader``/``_add_writer``/
+    ``_remove_reader``/``_remove_writer``) with Rust-side descriptor
+    watchers, the ready queue and timers with the Rust pump, and the TCP
+    socket transport with a native one.
     """
 
     def __init__(self, scheduler):
@@ -152,10 +162,66 @@ class WorkerLoop(asyncio.SelectorEventLoop):
             return task
         return asyncio.Task(coro, loop=self, name=name, context=context, **kwargs)
 
-    # Descriptor watching: the stdlib selector loop's transports, sock_*
-    # helpers, pipes, and child watchers all reduce to these four calls. The
-    # Handle bookkeeping mirrors selector_events so cancellation semantics
-    # (a replaced or removed reader never fires) are identical.
+    # TCP transports are native (src/worker_transport.rs): the pump reads and
+    # writes the socket in Rust and knows from the read result whether the
+    # descriptor is drained, so no Python _read_ready/write frames and no
+    # poll(2) per event. TLS layers sslproto over it exactly as the stdlib does
+    # over _SelectorSocketTransport. Datagram, pipe, and subprocess transports
+    # stay stdlib (built on the four primitives below).
+
+    if _HAS_NATIVE_TRANSPORT:
+
+        def _make_socket_transport(self, sock, protocol, waiter=None, *, extra=None, server=None):
+            self._ensure_fd_no_transport(sock)
+            extra = dict(extra) if extra else {}
+            extra["socket"] = trsock.TransportSocket(sock)
+            try:
+                extra["sockname"] = sock.getsockname()
+            except OSError:
+                extra["sockname"] = None
+            if "peername" not in extra:
+                try:
+                    extra["peername"] = sock.getpeername()
+                except OSError:
+                    extra["peername"] = None
+            transport = _core.SocketTransport(
+                self, sock, protocol, waiter, extra, server, _SERVER_ATTACH_TAKES_TRANSPORT
+            )
+            self._transports[sock.fileno()] = transport
+            return transport
+
+        def _make_ssl_transport(
+            self,
+            rawsock,
+            protocol,
+            sslcontext,
+            waiter=None,
+            *,
+            server_side=False,
+            server_hostname=None,
+            extra=None,
+            server=None,
+            ssl_handshake_timeout=constants.SSL_HANDSHAKE_TIMEOUT,
+            ssl_shutdown_timeout=constants.SSL_SHUTDOWN_TIMEOUT,
+        ):
+            self._ensure_fd_no_transport(rawsock)
+            ssl_protocol = sslproto.SSLProtocol(
+                self,
+                protocol,
+                sslcontext,
+                waiter,
+                server_side,
+                server_hostname,
+                ssl_handshake_timeout=ssl_handshake_timeout,
+                ssl_shutdown_timeout=ssl_shutdown_timeout,
+            )
+            self._make_socket_transport(rawsock, ssl_protocol, extra=extra, server=server)
+            return ssl_protocol._app_transport
+
+    # Descriptor watching: the stdlib selector loop's remaining transports,
+    # sock_* helpers, pipes, and child watchers all reduce to these four
+    # calls. The Handle bookkeeping mirrors selector_events so cancellation
+    # semantics (a replaced or removed reader never fires) are identical.
 
     def _add_reader(self, fd, callback, *args):
         self._check_closed()
