@@ -49,10 +49,11 @@ StreamReader/Writer round trip. Use it when touching `src/worker_loop.rs`,
 it dispatches async handlers on a stdlib background loop, so its numbers are
 the stdlib column. Reference (12-core Linux, Python 3.12): WorkerLoop is
 ~0.75-0.85x of uvloop on the ready-queue paths, ~1.1x on raw `add_reader`
-events and `sock_*` round trips (opaque callbacks still need a `poll(2)` per
-event for level triggering), and ~1.04x on the StreamReader/Writer path,
-where the native Rust TCP transport (`src/worker_transport.rs`) reads and
-writes without Python frames or the `poll(2)` re-check.
+events (opaque callbacks still need a `poll(2)` per event for level
+triggering), ~0.9x on `sock_*` round trips (one shared registration per fd,
+so add/remove churn is a slot update), and ~1.05x on the StreamReader/Writer
+path, where the native Rust TCP transport (`src/worker_transport.rs`) reads
+and writes without Python frames or the `poll(2)` re-check.
 
 ## Rust micro-benchmarks (criterion)
 

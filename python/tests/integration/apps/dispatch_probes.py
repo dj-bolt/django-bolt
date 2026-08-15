@@ -24,6 +24,7 @@ Probe map:
 - /t-stream   async generator (NDJSON)    → streaming wire through async path
 - /t-server-api                           → Server.get_loop()/close_clients() on the WorkerLoop
 - /t-fd-cancelled-handle                 → cancelled reader Handle stops its Rust watcher
+- /t-fd-reuse-after-close                → re-registering a reused descriptor number fires
 - /t-transport-*                          → native Rust TCP transport: EOF, writelines, large reads,
                                             pause/resume_reading, sendfile, abort
 - /t-datagram-flow-control                → pause/resume_writing reaches datagram protocols
@@ -363,6 +364,25 @@ async def t_fd_cancelled_handle():
         loop.remove_reader(read_fd)
         os.close(read_fd)
         os.close(write_fd)
+
+
+@api.get("/t-fd-reuse-after-close")
+async def t_fd_reuse_after_close():
+    """remove_reader + close, then a new descriptor that gets the same number
+    is registered again: the second registration must fire (a retiring
+    registration is only reused while the number still names the same file)."""
+    loop = asyncio.get_running_loop()
+    results = []
+    for _ in range(3):
+        read_fd, write_fd = os.pipe()
+        got = loop.create_future()
+        loop.add_reader(read_fd, lambda got=got, fd=read_fd: got.done() or got.set_result(os.read(fd, 1)))
+        os.write(write_fd, b"x")
+        results.append((await asyncio.wait_for(got, 1)).decode())
+        loop.remove_reader(read_fd)
+        os.close(read_fd)
+        os.close(write_fd)
+    return {"results": results}
 
 
 @api.get("/t-fd-read-write")

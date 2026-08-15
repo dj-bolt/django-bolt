@@ -312,6 +312,11 @@ pub(crate) fn remove_fd_watch(fd: i32, direction: crate::worker_fd::Direction) -
     WorkerLoopService::get().fd_watchers.remove(fd, direction)
 }
 
+#[cfg(unix)]
+pub(crate) fn fd_watchers() -> &'static crate::worker_fd::FdWatchers {
+    &WorkerLoopService::get().fd_watchers
+}
+
 /// Test/introspection hook: descriptor watchers whose Tokio task is still
 /// running. A watcher for a cancelled handle must exit rather than spin.
 #[pyfunction]

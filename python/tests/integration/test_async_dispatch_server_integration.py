@@ -210,6 +210,7 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             assert server.get("/t-datagram").json() == {"reply": "datagram-ok"}
             assert server.get("/t-fd-level-triggered").json() == {"chunks": ["a", "b", "c", "d"]}
             assert server.get("/t-fd-cancelled-handle").json() == {"watcher_stopped": True, "calls": 0}
+            assert server.get("/t-fd-reuse-after-close").json() == {"results": ["x", "x", "x"]}
 
             # TCP transports are the native Rust SocketTransport on both ends.
             native = server.get("/t-transport-native").json()
