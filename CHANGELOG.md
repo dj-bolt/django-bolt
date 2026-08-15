@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **One 422 error for each field** - If more than one `@field_validator` fails, the response now has one `detail` entry for each field. Before: `{"loc": ["body"], "msg": "body.collage_code: collage Code is Not Valid; body.phone_number: The phone number entered is not valid.", "type": "validation_error"}`. Now: `{"loc": ["body", "collage_code"], "msg": "collage Code is Not Valid", "type": "value_error"}` and `{"loc": ["body", "phone_number"], "msg": "The phone number entered is not valid.", "type": "value_error"}`. For nested serializers and list bodies, `loc` includes the container path, `["body", "items", "1", "email"]`. (#280)
+- **`@classmethod` field validators run** - Before, Bolt ignored a `@field_validator` on a `@classmethod` and did not validate the field. Both decorator orders now work. `@staticmethod` on a field validator, or a descriptor on `@model_validator`, now raises `TypeError` at class creation. (#280)
+
+### Changed
+
+- **BREAKING: nested `loc` in 422 bodies** - Each path step is now one list item: `["body", "items", "1", "age"]`. Before, it was one string: `["body", "items1.age"]`. Top-level fields, `["body", "age"]`, do not change. This is the Pydantic/FastAPI format. If your client parses nested `loc` values, read the list. (#280)
+
 ## [0.10.0]
 
 ### Added
