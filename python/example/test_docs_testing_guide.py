@@ -33,7 +33,7 @@ def test_root_route_through_the_real_pipeline():
     with TestClient(api) as client:
         response = client.get("/")
         assert response.status_code == 200
-        assert response.json() == {"message": "Hello World"}
+        assert response.json() == {"message": "Hello Django"}
 
 
 # ── Validation ──────────────────────────────────────────────────────────────--

@@ -11,9 +11,6 @@ from typing import Annotated, Protocol
 import msgspec
 import test_data
 from django.contrib.auth import aauthenticate, get_user_model
-from msgspec import Meta
-from users.api import UserMini
-from users.models import User
 
 from django_bolt import (
     BoltAPI,
@@ -21,7 +18,6 @@ from django_bolt import (
 )
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user, get_current_user
 from django_bolt.exceptions import (
-    BadRequest,
     HTTPException,
     NotFound,
     RequestValidationError,
@@ -39,12 +35,10 @@ from django_bolt.responses import (
     FileResponse,
     PlainText,
     Redirect,
-    ServerSentEvent,
     StreamingResponse,
 )
-from django_bolt.serializers import Serializer, field_validator
 from django_bolt.types import Request
-from django_bolt.views import APIView, ViewSet
+from django_bolt.views import APIView
 
 from .middleware_demo import middleware_api
 
@@ -118,11 +112,6 @@ class Item(msgspec.Struct):
     name: str
     price: float
     is_offer: bool | None = None
-
-
-@api.get("/items100", response_model=list[Item])
-async def items100() -> list[Item]:
-    return [Item(name=f"item{i}", price=float(i), is_offer=(i % 2 == 0)) for i in range(100)]
 
 
 class PostActivity(msgspec.Struct, tag="post"):
@@ -216,47 +205,6 @@ async def feed() -> list[FeedItem]:
                 )
             )
     return out
-
-
-# ---------------------------------------------------------------------------
-# Union response overhead bench
-# ---------------------------------------------------------------------------
-# Paired endpoints that build identical PostActivity instances and emit
-# byte-identical JSON. The only difference is the declared response_model:
-# the `union` variants advertise a tagged union, the matched variants
-# advertise the concrete PostActivity type. Diffing RPS between each pair
-# isolates the union dispatch / response-validation overhead from
-# everything else (struct construction, msgspec encoding, IO).
-
-
-def _post_activity(i: int) -> PostActivity:
-    return PostActivity(
-        id=i,
-        actor=f"user{i}",
-        title=f"Post {i}",
-        body="Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
-        created_at="2026-05-24T10:00:00Z",
-    )
-
-
-@api.get("/bench/union-single", response_model=FeedItem)
-async def bench_union_single() -> FeedItem:
-    return _post_activity(1)
-
-
-@api.get("/bench/single", response_model=PostActivity)
-async def bench_single() -> PostActivity:
-    return _post_activity(1)
-
-
-@api.get("/bench/union-list", response_model=list[FeedItem])
-async def bench_union_list() -> list[FeedItem]:
-    return [_post_activity(i) for i in range(100)]
-
-
-@api.get("/bench/list", response_model=list[PostActivity])
-async def bench_list() -> list[PostActivity]:
-    return [_post_activity(i) for i in range(100)]
 
 
 # ============================================================================
@@ -434,36 +382,6 @@ async def get_auth_context(request: Request):
     }
 
 
-@api.get(
-    "/auth/no-user-access",
-    auth=[JWTAuthentication()],
-    guards=[IsAuthenticated()],
-    tags=["auth"],
-    summary="Authenticated endpoint that does NOT access request.user (lazy loading benchmark)",
-)
-async def get_no_user_access(request: Request):
-    """
-    Authenticated endpoint that does NOT access request.user.
-
-    This demonstrates lazy loading - the user is never loaded from the database
-    because request.user is never accessed. Compare performance with /auth/me
-    which does access request.user and triggers a database query.
-
-    Use this endpoint to benchmark the overhead of authentication WITHOUT
-    user loading, vs /auth/me which includes user loading.
-
-    Requires a valid JWT token in the Authorization header:
-    Authorization: Bearer <jwt_token>
-    """
-    # Only access auth context - never touch request.user
-    context = request.context
-    return {
-        "authenticated": True,
-        "user_id": context.get("user_id"),
-        "message": "User was NOT loaded from database (lazy loading)",
-    }
-
-
 class TokenRequest(msgspec.Struct):
     """Request body for token generation."""
 
@@ -570,24 +488,6 @@ async def read_1k() -> list[ItemSchema]:
     return test_data.JSON_1K
 
 
-@api.get("/100k-json")
-async def read_100k():
-    """Endpoint that returns 100k JSON objects."""
-    return test_data.JSON_100K
-
-
-@api.get("/500k-json")
-async def read_500k():
-    """Endpoint that returns 500k JSON objects."""
-    return test_data.JSON_500K
-
-
-@api.get("/1m-json")
-async def read_1m():
-    """Endpoint that returns 1m JSON objects."""
-    return test_data.JSON_1M
-
-
 @api.get("/sync-10k-json")
 def read_10k_sync():
     """
@@ -595,44 +495,6 @@ def read_10k_sync():
 
     """
     return test_data.JSON_10K
-
-
-class UserMiniSerializer(Serializer):
-    id: int
-    username: str
-
-
-@api.get("/sync-users", response_model=list[UserMiniSerializer])
-def read_users_sync():
-    """
-    Sync version: Endpoint that returns 10k JSON objects.
-
-    """
-    users = User.objects.all()[0:100]
-
-    return users
-
-
-# @api.get("/sync-users")
-# def read_10k_sync() -> list[UserMini]:
-#     """
-#     Sync version: Endpoint that returns 10k JSON objects.
-
-#     """
-#     users = User.objects.all()[0:100]
-
-#     return users
-
-
-@api.get("/async-users")
-async def read_users_async() -> list[UserMini]:
-    """
-    Async version: Endpoint that returns 10k JSON objects.
-
-    """
-    users = User.objects.all()[0:100]
-
-    return users
 
 
 @api.get("/items/{item_id}")
@@ -664,72 +526,6 @@ async def bench_query(req: Request, payload: BenchPayload):
     # Byte-identical work to /bench/parse (POST). The only difference is the
     # HTTP QUERY method, so diffing RPS isolates the method's routing cost.
     return {"ok": True, "n": len(payload.items), "count": payload.count}
-
-
-@api.get("/bench/slow")
-async def bench_slow(ms: int | None = 100):
-    # Simulate slow I/O (network) with asyncio.sleep
-    delay = max(0, (ms or 0)) / 1000.0
-    await asyncio.sleep(delay)
-    return {"ok": True, "ms": ms}
-
-
-# ==== Parameter Handling Benchmark Endpoints ====
-@api.get("/bench/params/typed/{id}")
-async def bench_typed_params(
-    id: int,
-    count: int,
-    price: float,
-    active: bool = True,
-):
-    return {"id": id, "count": count, "price": price, "active": active}
-
-
-@api.get("/bench/params/multi-query")
-async def bench_multi_query(
-    page: int = 1,
-    limit: int = 10,
-    sort: str = "id",
-    order: str = "asc",
-    filter_active: bool = True,
-    min_price: float = 0.0,
-    max_price: float = 1000.0,
-):
-    return {
-        "page": page,
-        "limit": limit,
-        "sort": sort,
-        "order": order,
-        "filter_active": filter_active,
-        "min_price": min_price,
-        "max_price": max_price,
-    }
-
-
-@api.post("/bench/form/typed")
-async def bench_typed_form(
-    name: Annotated[str, Form()],
-    age: Annotated[int, Form()],
-    score: Annotated[float, Form()],
-    active: Annotated[bool, Form()] = True,
-):
-    return {"name": name, "age": age, "score": score, "active": active}
-
-
-@api.post("/bench/form/large")
-async def bench_large_form(
-    field1: Annotated[str, Form()],
-    field2: Annotated[str, Form()],
-    field3: Annotated[str, Form()],
-    field4: Annotated[str, Form()],
-    field5: Annotated[str, Form()],
-    num1: Annotated[int, Form()],
-    num2: Annotated[int, Form()],
-    num3: Annotated[float, Form()],
-    flag1: Annotated[bool, Form()] = True,
-    flag2: Annotated[bool, Form()] = False,
-):
-    return {"fields": 10, "ok": True}
 
 
 # ==== Benchmark endpoints for Header/Cookie/Exception/HTML/Redirect ====
@@ -771,23 +567,6 @@ async def cookies_valid():
     return response
 
 
-@api.get("/cookies/multiple")
-async def cookies_multiple():
-    """
-    Set multiple cookies in one response.
-
-    Test with:
-        curl -v http://localhost:8000/cookies/multiple
-
-    Response headers should include multiple Set-Cookie headers.
-    """
-    response = JSON({"message": "Multiple cookies set", "cookies": ["user_id", "theme", "lang"]})
-    response.set_cookie("user_id", "12345", httponly=True)
-    response.set_cookie("theme", "dark", max_age=86400 * 365)  # 1 year
-    response.set_cookie("lang", "en-US")
-    return response
-
-
 @api.get("/cookies/delete")
 async def cookies_delete():
     """
@@ -801,123 +580,6 @@ async def cookies_delete():
     """
     response = JSON({"message": "Cookie deleted", "cookie_name": "session"})
     response.delete_cookie("session")
-    return response
-
-
-@api.get("/cookies/invalid-name")
-async def cookies_invalid_name():
-    """
-    Attempt to set a cookie with an invalid name (contains injection characters).
-
-    The Rust layer will reject this cookie and log a warning.
-    The response will succeed but the invalid cookie won't be set.
-
-    Test with:
-        curl -v http://localhost:8000/cookies/invalid-name
-
-    Check server logs for:
-        [django-bolt] WARNING: Invalid cookie name 'session; Path=/evil' - contains invalid characters
-
-    The Set-Cookie header will NOT appear in the response.
-    """
-    response = JSON(
-        {
-            "message": "Attempted to set cookie with invalid name",
-            "cookie_name": "session; Path=/evil",
-            "note": "This cookie will be rejected by Rust validation - check server logs",
-        }
-    )
-    # This name contains '; Path=/evil' which is a header injection attempt
-    # Rust will reject it based on RFC 6265 cookie name validation
-    response.set_cookie("session; Path=/evil", "malicious", httponly=True)
-    return response
-
-
-@api.get("/cookies/invalid-value")
-async def cookies_invalid_value():
-    """
-    Attempt to set a cookie with control characters in the value.
-
-    The Rust layer will reject this cookie and log a warning.
-    The response will succeed but the invalid cookie won't be set.
-
-    Test with:
-        curl -v http://localhost:8000/cookies/invalid-value
-
-    Check server logs for:
-        [django-bolt] WARNING: Cookie 'injection' value contains control characters - rejected for security
-
-    The Set-Cookie header will NOT appear in the response.
-    """
-    response = JSON(
-        {
-            "message": "Attempted to set cookie with control characters in value",
-            "cookie_name": "injection",
-            "note": "This cookie will be rejected by Rust validation - check server logs",
-        }
-    )
-    # This value contains CRLF which could enable header injection
-    # Rust will reject it for security
-    response.set_cookie("injection", "value\r\nSet-Cookie: evil=1", httponly=True)
-    return response
-
-
-@api.get("/cookies/mixed")
-async def cookies_mixed():
-    """
-    Set multiple cookies - some valid, some invalid.
-
-    Demonstrates that invalid cookies are rejected individually,
-    while valid cookies in the same response are still set.
-
-    Test with:
-        curl -v http://localhost:8000/cookies/mixed
-
-    Only valid cookies will appear in Set-Cookie headers.
-    Invalid ones will be logged and skipped.
-    """
-    response = JSON(
-        {
-            "message": "Mixed valid/invalid cookies",
-            "valid_cookies": ["good_session", "user_prefs"],
-            "invalid_cookies": ["bad; name", "has_control_chars"],
-        }
-    )
-
-    # Valid cookies - these will be set
-    response.set_cookie("good_session", "valid123", httponly=True, secure=True)
-    response.set_cookie("user_prefs", "theme=dark", max_age=86400)
-
-    # Invalid cookie name - will be rejected
-    response.set_cookie("bad; name", "value")
-
-    # Invalid cookie value (control characters) - will be rejected
-    response.set_cookie("has_control_chars", "line1\nline2")
-
-    return response
-
-
-@api.get("/cookies/special-chars")
-async def cookies_special_chars():
-    """
-    Set a cookie with special characters in the value that need escaping.
-
-    The cookie crate handles proper quoting/escaping for RFC 6265 compliance.
-
-    Test with:
-        curl -v http://localhost:8000/cookies/special-chars
-
-    The value with spaces will be properly quoted in the Set-Cookie header.
-    """
-    response = JSON(
-        {
-            "message": "Cookie with special characters",
-            "cookie_name": "data",
-            "cookie_value": "hello world with spaces",
-        }
-    )
-    # Spaces require quoting per RFC 6265 - the cookie crate handles this
-    response.set_cookie("data", "hello world with spaces")
     return response
 
 
@@ -948,29 +610,6 @@ async def handle_form(
 async def handle_upload(files: Annotated[list[dict], File(alias="file")]):
     # Return file metadata
     return {"uploaded": len(files), "files": [{"name": f.get("filename"), "size": f.get("size")} for f in files]}
-
-
-@api.post("/mixed-form")
-async def handle_mixed(
-    title: Annotated[str, Form()],
-    description: Annotated[str, Form()],
-    attachments: Annotated[list[dict], File(alias="file")] = None,
-):
-    """
-    Handle a multipart form submission containing a title, description, and optional file attachments.
-
-    Parameters:
-        title (str): Form field for the item's title.
-        description (str): Form field for the item's description.
-        attachments (list[dict] | None): Uploaded files (each represented as a dict with file metadata); may be omitted.
-
-    Returns:
-        dict: A summary containing `title`, `description`, `has_attachments` (`true` if any attachments were provided, `false` otherwise), and `attachment_count` when attachments are present.
-    """
-    result = {"title": title, "description": description, "has_attachments": bool(attachments)}
-    if attachments:
-        result["attachment_count"] = len(attachments)
-    return result
 
 
 class FormRepeatedKeys(msgspec.Struct):
@@ -1008,11 +647,6 @@ async def file_static():
     return FileResponse(THIS_FILE, filename="api.py")
 
 
-@api.get("/file-static-nonexistent")
-async def file_static_nonexistent():
-    return FileResponse("/path/to/nonexistent/file.txt", filename="asdfasd.py")
-
-
 # ==== Streaming endpoints for benchmarks ====
 @api.get("/stream")
 @no_compress
@@ -1024,30 +658,11 @@ async def stream_plain():
     return StreamingResponse(gen(), media_type="text/plain")
 
 
-@api.get("/collected")
-async def collected_plain():
-    # Same data but collected into a single response
-    return PlainText("x" * 100)
-
-
 @api.get("/sse")
 async def sse():
     async def gen():
         while True:
             await asyncio.sleep(1)
-            yield f"data: {time.time()}\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-@api.get("/sync-sse")
-@no_compress
-def sse_sync():
-    """Sync version: Server-Sent Events."""
-
-    def gen():
-        while True:
-            time.sleep(1)
             yield f"data: {time.time()}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -1071,94 +686,6 @@ async def sse_new() -> AsyncIterable[TimestampEvent]:
         yield TimestampEvent(timestamp=time.time(), count=count)
 
 
-@api.get("/sse-new-explicit")
-async def sse_new_explicit():
-    """Explicit SSE: return EventSourceResponse with mixed yields."""
-
-    async def gen():
-        yield {"message": "stream started", "time": time.time()}
-        for i in range(5):
-            await asyncio.sleep(1)
-            yield ServerSentEvent(
-                data={"count": i, "time": time.time()},
-                event="tick",
-                id=str(i),
-            )
-        yield ServerSentEvent(comment="stream ending")
-        yield ServerSentEvent(data="done", event="complete")
-
-    return EventSourceResponse(gen())
-
-
-# ==== OpenAI-style Chat Completions (streaming/non-streaming) ====
-class ChatMessage(msgspec.Struct):
-    role: str
-    content: str
-
-
-class ChatCompletionRequest(msgspec.Struct):
-    model: str = "gpt-4o-mini"
-    messages: list[ChatMessage] = []
-    stream: bool = True
-    n_chunks: int = 50
-    token: str = " hello"
-    delay_ms: int = 0
-
-
-# Optimized msgspec structs for streaming responses (zero-allocation serialization)
-class ChatCompletionChunkDelta(msgspec.Struct):
-    content: str | None = None
-
-
-class ChatCompletionChunkChoice(msgspec.Struct):
-    index: int
-    delta: ChatCompletionChunkDelta
-    finish_reason: str | None = None
-
-
-class ChatCompletionChunk(msgspec.Struct):
-    id: str
-    created: int
-    model: str
-    choices: list[ChatCompletionChunkChoice]
-    object: str = "chat.completion.chunk"
-
-
-@api.get("/v1/chat/completions")
-@no_compress
-async def openai_chat_completions():
-    """Ultra-optimized chat completions endpoint that streams 100 chunks using msgspec"""
-    created = int(time.time())
-    model = "gpt-4o-mini"
-    chat_id = "chatcmpl-bolt-bench"
-
-    # Pre-create reusable msgspec structs (minimal object creation)
-    stop_delta = ChatCompletionChunkDelta()
-
-    async def agen():
-        # Ultra-optimized: reuse structs and minimize allocations
-        for i in range(50):
-            await asyncio.sleep(0.2)
-            # Reuse pre-created delta struct
-            choice = ChatCompletionChunkChoice(
-                index=0, delta=ChatCompletionChunkDelta(content=f"hello - {i}"), finish_reason=None
-            )
-            chunk = ChatCompletionChunk(id=chat_id, created=created, model=model, choices=[choice])
-
-            # msgspec.json.encode directly to bytes - fastest possible path
-            chunk_bytes = msgspec.json.encode(chunk)
-            yield b"data: " + chunk_bytes + b"\n\n"
-
-        # Final chunk with stop reason
-        final_choice = ChatCompletionChunkChoice(index=0, delta=stop_delta, finish_reason="stop")
-        final_chunk = ChatCompletionChunk(id=chat_id, created=created, model=model, choices=[final_choice])
-        final_bytes = msgspec.json.encode(final_chunk)
-        yield b"data: " + final_bytes + b"\n\n"
-        yield b"data: [DONE]\n\n"
-
-    return StreamingResponse(agen(), media_type="text/event-stream")
-
-
 # ==== Error Handling & Logging Examples ====
 
 
@@ -1171,21 +698,6 @@ async def error_not_found(resource_id: int):
     return {"resource_id": resource_id, "status": "found"}
 
 
-@api.get("/errors/bad-request")
-async def error_bad_request(value: int | None = None):
-    """Example of BadRequest exception."""
-    if value is None or value < 0:
-        raise BadRequest(detail="Value must be a positive integer")
-    return {"value": value, "doubled": value * 2}
-
-
-@api.get("/errors/unauthorized")
-async def error_unauthorized():
-    """Example of Unauthorized exception with headers."""
-    raise Unauthorized(detail="Authentication required", headers={"WWW-Authenticate": 'Bearer realm="API"'})
-
-
-# Example 2: Validation errors with field-level details
 class UserCreate(msgspec.Struct):
     username: str
     email: str
@@ -1231,19 +743,6 @@ async def error_validation(user: UserCreate):
 
 
 # Example 3: Generic exception (will show traceback in DEBUG mode)
-@api.get("/errors/internal")
-async def error_internal():
-    """Example of generic exception that triggers debug mode behavior.
-
-    In DEBUG=True: Returns 500 with full traceback
-    In DEBUG=False: Returns 500 with generic message
-    """
-    # This simulates an unexpected error
-    result = 1 / 0  # ZeroDivisionError
-    return {"result": result}
-
-
-# Example 4: Custom error with extra data
 @api.get("/errors/complex")
 async def error_complex():
     """Example of HTTPException with extra structured data."""
@@ -1274,126 +773,6 @@ async def check_external_api():
 
 # Add custom health check to /ready endpoint
 add_health_check(check_external_api)
-
-
-# ==== Compression Test Endpoint ====
-@api.get("/compression-test")
-# @no_compress
-async def compression_test():
-    """
-    Endpoint to test compression.
-
-    Returns a large JSON response (>1KB) that should be compressed
-    when client sends Accept-Encoding: gzip, br, deflate headers.
-
-    Test with:
-        curl -H "Accept-Encoding: gzip, br" http://localhost:8000/compression-test -v
-
-    Check for "Content-Encoding" header in response.
-    """
-    # Generate large data (>1KB to trigger compression)
-    large_data = {
-        "message": "This is a compression test endpoint",
-        "compression_info": {
-            "enabled": "Compression is enabled by default in Django-Bolt",
-            "algorithms": ["brotli", "gzip", "zstd"],
-            "automatic": "Actix Web automatically compresses based on Accept-Encoding header",
-            "threshold": "Responses larger than ~1KB are compressed",
-        },
-        "sample_data": [
-            {
-                "id": i,
-                "name": f"Item {i}",
-                "description": "This is a sample description that adds to the response size. " * 5,
-                "metadata": {
-                    "created_at": "2025-01-01T00:00:00Z",
-                    "updated_at": "2025-01-02T00:00:00Z",
-                    "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"],
-                    "properties": {
-                        "key1": "value1",
-                        "key2": "value2",
-                        "key3": "value3",
-                    },
-                },
-            }
-            for i in range(50)  # 50 items to ensure >1KB
-        ],
-        "instructions": {
-            "step1": "Send a request with 'Accept-Encoding: gzip, br' header",
-            "step2": "Check response headers for 'Content-Encoding'",
-            "step3": "Compare response size with/without compression",
-            "note": "Small responses (<1KB) won't be compressed even with Accept-Encoding",
-        },
-    }
-
-    return large_data
-
-
-# ============================================================================
-# Serializer Benchmark Endpoints
-# ============================================================================
-
-
-class BenchAuthorRaw(msgspec.Struct):
-    """Raw msgspec for baseline comparison."""
-
-    id: int
-    name: Annotated[str, Meta(min_length=2)]
-    email: Annotated[str, Meta(pattern=r"^[^@]+@[^@]+\.[^@]+$")]
-    bio: str = ""
-
-
-class BenchAuthorWithValidators(Serializer):
-    """Django-Bolt Serializer with custom field validators."""
-
-    id: int
-    name: Annotated[str, Meta(min_length=2)]
-    email: Annotated[str, Meta(pattern=r"^[^@]+@[^@]+\.[^@]+$")]
-    bio: str = ""
-
-    @field_validator("name")
-    def strip_name(cls, value: str) -> str:
-        """Strip whitespace from name."""
-        return value.strip()
-
-    @field_validator("email")
-    def lowercase_email(cls, value: str) -> str:
-        """Lowercase email for consistency."""
-        return value.lower()
-
-    # @field_validator("password")
-    # def validate_password(cls, value: str) -> str:
-    #     """Validate password strength."""
-    #     if value == "4321":
-    #         raise ValidationError("Incorrect password")
-    #     # MUST return the value (or transformed value)
-    #     return value
-
-
-@api.post("/bench/serializer-raw")
-async def bench_serializer_raw(author: BenchAuthorRaw) -> BenchAuthorRaw:
-    """
-    Benchmark endpoint using raw msgspec (no validators).
-    Tests pure msgspec deserialization and serialization.
-    """
-    return author
-
-
-@api.post("/bench/serializer-validated")
-async def bench_serializer_validated(author: BenchAuthorWithValidators) -> BenchAuthorWithValidators:
-    """
-    Benchmark endpoint using Django-Bolt Serializer with custom validators.
-    Tests deserialization with field validators (strip, lowercase).
-
-    Validates that:
-    - name is stripped of whitespace
-    - email is lowercased
-    """
-    # Ensure validations worked
-    assert author.name == author.name.strip(), "Name should be stripped"
-    assert author.email == author.email.lower(), "Email should be lowercase"
-
-    return author
 
 
 # ============================================================================
@@ -1510,30 +889,6 @@ async def multi_delete_item(item_id: int):
 
 
 # ============================================================================
-# Multi-Response Benchmark Endpoints
-# ============================================================================
-
-
-class BenchOk(msgspec.Struct):
-    id: int
-    name: str
-
-
-class BenchError(msgspec.Struct):
-    detail: str
-
-
-@api.get("/bench/multi/tuple", response_model={200: BenchOk, 400: BenchError})
-async def bench_multi_tuple():
-    return (200, {"id": 1, "name": "alice"})
-
-
-@api.get("/bench/multi/dict", response_model={200: BenchOk, 400: BenchError})
-async def bench_multi_dict():
-    return {"id": 1, "name": "alice"}
-
-
-# ============================================================================
 # Class-Based Views (APIView) - Using Decorator Syntax
 # ============================================================================
 
@@ -1565,108 +920,6 @@ class ItemAPIView(APIView):
 
 
 # ============================================================================
-# Class-Based Views (ViewSet) - Using Unified ViewSet Pattern with @action
-# ============================================================================
-
-
-# ============================================================================
-# Benchmark ViewSets - Using Decorator Syntax
-# ============================================================================
-
-
-@api.view("/cbv-items100")
-class Items100ViewSet(ViewSet):
-    """ViewSet that returns 100 items (for benchmarking)."""
-
-    async def get(self, request):
-        """GET /cbv-items100 - Return 100 items."""
-        return [{"name": f"item{i}", "price": float(i), "is_offer": (i % 2 == 0)} for i in range(100)]
-
-
-@api.view("/cbv-bench-parse")
-class BenchParseViewSet(ViewSet):
-    """ViewSet for JSON parsing benchmark."""
-
-    async def post(self, request, payload: BenchPayload):
-        """POST /cbv-bench-parse - Parse and validate JSON payload."""
-        return {"ok": True, "n": len(payload.items), "count": payload.count, "cbv": True}
-
-
-# ============================================================================
-# Response Type ViewSets - Using Decorator Syntax
-# ============================================================================
-
-
-@api.view("/cbv-response")
-class ResponseTypeViewSet(ViewSet):
-    """ViewSet demonstrating different response types."""
-
-    async def get(self, request, response_type: str = "json"):
-        """GET /cbv-response - Return different response types based on parameter."""
-        if response_type == "plain":
-            return PlainText("Hello from ViewSet")
-        elif response_type == "html":
-            return HTML("<h1>Hello from ViewSet</h1>")
-        elif response_type == "redirect":
-            return Redirect("/", status_code=302)
-        else:
-            return {"type": "json", "message": "Hello from ViewSet"}
-
-
-@api.view("/cbv-header")
-class HeaderViewSet(ViewSet):
-    """ViewSet for header extraction."""
-
-    async def get(self, request, x: Annotated[str, Header(alias="x-test")]):
-        """GET /cbv-header - Extract custom header."""
-        return PlainText(f"Header: {x}")
-
-
-@api.view("/cbv-cookie")
-class CookieViewSet(ViewSet):
-    """ViewSet for cookie extraction."""
-
-    async def post(self, request, val: Annotated[str, Cookie(alias="session")]):
-        """POST /cbv-cookie - Extract cookie."""
-        return PlainText(f"Cookie: {val}")
-
-
-# ============================================================================
-# Streaming ViewSets - Using Decorator Syntax
-# ============================================================================
-
-
-@api.view("/cbv-stream")
-class StreamViewSet(ViewSet):
-    """ViewSet for streaming responses."""
-
-    @no_compress
-    async def get(self, request):
-        """GET /cbv-stream - Stream plain text."""
-
-        def gen():
-            for _i in range(100):
-                yield "x"
-
-        return StreamingResponse(gen(), media_type="text/plain")
-
-
-@api.view("/cbv-sse")
-class SSEViewSet(ViewSet):
-    """ViewSet for Server-Sent Events."""
-
-    @no_compress
-    async def get(self, request):
-        """GET /cbv-sse - Stream SSE events."""
-
-        def gen():
-            for i in range(3):
-                yield f"data: {i}\n\n"
-
-        return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-# ============================================================================
 # WebSocket Endpoints
 # ============================================================================
 
@@ -1688,20 +941,6 @@ async def websocket_load_test(websocket: WebSocket):
             await websocket.send_text(message)
 
 
-@api.websocket("/ws/echo")
-async def websocket_echo(websocket: WebSocket):
-    """
-    WebSocket echo endpoint.
-    """
-    await websocket.accept()
-    try:
-        async for message in websocket.iter_json():
-            await websocket.send_text(f"Echo: {message}")
-    except Exception as e:
-        print(f"Error in websocket_echo: {e}")
-        await websocket.close(code=1011, reason="Some Error")
-
-
 @api.websocket("/ws/room/{room_id}")
 async def websocket_room(websocket: WebSocket, room_id: str):
     """
@@ -1717,62 +956,3 @@ async def websocket_room(websocket: WebSocket, room_id: str):
     with suppress(Exception):
         async for message in websocket.iter_text():
             await websocket.send_text(f"[{room_id}] {message}")
-
-
-@api.view("/cbv-chat-completions")
-class ChatCompletionsViewSet(ViewSet):
-    """ViewSet for OpenAI-style chat completions."""
-
-    @no_compress
-    async def post(self, request, payload: ChatCompletionRequest):
-        """POST /cbv-chat-completions - Handle chat completions with streaming support."""
-        created = int(time.time())
-        model = payload.model or "gpt-4o-mini"
-        chat_id = "chatcmpl-bolt-cbv"
-
-        if payload.stream:
-
-            async def agen():
-                delay = max(0, payload.delay_ms or 0) / 1000.0
-                for _i in range(max(1, payload.n_chunks)):
-                    chunk = ChatCompletionChunk(
-                        id=chat_id,
-                        created=created,
-                        model=model,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                index=0, delta=ChatCompletionChunkDelta(content=payload.token), finish_reason=None
-                            )
-                        ],
-                    )
-                    chunk_json = msgspec.json.encode(chunk)
-                    yield b"data: " + chunk_json + b"\n\n"
-
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-
-                # Final chunk
-                final_chunk = ChatCompletionChunk(
-                    id=chat_id,
-                    created=created,
-                    model=model,
-                    choices=[
-                        ChatCompletionChunkChoice(index=0, delta=ChatCompletionChunkDelta(), finish_reason="stop")
-                    ],
-                )
-                final_json = msgspec.json.encode(final_chunk)
-                yield b"data: " + final_json + b"\n\n"
-                yield b"data: [DONE]\n\n"
-
-            return StreamingResponse(agen(), media_type="text/event-stream")
-
-        # Non-streaming
-        text = (payload.token * max(1, payload.n_chunks)).strip()
-        response = {
-            "id": chat_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-        }
-        return response

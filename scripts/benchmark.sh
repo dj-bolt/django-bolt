@@ -208,24 +208,6 @@ else
 fi
 
 echo ""
-echo "## Union Response Overhead"
-# Paired endpoints — identical Python work and byte-identical JSON output.
-# The only difference is response_model: union vs the concrete struct. Diffing
-# RPS between each pair isolates union dispatch / response-validation cost.
-
-printf "### Single struct, no union (/bench/single)\n"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/single 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
-printf "### Single struct via tagged union (/bench/union-single)\n"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/union-single 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
-printf "### List of 100 structs, no union (/bench/list)\n"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
-printf "### List of 100 structs via tagged union (/bench/union-list)\n"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/union-list 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
-echo ""
 echo "## Authentication & Authorization Performance"
 
 # Create a Django user and JWT token for testing
@@ -273,14 +255,8 @@ PYTHON_TOKEN_SCRIPT
 if [ -n "$TOKEN" ] && [ ${#TOKEN} -gt 50 ]; then
     AUTH_HEADER="Authorization: Bearer $TOKEN"
 
-    printf "### Auth NO User Access (/auth/no-user-access) - lazy loading, no DB query\n"
-    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/no-user-access 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
     printf "### Get Authenticated User (/auth/me) - accesses request.user, triggers DB query\n"
     $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/me 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
-    printf "### Get User via Dependency (/auth/me-dependency)\n"
-    $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/me-dependency 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
     printf "### Get Auth Context (/auth/context) validated jwt no db\n"
     $BOMBARDIER_BIN -c $C -n $N -l -H "$AUTH_HEADER" http://$HOST:$PORT/auth/context 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
@@ -353,9 +329,6 @@ $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/sync-full10 2>&1 | tr '\
 echo "### Users Mini10 (Async) (/users/mini10)"
 $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/mini10 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
-echo "### Users Mini10 (Sync) (/users/sync-mini10)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/sync-mini10 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
 # Clean up: delete all users
 echo "Cleaning up test users..."
 curl -s -X POST http://$HOST:$PORT/users/delete >/dev/null 2>&1
@@ -375,10 +348,6 @@ BODY_FILE=$(mktemp)
 echo '{"name":"bench","price":1.23,"is_offer":true}' > "$BODY_FILE"
 $BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/cbv-simple 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$BODY_FILE"
-
-echo "### Items100 ViewSet GET (/cbv-items100)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-items100 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
 echo ""
 echo "## CBV Items - Basic Operations"
 
@@ -400,63 +369,6 @@ else
   echo "Skipped: CBV Items PUT returned $PCODE" >&2
 fi
 rm -f "$BODY_FILE"
-
-echo ""
-echo "## CBV Additional Benchmarks"
-
-echo "### CBV Bench Parse (POST /cbv-bench-parse)"
-BODY_FILE=$(mktemp)
-cat > "$BODY_FILE" << 'JSON'
-{
-  "title": "bench",
-  "count": 100,
-  "items": [
-    {"name": "a", "price": 1.0, "is_offer": true}
-  ]
-}
-JSON
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$BODY_FILE" http://$HOST:$PORT/cbv-bench-parse 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-rm -f "$BODY_FILE"
-
-echo "### CBV Response Types (/cbv-response)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/cbv-response 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
-# ORM endpoints with CBV
-echo ""
-echo "## ORM Performance with CBV"
-
-# Seed users for CBV benchmarking
-echo "Seeding 1000 users for CBV benchmark..."
-SEED_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X GET http://$HOST:$PORT/users/seed?count=1000)
-if [ "$SEED_CODE" != "200" ]; then
-  echo "Warning: Failed to seed users (got $SEED_CODE), benchmarking with empty database" >&2
-else
-  echo "Successfully seeded users"
-
-  # Validate users exist by checking /users/cbv-mini10
-  USERS_RESPONSE=$(curl -s http://$HOST:$PORT/users/cbv-mini10)
-  USER_COUNT=$(echo "$USERS_RESPONSE" | grep -o '"id"' | wc -l)
-  if [ "$USER_COUNT" -eq 0 ]; then
-    echo "Warning: No users found after seeding, benchmarking with empty database" >&2
-  else
-    echo "Validated: $USER_COUNT users exist in database"
-  fi
-fi
-
-# Sanity check
-UCODE=$(curl -s -o /dev/null -w '%{http_code}' http://$HOST:$PORT/users/cbv-mini10)
-if [ "$UCODE" != "200" ]; then
-  echo "Expected 200 from /users/cbv-mini10 but got $UCODE; skipping CBV ORM benchmark." >&2
-else
-  echo "### Users CBV Mini10 (List) (/users/cbv-mini10)"
-  $BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/users/cbv-mini10 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-fi
-
-# Clean up: delete all users
-echo "Cleaning up test users..."
-curl -s -X POST http://$HOST:$PORT/users/delete >/dev/null 2>&1
-
-echo ""
 
 stop_server
 
@@ -491,31 +403,6 @@ printf "This is test file content 2\r\n" >> "$UPLOAD_FILE"
 printf -- "--%s--\r\n" "$BOUNDARY" >> "$UPLOAD_FILE"
 $BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$UPLOAD_FILE" http://$HOST:$PORT/upload 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 rm -f "$UPLOAD_FILE"
-
-# Mixed form with files benchmark
-echo "### Mixed Form with Files (POST /mixed-form)"
-MIXED_FILE=$(mktemp)
-BOUNDARY="----BoltMixed$(date +%s)"
-# Use printf with \r\n for proper CRLF line endings (required by HTTP multipart/form-data spec)
-printf -- "--%s\r\n" "$BOUNDARY" > "$MIXED_FILE"
-printf "Content-Disposition: form-data; name=\"title\"\r\n" >> "$MIXED_FILE"
-printf "\r\n" >> "$MIXED_FILE"
-printf "Test Title\r\n" >> "$MIXED_FILE"
-printf -- "--%s\r\n" "$BOUNDARY" >> "$MIXED_FILE"
-printf "Content-Disposition: form-data; name=\"description\"\r\n" >> "$MIXED_FILE"
-printf "\r\n" >> "$MIXED_FILE"
-printf "This is a test description\r\n" >> "$MIXED_FILE"
-printf -- "--%s\r\n" "$BOUNDARY" >> "$MIXED_FILE"
-printf "Content-Disposition: form-data; name=\"file\"; filename=\"attachment.txt\"\r\n" >> "$MIXED_FILE"
-printf "Content-Type: text/plain\r\n" >> "$MIXED_FILE"
-printf "\r\n" >> "$MIXED_FILE"
-printf "File attachment content\r\n" >> "$MIXED_FILE"
-printf -- "--%s--\r\n" "$BOUNDARY" >> "$MIXED_FILE"
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" -f "$MIXED_FILE" http://$HOST:$PORT/mixed-form 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-rm -f "$MIXED_FILE"
-
-# Repeated-key form: exercises the multi-value form path (e.g. multi-select,
-# multiple checkboxes with the same name). Validates list[T] struct binding.
 echo "### Form Repeated Keys urlencoded (POST /form-list)"
 FORM_LIST_FILE=$(mktemp)
 printf '%s' "name=Bench&tags=red&tags=green&tags=blue&tags=yellow&counts=1&counts=2&counts=3" > "$FORM_LIST_FILE"
@@ -592,90 +479,8 @@ else
 fi
 rm -f "$BODY_FILE"
 
-echo ""
-echo "## Serializer Performance Benchmarks"
-
-# Test raw msgspec (baseline)
-SERIALIZER_RAW=$(mktemp)
-cat > "$SERIALIZER_RAW" << 'JSON'
-{
-  "id": 1,
-  "name": "John Doe",
-  "email": "john@example.com",
-  "bio": "Software developer"
-}
-JSON
-
-echo "### Raw msgspec Serializer (POST /bench/serializer-raw)"
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$SERIALIZER_RAW" http://$HOST:$PORT/bench/serializer-raw 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-rm -f "$SERIALIZER_RAW"
-
-# Test with custom validators
-SERIALIZER_VALIDATED=$(mktemp)
-cat > "$SERIALIZER_VALIDATED" << 'JSON'
-{
-  "id": 1,
-  "name": "  John Doe  ",
-  "email": "JOHN@EXAMPLE.COM",
-  "bio": "Software developer"
-}
-JSON
-
-echo "### Django-Bolt Serializer with Validators (POST /bench/serializer-validated)"
-$BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$SERIALIZER_VALIDATED" http://$HOST:$PORT/bench/serializer-validated 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-rm -f "$SERIALIZER_VALIDATED"
-
-# Test users endpoint with raw msgspec
-USER_BENCH=$(mktemp)
-cat > "$USER_BENCH" << 'JSON'
-{
-  "id": 1,
-  "username": "testuser",
-  "email": "test@example.com",
-  "bio": "Test bio"
-}
-JSON
-
-echo "### Users msgspec Serializer (POST /users/bench/msgspec)"
-USCODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary @"$USER_BENCH" http://$HOST:$PORT/users/bench/msgspec)
-if [ "$USCODE" = "200" ]; then
-  $BOMBARDIER_BIN -c $C -n $N -l -m POST -H 'Content-Type: application/json' -f "$USER_BENCH" http://$HOST:$PORT/users/bench/msgspec 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-else
-  echo "Skipped: Users msgspec endpoint returned $USCODE" >&2
-fi
-rm -f "$USER_BENCH"
-
-echo ""
-echo "## Multi-Response Performance"
-
-echo ""
-echo "### Multi-response tuple return (/bench/multi/tuple)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/tuple 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
-echo ""
-echo "### Multi-response bare dict (/bench/multi/dict)"
-$BOMBARDIER_BIN -c $C -n $N -l http://$HOST:$PORT/bench/multi/dict 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
-echo ""
 echo "## Union Response Performance"
 echo "Polymorphic feed with tagged msgspec Struct union (PostActivity | CommentActivity | LikeActivity)"
-
-echo ""
-echo "### Single union item — Post branch (/feed/0)"
-UCODE=$(curl -s -o /dev/null -w '%{http_code}' "http://$HOST:$PORT/feed/0")
-if [ "$UCODE" = "200" ]; then
-  $BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/feed/0" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-else
-  echo "Skipped: /feed/0 returned $UCODE" >&2
-fi
-
-echo ""
-echo "### Single union item — Comment branch (/feed/1)"
-$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/feed/1" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
-
-echo ""
-echo "### Single union item — Like branch (/feed/2)"
-$BOMBARDIER_BIN -c $C -n $N -l "http://$HOST:$PORT/feed/2" 2>&1 | tr '\r' '\n' | grep -E "(Reqs/sec|Latency|50%|75%|90%|99%)"
 
 echo ""
 echo "### Feed of 100 mixed union items (/feed)"

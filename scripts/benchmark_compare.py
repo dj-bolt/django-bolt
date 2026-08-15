@@ -64,8 +64,8 @@ def pct_delta(old: float, new: float) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", default="bench/BENCHMARK_BASELINE.md")
-    parser.add_argument("--candidate", default="bench/BENCHMARK_DEV.md")
+    parser.add_argument("--baseline", required=True)
+    parser.add_argument("--candidate", default="bench/BENCHMARK.md")
     parser.add_argument(
         "--max-regression",
         type=float,

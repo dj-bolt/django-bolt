@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Annotated
 
 import msgspec
-from msgspec import Meta
 
 from django_bolt import BoltAPI
 from django_bolt.pagination import (
@@ -14,7 +13,7 @@ from django_bolt.pagination import (
 )
 from django_bolt.params import Depends
 from django_bolt.serializers import Serializer
-from django_bolt.views import APIView, ModelViewSet, ViewSet
+from django_bolt.views import ModelViewSet, ViewSet
 
 from .models import User
 
@@ -105,15 +104,6 @@ def list_full_10_sync() -> list[UserFull]:
     return User.objects.only("id", "username", "email", "first_name", "last_name", "is_active")[:10]
 
 
-@api.get("/sync-mini10")
-def list_mini_10_sync() -> list[UserMini]:
-    # Already optimized: only() fetches just id and username
-    users = User.objects.only("id", "username")[:10]
-    # evaludate query inside of sync context
-    users = list(users)
-    return users
-
-
 @api.get("/mini10")
 async def list_mini_10() -> list[UserMini]:
     # Already optimized: only() fetches just id and username
@@ -149,69 +139,6 @@ async def delete_all_users() -> dict:
     return {"deleted": count}
 
 
-# ============================================================================
-# Serializer Benchmark Endpoints - Raw msgspec
-# ============================================================================
-
-
-class BenchUser(msgspec.Struct):
-    """Benchmark user with msgspec only (no custom validators)."""
-
-    id: int
-    username: Annotated[str, Meta(min_length=2, max_length=150)]
-    email: Annotated[str, Meta(pattern=r"^[^@]+@[^@]+\.[^@]+$")]
-    bio: str = ""
-
-
-@api.post("/bench/msgspec")
-async def bench_msgspec_serializer(user: BenchUser) -> BenchUser:
-    """
-    Benchmark endpoint using raw msgspec Struct.
-    Tests deserialization (JSON -> Object) and serialization (Object -> JSON).
-    """
-    return user
-
-
-# ============================================================================
-# Unified ViewSet (DRF-style with api.viewset())
-# ============================================================================
-
-
-@api.view("/cbv-mini10")
-class UserBenchViewSet(APIView):
-    """Benchmarking endpoints using class-based views."""
-
-    async def get(self, request):
-        """List first 10 users (CBV version for benchmarking)."""
-        users = []
-        async for user in User.objects.only("id", "username")[:10]:
-            users.append(UserMini(id=user.id, username=user.username))
-        return users
-
-
-@api.view("/cbv-full10")
-class UserFull10ViewSet(APIView):
-    """List first 10 users (CBV version for benchmarking)."""
-
-    async def get(self, request):
-        """List first 10 users (CBV version for benchmarking)."""
-        users = []
-        async for user in User.objects.only("id", "username", "email", "first_name", "last_name", "is_active")[:10]:
-            users.append(
-                UserFull(
-                    id=user.id,
-                    username=user.username,
-                    email=user.email,
-                    first_name=user.first_name,
-                    last_name=user.last_name,
-                    is_active=user.is_active,
-                )
-            )
-        return users
-
-
-# ============================================================================
-# Pagination Examples
 # ============================================================================
 
 

@@ -113,57 +113,25 @@ seed-data host=host port=port:
     echo "Seeding database..."
     curl -s http://{{host}}:{{port}}/users/seed | head -1
 
-# Save baseline vs dev benchmark comparison
+# Run the full benchmark suite; overwrites bench/BENCHMARK.md (git diff shows the change vs the committed run)
 save-bench host=host port=port c=c n=n p=p workers=workers:
     #!/usr/bin/env bash
     mkdir -p bench
-    if [ ! -f bench/BENCHMARK_BASELINE.md ]; then
-        echo "Creating baseline benchmark..."
-        P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark.sh > bench/BENCHMARK_BASELINE.md
-        echo "✅ Baseline saved to bench/BENCHMARK_BASELINE.md"
-    elif [ ! -f bench/BENCHMARK_DEV.md ]; then
-        echo "Creating dev benchmark..."
-        P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark.sh > bench/BENCHMARK_DEV.md
-        echo "✅ Dev version saved to bench/BENCHMARK_DEV.md"
-        echo ""
-        echo "=== PERFORMANCE COMPARISON ==="
-        echo "Baseline:"
-        grep "Requests per second" bench/BENCHMARK_BASELINE.md | head -2
-        echo "Dev:"
-        grep "Requests per second" bench/BENCHMARK_DEV.md | head -2
-        echo ""
-        echo "Streaming (Plain) RPS - Dev:"
-        awk '/### Streaming Plain/{flag=1;next} /###/{flag=0} flag && /Requests per second/{print}' bench/BENCHMARK_DEV.md || true
-        echo "Streaming (SSE) RPS - Dev:"
-        awk '/### Server-Sent Events/{flag=1;next} /###/{flag=0} flag && /Requests per second/{print}' bench/BENCHMARK_DEV.md || true
-    else
-        echo "Rotating benchmarks: dev -> baseline, new -> dev"
-        mv bench/BENCHMARK_DEV.md bench/BENCHMARK_BASELINE.md
-        P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark.sh > bench/BENCHMARK_DEV.md
-        echo "✅ New dev version saved, old dev moved to baseline"
-        echo ""
-        echo "=== PERFORMANCE COMPARISON ==="
-        echo "Baseline (old dev):"
-        grep "Requests per second" bench/BENCHMARK_BASELINE.md | head -2
-        echo "Dev (current):"
-        grep "Requests per second" bench/BENCHMARK_DEV.md | head -2
-        echo ""
-        echo "Streaming (Plain) RPS - Baseline:"
-        awk '/### Streaming Plain/{flag=1;next} /###/{flag=0} flag && /Requests per second/{print}' bench/BENCHMARK_BASELINE.md || true
-        echo "Streaming (SSE) RPS - Baseline:"
-        awk '/### Server-Sent Events/{flag=1;next} /###/{flag=0} flag && /Requests per second/{print}' bench/BENCHMARK_BASELINE.md || true
-        echo "Streaming (Plain) RPS - Dev:"
-        awk '/### Streaming Plain/{flag=1;next} /###/{flag=0} flag && /Requests per second/{print}' bench/BENCHMARK_DEV.md || true
-        echo "Streaming (SSE) RPS - Dev:"
-        awk '/### Server-Sent Events/{flag=1;next} /###/{flag=0} flag && /Requests per second/{print}' bench/BENCHMARK_DEV.md || true
-    fi
+    P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark.sh > bench/BENCHMARK.md
+    echo "✅ Results saved to bench/BENCHMARK.md"
+    echo ""
+    echo "=== ROOT RPS ==="
+    grep "Reqs/sec" bench/BENCHMARK.md | head -2
 
 # Build and run benchmark
 build-bench: build save-bench
 
 # Deterministic pass/fail gate: per-endpoint RPS AND p99 latency vs baseline
 bench-gate:
-    uv run python scripts/benchmark_compare.py
+    #!/usr/bin/env bash
+    set -e
+    git show HEAD:bench/BENCHMARK.md > bench/.BENCHMARK_HEAD.md
+    uv run python scripts/benchmark_compare.py --baseline bench/.BENCHMARK_HEAD.md --candidate bench/BENCHMARK.md
 
 # WorkerLoop vs uvloop vs stdlib: µs per call_soon / sleep(0) / fd event / socket round trip
 bench-loop *ARGS:
@@ -184,10 +152,6 @@ bench-micro-save NAME:
 # Build with profiling profile (release + debug symbols) for flamegraphs
 build-profiling:
     uv run maturin develop --profile profiling
-
-# Focused parameter and form parsing benchmark (fast iteration)
-bench-params host=host port=port c=c n=n p=p workers=workers:
-    P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark_params.sh
 
 # Cross-framework comparison: Django-Bolt vs Hono (node + bun) vs Elysia (bun)
 # Runtimes: `just bench-js` (all) or RUNTIMES="bolt elysia-bun" just bench-js

@@ -82,9 +82,6 @@ Benchmark recipes need `bombardier` (`go install github.com/codesenberg/bombardi
 just save-bench                  # defaults: host=127.0.0.1 port=8001 c=100 n=100000 p=8 workers=1
 just save-bench 127.0.0.1 8001 100 50000   # positional: host port c n ...
 
-# Focused parameter/form-parsing benchmark (fast iteration)
-just bench-params
-
 # Deterministic regression gate (per-endpoint RPS AND p99 vs baseline)
 just bench-gate
 

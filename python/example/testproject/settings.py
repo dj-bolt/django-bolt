@@ -41,7 +41,6 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "users",
-    "bench",
     "core",
     "missions",
     "mcp_demo",
@@ -49,6 +48,10 @@ INSTALLED_APPS = [
     # when an mcp mount passes oauth=AuthorizationServer(...); run `manage.py migrate`.
     "bolt_mcp.oauth",
 ]
+
+# Optional local-only app (gitignored): bulk payloads and scratch endpoints.
+if (BASE_DIR / "local").is_dir():
+    INSTALLED_APPS.append("local")
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",

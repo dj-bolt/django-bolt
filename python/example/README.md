@@ -1,7 +1,7 @@
 # django-bolt example project
 
 A Django project exercising django-bolt features: REST APIs (`core`, `users`,
-`missions`, `bench`), middleware demos, and an MCP server (`mcp_demo`) built with
+`missions`), middleware demos, and an MCP server (`mcp_demo`) built with
 bolt-mcp.
 
 ## Setup
