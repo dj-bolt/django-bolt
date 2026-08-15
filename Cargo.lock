@@ -457,6 +457,113 @@ dependencies = [
 ]
 
 [[package]]
+name = "bolt-asgi"
+version = "0.10.0"
+dependencies = [
+ "actix-web",
+ "bolt-core",
+ "bolt-loop",
+ "bytes",
+ "futures-util",
+ "log",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "tokio",
+]
+
+[[package]]
+name = "bolt-core"
+version = "0.10.0"
+dependencies = [
+ "actix-files",
+ "actix-http",
+ "actix-multipart",
+ "actix-web",
+ "ahash",
+ "base64 0.22.1",
+ "bolt-loop",
+ "brotli",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "flate2",
+ "futures-util",
+ "governor",
+ "http 1.5.0",
+ "jsonwebtoken",
+ "log",
+ "matchit",
+ "once_cell",
+ "parking_lot",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "tempfile",
+ "tokio",
+ "urlencoding",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "bolt-loop"
+version = "0.10.0"
+dependencies = [
+ "libc",
+ "once_cell",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "bolt-mcp"
+version = "0.10.0"
+dependencies = [
+ "actix-web",
+ "ahash",
+ "bolt-core",
+ "bolt-loop",
+ "bytes",
+ "futures-util",
+ "http 1.5.0",
+ "http-body",
+ "http-body-util",
+ "log",
+ "once_cell",
+ "pyo3",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
+name = "bolt-websocket"
+version = "0.10.0"
+dependencies = [
+ "actix",
+ "actix-web",
+ "actix-web-actors",
+ "ahash",
+ "bolt-core",
+ "bolt-loop",
+ "futures-util",
+ "matchit",
+ "once_cell",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "regex",
+ "tokio",
+ "urlencoding",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -825,28 +932,23 @@ name = "django-bolt"
 version = "0.10.0"
 dependencies = [
  "actix",
- "actix-files",
  "actix-http",
  "actix-multipart",
  "actix-web",
  "actix-web-actors",
  "ahash",
- "base64 0.22.1",
- "brotli",
+ "bolt-asgi",
+ "bolt-core",
+ "bolt-loop",
+ "bolt-mcp",
+ "bolt-websocket",
  "bytes",
  "chrono",
  "ctrlc",
  "dashmap",
- "flate2",
  "futures-util",
- "governor",
  "http 1.5.0",
- "http-body",
- "http-body-util",
- "jsonwebtoken",
  "libc",
- "log",
- "matchit",
  "mimalloc",
  "notify",
  "once_cell",
@@ -854,19 +956,10 @@ dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
  "regex",
- "rmcp",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sha2 0.10.9",
  "socket2 0.6.2",
- "tempfile",
  "tikv-jemallocator",
  "tokio",
- "tokio-util",
  "urlencoding",
- "uuid",
- "zstd",
 ]
 
 [[package]]

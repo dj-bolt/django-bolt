@@ -261,3 +261,29 @@ mod tests {
         assert_eq!(escape_json("Tab\there"), "Tab\\there");
     }
 }
+
+/// Handle Python errors and convert to HTTP response
+/// OPTIMIZATION: #[inline(never)] on error path - keeps hot path code smaller
+#[inline(never)]
+pub fn handle_python_error(
+    py: Python<'_>,
+    err: PyErr,
+    path: &str,
+    method: &str,
+    debug: bool,
+) -> HttpResponse {
+    err.restore(py);
+    if let Some(exc) = PyErr::take(py) {
+        let exc_value = exc.value(py);
+        handle_python_exception(py, exc_value, path, method, debug)
+    } else {
+        build_error_response(
+            py,
+            500,
+            "Handler execution error".to_string(),
+            vec![],
+            None,
+            debug,
+        )
+    }
+}

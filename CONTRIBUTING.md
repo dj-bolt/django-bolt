@@ -70,7 +70,8 @@ python manage.py runbolt --dev
 ## Project layout
 
 ```
-src/                     Rust extension (Actix Web server, router, auth, middleware, PyO3 bridge)
+src/                     Rust extension entry crate (PyO3 module, Actix server, dispatch)
+crates/                  Rust workspace crates (bolt-loop, bolt-core, bolt-asgi, bolt-websocket, bolt-mcp)
 python/django_bolt/      Python framework (BoltAPI, serializers, responses, auth, viewsets, ...)
 python/bolt-mcp/         Optional MCP add-on package
 python/tests/            Python test suite
@@ -85,7 +86,7 @@ See [`CLAUDE.md`](CLAUDE.md) for a deeper architecture overview, request flow, a
 ## Making changes
 
 1. **Create a branch** from `master`: `git checkout -b feature/my-change`
-2. **Rust changes** live in `src/`. Run `just build` after every edit — Python tests use the compiled extension.
+2. **Rust changes** live in `src/` and `crates/`. Run `just build` after every edit — Python tests use the compiled extension.
 3. **Python changes** live in `python/django_bolt/`. No rebuild needed.
 4. **Keep changes focused.** Small, surgical PRs are reviewed and merged faster than sweeping ones.
 5. **Never silently swallow errors.** Raise or log — silent failures make bugs hard to trace.

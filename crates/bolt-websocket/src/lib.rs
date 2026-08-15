@@ -12,11 +12,11 @@
 //! - `router` - WebSocket route matching
 //! - `handler` - HTTP upgrade handler
 
-mod actor;
-mod config;
-mod handler;
-mod messages;
-mod router;
+pub mod actor;
+pub mod config;
+pub mod handler;
+pub mod messages;
+pub mod router;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -31,6 +31,10 @@ pub use messages::{SendToClient, WsMessage};
 #[allow(unused_imports)] // Re-exported for external use
 pub use router::WebSocketRoute;
 pub use router::WebSocketRouter;
+
+/// Process-wide WebSocket router, set once at server startup.
+pub static GLOBAL_WEBSOCKET_ROUTER: once_cell::sync::OnceCell<std::sync::Arc<WebSocketRouter>> =
+    once_cell::sync::OnceCell::new();
 
 /// Global counter for active WebSocket connections
 pub static ACTIVE_WS_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);

@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 
-use crate::handler::handle_python_error;
-use crate::state::{AsgiMount, TASK_LOCALS};
+use bolt_core::error::handle_python_error;
+use bolt_core::state::{AsgiMount, TASK_LOCALS};
 
 struct AsgiResponseStart {
     status: u16,

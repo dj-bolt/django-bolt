@@ -52,7 +52,7 @@ impl WebSocketRouter {
         if !path.contains('{') {
             self.static_routes.insert(path.to_string(), route);
         } else {
-            let converted = crate::router::convert_path(path);
+            let converted = bolt_core::router::convert_path(path);
             self.dynamic_router.insert(&converted, route).map_err(|e| {
                 pyo3::exceptions::PyValueError::new_err(format!(
                     "Failed to register WebSocket route: {}",

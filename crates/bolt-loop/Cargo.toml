@@ -1,0 +1,16 @@
+[package]
+name = "bolt-loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Process-lived asyncio WorkerLoop pump, fd reactor bridge and timer thread for django-bolt"
+
+[dependencies]
+libc = { workspace = true }
+once_cell = { workspace = true }
+pyo3 = { workspace = true }
+pyo3-async-runtimes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

@@ -48,7 +48,7 @@ pub fn args_hash(arguments: Option<&rmcp::model::JsonObject>) -> String {
 
 /// Digest of the authenticated principal. Uses the auth context's user id and
 /// backend so state cannot be replayed across users or auth methods.
-pub fn principal_hash(auth: Option<&crate::middleware::auth::AuthContext>) -> String {
+pub fn principal_hash(auth: Option<&bolt_core::middleware::auth::AuthContext>) -> String {
     let mut hasher = Sha256::new();
     match auth {
         Some(ctx) => {
@@ -87,7 +87,7 @@ pub fn open_verified(
     sealed: &str,
     tool: &str,
     arguments: Option<&rmcp::model::JsonObject>,
-    auth: Option<&crate::middleware::auth::AuthContext>,
+    auth: Option<&bolt_core::middleware::auth::AuthContext>,
 ) -> Result<McpRequestState, String> {
     let state: McpRequestState = codec
         .open_json(sealed)
@@ -159,7 +159,7 @@ mod tests {
     fn wrong_principal_rejected() {
         let c = codec();
         let sealed = seal(&c, &state()).unwrap();
-        let other = crate::middleware::auth::AuthContext {
+        let other = bolt_core::middleware::auth::AuthContext {
             user_id: Some("other-user".to_string()),
             is_staff: false,
             is_superuser: false,

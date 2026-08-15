@@ -27,13 +27,13 @@ use rmcp::service::RequestContext;
 use rmcp::RoleServer;
 use serde_json::Value;
 
-use crate::mcp::context::{CtxEvent, McpPyContext, ProtocolMode};
-use crate::mcp::registry::{McpRegistry, McpToolEntry};
-use crate::mcp::state_codec;
-use crate::mcp::McpAuthExt;
-use crate::middleware::auth::{populate_auth_context, AuthContext};
-use crate::permissions::{evaluate_guards, GuardResult};
-use crate::worker_loop;
+use crate::context::{CtxEvent, McpPyContext, ProtocolMode};
+use crate::registry::{McpRegistry, McpToolEntry};
+use crate::state_codec;
+use crate::McpAuthExt;
+use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
+use bolt_core::permissions::{evaluate_guards, GuardResult};
+use bolt_loop as worker_loop;
 
 #[derive(Clone)]
 pub struct McpHandler {
@@ -265,7 +265,7 @@ impl McpHandler {
                 // Convert via the wire name to avoid depending on enum layout.
                 serde_json::to_value(level)
                     .ok()
-                    .and_then(|v| v.as_str().and_then(crate::mcp::context::level_rank))
+                    .and_then(|v| v.as_str().and_then(crate::context::level_rank))
                     .unwrap_or(0)
             }),
         };
@@ -428,7 +428,7 @@ impl McpHandler {
                 reply,
             } => {
                 let envelope = self.live_server_request(ctx, method, &params_json).await;
-                crate::mcp::context::resolve_reply_future(&reply, &envelope);
+                crate::context::resolve_reply_future(&reply, &envelope);
             }
         }
     }
@@ -442,7 +442,7 @@ impl McpHandler {
         params_json: &str,
     ) -> String {
         let outcome: Result<Value, String> = match method {
-            crate::mcp::context::METHOD_ELICIT => {
+            crate::context::METHOD_ELICIT => {
                 match serde_json::from_str::<rmcp::model::ElicitRequestParams>(params_json) {
                     Ok(params) => ctx
                         .peer
@@ -453,7 +453,7 @@ impl McpHandler {
                     Err(e) => Err(format!("invalid elicitation params: {e}")),
                 }
             }
-            crate::mcp::context::METHOD_SAMPLE => {
+            crate::context::METHOD_SAMPLE => {
                 #[allow(deprecated)]
                 match serde_json::from_str::<rmcp::model::CreateMessageRequestParams>(params_json) {
                     Ok(params) => ctx

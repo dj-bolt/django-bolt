@@ -1,48 +1,21 @@
 use pyo3::prelude::*;
 
-use crate::request::PyRequest;
+use bolt_core::request::PyRequest;
 
-mod asgi_http;
-mod asgi_mounts;
-mod cookies;
-mod cors;
 mod dev_reload;
-mod error;
-mod form_parsing;
 mod handler;
-mod json;
-mod mcp;
-mod metadata;
-mod middleware;
-mod permissions;
-mod request;
-mod request_pipeline;
-mod response_builder;
-mod response_meta;
-mod responses;
-mod router;
 mod server;
-mod state;
-mod static_files;
-mod streaming;
-mod streaming_compression;
 mod testing;
-mod type_coercion;
-mod validation;
-mod websocket;
-#[cfg(unix)]
-mod worker_fd;
-mod worker_loop;
 
 /// Pure-Rust hot-path helpers re-exported for criterion benches
 /// (benches/hot_path.rs links the rlib). Not part of the Python API.
 pub mod bench_support {
-    pub use crate::router::{convert_path, parse_query_string};
-    pub use crate::type_coercion::{
+    pub use bolt_core::router::{convert_path, parse_query_string};
+    pub use bolt_core::type_coercion::{
         coerce_param, CoercedValue, DEFAULT_MAX_PARAM_LENGTH, TYPE_BOOL, TYPE_DATETIME,
         TYPE_DECIMAL, TYPE_INT, TYPE_STRING, TYPE_UUID,
     };
-    pub use crate::validation::parse_cookies_inline;
+    pub use bolt_core::validation::parse_cookies_inline;
 }
 
 // Global allocator selection (mutually exclusive features)
@@ -74,18 +47,15 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Class
     m.add_class::<PyRequest>()?;
-    m.add_class::<crate::worker_loop::WorkerLoopScheduler>()?;
-    m.add_function(wrap_pyfunction!(crate::worker_loop::worker_timer_count, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        crate::worker_loop::worker_fd_watcher_count,
-        m
-    )?)?;
+    m.add_class::<bolt_loop::WorkerLoopScheduler>()?;
+    m.add_function(wrap_pyfunction!(bolt_loop::worker_timer_count, m)?)?;
+    m.add_function(wrap_pyfunction!(bolt_loop::worker_fd_watcher_count, m)?)?;
 
     // Production server functions
     m.add_function(wrap_pyfunction!(register_routes, m)?)?;
     m.add_function(wrap_pyfunction!(register_websocket_routes, m)?)?;
     m.add_function(wrap_pyfunction!(register_asgi_mounts, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::mcp::register_mcp_mounts, m)?)?;
+    m.add_function(wrap_pyfunction!(bolt_mcp::register_mcp_mounts, m)?)?;
     m.add_function(wrap_pyfunction!(register_middleware_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_function(wrap_pyfunction!(run_dev_reloader, m)?)?;

@@ -1,11 +1,9 @@
 use pyo3::prelude::*;
 
-use crate::state::AsgiMount;
+use bolt_core::state::AsgiMount;
 
 /// Validate, normalize ordering, and de-duplicate ASGI mount configuration.
-pub(crate) fn validate_and_sort_asgi_mounts(
-    mounts: Vec<(String, Py<PyAny>)>,
-) -> PyResult<Vec<AsgiMount>> {
+pub fn validate_and_sort_asgi_mounts(mounts: Vec<(String, Py<PyAny>)>) -> PyResult<Vec<AsgiMount>> {
     let mut asgi_mounts: Vec<AsgiMount> = Vec::with_capacity(mounts.len());
 
     for (prefix, app) in mounts {

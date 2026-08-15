@@ -111,33 +111,39 @@ just release VERSION=0.2.2 DRY_RUN=1    # Test without changes
 
 ### Core Components
 
-1. **Rust Layer (`src/`)**
+1. **Rust Layer** — a Cargo workspace: the root `django-bolt` package (`src/`) is the PyO3 cdylib; shared code lives in `crates/*` (layered bottom-up, no back-edges: `bolt-loop` → `bolt-core` → {`bolt-asgi`, `bolt-websocket`, `bolt-mcp`} → root)
 
-   - `lib.rs` - PyO3 module entry point, registers Python-callable functions
-   - `server.rs` - Actix Web server with tokio runtime, handles multi-worker/multi-process setup (includes CORS and compression via Actix middleware)
-   - `router.rs` - matchit-based routing (zero-copy path matching)
-   - `handler.rs` - Python callback dispatcher via PyO3 with dual dispatch (sync/async paths via `DispatchOutcome` enum)
-   - `response_meta.rs` - Response metadata types (`ResponseMeta`, `ResponseType`, `CookieData`) with static constants for zero-alloc fast path
-   - `response_builder.rs` - Unified HTTP response building from `ResponseMeta` (content-type, headers, cookies all set in Rust)
-   - `request.rs` - `PyRequest` struct with `OnceLock` lazy allocation for form/files/state/meta dicts
-   - `request_pipeline.rs` - Typed parameter validation and caching
-   - `validation.rs` - Auth and guard validation pipeline
-   - `type_coercion.rs` - Rust-side parameter type coercion (UUID, Decimal, datetime, etc.)
-   - `middleware/` - Custom middleware pipeline running in Rust (no Python GIL overhead)
-     - `auth.rs` - JWT/API Key/Session authentication in Rust
-     - `rate_limit.rs` - Token bucket rate limiting
-   - `permissions.rs` - Guard/permission evaluation in Rust
-   - `streaming.rs` - Streaming response handling (SSE, async generators)
-   - `state.rs` - Shared server state (auth config, middleware config)
-   - `metadata.rs` - Route metadata structures including `RustArgBinding` for Rust-side parameter extraction
-   - `error.rs` - Error handling and HTTP exceptions
-   - `form_parsing.rs` - Multipart and URL-encoded form parsing in Rust
-   - `json.rs` - JSON body parsing
-   - `cookies.rs` - Cookie parsing utilities
-   - `cors.rs` - CORS handling
-   - `static_files.rs` - Static file serving
-   - `asgi_http.rs` - ASGI HTTP mounting support
-   - `asgi_mounts.rs` - ASGI mount configuration
+   - `src/` (root crate `django-bolt`, `_core` extension module)
+     - `lib.rs` - PyO3 module entry point, registers Python-callable functions
+     - `server.rs` - Actix Web server with tokio runtime, handles multi-worker/multi-process setup (includes CORS and compression via Actix middleware)
+     - `handler.rs` - Python callback dispatcher via PyO3 with dual dispatch (sync/async paths via `DispatchOutcome` enum)
+     - `testing.rs` - In-process test app (`TestClient` backend)
+     - `dev_reload.rs` - `--dev` file watcher / reloader
+   - `crates/bolt-loop` - Process-lived asyncio `WorkerLoop` pump, Tokio fd reactor bridge (`worker_fd.rs`, Unix), timer thread, `TASK_LOCALS`
+   - `crates/bolt-core` - Everything below dispatch
+     - `router.rs` - matchit-based routing (zero-copy path matching)
+     - `response_meta.rs` - Response metadata types (`ResponseMeta`, `ResponseType`, `CookieData`) with static constants for zero-alloc fast path
+     - `response_builder.rs` - Unified HTTP response building from `ResponseMeta` (content-type, headers, cookies all set in Rust)
+     - `request.rs` - `PyRequest` struct with `OnceLock` lazy allocation for form/files/state/meta dicts
+     - `request_pipeline.rs` - Header extraction, typed parameter validation and caching
+     - `validation.rs` - Auth and guard validation pipeline
+     - `type_coercion.rs` - Rust-side parameter type coercion (UUID, Decimal, datetime, etc.) and `CoercedValue` → Python conversion
+     - `middleware/` - Custom middleware pipeline running in Rust (no Python GIL overhead)
+       - `auth.rs` - JWT/API Key/Session authentication in Rust
+       - `rate_limit.rs` - Token bucket rate limiting
+     - `permissions.rs` - Guard/permission evaluation in Rust
+     - `streaming.rs` - Streaming response handling (SSE, async generators)
+     - `state.rs` - Shared server state (`AppState`; `extensions` slot holds per-instance state owned by higher crates)
+     - `metadata.rs` - Route metadata structures including `RustArgBinding` for Rust-side parameter extraction
+     - `error.rs` - Error handling, HTTP exceptions, `handle_python_error`
+     - `form_parsing.rs` - Multipart and URL-encoded form parsing in Rust
+     - `json.rs` - JSON body parsing
+     - `cookies.rs` - Cookie parsing utilities
+     - `cors.rs` - CORS handling
+     - `static_files.rs` - Static file serving
+   - `crates/bolt-asgi` - ASGI HTTP mounting (`asgi_http.rs`) and mount configuration (`asgi_mounts.rs`)
+   - `crates/bolt-websocket` - WebSocket router, actor, upgrade handler
+   - `crates/bolt-mcp` - MCP Streamable HTTP transport core (rmcp bridge, registry, request-state codec)
 
 2. **Python Framework (`python/django_bolt/`)**
 
@@ -357,7 +363,7 @@ uv run --with pytest pytest python/tests -s -vv
 ### Adding a New Core Feature
 
 1. Identify the component location (auth, middleware, responses, etc.)
-2. Implement in both Python (`python/django_bolt/`) and Rust (`src/`) if needed
+2. Implement in both Python (`python/django_bolt/`) and Rust (`src/` and `crates/`) if needed
 3. Add comprehensive tests in `python/tests/`
 4. Update relevant documentation in `docs/`
 5. Run full test suite: `just test-py`
@@ -365,7 +371,7 @@ uv run --with pytest pytest python/tests -s -vv
 ### Adding a New Authentication Backend
 
 1. Extend `python/django_bolt/auth/backends.py` with new backend class
-2. Implement validation logic (can run in Rust via `src/middleware/auth.rs` if performance-critical)
+2. Implement validation logic (can run in Rust via `crates/bolt-core/src/middleware/auth.rs` if performance-critical)
 3. Add tests in `python/tests/test_*_auth.py`
 4. Update `python/django_bolt/auth/__init__.py` exports
 5. Document in [docs/SECURITY.md](docs/SECURITY.md)
@@ -471,7 +477,7 @@ uv run --with pytest pytest python/tests -s -vv
 
 1. Run benchmarks to quantify: `just save-bench` (creates baseline comparison)
 2. Check which component regressed: compare BENCHMARK_BASELINE.md vs BENCHMARK_DEV.md
-3. Profile Rust hot paths: check `src/handler.rs`, `src/response_builder.rs`, `src/response_meta.rs`, `src/router.rs`
+3. Profile Rust hot paths: check `src/handler.rs`, `crates/bolt-core/src/response_builder.rs`, `crates/bolt-core/src/response_meta.rs`, `crates/bolt-core/src/router.rs`
 4. Check for GIL contention in Python: look at `src/handler.rs` for Python interop efficiency
 5. Review recent commits for inefficient patterns (N+1 queries, unnecessary allocations, etc.)
 6. Use benchmarking to isolate: test individual endpoints
@@ -501,9 +507,9 @@ uv run --with pytest pytest python/tests -s -vv
 - **Zero-copy response body**: `PyBackedBytes` holds a reference to Python bytes. `Bytes::from_owner()` wraps it without memcpy, used for JSON/serialized bodies.
 - **MiddlewareResponse bridge**: `python/django_bolt/middleware_response.py` wraps internal wire tuples into middleware-compatible objects with `.status_code` and `.headers` attributes. Raw cookie tuples are preserved (not serialized in Python) — Rust handles all cookie serialization.
 - **Python-Rust bridge (PyO3)**: Handler execution crosses the GIL boundary. Minimize Python work in Rust hot paths. See `src/handler.rs` for GIL management patterns.
-- **Middleware compilation**: Middleware decorators on handlers are converted to Rust metadata structs at server startup. Implementation in `python/django_bolt/middleware/compiler.py` and `src/metadata.rs`.
+- **Middleware compilation**: Middleware decorators on handlers are converted to Rust metadata structs at server startup. Implementation in `python/django_bolt/middleware/compiler.py` and `crates/bolt-core/src/metadata.rs`.
 - **Route autodiscovery**: Runs once at startup. No hot-reload in production (only in `--dev` mode). See `python/django_bolt/management/commands/runbolt.py`.
-- **Multi-process isolation**: Each process has independent Python interpreter and Django imports. State sharing must happen via Rust shared state (`src/state.rs`) or external mechanisms.
+- **Multi-process isolation**: Each process has independent Python interpreter and Django imports. State sharing must happen via Rust shared state (`crates/bolt-core/src/state.rs`) or external mechanisms.
 
 ### Development Standards
 
@@ -518,20 +524,20 @@ uv run --with pytest pytest python/tests -s -vv
 ### Adding Framework Features
 
 - **New parameter types** (Query, Header, Body variants): Edit `python/django_bolt/params.py` and `python/django_bolt/_kwargs/` (`model.py`/`extractors.py`), then update `src/handler.rs` for extraction
-- **New response types**: Add to `python/django_bolt/responses.py`, implement serialization in `python/django_bolt/serialization.py`, and if adding a new common type, add integer meta tag constant there + matching static `ResponseMeta` in `src/response_meta.rs`
-- **New authentication backend**: Extend `python/django_bolt/auth/backends.py` with new class, optionally implement validation in `src/middleware/auth.rs` for performance
-- **New guard/permission type**: Add to `python/django_bolt/auth/guards.py` and implement check in `src/permissions.rs`
-- **New middleware system**: Add to `python/django_bolt/middleware/`, implement compiler in `middleware/compiler.py`, and Rust handler in `src/middleware/`
+- **New response types**: Add to `python/django_bolt/responses.py`, implement serialization in `python/django_bolt/serialization.py`, and if adding a new common type, add integer meta tag constant there + matching static `ResponseMeta` in `crates/bolt-core/src/response_meta.rs`
+- **New authentication backend**: Extend `python/django_bolt/auth/backends.py` with new class, optionally implement validation in `crates/bolt-core/src/middleware/auth.rs` for performance
+- **New guard/permission type**: Add to `python/django_bolt/auth/guards.py` and implement check in `crates/bolt-core/src/permissions.rs`
+- **New middleware system**: Add to `python/django_bolt/middleware/`, implement compiler in `middleware/compiler.py`, and Rust handler in `crates/bolt-core/src/middleware/`
 
 ### Performance Improvements
 
 - **Serialization speed**: `python/django_bolt/serialization.py` and `src/handler.rs`
-- **Response building**: `src/response_builder.rs` (header/cookie/content-type setting) and `src/response_meta.rs` (static meta constants)
-- **Routing performance**: `src/router.rs`
+- **Response building**: `crates/bolt-core/src/response_builder.rs` (header/cookie/content-type setting) and `crates/bolt-core/src/response_meta.rs` (static meta constants)
+- **Routing performance**: `crates/bolt-core/src/router.rs`
 - **GIL contention**: Reduce Python work in hot paths, consider moving logic to Rust in `src/handler.rs`
-- **Request allocation**: `src/request.rs` (lazy dict allocation via `OnceLock`)
+- **Request allocation**: `crates/bolt-core/src/request.rs` (lazy dict allocation via `OnceLock`)
 - **Middleware response overhead**: `python/django_bolt/middleware_response.py` (wire format bridge)
-- **Compression**: `python/django_bolt/middleware/compression.py` and `src/middleware/compression.rs`
+- **Compression**: `python/django_bolt/middleware/compression.py` and `crates/bolt-core/src/middleware/compression.rs`
 
 ## Performance Principles (Hot Path)
 
@@ -566,7 +572,7 @@ The async bridge (coroutine creation + Task scheduling + cross-thread wakeups) i
 
 3. **When to use sync dispatch** -- Only when ALL conditions are met: handler has `_sync_executor`, no Python middleware (global or route), no Django middleware, no signals. If any condition fails, fall back to full async path.
 
-4. **Worker-local loop** -- Async HTTP dispatch uses one process-lived `WorkerLoop` whose callback queue is serviced by a persistent Tokio pump. The stable loop identity lets detached Tasks survive their originating response and lets loop-bound locks, queues, and client pools be reused across requests. `WorkerLoop` is a real `asyncio.SelectorEventLoop` subclass: transports, TLS/STARTTLS, DNS, pipes, `sock_*`, datagrams, and subprocesses come from the stdlib, built on four primitives (`_add_reader`/`_add_writer`/`_remove_reader`/`_remove_writer`) that register the descriptor with the Tokio reactor directly (`src/worker_fd.rs`, Unix). No second loop is involved, so drivers that use the selector-style fd API (psycopg's `wait_async`) pay no cross-loop hops. Tokio's reactor is edge-triggered while asyncio's selector is level-triggered: after each callback the pump re-checks the descriptor with a zero-timeout `poll(2)` and requeues the callback while the kernel still reports it ready, only waking the watcher to clear Tokio's cached readiness once the fd is drained, so partial reads re-fire (`/t-fd-level-triggered` probe). The pump runs handles directly from Rust (`_cancelled` check + `Handle._run`, running loop installed once per drain batch) — `call_soon`/`sleep(0)` cost ~0.75-0.85x of uvloop and one fd event ~1.1x; keep it that way when touching the pump. Unix signals are received by Tokio and queued onto the same pump. Positive-delay timers use one process-wide, GIL-free high-resolution Rust timer thread because Tokio's ~1ms wheel measurably delayed short `asyncio.sleep()`/`wait_for()` deadlines. Moving Python work onto the HTTP worker removes wakeups but can also remove cross-core pipelining with the loop thread, so retain both C=1 and high-concurrency benchmark coverage. Two guardrails: cancelled timers are compacted out of the Rust heap once enough cancellation notices accumulate (asyncio-style heuristic, observable via `_core.worker_timer_count()`) rather than retained until distant deadlines; and WorkerLoop callbacks may resume on a different OS thread after suspension (Tokio task migration) — contextvars are preserved via Handle contexts, but `threading.local` state is not carried across awaits.
+4. **Worker-local loop** -- Async HTTP dispatch uses one process-lived `WorkerLoop` whose callback queue is serviced by a persistent Tokio pump. The stable loop identity lets detached Tasks survive their originating response and lets loop-bound locks, queues, and client pools be reused across requests. `WorkerLoop` is a real `asyncio.SelectorEventLoop` subclass: transports, TLS/STARTTLS, DNS, pipes, `sock_*`, datagrams, and subprocesses come from the stdlib, built on four primitives (`_add_reader`/`_add_writer`/`_remove_reader`/`_remove_writer`) that register the descriptor with the Tokio reactor directly (`crates/bolt-loop/src/worker_fd.rs`, Unix). No second loop is involved, so drivers that use the selector-style fd API (psycopg's `wait_async`) pay no cross-loop hops. Tokio's reactor is edge-triggered while asyncio's selector is level-triggered: after each callback the pump re-checks the descriptor with a zero-timeout `poll(2)` and requeues the callback while the kernel still reports it ready, only waking the watcher to clear Tokio's cached readiness once the fd is drained, so partial reads re-fire (`/t-fd-level-triggered` probe). The pump runs handles directly from Rust (`_cancelled` check + `Handle._run`, running loop installed once per drain batch) — `call_soon`/`sleep(0)` cost ~0.75-0.85x of uvloop and one fd event ~1.1x; keep it that way when touching the pump. Unix signals are received by Tokio and queued onto the same pump. Positive-delay timers use one process-wide, GIL-free high-resolution Rust timer thread because Tokio's ~1ms wheel measurably delayed short `asyncio.sleep()`/`wait_for()` deadlines. Moving Python work onto the HTTP worker removes wakeups but can also remove cross-core pipelining with the loop thread, so retain both C=1 and high-concurrency benchmark coverage. Two guardrails: cancelled timers are compacted out of the Rust heap once enough cancellation notices accumulate (asyncio-style heuristic, observable via `_core.worker_timer_count()`) rather than retained until distant deadlines; and WorkerLoop callbacks may resume on a different OS thread after suspension (Tokio task migration) — contextvars are preserved via Handle contexts, but `threading.local` state is not carried across awaits.
 
 ### Response Wire Format Optimization
 
@@ -605,7 +611,7 @@ When adding new common response types, add both a Python integer constant and a 
 
 - **Add unit tests**: Create file in `python/tests/test_*.py` following existing patterns
 - **Add integration tests**: Modify `python/tests/syntax_test_server.py` or `python/tests/middleware_test_server.py` for test routes
-- **Test Rust changes**: Add tests in `src/test_state.rs` and `src/testing.rs`
+- **Test Rust changes**: Add `#[cfg(test)]` tests next to the code in the owning crate (`crates/*/src`) or `src/`
 - Always import on the top of the file
 
 ## Testing Principles

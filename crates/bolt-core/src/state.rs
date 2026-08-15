@@ -2,7 +2,6 @@ use actix_web::http::header::HeaderValue;
 use ahash::AHashMap;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
-use pyo3_async_runtimes::TaskLocals;
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -11,7 +10,7 @@ use std::time::Duration;
 
 use crate::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
 use crate::router::Router;
-use crate::websocket::WebSocketRouter;
+pub use bolt_loop::TASK_LOCALS;
 
 /// ASGI sub-application mount configuration.
 ///
@@ -98,19 +97,14 @@ pub struct AppState {
     pub router: Option<Arc<Router>>, // Router (used by test infrastructure, optional in production)
     pub route_metadata: Option<Arc<RouteMetadataStore>>, // Route metadata (used by test infrastructure)
     pub asgi_mounts: Option<Arc<Vec<AsgiMount>>>, // ASGI mounts (tests). Production uses GLOBAL_ASGI_MOUNTS.
-    pub mcp_mounts: Option<Arc<Vec<crate::mcp::McpMount>>>, // MCP mounts (tests). Production uses mcp::GLOBAL_MCP_MOUNTS.
+    pub extensions: http::Extensions, // Per-instance state owned by higher-level crates (e.g. bolt-mcp test mounts). Production uses their globals.
     pub static_files_config: Option<Arc<ScopeConfig>>,
     pub media_files_config: Option<Arc<ScopeConfig>>,
     pub access_logger: Option<Py<PyAny>>, // Python logger instance for access logging (django.server). None when disabled.
 }
 
 pub static GLOBAL_ROUTER: OnceCell<Arc<Router>> = OnceCell::new();
-pub static GLOBAL_WEBSOCKET_ROUTER: OnceCell<Arc<WebSocketRouter>> = OnceCell::new();
 pub static GLOBAL_ASGI_MOUNTS: OnceCell<Arc<Vec<AsgiMount>>> = OnceCell::new();
-// The startup/selector loop. Bolt route coroutines run on the WorkerLoop
-// instead (see `worker_loop::worker_task_locals`); this loop backs the
-// WorkerLoop's delegated selector work and mounted ASGI apps.
-pub static TASK_LOCALS: OnceCell<TaskLocals> = OnceCell::new();
 pub static ROUTE_METADATA: OnceCell<Arc<RouteMetadataStore>> = OnceCell::new();
 pub static ROUTE_METADATA_TEMP: OnceCell<AHashMap<usize, RouteMetadata>> = OnceCell::new(); // Temporary storage before CORS injection
 

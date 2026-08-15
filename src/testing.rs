@@ -25,27 +25,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::asgi_http;
-use crate::asgi_mounts::validate_and_sort_asgi_mounts;
-use crate::form_parsing::{
+use actix_multipart::Multipart;
+use bolt_asgi::asgi_http;
+use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
+use bolt_core::form_parsing::{
     parse_multipart, parse_urlencoded, FormParseResult, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
 };
-use crate::metadata::{CorsConfig, RouteMetadata, RouteMetadataStore};
-use crate::middleware::compression::CompressionMiddleware;
-use crate::middleware::cors::CorsMiddleware;
-use crate::router::Router;
-use crate::state::{find_asgi_mount, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS};
-use crate::websocket::WebSocketRouter;
-use actix_multipart::Multipart;
+use bolt_core::metadata::{CorsConfig, RouteMetadata, RouteMetadataStore};
+use bolt_core::middleware::compression::CompressionMiddleware;
+use bolt_core::middleware::cors::CorsMiddleware;
+use bolt_core::router::Router;
+use bolt_core::state::{find_asgi_mount, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS};
+use bolt_websocket::WebSocketRouter;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 
-use crate::handler::{
-    build_prebound_args_kwargs, coerced_value_to_py, form_result_to_py, response_from_wire_result,
-};
-use crate::request_pipeline::validate_and_cache_typed_params;
-use crate::static_files::handle_file;
-use crate::type_coercion::{coerce_param, params_to_py_dict, CoerceError, TYPE_STRING};
+use crate::handler::{build_prebound_args_kwargs, form_result_to_py, response_from_wire_result};
+use bolt_core::request_pipeline::validate_and_cache_typed_params;
+use bolt_core::static_files::handle_file;
+use bolt_core::type_coercion::coerced_value_to_py;
+use bolt_core::type_coercion::{coerce_param, params_to_py_dict, CoerceError, TYPE_STRING};
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
@@ -115,13 +114,13 @@ pub struct TestAppState {
     pub router: Arc<Router>,
     pub websocket_router: Arc<WebSocketRouter>,
     pub asgi_mounts: Arc<Vec<AsgiMount>>,
-    pub mcp_mounts: Arc<Vec<crate::mcp::McpMount>>,
+    pub mcp_mounts: Arc<Vec<bolt_mcp::McpMount>>,
     pub route_metadata: Arc<RouteMetadataStore>,
     pub dispatch: Py<PyAny>,
     pub global_cors_config: Option<CorsConfig>,
     /// Global compression config (mirrors production server). Drives the
     /// streaming-compression codec selection in `handler.rs`.
-    pub global_compression_config: Option<Arc<crate::metadata::CompressionConfig>>,
+    pub global_compression_config: Option<Arc<bolt_core::metadata::CompressionConfig>>,
     pub debug: bool,
     pub max_payload_size: usize,
     /// Max byte length for parameter values (resolved once from
@@ -258,7 +257,7 @@ pub fn create_test_app(
 
     let global_compression_config = match compression_config {
         Some(d) => Some(Arc::new(
-            crate::metadata::CompressionConfig::from_python_dict(d.as_any())?,
+            bolt_core::metadata::CompressionConfig::from_python_dict(d.as_any())?,
         )),
         None => None,
     };
@@ -343,7 +342,7 @@ pub fn create_test_app(
         global_compression_config,
         debug,
         max_payload_size,
-        max_param_length: crate::type_coercion::resolve_max_param_length(),
+        max_param_length: bolt_core::type_coercion::resolve_max_param_length(),
         asgi_mount_timeout,
         trailing_slash: trailing_slash.unwrap_or_else(|| "strip".to_string()),
         static_files_config: static_config,
@@ -435,7 +434,7 @@ pub fn register_test_mcp_mounts(
         let dict = dict.cast::<PyDict>().map_err(|_| {
             pyo3::exceptions::PyValueError::new_err("MCP mount definition must be a dict")
         })?;
-        parsed.push(crate::mcp::parse_mount(py, dict)?);
+        parsed.push(bolt_mcp::parse_mount(py, dict)?);
     }
 
     let entry = registry()
@@ -579,7 +578,11 @@ pub fn test_request(
                 router: Some(router.clone()),
                 route_metadata: Some(route_metadata.clone()),
                 asgi_mounts: Some(asgi_mounts.clone()),
-                mcp_mounts: Some(mcp_mounts.clone()),
+                extensions: {
+                    let mut ext = http::Extensions::new();
+                    ext.insert(mcp_mounts.clone());
+                    ext
+                },
                 static_files_config: static_files_config.clone(),
                 media_files_config: None,
                 access_logger: None,
@@ -713,16 +716,15 @@ async fn handle_test_request_internal(
     router: Arc<Router>,
     route_metadata: Arc<RouteMetadataStore>,
 ) -> HttpResponse {
-    use crate::handler::{
-        build_validation_error_response, content_length_exceeds_limit, extract_headers,
-        handle_python_error, parse_content_length,
-    };
-    use crate::middleware;
-    use crate::middleware::auth::populate_auth_context;
-    use crate::request::PyRequest;
-    use crate::responses;
-    use crate::router::parse_query_string;
-    use crate::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
+    use crate::handler::{content_length_exceeds_limit, parse_content_length};
+    use bolt_core::error::handle_python_error;
+    use bolt_core::middleware;
+    use bolt_core::middleware::auth::populate_auth_context;
+    use bolt_core::request::PyRequest;
+    use bolt_core::request_pipeline::{build_validation_error_response, extract_headers};
+    use bolt_core::responses;
+    use bolt_core::router::parse_query_string;
+    use bolt_core::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
 
     let method = req.method().as_str();
     let path = req.path();
@@ -780,9 +782,8 @@ async fn handle_test_request_internal(
 
             // MCP mount check (mirrors production handle_request): only on
             // router miss, before the ASGI fallback.
-            if let Some(mcp_mount) = crate::mcp::find_mcp_mount(&state, path) {
-                return crate::mcp::bridge::handle_mcp_request(req, payload, mcp_mount, &state)
-                    .await;
+            if let Some(mcp_mount) = bolt_mcp::find_mcp_mount(&state, path) {
+                return bolt_mcp::bridge::handle_mcp_request(req, payload, mcp_mount, &state).await;
             }
 
             // HTTP ASGI mount fallback:
@@ -901,7 +902,7 @@ async fn handle_test_request_internal(
         match validate_auth_and_guards(&headers, &meta.auth_backends, &meta.guards) {
             AuthGuardResult::Allow(ctx) => {
                 let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
-                if crate::validation::cookie_csrf_blocks(
+                if bolt_core::validation::cookie_csrf_blocks(
                     method,
                     &headers,
                     requires_csrf,
@@ -961,110 +962,110 @@ async fn handle_test_request_internal(
     }
 
     // Read body from payload (before form parsing consumes it for multipart)
-    let (body, form_result): (Vec<u8>, Option<FormParseResult>) = if needs_form_parsing
-        && is_multipart
-    {
-        // Multipart form parsing - uses the payload stream directly
-        let form_type_hints = route_meta
-            .as_ref()
-            .map(|m| &m.form_type_hints)
-            .cloned()
-            .unwrap_or_default();
-        let file_constraints = route_meta
-            .as_ref()
-            .map(|m| &m.file_constraints)
-            .cloned()
-            .unwrap_or_default();
-        let max_upload_size = route_meta
-            .as_ref()
-            .map(|m| m.max_upload_size)
-            .unwrap_or(1024 * 1024);
-        let memory_spool_threshold = route_meta
-            .as_ref()
-            .map(|m| m.memory_spool_threshold)
-            .unwrap_or(DEFAULT_MEMORY_LIMIT);
-
-        // Create Multipart from the payload
-        let multipart = Multipart::new(req.headers(), payload);
-
-        match parse_multipart(
-            multipart,
-            &form_type_hints,
-            &file_constraints,
-            max_upload_size,
-            memory_spool_threshold,
-            DEFAULT_MAX_PARTS,
-            max_param_length,
-            state.max_payload_size,
-        )
-        .await
-        {
-            Ok(result) => (Vec::new(), Some(result)),
-            Err(validation_error) => {
-                // Aggregate-size overflow maps to 413 to match the non-multipart
-                // path; other multipart failures stay 422 validation errors.
-                if validation_error.error_type == crate::form_parsing::ERROR_TYPE_PAYLOAD_TOO_LARGE
-                {
-                    return responses::error_413();
-                }
-                return build_validation_error_response(&validation_error);
-            }
-        }
-    } else {
-        // Read payload as bytes (for non-multipart requests).
-        // Bound the aggregate body against max_payload_size during streaming
-        // so chunked requests (no Content-Length) are also enforced — mirrors
-        // the production handler.
-        let mut body_bytes = web::BytesMut::new();
-        let mut total_read: usize = 0;
-        while let Some(chunk) = payload.next().await {
-            match chunk {
-                Ok(data) => {
-                    total_read = match total_read.checked_add(data.len()) {
-                        Some(v) => v,
-                        None => return responses::error_413(),
-                    };
-                    if total_read > state.max_payload_size {
-                        return responses::error_413();
-                    }
-                    body_bytes.extend_from_slice(&data);
-                }
-                Err(e) => {
-                    return HttpResponse::BadRequest()
-                        .content_type("application/json")
-                        .body(format!(
-                            "{{\"error\": \"Failed to read request body: {}\"}}",
-                            e
-                        ));
-                }
-            }
-        }
-        let body = body_bytes.freeze();
-
-        // URL-encoded form parsing
-        if needs_form_parsing && is_urlencoded {
+    let (body, form_result): (Vec<u8>, Option<FormParseResult>) =
+        if needs_form_parsing && is_multipart {
+            // Multipart form parsing - uses the payload stream directly
             let form_type_hints = route_meta
                 .as_ref()
                 .map(|m| &m.form_type_hints)
                 .cloned()
                 .unwrap_or_default();
+            let file_constraints = route_meta
+                .as_ref()
+                .map(|m| &m.file_constraints)
+                .cloned()
+                .unwrap_or_default();
+            let max_upload_size = route_meta
+                .as_ref()
+                .map(|m| m.max_upload_size)
+                .unwrap_or(1024 * 1024);
+            let memory_spool_threshold = route_meta
+                .as_ref()
+                .map(|m| m.memory_spool_threshold)
+                .unwrap_or(DEFAULT_MEMORY_LIMIT);
 
-            match parse_urlencoded(&body, &form_type_hints, max_param_length) {
-                Ok(form_map) => {
-                    let result = FormParseResult {
-                        form_map,
-                        files_map: HashMap::new(),
-                    };
-                    (body.to_vec(), Some(result))
-                }
+            // Create Multipart from the payload
+            let multipart = Multipart::new(req.headers(), payload);
+
+            match parse_multipart(
+                multipart,
+                &form_type_hints,
+                &file_constraints,
+                max_upload_size,
+                memory_spool_threshold,
+                DEFAULT_MAX_PARTS,
+                max_param_length,
+                state.max_payload_size,
+            )
+            .await
+            {
+                Ok(result) => (Vec::new(), Some(result)),
                 Err(validation_error) => {
+                    // Aggregate-size overflow maps to 413 to match the non-multipart
+                    // path; other multipart failures stay 422 validation errors.
+                    if validation_error.error_type
+                        == bolt_core::form_parsing::ERROR_TYPE_PAYLOAD_TOO_LARGE
+                    {
+                        return responses::error_413();
+                    }
                     return build_validation_error_response(&validation_error);
                 }
             }
         } else {
-            (body.to_vec(), None)
-        }
-    };
+            // Read payload as bytes (for non-multipart requests).
+            // Bound the aggregate body against max_payload_size during streaming
+            // so chunked requests (no Content-Length) are also enforced — mirrors
+            // the production handler.
+            let mut body_bytes = web::BytesMut::new();
+            let mut total_read: usize = 0;
+            while let Some(chunk) = payload.next().await {
+                match chunk {
+                    Ok(data) => {
+                        total_read = match total_read.checked_add(data.len()) {
+                            Some(v) => v,
+                            None => return responses::error_413(),
+                        };
+                        if total_read > state.max_payload_size {
+                            return responses::error_413();
+                        }
+                        body_bytes.extend_from_slice(&data);
+                    }
+                    Err(e) => {
+                        return HttpResponse::BadRequest()
+                            .content_type("application/json")
+                            .body(format!(
+                                "{{\"error\": \"Failed to read request body: {}\"}}",
+                                e
+                            ));
+                    }
+                }
+            }
+            let body = body_bytes.freeze();
+
+            // URL-encoded form parsing
+            if needs_form_parsing && is_urlencoded {
+                let form_type_hints = route_meta
+                    .as_ref()
+                    .map(|m| &m.form_type_hints)
+                    .cloned()
+                    .unwrap_or_default();
+
+                match parse_urlencoded(&body, &form_type_hints, max_param_length) {
+                    Ok(form_map) => {
+                        let result = FormParseResult {
+                            form_map,
+                            files_map: HashMap::new(),
+                        };
+                        (body.to_vec(), Some(result))
+                    }
+                    Err(validation_error) => {
+                        return build_validation_error_response(&validation_error);
+                    }
+                }
+            } else {
+                (body.to_vec(), None)
+            }
+        };
 
     let is_head_request = method == "HEAD";
 
@@ -1243,7 +1244,7 @@ async fn handle_test_request_internal(
     {
         Ok(response) => response,
         Err(e) => Python::attach(|py| {
-            crate::error::build_error_response(
+            bolt_core::error::build_error_response(
                 py,
                 500,
                 format!("Handler returned unsupported response wire format: {}", e),
@@ -1264,8 +1265,8 @@ pub fn handle_test_websocket(
     headers: Vec<(String, String)>,
     query_string: Option<String>,
 ) -> PyResult<(bool, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
-    use crate::middleware::auth::authenticate;
-    use crate::permissions::{evaluate_guards, GuardResult};
+    use bolt_core::middleware::auth::authenticate;
+    use bolt_core::permissions::{evaluate_guards, GuardResult};
 
     let entry = registry()
         .get(&app_id)
@@ -1323,7 +1324,7 @@ pub fn handle_test_websocket(
     // Rate limiting for WebSocket
     if let Some(route_meta) = app.route_metadata.get(handler_id) {
         if let Some(ref rate_config) = route_meta.rate_limit_config {
-            if crate::middleware::rate_limit::check_rate_limit(
+            if bolt_core::middleware::rate_limit::check_rate_limit(
                 handler_id,
                 &header_map,
                 Some("127.0.0.1"),
@@ -1475,7 +1476,11 @@ pub fn handle_test_websocket(
 
         if let Some(ref auth) = auth_ctx {
             let ctx_dict = pyo3::types::PyDict::new(py);
-            crate::middleware::auth::populate_auth_context(&ctx_dict.clone().unbind(), auth, py);
+            bolt_core::middleware::auth::populate_auth_context(
+                &ctx_dict.clone().unbind(),
+                auth,
+                py,
+            );
             scope_dict.set_item("auth_context", ctx_dict)?;
         }
     }

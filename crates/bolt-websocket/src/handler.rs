@@ -14,12 +14,12 @@ use tokio::sync::mpsc;
 
 use std::collections::HashMap;
 
-use crate::handler::coerced_value_to_py;
-use crate::metadata::CorsConfig;
-use crate::middleware::rate_limit::check_rate_limit;
-use crate::state::{AppState, ROUTE_METADATA};
-use crate::type_coercion::{coerce_param, CoerceError, TYPE_STRING};
-use crate::validation::{validate_auth_and_guards, AuthGuardResult};
+use bolt_core::metadata::CorsConfig;
+use bolt_core::middleware::rate_limit::check_rate_limit;
+use bolt_core::state::{AppState, ROUTE_METADATA};
+use bolt_core::type_coercion::coerced_value_to_py;
+use bolt_core::type_coercion::{coerce_param, CoerceError, TYPE_STRING};
+use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 
 use super::actor::WebSocketActor;
 use super::config::WS_CONFIG;
@@ -540,10 +540,10 @@ pub async fn handle_websocket_upgrade_with_handler(
                     // Guards passed, continue with WebSocket upgrade
                 }
                 AuthGuardResult::Unauthorized => {
-                    return Ok(crate::responses::error_401());
+                    return Ok(bolt_core::responses::error_401());
                 }
                 AuthGuardResult::Forbidden(denial) => {
-                    return Ok(crate::responses::error_403_denial(denial.as_deref()));
+                    return Ok(bolt_core::responses::error_403_denial(denial.as_deref()));
                 }
             }
         }
@@ -657,7 +657,7 @@ pub async fn handle_websocket_upgrade_with_handler(
                 // the foreign selector and the WebSocket side hangs.) The
                 // receive/send futures created by `future_into_py` follow the
                 // running loop, so they migrate with the handler.
-                let locals = crate::worker_loop::worker_task_locals(py)?;
+                let locals = bolt_loop::worker_task_locals(py)?;
 
                 // Convert Python coroutine to Rust future using the shared event loop
                 pyo3_async_runtimes::into_future_with_locals(locals, coro.bind(py).clone())

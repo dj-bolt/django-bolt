@@ -18,8 +18,8 @@ use rmcp::model::{
 };
 use serde::Deserialize;
 
-use crate::metadata::parse_guard;
-use crate::permissions::{Guard, GuardSet};
+use bolt_core::metadata::parse_guard;
+use bolt_core::permissions::{Guard, GuardSet};
 
 /// One tool entry: prebuilt wire model + Rust-evaluated guards + the Python
 /// callable that executes it.
@@ -221,7 +221,7 @@ impl McpRegistry {
     /// Tools visible to this request's principal, in registration order.
     pub fn visible_tools(
         &self,
-        auth_ctx: Option<&crate::middleware::auth::AuthContext>,
+        auth_ctx: Option<&bolt_core::middleware::auth::AuthContext>,
     ) -> Vec<Tool> {
         self.tool_order
             .iter()
@@ -229,8 +229,8 @@ impl McpRegistry {
             .filter(|entry| {
                 entry.guards.is_empty()
                     || matches!(
-                        crate::permissions::evaluate_guards(&entry.guards, auth_ctx),
-                        crate::permissions::GuardResult::Allow
+                        bolt_core::permissions::evaluate_guards(&entry.guards, auth_ctx),
+                        bolt_core::permissions::GuardResult::Allow
                     )
             })
             .map(|entry| entry.tool.clone())

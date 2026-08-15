@@ -1,0 +1,19 @@
+[package]
+name = "bolt-asgi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "ASGI sub-application mounting for django-bolt"
+
+[dependencies]
+actix-web = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+pyo3 = { workspace = true }
+pyo3-async-runtimes = { workspace = true }
+tokio = { workspace = true }
+bolt-core = { workspace = true }
+bolt-loop = { workspace = true }

@@ -6,8 +6,8 @@
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyAnyMethods, PyDictMethods};
-use pyo3::{IntoPyObject, Py, PyAny, Python};
+use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
+use pyo3::{IntoPyObject, Py, PyAny, PyResult, Python};
 use uuid::Uuid;
 
 // OPTIMIZATION: Cache Python classes for type construction (avoids repeated imports)
@@ -16,14 +16,14 @@ static UUID_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static DECIMAL_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 #[inline]
-pub(crate) fn get_uuid_class(py: Python<'_>) -> &Py<PyAny> {
+pub fn get_uuid_class(py: Python<'_>) -> &Py<PyAny> {
     UUID_CLASS.get_or_init(py, || {
         py.import("uuid").unwrap().getattr("UUID").unwrap().unbind()
     })
 }
 
 #[inline]
-pub(crate) fn get_decimal_class(py: Python<'_>) -> &Py<PyAny> {
+pub fn get_decimal_class(py: Python<'_>) -> &Py<PyAny> {
     DECIMAL_CLASS.get_or_init(py, || {
         py.import("decimal")
             .unwrap()
@@ -388,7 +388,7 @@ pub fn coerce_to_py(
             // Parse UUID in Rust, construct uuid.UUID from the 128-bit value —
             // no 36-char string alloc, no hex re-parse on the Python side.
             match Uuid::parse_str(value) {
-                Ok(uuid) => crate::handler::uuid_to_py(py, uuid),
+                Ok(uuid) => uuid_to_py(py, uuid),
                 Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Invalid UUID '{}': {}",
                     value, e
@@ -704,4 +704,48 @@ mod tests {
             MAX_ALLOWED_PARAM_LENGTH
         );
     }
+}
+
+/// Convert CoercedValue to Python object
+///
+/// Constructs actual Python typed objects (uuid.UUID, decimal.Decimal, datetime, etc.)
+/// directly — datetime/date/time go through PyO3's chrono integration (C-API
+/// construction, no ISO-string round trip) and UUID is built from its 128-bit
+/// value instead of re-parsing a hex string in Python.
+pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
+    match value {
+        // Primitives - direct conversion
+        CoercedValue::Int(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::Float(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::Bool(v) => v.into_pyobject(py).unwrap().to_owned().unbind().into_any(),
+        CoercedValue::String(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+
+        // UUID: construct from the 128-bit integer (uuid.UUID(int=...)) —
+        // avoids a 36-char string alloc in Rust + hex parsing in Python.
+        CoercedValue::Uuid(v) => uuid_to_py(py, *v).unwrap(),
+
+        // Decimal: construct Python decimal.Decimal from the validated input
+        // string (kept as-is so large exponents are never expanded into their
+        // full digit string in Rust).
+        CoercedValue::Decimal(v) => get_decimal_class(py).call1(py, (v.as_str(),)).unwrap(),
+
+        // Temporal types: direct C-API construction via pyo3's chrono feature.
+        CoercedValue::DateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::NaiveDateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::Date(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::Time(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+
+        CoercedValue::Null => py.None(),
+    }
+}
+
+/// Build a Python `uuid.UUID` from the parsed 128-bit value.
+#[inline]
+pub fn uuid_to_py(py: Python<'_>, v: uuid::Uuid) -> PyResult<Py<PyAny>> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(pyo3::intern!(py, "int"), v.as_u128())?;
+    Ok(get_uuid_class(py)
+        .bind(py)
+        .call((), Some(&kwargs))?
+        .unbind())
 }

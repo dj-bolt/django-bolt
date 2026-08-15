@@ -3,10 +3,11 @@
 //! This module contains validation and processing logic that is common
 //! between the production handler (handler.rs) and test handler (testing.rs).
 
-use actix_web::HttpResponse;
+use actix_web::{HttpRequest, HttpResponse};
 use ahash::AHashMap;
 use std::collections::HashMap;
 
+use crate::form_parsing::ValidationError;
 use crate::responses;
 use crate::type_coercion::{coerce_param, CoercedValue, TYPE_STRING};
 
@@ -98,4 +99,43 @@ pub fn validate_and_cache_typed_params(
     }
 
     Ok((path_coerced, query_coerced))
+}
+
+/// Extract headers from request with validation
+/// OPTIMIZATION: HeaderName::as_str() already returns lowercase (http crate canonical form)
+/// so we skip the redundant to_ascii_lowercase() call (~50ns saved per header)
+/// OPTIMIZATION: #[inline] on hot path - called on every request
+#[inline]
+pub fn extract_headers(
+    req: &HttpRequest,
+    max_header_size: usize,
+) -> Result<AHashMap<String, String>, HttpResponse> {
+    const MAX_HEADERS: usize = 100;
+    let mut headers: AHashMap<String, String> = AHashMap::with_capacity(16);
+    let mut header_count = 0;
+
+    for (name, value) in req.headers().iter() {
+        header_count += 1;
+        if header_count > MAX_HEADERS {
+            return Err(responses::error_400_too_many_headers());
+        }
+        if let Ok(v) = value.to_str() {
+            if v.len() > max_header_size {
+                return Err(responses::error_400_header_too_large(max_header_size));
+            }
+            // HeaderName::as_str() returns lowercase already (http crate stores canonically)
+            headers.insert(name.as_str().to_owned(), v.to_owned());
+        }
+    }
+    Ok(headers)
+}
+
+/// Build HTTP 422 response for validation errors
+pub fn build_validation_error_response(error: &ValidationError) -> HttpResponse {
+    let body = serde_json::json!({
+        "detail": [error.to_json()]
+    });
+    HttpResponse::UnprocessableEntity()
+        .content_type("application/json")
+        .body(body.to_string())
 }

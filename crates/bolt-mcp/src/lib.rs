@@ -27,10 +27,10 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 
-use crate::metadata::{parse_auth_backend, parse_guard};
-use crate::middleware::auth::{AuthBackend, AuthContext};
-use crate::permissions::{Guard, GuardSet};
-use crate::state::AppState;
+use bolt_core::metadata::{parse_auth_backend, parse_guard};
+use bolt_core::middleware::auth::{AuthBackend, AuthContext};
+use bolt_core::permissions::{Guard, GuardSet};
+use bolt_core::state::AppState;
 use handler::McpHandler;
 use registry::McpRegistry;
 
@@ -92,10 +92,10 @@ impl McpMount {
 pub static GLOBAL_MCP_MOUNTS: OnceCell<Arc<Vec<McpMount>>> = OnceCell::new();
 
 /// Find the MCP mount for a path. Tests provide per-instance mounts via
-/// `AppState.mcp_mounts`; production uses `GLOBAL_MCP_MOUNTS`.
+/// `AppState.extensions` (an `Arc<Vec<McpMount>>`); production uses `GLOBAL_MCP_MOUNTS`.
 #[inline]
 pub fn find_mcp_mount<'a>(state: &'a AppState, path: &str) -> Option<&'a McpMount> {
-    if let Some(ref mounts) = state.mcp_mounts {
+    if let Some(mounts) = state.extensions.get::<Arc<Vec<McpMount>>>() {
         return mounts.iter().find(|m| m.matches_path(path));
     }
     GLOBAL_MCP_MOUNTS

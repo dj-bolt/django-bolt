@@ -15,26 +15,28 @@ use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
-use crate::asgi_http;
-use crate::error;
-use crate::form_parsing::{
+use bolt_asgi::asgi_http;
+use bolt_core::error::{self, handle_python_error};
+use bolt_core::form_parsing::{
     parse_multipart, parse_urlencoded, FileContent, FileFieldConstraints, FileInfo,
-    FormParseResult, FormValue, ValidationError, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
+    FormParseResult, FormValue, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
     ERROR_TYPE_PAYLOAD_TOO_LARGE,
 };
-use crate::metadata::{RustArgBinding, RustArgSource};
-use crate::middleware;
-use crate::middleware::auth::populate_auth_context;
-use crate::request::PyRequest;
-use crate::request_pipeline::validate_and_cache_typed_params;
-use crate::response_builder;
-use crate::response_meta::ResponseMeta;
-use crate::responses;
-use crate::router::parse_query_string;
-use crate::state::{find_asgi_mount, AppState, GLOBAL_ROUTER, ROUTE_METADATA};
-use crate::streaming::{create_python_stream, create_sse_stream};
-use crate::type_coercion::{params_to_py_dict, CoercedValue};
-use crate::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
+use bolt_core::metadata::{RustArgBinding, RustArgSource};
+use bolt_core::middleware;
+use bolt_core::middleware::auth::populate_auth_context;
+use bolt_core::request::PyRequest;
+use bolt_core::request_pipeline::{
+    build_validation_error_response, extract_headers, validate_and_cache_typed_params,
+};
+use bolt_core::response_builder;
+use bolt_core::response_meta::ResponseMeta;
+use bolt_core::responses;
+use bolt_core::router::parse_query_string;
+use bolt_core::state::{find_asgi_mount, AppState, GLOBAL_ROUTER, ROUTE_METADATA};
+use bolt_core::streaming::{create_python_stream, create_sse_stream};
+use bolt_core::type_coercion::{coerced_value_to_py, params_to_py_dict};
+use bolt_core::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -155,117 +157,6 @@ pub async fn build_file_response(
     }
 }
 
-/// Handle Python errors and convert to HTTP response
-/// OPTIMIZATION: #[inline(never)] on error path - keeps hot path code smaller
-#[inline(never)]
-pub fn handle_python_error(
-    py: Python<'_>,
-    err: PyErr,
-    path: &str,
-    method: &str,
-    debug: bool,
-) -> HttpResponse {
-    err.restore(py);
-    if let Some(exc) = PyErr::take(py) {
-        let exc_value = exc.value(py);
-        error::handle_python_exception(py, exc_value, path, method, debug)
-    } else {
-        error::build_error_response(
-            py,
-            500,
-            "Handler execution error".to_string(),
-            vec![],
-            None,
-            debug,
-        )
-    }
-}
-
-/// Extract headers from request with validation
-/// OPTIMIZATION: HeaderName::as_str() already returns lowercase (http crate canonical form)
-/// so we skip the redundant to_ascii_lowercase() call (~50ns saved per header)
-/// OPTIMIZATION: #[inline] on hot path - called on every request
-#[inline]
-pub fn extract_headers(
-    req: &HttpRequest,
-    max_header_size: usize,
-) -> Result<AHashMap<String, String>, HttpResponse> {
-    const MAX_HEADERS: usize = 100;
-    let mut headers: AHashMap<String, String> = AHashMap::with_capacity(16);
-    let mut header_count = 0;
-
-    for (name, value) in req.headers().iter() {
-        header_count += 1;
-        if header_count > MAX_HEADERS {
-            return Err(responses::error_400_too_many_headers());
-        }
-        if let Ok(v) = value.to_str() {
-            if v.len() > max_header_size {
-                return Err(responses::error_400_header_too_large(max_header_size));
-            }
-            // HeaderName::as_str() returns lowercase already (http crate stores canonically)
-            headers.insert(name.as_str().to_owned(), v.to_owned());
-        }
-    }
-    Ok(headers)
-}
-
-/// Build HTTP 422 response for validation errors
-pub fn build_validation_error_response(error: &ValidationError) -> HttpResponse {
-    let body = serde_json::json!({
-        "detail": [error.to_json()]
-    });
-    HttpResponse::UnprocessableEntity()
-        .content_type("application/json")
-        .body(body.to_string())
-}
-
-/// Convert CoercedValue to Python object
-///
-/// Constructs actual Python typed objects (uuid.UUID, decimal.Decimal, datetime, etc.)
-/// directly — datetime/date/time go through PyO3's chrono integration (C-API
-/// construction, no ISO-string round trip) and UUID is built from its 128-bit
-/// value instead of re-parsing a hex string in Python.
-pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
-    match value {
-        // Primitives - direct conversion
-        CoercedValue::Int(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Float(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Bool(v) => v.into_pyobject(py).unwrap().to_owned().unbind().into_any(),
-        CoercedValue::String(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-
-        // UUID: construct from the 128-bit integer (uuid.UUID(int=...)) —
-        // avoids a 36-char string alloc in Rust + hex parsing in Python.
-        CoercedValue::Uuid(v) => uuid_to_py(py, *v).unwrap(),
-
-        // Decimal: construct Python decimal.Decimal from the validated input
-        // string (kept as-is so large exponents are never expanded into their
-        // full digit string in Rust).
-        CoercedValue::Decimal(v) => crate::type_coercion::get_decimal_class(py)
-            .call1(py, (v.as_str(),))
-            .unwrap(),
-
-        // Temporal types: direct C-API construction via pyo3's chrono feature.
-        CoercedValue::DateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::NaiveDateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Date(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Time(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-
-        CoercedValue::Null => py.None(),
-    }
-}
-
-/// Build a Python `uuid.UUID` from the parsed 128-bit value.
-#[inline]
-pub(crate) fn uuid_to_py(py: Python<'_>, v: uuid::Uuid) -> PyResult<Py<PyAny>> {
-    let kwargs = PyDict::new(py);
-    kwargs.set_item(pyo3::intern!(py, "int"), v.as_u128())?;
-    Ok(crate::type_coercion::get_uuid_class(py)
-        .bind(py)
-        .call((), Some(&kwargs))?
-        .unbind())
-}
-
 /// Convert a FileInfo into an unbound Python dict for use in Python code.
 ///
 /// The returned dict contains the following keys:
@@ -317,7 +208,7 @@ pub fn file_info_to_py(py: Python<'_>, file: &FileInfo) -> PyResult<Py<PyDict>> 
 /// use pyo3::prelude::*;
 ///
 /// // Assume `result` is a FormParseResult obtained from multipart parsing.
-/// # let result: crate::form_parsing::FormParseResult = unimplemented!();
+/// # let result: bolt_core::form_parsing::FormParseResult = unimplemented!();
 /// let seq_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
 /// Python::with_gil(|py| {
 ///     let (form_dict, files_dict) =
@@ -502,8 +393,10 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
 
 /// Borrow the global `CompressionConfig` from `AppState` attached to the
 /// request. Returns `None` when no `BoltAPI(compression=...)` was configured.
-fn compression_config_from_req(req: &HttpRequest) -> Option<&crate::metadata::CompressionConfig> {
-    req.app_data::<actix_web::web::Data<std::sync::Arc<crate::state::AppState>>>()
+fn compression_config_from_req(
+    req: &HttpRequest,
+) -> Option<&bolt_core::metadata::CompressionConfig> {
+    req.app_data::<actix_web::web::Data<std::sync::Arc<bolt_core::state::AppState>>>()
         .and_then(|s| s.global_compression_config.as_deref())
 }
 
@@ -591,7 +484,7 @@ async fn build_response_from_parsed(
             let codec = if user_set_content_encoding {
                 None
             } else {
-                crate::streaming_compression::select_stream_encoding(
+                bolt_core::streaming_compression::select_stream_encoding(
                     req,
                     compression_config_from_req(req),
                     skip_compression,
@@ -650,7 +543,7 @@ async fn build_response_from_parsed(
                 return response;
             }
             let inner = create_python_stream(content_obj, is_async_generator);
-            let stream = crate::streaming::maybe_wrap_codec(inner, codec);
+            let stream = bolt_core::streaming::maybe_wrap_codec(inner, codec);
             let mut response = builder.streaming(stream);
             mark_skip_cors(&mut response, skip_cors);
             response
@@ -773,7 +666,7 @@ thread_local! {
 fn ensure_pinned_thread_state() {
     TSTATE_PINNED.with(|c| {
         if !c.get() {
-            crate::state::pin_python_thread_state();
+            bolt_core::state::pin_python_thread_state();
             c.set(true);
         }
     });
@@ -868,8 +761,8 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // MCP mount check: only on router miss, so the non-MCP hot path
             // pays nothing. Before the ASGI fallback so an overlapping prefix
             // cannot shadow an MCP endpoint.
-            if let Some(mcp_mount) = crate::mcp::find_mcp_mount(state.get_ref(), path) {
-                return crate::mcp::bridge::handle_mcp_request(
+            if let Some(mcp_mount) = bolt_mcp::find_mcp_mount(state.get_ref(), path) {
+                return bolt_mcp::bridge::handle_mcp_request(
                     req,
                     payload,
                     mcp_mount,
@@ -1027,8 +920,12 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                     let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
                     if requires_csrf {
                         let scheme = req.connection_info().scheme().to_owned();
-                        if crate::validation::cookie_csrf_blocks(method, headers_map, true, &scheme)
-                        {
+                        if bolt_core::validation::cookie_csrf_blocks(
+                            method,
+                            headers_map,
+                            true,
+                            &scheme,
+                        ) {
                             return responses::error_403();
                         }
                     }
@@ -1364,7 +1261,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // the same GIL block. Eliminates: coroutine creation,
             // into_future_with_locals, asyncio polling.
             let result_obj = if is_async_handler {
-                crate::worker_loop::dispatch_sync(py, &route.dispatch_sync, &request_obj)?
+                bolt_loop::dispatch_sync(py, &route.dispatch_sync, request_obj.as_any())?
             } else {
                 route.dispatch_sync.call1(py, (request_obj,))?
             };
@@ -1385,7 +1282,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 };
                 let mut resp = response_builder::build_response_from_meta(
                     status,
-                    &crate::response_meta::STATIC_META_JSON,
+                    &bolt_core::response_meta::STATIC_META_JSON,
                     body,
                     skip_compression,
                 );
@@ -1439,7 +1336,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // ASYNC PATH: submit to the process-lived WorkerLoop whose ready
             // queue is serviced by a persistent Tokio pump.
             let dispatch = route.dispatch.clone_ref(py);
-            let fut = crate::worker_loop::dispatch(dispatch, request_obj.into());
+            let fut = bolt_loop::dispatch(dispatch, request_obj.into());
             Ok(DispatchOutcome::Pending(Box::pin(fut)))
         }
     });

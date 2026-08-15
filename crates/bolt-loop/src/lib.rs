@@ -10,8 +10,15 @@ use pyo3::sync::PyOnceLock;
 #[cfg(unix)]
 use std::collections::HashMap;
 
-use crate::request::PyRequest;
-use crate::state::TASK_LOCALS;
+#[cfg(unix)]
+mod worker_fd;
+
+use once_cell::sync::OnceCell;
+
+/// The startup/selector loop. Bolt route coroutines run on the WorkerLoop
+/// instead (see `worker_task_locals`); this loop backs the WorkerLoop's
+/// delegated selector work and mounted ASGI apps.
+pub static TASK_LOCALS: OnceCell<pyo3_async_runtimes::TaskLocals> = OnceCell::new();
 
 static WORKER_LOOP_FACTORY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_DISPATCH_START: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -26,7 +33,7 @@ static SIGNAL_WATCHERS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<i32, tokio::sync::oneshot::Sender<()>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-pub(crate) enum WorkerLoopCommand {
+pub enum WorkerLoopCommand {
     Soon(Py<PyAny>),
     /// File-descriptor readiness (see `worker_fd`): run the handle, then
     /// either requeue while the descriptor stays ready, tell the watcher to
@@ -86,7 +93,7 @@ fn get_worker_fn<'py>(
 ///
 /// Rust outside this module reaches the loop through `worker_task_locals`.
 /// The one deliberate exception is `asgi_http::submit_to_event_loop`: mounted
-/// ASGI apps stay on the startup/selector loop (`state::TASK_LOCALS`), so they
+/// ASGI apps stay on the startup/selector loop (`TASK_LOCALS`), so they
 /// cannot share asyncio primitives with Bolt handlers.
 fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     WORKER_LOOP.get_or_try_init(py, || {
@@ -109,9 +116,7 @@ fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
 /// is initialized lazily from whichever request first streams or upgrades, and
 /// is then inherited by every stream/WebSocket task for the process lifetime —
 /// so copying here would pin that request's contextvars forever.
-pub(crate) fn worker_task_locals(
-    py: Python<'_>,
-) -> PyResult<&'static pyo3_async_runtimes::TaskLocals> {
+pub fn worker_task_locals(py: Python<'_>) -> PyResult<&'static pyo3_async_runtimes::TaskLocals> {
     static WORKER_TASK_LOCALS: PyOnceLock<pyo3_async_runtimes::TaskLocals> = PyOnceLock::new();
     WORKER_TASK_LOCALS.get_or_try_init(py, || {
         let event_loop = get_loop(py)?.bind(py).clone();
@@ -293,19 +298,19 @@ const TIMER_COMPACTION_MIN_CANCELLED: usize = 64;
 /// (e.g. completed `asyncio.wait_for` deadlines) would be counted here until
 /// their deadline passes.
 #[pyfunction]
-pub(crate) fn worker_timer_count() -> usize {
+pub fn worker_timer_count() -> usize {
     WORKER_TIMER_LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(unix)]
-pub(crate) fn fd_watchers() -> &'static crate::worker_fd::FdWatchers {
+pub fn fd_watchers() -> &'static crate::worker_fd::FdWatchers {
     &WorkerLoopService::get().fd_watchers
 }
 
 /// Test/introspection hook: descriptor watchers whose Tokio task is still
 /// running. A watcher for a cancelled handle must exit rather than spin.
 #[pyfunction]
-pub(crate) fn worker_fd_watcher_count() -> usize {
+pub fn worker_fd_watcher_count() -> usize {
     #[cfg(unix)]
     {
         WorkerLoopService::get().fd_watchers.live_count()
@@ -392,7 +397,7 @@ fn run_worker_timers(rx: std::sync::mpsc::Receiver<TimerCommand>) {
 }
 
 #[pyclass(frozen)]
-pub(crate) struct WorkerLoopScheduler {
+pub struct WorkerLoopScheduler {
     tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
 }
 
@@ -585,7 +590,7 @@ impl WorkerDispatchResolver {
 /// Deliberate: if the caller's future is dropped (client disconnect), the
 /// Python task is NOT cancelled — it runs to completion and its result is
 /// discarded, consistent with tasks being allowed to outlive responses.
-pub(crate) async fn dispatch(dispatch: Py<PyAny>, request: Py<PyAny>) -> PyResult<Py<PyAny>> {
+pub async fn dispatch(dispatch: Py<PyAny>, request: Py<PyAny>) -> PyResult<Py<PyAny>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     Python::attach(|py| {
         let resolver = Py::new(
@@ -610,7 +615,7 @@ pub(crate) async fn dispatch(dispatch: Py<PyAny>, request: Py<PyAny>) -> PyResul
 /// Holds the asyncio Task created by `worker_dispatch_start_cancellable` so a
 /// later cancellation can reach it. Filled from the WorkerLoop thread.
 #[pyclass(frozen)]
-pub(crate) struct WorkerTaskHandle {
+pub struct WorkerTaskHandle {
     task: std::sync::Mutex<Option<Py<PyAny>>>,
     cancelled: std::sync::atomic::AtomicBool,
 }
@@ -634,7 +639,7 @@ impl WorkerTaskHandle {
 /// `notifications/cancelled` (legacy sessions). Plain routes keep the
 /// non-cancelling `dispatch` semantics deliberately (tasks may outlive
 /// responses); MCP semantics require the tool to actually stop.
-pub(crate) async fn dispatch_cancellable(
+pub async fn dispatch_cancellable(
     dispatch: Py<PyAny>,
     payload: Py<PyAny>,
     ct: tokio_util::sync::CancellationToken,
@@ -701,10 +706,10 @@ pub(crate) async fn dispatch_cancellable(
     }
 }
 
-pub(crate) fn dispatch_sync(
+pub fn dispatch_sync(
     py: Python<'_>,
     dispatch: &Py<PyAny>,
-    request: &Py<PyRequest>,
+    request: &Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let call = get_worker_fn(py, &WORKER_SYNC_DISPATCH, "worker_sync_dispatch")?;
     call.call1(py, (dispatch, request, get_loop(py)?))

@@ -14,19 +14,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::asgi_mounts::validate_and_sort_asgi_mounts;
 use crate::handler::handle_request;
-use crate::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
-use crate::middleware::compression::CompressionMiddleware;
-use crate::middleware::cors::CorsMiddleware;
-use crate::router::Router;
-use crate::state::{
-    AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, GLOBAL_WEBSOCKET_ROUTER,
-    ROUTE_METADATA, ROUTE_METADATA_TEMP, TASK_LOCALS,
+use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
+use bolt_core::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
+use bolt_core::middleware::compression::CompressionMiddleware;
+use bolt_core::middleware::cors::CorsMiddleware;
+use bolt_core::router::Router;
+use bolt_core::state::{
+    AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, ROUTE_METADATA,
+    ROUTE_METADATA_TEMP, TASK_LOCALS,
 };
-use crate::static_files::handle_file;
-use crate::websocket::{
+use bolt_core::static_files::handle_file;
+use bolt_websocket::{
     handle_websocket_upgrade_with_handler, is_websocket_upgrade, WebSocketRouter,
+    GLOBAL_WEBSOCKET_ROUTER,
 };
 
 /// Reject URL prefixes containing actix scope path-param syntax.
@@ -269,8 +270,8 @@ pub fn start_server(
     // samples on the sync dispatch path). Pinning makes attach a cheap
     // counter bump reusing the cached state. on_thread_stop tears the state
     // down properly so recycled blocking-pool threads don't leak states.
-    runtime_builder.on_thread_start(crate::state::pin_python_thread_state);
-    runtime_builder.on_thread_stop(crate::state::unpin_python_thread_state);
+    runtime_builder.on_thread_start(bolt_core::state::pin_python_thread_state);
+    runtime_builder.on_thread_stop(bolt_core::state::unpin_python_thread_state);
     pyo3_async_runtimes::tokio::init(runtime_builder);
 
     let loop_obj: Py<PyAny> = {
@@ -786,7 +787,7 @@ pub fn start_server(
     });
 
     // Resolve DJANGO_BOLT_MAX_PARAM_LENGTH once at startup, not per request.
-    let max_param_length = crate::type_coercion::resolve_max_param_length();
+    let max_param_length = bolt_core::type_coercion::resolve_max_param_length();
 
     let app_state = Arc::new(AppState {
         dispatch: dispatch.into(),
@@ -798,10 +799,10 @@ pub fn start_server(
         global_cors_config,
         cors_origin_regexes,
         global_compression_config: global_compression_config.clone(),
-        router: None,         // Production uses GLOBAL_ROUTER
-        route_metadata: None, // Production uses ROUTE_METADATA
-        asgi_mounts: None,    // Production uses GLOBAL_ASGI_MOUNTS
-        mcp_mounts: None,     // Production uses mcp::GLOBAL_MCP_MOUNTS
+        router: None,                        // Production uses GLOBAL_ROUTER
+        route_metadata: None,                // Production uses ROUTE_METADATA
+        asgi_mounts: None,                   // Production uses GLOBAL_ASGI_MOUNTS
+        extensions: http::Extensions::new(), // Production uses per-crate globals (e.g. mcp::GLOBAL_MCP_MOUNTS)
         static_files_config: static_files_config.clone(),
         media_files_config: media_files_config.clone(),
         access_logger: access_logger_obj,
@@ -961,7 +962,7 @@ pub fn start_server(
                     let handle = server.handle();
                     aw::rt::spawn(async move {
                         let graceful = wait_for_shutdown_signal().await;
-                        crate::websocket::begin_drain();
+                        bolt_websocket::begin_drain();
                         if graceful {
                             // The 1012 close is delivered by each actor's
                             // drain-watch poll tick; stopping Actix immediately
@@ -971,7 +972,7 @@ pub fn start_server(
                             // a small margin for the final frame flush.
                             let deadline =
                                 std::time::Instant::now() + std::time::Duration::from_secs(5);
-                            while crate::websocket::ACTIVE_WS_CONNECTIONS
+                            while bolt_websocket::ACTIVE_WS_CONNECTIONS
                                 .load(std::sync::atomic::Ordering::Relaxed)
                                 > 0
                                 && std::time::Instant::now() < deadline

@@ -12,12 +12,12 @@ use futures_util::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::handler::extract_headers;
-use crate::mcp::{McpAuthExt, McpMount};
-use crate::middleware::auth::AuthContext;
-use crate::responses;
-use crate::state::AppState;
-use crate::validation::{cookie_csrf_blocks, validate_auth_and_guards, AuthGuardResult};
+use crate::{McpAuthExt, McpMount};
+use bolt_core::middleware::auth::AuthContext;
+use bolt_core::request_pipeline::extract_headers;
+use bolt_core::responses;
+use bolt_core::state::AppState;
+use bolt_core::validation::{cookie_csrf_blocks, validate_auth_and_guards, AuthGuardResult};
 
 /// Buffer the request body, enforcing the payload cap. Mirrors the bounded
 /// read loop used for regular routes; rmcp enforces its own configured cap as

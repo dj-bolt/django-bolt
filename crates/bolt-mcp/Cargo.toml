@@ -1,0 +1,27 @@
+[package]
+name = "bolt-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "MCP (Model Context Protocol) Streamable HTTP transport core for django-bolt, built on rmcp"
+
+[dependencies]
+actix-web = { workspace = true }
+ahash = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+log = { workspace = true }
+once_cell = { workspace = true }
+pyo3 = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+bolt-core = { workspace = true }
+bolt-loop = { workspace = true }

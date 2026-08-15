@@ -31,10 +31,10 @@ use std::sync::{Arc, Mutex};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
-use crate::worker_loop::WorkerLoopCommand;
+use crate::WorkerLoopCommand;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Direction {
+pub enum Direction {
     Read,
     Write,
 }
@@ -56,7 +56,7 @@ impl Direction {
 }
 
 #[derive(Default)]
-pub(crate) struct FdWatchers {
+pub struct FdWatchers {
     tasks: Mutex<HashMap<(RawFd, Direction), tokio::task::AbortHandle>>,
 }
 
@@ -64,7 +64,7 @@ impl FdWatchers {
     /// Register `handle` for `direction` on `fd`, replacing any previous
     /// registration. The caller (Python) has already cancelled the previous
     /// Handle, so a readiness event still in flight for it is a no-op.
-    pub(crate) fn add(
+    pub fn add(
         &self,
         runtime: &tokio::runtime::Handle,
         tx: &tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
@@ -95,7 +95,7 @@ impl FdWatchers {
 
     /// Number of registered watchers (test hook). Watchers unregister
     /// themselves on exit, so this is the live count.
-    pub(crate) fn live_count(&self) -> usize {
+    pub fn live_count(&self) -> usize {
         self.tasks.lock().unwrap().len()
     }
 
@@ -112,7 +112,7 @@ impl FdWatchers {
         }
     }
 
-    pub(crate) fn remove(&self, fd: RawFd, direction: Direction) -> bool {
+    pub fn remove(&self, fd: RawFd, direction: Direction) -> bool {
         match self.tasks.lock().unwrap().remove(&(fd, direction)) {
             Some(task) => {
                 task.abort();
@@ -127,8 +127,8 @@ impl FdWatchers {
 /// the callback it polls the descriptor and requeues itself while the
 /// descriptor stays ready, and only wakes the watcher (to clear Tokio's
 /// cached readiness and re-arm) once the kernel says it is drained.
-pub(crate) struct Ready {
-    pub(crate) handle: Arc<Py<PyAny>>,
+pub struct Ready {
+    pub handle: Arc<Py<PyAny>>,
     fd: RawFd,
     direction: Direction,
     rearm: tokio::sync::oneshot::Sender<()>,
@@ -138,7 +138,7 @@ impl Ready {
     /// Called by the pump after the callback ran. Dropping `self` without
     /// re-arming (cancelled handle: the pump never calls this) stops the
     /// watcher, as the stdlib selector loop drops cancelled readers.
-    pub(crate) fn after_callback(self, tx: &tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>) {
+    pub fn after_callback(self, tx: &tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>) {
         if still_ready(self.fd, self.direction) {
             let _ = tx.send(WorkerLoopCommand::Ready(self));
         } else {
@@ -169,7 +169,7 @@ struct Retire {
 
 impl Drop for Retire {
     fn drop(&mut self) {
-        crate::worker_loop::fd_watchers().retire(self.fd, self.direction, tokio::task::id());
+        crate::fd_watchers().retire(self.fd, self.direction, tokio::task::id());
     }
 }
 

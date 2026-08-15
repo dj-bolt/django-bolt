@@ -382,7 +382,7 @@ pub fn authenticate(
 
 /// Find a cookie value by name in a raw Cookie header string.
 /// Zero-allocation scan — returns a slice into the header value.
-pub(crate) fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<&'a str> {
+pub fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<&'a str> {
     for pair in raw_cookie.split(';') {
         let part = pair.trim();
         if let Some(eq) = part.find('=') {

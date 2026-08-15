@@ -65,22 +65,22 @@ pub fn level_rank(level: &str) -> Option<u8> {
 
 #[pyclass(frozen, name = "McpCallContext", module = "django_bolt._core")]
 pub struct McpPyContext {
-    pub(crate) tx: tokio::sync::mpsc::UnboundedSender<CtxEvent>,
-    pub(crate) has_progress_token: bool,
-    pub(crate) mode: ProtocolMode,
+    pub tx: tokio::sync::mpsc::UnboundedSender<CtxEvent>,
+    pub has_progress_token: bool,
+    pub mode: ProtocolMode,
     /// Per-request log gate as a rank (see `level_rank`): modern era = the
     /// request's `io.modelcontextprotocol/logLevel` (None -> never emit);
     /// legacy era = Some(0) (session logging, no gate).
-    pub(crate) log_gate: Option<u8>,
-    pub(crate) caps_elicitation: bool,
-    pub(crate) caps_sampling: bool,
+    pub log_gate: Option<u8>,
+    pub caps_elicitation: bool,
+    pub caps_sampling: bool,
     /// MRTR replay answers, keyed by input key; values are JSON envelopes
     /// ({"result": <client result>}), matching the live-path reply format.
-    pub(crate) input_responses: Mutex<HashMap<String, String>>,
+    pub input_responses: Mutex<HashMap<String, String>>,
     /// Whether this invocation is an MRTR replay (requestState was present).
-    pub(crate) is_replay: bool,
+    pub is_replay: bool,
     /// Raw request `_meta` JSON for Python-side passthrough.
-    pub(crate) meta_json: Option<String>,
+    pub meta_json: Option<String>,
 }
 
 #[pymethods]
