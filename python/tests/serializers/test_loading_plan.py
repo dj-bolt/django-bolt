@@ -270,3 +270,40 @@ def test_paginated_route_applies_plan_to_the_page(blog, count_queries):
     assert items[0]["comments"][0]["author"]["name"] == "Alice"
     # count + page(posts+author) + tags + comments
     assert len(count_queries) == 4
+
+
+# ---------------------------------------------------------------------------
+# Django 6.1: fetch_mode(FETCH_PEERS) as the safety net for anything the plan
+# does not cover (deferred fields, relations behind properties)
+# ---------------------------------------------------------------------------
+
+fetch_modes = pytest.importorskip("django.db.models.fetch_modes", reason="fetch modes need Django >= 6.1")
+
+
+def test_plan_sets_fetch_peers_when_available():
+    qs = PostWithAuthor.loading_plan(BlogPost).apply(BlogPost.objects.all())
+    assert qs._fetch_mode is fetch_modes.FETCH_PEERS
+
+
+def test_plan_keeps_callers_explicit_fetch_mode():
+    qs = BlogPost.objects.fetch_mode(fetch_modes.FETCH_RAISE)
+    assert PostWithAuthor.loading_plan(BlogPost).apply(qs)._fetch_mode is fetch_modes.FETCH_RAISE
+
+
+@pytest.mark.django_db
+def test_fetch_peers_batches_relations_the_plan_cannot_see(blog, django_assert_num_queries):
+    class PostWithAuthorViaProperty(Serializer):
+        id: int
+        author_name: str = field(source="author_display")  # a model property, opaque to the plan
+
+    BlogPost.author_display = property(lambda self: self.author.name)
+    try:
+        assert not PostWithAuthorViaProperty.loading_plan(BlogPost).select_related
+        # posts + ONE peers batch for author (not one query per post)
+        with django_assert_num_queries(2):
+            dumped = PostWithAuthorViaProperty.dump_many(
+                PostWithAuthorViaProperty.from_models(BlogPost.objects.order_by("id"))
+            )
+    finally:
+        del BlogPost.author_display
+    assert [d["author_name"] for d in dumped] == ["Alice"] * 3
