@@ -1725,7 +1725,13 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
     @classmethod
     async def afrom_models(cls: type[T], objects: QuerySet | Iterable[Model]) -> list[T]:
-        """Async :meth:`from_models`: iterates the prepared QuerySet with the async ORM."""
+        """Async :meth:`from_models`: iterates the prepared QuerySet with the async ORM.
+
+        Rows are converted with the sync :meth:`from_model`, so relations the
+        loading plan cannot cover are *not* lazily loaded (unlike
+        :meth:`afrom_model`): a required nested field left unloaded raises
+        ``UnloadedRelationError`` — add the load to the queryset instead.
+        """
         if isinstance(objects, QuerySet):
             return [cls.from_model(obj) async for obj in cls._prepare_queryset(objects)]
         return [cls.from_model(obj) for obj in objects]

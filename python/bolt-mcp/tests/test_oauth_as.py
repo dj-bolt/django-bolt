@@ -557,7 +557,14 @@ def test_oauth_routes_are_public_under_global_default_guards(settings):
     with TestClient(api) as client:
         assert client.get("/.well-known/oauth-authorization-server").status_code == 200
         assert client.get("/.well-known/oauth-protected-resource/mcp").status_code == 200
-        assert client.get("/oauth/authorize").status_code != 401
-        assert client.post("/oauth/token", data={"grant_type": "authorization_code"}).status_code != 401
-        assert client.post("/oauth/revoke", data={"token": "x"}).status_code != 401
-        assert client.post("/oauth/register", json={"redirect_uris": [REDIRECT_URI]}).status_code != 401
+        # Malformed inputs: the handlers must run and answer 4xx themselves,
+        # not be short-circuited by auth (401/403) or crash (5xx).
+        for response in (
+            client.get("/oauth/authorize"),
+            client.post("/oauth/authorize", data={"action": "login"}, headers={"Origin": ISSUER}),
+            client.post("/oauth/token", data={"grant_type": "authorization_code"}),
+            client.post("/oauth/revoke", data={"token": "x"}),
+            client.post("/oauth/register", json={"redirect_uris": ["javascript:alert(1)"]}),
+        ):
+            assert response.status_code not in (401, 403), response.text
+            assert response.status_code < 500, response.text

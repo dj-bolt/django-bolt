@@ -17,13 +17,20 @@ from __future__ import annotations
 
 import pytest
 from django.db.backends import utils as db_utils
-from django.db.models import Count, Prefetch
+from django.db.models import Count, F, Prefetch
 
 from django_bolt import BoltAPI
 from django_bolt.pagination import PageNumberPagination, paginate
 from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
 from tests.test_models import Author, BlogPost, Comment, Tag
+
+try:  # Django >= 6.1
+    from django.db.models import fetch_modes
+except ImportError:  # pragma: no cover
+    fetch_modes = None
+
+needs_fetch_modes = pytest.mark.skipif(fetch_modes is None, reason="fetch modes need Django >= 6.1")
 
 
 class AuthorMini(Serializer):
@@ -84,8 +91,12 @@ def blog(db):
 
 
 @pytest.fixture
-def count_queries(monkeypatch):
-    """Count SQL statements on every thread (the ORM executor uses its own connections)."""
+def count_queries(monkeypatch, blog):
+    """Count SQL statements on every thread (the ORM executor uses its own connections).
+
+    Depends on ``blog`` so the fixture data is inserted before counting starts,
+    whatever order a test lists its parameters in.
+    """
     statements: list[str] = []
     original = db_utils.CursorWrapper._execute
 
@@ -128,6 +139,14 @@ def test_plan_carries_config_annotations():
     assert list(AuthorWithPostCount.loading_plan(Author).annotations) == ["post_count"]
 
 
+def test_plan_skips_join_for_fk_id_only_field():
+    class PostAuthorId(Serializer):
+        id: int
+        author: int  # reads author_id; the related row is never touched
+
+    assert not PostAuthorId.loading_plan(BlogPost)
+
+
 def test_plan_ignores_columns_and_unknown_attributes():
     class Plain(Serializer):
         id: int
@@ -168,6 +187,30 @@ def test_from_models_keeps_callers_loads_and_never_duplicates(blog, django_asser
     with django_assert_num_queries(3):  # posts+author, tags (once), comments
         posts = PostFull.from_models(base)
     assert [p.title for p in posts] == ["Post 0", "Post 1", "Post 2"]
+
+
+@pytest.mark.django_db
+def test_from_models_leaves_values_querysets_alone(blog):
+    """A ``.values()`` queryset yields dicts, not models: no select_related on it (TypeError)."""
+    values_qs = BlogPost.objects.order_by("id").values("id", author_email=F("author__email"))
+    rows = PostWithAuthorEmail._prepare_queryset(values_qs)
+    assert list(rows) == [{"id": p.id, "author_email": "alice@example.com"} for p in blog[1]]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_paginated_values_queryset_still_works(blog, count_queries):
+    api = BoltAPI()
+
+    @api.get("/posts")
+    @paginate(PageNumberPagination)
+    async def list_posts(request) -> list[PostWithAuthorEmail]:
+        return BlogPost.objects.order_by("id").values("id", author_email=F("author__email"))
+
+    with TestClient(api) as client:
+        response = client.get("/posts")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["author_email"] == "alice@example.com"
 
 
 @pytest.mark.django_db
@@ -277,19 +320,21 @@ def test_paginated_route_applies_plan_to_the_page(blog, count_queries):
 # does not cover (deferred fields, relations behind properties)
 # ---------------------------------------------------------------------------
 
-fetch_modes = pytest.importorskip("django.db.models.fetch_modes", reason="fetch modes need Django >= 6.1")
 
 
+@needs_fetch_modes
 def test_plan_sets_fetch_peers_when_available():
     qs = PostWithAuthor.loading_plan(BlogPost).apply(BlogPost.objects.all())
     assert qs._fetch_mode is fetch_modes.FETCH_PEERS
 
 
+@needs_fetch_modes
 def test_plan_keeps_callers_explicit_fetch_mode():
     qs = BlogPost.objects.fetch_mode(fetch_modes.FETCH_RAISE)
     assert PostWithAuthor.loading_plan(BlogPost).apply(qs)._fetch_mode is fetch_modes.FETCH_RAISE
 
 
+@needs_fetch_modes
 @pytest.mark.django_db
 def test_fetch_peers_batches_relations_the_plan_cannot_see(blog, django_assert_num_queries):
     class PostWithAuthorViaProperty(Serializer):

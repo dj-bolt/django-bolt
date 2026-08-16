@@ -11,8 +11,8 @@ turns that into the ORM calls that load it in a bounded number of queries:
 - Django >= 6.1: ``fetch_mode(FETCH_PEERS)`` as a safety net for anything not
   declared (e.g. a model ``@property`` reading a FK)
 
-Plans are built once per ``(serializer, model)`` and cached weakly by model class
-so dev reloads don't pin stale classes.
+Plans are built once per ``(serializer, model)``; the cache holds both classes
+weakly so dev reloads don't pin stale classes.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from weakref import WeakKeyDictionary
 
 from django.db.models import Prefetch, QuerySet
+from django.db.models.query import ModelIterable
 
 try:  # Django >= 6.1
     from django.db.models import FETCH_ONE, FETCH_PEERS
@@ -51,7 +52,11 @@ class LoadingPlan:
         Additive and idempotent: relations the caller already loads are kept
         (``select_related`` merges; a prefetch lookup already present is not
         added again), annotations already on the query are not overwritten.
+        A ``values()``/``values_list()`` queryset yields rows, not model
+        instances — there is nothing to load onto, so it is returned unchanged.
         """
+        if not issubclass(queryset._iterable_class, ModelIterable):
+            return queryset
         if self.select_related:
             queryset = queryset.select_related(*self.select_related)
         if self.prefetch:
@@ -73,14 +78,14 @@ def _prefetch_lookup(lookup: str | Prefetch) -> str:
     return lookup.prefetch_to if isinstance(lookup, Prefetch) else lookup
 
 
-_PLAN_CACHE: WeakKeyDictionary[type, dict[type, LoadingPlan]] = WeakKeyDictionary()
+_PLAN_CACHE: WeakKeyDictionary[type, WeakKeyDictionary[type, LoadingPlan]] = WeakKeyDictionary()
 
 
 def build_loading_plan(serializer_cls: type[Serializer], model_cls: type) -> LoadingPlan:
     """Build (or fetch the cached) loading plan for ``serializer_cls`` over ``model_cls``."""
     per_model = _PLAN_CACHE.get(model_cls)
     if per_model is None:
-        per_model = _PLAN_CACHE[model_cls] = {}
+        per_model = _PLAN_CACHE[model_cls] = WeakKeyDictionary()
     plan = per_model.get(serializer_cls)
     if plan is None:
         # Guard against recursion (Author.posts -> Post.author -> ...): publish an
@@ -127,6 +132,8 @@ def _build(serializer_cls: type[Serializer], model_cls: type) -> LoadingPlan:
                 add_prefetch(Prefetch(lookup, queryset=nested_qs) if nested_qs is not None else lookup)
                 break  # cannot select_related through a many-valued relation
 
+            if is_last and nested is None and info.kind == "forward_one":
+                break  # from_model reads the FK id (attname); the related row is never touched
             select_related.append(lookup)
             if nested is not None:
                 nested_plan = build_loading_plan(nested.serializer_class, info.related_model)
