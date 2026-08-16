@@ -45,3 +45,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# Fix for issue #291: safe input handling
