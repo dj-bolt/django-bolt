@@ -12,6 +12,7 @@ import secrets
 from urllib.parse import parse_qs, urlsplit
 
 import jwt
+import pytest
 from _helpers import initialize, parse_rpc, post_rpc
 from bolt_mcp import MCP, AuthorizationServer, mount_mcp
 from bolt_mcp.oauth import sessions as oauth_sessions
@@ -22,6 +23,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 
 from django_bolt import BoltAPI, Requires
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.testing import TestClient
 
 ISSUER = "http://localhost:8000"
@@ -542,3 +544,20 @@ def test_registration_rejects_invalid_application_type():
         )
     assert r.status_code == 400
     assert r.json()["error"] == "invalid_client_metadata"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_oauth_routes_are_public_under_global_default_guards(settings):
+    """#296: BOLT_DEFAULT_PERMISSION_CLASSES / BOLT_AUTHENTICATION_CLASSES must not
+    gate discovery or the OAuth endpoints — a client has no token before the flow."""
+    settings.BOLT_AUTHENTICATION_CLASSES = [JWTAuthentication()]
+    settings.BOLT_DEFAULT_PERMISSION_CLASSES = [IsAuthenticated()]
+    api, _mcp, _server = _build()
+
+    with TestClient(api) as client:
+        assert client.get("/.well-known/oauth-authorization-server").status_code == 200
+        assert client.get("/.well-known/oauth-protected-resource/mcp").status_code == 200
+        assert client.get("/oauth/authorize").status_code != 401
+        assert client.post("/oauth/token", data={"grant_type": "authorization_code"}).status_code != 401
+        assert client.post("/oauth/revoke", data={"token": "x"}).status_code != 401
+        assert client.post("/oauth/register", json={"redirect_uris": [REDIRECT_URI]}).status_code != 401

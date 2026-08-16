@@ -27,7 +27,7 @@ import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import wraps
-from typing import Any, TypeVar, get_args, get_origin
+from typing import Any, Generic, TypeVar, get_args, get_origin
 
 import msgspec
 
@@ -49,7 +49,7 @@ T = TypeVar("T")
 _PAGINATION_UNSET = object()
 
 
-class PaginatedResponse[T](msgspec.Struct, omit_defaults=True):
+class PaginatedResponse(msgspec.Struct, Generic[T], omit_defaults=True):  # noqa: UP046 — PEP 695 params are unresolvable under PEP 563
     """
     Standard paginated response structure.
 
@@ -144,6 +144,29 @@ class PaginationBase(ABC):
     # Serializer class for item serialization (set at runtime by paginate wrapper)
     serializer_class: type | None = None
 
+    # Envelope type: a generic msgspec.Struct/Serializer taking the item type
+    # (``response_class[Item]``). Drives the OpenAPI schema and response
+    # validation; override together with build_response() for a custom shape.
+    response_class: type = PaginatedResponse
+
+    def build_response(
+        self,
+        items: list[Any],
+        *,
+        total: int,
+        request: Any,
+        has_next: bool,
+        has_previous: bool,
+        **info: Any,
+    ) -> Any:
+        """Build the envelope for one page.
+
+        ``info`` carries the scheme-specific fields (page/page_size/total_pages/
+        next_page/previous_page, limit/offset, next_cursor/previous_cursor).
+        Override to return an instance of a custom ``response_class``.
+        """
+        return self.response_class(items=items, total=total, has_next=has_next, has_previous=has_previous, **info)
+
     @abstractmethod
     async def get_page_params(self, request: dict[str, Any]) -> dict[str, Any]:
         """
@@ -158,7 +181,7 @@ class PaginationBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> PaginatedResponse:
+    async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> Any:
         """
         Apply pagination to a queryset and return paginated response.
 
@@ -238,18 +261,6 @@ class PaginationBase(ABC):
         if getattr(self.serializer_class, "__is_bolt_serializer__", False):
             serializer_class = self.serializer_class
             serializer_class._ensure_from_model_ready()
-            can_use_sync_from_model = not any(
-                spec.nested is not None or (spec.source is not None and "." in spec.source)
-                for spec in serializer_class.__model_field_specs__
-            )
-
-            if can_use_sync_from_model:
-                try:
-                    serializer_instances = [serializer_class.from_model(item) for item in items]
-                except Exception:
-                    serializer_instances = None
-                else:
-                    return serializer_class.dump_many(serializer_instances)
 
             try:
                 serializer_instances = [serializer_class.from_model(item) for item in items]
@@ -289,6 +300,11 @@ class PaginationBase(ABC):
         # sync_to_async(thread_sensitive=True) hop onto one shared thread —
         # both per-chunk overhead AND a cross-request serialization point.
         if hasattr(queryset, "_iterable_class") and hasattr(queryset, "model"):
+            serializer_class = self.serializer_class
+            if getattr(serializer_class, "__is_bolt_serializer__", False):
+                # Pre-load what the item serializer reads (select_related /
+                # prefetch_related / annotate) so a page never costs N+1.
+                queryset = serializer_class._prepare_queryset(queryset)
             return await run_in_orm_executor(list, queryset)
         # Non-QuerySet async iterables (has __aiter__)
         if hasattr(queryset, "__aiter__"):
@@ -390,7 +406,7 @@ class PageNumberPagination(PaginationBase):
 
         return {"page": page, "page_size": page_size}
 
-    async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> PaginatedResponse:
+    async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> Any:
         """
         Paginate queryset using page numbers.
 
@@ -426,14 +442,15 @@ class PageNumberPagination(PaginationBase):
         items = await self._serialize_items(raw_items)
 
         # Build response
-        return PaginatedResponse(
-            items=items,
+        return self.build_response(
+            items,
             total=total,
+            request=request,
+            has_next=page_number < total_pages,
+            has_previous=page_number > 1,
             page=page_number,
             page_size=page_size,
             total_pages=total_pages,
-            has_next=page_number < total_pages,
-            has_previous=page_number > 1,
             next_page=page_number + 1 if page_number < total_pages else None,
             previous_page=page_number - 1 if page_number > 1 else None,
         )
@@ -488,7 +505,7 @@ class LimitOffsetPagination(PaginationBase):
 
         return {"limit": limit, "offset": offset}
 
-    async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> PaginatedResponse:
+    async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> Any:
         """
         Paginate queryset using limit/offset.
 
@@ -517,13 +534,14 @@ class LimitOffsetPagination(PaginationBase):
         has_next = (offset + limit) < total
         has_previous = offset > 0
 
-        return PaginatedResponse(
-            items=items,
+        return self.build_response(
+            items,
             total=total,
-            limit=limit,
-            offset=offset,
+            request=request,
             has_next=has_next,
             has_previous=has_previous,
+            limit=limit,
+            offset=offset,
         )
 
 
@@ -596,7 +614,7 @@ class CursorPagination(PaginationBase):
 
         return {"cursor": cursor_value, "page_size": page_size}
 
-    async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> PaginatedResponse:
+    async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> Any:
         """
         Paginate queryset using cursor-based pagination.
 
@@ -655,12 +673,13 @@ class CursorPagination(PaginationBase):
         # Serialize items using efficient batch serialization
         items = await self._serialize_items(raw_items)
 
-        return PaginatedResponse(
-            items=items,
+        return self.build_response(
+            items,
             total=0,  # Cursor pagination doesn't provide total count for efficiency
-            page_size=page_size,
+            request=request,
             has_next=has_next,
             has_previous=cursor_value is not None,
+            page_size=page_size,
             next_cursor=next_cursor,
         )
 

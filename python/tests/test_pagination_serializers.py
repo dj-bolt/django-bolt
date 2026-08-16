@@ -7,7 +7,6 @@ or return type annotation for efficient batch serialization.
 
 from __future__ import annotations
 
-import asyncio
 import builtins
 
 import msgspec
@@ -289,21 +288,19 @@ def test_paginate_with_nested_serializer_uses_afrom_model(sample_blog_posts):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_paginate_serializes_page_items_concurrently(sample_blog_posts, monkeypatch):
-    """Test paginated async serialization gathers item-level afrom_model() calls."""
+def test_paginate_preloads_relations_instead_of_per_item_async_loading(sample_blog_posts, monkeypatch):
+    """A page of nested-FK items is served from the serializer's loading plan.
+
+    The relation is select_related before the slice is evaluated, so the
+    per-item ``afrom_model()`` fallback (one query per row on the loop) is
+    never needed.
+    """
     api = BoltAPI()
-    original_afrom_model = Serializer.afrom_model.__func__
-    first_started = asyncio.Event()
-    second_started = asyncio.Event()
     seen_ids: list[int] = []
+    original_afrom_model = Serializer.afrom_model.__func__
 
     async def tracked_afrom_model(cls, instance, *, _depth=0, max_depth=10):
         seen_ids.append(instance.pk)
-        if not first_started.is_set():
-            first_started.set()
-            await asyncio.wait_for(second_started.wait(), timeout=0.5)
-        else:
-            second_started.set()
         return await original_afrom_model(cls, instance, _depth=_depth, max_depth=max_depth)
 
     monkeypatch.setattr(
@@ -326,7 +323,8 @@ def test_paginate_serializes_page_items_concurrently(sample_blog_posts, monkeypa
 
         data = response.json()
         assert len(data["items"]) == 2
-        assert len(seen_ids) == 2
+        assert data["items"][0]["author"]["name"].startswith("Author ")
+        assert seen_ids == []
 
 
 # ============================================================================

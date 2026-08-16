@@ -104,11 +104,13 @@ class TestValuesEvaluatorRuntime:
     def test_non_column_field_falls_back_to_instances(self, values_user_table):
         evaluate_sync, _ = _compile_serializer_values_evaluators(NonColumnUserSerializer)
         items = evaluate_sync(ValuesPathUser.objects.order_by("id"))
-        # FieldError fallback: model instances, not dicts
-        assert all(isinstance(item, ValuesPathUser) for item in items)
+        # FieldError fallback: instances are projected through the serializer
+        # right there on the ORM thread, so the evaluator still yields dicts.
+        assert items and all(isinstance(item, dict) for item in items)
+        assert set(items[0]) == set(NonColumnUserSerializer.__struct_fields__)
         # And the verdict is cached: second call goes straight to instances
         items2 = evaluate_sync(ValuesPathUser.objects.order_by("id"))
-        assert all(isinstance(item, ValuesPathUser) for item in items2)
+        assert items2 == items
 
 
 @pytest.mark.django_db(transaction=True)

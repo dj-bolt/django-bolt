@@ -506,3 +506,23 @@ class TestModelValidateCollectsAllErrors:
         errors = exc_info.value.errors()
         locs = {tuple(err["loc"]) for err in errors}
         assert ("body", "lastName") in locs
+
+
+def test_subclass_used_after_parent_dumps_all_fields():
+    """A field-less subclass must build its own dump specs even when the parent was
+    used (and lazily collected) first — it used to inherit the parent's 'collected'
+    flag with empty specs and dump ``{}``."""
+
+    class Owner(Serializer):
+        id: int
+
+    class Parent(Serializer):
+        id: int
+        owner: Owner  # nested: forces the spec-driven (non-fast-path) dump
+
+    class Child(Parent):
+        pass
+
+    assert Parent(id=1, owner=Owner(id=9)).dump() == {"id": 1, "owner": {"id": 9}}
+    assert Child(id=2, owner=Owner(id=9)).dump() == {"id": 2, "owner": {"id": 9}}
+    assert Child.dump_many([Child(id=3, owner=Owner(id=9))]) == [{"id": 3, "owner": {"id": 9}}]

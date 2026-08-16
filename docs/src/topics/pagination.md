@@ -131,30 +131,67 @@ class ArticleViewSet(ModelViewSet):
     pagination_class = ArticlePagination  # Automatically applied to list()
 ```
 
+## Custom response envelope
+
+The default envelope is `PaginatedResponse[T]`. It has `items`, `total`,
+`has_next`, `has_previous` and the fields of the pagination scheme. You can use
+a different shape, for example the DRF shape `count/next/previous/results`. Set
+`response_class` to a generic `Serializer` or `msgspec.Struct`. Then override
+`build_response()`. The response body and the OpenAPI schema
+(`DRFPage_ArticleSerializer_`) use the new shape:
+
+```python
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+class DRFPage(Serializer, Generic[T]):
+    count: int
+    next: str | None
+    previous: str | None
+    results: list[T]
+
+class DRFPagination(PageNumberPagination):
+    page_size = 20
+    response_class = DRFPage
+
+    def build_response(self, items, *, total, request, page, page_size, has_next, has_previous, **info):
+        base = f"{request.path}?page_size={page_size}&page="
+        return DRFPage(
+            count=total,
+            next=f"{base}{page + 1}" if has_next else None,
+            previous=f"{base}{page - 1}" if has_previous else None,
+            results=items,
+        )
+```
+
+`build_response()` gets the serialized `items`, the `total`, the `request` and
+the `has_next` and `has_previous` flags. It also gets the fields of the scheme
+as keyword arguments:
+
+- Page number: `page`, `page_size`, `total_pages`, `next_page`, `previous_page`
+- Limit/offset: `limit`, `offset`
+- Cursor: `page_size`, `next_cursor`
+
 ## Performance Considerations
 
 ### Avoiding N+1 Queries
 
-Serialization happens after fetching items. If your serializer accesses related fields, use `select_related()` or `prefetch_related()` to avoid N+1 queries:
+If the item type is a Bolt `Serializer`, Bolt applies the loading plan of the
+serializer to the page QuerySet. The plan uses `select_related` for ForeignKey
+and OneToOne fields, `prefetch_related` for many-valued relations, and
+`Config.annotations`. Nested relations cost a small, fixed number of queries
+for each page. See
+[Loading a QuerySet with from_models()](serializers.md#loading-a-queryset-with-from_models).
+
+Bolt keeps the loads that you apply. Bolt does not apply them a second time.
+This code is correct:
 
 ```python
-# Bad - N+1 queries when serializer accesses article.author
 @api.get("/articles")
 @paginate(ArticlePagination)
 async def list_articles(request) -> list[ArticleSerializer]:
-    return Article.objects.all()
-
-# Good - single query with JOIN
-@api.get("/articles")
-@paginate(ArticlePagination)
-async def list_articles(request) -> list[ArticleSerializer]:
-    return Article.objects.select_related("author").all()
-
-# Good - prefetch for many-to-many
-@api.get("/articles")
-@paginate(ArticlePagination)
-async def list_articles(request) -> list[ArticleSerializer]:
-    return Article.objects.prefetch_related("tags").all()
+    return Article.objects.select_related("author").prefetch_related("tags")
 ```
 
 ### Cursor vs PageNumber for Large Datasets

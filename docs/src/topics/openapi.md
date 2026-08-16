@@ -51,8 +51,25 @@ OpenAPIConfig(
     docs_url="/docs",            # Swagger UI URL
     openapi_url="/openapi.json", # OpenAPI JSON URL
     django_auth=False,           # Enable Django admin auth for docs
+    strict=False,                # Fail generation on untypeable shapes (see below)
 )
 ```
+
+### Strict mode
+
+Set `OpenAPIConfig(strict=True)` to make schema generation fail on shapes that
+client code generators cannot type. `SchemaGenerator.generate()` raises
+`OpenAPIStrictError`. The error lists all problems at the same time. These are
+the problems:
+
+- A route has the success response `{"type": "object"}`. The route has no
+  return annotation and no `response_model`.
+- A component name uses the long form `module.qualname`. This occurs when two
+  types have the same short name.
+
+Routes with `include_in_schema=False` are not problems. Routes with a non-JSON
+`response_class` are not problems. Run strict mode in CI to keep the generated
+clients correct.
 
 ## Documenting endpoints
 
@@ -362,13 +379,36 @@ async def search(
 
 ## Hiding endpoints
 
-Exclude endpoints from documentation:
+Remove endpoints from the documentation. The server continues to serve them:
 
 ```python
 @api.get("/internal", include_in_schema=False)
 async def internal():
     return {"internal": True}
 ```
+
+## Non-JSON responses
+
+`response_class` sets the media type in the documentation. The default is
+`application/json`:
+
+| `response_class` | Media type | Schema |
+|---|---|---|
+| `HTML` | `text/html` | string |
+| `PlainText` | `text/plain` | string |
+| `File`, `FileResponse`, `StreamingResponse` | `application/octet-stream` | string / binary |
+| `EventSourceResponse` | `text/event-stream` | string |
+| `Redirect` | none (status 307, or the `status_code` of the route) | `Location` header only |
+
+```python
+@api.get("/report.csv", response_class=File)
+async def report():
+    return File("/srv/report.csv")
+```
+
+Each parametrization of a generic response model gets its own component name.
+This is the same as msgspec. `Page[UserRead]` becomes the component
+`Page_UserRead_`. Its title is `Page[UserRead]`.
 
 ## OpenAPI extensions
 
