@@ -21,22 +21,37 @@ def _text_content(text: str) -> dict[str, Any]:
     return {"type": "text", "text": text}
 
 
+# MCP 2026-07-28 requires ``resultType`` on every result. Rust strips it for
+# legacy peers.
+RESULT_TYPE_COMPLETE = "complete"
+
+
 def error_result(message: str) -> dict[str, Any]:
     """An in-band CallToolResult error (the MCP way to surface tool failures)."""
-    return {"content": [_text_content(message)], "isError": True}
+    return {"content": [_text_content(message)], "isError": True, "resultType": RESULT_TYPE_COMPLETE}
 
 
 def to_call_tool_result(result: Any) -> dict[str, Any]:
     """Map a tool's return value into a CallToolResult dict."""
     if isinstance(result, str):
-        return {"content": [_text_content(result)], "isError": False}
+        return {"content": [_text_content(result)], "isError": False, "resultType": RESULT_TYPE_COMPLETE}
     if isinstance(result, dict):
         text = json_encode(result).decode()
-        return {"content": [_text_content(text)], "structuredContent": result, "isError": False}
+        return {
+            "content": [_text_content(text)],
+            "structuredContent": result,
+            "isError": False,
+            "resultType": RESULT_TYPE_COMPLETE,
+        }
     payload = msgspec.to_builtins(result, enc_hook=default_serializer)
     structured = payload if isinstance(payload, dict) else {"result": payload}
     text = json_encode(payload).decode()
-    return {"content": [_text_content(text)], "structuredContent": structured, "isError": False}
+    return {
+        "content": [_text_content(text)],
+        "structuredContent": structured,
+        "isError": False,
+        "resultType": RESULT_TYPE_COMPLETE,
+    }
 
 
 async def run_tool(tool: ToolDef, kwargs: dict[str, Any]) -> Any:

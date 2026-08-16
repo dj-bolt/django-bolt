@@ -30,6 +30,21 @@ def test_results_carry_result_type_complete():
         assert parse_rpc(resp)["result"]["resultType"] == "complete"
 
 
+def test_python_built_results_carry_result_type_complete():
+    # Python builds tools/call, resources/read and prompts/get results; the
+    # 2026-07-28 revision requires resultType on every one of them.
+    api, _ = make_server()
+    with TestClient(api) as client:
+        for method, params in (
+            ("tools/call", {"name": "add", "arguments": {"a": 2, "b": 3}}),
+            ("tools/call", {"name": "boom", "arguments": {}}),
+            ("resources/read", {"uri": "config://app"}),
+            ("prompts/get", {"name": "summarize", "arguments": {"topic": "Ada"}}),
+        ):
+            resp = post_rpc_modern(client, method, params)
+            assert parse_rpc(resp)["result"]["resultType"] == "complete", method
+
+
 def test_mcp_name_header_mismatch_rejected_with_32020():
     api, _ = make_server()
     with TestClient(api) as client:

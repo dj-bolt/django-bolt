@@ -25,7 +25,7 @@ import msgspec
 from django_bolt._json import decode as json_decode
 from django_bolt._json import encode as json_encode
 
-from ._execute import error_result, execute_tool
+from ._execute import RESULT_TYPE_COMPLETE, error_result, execute_tool
 from .context import Context, _InputRequired
 
 if TYPE_CHECKING:
@@ -129,7 +129,9 @@ async def _read_resource(mcp: MCP, payload: dict[str, Any]) -> bytes:
         return _error("resource_not_found", f"Unknown resource: {uri!r}")
     except msgspec.ValidationError as exc:
         return _error("invalid_params", f"Invalid resource URI {uri!r}: {exc}")
-    return json_encode({"contents": [{"uri": uri, "mimeType": mime_type, "text": text}]})
+    return json_encode(
+        {"contents": [{"uri": uri, "mimeType": mime_type, "text": text}], "resultType": RESULT_TYPE_COMPLETE}
+    )
 
 
 def resource_dispatch(mcp: MCP) -> Any:
@@ -152,7 +154,7 @@ async def _get_prompt(mcp: MCP, payload: dict[str, Any]) -> bytes:
         messages = [{"role": "user", "content": {"type": "text", "text": rendered}}]
     else:
         messages = rendered
-    result: dict[str, Any] = {"messages": messages}
+    result: dict[str, Any] = {"messages": messages, "resultType": RESULT_TYPE_COMPLETE}
     if prompt.description:
         result["description"] = prompt.description
     return json_encode(result)
