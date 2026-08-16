@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.2]
+
+### Added
+
+- **Serializer loading plans** - A `Serializer` derives its own `select_related` (FK/O2O, dotted `source`), `prefetch_related` (M2M/reverse, with the nested serializer plan inside the `Prefetch`) and `annotate` (`Config.annotations`) from its fields. Use `Serializer.from_models(qs)`, `afrom_models(qs)` or `loading_plan(Model)`. Django 6.1+ also gets `fetch_mode(FETCH_PEERS)`. The plan is additive: loads that the caller applied are kept and not duplicated. Routes that return `list[Serializer]`, and `@paginate` pages that return a bare QuerySet, get the plan automatically, thus no N+1 queries and no user code. Async routes iterate with the async ORM, with no thread hop. (#292, #295)
+- **`include_in_schema=False`** - Available on all route decorators. It was documented but not implemented. (#289)
+- **`response_class` in the schema** - `HTML` documents `text/html`, `PlainText` documents `text/plain`, `File`/`FileResponse`/`StreamingResponse` document `application/octet-stream` binary, `EventSourceResponse` documents `text/event-stream`, and `Redirect` documents a 3xx response with a `Location` header and no body. (#289)
+- **Custom pagination envelope** - `PaginationBase.response_class` and `build_response(items, *, total, request, has_next, has_previous, **info)` set the envelope on the wire and in the OpenAPI schema. (#288)
+- **OpenAPI strict mode** - `OpenAPIConfig(strict=True)` raises `OpenAPIStrictError` that lists each untyped JSON response and each component that needed the `module.qualname` name fallback. (#290)
+
+### Fixed
+
+- **Generic component names** - `Page[UserRead]` renders as the component `Page_UserRead_` (msgspec naming), one component for each parametrization. `@paginate` routes document `PaginatedResponse_UserRead_` instead of a bare array. `PaginatedResponse` now uses `Generic[T]`, because its PEP 695 type parameter could not be resolved under PEP 563 and `items` was documented as `Any`. (#287)
+- **Fieldless serializer** - A `Serializer` subclass with no fields dumped `{}`.
+- **bolt-mcp: public OAuth routes** - The OAuth authorization-server routes and the protected-resource metadata route register with `auth=[], guards=[]`. Global `BOLT_DEFAULT_PERMISSION_CLASSES` / `BOLT_AUTHENTICATION_CLASSES` no longer answer 401 to discovery. `mount_mcp(auth=..., guards=...)` still overrides the globals for `/mcp` itself. (#296)
+
+## [0.10.1]
+
+### Changed
+
+- **Cargo workspace** - The Rust extension is split into crates: `bolt-loop`, `bolt-core`, `bolt-asgi`, `bolt-websocket`, `bolt-mcp` and the root `django-bolt` PyO3 crate. No change to the Python API.
+- **Repository cleanup** - Benchmark results moved to `python/benchmark/`, the nanodjango example folded into `python/example`, and the micro-benchmark harnesses, `llm.txt` and scratch endpoints removed from the public tree.
+
+### Fixed
+
+- **Serializer validation errors** - Per-field validation errors are kept, and `@classmethod` validators are no longer dropped. (#282)
+- **`WorkerLoop` as a `SelectorEventLoop`** - The worker loop is a real `asyncio.SelectorEventLoop` on the Tokio reactor, thus stdlib transports, TLS, DNS, pipes, `sock_*`, datagrams and subprocesses all work with no second loop. (#286)
+
 ## [0.10.0]
 
 ### Added
