@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-asgi"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "actix-web",
  "bolt-core",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-core"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "actix-files",
  "actix-http",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-loop"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "libc",
  "once_cell",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-mcp"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "actix-web",
  "ahash",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-websocket"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "actix",
  "actix-web",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "django-bolt"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "actix",
  "actix-http",
