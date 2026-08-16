@@ -321,7 +321,6 @@ def test_paginated_route_applies_plan_to_the_page(blog, count_queries):
 # ---------------------------------------------------------------------------
 
 
-
 @needs_fetch_modes
 def test_plan_sets_fetch_peers_when_available():
     qs = PostWithAuthor.loading_plan(BlogPost).apply(BlogPost.objects.all())

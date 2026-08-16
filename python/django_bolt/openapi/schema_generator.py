@@ -974,7 +974,9 @@ class SchemaGenerator:
             required=True,
         )
 
-    def _extract_responses(self, meta: dict[str, Any], handler_id: int, *, method: str = "", path: str = "") -> dict[str, OpenAPIResponse]:
+    def _extract_responses(
+        self, meta: dict[str, Any], handler_id: int, *, method: str = "", path: str = ""
+    ) -> dict[str, OpenAPIResponse]:
         """Extract OpenAPI responses from handler metadata.
 
         Args:

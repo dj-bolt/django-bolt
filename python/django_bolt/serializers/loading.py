@@ -140,7 +140,9 @@ def _build(serializer_cls: type[Serializer], model_cls: type) -> LoadingPlan:
                 select_related.extend(f"{lookup}__{rel}" for rel in nested_plan.select_related)
                 for nested_lookup in nested_plan.prefetch:
                     if isinstance(nested_lookup, Prefetch):
-                        add_prefetch(Prefetch(f"{lookup}__{nested_lookup.prefetch_to}", queryset=nested_lookup.queryset))
+                        add_prefetch(
+                            Prefetch(f"{lookup}__{nested_lookup.prefetch_to}", queryset=nested_lookup.queryset)
+                        )
                     else:
                         add_prefetch(f"{lookup}__{nested_lookup}")
             current_model = info.related_model
