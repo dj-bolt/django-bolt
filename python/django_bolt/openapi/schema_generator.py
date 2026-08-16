@@ -12,6 +12,15 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_
 import msgspec
 
 from ..datastructures import UploadFile
+from ..responses import (
+    HTML,
+    EventSourceResponse,
+    File,
+    FileResponse,
+    PlainText,
+    Redirect,
+    StreamingResponse,
+)
 from ..serializers.fields import _FieldMarker
 from ..typing import is_msgspec_struct, is_optional, unwrap_optional
 from .spec import (
@@ -34,7 +43,55 @@ if TYPE_CHECKING:
     from ..api import BoltAPI
     from .config import OpenAPIConfig
 
-__all__ = ("ComponentNameCollisionError", "SchemaGenerator")
+__all__ = ("ComponentNameCollisionError", "OpenAPIStrictError", "SchemaGenerator")
+
+
+class OpenAPIStrictError(ValueError):
+    """``OpenAPIConfig(strict=True)``: the schema would contain shapes codegen cannot type.
+
+    Raised by ``SchemaGenerator.generate`` with every offender listed at once:
+    routes whose success response is an opaque ``{"type": "object"}`` (no return
+    annotation / ``response_model``) and components that needed the
+    ``module.qualname`` fallback because two types share a short name.
+    """
+
+
+# ``response_class`` → (media type, body schema). ``Redirect`` is handled
+# separately (3xx, no body). Order matters: subclasses before their bases.
+_RESPONSE_CLASS_MEDIA: tuple[tuple[type, str, Schema], ...] = (
+    (HTML, "text/html", Schema(type="string")),
+    (PlainText, "text/plain", Schema(type="string")),
+    (EventSourceResponse, "text/event-stream", Schema(type="string")),
+    (StreamingResponse, "application/octet-stream", Schema(type="string", format="binary")),
+    (File, "application/octet-stream", Schema(type="string", format="binary")),
+    (FileResponse, "application/octet-stream", Schema(type="string", format="binary")),
+)
+
+
+def _response_class_media(response_class: type | None) -> tuple[str, Schema] | None:
+    if response_class is None:
+        return None
+    for cls, media_type, schema in _RESPONSE_CLASS_MEDIA:
+        if issubclass(response_class, cls):
+            return media_type, schema
+    return None
+
+
+def _struct_origin(annotation: Any) -> type | None:
+    """The msgspec.Struct class behind ``annotation`` — itself, or the origin of ``Struct[T]``."""
+    if is_msgspec_struct(annotation):
+        return annotation
+    origin = get_origin(annotation)
+    return origin if is_msgspec_struct(origin) else None
+
+
+def _type_display_name(annotation: Any) -> str:
+    """``Page[UserRead]`` for a parametrized struct, ``__name__`` otherwise (msgspec's title)."""
+    origin = get_origin(annotation)
+    if origin is not None and get_args(annotation):
+        args = ", ".join(_type_display_name(a) for a in get_args(annotation))
+        return f"{getattr(origin, '__name__', repr(origin))}[{args}]"
+    return getattr(annotation, "__name__", None) or repr(annotation)
 
 
 class ComponentNameCollisionError(ValueError):
@@ -231,6 +288,9 @@ class SchemaGenerator:
         # registration order the name map iterates.
         self._component_ref: dict[type, Reference] = {}
         self._component_schema: dict[type, Schema] = {}
+        # strict mode bookkeeping (see OpenAPIStrictError)
+        self._opaque_operations: list[str] = []
+        self._qualified_components: list[str] = []
 
     @staticmethod
     def _schema_kwargs(**kwargs: Any) -> dict[str, Any]:
@@ -460,11 +520,13 @@ class SchemaGenerator:
             if should_exclude:
                 continue
 
-            if path not in paths:
-                paths[path] = PathItem()
-
             # Get handler metadata
             meta = self.api._handler_meta.get(handler_id, {})
+            if not meta.get("include_in_schema", True):
+                continue
+
+            if path not in paths:
+                paths[path] = PathItem()
 
             # Create operation
             operation = self._create_operation(
@@ -547,6 +609,20 @@ class SchemaGenerator:
         # Collect and merge tags
         openapi.tags = self._collect_tags(collected_tags)
 
+        if self.config.strict and (self._opaque_operations or self._qualified_components):
+            problems = []
+            if self._opaque_operations:
+                problems.append(
+                    "routes with an untyped JSON response (add a return annotation or response_model): "
+                    + ", ".join(self._opaque_operations)
+                )
+            if self._qualified_components:
+                problems.append(
+                    "component names that fell back to module.qualname because two types share a "
+                    "short name (rename one): " + ", ".join(self._qualified_components)
+                )
+            raise OpenAPIStrictError("OpenAPI strict mode: " + "; ".join(problems))
+
         return openapi
 
     def _create_operation(
@@ -581,7 +657,7 @@ class SchemaGenerator:
         request_body = self._extract_request_body(meta)
 
         # Extract responses (pass handler_id for auth error responses)
-        responses = self._extract_responses(meta, handler_id)
+        responses = self._extract_responses(meta, handler_id, method=method, path=path)
 
         # Extract security requirements
         security = self._extract_security(handler_id)
@@ -898,7 +974,9 @@ class SchemaGenerator:
             required=True,
         )
 
-    def _extract_responses(self, meta: dict[str, Any], handler_id: int) -> dict[str, OpenAPIResponse]:
+    def _extract_responses(
+        self, meta: dict[str, Any], handler_id: int, *, method: str = "", path: str = ""
+    ) -> dict[str, OpenAPIResponse]:
         """Extract OpenAPI responses from handler metadata.
 
         Args:
@@ -952,8 +1030,26 @@ class SchemaGenerator:
             response_type = meta.get("response_type")
             default_status = meta.get("default_status_code", 200)
 
-            # Add successful response
-            if response_type and response_type != inspect._empty:
+            response_class = meta.get("response_class")
+            has_type = bool(response_type) and response_type != inspect._empty
+            media = _response_class_media(response_class)
+
+            if response_class is not None and issubclass(response_class, Redirect):
+                # A redirect has no body; the default 200 is meaningless here.
+                status = default_status if default_status != 200 else 307
+                responses[str(status)] = OpenAPIResponse(
+                    description=http.client.responses.get(status, "Redirect"),
+                    headers={"Location": OpenAPIHeader(schema=Schema(type="string"))},
+                )
+            elif media is not None:
+                media_type, body_schema = media
+                if has_type:
+                    body_schema = self._type_to_schema(response_type, register_component=True)
+                responses[str(default_status)] = OpenAPIResponse(
+                    description="Successful response",
+                    content={media_type: OpenAPIMediaType(schema=body_schema)},
+                )
+            elif has_type:
                 schema = self._type_to_schema(response_type, register_component=True)
 
                 responses[str(default_status)] = OpenAPIResponse(
@@ -966,7 +1062,8 @@ class SchemaGenerator:
                     },
                 )
             else:
-                # Default response
+                # Opaque JSON: nothing to type. Recorded for strict mode.
+                self._opaque_operations.append(f"{method} {path}")
                 responses["200"] = OpenAPIResponse(
                     description="Successful response",
                     content={
@@ -1324,8 +1421,9 @@ class SchemaGenerator:
         if type_annotation is UploadFile:
             return Schema(type="string", format="binary")
 
-        # Handle msgspec.Struct
-        if is_msgspec_struct(type_annotation):
+        # Handle msgspec.Struct — bare or parametrized (``Page[UserRead]``, keyed
+        # and named per parametrization like msgspec: ``Page_UserRead_``).
+        if _struct_origin(type_annotation) is not None:
             if register_component:
                 return self._struct_to_component_schema(type_annotation)
             else:
@@ -1435,9 +1533,9 @@ class SchemaGenerator:
         # _own_docstring — avoids inheriting msgspec.Struct's base docstring).
         # Matches `msgspec.json.schema_components` behavior.
         return Schema(
-            title=struct_type.__name__,
+            title=_type_display_name(struct_type),
             type="object",
-            description=self._own_docstring(struct_type),
+            description=self._own_docstring(_struct_origin(struct_type) or struct_type),
             properties=properties,
             required=required or None,
         )
@@ -1508,7 +1606,9 @@ class SchemaGenerator:
             return re.sub(r"[^a-zA-Z0-9.\-_]", "_", name)
 
         def fullname(cls: type) -> str:
-            return normalize(f"{cls.__module__}.{cls.__qualname__}")
+            origin = get_origin(cls) or cls
+            display = _type_display_name(cls)
+            return normalize(f"{origin.__module__}.{display.replace(origin.__name__, origin.__qualname__, 1)}")
 
         # First map name -> type, expanding only the names that actually collide.
         names: dict[str, type] = {}
@@ -1524,7 +1624,7 @@ class SchemaGenerator:
             names[name] = cls
 
         for cls in self._component_ref:
-            short = normalize(cls.__name__)
+            short = normalize(_type_display_name(cls))
             if short in names and names[short] is not cls:
                 # First collision on this short name: re-home the incumbent under
                 # its qualified name and mark the short name as conflicted.
@@ -1535,6 +1635,8 @@ class SchemaGenerator:
                 assign(fullname(cls), cls)
             else:
                 assign(short, cls)
+
+        self._qualified_components = [fullname(names[n]) for n in sorted(names) if n not in conflicts and "." in n]
 
         # Stamp each shared Reference and publish the schema under its final name.
         for name, cls in names.items():

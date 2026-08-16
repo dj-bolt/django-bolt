@@ -549,6 +549,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        include_in_schema: bool = True,
     ):
         return self._route_decorator(
             "GET",
@@ -563,6 +564,7 @@ class BoltAPI:
             summary=summary,
             description=description,
             response_class=response_class,
+            include_in_schema=include_in_schema,
         )
 
     def post(
@@ -579,6 +581,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        include_in_schema: bool = True,
     ):
         return self._route_decorator(
             "POST",
@@ -593,6 +596,7 @@ class BoltAPI:
             summary=summary,
             description=description,
             response_class=response_class,
+            include_in_schema=include_in_schema,
         )
 
     def put(
@@ -609,6 +613,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        include_in_schema: bool = True,
     ):
         return self._route_decorator(
             "PUT",
@@ -623,6 +628,7 @@ class BoltAPI:
             summary=summary,
             description=description,
             response_class=response_class,
+            include_in_schema=include_in_schema,
         )
 
     def patch(
@@ -639,6 +645,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        include_in_schema: bool = True,
     ):
         return self._route_decorator(
             "PATCH",
@@ -653,6 +660,7 @@ class BoltAPI:
             summary=summary,
             description=description,
             response_class=response_class,
+            include_in_schema=include_in_schema,
         )
 
     def delete(
@@ -669,6 +677,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        include_in_schema: bool = True,
     ):
         return self._route_decorator(
             "DELETE",
@@ -683,6 +692,7 @@ class BoltAPI:
             summary=summary,
             description=description,
             response_class=response_class,
+            include_in_schema=include_in_schema,
         )
 
     def head(
@@ -699,6 +709,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        include_in_schema: bool = True,
     ):
         return self._route_decorator(
             "HEAD",
@@ -713,6 +724,7 @@ class BoltAPI:
             summary=summary,
             description=description,
             response_class=response_class,
+            include_in_schema=include_in_schema,
         )
 
     def options(
@@ -729,6 +741,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        include_in_schema: bool = True,
     ):
         return self._route_decorator(
             "OPTIONS",
@@ -743,6 +756,7 @@ class BoltAPI:
             summary=summary,
             description=description,
             response_class=response_class,
+            include_in_schema=include_in_schema,
         )
 
     def query(
@@ -759,6 +773,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        include_in_schema: bool = True,
     ):
         return self._route_decorator(
             "QUERY",
@@ -773,6 +788,7 @@ class BoltAPI:
             summary=summary,
             description=description,
             response_class=response_class,
+            include_in_schema=include_in_schema,
         )
 
     def websocket(
@@ -1366,6 +1382,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
+        include_in_schema: bool = True,
         _name_explicit: bool = True,
         _skip_prefix: bool = False,
         _router_middleware: list[Any] | None = None,
@@ -1524,6 +1541,7 @@ class BoltAPI:
                 meta["response_type"] = None
             meta["validate_response"] = route_validate_response
             meta["response_class"] = response_class
+            meta["include_in_schema"] = include_in_schema
             # Pre-compute stream annotation analysis (registration time only)
             meta["_stream_info"] = _extract_stream_item_type(meta["response_type"])
 
@@ -1537,6 +1555,9 @@ class BoltAPI:
                     original = getattr(fn, "__original_handler__", None)
                     if original is not None:
                         original.__serializer_class__ = item_type
+                    # The wire shape is the pagination envelope, not the item
+                    # list: validate and document ``response_class[item]``.
+                    meta["response_type"] = fn.__pagination_class__.response_class[item_type]
 
             # Guarantee all keys exist at registration time for direct access
             if meta["is_multi_response"]:

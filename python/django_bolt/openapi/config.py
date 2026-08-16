@@ -161,6 +161,17 @@ class OpenAPIConfig:
         ```
     """
 
+    strict: bool = field(default=False)
+    """Fail schema generation on shapes codegen cannot type.
+
+    When True, ``SchemaGenerator.generate`` raises ``OpenAPIStrictError`` (listing
+    every offender) if any route documents an opaque ``{"type": "object"}`` JSON
+    response (no return annotation / ``response_model``) or any component name
+    had to fall back to ``module.qualname`` because two types share a short name.
+    Routes with ``include_in_schema=False`` and non-JSON ``response_class`` routes
+    are not offenders.
+    """
+
     enabled: bool = field(default=True)
     """Enable or disable OpenAPI documentation.
 

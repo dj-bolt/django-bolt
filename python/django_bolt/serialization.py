@@ -422,15 +422,18 @@ def _compile_serializer_values_evaluators(serializer_cls: Any) -> tuple[Any, Any
     model_ok: dict[type, bool] = {}
 
     def evaluate_sync(queryset: QuerySet) -> list[Any]:
+        queryset = serializer_cls._prepare_queryset(queryset)  # Config.annotations & co.
         ok = model_ok.get(queryset.model)
         if ok is False:
-            return list(queryset)
+            # Project here, on the ORM thread, so model properties may still
+            # query (an N+1, never SynchronousOnlyOperation on the loop).
+            return _dump_many_sync(serializer_cls, list(queryset), False)
         try:
             items = list(queryset.values(*field_names))
         except FieldError:
             # Serializer field isn't a concrete column on this model.
             model_ok[queryset.model] = False
-            return list(queryset)
+            return _dump_many_sync(serializer_cls, list(queryset), False)
         model_ok[queryset.model] = True
         return items
 
@@ -824,7 +827,21 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     stream_info = meta.get("_stream_info", (False, None))
     response_class = meta.get("response_class")
 
-    is_serializer_response = _response_serializer_info(meta.get("response_type"))[0] is not None
+    _serializer_cls, _serializer_many = _response_serializer_info(meta.get("response_type"))
+    is_serializer_response = _serializer_cls is not None
+    # list[Serializer] routes returning a QuerySet: pre-load what the serializer
+    # reads (select_related/prefetch_related/annotate from its fields), then
+    # from_model + dump. Async routes iterate with the async ORM on the loop.
+    if _serializer_many:
+
+        def evaluate_serializer_queryset(queryset: QuerySet) -> list[Any]:
+            return _serializer_cls.dump_many(_serializer_cls.from_models(queryset))
+
+        async def evaluate_serializer_queryset_async(queryset: QuerySet) -> list[Any]:
+            return _serializer_cls.dump_many(await _serializer_cls.afrom_models(queryset))
+
+    else:
+        evaluate_serializer_queryset = evaluate_serializer_queryset_async = None
 
     def prepare_list(result: list[Any]) -> Any:
         if is_serializer_response:
@@ -866,6 +883,10 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, QuerySet):
             if queryset_serializer_async is not None:
                 result = await queryset_serializer_async(result)
+            elif evaluate_serializer_queryset_async is not None:
+                # Already dumped dicts — nothing left for the validator to do.
+                result = await evaluate_serializer_queryset_async(result)
+                return await _serialize_json_payload_async(result, current_status, None)
             else:
                 # Bounded ORM pool — parallel, but capped connection count.
                 result = await run_in_orm_executor(list, result)
@@ -903,7 +924,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             return _serialize_json_payload_sync(result, current_status, validator_sync)
 
         if isinstance(result, QuerySet):
-            result = queryset_serializer_sync(result) if queryset_serializer_sync is not None else list(result)
+            if queryset_serializer_sync is not None:
+                result = queryset_serializer_sync(result)
+            elif evaluate_serializer_queryset is not None:
+                return _serialize_json_payload_sync(evaluate_serializer_queryset(result), current_status, None)
+            else:
+                result = list(result)
             return _serialize_json_payload_sync(result, current_status, validator_sync)
 
         if isinstance(result, msgspec.Struct) or validator_sync is not None:

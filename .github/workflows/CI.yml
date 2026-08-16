@@ -49,13 +49,22 @@ jobs:
 
   # Run tests across Python versions
   test:
-    name: Test Python ${{ matrix.python-version }}
+    name: Test Python ${{ matrix.python-version }} / Django ${{ matrix.django-version }}
     runs-on: ubuntu-latest
     needs: python-versions
     strategy:
       fail-fast: false
       matrix:
         python-version: ${{ fromJSON(needs.python-versions.outputs.versions-json) }}
+        # Newest supported Django on every Python; older Django series on the
+        # newest Python each of them supports (see pyproject classifiers).
+        django-version: ["6.1"]
+        include:
+          - { python-version: "3.12", django-version: "4.2" }
+          - { python-version: "3.12", django-version: "5.0" }
+          - { python-version: "3.13", django-version: "5.1" }
+          - { python-version: "3.13", django-version: "5.2" }
+          - { python-version: "3.14", django-version: "6.0" }
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -82,19 +91,24 @@ jobs:
           rustflags: "" # action defaults to -D warnings; don't block tests on warnings
 
       - name: Install dependencies
+        # One explicit sync (dev group pins the newest Django), then swap in the
+        # matrix Django. Every later `uv run` is --no-sync so the lockfile's
+        # Django is not reinstalled over it.
         run: |
-          uv pip install -e ".[dev]" -e python/bolt-mcp
+          uv sync --all-extras
+          uv pip install "django~=${{ matrix.django-version }}.0"
+          uv run --no-sync python -c "import django; print('Django', django.__version__)"
 
       - name: Build extension
-        run: uv run maturin develop --release
+        run: uv run --no-sync maturin develop --release
 
       - name: Run tests
-        run: uv run --with pytest pytest python/tests -m "not server_integration and not artifact_smoke" -s -vv
+        run: uv run --no-sync --with pytest pytest python/tests -m "not server_integration and not artifact_smoke" -s -vv
 
       # Separate invocation: bolt-mcp's conftest configures Django (OAuth app,
       # file-backed sqlite) incompatibly with the main suite's settings.
       - name: Run bolt-mcp tests
-        run: uv run --with pytest pytest python/bolt-mcp/tests -m "not server_integration and not artifact_smoke" -s -vv
+        run: uv run --no-sync --with pytest pytest python/bolt-mcp/tests -m "not server_integration and not artifact_smoke" -s -vv
 
   server_smoke_linux:
     name: Server Smoke Linux

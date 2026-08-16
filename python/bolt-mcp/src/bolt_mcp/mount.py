@@ -192,7 +192,7 @@ def mount_mcp(
         # RFC 9728 location derived from the resource identifier: path-aware
         # for a resource with a path, root for a path-less resource. The
         # WWW-Authenticate challenge points at the same URL.
-        api.get(f"{WELL_KNOWN_PROTECTED_RESOURCE}{resource_path}")(_mcp_protected_resource_metadata)
+        api.get(f"{WELL_KNOWN_PROTECTED_RESOURCE}{resource_path}", auth=[], guards=[])(_mcp_protected_resource_metadata)
 
     secret_key = getattr(settings, "SECRET_KEY", "")
     if not secret_key:

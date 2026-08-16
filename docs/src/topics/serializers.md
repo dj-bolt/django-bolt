@@ -704,6 +704,41 @@ user = await User.objects.prefetch_related("addresses").aget(id=1)
 serializer = UserSerializer.from_model(user)
 ```
 
+### Loading a QuerySet with from_models()
+
+A serializer knows which relations it reads. Thus it can prepare the QuerySet.
+`from_models()` makes a loading plan from the serializer fields. It applies the
+plan to the QuerySet before it reads the rows:
+
+- ForeignKey and OneToOne fields use `select_related`. Dotted sources such as `field(source="author.email")` also use `select_related`.
+- ManyToMany and reverse relations use `prefetch_related`. A nested serializer adds its own plan to the `Prefetch`.
+- `Config.annotations` uses `annotate`.
+- Django 6.1 and later: `fetch_mode(FETCH_PEERS)` applies to all other fields.
+
+```python
+class PostSerializer(Serializer):
+    class Config:
+        annotations = {"comment_count": Count("comments")}
+
+    id: int
+    title: str
+    author: AuthorSerializer          # select_related("author")
+    tags: list[TagSerializer]         # prefetch_related("tags")
+    comment_count: int                # annotate(...)
+
+posts = PostSerializer.from_models(BlogPost.objects.filter(published=True))   # sync
+posts = await PostSerializer.afrom_models(BlogPost.objects.all())            # async (async ORM iteration)
+```
+
+The plan only adds loads. Bolt keeps the `select_related`, `prefetch_related`
+and `annotate` calls that you applied. Bolt does not apply them a second time.
+If you give a list of model instances, Bolt uses the list as it is.
+Use `loading_plan(Model)` to see the plan.
+
+A route with the annotation `list[PostSerializer]` can return a QuerySet. This
+also applies to `@paginate` routes. Bolt applies the plan to that QuerySet. You
+do not write more code. There is no N+1.
+
 ### Bulk serialization
 
 ```python

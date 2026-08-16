@@ -1,6 +1,6 @@
 """OAuth Authorization Server HTTP endpoints, registered on a ``BoltAPI``.
 
-Routes (all public — ``auth=None``):
+Routes (all public — ``auth=[], guards=[]`` so global defaults never gate them):
   GET  /.well-known/oauth-authorization-server   RFC 8414 metadata
   POST {prefix}/register                         RFC 7591 Dynamic Client Registration
   GET  {prefix}/authorize                         login / consent (Authorization Code)
@@ -307,10 +307,10 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
         return JSON({}, headers=_NO_STORE)
 
     # ── registration ─────────────────────────────────────────────────────────────
-    api.get(WELL_KNOWN_AUTHORIZATION_SERVER, auth=None)(_as_metadata)
-    api.get(server.path("authorize"), auth=None)(_authorize_get)
-    api.post(server.path("authorize"), auth=None)(_authorize_post)
-    api.post(server.path("token"), auth=None)(_token)
-    api.post(server.path("revoke"), auth=None)(_revoke)
+    api.get(WELL_KNOWN_AUTHORIZATION_SERVER, auth=[], guards=[])(_as_metadata)
+    api.get(server.path("authorize"), auth=[], guards=[])(_authorize_get)
+    api.post(server.path("authorize"), auth=[], guards=[])(_authorize_post)
+    api.post(server.path("token"), auth=[], guards=[])(_token)
+    api.post(server.path("revoke"), auth=[], guards=[])(_revoke)
     if server.allow_dynamic_registration:
-        api.post(server.path("register"), auth=None)(_register)
+        api.post(server.path("register"), auth=[], guards=[])(_register)

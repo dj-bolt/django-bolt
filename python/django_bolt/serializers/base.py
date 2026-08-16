@@ -38,7 +38,11 @@ from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
 
 from django_bolt import _json
-from django_bolt.exceptions import RequestValidationError, SerializationError, UnloadedRelationError
+from django_bolt.exceptions import (
+    RequestValidationError,
+    SerializationError,
+    UnloadedRelationError,
+)
 
 from .decorators import (
     ComputedFieldConfig,
@@ -47,6 +51,7 @@ from .decorators import (
     collect_model_validators,
 )
 from .fields import FieldConfig, _FieldMarker
+from .loading import LoadingPlan, build_loading_plan
 from .nested import resolve_nested_config, validate_nested_field
 
 # Regex to extract field path from msgspec error messages (e.g., "at `$.field_name`")
@@ -478,6 +483,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         )
 
         cls.__default_values_map__ = None
+        # A subclass must rebuild its own specs even when the parent already
+        # collected (otherwise it inherits ``True`` and dumps ``{}``).
+        cls.__field_configs_collected__ = False
         cls._dump_field_specs = ()
         cls._dump_field_spec_cache = {}
         cls._computed_dump_spec_cache = {}
@@ -1686,6 +1694,47 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             data[spec.field_name] = value
 
         return cls(**data)
+
+    @classmethod
+    def loading_plan(cls, model_cls: type[Model]) -> LoadingPlan:
+        """The ORM loads (select_related/prefetch_related/annotate) this serializer needs from ``model_cls``."""
+        return build_loading_plan(cls, model_cls)
+
+    @classmethod
+    def _prepare_queryset(cls, queryset: QuerySet) -> QuerySet:
+        """Apply this serializer's loading plan to ``queryset`` (additive, idempotent)."""
+        return build_loading_plan(cls, queryset.model).apply(queryset)
+
+    @classmethod
+    def from_models(cls: type[T], objects: QuerySet | Iterable[Model]) -> list[T]:
+        """Build one serializer instance per model in ``objects``.
+
+        A QuerySet is first prepared with this serializer's loading plan —
+        FK/O2O → ``select_related``, M2M/reverse → ``prefetch_related`` (nested
+        serializers recurse), ``Config.annotations`` → ``annotate`` — so the
+        whole batch costs a bounded number of queries; loads the caller already
+        requested are kept. Any other iterable of instances is used as-is.
+
+        Bolt does this automatically for routes annotated ``list[ThisSerializer]``
+        that return a QuerySet; call it when you evaluate the queryset yourself.
+        Use :meth:`afrom_models` from async code.
+        """
+        if isinstance(objects, QuerySet):
+            objects = cls._prepare_queryset(objects)
+        return [cls.from_model(obj) for obj in objects]
+
+    @classmethod
+    async def afrom_models(cls: type[T], objects: QuerySet | Iterable[Model]) -> list[T]:
+        """Async :meth:`from_models`: iterates the prepared QuerySet with the async ORM.
+
+        Rows are converted with the sync :meth:`from_model`, so relations the
+        loading plan cannot cover are *not* lazily loaded (unlike
+        :meth:`afrom_model`): a required nested field left unloaded raises
+        ``UnloadedRelationError`` — add the load to the queryset instead.
+        """
+        if isinstance(objects, QuerySet):
+            return [cls.from_model(obj) async for obj in cls._prepare_queryset(objects)]
+        return [cls.from_model(obj) for obj in objects]
 
     @classmethod
     async def afrom_model(
