@@ -209,12 +209,34 @@ impl CorsConfig {
     }
 }
 
+/// Rate limit key strategy parsed once at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitKey {
+    /// Key on the client IP (trusted-proxy aware).
+    Ip,
+    /// Key on the authenticated identity; fall back to the client IP.
+    User,
+    /// Key on the authenticated API key; fall back to the client IP.
+    ApiKey,
+    /// Key on a request header (stored lowercase); fall back to the client IP.
+    Header(String),
+}
+
+impl RateLimitKey {
+    /// Identity-keyed strategies need the auth result, so their check runs
+    /// after `validate_auth_and_guards` instead of before it.
+    #[inline]
+    pub fn needs_identity(&self) -> bool {
+        matches!(self, RateLimitKey::User | RateLimitKey::ApiKey)
+    }
+}
+
 /// Rate limiting configuration parsed at startup
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
     pub rps: u32,
     pub burst: u32,
-    pub key_type: String,
+    pub key: RateLimitKey,
 }
 
 impl Default for RateLimitConfig {
@@ -222,7 +244,7 @@ impl Default for RateLimitConfig {
         RateLimitConfig {
             rps: 100,
             burst: 200,
-            key_type: "ip".to_string(),
+            key: RateLimitKey::Ip,
         }
     }
 }
@@ -852,15 +874,16 @@ fn parse_rate_limit_config(
         config.burst = config.rps * 2;
     }
 
-    // Parse key_type (optional, defaults to "ip").
+    // Parse the key strategy (optional, defaults to "ip").
     // Custom header keys are lowercased ONCE here so the per-request rate-limit
     // check can look them up directly (headers are stored lowercase).
     if let Some(key_py) = dict.get("key") {
         if let Ok(key_type) = key_py.extract::<String>(py) {
-            config.key_type = if key_type == "ip" {
-                key_type
-            } else {
-                key_type.to_lowercase()
+            config.key = match key_type.as_str() {
+                "ip" => RateLimitKey::Ip,
+                "user" => RateLimitKey::User,
+                "api_key" => RateLimitKey::ApiKey,
+                _ => RateLimitKey::Header(key_type.to_lowercase()),
             };
         }
     }

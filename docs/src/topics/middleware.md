@@ -72,6 +72,42 @@ Parameters:
 
 - `rps` - Requests per second allowed
 - `burst` - Maximum burst size (allows short spikes)
+- `key` - Bucket key strategy: `"ip"` (default), `"user"`, `"api_key"`, or a header name
+
+### Key strategies
+
+Each key value gets its own token bucket:
+
+- `"ip"` - Key on the client IP. See "Trusted proxies" below.
+- `"user"` - Key on the authenticated user id. Anonymous requests fall back to the client IP.
+- `"api_key"` - Key on the authenticated API key. Anonymous requests fall back to the client IP.
+- Any other value - Key on that request header. Requests without the header fall back to the client IP.
+
+Identity keys (`"user"`, `"api_key"`) run after authentication. Requests
+that authentication rejects do not consume tokens. Keys longer than 256
+bytes are hashed, so a JWT in a keyed header works.
+
+### Trusted proxies
+
+By default, django-bolt ignores `X-Forwarded-For` and `X-Real-IP`. The
+client IP is the TCP peer address. These headers are client-controlled,
+so trusting them lets one caller fake many IPs.
+
+Set `BOLT_TRUSTED_PROXIES` when django-bolt runs behind a reverse proxy:
+
+```python
+# settings.py
+BOLT_TRUSTED_PROXIES = ["127.0.0.1/32", "10.0.0.0/8"]
+```
+
+Entries are CIDR networks or plain IPs. When the peer is a trusted
+proxy, django-bolt walks `X-Forwarded-For` from right to left and uses
+the first entry that is not a trusted proxy. A malformed entry stops
+server startup with an error.
+
+`TestClient` requests have no peer address. When `BOLT_TRUSTED_PROXIES`
+is set, the missing peer counts as trusted. Set it in a test to fake
+distinct client IPs with `X-Forwarded-For`.
 
 ### How it works
 

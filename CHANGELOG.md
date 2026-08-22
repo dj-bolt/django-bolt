@@ -4,8 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`BOLT_TRUSTED_PROXIES` setting** - A list of CIDR networks or IPs. When the TCP peer is in the list, the rate-limit client IP is the rightmost `X-Forwarded-For` entry that is not a trusted proxy. When the list is unset, forwarding headers are ignored and the peer address is used, so a client cannot bypass `key="ip"` limits with a spoofed header. `TestClient` requests have no peer; set the list in a test to fake client IPs. (#302)
+
 ### Fixed
 
+- **`rate_limit(key="user")` and `key="api_key"`** - Both keyed every request to one shared bucket, so one caller could exhaust a route for all users. They now key on the authenticated identity and run after authentication. Anonymous requests fall back to the client IP. A header-keyed route also falls back to the client IP when the header is absent, and keys longer than 256 bytes are hashed instead of rejected with 400. (#301)
 - **bolt-mcp 0.2.2: `resultType` on Python-built results** - `tools/call`, `resources/read` and `prompts/get` results now carry `resultType: "complete"` for 2026-07-28 clients. Claude Code and claude.ai connectors rejected every tool call without it. Legacy peers keep the old wire shape.
 
 ## [0.10.2]

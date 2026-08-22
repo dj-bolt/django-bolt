@@ -505,19 +505,23 @@ pub async fn handle_websocket_upgrade_with_handler(
     // Get peer address for rate limiting
     let peer_addr = req.peer_addr().map(|addr| addr.ip().to_string());
 
-    // Check rate limiting BEFORE origin validation (reuse HTTP rate limit)
+    // Check rate limiting BEFORE origin validation (reuse HTTP rate limit).
+    // Identity-keyed limits (key="user" / key="api_key") run after auth below.
     if let Some(route_metadata) = ROUTE_METADATA.get() {
         if let Some(route_meta) = route_metadata.get(handler_id) {
             if let Some(ref rate_config) = route_meta.rate_limit_config {
-                if let Some(response) = check_rate_limit(
-                    handler_id,
-                    &headers,
-                    peer_addr.as_deref(),
-                    rate_config,
-                    req.method().as_str(),
-                    req.path(),
-                ) {
-                    return Ok(response);
+                if !rate_config.key.needs_identity() {
+                    if let Some(response) = check_rate_limit(
+                        handler_id,
+                        &headers,
+                        peer_addr.as_deref(),
+                        None,
+                        rate_config,
+                        req.method().as_str(),
+                        req.path(),
+                    ) {
+                        return Ok(response);
+                    }
                 }
             }
         }
@@ -536,8 +540,26 @@ pub async fn handle_websocket_upgrade_with_handler(
         if let Some(route_meta) = route_metadata.get(handler_id) {
             match validate_auth_and_guards(&headers, &route_meta.auth_backends, &route_meta.guards)
             {
-                AuthGuardResult::Allow(_ctx) => {
-                    // Guards passed, continue with WebSocket upgrade
+                AuthGuardResult::Allow(ctx) => {
+                    // Guards passed. Apply identity-keyed rate limits: keyed
+                    // per user / API key, anonymous connections fall back to
+                    // the client IP.
+                    if let Some(ref rate_config) = route_meta.rate_limit_config {
+                        if rate_config.key.needs_identity() {
+                            let identity = ctx.as_ref().and_then(|c| c.user_id.as_deref());
+                            if let Some(response) = check_rate_limit(
+                                handler_id,
+                                &headers,
+                                peer_addr.as_deref(),
+                                identity,
+                                rate_config,
+                                req.method().as_str(),
+                                req.path(),
+                            ) {
+                                return Ok(response);
+                            }
+                        }
+                    }
                 }
                 AuthGuardResult::Unauthorized => {
                     return Ok(bolt_core::responses::error_401());

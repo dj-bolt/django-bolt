@@ -251,6 +251,10 @@ pub fn start_server(
         ));
     }
 
+    // Trusted proxy networks for client-IP resolution (rate limiting).
+    // Read once at startup; a malformed setting fails startup loudly.
+    bolt_core::middleware::rate_limit::configure_trusted_proxies_from_settings(py)?;
+
     // Configure tokio runtime with adequate blocking thread pool for concurrent streaming
     // Default is 512, but with concurrent SSE clients doing blocking operations (time.sleep),
     // we need enough threads to handle simultaneous blocking tasks

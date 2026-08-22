@@ -249,6 +249,10 @@ pub fn create_test_app(
     static_files_config: Option<&Bound<'_, PyDict>>,
     compression_config: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<u64> {
+    // Trusted proxy networks for client-IP resolution (rate limiting).
+    // Re-read on every client creation so tests can vary the setting.
+    bolt_core::middleware::rate_limit::configure_trusted_proxies_from_settings(py)?;
+
     let global_cors_config = if let Some(cors_dict) = cors_config {
         Some(parse_cors_config_from_dict(cors_dict)?)
     } else {
@@ -358,6 +362,15 @@ pub fn create_test_app(
 pub fn destroy_test_app(app_id: u64) -> PyResult<()> {
     registry().remove(&app_id);
     Ok(())
+}
+
+/// Test-only: drop every rate-limiter bucket. Limiters live in one
+/// process-global map, so tests reset it to keep buckets from leaking
+/// between test cases.
+#[pyfunction]
+#[pyo3(name = "_reset_rate_limiters")]
+pub fn reset_rate_limiters() {
+    bolt_core::middleware::rate_limit::reset_all_limiters();
 }
 
 /// Register HTTP routes for a test app
@@ -881,13 +894,18 @@ async fn handle_test_request_internal(
         .unwrap_or("127.0.0.1")
         .to_owned();
 
-    // Rate limiting
-    if let Some(ref meta) = route_meta {
-        if let Some(ref rate_config) = meta.rate_limit_config {
+    // Rate limiting. Identity-keyed limits (key="user" / key="api_key") run
+    // after auth below, matching the production handler.
+    let rate_config = route_meta
+        .as_ref()
+        .and_then(|m| m.rate_limit_config.as_ref());
+    if let Some(rate_config) = rate_config {
+        if !rate_config.key.needs_identity() {
             if let Some(response) = middleware::rate_limit::check_rate_limit(
                 handler_id,
                 &headers,
                 peer_addr.as_deref(),
+                None,
                 rate_config,
                 method,
                 path,
@@ -920,6 +938,25 @@ async fn handle_test_request_internal(
     } else {
         None
     };
+
+    // Identity-keyed rate limits: keyed per user / API key, anonymous
+    // requests fall back to the client IP.
+    if let Some(rate_config) = rate_config {
+        if rate_config.key.needs_identity() {
+            let identity = auth_ctx.as_ref().and_then(|ctx| ctx.user_id.as_deref());
+            if let Some(response) = middleware::rate_limit::check_rate_limit(
+                handler_id,
+                &headers,
+                peer_addr.as_deref(),
+                identity,
+                rate_config,
+                method,
+                path,
+            ) {
+                return response;
+            }
+        }
+    }
 
     // Cookies
     let needs_cookies = route_meta
@@ -1321,28 +1358,29 @@ pub fn handle_test_websocket(
     let handler_id = route.handler_id;
     let handler = route.handler.clone_ref(py);
 
-    // Rate limiting for WebSocket
+    // Rate limiting, auth and guards for WebSocket. Identity-keyed limits
+    // (key="user" / key="api_key") run after auth, matching the HTTP path.
     if let Some(route_meta) = app.route_metadata.get(handler_id) {
-        if let Some(ref rate_config) = route_meta.rate_limit_config {
-            if bolt_core::middleware::rate_limit::check_rate_limit(
-                handler_id,
-                &header_map,
-                Some("127.0.0.1"),
-                rate_config,
-                "GET",
-                &path,
-            )
-            .is_some()
+        let rate_config = route_meta.rate_limit_config.as_ref();
+        if let Some(rate_config) = rate_config {
+            if !rate_config.key.needs_identity()
+                && bolt_core::middleware::rate_limit::check_rate_limit(
+                    handler_id,
+                    &header_map,
+                    Some("127.0.0.1"),
+                    None,
+                    rate_config,
+                    "GET",
+                    &path,
+                )
+                .is_some()
             {
                 return Err(pyo3::exceptions::PyPermissionError::new_err(
                     "Rate limit exceeded",
                 ));
             }
         }
-    }
 
-    // Auth and guards for WebSocket
-    if let Some(route_meta) = app.route_metadata.get(handler_id) {
         let auth_ctx = if !route_meta.auth_backends.is_empty() {
             authenticate(&header_map, &route_meta.auth_backends)
         } else {
@@ -1363,6 +1401,27 @@ pub fn handle_test_websocket(
                             || "Permission denied".to_string(),
                             |denial| denial.text.clone(),
                         ),
+                    ));
+                }
+            }
+        }
+
+        if let Some(rate_config) = rate_config {
+            if rate_config.key.needs_identity() {
+                let identity = auth_ctx.as_ref().and_then(|ctx| ctx.user_id.as_deref());
+                if bolt_core::middleware::rate_limit::check_rate_limit(
+                    handler_id,
+                    &header_map,
+                    Some("127.0.0.1"),
+                    identity,
+                    rate_config,
+                    "GET",
+                    &path,
+                )
+                .is_some()
+                {
+                    return Err(pyo3::exceptions::PyPermissionError::new_err(
+                        "Rate limit exceeded",
                     ));
                 }
             }

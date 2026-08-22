@@ -885,14 +885,18 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         None
     };
 
-    // Process rate limiting (Rust-native, no GIL)
-    if let Some(route_meta) = route_metadata {
-        if let Some(ref rate_config) = route_meta.rate_limit_config {
+    // Process rate limiting (Rust-native, no GIL). Identity-keyed limits
+    // (key="user" / key="api_key") run after auth below, because the identity
+    // does not exist yet at this point.
+    let rate_config = route_metadata.and_then(|m| m.rate_limit_config.as_ref());
+    if let Some(rate_config) = rate_config {
+        if !rate_config.key.needs_identity() {
             if let Some(headers_map) = headers.as_ref() {
                 if let Some(response) = middleware::rate_limit::check_rate_limit(
                     handler_id,
                     headers_map,
                     peer_addr.as_deref(),
+                    None,
                     rate_config,
                     &method,
                     &path,
@@ -946,6 +950,30 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     } else {
         None
     };
+
+    // Identity-keyed rate limits run after auth: authenticated requests are
+    // keyed per user / API key, anonymous ones fall back to the client IP.
+    if let Some(rate_config) = rate_config {
+        if rate_config.key.needs_identity() {
+            if let Some(headers_map) = headers.as_ref() {
+                let identity = auth_ctx.as_ref().and_then(|ctx| ctx.user_id.as_deref());
+                if let Some(response) = middleware::rate_limit::check_rate_limit(
+                    handler_id,
+                    headers_map,
+                    peer_addr.as_deref(),
+                    identity,
+                    rate_config,
+                    &method,
+                    &path,
+                ) {
+                    // CORS headers will be added by CorsMiddleware
+                    return response;
+                }
+            } else {
+                debug_assert!(false, "rate-limited route missing extracted headers");
+            }
+        }
+    }
 
     // Optimization: Only parse cookies if handler needs them
     // Cookie parsing can be expensive for requests with many cookies

@@ -42,7 +42,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     use crate::testing::{
         create_test_app, destroy_test_app, handle_test_websocket, register_test_asgi_mounts,
         register_test_middleware_metadata, register_test_routes, register_test_websocket_routes,
-        test_request,
+        reset_rate_limiters, test_request,
     };
 
     // Class
@@ -73,6 +73,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(register_test_middleware_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(test_request, m)?)?;
     m.add_function(wrap_pyfunction!(handle_test_websocket, m)?)?;
+    m.add_function(wrap_pyfunction!(reset_rate_limiters, m)?)?;
 
     Ok(())
 }
