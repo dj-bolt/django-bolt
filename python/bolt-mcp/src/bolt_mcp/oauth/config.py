@@ -59,7 +59,7 @@ class AuthorizationServer:
 
     Behavior — override these methods in a subclass to customize:
         get_extra_claims, authenticate, resolve_user, load_user, render_login,
-        render_consent, redirect_uri_allowed.
+        render_consent, redirect_uri_allowed, code_redirect_response.
     """
 
     # ── configuration (override via subclass attributes or constructor kwargs) ──
@@ -154,3 +154,23 @@ class AuthorizationServer:
         """Whether ``redirect_uri`` is permitted. Default: exact match against registered
         values (no open redirect). Override only with great care."""
         return redirect_uri in (registered or [])
+
+    def code_redirect_response(self, redirect_url: str) -> Any:
+        """Build the post-consent response that delivers the authorization code.
+
+        ``redirect_url`` is the validated client redirect URI with ``code``,
+        ``iss`` and ``state`` already appended. Default: a plain 302, except for
+        loopback redirect URIs (``http://localhost`` / ``127.0.0.1`` / ``[::1]``),
+        which get an interstitial page on the issuer origin — browsers can block
+        a ``https → http://localhost`` 302 (Firefox HTTPS-Only mode). Override to
+        customize how the code reaches the client.
+        """
+        from django_bolt.responses import HTML, Redirect  # noqa: PLC0415
+
+        from . import consent  # noqa: PLC0415
+
+        if consent.is_loopback_uri(redirect_url):
+            # The page carries a live code: never cache it, never leak a referrer.
+            headers = {"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"}
+            return HTML(consent.code_delivery_page(redirect_url), headers=headers)
+        return Redirect(redirect_url, status_code=302)

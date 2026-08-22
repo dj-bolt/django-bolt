@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **bolt-mcp: loopback code delivery** - After consent, loopback redirect URIs (`http://localhost` / `127.0.0.1` / `[::1]`) get an interstitial page on the issuer origin instead of a raw 302. Browsers such as Firefox with HTTPS-Only mode block the `https → http://localhost` redirect, so the client never received the code. The page navigates with JS, keeps a click-through link, and shows the code for copy-paste. `https` redirect URIs keep the plain 302. Override the new `AuthorizationServer.code_redirect_response(redirect_url)` to customize the post-consent response. (#307)
 - **bolt-mcp 0.2.2: `resultType` on Python-built results** - `tools/call`, `resources/read` and `prompts/get` results now carry `resultType: "complete"` for 2026-07-28 clients. Claude Code and claude.ai connectors rejected every tool call without it. Legacy peers keep the old wire shape.
 
 ## [0.10.2]

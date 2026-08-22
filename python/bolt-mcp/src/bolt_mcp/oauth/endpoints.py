@@ -126,7 +126,7 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
             )
         return client
 
-    async def _issue_code_redirect(p: dict[str, str], client: dict, user: dict, *, session_key: str | None) -> Redirect:
+    async def _issue_code_redirect(p: dict[str, str], client: dict, user: dict, *, session_key: str | None) -> Any:
         code = await store.create_authorization_code(
             client_pk=client["pk"],
             user_id=user["user_id"],
@@ -140,7 +140,9 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
         params = {"code": code, "iss": _issuer}
         if p.get("state"):
             params["state"] = p["state"]
-        resp = Redirect(_append_query(p["redirect_uri"], params), status_code=302)
+        # Overridable: a 302, or an interstitial page for loopback redirect URIs
+        # (browsers can block a https → http://localhost redirect). See #307.
+        resp = server.code_redirect_response(_append_query(p["redirect_uri"], params))
         if session_key:
             _apply_session_cookie(resp, session_key)
         return resp
