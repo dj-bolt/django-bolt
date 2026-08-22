@@ -72,6 +72,27 @@ Parameters:
 
 - `rps` - Requests per second allowed
 - `burst` - Maximum burst size (allows short spikes)
+- `key` - What to count per (`"ip"` by default)
+
+### Client address behind a proxy
+
+With `key="ip"`, Bolt keys on the peer address of the connection. A client sends
+`X-Forwarded-For` itself, so Bolt ignores that header by default.
+
+Declare your proxies to make the header trustworthy:
+
+```python
+# settings.py
+BOLT_TRUSTED_PROXIES = ["10.0.0.0/8"]
+```
+
+Bolt then reads `X-Forwarded-For` from the right and takes the first entry that
+is not a listed proxy. A client cannot pick its own bucket, because the proxy
+appends the real address to the right of anything the client sent.
+
+Set this whenever a proxy, a load balancer or a CDN is in front of Bolt.
+Without it every caller behind that proxy shares one bucket. See
+[BOLT_TRUSTED_PROXIES](../ref/settings.md#bolt_trusted_proxies).
 
 ### How it works
 

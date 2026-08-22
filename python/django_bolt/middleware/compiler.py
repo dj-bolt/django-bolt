@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import decimal
 import inspect
+import ipaddress
 import uuid
 from collections.abc import Callable
 from typing import Annotated, Any, get_args, get_origin
@@ -181,6 +182,12 @@ def compile_middleware_meta(
 
     if all_middleware:
         result["middleware"] = all_middleware
+
+        # Rust needs the trusted proxy list to resolve the client address for a
+        # `key="ip"` rate limit. Proxies belong to the deployment, not to one
+        # route, so resolve the setting once here at registration.
+        if any(mw.get("type") == "rate_limit" for mw in all_middleware):
+            result["trusted_proxies"] = get_trusted_proxies()
 
     # Always include skip flags if present (even without middleware/auth/guards)
     if skip_middleware:
@@ -423,6 +430,44 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     metadata["memory_spool_threshold"] = getattr(settings, "BOLT_MEMORY_SPOOL_THRESHOLD", 1024 * 1024)
 
     return metadata
+
+
+def get_trusted_proxies() -> list[str]:
+    """
+    Read and validate `settings.BOLT_TRUSTED_PROXIES`.
+
+    The setting holds the proxies that sit in front of Bolt, as addresses or
+    CIDR blocks. A `key="ip"` rate limit believes `X-Forwarded-For` only from a
+    peer in this list. The list is empty by default, so Bolt keys on the peer
+    address and ignores forwarding headers.
+
+    Returns:
+        Normalized CIDR strings, for example `["10.0.0.0/8", "127.0.0.1/32"]`.
+
+    Raises:
+        ImproperlyConfigured: An entry is not an address or a CIDR block.
+    """
+    configured = getattr(settings, "BOLT_TRUSTED_PROXIES", None)
+    # Check the raw value. Normalizing first would turn an empty string into an
+    # empty list, and a typo that empties the setting must not read as "no
+    # proxies declared".
+    if isinstance(configured, str):
+        raise ImproperlyConfigured(
+            f"BOLT_TRUSTED_PROXIES must be a list of addresses or CIDR blocks, got the string {configured!r}."
+        )
+    if not configured:
+        return []
+
+    normalized = []
+    for entry in configured:
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except (TypeError, ValueError) as e:
+            raise ImproperlyConfigured(
+                f"BOLT_TRUSTED_PROXIES entry {entry!r} is not an address or CIDR block: {e}"
+            ) from e
+        normalized.append(str(network))
+    return normalized
 
 
 def middleware_to_dict(mw: Any) -> dict[str, Any] | None:

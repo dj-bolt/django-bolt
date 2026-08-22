@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- **`@rate_limit(key="ip")` trusted `X-Forwarded-For`** - The key came from the leftmost entry of `X-Forwarded-For`, which the client sends. Behind a proxy that appends the header, and with Bolt exposed directly, a client changed one header and got a new bucket for every request. Bolt now keys on the peer address and ignores forwarding headers. Set `BOLT_TRUSTED_PROXIES` to the addresses or CIDR blocks of your proxies to read `X-Forwarded-For` again. Bolt then reads it from the right and takes the first entry that is not a listed proxy. **Add the setting if you run behind a proxy**, or every caller behind it shares one bucket. (#302)
+
 ### Fixed
 
 - **bolt-mcp 0.2.2: `resultType` on Python-built results** - `tools/call`, `resources/read` and `prompts/get` results now carry `resultType: "complete"` for 2026-07-28 clients. Claude Code and claude.ai connectors rejected every tool call without it. Legacy peers keep the old wire shape.

@@ -16,6 +16,7 @@ use crate::middleware::auth::{
     build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
     RefreshingJwks,
 };
+use crate::middleware::client_ip::IpCidr;
 use crate::permissions::{ClaimKey, Guard, GuardDenial, GuardSet, Quantifier};
 
 /// Request value source for Rust-side argument prebinding.
@@ -215,6 +216,11 @@ pub struct RateLimitConfig {
     pub rps: u32,
     pub burst: u32,
     pub key_type: String,
+    /// Proxies whose forwarding headers a `key="ip"` limit may believe.
+    ///
+    /// Comes from `settings.BOLT_TRUSTED_PROXIES` and is empty by default. An
+    /// empty list makes the limit key on the peer address only.
+    pub trusted_proxies: Vec<IpCidr>,
 }
 
 impl Default for RateLimitConfig {
@@ -223,6 +229,7 @@ impl Default for RateLimitConfig {
             rps: 100,
             burst: 200,
             key_type: "ip".to_string(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -549,6 +556,15 @@ impl RouteMetadata {
             }
         }
 
+        // Attach the trusted proxy list. Proxies are a property of the
+        // deployment, not of one route, so Python resolves
+        // `settings.BOLT_TRUSTED_PROXIES` once at registration and sends it
+        // beside the middleware list. A bad entry aborts startup: keying a
+        // limit on the wrong address is a silent security downgrade.
+        if let Some(config) = rate_limit_config.as_mut() {
+            config.trusted_proxies = parse_trusted_proxies(py_meta)?;
+        }
+
         // Parse auth backends. Failures propagate: metadata that fails to
         // extract must abort startup, not leave the route unauthenticated.
         if let Some(auth_list) = py_meta.get_item("auth_backends")? {
@@ -829,6 +845,32 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<Co
 }
 
 /// Parse rate limiting configuration from middleware dict
+/// Read `trusted_proxies` from route metadata.
+///
+/// Python validates the setting first, so anything invalid here is a bug.
+fn parse_trusted_proxies(py_meta: &Bound<'_, PyDict>) -> PyResult<Vec<IpCidr>> {
+    let Some(value) = py_meta.get_item("trusted_proxies")? else {
+        return Ok(Vec::new());
+    };
+    if value.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let entries: Vec<String> = value.extract().map_err(|e| {
+        PyValueError::new_err(format!(
+            "Invalid 'trusted_proxies' route metadata, expected a list of strings: {e}"
+        ))
+    })?;
+
+    let mut blocks = Vec::with_capacity(entries.len());
+    for entry in entries {
+        blocks.push(IpCidr::parse(&entry).map_err(|e| {
+            PyValueError::new_err(format!("Invalid BOLT_TRUSTED_PROXIES entry: {e}"))
+        })?);
+    }
+    Ok(blocks)
+}
+
 fn parse_rate_limit_config(
     dict: &HashMap<String, Py<PyAny>>,
     py: Python,

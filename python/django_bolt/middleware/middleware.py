@@ -398,6 +398,16 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     This middleware is handled in Rust for maximum performance.
     No Python overhead in the hot path.
 
+    With `key="ip"`, Bolt keys on the peer address of the connection. A client
+    can send `X-Forwarded-For` itself, so Bolt ignores that header by default.
+    Behind a proxy, list the proxy in `settings.BOLT_TRUSTED_PROXIES`:
+
+        BOLT_TRUSTED_PROXIES = ["10.0.0.0/8"]
+
+    Bolt then reads `X-Forwarded-For` from the right and takes the first entry
+    that is not a listed proxy. Without the setting, every caller behind the
+    proxy shares one bucket.
+
     Args:
         rps: Requests per second limit
         burst: Burst capacity (defaults to 2x rps)

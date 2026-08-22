@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::metadata::RateLimitConfig;
+use crate::middleware::client_ip;
 use crate::response_builder;
 use crate::responses;
 
@@ -42,17 +43,10 @@ pub fn check_rate_limit(
     // Determine the rate limit key
     let key = match key_type.as_str() {
         "ip" => {
-            // Try to get client IP from headers (X-Forwarded-For, X-Real-IP, etc.)
-            headers
-                .get("x-forwarded-for")
-                .or_else(|| headers.get("x-real-ip"))
-                .or_else(|| headers.get("remote-addr"))
-                .map(|ip| {
-                    // Take first IP if comma-separated
-                    ip.split(',').next().unwrap_or(ip).trim().to_string()
-                })
-                // Fallback to peer_addr if headers are missing
-                .or_else(|| peer_addr.map(|s| s.to_string()))
+            // SECURITY: a forwarding header is client input. `client_ip::resolve`
+            // reads one only when a declared trusted proxy sent it. See
+            // `client_ip` for the rules and `BOLT_TRUSTED_PROXIES` for the list.
+            client_ip::resolve(headers, peer_addr, &config.trusted_proxies)
                 .unwrap_or_else(|| "unknown".to_string())
         }
         header_name => {
