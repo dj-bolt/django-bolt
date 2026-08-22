@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from html import escape
 from typing import Any
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import msgspec
 from asgiref.sync import sync_to_async
@@ -62,6 +62,23 @@ def _html_error(message: str, *, status: int = 400) -> HTML:
 
 def _append_query(url: str, params: dict[str, str]) -> str:
     return url + ("&" if "?" in url else "?") + urlencode(params)
+
+
+def _valid_redirect_uri(uri: str, *, application_type: str) -> bool:
+    """Reject malformed or relative redirect URIs at registration time."""
+    try:
+        parts = urlsplit(uri)
+        # Accessing hostname/port performs urllib's remaining netloc validation.
+        hostname = parts.hostname
+        _port = parts.port
+    except ValueError:
+        return False
+    if not parts.scheme or parts.fragment:
+        return False
+    if parts.scheme in ("http", "https"):
+        return bool(hostname)
+    # RFC 8252 native clients may use private-use URI schemes, which have no host.
+    return application_type == "native" and bool(parts.path)
 
 
 def _redirect_error(
@@ -126,7 +143,7 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
             )
         return client
 
-    async def _issue_code_redirect(p: dict[str, str], client: dict, user: dict, *, session_key: str | None) -> Redirect:
+    async def _issue_code_redirect(p: dict[str, str], client: dict, user: dict, *, session_key: str | None) -> Any:
         code = await store.create_authorization_code(
             client_pk=client["pk"],
             user_id=user["user_id"],
@@ -140,7 +157,9 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
         params = {"code": code, "iss": _issuer}
         if p.get("state"):
             params["state"] = p["state"]
-        resp = Redirect(_append_query(p["redirect_uri"], params), status_code=302)
+        # Overridable: a 302, or an interstitial page for loopback redirect URIs
+        # (browsers can block a https → http://localhost redirect). See #307.
+        resp = server.code_redirect_response(_append_query(p["redirect_uri"], params))
         if session_key:
             _apply_session_cookie(resp, session_key)
         return resp
@@ -278,6 +297,10 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
         application_type = body.get("application_type", "web")
         if application_type not in ("web", "native"):
             return _json_error("invalid_client_metadata", "application_type must be 'web' or 'native'")
+        if not all(_valid_redirect_uri(uri, application_type=application_type) for uri in redirect_uris):
+            return _json_error(
+                "invalid_redirect_uri", "redirect_uris must contain valid absolute URIs without fragments"
+            )
         client = await store.create_client(
             client_name=body.get("client_name", ""),
             redirect_uris=redirect_uris,

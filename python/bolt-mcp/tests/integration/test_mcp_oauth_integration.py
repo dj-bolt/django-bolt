@@ -26,7 +26,9 @@ pytestmark = pytest.mark.server_integration
 
 DUAL_ACCEPT = "application/json, text/event-stream"
 ISSUER = "http://testserver"
-REDIRECT_URI = "http://localhost:9999/callback"
+# An https redirect URI keeps the plain-302 code delivery; loopback URIs get an
+# interstitial page instead (covered in-process by test_oauth_as.py).
+REDIRECT_URI = "https://client.example.com/callback"
 USERNAME = "alice"
 PASSWORD = "s3cr3t-pw-123456"
 
