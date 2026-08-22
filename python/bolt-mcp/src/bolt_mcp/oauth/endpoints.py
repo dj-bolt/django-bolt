@@ -298,7 +298,9 @@ def register_oauth_endpoints(api: BoltAPI, server: AuthorizationServer) -> None:
         if application_type not in ("web", "native"):
             return _json_error("invalid_client_metadata", "application_type must be 'web' or 'native'")
         if not all(_valid_redirect_uri(uri, application_type=application_type) for uri in redirect_uris):
-            return _json_error("invalid_redirect_uri", "redirect_uris must contain valid absolute URIs without fragments")
+            return _json_error(
+                "invalid_redirect_uri", "redirect_uris must contain valid absolute URIs without fragments"
+            )
         client = await store.create_client(
             client_name=body.get("client_name", ""),
             redirect_uris=redirect_uris,
