@@ -430,7 +430,13 @@ jobs:
           # RUSTSEC-2023-0071 (rsa Marvin attack): no fixed release exists. rsa is
           # transitive via jsonwebtoken, and the timing oracle targets RSA
           # private-key decryption, not the public-key path JWT verification uses.
-          cargo audit --ignore RUSTSEC-2023-0071
+          #
+          # RUSTSEC-2026-0258 (h2 unbounded empty DATA frames): the patch is in
+          # h2 0.4.16, but the 0.3 line has no backport. h2 is transitive via
+          # actix-http, which needs h2 0.3, so actix-web 4.x cannot reach the
+          # patched release. Low severity, and it needs HTTP/2. Remove this
+          # ignore when actix-web moves to h2 0.4.
+          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0258
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
