@@ -157,15 +157,16 @@ class Response(CookieMixin):
         # Bytes-like content is a pre-encoded body. Pass it through verbatim,
         # even for the JSON media type — JSON-encoding bytes would base64-wrap
         # them and corrupt pre-compressed payloads (issue #305).
-        if isinstance(self.content, memoryview):
-            return self.content.tobytes()
-        if isinstance(self.content, (bytes, bytearray)):
-            return bytes(self.content)
+        # One isinstance for the whole bytes-like family keeps the structured
+        # content path to a single failed check.
+        content = self.content
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            return content.tobytes() if isinstance(content, memoryview) else bytes(content)
         if self.media_type == "application/json":
-            return _json.encode(self.content)
-        if isinstance(self.content, str):
-            return self.content.encode()
-        return str(self.content).encode()
+            return _json.encode(content)
+        if isinstance(content, str):
+            return content.encode()
+        return str(content).encode()
 
 
 class JSON(CookieMixin):

@@ -259,10 +259,10 @@ def _render_response_body(content: Any, media_type: str) -> bytes:
     # Bytes-like content is a pre-encoded body. Pass it through verbatim,
     # even for JSON media types — JSON-encoding bytes would base64-wrap
     # them and corrupt pre-compressed payloads (issue #305).
-    if isinstance(content, memoryview):
-        return content.tobytes()
-    if isinstance(content, (bytes, bytearray)):
-        return bytes(content)
+    # One isinstance for the whole bytes-like family keeps the structured
+    # content path to a single failed check.
+    if isinstance(content, (bytes, bytearray, memoryview)):
+        return content.tobytes() if isinstance(content, memoryview) else bytes(content)
     if _is_json_media_type(media_type):
         return _json.encode(content)
     if isinstance(content, str):
