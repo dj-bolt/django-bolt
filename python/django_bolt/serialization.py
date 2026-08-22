@@ -256,12 +256,15 @@ def _is_json_media_type(media_type: str) -> bool:
 
 
 def _render_response_body(content: Any, media_type: str) -> bytes:
-    if _is_json_media_type(media_type):
-        return _json.encode(content)
+    # Bytes-like content is a pre-encoded body. Pass it through verbatim,
+    # even for JSON media types — JSON-encoding bytes would base64-wrap
+    # them and corrupt pre-compressed payloads (issue #305).
     if isinstance(content, memoryview):
         return content.tobytes()
     if isinstance(content, (bytes, bytearray)):
         return bytes(content)
+    if _is_json_media_type(media_type):
+        return _json.encode(content)
     if isinstance(content, str):
         return content.encode()
     return str(content).encode()
@@ -967,7 +970,9 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, FileResponse):
             return serialize_file_streaming_response(result)
         if isinstance(result, ResponseClass):
-            if validator_async is not None:
+            # Bytes-like content is a pre-encoded body — skip the response
+            # validator, it only applies to structured data (issue #305).
+            if validator_async is not None and not isinstance(result.content, (bytes, bytearray, memoryview)):
                 try:
                     validated = await validator_async(result.content)
                 except ResponseValidationError:
@@ -1012,7 +1017,9 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, FileResponse):
             return serialize_file_streaming_response(result)
         if isinstance(result, ResponseClass):
-            if validator_sync is not None:
+            # Bytes-like content is a pre-encoded body — skip the response
+            # validator, it only applies to structured data (issue #305).
+            if validator_sync is not None and not isinstance(result.content, (bytes, bytearray, memoryview)):
                 try:
                     validated = validator_sync(result.content)
                 except ResponseValidationError:

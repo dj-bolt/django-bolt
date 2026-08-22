@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Pre-compressed `Response` bodies** - `Response(b"...")` with the default JSON media type wrapped the bytes in a base64 JSON string. A pre-compressed body with a `Content-Encoding` header reached the client corrupt. Bytes-like content now passes through verbatim, and the response validator skips it. (#305)
 - **bolt-mcp 0.2.2: `resultType` on Python-built results** - `tools/call`, `resources/read` and `prompts/get` results now carry `resultType: "complete"` for 2026-07-28 clients. Claude Code and claude.ai connectors rejected every tool call without it. Legacy peers keep the old wire shape.
 
 ## [0.10.2]

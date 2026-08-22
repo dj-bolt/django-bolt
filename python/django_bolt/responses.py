@@ -154,14 +154,18 @@ class Response(CookieMixin):
         self.media_type = media_type
 
     def to_bytes(self) -> bytes:
+        # Bytes-like content is a pre-encoded body. Pass it through verbatim,
+        # even for the JSON media type — JSON-encoding bytes would base64-wrap
+        # them and corrupt pre-compressed payloads (issue #305).
+        if isinstance(self.content, memoryview):
+            return self.content.tobytes()
+        if isinstance(self.content, (bytes, bytearray)):
+            return bytes(self.content)
         if self.media_type == "application/json":
             return _json.encode(self.content)
-        elif isinstance(self.content, str):
+        if isinstance(self.content, str):
             return self.content.encode()
-        elif isinstance(self.content, bytes):
-            return self.content
-        else:
-            return str(self.content).encode()
+        return str(self.content).encode()
 
 
 class JSON(CookieMixin):

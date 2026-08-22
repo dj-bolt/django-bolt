@@ -4,11 +4,15 @@ Tests for compression middleware in Django-Bolt.
 Tests both global compression configuration and per-route skip functionality.
 """
 
+import gzip
+import json
+
+import msgspec
 import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import CompressionConfig, no_compress, skip_middleware
-from django_bolt.responses import HTML, PlainText, StreamingResponse
+from django_bolt.responses import HTML, PlainText, Response, StreamingResponse
 from django_bolt.testing import TestClient
 
 
@@ -226,6 +230,102 @@ def test_compression_multiple_skip_middleware():
 
     assert response.status_code == 200
     assert response.headers.get("content-encoding") is None
+
+
+# ─── Pre-compressed Response bodies (issue #305) ────────────────────────
+#
+# A handler can return a Response whose content is already compressed,
+# with an explicit Content-Encoding header. The bytes must reach the
+# client verbatim. The JSON media type must not base64-encode them.
+
+
+def _pre_compressed_payload() -> tuple[bytes, bytes]:
+    payload = json.dumps({"data": "x" * 1000}).encode()
+    return payload, gzip.compress(payload)
+
+
+def test_pre_compressed_response_with_compression_disabled():
+    """Response(bytes) with Content-Encoding passes through when compression is off."""
+    api = BoltAPI(compression=False)
+    payload, compressed = _pre_compressed_payload()
+
+    @api.get("/cached")
+    async def cached():
+        return Response(compressed, headers={"Content-Encoding": "gzip"})
+
+    with TestClient(api, use_http_layer=True) as client:
+        resp = client.get("/cached", headers={"Accept-Encoding": "gzip"})
+        assert resp.status_code == 200
+        assert resp.headers.get("content-encoding") == "gzip"
+        # httpx auto-decodes gzip; corrupted bytes raise DecodingError here.
+        assert resp.content == payload
+
+
+def test_pre_compressed_response_with_compression_enabled():
+    """The middleware must not re-encode a body with a pre-set Content-Encoding."""
+    api = BoltAPI(compression=CompressionConfig(backend="brotli", minimum_size=0))
+    payload, compressed = _pre_compressed_payload()
+
+    @api.get("/cached")
+    async def cached():
+        return Response(compressed, headers={"Content-Encoding": "gzip"})
+
+    with TestClient(api, use_http_layer=True) as client:
+        resp = client.get("/cached", headers={"Accept-Encoding": "br, gzip"})
+        assert resp.status_code == 200
+        assert resp.headers.get("content-encoding") == "gzip"
+        assert resp.content == payload
+
+
+def test_pre_compressed_response_sync_handler():
+    """The sync serialization path must also pass pre-compressed bytes through."""
+    api = BoltAPI(compression=False)
+    payload, compressed = _pre_compressed_payload()
+
+    @api.get("/cached-sync")
+    def cached_sync():
+        return Response(compressed, headers={"Content-Encoding": "gzip"})
+
+    with TestClient(api, use_http_layer=True) as client:
+        resp = client.get("/cached-sync", headers={"Accept-Encoding": "gzip"})
+        assert resp.status_code == 200
+        assert resp.headers.get("content-encoding") == "gzip"
+        assert resp.content == payload
+
+
+def test_pre_compressed_response_with_response_model():
+    """A route with a response_model must not validate pre-encoded bytes."""
+
+    class Item(msgspec.Struct):
+        data: str
+
+    api = BoltAPI(compression=False)
+    payload, compressed = _pre_compressed_payload()
+
+    @api.get("/cached-model", response_model=list[Item])
+    async def cached_model():
+        return Response(compressed, headers={"Content-Encoding": "gzip"})
+
+    with TestClient(api, use_http_layer=True) as client:
+        resp = client.get("/cached-model", headers={"Accept-Encoding": "gzip"})
+        assert resp.status_code == 200
+        assert resp.headers.get("content-encoding") == "gzip"
+        assert resp.content == payload
+
+
+def test_response_bytes_without_content_encoding_not_json_wrapped():
+    """Response(bytes) with the default media type sends the bytes as-is."""
+    api = BoltAPI(compression=False)
+    raw = b'{"already": "encoded"}'
+
+    @api.get("/raw")
+    async def raw_bytes():
+        return Response(raw)
+
+    with TestClient(api, use_http_layer=True) as client:
+        resp = client.get("/raw")
+        assert resp.status_code == 200
+        assert resp.content == raw
 
 
 def test_compression_config_validation():
