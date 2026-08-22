@@ -34,13 +34,14 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import secrets
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
-REDIRECT_URI = "http://127.0.0.1:8765/callback"  # never actually served; we read the 302
+REDIRECT_URI = "http://127.0.0.1:8765/callback"  # never served; we read the code out of the response
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -71,6 +72,23 @@ def post_form(url: str, fields: dict, *, headers: dict | None = None):
     data = urllib.parse.urlencode(fields).encode()
     hdrs = {"Content-Type": "application/x-www-form-urlencoded", **(headers or {})}
     return http("POST", url, data=data, headers=hdrs)
+
+
+def code_url(resp, body: bytes) -> str:
+    """Return the client redirect URL (with ``code``) from a post-consent response.
+
+    A browser gets one of two shapes. An ``https`` redirect URI gets a plain 302.
+    A loopback redirect URI (``http://localhost`` / ``127.0.0.1``) gets a 200
+    interstitial page on the issuer origin, because some browsers block the
+    ``https → http://localhost`` 302. The page navigates with JS. This script has
+    no JS engine, so it reads the same URL out of the page markup.
+    """
+    if resp.status == 302:
+        return resp.headers["Location"]
+    match = re.search(r'<script>location\.(?:assign|replace)\((".*?")\);</script>', body.decode())
+    if not match:
+        sys.exit(f"no code in the post-consent response: {resp.status} {body[:500]!r}")
+    return json.loads(match.group(1))
 
 
 def step(n: int, text: str) -> None:
@@ -156,9 +174,10 @@ def main() -> None:
             {**oauth_params, "decision": "approve"},
             headers={"Origin": issuer, "Cookie": cookie},
         )
-        if consent.status != 302:
-            sys.exit(f"consent failed: {consent.status} {consent.read()[:500]!r}")
-        location = consent.headers["Location"]
+        consent_body = consent.read()
+        if consent.status not in (200, 302):
+            sys.exit(f"consent failed: {consent.status} {consent_body[:500]!r}")
+        location = code_url(consent, consent_body)
     else:
         sys.exit(f"authorize failed: {login.status} {login_body[:500]!r}")
 
