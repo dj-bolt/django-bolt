@@ -9,6 +9,7 @@ that the issued JWT authenticates to /mcp and drives per-tool guards.
 from __future__ import annotations
 
 import html as html_mod
+import json
 import re
 import secrets
 from urllib.parse import parse_qs, urlsplit
@@ -540,6 +541,13 @@ def _interstitial_target(page: str) -> str:
     return html_mod.unescape(match.group(1))
 
 
+def _interstitial_script_target(page: str) -> str:
+    """The client redirect URL the interstitial's JS navigates to."""
+    match = re.search(r'<script>location\.assign\((".*?")\);</script>', page)
+    assert match, page
+    return json.loads(match.group(1))
+
+
 @pytest.mark.parametrize(
     "redirect_uri",
     [
@@ -564,8 +572,10 @@ def test_loopback_redirect_renders_interstitial_with_working_code(redirect_uri):
         assert q["state"] == ["st-1"]
         assert q["iss"] == [ISSUER]
         code = q["code"][0]
-        assert code in r.text  # visible copy-paste fallback
-        assert "location.assign" in r.text  # JS auto-navigation preserves the fallback in browser history
+        assert f'<div class="code">{code}</div>' in r.text  # visible copy-paste fallback
+        # JS auto-navigation targets the same URL. ``assign`` keeps the page in history,
+        # so the copy-paste fallback stays reachable with the Back button.
+        assert _interstitial_script_target(r.text) == target
         tok = client.post(
             "/oauth/token",
             data={

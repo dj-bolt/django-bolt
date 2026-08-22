@@ -429,7 +429,7 @@ For trivial cases set attributes inline instead of subclassing: `AuthorizationSe
 | `redirect_uri_allowed(registered, redirect_uri)` | `/authorize` | change redirect-URI matching |
 | `code_redirect_response(redirect_url)` | consent approved | change how the code reaches the client |
 
-**Loopback clients.** After consent, an `https` redirect URI gets a plain 302. A loopback redirect URI (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) gets an interstitial page instead. Browsers such as Firefox with HTTPS-Only mode block the `https → http://localhost` 302, so "Allow" appears to do nothing. The interstitial navigates with JS, keeps a click-through link, and shows the code for copy-paste. Override `code_redirect_response(redirect_url)` to change this — for example, return `Redirect(redirect_url, status_code=302)` to force the raw 302.
+**Loopback clients.** After consent, an `https` redirect URI gets a plain 302. A loopback redirect URI (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) gets an interstitial page instead. Browsers such as Firefox with HTTPS-Only mode block the `https → http://localhost` 302, so "Allow" appears to do nothing. The interstitial navigates with JS, keeps a click-through link, and shows the code for copy-paste. Override `code_redirect_response(redirect_url)` to change this — for example, return `Redirect(redirect_url, status_code=302)` (from `django_bolt.responses`) to force the raw 302.
 
 #### Endpoints
 

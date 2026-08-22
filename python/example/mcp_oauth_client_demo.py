@@ -74,21 +74,32 @@ def post_form(url: str, fields: dict, *, headers: dict | None = None):
     return http("POST", url, data=data, headers=hdrs)
 
 
-def code_url(resp, body: bytes) -> str:
-    """Return the client redirect URL (with ``code``) from a post-consent response.
+_INTERSTITIAL_SCRIPT = re.compile(r'<script>location\.(?:assign|replace)\((".*?")\);</script>')
 
-    A browser gets one of two shapes. An ``https`` redirect URI gets a plain 302.
+
+def interstitial_url(body: bytes) -> str | None:
+    """Return the client redirect URL if ``body`` is a code-delivery interstitial.
+
     A loopback redirect URI (``http://localhost`` / ``127.0.0.1``) gets a 200
     interstitial page on the issuer origin, because some browsers block the
     ``https → http://localhost`` 302. The page navigates with JS. This script has
     no JS engine, so it reads the same URL out of the page markup.
     """
+    match = _INTERSTITIAL_SCRIPT.search(body.decode())
+    return json.loads(match.group(1)) if match else None
+
+
+def code_url(resp, body: bytes) -> str:
+    """Return the client redirect URL (with ``code``) from a post-consent response.
+
+    An ``https`` redirect URI gets a plain 302. A loopback one gets the interstitial.
+    """
     if resp.status == 302:
         return resp.headers["Location"]
-    match = re.search(r'<script>location\.(?:assign|replace)\((".*?")\);</script>', body.decode())
-    if not match:
+    url = interstitial_url(body)
+    if url is None:
         sys.exit(f"no code in the post-consent response: {resp.status} {body[:500]!r}")
-    return json.loads(match.group(1))
+    return url
 
 
 def step(n: int, text: str) -> None:
@@ -163,6 +174,11 @@ def main() -> None:
         location = login.headers["Location"]
     elif login.status == 200 and b"Invalid username or password" in login_body:
         sys.exit("login failed: invalid username or password (create the user first — see README)")
+    elif login.status == 200 and (login_interstitial := interstitial_url(login_body)):
+        # auto_consent server + loopback redirect URI: the login response is already the
+        # code-delivery interstitial, not a consent page. Approving again would make the
+        # server issue a second, redundant authorization code.
+        location = login_interstitial
     elif login.status == 200:
         # ── 4. consent screen: approve with the session cookie ────────────────
         step(4, "consent: approve")
