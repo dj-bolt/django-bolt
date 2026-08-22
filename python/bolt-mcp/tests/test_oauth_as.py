@@ -17,6 +17,7 @@ import jwt
 import pytest
 from _helpers import initialize, parse_rpc, post_rpc
 from bolt_mcp import MCP, AuthorizationServer, mount_mcp
+from bolt_mcp.oauth import consent as oauth_consent
 from bolt_mcp.oauth import sessions as oauth_sessions
 from bolt_mcp.oauth.models import RefreshToken
 from bolt_mcp.oauth.pkce import compute_s256, verify_s256
@@ -564,7 +565,7 @@ def test_loopback_redirect_renders_interstitial_with_working_code(redirect_uri):
         assert q["iss"] == [ISSUER]
         code = q["code"][0]
         assert code in r.text  # visible copy-paste fallback
-        assert "location.replace" in r.text  # JS auto-navigation
+        assert "location.assign" in r.text  # JS auto-navigation preserves the fallback in browser history
         tok = client.post(
             "/oauth/token",
             data={
@@ -593,6 +594,29 @@ def test_loopback_interstitial_sets_session_cookie_after_login():
     assert r.status_code == 200, r.text
     assert "sessionid=" in r.headers.get("set-cookie", "")
     assert LOOPBACK_REDIRECT_URI in _interstitial_target(r.text)
+
+
+def test_loopback_interstitial_displays_appended_code_with_existing_query_parameter():
+    page = oauth_consent.code_delivery_page("http://localhost/callback?code=client-value&code=issued-value")
+    assert '<div class="code">issued-value</div>' in page
+    assert '<div class="code">client-value</div>' not in page
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "https://[broken/callback",
+        "https://client.example.com:invalid/callback",
+        "/relative/callback",
+        "https://client.example.com/callback#fragment",
+    ],
+)
+def test_registration_rejects_malformed_redirect_uri(redirect_uri):
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        r = client.post("/oauth/register", json={"redirect_uris": [redirect_uri]})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_redirect_uri"
 
 
 def test_subclass_overrides_code_redirect_response():
@@ -628,6 +652,16 @@ def test_registration_persists_application_type_native():
         )
     assert r.status_code == 201
     assert r.json()["application_type"] == "native"
+
+
+def test_registration_accepts_native_private_use_redirect_uri():
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        r = client.post(
+            "/oauth/register",
+            json={"redirect_uris": ["com.example.app:/oauth2redirect"], "application_type": "native"},
+        )
+    assert r.status_code == 201
 
 
 def test_registration_defaults_application_type_web():
