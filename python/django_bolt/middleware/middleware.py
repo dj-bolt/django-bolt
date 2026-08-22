@@ -32,6 +32,8 @@ from typing import (
     runtime_checkable,
 )
 
+from django.core.exceptions import ImproperlyConfigured
+
 from ..exceptions import HTTPException
 
 if TYPE_CHECKING:
@@ -391,6 +393,13 @@ def middleware(*args, **kwargs):
     return decorator
 
 
+# Keys that name an authenticated identity. Rust runs the rate limit check
+# before it validates auth, so no identity exists at that point. Rust has no arm
+# for these, and the catch-all looks for a request header with the same name.
+# That header never arrives, so every caller shares the bucket for "unknown".
+_UNIMPLEMENTED_RATE_LIMIT_KEYS = ("user", "api_key")
+
+
 def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     """
     Rate limiting decorator (Rust-accelerated).
@@ -401,7 +410,12 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     Args:
         rps: Requests per second limit
         burst: Burst capacity (defaults to 2x rps)
-        key: Rate limit key strategy ("ip", "user", "api_key", or header name)
+        key: What to count per. Use "ip" for the client address, or a request
+            header name such as "x-api-key" to count per header value.
+
+    Raises:
+        ImproperlyConfigured: `key` is "user" or "api_key". Neither is
+            implemented, and both used to collapse into one shared bucket.
 
     Example:
         @api.get("/api/data")
@@ -409,6 +423,15 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
         async def get_data(request: Request) -> dict:
             return {"data": [...]}
     """
+    if key in _UNIMPLEMENTED_RATE_LIMIT_KEYS:
+        raise ImproperlyConfigured(
+            f"@rate_limit(key={key!r}) is not implemented. The limit runs before "
+            f"authentication, so no identity is available to key on. Every caller "
+            f"shared one bucket, which made the route easier to exhaust than an "
+            f"unlimited one. Use key='ip', or a request header that carries the "
+            f"identity, such as key='x-api-key'. See "
+            f"https://github.com/dj-bolt/django-bolt/issues/301."
+        )
 
     def decorator(func):
         if not hasattr(func, "__bolt_middleware__"):

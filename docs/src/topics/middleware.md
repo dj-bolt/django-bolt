@@ -72,6 +72,26 @@ Parameters:
 
 - `rps` - Requests per second allowed
 - `burst` - Maximum burst size (allows short spikes)
+- `key` - What to count per: `"ip"` (the default) or a request header name
+
+### Counting per caller
+
+`key="ip"` counts per client address. A header name counts per header value:
+
+```python
+@api.get("/api/data")
+@rate_limit(rps=10, key="x-api-key")
+async def data():
+    return {"data": []}
+```
+
+Callers that do not send the header share one bucket.
+
+!!! warning "`key="user"` and `key="api_key"` are rejected"
+    Both were documented but never implemented. The limit runs before
+    authentication, so no identity exists to count per. Bolt raises
+    `ImproperlyConfigured` at import time. Use `key="ip"` or a header that
+    carries the identity.
 
 ### How it works
 

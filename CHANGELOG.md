@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`@rate_limit(key="user")` and `key="api_key"` raise** - Neither was implemented. The limit runs before authentication, so no identity is available. Both fell into the header catch-all, matched no header, and resolved to one shared bucket, thus a route marked "per user" was a single global limit that one caller could exhaust for everyone. Both keys now raise `ImproperlyConfigured` at import time. Use `key="ip"` or a request header name. (#301)
+
 ### Fixed
 
 - **bolt-mcp 0.2.2: `resultType` on Python-built results** - `tools/call`, `resources/read` and `prompts/get` results now carry `resultType: "complete"` for 2026-07-28 clients. Claude Code and claude.ai connectors rejected every tool call without it. Legacy peers keep the old wire shape.
