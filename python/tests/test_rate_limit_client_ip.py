@@ -39,14 +39,23 @@ def test_an_invalid_entry_fails_at_registration(entry):
         _api_with_limited_route()
 
 
-@pytest.mark.parametrize("configured", ["10.0.0.0/8", ""])
-def test_a_string_setting_fails_at_registration(configured):
-    """
-    A bare string iterates one character at a time, so reject it by name.
-
-    The empty string counts. It is falsey, so a normalize-then-check order would
-    read it as an empty list and report no proxies at all.
-    """
+@pytest.mark.parametrize(
+    "configured",
+    [
+        pytest.param("10.0.0.0/8", id="string"),
+        # Falsey, so a normalize-then-check order reads it as an empty list and
+        # reports no proxies at all.
+        pytest.param("", id="empty-string"),
+        # Iterates its keys, which would look like a valid list of proxies.
+        pytest.param({"10.0.0.0/8": "edge proxy"}, id="mapping"),
+        pytest.param({}, id="empty-mapping"),
+        # Not iterable, so the loop would raise a bare TypeError.
+        pytest.param(42, id="integer"),
+        pytest.param(True, id="boolean"),
+    ],
+)
+def test_a_setting_that_is_not_a_list_fails_at_registration(configured):
+    """Reject the whole setting by type, before anything iterates it."""
     with (
         override_settings(BOLT_TRUSTED_PROXIES=configured),
         pytest.raises(ImproperlyConfigured, match="must be a list"),
@@ -54,9 +63,9 @@ def test_a_string_setting_fails_at_registration(configured):
         _api_with_limited_route()
 
 
-@pytest.mark.parametrize("configured", [None, [], ["10.0.0.1"], ["10.0.0.0/8", "::1"]])
+@pytest.mark.parametrize("configured", [None, [], (), ["10.0.0.1"], ["10.0.0.0/8", "::1"], ("10.0.0.0/8",)])
 def test_a_valid_setting_registers(configured):
-    """Addresses and blocks are both accepted, in either family."""
+    """Addresses and blocks are both accepted, in either family, list or tuple."""
     with override_settings(BOLT_TRUSTED_PROXIES=configured):
         assert _api_with_limited_route() is not None
 

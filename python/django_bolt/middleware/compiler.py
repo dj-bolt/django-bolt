@@ -445,18 +445,22 @@ def get_trusted_proxies() -> list[str]:
         Normalized CIDR strings, for example `["10.0.0.0/8", "127.0.0.1/32"]`.
 
     Raises:
-        ImproperlyConfigured: An entry is not an address or a CIDR block.
+        ImproperlyConfigured: The setting is not a list, or an entry is not an
+            address or a CIDR block.
     """
     configured = getattr(settings, "BOLT_TRUSTED_PROXIES", None)
-    # Check the raw value. Normalizing first would turn an empty string into an
-    # empty list, and a typo that empties the setting must not read as "no
-    # proxies declared".
-    if isinstance(configured, str):
-        raise ImproperlyConfigured(
-            f"BOLT_TRUSTED_PROXIES must be a list of addresses or CIDR blocks, got the string {configured!r}."
-        )
-    if not configured:
+    if configured is None:
         return []
+
+    # Check the type before the loop reads it. A string iterates one character
+    # at a time, a mapping iterates its keys, and anything else raises a bare
+    # TypeError from inside the loop. All three are configuration mistakes, and
+    # the two that iterate would otherwise produce a silently wrong proxy list.
+    if not isinstance(configured, (list, tuple)):
+        raise ImproperlyConfigured(
+            f"BOLT_TRUSTED_PROXIES must be a list of addresses or CIDR blocks, "
+            f"got {type(configured).__name__} {configured!r}."
+        )
 
     normalized = []
     for entry in configured:
