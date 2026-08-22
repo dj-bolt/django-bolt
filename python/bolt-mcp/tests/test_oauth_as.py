@@ -573,8 +573,8 @@ def test_loopback_redirect_renders_interstitial_with_working_code(redirect_uri):
         assert q["iss"] == [ISSUER]
         code = q["code"][0]
         assert f'<div class="code">{code}</div>' in r.text  # visible copy-paste fallback
-        # JS auto-navigation targets the same URL. ``assign`` keeps the page in history,
-        # so the copy-paste fallback stays reachable with the Back button.
+        # The JavaScript navigation goes to the same URL. ``assign`` keeps the page in
+        # history. The Back button thus returns to the copy-paste fallback.
         assert _interstitial_script_target(r.text) == target
         tok = client.post(
             "/oauth/token",

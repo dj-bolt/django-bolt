@@ -175,9 +175,9 @@ def main() -> None:
     elif login.status == 200 and b"Invalid username or password" in login_body:
         sys.exit("login failed: invalid username or password (create the user first — see README)")
     elif login.status == 200 and (login_interstitial := interstitial_url(login_body)):
-        # auto_consent server + loopback redirect URI: the login response is already the
-        # code-delivery interstitial, not a consent page. Approving again would make the
-        # server issue a second, redundant authorization code.
+        # With auto_consent and a loopback redirect URI, the login response is already
+        # the code-delivery interstitial. It is not a consent page. A second approval
+        # would make the server issue a redundant authorization code.
         location = login_interstitial
     elif login.status == 200:
         # ── 4. consent screen: approve with the session cookie ────────────────
