@@ -445,8 +445,8 @@ def get_trusted_proxies() -> list[str]:
         Normalized CIDR strings, for example `["10.0.0.0/8", "127.0.0.1/32"]`.
 
     Raises:
-        ImproperlyConfigured: The setting is not a list, or an entry is not an
-            address or a CIDR block.
+        ImproperlyConfigured: The setting is not a list or a tuple, or an entry
+            is not an address or a CIDR block.
     """
     configured = getattr(settings, "BOLT_TRUSTED_PROXIES", None)
     if configured is None:
