@@ -12,6 +12,9 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import logging
+import threading
+import warnings
 from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urlsplit
@@ -22,11 +25,81 @@ from httpx import Response
 from django_bolt import BoltAPI, _core
 from django_bolt._bridge import make_bound_dispatch
 from django_bolt.api import _validate_asgi_mount_conflicts, _validate_mcp_mount_conflicts
+from django_bolt.testing.dbshare import SharedConnections
+
+logger = logging.getLogger(__name__)
 
 try:
     from django.conf import settings
+    from django.core.exceptions import ImproperlyConfigured
+    from django.db import connections
 except ImportError:
     settings = None  # type: ignore
+    ImproperlyConfigured = None  # type: ignore
+    connections = None  # type: ignore
+
+
+class BoltTestClientWarning(RuntimeWarning):
+    """Advisory about a test setup that TestClient cannot serve correctly.
+
+    It has its own category, thus you can stop it with
+    ``warnings.simplefilter("ignore", BoltTestClientWarning)``.
+    """
+
+
+# Emitted at most once per process. The point is to explain a confusing
+# failure mode once, not to annotate every call site: a suite that mixes
+# database-free TestClient tests with a transactional marker would otherwise
+# repeat this on every one of them. Test suites enter clients from several
+# threads, so the check and the set have to be one atomic step.
+_atomic_block_warning_emitted = threading.Event()
+_atomic_block_warning_lock = threading.Lock()
+
+
+def _warn_if_inside_atomic_block() -> None:
+    """Give a warning when the test that enters the client holds a transaction.
+
+    Requests go through the Rust pipeline, thus handlers run on framework
+    threads that have their own database connections. A test that puts itself
+    in a transaction (Django's ``TestCase``, or pytest-django's plain
+    ``django_db``) does not commit. Thus the handler cannot read those rows.
+    On SQLite the write lock of the test also stops the query of the handler,
+    which gives ``database table is locked``. In the two conditions the symptom
+    is an unclear 500 that does not show the cause.
+
+    The warning is advisory. A test whose handlers do not use the database is
+    correct in a transaction, thus this function must not stop the run.
+
+    The synchronous client is the only caller. In an event loop, Django gives a
+    different connection object, thus the transaction of the test is not
+    visible and there is nothing to detect.
+    """
+    if connections is None or _atomic_block_warning_emitted.is_set():
+        return
+    if settings is None or not settings.configured:
+        return
+    try:
+        open_aliases = [conn.alias for conn in connections.all(initialized_only=True) if conn.in_atomic_block]
+    except ImproperlyConfigured as exc:  # DATABASES missing or malformed
+        logger.debug("Could not inspect database transaction state: %s", exc)
+        return
+    if not open_aliases:
+        return
+    with _atomic_block_warning_lock:
+        if _atomic_block_warning_emitted.is_set():
+            return
+        _atomic_block_warning_emitted.set()
+    warnings.warn(
+        f"TestClient started in an open database transaction on: {', '.join(open_aliases)}. "
+        "Handlers run on framework threads that have their own database connections. "
+        "Thus they cannot read the rows that this test made, and on SQLite the lock of "
+        "the test shows as an unclear 500. Remove share_db_connection=False, or use "
+        "TransactionTestCase (or pytest-django's django_db(transaction=True)) for tests "
+        "whose handlers use the database. "
+        "See https://bolt.farhana.li/topics/testing/#using-djangos-test-runner",
+        BoltTestClientWarning,
+        stacklevel=3,
+    )
 
 
 class BoltTestTransport(httpx.BaseTransport):
@@ -347,6 +420,7 @@ class TestClient(httpx.Client):
         read_django_settings: bool = True,
         use_http_layer: bool = True,  # Ignored - kept for backward compatibility
         static_files_config: dict | None = None,
+        share_db_connection: bool = True,
         **kwargs: Any,
     ):
         """Initialize test client.
@@ -363,6 +437,12 @@ class TestClient(httpx.Client):
             static_files_config: Static files configuration dict with keys:
                                  url_prefix, directories, csp_header.
                                  If None and read_django_settings=True, reads from Django settings.
+            share_db_connection: If True (the default), handlers use the database
+                                 connection of the test while the client is open, so
+                                 plain ``TestCase`` and ``django_db`` see the rows of
+                                 the test. Set False for a test that holds a cursor
+                                 open across a request; then use ``TransactionTestCase``
+                                 or ``django_db(transaction=True)``.
             **kwargs: Additional arguments passed to httpx.Client
         """
         # use_http_layer is ignored - we always use the HTTP layer now
@@ -448,9 +528,12 @@ class TestClient(httpx.Client):
             **kwargs,
         )
         self.api = api
+        self._db_share = SharedConnections() if share_db_connection else None
 
     def __enter__(self):
         """Enter context manager — runs lifespan startup if configured."""
+        if self._db_share is None or not self._db_share.install():
+            _warn_if_inside_atomic_block()
         if self.api._has_lifespan:
             loop = asyncio.new_event_loop()
             cm = self.api._lifespan_context(self.api)
@@ -476,8 +559,12 @@ class TestClient(httpx.Client):
                 self._lifespan_loop.run_until_complete(self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb))
                 self._lifespan_loop.close()
         finally:
-            with contextlib.suppress(builtins.BaseException):
-                _core.destroy_test_app(self.app_id)
+            try:
+                if self._db_share is not None:
+                    self._db_share.uninstall()
+            finally:
+                with contextlib.suppress(builtins.BaseException):
+                    _core.destroy_test_app(self.app_id)
         return super().__exit__(exc_type, exc_val, exc_tb)
 
     # Override HTTP methods to support stream=True
@@ -491,6 +578,30 @@ class TestClient(httpx.Client):
         response._iter_lines = lambda decode_unicode=True: self._iter_response_lines(response.content, decode_unicode)
         response.iter_lines = response._iter_lines  # type: ignore
 
+        return response
+
+    def send(self, *args: Any, **kwargs: Any) -> Response:
+        """Send one request, and report a shared-connection conflict as itself.
+
+        A conflict is raised on a handler thread, thus the pipeline turns it
+        into a plain 500. The cause belongs to the test that made the request.
+
+        The locks of this thread are given back for the time of the request.
+        See `SharedConnections.park`.
+        """
+        if self._db_share is None:
+            return super().send(*args, **kwargs)
+        # This thread waits in the Rust pipeline until the response arrives, thus
+        # it runs no query. Holding its cursor locks would only block the handler.
+        parked = self._db_share.park()
+        try:
+            response = super().send(*args, **kwargs)
+        except BaseException:
+            self._db_share.raise_if_conflict()
+            raise
+        finally:
+            self._db_share.unpark(parked)
+        self._db_share.raise_if_conflict()
         return response
 
     def get(self, url: str | httpx.URL, *, stream: bool = False, **kwargs: Any) -> Response:
@@ -728,7 +839,13 @@ class AsyncTestClient(httpx.AsyncClient):
         self.api = api
 
     async def __aenter__(self):
-        """Enter async context manager — runs lifespan startup if configured."""
+        """Enter async context manager — runs lifespan startup if configured.
+
+        There is no transaction advisory here, unlike ``TestClient.__enter__``.
+        Django keeps connections in a thread-critical ``asgiref`` Local, so code
+        that runs in an event loop gets its own connection object and cannot
+        read the transaction that the test opened. The check would never fire.
+        """
         if self.api._has_lifespan:
             cm = self.api._lifespan_context(self.api)
             await cm.__aenter__()

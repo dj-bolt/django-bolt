@@ -33,7 +33,7 @@ def test_root_route_through_the_real_pipeline():
     with TestClient(api) as client:
         response = client.get("/")
         assert response.status_code == 200
-        assert response.json() == {"message": "Hello Django"}
+        assert response.json() == {"message": "Hello World"}
 
 
 # ── Validation ──────────────────────────────────────────────────────────────--
@@ -109,6 +109,23 @@ def clean_users(db):
     User.objects.all().delete()
     yield
     User.objects.all().delete()
+
+
+@pytest.mark.django_db  # the guide's default: no transaction=True
+def test_db_backed_route_sees_rows_the_test_has_not_committed():
+    """TestClient lends its connection, thus plain django_db is enough."""
+    User.objects.create(username="dave", email="dave@example.com")
+
+    with TestClient(users_api) as client:
+        response = client.get("/users/mini10")
+        assert response.status_code == 200
+        assert "dave" in {row["username"] for row in response.json()}
+
+
+@pytest.mark.django_db
+def test_rows_a_handler_writes_roll_back_with_the_test():
+    """Nothing from the previous test may survive its rollback."""
+    assert not User.objects.filter(username="dave").exists()
 
 
 @pytest.mark.django_db(transaction=True)
