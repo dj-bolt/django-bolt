@@ -866,7 +866,7 @@ fn parse_rate_limit_config(
     // check can look them up directly (headers are stored lowercase).
     if let Some(key_py) = dict.get("key") {
         if let Ok(key_type) = key_py.extract::<String>(py) {
-            config.key = if key_type == "ip" {
+            config.key = if key_type.eq_ignore_ascii_case("ip") {
                 RateLimitKey::Ip
             } else {
                 RateLimitKey::Header(key_type.to_lowercase())

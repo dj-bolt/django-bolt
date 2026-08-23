@@ -84,3 +84,20 @@ def test_an_invalid_deployment_setting_fails_even_without_a_limited_route():
             return {"ok": True}
 
         TestClient(api)
+
+
+def test_the_ip_key_is_matched_without_regard_to_case():
+    """`key="IP"` must key on the address, not on a header named `ip`."""
+    api = BoltAPI()
+
+    @api.get("/limited")
+    @rate_limit(rps=1, burst=2, key="IP")
+    async def limited():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        for _ in range(3):
+            status = client.get("/limited", headers={"ip": "a"}).status_code
+        assert status == 429
+        # A header named `ip` must not buy a new bucket.
+        assert client.get("/limited", headers={"ip": "b"}).status_code == 429

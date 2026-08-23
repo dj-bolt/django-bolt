@@ -53,6 +53,19 @@ impl IpCidr {
             ));
         }
 
+        // `::ffff:a.b.c.d/n` with n >= 96 is an IPv4 block. Peers are
+        // normalized to IPv4, so store it as one or it never matches.
+        if let IpAddr::V6(v6) = network {
+            if prefix_len >= 96 {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return Ok(IpCidr {
+                        network: IpAddr::V4(v4),
+                        prefix_len: prefix_len - 96,
+                    });
+                }
+            }
+        }
+
         Ok(IpCidr {
             network,
             prefix_len,
@@ -61,8 +74,8 @@ impl IpCidr {
 
     /// Report whether `candidate` is inside this block.
     ///
-    /// An IPv4 block matches an IPv4-mapped IPv6 peer. An explicitly configured
-    /// IPv4-mapped IPv6 block remains IPv6, preserving its prefix length.
+    /// An IPv4 block matches an IPv4-mapped IPv6 peer. An IPv6 block that is
+    /// wider than the mapped range stays IPv6 and never matches IPv4.
     pub fn contains(&self, candidate: &IpAddr) -> bool {
         match self.network {
             IpAddr::V4(network) => match normalize(*candidate) {
@@ -350,10 +363,30 @@ mod tests {
     }
 
     #[test]
-    fn accepts_an_explicit_ipv4_mapped_ipv6_proxy() {
-        let block = IpCidr::parse("::ffff:10.0.0.0/104").unwrap();
-        assert!(block.contains(&"::ffff:10.1.2.3".parse().unwrap()));
-        assert!(!block.contains(&"::ffff:11.1.2.3".parse().unwrap()));
+    fn an_ipv4_mapped_block_trusts_the_ipv4_peer() {
+        // `::ffff:10.0.0.0/104` is `10.0.0.0/8`. The peer arrives as IPv4.
+        let trusted = proxies(&["::ffff:10.0.0.0/104"]);
+        let resolved = resolve(
+            &headers(&[("x-forwarded-for", "203.0.113.9")]),
+            Some("10.0.0.1"),
+            &trusted,
+        );
+        assert_eq!(resolved.as_deref(), Some("203.0.113.9"));
+
+        let outside = resolve(
+            &headers(&[("x-forwarded-for", "203.0.113.9")]),
+            Some("11.0.0.1"),
+            &trusted,
+        );
+        assert_eq!(outside.as_deref(), Some("11.0.0.1"));
+    }
+
+    #[test]
+    fn an_ipv4_mapped_block_narrower_than_the_mapped_prefix_stays_ipv6() {
+        // `/64` covers more than the mapped range, so it is a real IPv6 block.
+        let block = IpCidr::parse("::ffff:0:0/64").unwrap();
+        assert!(block.contains(&"::ffff:0:0:1".parse().unwrap()));
+        assert!(!block.contains(&"10.0.0.1".parse().unwrap()));
     }
 
     #[test]

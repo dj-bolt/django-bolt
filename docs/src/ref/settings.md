@@ -82,7 +82,7 @@ Bolt uses this list to find the canonical client address for
 
 - The list is empty. Bolt keys on the peer address of the connection and ignores every forwarding header.
 - The peer is not in the list. Bolt keys on the peer address. That peer is not a declared proxy, so its headers prove nothing.
-- The peer is in the list. Bolt reads `X-Forwarded-For` from the right and takes the first entry that is not a listed proxy. It falls back to a valid `X-Real-IP`, then the peer address. A malformed chain also falls back to the peer.
+- The peer is in the list. Bolt reads `X-Forwarded-For` from the right and takes the first entry that is not a listed proxy. When every entry is a listed proxy, the client is inside your network and Bolt takes the leftmost entry. Without the header, Bolt falls back to a valid `X-Real-IP`, then the peer address. A malformed chain also falls back to the peer.
 
 Both an address and a block are accepted. `127.0.0.1` matches one address. `10.0.0.0/8` matches the block. An invalid entry raises `ImproperlyConfigured` at startup.
 
