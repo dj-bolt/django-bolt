@@ -35,8 +35,11 @@ impl fmt::Display for LimiterKey {
     }
 }
 
-// Store per-key limiters
-static IP_LIMITERS: Lazy<DashMap<(usize, LimiterKey), Arc<Limiter>>> = Lazy::new(DashMap::new);
+/// Per-key limiters. The quota is part of the identity: handler ids are reused
+/// after a reload or by the next test app, and a stale limiter must not keep
+/// an old quota alive.
+static IP_LIMITERS: Lazy<DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>>> =
+    Lazy::new(DashMap::new);
 
 // Track total limiter count for cleanup
 static LIMITER_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -87,16 +90,18 @@ pub fn check_rate_limit(
     }
 
     // Get or create rate limiter for this handler + key combination
-    let limiter = IP_LIMITERS.entry((handler_id, key)).or_insert_with(|| {
-        // Increment counter
-        LIMITER_COUNT.fetch_add(1, Ordering::Relaxed);
+    let limiter = IP_LIMITERS
+        .entry((handler_id, rps, burst, key))
+        .or_insert_with(|| {
+            // Increment counter
+            LIMITER_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        // Use NonZero constructors properly
-        let rps_nonzero = std::num::NonZeroU32::new(rps.max(1)).unwrap();
-        let burst_nonzero = std::num::NonZeroU32::new(burst.max(1)).unwrap();
-        let quota = Quota::per_second(rps_nonzero).allow_burst(burst_nonzero);
-        Arc::new(RateLimiter::direct(quota))
-    });
+            // Use NonZero constructors properly
+            let rps_nonzero = std::num::NonZeroU32::new(rps.max(1)).unwrap();
+            let burst_nonzero = std::num::NonZeroU32::new(burst.max(1)).unwrap();
+            let quota = Quota::per_second(rps_nonzero).allow_burst(burst_nonzero);
+            Arc::new(RateLimiter::direct(quota))
+        });
 
     // Check rate limit
     match limiter.check() {
@@ -109,7 +114,7 @@ pub fn check_rate_limit(
             // Log rate limit exceeded
             eprintln!(
                 "[django-bolt] Rate limit exceeded: {} {} | key: {} | limit: {} rps (burst: {}) | retry after: {}s",
-                method, path, limiter.key().1, rps, burst, retry_after
+                method, path, limiter.key().3, rps, burst, retry_after
             );
 
             Some(response_builder::build_rate_limit_response(
