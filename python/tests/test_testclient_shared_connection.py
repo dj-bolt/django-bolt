@@ -21,7 +21,13 @@ from django_bolt import BoltAPI
 from django_bolt.testing import AsyncTestClient, TestClient
 from django_bolt.testing import client as client_module
 from django_bolt.testing.client import BoltTestClientWarning
-from django_bolt.testing.dbshare import DEFAULT_LOCK_TIMEOUT, SharedTestConnectionError, lock_timeout
+from django_bolt.testing.dbshare import (
+    DEFAULT_LOCK_TIMEOUT,
+    SharedConnections,
+    SharedTestConnectionError,
+    _Gate,
+    lock_timeout,
+)
 
 User = get_user_model()
 
@@ -270,12 +276,13 @@ def test_nothing_is_shared_when_the_test_commits():
 
 
 # ── configuration and concurrent entry ────────────────────────────────────────
-@pytest.mark.parametrize("bad", ["nan", "inf", "-1", "-5", "abc"])
+@pytest.mark.parametrize("bad", ["nan", "inf", "0", "-1", "-5", "abc"])
 def test_a_bad_lock_timeout_is_rejected(monkeypatch, bad):
     """Every one of these breaks the lock, thus none may pass silently.
 
-    ``nan`` and ``-5`` make ``acquire()`` raise, ``inf`` overflows, ``-1`` means
-    wait forever, and text used to fall back to the default with no report.
+    ``nan`` and ``-5`` make ``acquire()`` raise, and ``inf`` overflows. Zero and
+    ``-1`` are not waits at all: ``-1`` means wait forever. Text used to fall
+    back to the default with no report.
     """
     monkeypatch.setenv("DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT", bad)
     with pytest.raises(ValueError, match="DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT"):
@@ -324,10 +331,72 @@ def test_nested_clients_on_one_thread_still_work():
     """Nesting on one thread is legal, and the outer client keeps working."""
     User.objects.create(username="nested", email="n@example.com")
 
-    with TestClient(_make_api()) as outer:
-        with TestClient(_make_api()) as inner:
-            assert inner.get("/count").json()["n"] == 1
+    with TestClient(_make_api()) as outer, TestClient(_make_api()) as inner:
+        assert inner.get("/count").json()["n"] == 1
         assert outer.get("/count").json()["n"] == 1
+
+
+@pytest.mark.django_db
+def test_an_inner_client_parks_the_locks_of_the_outer_one():
+    """A nested client reuses the sharing of the outer one, and does not re-wrap.
+
+    With its own gates, the inner client would park only those. The locks the
+    test holds through the outer client would stay held, its handler would wait
+    for them, and the request would come back as a plain 500.
+    """
+    for i in range(6):
+        User.objects.create(username=f"u{i}", email=f"u{i}@example.com")
+
+    with TestClient(_make_api()):
+        for _ in User.objects.iterator(chunk_size=1):
+            with TestClient(_make_api()) as inner:
+                assert inner.get("/count").json()["n"] == 6
+            break
+
+
+def test_a_lock_lost_by_unpark_is_not_released_twice():
+    """A failed `unpark` must not turn into `RuntimeError` at cursor close.
+
+    `park` gives the locks of this thread back. If another thread takes one and
+    keeps it, `unpark` cannot take it back and reports that. The cursor then
+    closes and releases, and a release of a lock this thread does not hold
+    raises `RuntimeError`, which would hide the error already reported.
+    """
+    share = SharedConnections(timeout=0.2)
+    gate = _Gate()
+    share._gates.append(gate)
+
+    gate.lock.acquire()
+    gate.took()
+    parked = share.park()
+    assert parked == [1]
+
+    taken = threading.Event()
+    release_it = threading.Event()
+
+    def other_thread():
+        gate.lock.acquire()
+        taken.set()
+        release_it.wait(5)
+        gate.lock.release()
+
+    thread = threading.Thread(target=other_thread)
+    thread.start()
+    assert taken.wait(5)
+
+    with pytest.raises(SharedTestConnectionError):
+        share.unpark(parked)
+
+    # What the cursor does when it closes, after the failed unpark.
+    gate.gave_back()
+    if gate.lost():
+        gate.found()
+    else:
+        gate.lock.release()
+
+    release_it.set()
+    thread.join(5)
+    assert gate.lost() == 0
 
 
 # ── the client must leave Django as it found it ───────────────────────────────

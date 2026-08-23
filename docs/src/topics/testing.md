@@ -269,8 +269,8 @@ ROLLBACK — the row is removed
 ```
 
 This is the mechanism Django uses for its own live-server tests. A row that a
-handler writes lands in the transaction of the test in the same way, thus the
-test reads it, and rollback removes it.
+handler writes lands in the same transaction. Thus the test reads it, and
+rollback removes it.
 
 ### Its one limit
 
@@ -501,8 +501,8 @@ async def test_async():
 ```
 
 `AsyncTestClient` does not share the connection of the test. Django keeps its
-connections in a thread-critical `asgiref` Local, thus code in an event loop
-gets a different connection object and cannot join the transaction of the test.
+connections in a thread-critical `asgiref` Local. Thus code in an event loop
+gets its own connection object, and cannot join the transaction of the test.
 For an async test whose handlers use the database, commit the rows with
 `@pytest.mark.django_db(transaction=True)`.
 

@@ -53,7 +53,7 @@ DEFAULT_LOCK_TIMEOUT = 10.0
 # thread is legal, and the depth counts it.
 _active_lock = threading.Lock()
 _active_owner: int | None = None
-_active_depth = 0
+_active: SharedConnections | None = None
 
 
 class SharedTestConnectionError(RuntimeError):
@@ -162,6 +162,16 @@ class _Gate:
     def gave_back(self) -> None:
         self.local.held = self.depth() - 1
 
+    def lost(self) -> int:
+        """Locks this thread parked and could not take back. See `lose`."""
+        return getattr(self.local, "lost", 0)
+
+    def lose(self, count: int) -> None:
+        self.local.lost = self.lost() + count
+
+    def found(self) -> None:
+        self.local.lost = self.lost() - 1
+
 
 class _CursorProxy:
     """Holds the connection lock while the cursor of one query is open.
@@ -215,6 +225,7 @@ class SharedConnections:
         self._restores: list[Callable[[], None]] = []
         self._previous_store: Any = None
         self._installed = False
+        self._outer: SharedConnections | None = None
 
     # -- lifecycle ---------------------------------------------------------
     def install(self) -> bool:
@@ -227,17 +238,25 @@ class SharedConnections:
         Raises `SharedTestConnectionError` when another thread already shares
         its connections. See the note on `_active_owner`.
         """
-        global _active_owner, _active_depth
+        global _active, _active_owner
 
         if connections is None:
             return False
         with _active_lock:
-            if _active_owner is not None and _active_owner != threading.get_ident():
-                raise SharedTestConnectionError(_CROSS_THREAD_MESSAGE)
+            if _active_owner is not None:
+                if _active_owner != threading.get_ident():
+                    raise SharedTestConnectionError(_CROSS_THREAD_MESSAGE)
+                # A client inside another client on the same thread. Wrapping
+                # the cursors a second time would give this client its own
+                # gates, and it would park only those. The locks of the outer
+                # client would stay held, and its handler would wait for the
+                # test that is waiting for it. Reuse the outer sharing instead.
+                self._outer = _active
+                return True
             installed = self._install_locked()
             if installed:
                 _active_owner = threading.get_ident()
-                _active_depth += 1
+                _active = self
             return installed
 
     def _install_locked(self) -> bool:
@@ -268,8 +287,9 @@ class SharedConnections:
         return True
 
     def uninstall(self) -> None:
-        global _active_owner, _active_depth
+        global _active, _active_owner
 
+        self._outer = None
         if not self._installed:
             return
         with _active_lock:
@@ -282,9 +302,8 @@ class SharedConnections:
             self._connections.clear()
             self._gates.clear()
             self._restores.clear()
-            _active_depth -= 1
-            if _active_depth == 0:
-                _active_owner = None
+            _active_owner = None
+            _active = None
 
     # -- guarding ----------------------------------------------------------
     def _guard(self, conn: Any) -> Callable[[], None]:
@@ -313,6 +332,12 @@ class SharedConnections:
     def _make_guarded(self, conn: Any, original: Callable[..., Any], gate: _Gate) -> Callable[..., Any]:
         def release() -> None:
             gate.gave_back()
+            if gate.lost():
+                # `unpark` could not take this one back, thus this thread does
+                # not hold it. Releasing it raises RuntimeError, which would
+                # hide the error that `unpark` already reported.
+                gate.found()
+                return
             gate.lock.release()
 
         def guarded(*args: Any, **kwargs: Any) -> _CursorProxy:
@@ -330,7 +355,7 @@ class SharedConnections:
         return guarded
 
     # -- parking ------------------------------------------------------------
-    def park(self) -> list[int] | None:
+    def park(self) -> list[int] | None:  # noqa: D401 - see the delegation note
         """Give back the locks of this thread while it waits for a response.
 
         A thread that waits in ``client.get()`` is blocked in the Rust
@@ -342,6 +367,8 @@ class SharedConnections:
         The thread takes its locks again in `unpark`. Returns the depth of each
         gate, or None when this thread holds nothing, which is the usual case.
         """
+        if self._outer is not None:
+            return self._outer.park()
         counts = [gate.depth() for gate in self._gates]
         if not any(counts):
             return None
@@ -352,11 +379,15 @@ class SharedConnections:
 
     def unpark(self, counts: list[int] | None) -> None:
         """Take the locks back, in the numbers `park` gave back."""
+        if self._outer is not None:
+            self._outer.unpark(counts)
+            return
         if not counts:
             return
         for gate, held in zip(self._gates, counts, strict=True):
-            for _ in range(held):
+            for taken in range(held):
                 if not gate.lock.acquire(timeout=self.timeout):
+                    gate.lose(held - taken)
                     self.conflict = "default"
                     raise SharedTestConnectionError(self._conflict_message("default"))
 
@@ -392,6 +423,9 @@ class SharedConnections:
 
     def raise_if_conflict(self) -> None:
         """Re-raise a conflict on the thread of the test, not as a bare 500."""
+        if self._outer is not None:
+            self._outer.raise_if_conflict()
+            return
         alias = self.conflict
         if alias is None:
             return
