@@ -25,12 +25,15 @@ Usage:
         assert response == "Echo: hello"
 """
 
-from django_bolt.testing.client import AsyncTestClient, TestClient
+from django_bolt.testing.client import AsyncTestClient, BoltTestClientWarning, TestClient
+from django_bolt.testing.dbshare import SharedTestConnectionError
 from django_bolt.testing.websocket import ConnectionClosed, WebSocketTestClient
 
 __all__ = [
     "TestClient",
     "AsyncTestClient",
+    "BoltTestClientWarning",
+    "SharedTestConnectionError",
     "WebSocketTestClient",
     "ConnectionClosed",
 ]

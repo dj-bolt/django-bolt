@@ -214,8 +214,7 @@ def client(api):
 
 ## Endpoints that use the database
 
-When a handler touches the Django ORM, mark the test with
-`@pytest.mark.django_db(transaction=True)`:
+Mark the test with `@pytest.mark.django_db`, the same as any other Django test:
 
 ```python
 import pytest
@@ -234,7 +233,7 @@ def api():
 
     return api
 
-@pytest.mark.django_db(transaction=True)
+@pytest.mark.django_db
 def test_get_user(api):
     user = User.objects.create(username="testuser", email="test@example.com")
 
@@ -244,92 +243,98 @@ def test_get_user(api):
         assert response.json()["username"] == "testuser"
 ```
 
-### Why `transaction=True` is required
+Rollback removes the rows after the test, thus you do not have to delete them
+yourself, and no marker option is necessary.
 
-This one trips everyone up once, so it's worth understanding. `TestClient`
-runs your handlers on the Rust/Actix side, in a separate thread with its own
-database connection. pytest-django's default `django_db` mark wraps each test
-in a transaction that is rolled back at the end — which means the data your
-test creates is never committed, and a second connection can't see it:
+### How a handler reads rows the test did not commit
+
+`TestClient` sends requests through the Rust pipeline, thus your handlers run
+on framework threads. Django gives each thread its own database connection. The
+row that `User.objects.create()` made is in the transaction of the test and is
+not committed, thus a second connection cannot read it:
 
 ```
-Test Thread (Connection A)          Rust/Actix Thread (Connection B)
-─────────────────────────          ─────────────────────────────────
+Test thread (connection A)          Handler thread (connection B)
+──────────────────────────          ─────────────────────────────
 BEGIN TRANSACTION
 User.objects.create(id=1)
-  ↓ (uncommitted)
+  ↓ (not committed)
                                     TestClient.get("/users/1")
                                       ↓
                                     await User.objects.aget(id=1)
                                       ↓
-                                    ❌ Not found! (can't see uncommitted)
+                                    ❌ not found
 ROLLBACK
 ```
 
-With `transaction=True`, data is committed immediately and every connection
-sees it:
+While the client is open, `TestClient` lends the connection of the test to the
+handler threads. They are then in the same transaction, thus they read the same
+rows:
 
 ```
-Test Thread                         Rust/Actix Thread
-───────────                         ─────────────────
+Test thread                         Handler thread
+───────────                         ──────────────
+BEGIN TRANSACTION
 User.objects.create(id=1)
-  ↓ (committed immediately)
+  ↓ (not committed)
                                     TestClient.get("/users/1")
-                                      ↓
+                                      ↓ same connection
                                     await User.objects.aget(id=1)
                                       ↓
-                                    ✅ Found! (committed data visible)
+                                    ✅ found
+ROLLBACK — the row is removed
 ```
 
-### Cleaning up between tests
+This is the mechanism Django uses for its own live-server tests. A row that a
+handler writes goes into the transaction of the test in the same way, thus the
+test can read it, and rollback removes it.
 
-The flip side of committing for real is that rollback no longer cleans up for
-you. Delete your test data explicitly — an autouse fixture keeps this out of
-the tests themselves:
+### When to switch the sharing off
+
+One connection cannot serve two threads at the same moment. `TestClient` puts a
+lock on the shared connection, thus database work from the test and from a
+handler waits its turn in place of corrupting rows. One condition cannot be made
+to wait: a test that holds a cursor open across a request, because the test is
+the holder. `QuerySet.iterator()` is the usual cause:
 
 ```python
-import pytest
-from django_bolt.testing import TestClient
-from myapp.models import User
-from myapp.api import api
-
-@pytest.fixture(autouse=True)
-def clean_db(db):
-    """Clean database before and after each test."""
-    User.objects.all().delete()
-    yield
-    User.objects.all().delete()
-
-
-@pytest.mark.django_db(transaction=True)
-class TestUserEndpoints:
-
-    def test_get_user(self):
-        user = User.objects.create(username="testuser")
-
-        with TestClient(api) as client:
-            response = client.get(f"/users/{user.id}")
-            assert response.status_code == 200
-            assert response.json()["username"] == "testuser"
-
-    def test_list_users(self):
-        User.objects.create(username="user1")
-        User.objects.create(username="user2")
-
-        with TestClient(api) as client:
-            response = client.get("/users")
-            assert response.status_code == 200
-            assert response.json()["count"] == 2
+for user in User.objects.iterator():     # holds a cursor open
+    client.get(f"/users/{user.id}")      # the handler cannot get the connection
 ```
+
+Bolt raises `SharedTestConnectionError` here, in place of a 500 with no cause.
+Read the rows into a list first:
+
+```python
+for user in list(User.objects.all()):
+    client.get(f"/users/{user.id}")
+```
+
+Or switch the sharing off and commit the rows instead:
+
+```python
+@pytest.mark.django_db(transaction=True)
+def test_iterating(api):
+    with TestClient(api, share_db_connection=False) as client:
+        for user in User.objects.iterator():
+            client.get(f"/users/{user.id}")
+```
+
+With `share_db_connection=False` the handler threads use their own connections
+again, thus the test must commit its rows: use
+`@pytest.mark.django_db(transaction=True)`, or `TransactionTestCase`. Those
+commit each row, and the tables are flushed after the test.
+
+The lock has a limit of 10 seconds. Set `DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT` to
+change it.
 
 ### Or create data through the API
 
 For end-to-end flows, skip the ORM in the test entirely and create data
-through the API itself. Whatever the endpoints write is committed and visible,
-so there's nothing to coordinate:
+through the API itself:
 
 ```python
-@pytest.mark.django_db(transaction=True)
+@pytest.mark.django_db
 def test_create_and_get_user():
     with TestClient(api) as client:
         create_response = client.post(
@@ -379,7 +384,7 @@ def api():
 
     return api
 
-@pytest.mark.django_db(transaction=True)
+@pytest.mark.django_db
 def test_article_viewset(api):
     Article.objects.create(title="Test Article", content="Content")
 
@@ -391,6 +396,65 @@ def test_article_viewset(api):
         response = client.get("/articles/1")
         assert response.status_code == 200
         assert response.json()["title"] == "Test Article"
+```
+
+## Using Django's test runner
+
+The sections above use pytest. The `manage.py test` runner also works, but you
+must make one change.
+
+**Django's test client does not find Bolt routes.** `self.client` looks for the
+route in `ROOT_URLCONF`. Bolt handlers are in the Rust router, not in the Django
+URL configuration. Thus a request to a route that exists gives a 404:
+
+```python
+from django.test import TestCase
+
+
+class Wrong(TestCase):
+    def test_slides(self):
+        response = self.client.get("/slides/")
+        assert response.status_code == 404  # not registered in ROOT_URLCONF
+```
+
+Use `TestClient` in its place. `TestClient` sends the request through the Rust
+pipeline. Thus routing, middleware, and authentication operate as they do in
+production.
+
+`TestCase` is correct for handlers that use the database, because `TestClient`
+lends the connection of the test to the handler threads. No special base class
+and no marker are necessary:
+
+```python
+from django.test import TestCase
+from django_bolt.testing import TestClient
+
+from .api import api
+from .models import Slide
+
+
+class TestSlides(TestCase):
+    def test_lists_slides(self):
+        slide = Slide.objects.create(description="hello")
+
+        with TestClient(api) as client:
+            response = client.get("/slides/")
+            assert response.status_code == 200
+            assert response.json() == [{"id": slide.pk, "description": "hello"}]
+```
+
+Use `TransactionTestCase` for a test that switches the sharing off with
+`TestClient(api, share_db_connection=False)`. See
+[When to switch the sharing off](#when-to-switch-the-sharing-off). Such a test
+gets a `BoltTestClientWarning` if it stays on `TestCase`, because the handler
+then cannot read its rows. To stop the warning, use this filter:
+
+```python
+import warnings
+
+from django_bolt.testing import BoltTestClientWarning
+
+warnings.simplefilter("ignore", BoltTestClientWarning)
 ```
 
 ## Authenticated endpoints
@@ -415,7 +479,7 @@ async def private():
     return {"ok": True}
 
 
-@pytest.mark.django_db(transaction=True)
+@pytest.mark.django_db
 def test_private_requires_a_token():
     user = User.objects.create_user(username="alice", password="s3cret")
     token = create_jwt_for_user(user)
@@ -485,6 +549,12 @@ async def test_async():
         assert response.status_code == 200
         assert response.json() == {"message": "world"}
 ```
+
+`AsyncTestClient` does not share the connection of the test. Django keeps its
+connections in a thread-critical `asgiref` Local, thus code in an event loop
+gets a different connection object and cannot join the transaction of the test.
+For an async test whose handlers use the database, commit the rows with
+`@pytest.mark.django_db(transaction=True)`.
 
 ## Testing against a live server
 
