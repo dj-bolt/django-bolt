@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Rate-limit buckets key on a hash** - A bucket key was stored as its own text. The map now holds an 8-byte hash of it, seeded once per process so a caller cannot craft a value that lands in another caller's bucket. Nothing is allocated per request, and the identity path matches the `key="ip"` path. This removes the 256-byte limit on a key: `@rate_limit(key="<header>")` with a long value, such as `key="authorization"` with a JWT, returned `400 Rate limit key too long` and now counts like any other value. (#301)
+
 - **`@rate_limit(key="user")` and `key="api_key"` count per identity** - Both keys were documented but never implemented. They fell into the header catch-all, matched no header, and resolved to one shared bucket. A route marked "per user" was one global limit that one caller could exhaust for everyone. Both keys now run after authentication and count per `AuthContext` identity: any backend for `"user"`, API keys only for `"api_key"`. A caller with no identity is counted per client address. A route with an identity key and no auth backend fails at startup. `key="ip"` and header keys still run before authentication. (#301)
 
 ### Security

@@ -88,16 +88,20 @@ def test_a_header_key_buckets_on_the_header_value(make_server_project):
         # The header route and the address route keep separate buckets.
         by_ip = server.request("GET", "/limited")
 
-        too_long = server.request("GET", "/limited-by-header", headers={"X-Tenant": "t" * 257})
-        longest_allowed = server.request("GET", "/limited-by-header", headers={"X-Tenant": "u" * 256})
+        # A long value is hashed like any other, so nothing caps its length.
+        # `key="authorization"` with a JWT lands here.
+        long_value = server.request("GET", "/limited-by-header", headers={"X-Tenant": "t" * 4096})
+        other_long_value = server.request(
+            "GET", "/limited-by-header", headers={"X-Tenant": "u" * 4096}
+        )
 
     assert other_tenant.status_code == 200, other_tenant.text
     assert same_tenant.status_code == 429, same_tenant.text
     assert missing_again.status_code == 429, missing_again.text
     assert by_ip.status_code == 200, by_ip.text
-    assert too_long.status_code == 400, too_long.text
-    assert too_long.json() == {"detail": "Rate limit key too long"}
-    assert longest_allowed.status_code == 200, longest_allowed.text
+    # Two long values, two buckets. Neither is rejected for its length.
+    assert long_value.status_code == 200, long_value.text
+    assert other_long_value.status_code == 200, other_long_value.text
 
 
 # ---------------------------------------------------------------------------

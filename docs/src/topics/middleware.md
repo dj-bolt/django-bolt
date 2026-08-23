@@ -77,7 +77,8 @@ Parameters:
 ### Counting per caller
 
 `key="ip"` counts per client address. A header name counts per header value.
-Callers that do not send the header share one bucket.
+Callers that do not send the header share one bucket. Bolt hashes the value,
+so its length is not limited.
 
 `key="user"` counts per authenticated identity. `key="api_key"` counts per
 authenticated API key. Both run after authentication:
