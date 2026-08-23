@@ -248,28 +248,11 @@ yourself, and no marker option is necessary.
 
 ### How a handler reads rows the test did not commit
 
-`TestClient` sends requests through the Rust pipeline, thus your handlers run
-on framework threads. Django gives each thread its own database connection. The
-row that `User.objects.create()` made is in the transaction of the test and is
-not committed, thus a second connection cannot read it:
-
-```text
-Test thread (connection A)          Handler thread (connection B)
-──────────────────────────          ─────────────────────────────
-BEGIN TRANSACTION
-User.objects.create(id=1)
-  ↓ (not committed)
-                                    TestClient.get("/users/1")
-                                      ↓
-                                    await User.objects.aget(id=1)
-                                      ↓
-                                    ❌ not found
-ROLLBACK
-```
-
-While the client is open, `TestClient` lends the connection of the test to the
-handler threads. They are then in the same transaction, thus they read the same
-rows:
+Handlers run on framework threads, and Django gives each thread its own database
+connection. A row that the test has not committed is therefore invisible to a
+second connection. While the client is open, `TestClient` lends the connection
+of the test to those threads, so they read and write inside the same
+transaction:
 
 ```text
 Test thread                         Handler thread
@@ -286,57 +269,25 @@ ROLLBACK — the row is removed
 ```
 
 This is the mechanism Django uses for its own live-server tests. A row that a
-handler writes goes into the transaction of the test in the same way. Thus the
-test can read it, and rollback removes it.
+handler writes lands in the transaction of the test in the same way, thus the
+test reads it, and rollback removes it.
 
-### When to switch the sharing off
+### Its one limit
 
-One connection cannot serve two threads at the same moment. `TestClient` puts a
-lock on the shared connection. Thus database work from the test and from a
-handler waits its turn, in place of corrupting rows.
+One connection serves one thread at a time. Bolt handles this for you: work from
+the test and work from a handler waits its turn.
 
-A request inside a `QuerySet.iterator()` loop is safe. The thread that makes the
-request waits in the Rust pipeline and runs no query, thus it gives its lock
-back for the time of the request and takes it again after:
-
-```python
-for user in User.objects.iterator():     # holds a cursor open
-    client.get(f"/users/{user.id}")      # safe: this thread parks its lock
-```
-
-A second thread of the test cannot be parked in that way, because it is not
-waiting for the response. If such a thread holds a cursor open, the handler
-waits for it, and Bolt raises `SharedTestConnectionError` in place of a 500 with
-no cause. Read the rows in that thread first:
-
-```python
-for user in list(User.objects.all()):
-    ...
-```
-
-Or switch the sharing off and commit the rows instead:
+It cannot do so for a second thread of your own that uses the database while a
+request runs. That raises `SharedTestConnectionError`, which names the fix.
+Usually the fix is `share_db_connection=False`, which gives the handlers their
+own connections again and needs the rows committed:
 
 ```python
 @pytest.mark.django_db(transaction=True)
-def test_background_thread(api):
+def test_with_a_worker_thread(api):
     with TestClient(api, share_db_connection=False) as client:
         ...
 ```
-
-With `share_db_connection=False` the handler threads use their own connections
-again, thus the test must commit its rows: use
-`@pytest.mark.django_db(transaction=True)`, or `TransactionTestCase`. Those
-commit each row, and the tables are flushed after the test.
-
-Two tests must not enter a `TestClient` in two threads at the same time. The
-connection store of Django is process-wide, thus the second client would lend
-the connection of the first test to its own handlers. Bolt refuses this and
-names the fixes. No test runner does it: pytest runs the tests one after the
-other, and pytest-xdist and `manage.py test --parallel` each use a separate
-process.
-
-The lock has a limit of 10 seconds. Set `DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT` to
-change it.
 
 ### Or create data through the API
 
@@ -410,30 +361,13 @@ def test_article_viewset(api):
 
 ## Using Django's test runner
 
-The sections above use pytest. The `manage.py test` runner also works, but you
-must make one change.
+The sections above use pytest. `manage.py test` works too, with one change:
+**Django's test client does not find Bolt routes.** `self.client` looks in
+`ROOT_URLCONF`, and Bolt handlers are in the Rust router, so a route that exists
+gives a 404. Use `TestClient` in its place.
 
-**Django's test client does not find Bolt routes.** `self.client` looks for the
-route in `ROOT_URLCONF`. Bolt handlers are in the Rust router, not in the Django
-URL configuration. Thus a request to a route that exists gives a 404:
-
-```python
-from django.test import TestCase
-
-
-class Wrong(TestCase):
-    def test_slides(self):
-        response = self.client.get("/slides/")
-        assert response.status_code == 404  # not registered in ROOT_URLCONF
-```
-
-Use `TestClient` in its place. `TestClient` sends the request through the Rust
-pipeline. Thus routing, middleware, and authentication operate as they do in
-production.
-
-`TestCase` is correct for handlers that use the database, because `TestClient`
-lends the connection of the test to the handler threads. No special base class
-and no marker are necessary:
+`TestCase` is the right base class, including for handlers that use the
+database:
 
 ```python
 from django.test import TestCase
@@ -453,19 +387,10 @@ class TestSlides(TestCase):
             assert response.json() == [{"id": slide.pk, "description": "hello"}]
 ```
 
-Use `TransactionTestCase` for a test that switches the sharing off with
-`TestClient(api, share_db_connection=False)`. See
-[When to switch the sharing off](#when-to-switch-the-sharing-off). Such a test
-gets a `BoltTestClientWarning` if it stays on `TestCase`, because the handler
-then cannot read its rows. To stop the warning, use this filter:
-
-```python
-import warnings
-
-from django_bolt.testing import BoltTestClientWarning
-
-warnings.simplefilter("ignore", BoltTestClientWarning)
-```
+Use `TransactionTestCase` only for a test that passes
+[`share_db_connection=False`](#its-one-limit). Such a test gets a
+`BoltTestClientWarning` if it stays on `TestCase`. Silence it with
+`warnings.simplefilter("ignore", BoltTestClientWarning)`.
 
 ## Authenticated endpoints
 
