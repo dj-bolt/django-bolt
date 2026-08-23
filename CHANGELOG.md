@@ -12,7 +12,7 @@ All notable changes to this project will be documented in this file.
 
 ### Performance
 
-- **Faster `Response` serialization** - A `Response` now builds its wire metadata straight from its media type. Before, the content-type went into a copied header dict, and a second pass read it back out. A `Response` with no custom headers and no cookies now uses the static integer metadata tag. Per response, the metadata step drops from about 517 ns to 78 ns. Bytes bodies also render about 40% faster, because exact `bytes` now pass through unchanged.
+- **Faster `Response` serialization** - A `Response` now builds its wire metadata straight from its media type. Before, the content-type went into a copied header dict, and a second pass read it back out. A `Response` with no custom headers and no cookies now uses the static integer metadata tag. This applies to the four media types that match a static Rust content-type, and includes the `application/json` default. Any other media type keeps a metadata tuple. Per response, the metadata step drops from about 517 ns to 78 ns. Bytes bodies also render about 40% faster, because exact `bytes` now pass through unchanged.
 
 ### Security
 
