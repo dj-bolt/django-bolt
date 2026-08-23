@@ -891,19 +891,20 @@ async fn handle_test_request_internal(
     let conn_scheme = conn_info.scheme().to_owned();
     let conn_remote_addr = client_ip;
 
-    // Rate limiting
-    if let Some(ref meta) = route_meta {
-        if let Some(ref rate_config) = meta.rate_limit_config {
-            if let Some(response) = middleware::rate_limit::check_rate_limit(
-                handler_id,
-                &headers,
-                client_ip.as_ref(),
-                rate_config,
-                method,
-                path,
-            ) {
-                return response;
-            }
+    // Rate limiting: address and header keys before auth, identity keys after.
+    let rate_config = route_meta
+        .as_ref()
+        .and_then(|m| m.rate_limit_config.as_ref());
+    if let Some(rate_config) = rate_config {
+        if let Some(response) = middleware::rate_limit::check_before_auth(
+            handler_id,
+            &headers,
+            client_ip.as_ref(),
+            rate_config,
+            method,
+            path,
+        ) {
+            return response;
         }
     }
 
@@ -930,6 +931,20 @@ async fn handle_test_request_internal(
     } else {
         None
     };
+
+    if let Some(rate_config) = rate_config {
+        if let Some(response) = middleware::rate_limit::check_after_auth(
+            handler_id,
+            &headers,
+            client_ip.as_ref(),
+            auth_ctx.as_ref(),
+            rate_config,
+            method,
+            path,
+        ) {
+            return response;
+        }
+    }
 
     // Cookies
     let needs_cookies = route_meta
@@ -1330,10 +1345,12 @@ pub fn handle_test_websocket(
 
     let handler_id = route.handler_id;
     let handler = route.handler.clone_ref(py);
-    // Rate limiting for WebSocket
+    // Rate limiting for WebSocket: address and header keys before auth,
+    // identity keys after it.
+    let mut client_ip = None;
     if let Some(route_meta) = app.route_metadata.get(handler_id) {
         if let Some(ref rate_config) = route_meta.rate_limit_config {
-            let client_ip = (rate_config.key == RateLimitKey::Ip)
+            client_ip = (!matches!(rate_config.key, RateLimitKey::Header(_)))
                 .then(|| {
                     bolt_core::middleware::client_ip::resolve(
                         header_map
@@ -1348,7 +1365,7 @@ pub fn handle_test_websocket(
                     )
                 })
                 .flatten();
-            if bolt_core::middleware::rate_limit::check_rate_limit(
+            if bolt_core::middleware::rate_limit::check_before_auth(
                 handler_id,
                 &header_map,
                 client_ip.as_ref(),
@@ -1389,6 +1406,26 @@ pub fn handle_test_websocket(
                         ),
                     ));
                 }
+            }
+        }
+
+        // After guards, mirroring the production upgrade path: a rejected
+        // upgrade must not spend the bucket it would have been counted in.
+        if let Some(rate_config) = route_meta.rate_limit_config.as_ref() {
+            if bolt_core::middleware::rate_limit::check_after_auth(
+                handler_id,
+                &header_map,
+                client_ip.as_ref(),
+                auth_ctx.as_ref(),
+                rate_config,
+                "GET",
+                &path,
+            )
+            .is_some()
+            {
+                return Err(pyo3::exceptions::PyPermissionError::new_err(
+                    "Rate limit exceeded",
+                ));
             }
         }
     }

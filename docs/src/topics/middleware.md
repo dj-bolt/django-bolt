@@ -72,7 +72,28 @@ Parameters:
 
 - `rps` - Requests per second allowed
 - `burst` - Maximum burst size (allows short spikes)
-- `key` - What to count per (`"ip"` by default)
+- `key` - What to count per: `"ip"` (the default), `"user"`, `"api_key"` or a request header name
+
+### Counting per caller
+
+`key="ip"` counts per client address. A header name counts per header value.
+Callers that do not send the header share one bucket. Bolt hashes the value,
+so its length is not limited.
+
+`key="user"` counts per authenticated identity. `key="api_key"` counts per
+authenticated API key. Both run after authentication:
+
+```python
+@api.get("/api/data", auth=[JWTAuthentication()])
+@rate_limit(rps=10, key="user")
+async def data():
+    return {"data": []}
+```
+
+A caller with no identity is counted per client address. A guard such as
+`IsAuthenticated` rejects that caller before the limit is counted. Both keys
+need an auth backend on the route or the API. Without one, the server does
+not start.
 
 ### Client address behind a proxy
 

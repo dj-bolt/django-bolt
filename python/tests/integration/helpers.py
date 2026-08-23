@@ -708,6 +708,61 @@ def create_server_project(
     return project
 
 
+def attempt_ws_upgrade(
+    host: str, port: int, path: str, *, headers: dict[str, str] | None = None, timeout: float = 5.0
+) -> tuple[str, str]:
+    """Send a raw WebSocket upgrade request and return (status_line, body_text).
+
+    Unlike `SimpleWebSocketClient`, this captures the full response (including
+    the error body) so a *rejected* upgrade can be inspected rather than
+    asserting a 101 handshake.
+    """
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+    request = "\r\n".join(
+        [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host}:{port}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+            *(f"{name}: {value}" for name, value in (headers or {}).items()),
+            "",
+            "",
+        ]
+    )
+
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(request.encode("utf-8"))
+
+        buf = bytearray()
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+
+        header_part, _, body_part = bytes(buf).partition(b"\r\n\r\n")
+        header_text = header_part.decode("utf-8", errors="replace")
+
+        content_length = 0
+        for line in header_text.splitlines()[1:]:
+            if line.lower().startswith("content-length:"):
+                content_length = int(line.split(":", 1)[1].strip())
+                break
+
+        body = bytearray(body_part)
+        while len(body) < content_length:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            body.extend(chunk)
+
+    status_line = header_text.splitlines()[0] if header_text else ""
+    return status_line, body.decode("utf-8", errors="replace")
+
+
 class SimpleWebSocketClient:
     def __init__(
         self,

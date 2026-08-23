@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Rate-limit buckets key on a hash** - A bucket key was stored as its own text. The map now holds an 8-byte hash of it, seeded once per process so a caller cannot craft a value that lands in another caller's bucket. Nothing is allocated per request, and the identity path matches the `key="ip"` path. This removes the 256-byte limit on a key: `@rate_limit(key="<header>")` with a long value, such as `key="authorization"` with a JWT, returned `400 Rate limit key too long` and now counts like any other value. (#301)
+
+- **`@rate_limit(key="user")` and `key="api_key"` count per identity** - Both keys were documented but never implemented. They fell into the header catch-all, matched no header, and resolved to one shared bucket. A route marked "per user" was one global limit that one caller could exhaust for everyone. Both keys now run after authentication and count per `AuthContext` identity: any backend for `"user"`, API keys only for `"api_key"`. A caller with no identity is counted per client address. A route with an identity key and no auth backend fails at startup. `key="ip"` and header keys still run before authentication. (#301)
+
 ### Security
 
 - **`@rate_limit(key="ip")` trusted `X-Forwarded-For`** - The key came from the leftmost entry of `X-Forwarded-For`, which the client sends. Behind a proxy that appends the header, and with Bolt exposed directly, a client changed one header and got a new bucket for every request. Bolt now uses one canonical client address for rate limiting, `request.META["REMOTE_ADDR"]`, and request logging: the peer address by default, or the first untrusted `X-Forwarded-For` hop when the peer matches `BOLT_TRUSTED_PROXIES`. Malformed chains fall back to the peer. **Add the setting if you run behind a proxy**, or every caller behind it shares one bucket. (#302)
