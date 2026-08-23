@@ -2,7 +2,7 @@
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.10.2"
+version = "0.10.3"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/dj-bolt/django-bolt"

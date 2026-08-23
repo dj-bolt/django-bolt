@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "django-bolt"
-version = "0.10.2"
+version = "0.10.3"
 description = "The fastest Python web framework, built on Django: Rust (Actix Web) HTTP server, async typed handlers, msgspec validation - with the full Django ORM, Admin, middleware and auth. 300k+ req/s, no gunicorn or uvicorn needed."
 readme = "README.md"
 requires-python = ">=3.12"
