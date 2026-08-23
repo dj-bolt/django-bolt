@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
 
 - **`@rate_limit(key="user")` and `key="api_key"` count per identity** - Both keys were documented but never implemented. They fell into the header catch-all, matched no header, and resolved to one shared bucket. A route marked "per user" was one global limit that one caller could exhaust for everyone. Both keys now run after authentication and count per `AuthContext` identity: any backend for `"user"`, API keys only for `"api_key"`. A caller with no identity is counted per client address. A route with an identity key and no auth backend fails at startup. `key="ip"` and header keys still run before authentication. (#301)
 
+### Performance
+
+- **Faster `Response` serialization** - A `Response` now builds its wire metadata straight from its media type. Before, the content-type went into a copied header dict, and a second pass read it back out. A `Response` with no custom headers and no cookies now uses the static integer metadata tag. This applies to the four media types that match a static Rust content-type, and includes the `application/json` default. Any other media type keeps a metadata tuple. Per response, the metadata step drops from about 517 ns to 78 ns. Bytes bodies also render about 40% faster, because exact `bytes` now pass through unchanged.
+
 ### Security
 
 - **`@rate_limit(key="ip")` trusted `X-Forwarded-For`** - The key came from the leftmost entry of `X-Forwarded-For`, which the client sends. Behind a proxy that appends the header, and with Bolt exposed directly, a client changed one header and got a new bucket for every request. Bolt now uses one canonical client address for rate limiting, `request.META["REMOTE_ADDR"]`, and request logging: the peer address by default, or the first untrusted `X-Forwarded-For` hop when the peer matches `BOLT_TRUSTED_PROXIES`. Malformed chains fall back to the peer. **Add the setting if you run behind a proxy**, or every caller behind it shares one bucket. (#302)
@@ -17,6 +21,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - **bolt-mcp: loopback code delivery** - After consent, a loopback redirect URI (`http://localhost` / `127.0.0.1` / `[::1]`) receives an interstitial page on the issuer origin. Before, it received a raw 302. Some browsers block the `https → http://localhost` redirect. Firefox with HTTPS-Only mode is one example. The client then never received the code. The page navigates with JavaScript, keeps a click-through link, and shows the code for copy-paste. An `https` redirect URI keeps the plain 302. To change the post-consent response, override the new `AuthorizationServer.code_redirect_response(redirect_url)`. (#307)
+- **Pre-compressed `Response` bodies** - `Response(b"...")` with the default JSON media type wrapped the bytes in a base64 JSON string. A pre-compressed body with a `Content-Encoding` header reached the client corrupt. Bytes-like content now passes through verbatim, and the response validator skips it. (#305)
 - **bolt-mcp 0.2.2: `resultType` on Python-built results** - `tools/call`, `resources/read` and `prompts/get` results now carry `resultType: "complete"` for 2026-07-28 clients. Claude Code and claude.ai connectors rejected every tool call without it. Legacy peers keep the old wire shape.
 
 ## [0.10.2]

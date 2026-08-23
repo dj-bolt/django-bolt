@@ -256,22 +256,61 @@ def _is_json_media_type(media_type: str) -> bool:
 
 
 def _render_response_body(content: Any, media_type: str) -> bytes:
+    # Bytes-like content is a pre-encoded body. Pass it through verbatim,
+    # even for JSON media types — JSON-encoding bytes would base64-wrap
+    # them and corrupt pre-compressed payloads (issue #305).
+    # One isinstance for the whole bytes-like family keeps the structured
+    # content path to a single failed check.
+    if isinstance(content, (bytes, bytearray, memoryview)):
+        return content if content.__class__ is bytes else bytes(content)
     if _is_json_media_type(media_type):
         return _json.encode(content)
-    if isinstance(content, memoryview):
-        return content.tobytes()
-    if isinstance(content, (bytes, bytearray)):
-        return bytes(content)
     if isinstance(content, str):
         return content.encode()
     return str(content).encode()
 
 
-def _ensure_content_type_header(headers: dict[str, str] | None, media_type: str) -> dict[str, str]:
-    normalized = headers.copy() if headers else {}
-    if not any(k.lower() == "content-type" for k in normalized):
-        normalized["content-type"] = media_type
-    return normalized
+# Media types whose exact string equals the static Rust content-type.
+# These need no meta tuple — the integer tag already carries the header.
+# Must match ResponseType::content_type() in crates/bolt-core/src/response_meta.rs.
+_STATIC_MEDIA_TYPE_META = {
+    "application/json": _RESPONSE_META_JSON,
+    "application/octet-stream": _RESPONSE_META_OCTETSTREAM,
+    "text/plain; charset=utf-8": _RESPONSE_META_PLAINTEXT,
+    "text/html; charset=utf-8": _RESPONSE_META_HTML,
+}
+
+
+def _response_class_wire_meta(
+    media_type: str,
+    headers: dict[str, str] | None,
+    cookies: list[Cookie] | None,
+) -> ResponseMetaTuple | int:
+    """Build the wire meta for a Response, using its media type as content-type.
+
+    A content-type in headers wins over the media type. The headers are read
+    once — do not inject the content-type into them first.
+    """
+    if not headers and not cookies:
+        static_meta = _STATIC_MEDIA_TYPE_META.get(media_type)
+        if static_meta is not None:
+            return static_meta
+        return (_infer_wire_response_type(media_type), media_type, None, None)
+
+    custom_ct = media_type
+    headers_list: list[tuple[str, str]] | None = None
+    if headers:
+        headers_list = []
+        for k, v in headers.items():
+            if k.lower() == "content-type":
+                custom_ct = v
+            else:
+                headers_list.append((k, v))
+        if not headers_list:
+            headers_list = None
+
+    cookies_data = [c.to_raw_tuple() for c in cookies] if cookies else None
+    return (_infer_wire_response_type(media_type), custom_ct, headers_list, cookies_data)
 
 
 def _response_validation_is_required(annotation: Any) -> bool:
@@ -967,7 +1006,9 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, FileResponse):
             return serialize_file_streaming_response(result)
         if isinstance(result, ResponseClass):
-            if validator_async is not None:
+            # Bytes-like content is a pre-encoded body — skip the response
+            # validator, it only applies to structured data (issue #305).
+            if validator_async is not None and not isinstance(result.content, (bytes, bytearray, memoryview)):
                 try:
                     validated = await validator_async(result.content)
                 except ResponseValidationError:
@@ -977,10 +1018,9 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 body = _render_response_body(validated, result.media_type)
             else:
                 body = _render_response_body(result.content, result.media_type)
-            rt = _infer_wire_response_type(result.media_type)
-            hdrs = _ensure_content_type_header(result.headers, result.media_type)
             cookies = getattr(result, "_cookies", None)
-            return _wire_bytes(result.status_code, _build_wire_meta(rt, hdrs, cookies), body)
+            meta = _response_class_wire_meta(result.media_type, result.headers, cookies)
+            return _wire_bytes(result.status_code, meta, body)
         if isinstance(result, DjangoHttpResponse):
             return serialize_django_response(result)
         raise TypeError(f"Unsupported response type {type(result).__name__!r}")
@@ -1012,7 +1052,9 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, FileResponse):
             return serialize_file_streaming_response(result)
         if isinstance(result, ResponseClass):
-            if validator_sync is not None:
+            # Bytes-like content is a pre-encoded body — skip the response
+            # validator, it only applies to structured data (issue #305).
+            if validator_sync is not None and not isinstance(result.content, (bytes, bytearray, memoryview)):
                 try:
                     validated = validator_sync(result.content)
                 except ResponseValidationError:
@@ -1022,10 +1064,9 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 body = _render_response_body(validated, result.media_type)
             else:
                 body = _render_response_body(result.content, result.media_type)
-            rt = _infer_wire_response_type(result.media_type)
-            hdrs = _ensure_content_type_header(result.headers, result.media_type)
             cookies = getattr(result, "_cookies", None)
-            return _wire_bytes(result.status_code, _build_wire_meta(rt, hdrs, cookies), body)
+            meta = _response_class_wire_meta(result.media_type, result.headers, cookies)
+            return _wire_bytes(result.status_code, meta, body)
         if isinstance(result, DjangoHttpResponse):
             return serialize_django_response(result)
         raise TypeError(f"Unsupported response type {type(result).__name__!r}")

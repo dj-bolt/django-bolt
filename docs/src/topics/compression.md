@@ -162,6 +162,18 @@ unchanged. Streaming compression runs inside the handler and pre-sets
 `Content-Encoding`, so the global middleware never re-wraps a stream —
 no double-compression possible.
 
+A handler can also return a body that it compressed itself. Return the
+bytes in a `Response` and set the `Content-Encoding` header:
+
+```python
+@api.get("/cached")
+async def cached():
+    return Response(compressed_bytes, headers={"Content-Encoding": "zstd"})
+```
+
+Bytes-like content passes through verbatim, for every media type. The
+middleware keeps the pre-set encoding and does not compress again.
+
 ## Security — CRIME / BREACH
 
 Compressing responses that mix attacker-influenced content with secrets
