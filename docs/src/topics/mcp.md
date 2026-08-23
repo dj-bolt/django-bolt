@@ -427,6 +427,9 @@ For trivial cases set attributes inline instead of subclassing: `AuthorizationSe
 | `render_login(params, *, error=None)` | no session | custom sign-in HTML |
 | `render_consent(params, *, client_name, username)` | signed in | custom consent HTML |
 | `redirect_uri_allowed(registered, redirect_uri)` | `/authorize` | change redirect-URI matching |
+| `code_redirect_response(redirect_url)` | consent approved | change how the code reaches the client |
+
+**Loopback clients.** After consent, an `https` redirect URI receives a plain 302. A loopback redirect URI (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) receives an interstitial page. Some browsers block the `https → http://localhost` redirect. Firefox with HTTPS-Only mode is one example. Then the "Allow" button seems to do nothing. The interstitial page prevents this. It navigates with JavaScript, keeps a click-through link, and shows the code for copy-paste. To force the raw 302, override `code_redirect_response(redirect_url)`. Return `Redirect(redirect_url, status_code=302)` from `django_bolt.responses`.
 
 #### Endpoints
 

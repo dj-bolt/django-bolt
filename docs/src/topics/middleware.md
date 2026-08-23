@@ -72,6 +72,52 @@ Parameters:
 
 - `rps` - Requests per second allowed
 - `burst` - Maximum burst size (allows short spikes)
+- `key` - What to count per: `"ip"` (the default), `"user"`, `"api_key"` or a request header name
+
+### Counting per caller
+
+`key="ip"` counts per client address. A header name counts per header value.
+Callers that do not send the header share one bucket. Bolt hashes the value,
+so its length is not limited.
+
+`key="user"` counts per authenticated identity. `key="api_key"` counts per
+authenticated API key. Both run after authentication:
+
+```python
+@api.get("/api/data", auth=[JWTAuthentication()])
+@rate_limit(rps=10, key="user")
+async def data():
+    return {"data": []}
+```
+
+A caller with no identity is counted per client address. A guard such as
+`IsAuthenticated` rejects that caller before the limit is counted. Both keys
+need an auth backend on the route or the API. Without one, the server does
+not start.
+
+### Client address behind a proxy
+
+With `key="ip"`, Bolt keys on the peer address of the connection. A client sends
+`X-Forwarded-For` itself, so Bolt ignores that header by default.
+
+Declare your proxies to make the header trustworthy:
+
+```python
+# settings.py
+BOLT_TRUSTED_PROXIES = ["10.0.0.0/8"]
+```
+
+Bolt then reads `X-Forwarded-For` from the right and takes the first entry that
+is not a listed proxy. A client cannot pick its own bucket, because the proxy
+appends the real address to the right of anything the client sent.
+
+The resolved address is also exposed as `request.META["REMOTE_ADDR"]`. If any
+forwarding hop is malformed, Bolt ignores the chain and uses the connection
+peer rather than searching farther left through client-controlled input.
+
+Set this whenever a proxy, a load balancer or a CDN is in front of Bolt.
+Without it every caller behind that proxy shares one bucket. See
+[BOLT_TRUSTED_PROXIES](../ref/settings.md#bolt_trusted_proxies).
 
 ### How it works
 

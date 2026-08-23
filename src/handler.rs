@@ -877,32 +877,38 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         None
     };
 
-    // Get peer address only when needed (rate limiting or conn_remote_addr fallback).
-    // Skip ip().to_string() for simple API routes with no auth/middleware/rate-limiting.
-    let peer_addr = if has_route_rate_limit || must_extract_headers {
-        req.peer_addr().map(|addr| addr.ip().to_string())
+    // Routes that do not extract headers skip client-address work entirely.
+    // Routes that do need connection metadata and IP rate limiting share this
+    // one canonical result. With no trusted proxy this is one `peer_addr()`.
+    let client_ip = if must_extract_headers {
+        middleware::client_ip::resolve_from_headers(
+            req.headers(),
+            req.peer_addr().map(|address| address.ip()),
+            &state.trusted_proxies,
+        )
     } else {
         None
     };
 
-    // Process rate limiting (Rust-native, no GIL)
-    if let Some(route_meta) = route_metadata {
-        if let Some(ref rate_config) = route_meta.rate_limit_config {
-            if let Some(headers_map) = headers.as_ref() {
-                if let Some(response) = middleware::rate_limit::check_rate_limit(
-                    handler_id,
-                    headers_map,
-                    peer_addr.as_deref(),
-                    rate_config,
-                    &method,
-                    &path,
-                ) {
-                    // CORS headers will be added by CorsMiddleware
-                    return response;
-                }
-            } else {
-                debug_assert!(false, "rate-limited route missing extracted headers");
+    // Rate limiting (Rust-native, no GIL). Address and header keys run before
+    // authentication so a flood never pays for token verification. Identity
+    // keys run after it; see the second call below.
+    let rate_config = route_metadata.and_then(|m| m.rate_limit_config.as_ref());
+    if let Some(config) = rate_config {
+        if let Some(headers_map) = headers.as_ref() {
+            if let Some(response) = middleware::rate_limit::check_before_auth(
+                handler_id,
+                headers_map,
+                client_ip.as_ref(),
+                config,
+                &method,
+                &path,
+            ) {
+                // CORS headers will be added by CorsMiddleware
+                return response;
             }
+        } else {
+            debug_assert!(false, "rate-limited route missing extracted headers");
         }
     }
 
@@ -947,6 +953,23 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         None
     };
 
+    if let Some(config) = rate_config {
+        if let Some(headers_map) = headers.as_ref() {
+            if let Some(response) = middleware::rate_limit::check_after_auth(
+                handler_id,
+                headers_map,
+                client_ip.as_ref(),
+                auth_ctx.as_ref(),
+                config,
+                &method,
+                &path,
+            ) {
+                // CORS headers will be added by CorsMiddleware
+                return response;
+            }
+        }
+    }
+
     // Optimization: Only parse cookies if handler needs them
     // Cookie parsing can be expensive for requests with many cookies
     let cookies = if needs_cookies {
@@ -974,18 +997,10 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             .and_then(|h| h.get("x-forwarded-proto"))
             .cloned()
             .unwrap_or_else(|| "http".to_string());
-        // X-Forwarded-For: leftmost IP is the original client (RFC 7239 §7.1)
-        let remote_addr = headers
-            .as_ref()
-            .and_then(|h| h.get("x-forwarded-for"))
-            .and_then(|v| v.split(',').next().map(|s| s.trim().to_string()))
-            .or_else(|| headers.as_ref().and_then(|h| h.get("x-real-ip").cloned()))
-            .or_else(|| peer_addr.clone())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        (host, scheme, remote_addr)
+        (host, scheme, client_ip)
     } else {
         // No META needed → empty strings (META getter will return defaults)
-        (String::new(), String::new(), String::new())
+        (String::new(), String::new(), None)
     };
 
     // Determine if form parsing is needed and get content type

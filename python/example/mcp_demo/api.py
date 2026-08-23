@@ -20,6 +20,7 @@ issues a GET (reserved for the server→client SSE channel) and returns an error
 from __future__ import annotations
 
 import asyncio
+import os
 
 import msgspec
 from bolt_mcp import MCP, AuthorizationServer, Context, principal
@@ -180,7 +181,9 @@ class ExampleMcpAuth(AuthorizationServer):
     # it is baked into every issued token and discovery document, and the client follows
     # it byte-for-byte through the OAuth handshake. This demo is run with
     # `runbolt --port 8001`, so the issuer is 127.0.0.1:8001; change it if you change either.
-    issuer = "http://127.0.0.1:8001"
+    # Set MCP_ISSUER to run behind a TLS terminator, for example
+    # MCP_ISSUER=https://localhost:8443.
+    issuer = os.environ.get("MCP_ISSUER", "http://127.0.0.1:8001")
 
     def get_extra_claims(self, user, *, scopes, client_id):
         # Map the signed-in Django user to the permissions the guarded tools check.

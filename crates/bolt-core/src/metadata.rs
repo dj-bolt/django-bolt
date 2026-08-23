@@ -214,7 +214,29 @@ impl CorsConfig {
 pub struct RateLimitConfig {
     pub rps: u32,
     pub burst: u32,
-    pub key_type: String,
+    pub key: RateLimitKey,
+}
+
+/// What a rate limit buckets on. Decided once at registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitKey {
+    /// The resolved client address. See `middleware::client_ip`.
+    Ip,
+    /// One request header, stored lowercase for direct lookup.
+    Header(String),
+    /// The authenticated identity from any backend (`AuthContext::user_id`).
+    /// Runs after authentication. No identity falls back to the client address.
+    User,
+    /// The authenticated API key. Other backends do not count as an identity.
+    ApiKey,
+}
+
+impl RateLimitKey {
+    /// `User` and `ApiKey` need an `AuthContext`, so their check runs after
+    /// authentication instead of before it.
+    pub const fn needs_identity(&self) -> bool {
+        matches!(self, RateLimitKey::User | RateLimitKey::ApiKey)
+    }
 }
 
 impl Default for RateLimitConfig {
@@ -222,7 +244,7 @@ impl Default for RateLimitConfig {
         RateLimitConfig {
             rps: 100,
             burst: 200,
-            key_type: "ip".to_string(),
+            key: RateLimitKey::Ip,
         }
     }
 }
@@ -655,6 +677,20 @@ impl RouteMetadata {
         let guards = GuardSet::from_guards(guards);
         let has_auth_or_guards = !auth_backends.is_empty() || guards.is_enforcing();
         let has_rate_limit = rate_limit_config.is_some();
+        // An identity key with no backend can never see an identity. Every
+        // caller would share the address bucket, so refuse to start.
+        if let Some(config) = &rate_limit_config {
+            if config.key.needs_identity() && auth_backends.is_empty() {
+                let key = match config.key {
+                    RateLimitKey::User => "user",
+                    _ => "api_key",
+                };
+                return Err(PyValueError::new_err(format!(
+                    "@rate_limit(key=\"{key}\") needs an auth backend on the route or the API; \
+                     without one there is no identity to count per. Use key=\"ip\" or a header name."
+                )));
+            }
+        }
         let can_sync_dispatch = py_meta
             .get_item("can_sync_dispatch")
             .ok()
@@ -857,10 +893,11 @@ fn parse_rate_limit_config(
     // check can look them up directly (headers are stored lowercase).
     if let Some(key_py) = dict.get("key") {
         if let Ok(key_type) = key_py.extract::<String>(py) {
-            config.key_type = if key_type == "ip" {
-                key_type
-            } else {
-                key_type.to_lowercase()
+            config.key = match key_type.to_lowercase().as_str() {
+                "ip" => RateLimitKey::Ip,
+                "user" => RateLimitKey::User,
+                "api_key" => RateLimitKey::ApiKey,
+                header => RateLimitKey::Header(header.to_owned()),
             };
         }
     }

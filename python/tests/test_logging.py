@@ -345,6 +345,17 @@ class TestLoggingMiddleware:
         data = middleware.extract_request_data(request)
         assert data["client_ip"] == "192.168.1.2"
 
+    def test_extract_request_data_prefers_canonical_client_ip(self):
+        """Runtime REMOTE_ADDR must win over client-controlled headers."""
+        config = LoggingConfig(request_log_fields={"client_ip"})
+        middleware = LoggingMiddleware(config)
+        request_data = {"headers": {"x-forwarded-for": "1.1.1.1"}}
+        request = Mock()
+        request.get.side_effect = request_data.get
+        request.META = {"REMOTE_ADDR": "203.0.113.9"}
+
+        assert middleware.extract_request_data(request)["client_ip"] == "203.0.113.9"
+
     def test_extract_request_data_extracts_user_agent(self):
         """User agent should be extracted when configured."""
         config = LoggingConfig(request_log_fields={"user_agent"})

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
+use crate::middleware::client_ip::TrustedProxies;
 use crate::router::Router;
 pub use bolt_loop::TASK_LOCALS;
 
@@ -94,6 +95,8 @@ pub struct AppState {
     pub global_cors_config: Option<CorsConfig>, // Global CORS configuration from Django settings
     pub cors_origin_regexes: Vec<Regex>,        // Compiled regex patterns for origin matching
     pub global_compression_config: Option<Arc<CompressionConfig>>, // Global compression configuration used by middleware
+    /// Deployment-wide forwarding-header trust policy.
+    pub trusted_proxies: Arc<TrustedProxies>,
     pub router: Option<Arc<Router>>, // Router (used by test infrastructure, optional in production)
     pub route_metadata: Option<Arc<RouteMetadataStore>>, // Route metadata (used by test infrastructure)
     pub asgi_mounts: Option<Arc<Vec<AsgiMount>>>, // ASGI mounts (tests). Production uses GLOBAL_ASGI_MOUNTS.

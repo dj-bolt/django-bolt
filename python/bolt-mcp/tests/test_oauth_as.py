@@ -8,6 +8,9 @@ that the issued JWT authenticates to /mcp and drives per-tool guards.
 
 from __future__ import annotations
 
+import html as html_mod
+import json
+import re
 import secrets
 from urllib.parse import parse_qs, urlsplit
 
@@ -15,6 +18,7 @@ import jwt
 import pytest
 from _helpers import initialize, parse_rpc, post_rpc
 from bolt_mcp import MCP, AuthorizationServer, mount_mcp
+from bolt_mcp.oauth import consent as oauth_consent
 from bolt_mcp.oauth import sessions as oauth_sessions
 from bolt_mcp.oauth.models import RefreshToken
 from bolt_mcp.oauth.pkce import compute_s256, verify_s256
@@ -24,10 +28,12 @@ from django.contrib.auth import get_user_model
 
 from django_bolt import BoltAPI, Requires
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
+from django_bolt.responses import Redirect
 from django_bolt.testing import TestClient
 
 ISSUER = "http://localhost:8000"
-REDIRECT_URI = "http://localhost:9876/callback"
+REDIRECT_URI = "https://client.example.com/callback"
+LOOPBACK_REDIRECT_URI = "http://localhost:9876/callback"
 PASSWORD = "s3cr3t-pw-123456"
 
 
@@ -512,6 +518,137 @@ def test_denied_consent_redirect_carries_iss():
     assert q["iss"] == [ISSUER]
 
 
+# ── loopback code delivery (issue #307) ─────────────────────────────────────────
+# A raw ``302 https://issuer → http://localhost`` redirect can be upgraded or
+# blocked by the browser (Firefox HTTPS-Only mode). Loopback redirect URIs get an
+# interstitial page instead; https redirect URIs keep the plain 302 (covered by
+# the tests above, which use an https REDIRECT_URI).
+
+
+def _approve(client, params, username="alice"):
+    return client.post(
+        "/oauth/authorize",
+        data={**params, "decision": "approve"},
+        headers={**_session_cookie(username), "Origin": ISSUER},
+        follow_redirects=False,
+    )
+
+
+def _interstitial_target(page: str) -> str:
+    """The client redirect URL the interstitial links to."""
+    match = re.search(r'href="([^"]+)"', page)
+    assert match, page
+    return html_mod.unescape(match.group(1))
+
+
+def _interstitial_script_target(page: str) -> str:
+    """The client redirect URL the interstitial's JS navigates to."""
+    match = re.search(r'<script>location\.assign\((".*?")\);</script>', page)
+    assert match, page
+    return json.loads(match.group(1))
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "http://localhost:9876/callback",
+        "http://127.0.0.1:9876/callback",
+        "http://[::1]:9876/callback",
+    ],
+)
+def test_loopback_redirect_renders_interstitial_with_working_code(redirect_uri):
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        _make_user()
+        client_id = _register_client(client, redirect_uris=[redirect_uri])
+        verifier, challenge = _pkce()
+        r = _approve(client, _authorize_params(client_id, challenge, redirect_uri=redirect_uri))
+        assert r.status_code == 200, r.text
+        assert "location" not in {k.lower() for k in r.headers}
+        assert "no-store" in r.headers.get("cache-control", "")
+        target = _interstitial_target(r.text)
+        assert target.startswith(redirect_uri + "?")
+        q = parse_qs(urlsplit(target).query)
+        assert q["state"] == ["st-1"]
+        assert q["iss"] == [ISSUER]
+        code = q["code"][0]
+        assert f'<div class="code">{code}</div>' in r.text  # visible copy-paste fallback
+        # The JavaScript navigation goes to the same URL. ``assign`` keeps the page in
+        # history. The Back button thus returns to the copy-paste fallback.
+        assert _interstitial_script_target(r.text) == target
+        tok = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            },
+        )
+        assert tok.status_code == 200, tok.text
+
+
+def test_loopback_interstitial_sets_session_cookie_after_login():
+    api, _, _ = _build(auto_consent=True)
+    _make_user()
+    with TestClient(api) as client:
+        client_id = _register_client(client, redirect_uris=[LOOPBACK_REDIRECT_URI])
+        _, challenge = _pkce()
+        form = {
+            **_authorize_params(client_id, challenge, redirect_uri=LOOPBACK_REDIRECT_URI),
+            "username": "alice",
+            "password": PASSWORD,
+        }
+        r = client.post("/oauth/authorize", data=form, headers={"Origin": ISSUER}, follow_redirects=False)
+    assert r.status_code == 200, r.text
+    assert "sessionid=" in r.headers.get("set-cookie", "")
+    assert LOOPBACK_REDIRECT_URI in _interstitial_target(r.text)
+
+
+def test_loopback_interstitial_displays_appended_code_with_existing_query_parameter():
+    page = oauth_consent.code_delivery_page("http://localhost/callback?code=client-value&code=issued-value")
+    assert '<div class="code">issued-value</div>' in page
+    assert '<div class="code">client-value</div>' not in page
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "https://[broken/callback",
+        "https://client.example.com:invalid/callback",
+        "/relative/callback",
+        "https://client.example.com/callback#fragment",
+    ],
+)
+def test_registration_rejects_malformed_redirect_uri(redirect_uri):
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        r = client.post("/oauth/register", json={"redirect_uris": [redirect_uri]})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_redirect_uri"
+
+
+def test_subclass_overrides_code_redirect_response():
+    class SeeOtherAuth(AuthorizationServer):
+        issuer = ISSUER
+
+        def code_redirect_response(self, redirect_url):
+            # 303: distinguishable from both the default 302 and the interstitial.
+            return Redirect(redirect_url, status_code=303)
+
+    api = _mount_subclass(SeeOtherAuth)
+    with TestClient(api) as client:
+        _make_user()
+        client_id = _register_client(client, redirect_uris=[LOOPBACK_REDIRECT_URI])
+        _, challenge = _pkce()
+        r = _approve(client, _authorize_params(client_id, challenge, redirect_uri=LOOPBACK_REDIRECT_URI))
+    # The override wins even for a loopback redirect URI.
+    assert r.status_code == 303, r.text
+    q = parse_qs(urlsplit(r.headers["location"]).query)
+    assert q["code"] and q["iss"] == [ISSUER]
+
+
 def test_registration_persists_application_type_native():
     api, _, _ = _build()
     with TestClient(api) as client:
@@ -525,6 +662,16 @@ def test_registration_persists_application_type_native():
         )
     assert r.status_code == 201
     assert r.json()["application_type"] == "native"
+
+
+def test_registration_accepts_native_private_use_redirect_uri():
+    api, _, _ = _build()
+    with TestClient(api) as client:
+        r = client.post(
+            "/oauth/register",
+            json={"redirect_uris": ["com.example.app:/oauth2redirect"], "application_type": "native"},
+        )
+    assert r.status_code == 201
 
 
 def test_registration_defaults_application_type_web():
