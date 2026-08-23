@@ -15,7 +15,7 @@ from django.contrib.auth import get_user_model
 from django_bolt.auth import create_jwt_for_user
 
 from .apps import app_module
-from .apps.rate_limit_identity import BURST, SECRET
+from .apps.rate_limit_identity import BURST, SECRET, SECRET_API_KEY
 from .helpers import attempt_ws_upgrade
 
 pytestmark = pytest.mark.server_integration
@@ -124,3 +124,23 @@ def test_identity_key_without_auth_aborts_startup(make_server_project):
     with pytest.raises(AssertionError) as excinfo, project.start(timeout=15):
         pass
     assert 'key="user"' in str(excinfo.value)
+
+
+def test_the_rejection_log_does_not_carry_the_api_key(make_server_project):
+    """A 429 must not write the caller's credential to the server output.
+
+    `AuthContext::from_api_key` stores `apikey:<raw key>` in `user_id`, which
+    is what an `api_key` bucket counts on.
+    """
+    project = make_server_project(api_module=APP)
+
+    with project.start() as server:
+        statuses = _statuses(server, "/limited-by-api-key", BURST + 2, {"X-API-Key": SECRET_API_KEY})
+
+    stdout, stderr = server.stop()
+    output = stdout + stderr
+
+    assert statuses[-1] == 429, statuses
+    # Without this the test passes when the log line never ran at all.
+    assert "Rate limit exceeded" in output, output[-2000:]
+    assert SECRET_API_KEY not in output, "the raw API key reached the server output"

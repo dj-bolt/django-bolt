@@ -10,7 +10,9 @@ api = BoltAPI()
 
 BURST = 4
 SECRET = "rate-limit-identity-server-secret-32b"
-API_KEYS = {"key-a", "key-b"}
+# Distinctive on purpose: a test greps the server output for it.
+SECRET_API_KEY = "sk-live-DO-NOT-LOG-4f2b9c"
+API_KEYS = {"key-a", "key-b", SECRET_API_KEY}
 JWT = [JWTAuthentication(secret=SECRET)]
 KEY = [APIKeyAuthentication(api_keys=API_KEYS, header="x-api-key")]
 

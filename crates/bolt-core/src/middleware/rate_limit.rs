@@ -58,12 +58,20 @@ impl KeySource<'_> {
     }
 }
 
+/// What the rejection log is allowed to name. Never the key material: the
+/// `api_key` backend stores the raw credential in `AuthContext::user_id`
+/// (`AuthContext::from_api_key`), and a header key may hold an `Authorization`
+/// value. Both would otherwise reach stderr on a 429.
+///
+/// A bucket keeps one label for the life of the process, so an operator can
+/// still see that the same caller keeps hitting the limit.
 impl fmt::Display for KeySource<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // An address is not a credential, and is the useful thing to read.
             KeySource::Ip(ip) => ip.fmt(f),
-            KeySource::Header(value) => f.write_str(value),
-            KeySource::Identity(value) => f.write_str(value),
+            KeySource::Header(_) => write!(f, "header:{:016x}", self.bucket().0),
+            KeySource::Identity(_) => write!(f, "identity:{:016x}", self.bucket().0),
             KeySource::Unknown => f.write_str("unknown"),
         }
     }
@@ -299,6 +307,42 @@ mod tests {
             KeySource::Header(&long_a).bucket(),
             KeySource::Header(&long_b).bucket()
         );
+    }
+
+    #[test]
+    fn the_log_label_never_carries_key_material() {
+        // `AuthContext::from_api_key` stores `apikey:<raw key>` in `user_id`,
+        // and a header key may be an `Authorization` value. Neither may reach
+        // the rejection log.
+        let secret = "sk-live-DO-NOT-LOG-4f2b9c";
+
+        let identity = KeySource::Identity(&format!("apikey:{secret}")).to_string();
+        assert!(
+            !identity.contains(secret),
+            "identity label leaked: {identity}"
+        );
+        assert!(
+            identity.starts_with("identity:"),
+            "unexpected label: {identity}"
+        );
+
+        let header = KeySource::Header(&format!("Bearer {secret}")).to_string();
+        assert!(!header.contains(secret), "header label leaked: {header}");
+        assert!(header.starts_with("header:"), "unexpected label: {header}");
+    }
+
+    #[test]
+    fn the_log_label_still_identifies_one_caller() {
+        // An operator has to see that the same caller keeps being limited.
+        let one = KeySource::Identity("apikey:aaa").to_string();
+        let same = KeySource::Identity("apikey:aaa").to_string();
+        let other = KeySource::Identity("apikey:bbb").to_string();
+        assert_eq!(one, same);
+        assert_ne!(one, other);
+
+        // An address is not a credential, and is the useful thing to read.
+        assert_eq!(KeySource::Ip(ip("203.0.113.7")).to_string(), "203.0.113.7");
+        assert_eq!(KeySource::Unknown.to_string(), "unknown");
     }
 
     #[test]
