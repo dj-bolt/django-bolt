@@ -233,6 +233,32 @@ def test_async_client_does_not_share_or_warn(fresh_advisory_latch):
 
 
 @pytest.mark.django_db(transaction=True)
+def test_the_escape_hatch_serves_a_worker_that_iterates():
+    """The fix the error names must work for the case that raises it.
+
+    This is the example in the testing guide: a thread of the test iterates a
+    QuerySet, which holds a cursor open, while the client serves requests.
+    """
+    for i in range(20):
+        User.objects.create(username=f"u{i}", email=f"u{i}@example.com")
+
+    exported: list[str] = []
+
+    def export():
+        for user in User.objects.iterator(chunk_size=2):
+            exported.append(user.username)
+
+    with TestClient(_make_api(), share_db_connection=False) as client:
+        worker = threading.Thread(target=export)
+        worker.start()
+        statuses = {client.get("/count").status_code for _ in range(15)}
+        worker.join()
+
+    assert statuses == {200}
+    assert len(exported) == 20
+
+
+@pytest.mark.django_db(transaction=True)
 def test_nothing_is_shared_when_the_test_commits():
     """With committed rows the handler threads need no help, thus none is given."""
     assert not connection.in_atomic_block

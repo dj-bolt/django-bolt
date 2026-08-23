@@ -277,16 +277,31 @@ test reads it, and rollback removes it.
 One connection serves one thread at a time. Bolt handles this for you: work from
 the test and work from a handler waits its turn.
 
-It cannot do so for a second thread of your own that uses the database while a
-request runs. That raises `SharedTestConnectionError`, which names the fix.
-Usually the fix is `share_db_connection=False`, which gives the handlers their
-own connections again and needs the rows committed:
+It cannot do so when a thread of your own keeps a cursor open across a request.
+A `QuerySet.iterator()` loop in a worker thread is the case that does it,
+because the cursor stays open for the whole loop. The request then waits for
+that thread, and Bolt raises `SharedTestConnectionError`.
+
+Pass `share_db_connection=False` for such a test. The handlers then use their
+own connections, thus the test must commit its rows with `transaction=True` or
+`TransactionTestCase`:
 
 ```python
 @pytest.mark.django_db(transaction=True)
-def test_with_a_worker_thread(api):
+def test_export_runs_while_the_api_serves(api):
+    exported = []
+
+    def export():
+        for user in User.objects.iterator():
+            exported.append(user.username)
+
     with TestClient(api, share_db_connection=False) as client:
-        ...
+        worker = threading.Thread(target=export)
+        worker.start()
+        assert client.get("/users").status_code == 200
+        worker.join()
+
+    assert len(exported) == 20
 ```
 
 ### Or create data through the API
