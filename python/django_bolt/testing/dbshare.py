@@ -96,13 +96,9 @@ def lock_timeout() -> float:
     try:
         timeout = float(raw)
     except ValueError:
-        raise ValueError(
-            f"DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT must be a number of seconds, got {raw!r}."
-        ) from None
+        raise ValueError(f"DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT must be a number of seconds, got {raw!r}.") from None
     if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError(
-            f"DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT must be a finite number above zero, got {raw!r}."
-        )
+        raise ValueError(f"DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT must be a finite number above zero, got {raw!r}.")
     return timeout
 
 
