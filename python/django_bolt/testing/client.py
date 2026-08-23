@@ -585,15 +585,23 @@ class TestClient(httpx.Client):
 
         A conflict is raised on a handler thread, thus the pipeline turns it
         into a plain 500. The cause belongs to the test that made the request.
+
+        The locks of this thread are given back for the time of the request.
+        See `SharedConnections.park`.
         """
+        if self._db_share is None:
+            return super().send(*args, **kwargs)
+        # This thread waits in the Rust pipeline until the response arrives, thus
+        # it runs no query. Holding its cursor locks would only block the handler.
+        parked = self._db_share.park()
         try:
             response = super().send(*args, **kwargs)
         except BaseException:
-            if self._db_share is not None:
-                self._db_share.raise_if_conflict()
-            raise
-        if self._db_share is not None:
             self._db_share.raise_if_conflict()
+            raise
+        finally:
+            self._db_share.unpark(parked)
+        self._db_share.raise_if_conflict()
         return response
 
     def get(self, url: str | httpx.URL, *, stream: bool = False, **kwargs: Any) -> Response:

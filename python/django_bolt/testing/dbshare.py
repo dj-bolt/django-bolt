@@ -18,9 +18,12 @@ One connection cannot serve two threads at the same moment. Django gives back
 rows from the wrong query if you try. This shows as
 ``IndexError: list index out of range`` deep in the ORM. Thus each shared
 connection gets a lock. The lock is held for the full life of a cursor. Thus
-concurrent database work waits in place of corrupting rows. A test that holds a
-cursor open across a request cannot be made to wait, because it is the holder.
-That one condition raises `SharedTestConnectionError`, which names the fixes.
+concurrent database work waits in place of corrupting rows. The thread that
+makes a request gives its locks back while it waits, because it is blocked in
+the Rust pipeline and runs no query. Thus a request inside a
+``QuerySet.iterator()`` loop is safe. A second thread of the test that holds a
+cursor open cannot be parked in that way. That condition raises
+`SharedTestConnectionError`, which names the fixes.
 """
 
 from __future__ import annotations
@@ -140,6 +143,30 @@ class _SharedStore:
             delattr(object.__getattribute__(self, "_fallback"), name)
 
 
+class _Gate:
+    """The lock of one shared connection, and the depth this thread holds it at.
+
+    The depth lives in a `threading.local`, thus only the owning thread reads
+    or writes its own count. This lets a thread give its locks back while it
+    waits for a response, and take them again after.
+    """
+
+    __slots__ = ("local", "lock")
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.local = threading.local()
+
+    def depth(self) -> int:
+        return getattr(self.local, "held", 0)
+
+    def took(self) -> None:
+        self.local.held = self.depth() + 1
+
+    def gave_back(self) -> None:
+        self.local.held = self.depth() - 1
+
+
 class _CursorProxy:
     """Holds the connection lock while the cursor of one query is open.
 
@@ -188,6 +215,7 @@ class SharedConnections:
         self.aliases: list[str] = []
         self.conflict: str | None = None
         self._connections: list[Any] = []
+        self._gates: list[_Gate] = []
         self._restores: list[Callable[[], None]] = []
         self._previous_store: Any = None
         self._installed = False
@@ -256,6 +284,7 @@ class SharedConnections:
             for conn in self._connections:
                 conn.dec_thread_sharing()
             self._connections.clear()
+            self._gates.clear()
             self._restores.clear()
             _active_depth -= 1
             if _active_depth == 0:
@@ -269,14 +298,15 @@ class SharedConnections:
         ``QuerySet.iterator()`` takes that second door, and on Postgres it is a
         different door: a server-side cursor that would otherwise skip the lock.
         """
-        lock = threading.RLock()
+        gate = _Gate()
+        self._gates.append(gate)
         originals = {}
         for name in ("cursor", "chunked_cursor"):
             original = getattr(conn, name, None)
             if original is None:
                 continue
             originals[name] = original
-            setattr(conn, name, self._make_guarded(conn, original, lock))
+            setattr(conn, name, self._make_guarded(conn, original, gate))
 
         def restore() -> None:
             for name, original in originals.items():
@@ -284,19 +314,55 @@ class SharedConnections:
 
         return restore
 
-    def _make_guarded(self, conn: Any, original: Callable[..., Any], lock: threading.RLock) -> Callable[..., Any]:
+    def _make_guarded(self, conn: Any, original: Callable[..., Any], gate: _Gate) -> Callable[..., Any]:
+        def release() -> None:
+            gate.gave_back()
+            gate.lock.release()
+
         def guarded(*args: Any, **kwargs: Any) -> _CursorProxy:
-            if not lock.acquire(timeout=self.timeout):
+            if not gate.lock.acquire(timeout=self.timeout):
                 self.conflict = conn.alias
                 raise SharedTestConnectionError(self._conflict_message(conn.alias))
+            gate.took()
             try:
                 cursor = original(*args, **kwargs)
             except BaseException:
-                lock.release()
+                release()
                 raise
-            return _CursorProxy(cursor, lock.release)
+            return _CursorProxy(cursor, release)
 
         return guarded
+
+    # -- parking ------------------------------------------------------------
+    def park(self) -> list[int] | None:
+        """Give back the locks of this thread while it waits for a response.
+
+        A thread that waits in ``client.get()`` is blocked in the Rust
+        pipeline. It cannot run a query, thus the cursors it holds open are
+        idle and its locks block a handler for no reason. Before this, a test
+        that made a request inside a ``QuerySet.iterator()`` loop deadlocked
+        against its own request, and the wait ended in an error.
+
+        The thread takes its locks again in `unpark`. Returns the depth of each
+        gate, or None when this thread holds nothing, which is the usual case.
+        """
+        counts = [gate.depth() for gate in self._gates]
+        if not any(counts):
+            return None
+        for gate, held in zip(self._gates, counts, strict=True):
+            for _ in range(held):
+                gate.lock.release()
+        return counts
+
+    def unpark(self, counts: list[int] | None) -> None:
+        """Take the locks back, in the numbers `park` gave back."""
+        if not counts:
+            return
+        for gate, held in zip(self._gates, counts, strict=True):
+            for _ in range(held):
+                if not gate.lock.acquire(timeout=self.timeout):
+                    self.conflict = "default"
+                    raise SharedTestConnectionError(self._conflict_message("default"))
 
     def _conflict_message(self, alias: str) -> str:
         """State the cause, then give the fix as code the reader can copy."""
@@ -304,16 +370,19 @@ class SharedConnections:
             f"The test and a handler both needed the {alias!r} database connection, and "
             f"neither could wait ({self.timeout:g}s).\n"
             "\n"
-            "Cause: this test holds a cursor open across a request. TestClient lends its "
-            "connection to the handler threads, so that plain TestCase and django_db see "
-            "the rows of the test, and a cursor that stays open cannot be lent. A loop "
-            "over QuerySet.iterator() that makes a request in its body is the usual cause.\n"
+            "Cause: another thread holds a cursor open on this connection, and it is "
+            "not waiting for a response. TestClient lends its connection to the handler "
+            "threads, so that plain TestCase and django_db see the rows of the test, and "
+            "one connection can serve one cursor at a time. The thread that makes the "
+            "request gives its own locks back while it waits, thus a request inside a "
+            "QuerySet.iterator() loop is safe. A second thread of the test that iterates "
+            "is not.\n"
             "\n"
             "Fix — use one of these:\n"
             "\n"
-            "  1. Read the rows before the request:\n"
+            "  1. Read the rows in that thread before the request:\n"
             "         for row in list(Model.objects.all()):\n"
-            "             client.get(f'/x/{row.pk}')\n"
+            "             ...\n"
             "\n"
             "  2. Switch the sharing off, and commit the rows instead:\n"
             "         @pytest.mark.django_db(transaction=True)   # or TransactionTestCase\n"
@@ -321,7 +390,7 @@ class SharedConnections:
             "             with TestClient(api, share_db_connection=False) as client:\n"
             "                 ...\n"
             "\n"
-            "  3. Give the wait more time, if the request is only slow:\n"
+            "  3. Give the wait more time, if the other thread is only slow:\n"
             "         DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT=60"
         )
 

@@ -293,37 +293,47 @@ test can read it, and rollback removes it.
 
 One connection cannot serve two threads at the same moment. `TestClient` puts a
 lock on the shared connection. Thus database work from the test and from a
-handler waits its turn, in place of corrupting rows. One condition cannot be
-made to wait: a test that holds a cursor open across a request, because the test
-is the holder. `QuerySet.iterator()` is the usual cause:
+handler waits its turn, in place of corrupting rows.
+
+A request inside a `QuerySet.iterator()` loop is safe. The thread that makes the
+request waits in the Rust pipeline and runs no query, thus it gives its lock
+back for the time of the request and takes it again after:
 
 ```python
 for user in User.objects.iterator():     # holds a cursor open
-    client.get(f"/users/{user.id}")      # the handler cannot get the connection
+    client.get(f"/users/{user.id}")      # safe: this thread parks its lock
 ```
 
-Bolt raises `SharedTestConnectionError` here, in place of a 500 with no cause.
-Read the rows into a list first:
+A second thread of the test cannot be parked in that way, because it is not
+waiting for the response. If such a thread holds a cursor open, the handler
+waits for it, and Bolt raises `SharedTestConnectionError` in place of a 500 with
+no cause. Read the rows in that thread first:
 
 ```python
 for user in list(User.objects.all()):
-    client.get(f"/users/{user.id}")
+    ...
 ```
 
 Or switch the sharing off and commit the rows instead:
 
 ```python
 @pytest.mark.django_db(transaction=True)
-def test_iterating(api):
+def test_background_thread(api):
     with TestClient(api, share_db_connection=False) as client:
-        for user in User.objects.iterator():
-            client.get(f"/users/{user.id}")
+        ...
 ```
 
 With `share_db_connection=False` the handler threads use their own connections
 again, thus the test must commit its rows: use
 `@pytest.mark.django_db(transaction=True)`, or `TransactionTestCase`. Those
 commit each row, and the tables are flushed after the test.
+
+Two tests must not enter a `TestClient` in two threads at the same time. The
+connection store of Django is process-wide, thus the second client would lend
+the connection of the first test to its own handlers. Bolt refuses this and
+names the fixes. No test runner does it: pytest runs the tests one after the
+other, and pytest-xdist and `manage.py test --parallel` each use a separate
+process.
 
 The lock has a limit of 10 seconds. Set `DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT` to
 change it.

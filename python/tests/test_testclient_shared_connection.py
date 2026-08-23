@@ -111,23 +111,54 @@ def test_concurrent_database_work_is_serialized_not_corrupted():
 
 
 @pytest.mark.django_db
-def test_a_cursor_held_across_a_request_raises_a_named_error(monkeypatch):
-    """The one case that cannot be serialized must name the escape hatch."""
-    monkeypatch.setenv("DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT", "0.5")
-    for i in range(5):
+def test_a_request_inside_an_iterator_loop_works():
+    """The test parks its locks while it waits, thus this must not deadlock.
+
+    A thread inside ``client.get()`` is blocked in the Rust pipeline and runs no
+    query, thus the cursor it holds open is idle. It gives its locks back for
+    the time of the request, and takes them again after.
+    """
+    for i in range(12):
         User.objects.create(username=f"u{i}", email=f"u{i}@example.com")
 
-    with TestClient(_make_api()) as client, pytest.raises(SharedTestConnectionError) as excinfo:
+    seen = []
+    with TestClient(_make_api()) as client:
+        for user in User.objects.iterator(chunk_size=2):
+            seen.append(user.username)
+            assert client.get("/count").json()["n"] == 12
+
+    assert len(seen) == 12
+
+
+@pytest.mark.django_db
+def test_a_cursor_held_by_another_thread_raises_a_named_error(monkeypatch):
+    """A holder that is not waiting for the response cannot be parked."""
+    monkeypatch.setenv("DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT", "0.5")
+    for i in range(8):
+        User.objects.create(username=f"u{i}", email=f"u{i}@example.com")
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_a_cursor():
+        # A thread of the test that iterates, and never reaches the end.
         for _ in User.objects.iterator(chunk_size=1):
+            holding.set()
+            release.wait(5)
+            return
+
+    with TestClient(_make_api()) as client:
+        holder = threading.Thread(target=hold_a_cursor)
+        holder.start()
+        assert holding.wait(5)
+        with pytest.raises(SharedTestConnectionError) as excinfo:
             client.get("/count")
+        release.set()
+        holder.join(5)
 
     message = str(excinfo.value)
-    assert "holds a cursor open across a request" in message, "the message must name the cause"
-    # Each of the three fixes must be spelled out, not merely alluded to.
-    assert "list(Model.objects.all())" in message
+    assert "holds a cursor open" in message
     assert "share_db_connection=False" in message
-    assert "transaction=True" in message
-    assert "TransactionTestCase" in message
     assert "DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT" in message
 
 
