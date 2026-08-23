@@ -274,8 +274,8 @@ rollback removes it.
 
 ### Its one limit
 
-One connection serves one thread at a time. Bolt handles this for you: work from
-the test and work from a handler waits its turn.
+One connection serves one thread at a time. Bolt handles this for you: the test
+and the handlers take turns.
 
 It cannot do so when a thread of your own keeps a cursor open across a request.
 A `QuerySet.iterator()` loop in a worker thread is the case that does it,

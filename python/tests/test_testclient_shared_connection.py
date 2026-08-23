@@ -249,17 +249,28 @@ def test_the_escape_hatch_serves_a_worker_that_iterates():
         User.objects.create(username=f"u{i}", email=f"u{i}@example.com")
 
     exported: list[str] = []
+    # The worker must still hold its cursor open while the requests run, thus it
+    # stops on the first row and waits. Without this it can finish the whole
+    # QuerySet before the first request, and cover nothing.
+    holding = threading.Event()
+    served = threading.Event()
 
     def export():
-        for user in User.objects.iterator(chunk_size=2):
+        for index, user in enumerate(User.objects.iterator(chunk_size=2)):
             exported.append(user.username)
+            if index == 0:
+                holding.set()
+                served.wait(5)
 
     with TestClient(_make_api(), share_db_connection=False) as client:
         worker = threading.Thread(target=export)
         worker.start()
-        statuses = {client.get("/count").status_code for _ in range(15)}
-        worker.join()
+        assert holding.wait(5), "the worker never opened its cursor"
+        statuses = {client.get("/count").status_code for _ in range(10)}
+        served.set()
+        worker.join(5)
 
+    assert not worker.is_alive()
     assert statuses == {200}
     assert len(exported) == 20
 
