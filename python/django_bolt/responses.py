@@ -161,7 +161,7 @@ class Response(CookieMixin):
         # content path to a single failed check.
         content = self.content
         if isinstance(content, (bytes, bytearray, memoryview)):
-            return content.tobytes() if isinstance(content, memoryview) else bytes(content)
+            return content if content.__class__ is bytes else bytes(content)
         if self.media_type == "application/json":
             return _json.encode(content)
         if isinstance(content, str):
