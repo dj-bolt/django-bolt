@@ -17,6 +17,7 @@ use std::time::Duration;
 use crate::handler::handle_request;
 use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
 use bolt_core::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
+use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
@@ -250,6 +251,10 @@ pub fn start_server(
             "Routes not registered",
         ));
     }
+
+    // Parse deployment proxy trust once. Python validation preserves Django's
+    // ImproperlyConfigured error for malformed settings.
+    let trusted_proxies = Arc::new(TrustedProxies::from_django_settings(py)?);
 
     // Configure tokio runtime with adequate blocking thread pool for concurrent streaming
     // Default is 512, but with concurrent SSE clients doing blocking operations (time.sleep),
@@ -799,6 +804,7 @@ pub fn start_server(
         global_cors_config,
         cors_origin_regexes,
         global_compression_config: global_compression_config.clone(),
+        trusted_proxies,
         router: None,                        // Production uses GLOBAL_ROUTER
         route_metadata: None,                // Production uses ROUTE_METADATA
         asgi_mounts: None,                   // Production uses GLOBAL_ASGI_MOUNTS

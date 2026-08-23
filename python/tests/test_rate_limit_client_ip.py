@@ -15,6 +15,7 @@ from django.test import override_settings
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import rate_limit
+from django_bolt.testing import TestClient
 
 
 def _api_with_limited_route():
@@ -29,14 +30,14 @@ def _api_with_limited_route():
     return api
 
 
-@pytest.mark.parametrize("entry", ["not-an-ip", "10.0.0.0/nine", "10.0.0.0/33", "::1/129"])
-def test_an_invalid_entry_fails_at_registration(entry):
+@pytest.mark.parametrize("entry", ["not-an-ip", "10.0.0.0/nine", "10.0.0.0/33", "::1/129", 10, None])
+def test_an_invalid_entry_fails_at_startup(entry):
     """A typo stops startup instead of quietly widening a bucket."""
     with (
         override_settings(BOLT_TRUSTED_PROXIES=["10.0.0.0/8", entry]),
         pytest.raises(ImproperlyConfigured, match="BOLT_TRUSTED_PROXIES"),
     ):
-        _api_with_limited_route()
+        TestClient(_api_with_limited_route())
 
 
 @pytest.mark.parametrize(
@@ -54,29 +55,32 @@ def test_an_invalid_entry_fails_at_registration(entry):
         pytest.param(True, id="boolean"),
     ],
 )
-def test_a_setting_that_is_not_a_list_fails_at_registration(configured):
+def test_a_setting_that_is_not_a_list_fails_at_startup(configured):
     """Reject the whole setting by type, before anything iterates it."""
     with (
         override_settings(BOLT_TRUSTED_PROXIES=configured),
         pytest.raises(ImproperlyConfigured, match="must be a list"),
     ):
-        _api_with_limited_route()
+        TestClient(_api_with_limited_route())
 
 
 @pytest.mark.parametrize("configured", [None, [], (), ["10.0.0.1"], ["10.0.0.0/8", "::1"], ("10.0.0.0/8",)])
-def test_a_valid_setting_registers(configured):
+def test_a_valid_setting_starts(configured):
     """Addresses and blocks are both accepted, in either family, list or tuple."""
-    with override_settings(BOLT_TRUSTED_PROXIES=configured):
-        assert _api_with_limited_route() is not None
+    with override_settings(BOLT_TRUSTED_PROXIES=configured), TestClient(_api_with_limited_route()):
+        pass
 
 
-def test_a_route_without_a_rate_limit_is_unaffected():
-    """Only a rate limited route reads the list, so only it should validate one."""
-    with override_settings(BOLT_TRUSTED_PROXIES=["not-an-ip"]):
+def test_an_invalid_deployment_setting_fails_even_without_a_limited_route():
+    """The deployment-wide policy is validated independently of route shape."""
+    with (
+        override_settings(BOLT_TRUSTED_PROXIES=["not-an-ip"]),
+        pytest.raises(ImproperlyConfigured, match="BOLT_TRUSTED_PROXIES"),
+    ):
         api = BoltAPI()
 
         @api.get("/plain")
         async def plain():
             return {"ok": True}
 
-        assert api is not None
+        TestClient(api)

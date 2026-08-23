@@ -77,11 +77,12 @@ Proxies that sit in front of Bolt, as addresses or CIDR blocks. The list is empt
 BOLT_TRUSTED_PROXIES = ["10.0.0.0/8"]
 ```
 
-A `@rate_limit(key="ip")` limit uses this list to find the client address:
+Bolt uses this list to find the canonical client address for
+`@rate_limit(key="ip")` and `request.META["REMOTE_ADDR"]`:
 
 - The list is empty. Bolt keys on the peer address of the connection and ignores every forwarding header.
 - The peer is not in the list. Bolt keys on the peer address. That peer is not a declared proxy, so its headers prove nothing.
-- The peer is in the list. Bolt reads `X-Forwarded-For` from the right and takes the first entry that is not a listed proxy. It falls back to `X-Real-IP`, then `Remote-Addr`, then the peer address.
+- The peer is in the list. Bolt reads `X-Forwarded-For` from the right and takes the first entry that is not a listed proxy. It falls back to a valid `X-Real-IP`, then the peer address. A malformed chain also falls back to the peer.
 
 Both an address and a block are accepted. `127.0.0.1` matches one address. `10.0.0.0/8` matches the block. An invalid entry raises `ImproperlyConfigured` at startup.
 

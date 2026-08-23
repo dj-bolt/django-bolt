@@ -183,12 +183,6 @@ def compile_middleware_meta(
     if all_middleware:
         result["middleware"] = all_middleware
 
-        # Rust needs the trusted proxy list to resolve the client address for a
-        # `key="ip"` rate limit. Proxies belong to the deployment, not to one
-        # route, so resolve the setting once here at registration.
-        if any(mw.get("type") == "rate_limit" for mw in all_middleware):
-            result["trusted_proxies"] = get_trusted_proxies()
-
     # Always include skip flags if present (even without middleware/auth/guards)
     if skip_middleware:
         result["skip"] = list(skip_middleware)
@@ -437,9 +431,9 @@ def get_trusted_proxies() -> list[str]:
     Read and validate `settings.BOLT_TRUSTED_PROXIES`.
 
     The setting holds the proxies that sit in front of Bolt, as addresses or
-    CIDR blocks. A `key="ip"` rate limit believes `X-Forwarded-For` only from a
-    peer in this list. The list is empty by default, so Bolt keys on the peer
-    address and ignores forwarding headers.
+    CIDR blocks. Bolt believes `X-Forwarded-For` only from a peer in this list.
+    The list is empty by default, so Bolt uses the peer address and ignores
+    forwarding headers.
 
     Returns:
         Normalized CIDR strings, for example `["10.0.0.0/8", "127.0.0.1/32"]`.
@@ -464,6 +458,13 @@ def get_trusted_proxies() -> list[str]:
 
     normalized = []
     for entry in configured:
+        # `ip_network` also accepts an int and turns 10 into 0.0.0.10/32.
+        # That is a silently wrong proxy, so accept only strings.
+        if not isinstance(entry, str):
+            raise ImproperlyConfigured(
+                f"BOLT_TRUSTED_PROXIES entry {entry!r} is not an address or CIDR block: "
+                f"expected a string, got {type(entry).__name__}."
+            )
         try:
             network = ipaddress.ip_network(entry, strict=False)
         except (TypeError, ValueError) as e:

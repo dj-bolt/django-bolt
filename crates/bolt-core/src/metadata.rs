@@ -16,7 +16,6 @@ use crate::middleware::auth::{
     build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
     RefreshingJwks,
 };
-use crate::middleware::client_ip::IpCidr;
 use crate::permissions::{ClaimKey, Guard, GuardDenial, GuardSet, Quantifier};
 
 /// Request value source for Rust-side argument prebinding.
@@ -215,12 +214,16 @@ impl CorsConfig {
 pub struct RateLimitConfig {
     pub rps: u32,
     pub burst: u32,
-    pub key_type: String,
-    /// Proxies whose forwarding headers a `key="ip"` limit may believe.
-    ///
-    /// Comes from `settings.BOLT_TRUSTED_PROXIES` and is empty by default. An
-    /// empty list makes the limit key on the peer address only.
-    pub trusted_proxies: Vec<IpCidr>,
+    pub key: RateLimitKey,
+}
+
+/// What a rate limit buckets on. Decided once at registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitKey {
+    /// The resolved client address. See `middleware::client_ip`.
+    Ip,
+    /// One request header, stored lowercase for direct lookup.
+    Header(String),
 }
 
 impl Default for RateLimitConfig {
@@ -228,8 +231,7 @@ impl Default for RateLimitConfig {
         RateLimitConfig {
             rps: 100,
             burst: 200,
-            key_type: "ip".to_string(),
-            trusted_proxies: Vec::new(),
+            key: RateLimitKey::Ip,
         }
     }
 }
@@ -556,15 +558,6 @@ impl RouteMetadata {
             }
         }
 
-        // Attach the trusted proxy list. Proxies are a property of the
-        // deployment, not of one route, so Python resolves
-        // `settings.BOLT_TRUSTED_PROXIES` once at registration and sends it
-        // beside the middleware list. A bad entry aborts startup: keying a
-        // limit on the wrong address is a silent security downgrade.
-        if let Some(config) = rate_limit_config.as_mut() {
-            config.trusted_proxies = parse_trusted_proxies(py_meta)?;
-        }
-
         // Parse auth backends. Failures propagate: metadata that fails to
         // extract must abort startup, not leave the route unauthenticated.
         if let Some(auth_list) = py_meta.get_item("auth_backends")? {
@@ -845,32 +838,6 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<Co
 }
 
 /// Parse rate limiting configuration from middleware dict
-/// Read `trusted_proxies` from route metadata.
-///
-/// Python validates the setting first, so anything invalid here is a bug.
-fn parse_trusted_proxies(py_meta: &Bound<'_, PyDict>) -> PyResult<Vec<IpCidr>> {
-    let Some(value) = py_meta.get_item("trusted_proxies")? else {
-        return Ok(Vec::new());
-    };
-    if value.is_none() {
-        return Ok(Vec::new());
-    }
-
-    let entries: Vec<String> = value.extract().map_err(|e| {
-        PyValueError::new_err(format!(
-            "Invalid 'trusted_proxies' route metadata, expected a list of strings: {e}"
-        ))
-    })?;
-
-    let mut blocks = Vec::with_capacity(entries.len());
-    for entry in entries {
-        blocks.push(IpCidr::parse(&entry).map_err(|e| {
-            PyValueError::new_err(format!("Invalid BOLT_TRUSTED_PROXIES entry: {e}"))
-        })?);
-    }
-    Ok(blocks)
-}
-
 fn parse_rate_limit_config(
     dict: &HashMap<String, Py<PyAny>>,
     py: Python,
@@ -899,10 +866,10 @@ fn parse_rate_limit_config(
     // check can look them up directly (headers are stored lowercase).
     if let Some(key_py) = dict.get("key") {
         if let Ok(key_type) = key_py.extract::<String>(py) {
-            config.key_type = if key_type == "ip" {
-                key_type
+            config.key = if key_type == "ip" {
+                RateLimitKey::Ip
             } else {
-                key_type.to_lowercase()
+                RateLimitKey::Header(key_type.to_lowercase())
             };
         }
     }

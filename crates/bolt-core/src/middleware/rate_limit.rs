@@ -5,18 +5,38 @@ use governor::clock::{Clock, DefaultClock};
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use once_cell::sync::Lazy;
+use std::fmt;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::metadata::RateLimitConfig;
-use crate::middleware::client_ip;
+use crate::metadata::{RateLimitConfig, RateLimitKey};
 use crate::response_builder;
 use crate::responses;
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
-// Store per-key limiters (IP-based)
-static IP_LIMITERS: Lazy<DashMap<(usize, String), Arc<Limiter>>> = Lazy::new(DashMap::new);
+/// One bucket identity. `Ip` is `Copy`, so the common path hashes 17 bytes
+/// and never allocates. `Header` owns its value because it is the map key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LimiterKey {
+    Ip(IpAddr),
+    Header(Box<str>),
+    Unknown,
+}
+
+impl fmt::Display for LimiterKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LimiterKey::Ip(ip) => ip.fmt(f),
+            LimiterKey::Header(value) => f.write_str(value),
+            LimiterKey::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
+// Store per-key limiters
+static IP_LIMITERS: Lazy<DashMap<(usize, LimiterKey), Arc<Limiter>>> = Lazy::new(DashMap::new);
 
 // Track total limiter count for cleanup
 static LIMITER_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -30,7 +50,7 @@ const MAX_KEY_LENGTH: usize = 256;
 pub fn check_rate_limit(
     handler_id: usize,
     headers: &AHashMap<String, String>,
-    peer_addr: Option<&str>,
+    client_ip: Option<&IpAddr>,
     config: &RateLimitConfig,
     method: &str,
     path: &str,
@@ -38,36 +58,26 @@ pub fn check_rate_limit(
     // Config is already parsed at startup - no GIL needed!
     let rps = config.rps;
     let burst = config.burst;
-    let key_type = &config.key_type;
 
     // Determine the rate limit key
-    let key = match key_type.as_str() {
-        "ip" => {
-            // SECURITY: a forwarding header is client input. `client_ip::resolve`
-            // reads one only when a declared trusted proxy sent it. See
-            // `client_ip` for the rules and `BOLT_TRUSTED_PROXIES` for the list.
-            client_ip::resolve(headers, peer_addr, &config.trusted_proxies)
-                .unwrap_or_else(|| "unknown".to_string())
-        }
-        header_name => {
-            // Custom header key — already lowercased once at startup when the
-            // RateLimitConfig was parsed (headers map stores lowercase names).
-            headers
-                .get(header_name)
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string())
-        }
-    };
-
-    // SECURITY: Validate key length to prevent memory attacks
-    if key.len() > MAX_KEY_LENGTH {
-        // Truncate or reject long keys
-        return Some(
-            HttpResponse::BadRequest()
-                .content_type("application/json")
-                .body(r#"{"detail":"Rate limit key too long"}"#),
-        );
+    let key = match &config.key {
+        RateLimitKey::Ip => client_ip.map(|ip| LimiterKey::Ip(*ip)),
+        // Custom header key — already lowercased once at startup when the
+        // RateLimitConfig was parsed (headers map stores lowercase names).
+        RateLimitKey::Header(name) => match headers.get(name) {
+            // SECURITY: Validate key length to prevent memory attacks
+            Some(value) if value.len() > MAX_KEY_LENGTH => {
+                return Some(
+                    HttpResponse::BadRequest()
+                        .content_type("application/json")
+                        .body(r#"{"detail":"Rate limit key too long"}"#),
+                );
+            }
+            Some(value) => Some(LimiterKey::Header(value.as_str().into())),
+            None => None,
+        },
     }
+    .unwrap_or(LimiterKey::Unknown);
 
     // SECURITY: Check if we've exceeded max limiters (prevent memory exhaustion)
     let current_count = LIMITER_COUNT.load(Ordering::Relaxed);
@@ -77,8 +87,7 @@ pub fn check_rate_limit(
     }
 
     // Get or create rate limiter for this handler + key combination
-    let limiter_key = (handler_id, key.clone());
-    let limiter = IP_LIMITERS.entry(limiter_key.clone()).or_insert_with(|| {
+    let limiter = IP_LIMITERS.entry((handler_id, key)).or_insert_with(|| {
         // Increment counter
         LIMITER_COUNT.fetch_add(1, Ordering::Relaxed);
 
@@ -100,7 +109,7 @@ pub fn check_rate_limit(
             // Log rate limit exceeded
             eprintln!(
                 "[django-bolt] Rate limit exceeded: {} {} | key: {} | limit: {} rps (burst: {}) | retry after: {}s",
-                method, path, key, rps, burst, retry_after
+                method, path, limiter.key().1, rps, burst, retry_after
             );
 
             Some(response_builder::build_rate_limit_response(

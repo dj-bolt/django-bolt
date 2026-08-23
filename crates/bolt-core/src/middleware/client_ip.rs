@@ -9,8 +9,10 @@
 //! list is empty by default. With an empty list Bolt ignores every forwarding
 //! header and keys on the peer address.
 
-use ahash::AHashMap;
-use std::net::IpAddr;
+use actix_web::http::header::HeaderMap;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use std::net::{IpAddr, SocketAddr};
 
 /// One entry of the trusted proxy list.
 ///
@@ -34,11 +36,9 @@ impl IpCidr {
             None => (entry, None),
         };
 
-        let network = normalize(
-            address
-                .parse::<IpAddr>()
-                .map_err(|_| format!("{entry:?} is not an IP address or CIDR block"))?,
-        );
+        let network = address
+            .parse::<IpAddr>()
+            .map_err(|_| format!("{entry:?} is not an IP address or CIDR block"))?;
         let max_prefix_len = if network.is_ipv4() { 32 } else { 128 };
 
         let prefix_len = match prefix {
@@ -61,18 +61,62 @@ impl IpCidr {
 
     /// Report whether `candidate` is inside this block.
     ///
-    /// An IPv4 block never matches an IPv6 address, and the reverse. Both sides
-    /// are normalized first, so `::ffff:10.0.0.1` matches `10.0.0.0/8`.
+    /// An IPv4 block matches an IPv4-mapped IPv6 peer. An explicitly configured
+    /// IPv4-mapped IPv6 block remains IPv6, preserving its prefix length.
     pub fn contains(&self, candidate: &IpAddr) -> bool {
-        match (self.network, normalize(*candidate)) {
-            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
-                prefix_eq(&network.octets(), &candidate.octets(), self.prefix_len)
-            }
-            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
-                prefix_eq(&network.octets(), &candidate.octets(), self.prefix_len)
-            }
-            _ => false,
+        match self.network {
+            IpAddr::V4(network) => match normalize(*candidate) {
+                IpAddr::V4(candidate) => {
+                    prefix_eq(&network.octets(), &candidate.octets(), self.prefix_len)
+                }
+                IpAddr::V6(_) => false,
+            },
+            IpAddr::V6(network) => match candidate {
+                IpAddr::V6(candidate) => {
+                    prefix_eq(&network.octets(), &candidate.octets(), self.prefix_len)
+                }
+                IpAddr::V4(_) => false,
+            },
         }
+    }
+}
+
+/// Deployment-wide proxy trust policy, parsed once for one server or test app.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedProxies {
+    blocks: Vec<IpCidr>,
+}
+
+impl TrustedProxies {
+    pub fn parse(entries: &[String]) -> Result<Self, String> {
+        let blocks = entries
+            .iter()
+            .map(|entry| IpCidr::parse(entry))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { blocks })
+    }
+
+    /// Preserve Python's `ImproperlyConfigured` validation while building the
+    /// Rust hot-path representation only once at application startup.
+    pub fn from_django_settings(py: Python<'_>) -> PyResult<Self> {
+        let entries: Vec<String> = py
+            .import("django_bolt.middleware.compiler")?
+            .getattr("get_trusted_proxies")?
+            .call0()?
+            .extract()?;
+        Self::parse(&entries).map_err(|error| {
+            PyValueError::new_err(format!("Invalid BOLT_TRUSTED_PROXIES entry: {error}"))
+        })
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    #[inline]
+    fn contains(&self, address: &IpAddr) -> bool {
+        self.blocks.iter().any(|block| block.contains(address))
     }
 }
 
@@ -111,11 +155,20 @@ fn parse_ip(value: &str) -> Option<IpAddr> {
     value.trim().parse::<IpAddr>().ok().map(normalize)
 }
 
-fn is_trusted(address: &IpAddr, trusted_proxies: &[IpCidr]) -> bool {
-    trusted_proxies.iter().any(|block| block.contains(address))
+/// Parse a forwarding hop. Plain IPs are standard; `SocketAddr` additionally
+/// accepts proxy output such as `192.0.2.1:1234` and `[2001:db8::1]:443`.
+fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim();
+    parse_ip(value).or_else(|| {
+        value
+            .parse::<SocketAddr>()
+            .ok()
+            .map(|address| normalize(address.ip()))
+    })
 }
 
-/// Resolve the address that a `key="ip"` rate limit applies to.
+/// Resolve the canonical client address used by rate limiting, Django request
+/// metadata, and request logging.
 ///
 /// The rules are:
 ///
@@ -126,80 +179,141 @@ fn is_trusted(address: &IpAddr, trusted_proxies: &[IpCidr]) -> bool {
 /// 3. With a trusted peer, read `X-Forwarded-For` from the right. Return the
 ///    first entry that is not a trusted proxy. That entry is the client.
 /// 4. When every `X-Forwarded-For` entry is trusted, return the leftmost entry.
-/// 5. Fall back to `X-Real-IP`, then `Remote-Addr`, then the peer address.
+/// 5. Fall back to a valid `X-Real-IP`, then the peer address.
+/// 6. A malformed forwarding chain falls back to the peer; it never exposes an
+///    attacker-controlled entry farther left.
 ///
 /// Returns `None` only when there is no peer address and no usable header. The
 /// caller then keys on a constant.
-pub fn resolve(
-    headers: &AHashMap<String, String>,
-    peer_addr: Option<&str>,
-    trusted_proxies: &[IpCidr],
-) -> Option<String> {
-    let peer = peer_addr.and_then(parse_ip);
-    let peer_key = || {
-        peer.map(|ip| ip.to_string())
-            .or_else(|| peer_addr.map(str::to_string))
-    };
+///
+/// `forwarded_for` yields each `X-Forwarded-For` header value in wire order.
+/// A `None` item is a value that is not valid text. `resolve` reads the values
+/// lazily and from the right, so a request that reaches rule 1 or 2 never
+/// touches them.
+pub fn resolve<'a>(
+    forwarded_for: impl DoubleEndedIterator<Item = Option<&'a str>>,
+    real_ip: Option<Option<&'a str>>,
+    peer_addr: Option<IpAddr>,
+    trusted_proxies: &TrustedProxies,
+) -> Option<IpAddr> {
+    let peer = peer_addr.map(normalize);
 
     if trusted_proxies.is_empty() {
-        return peer_key();
+        return peer;
     }
     match peer {
-        Some(address) if is_trusted(&address, trusted_proxies) => {}
-        _ => return peer_key(),
+        Some(address) if trusted_proxies.contains(&address) => {}
+        _ => return peer,
     }
 
-    if let Some(forwarded) = headers.get("x-forwarded-for") {
-        if let Some(client) = client_from_forwarded_for(forwarded, trusted_proxies) {
-            return Some(client);
-        }
+    match client_from_forwarded_for(forwarded_for, trusted_proxies) {
+        Ok(Some(client)) => return Some(client),
+        Ok(None) => {}
+        // A malformed chain proves nothing. Fall back to the socket peer
+        // instead of searching farther left through client-controlled data.
+        Err(()) => return peer,
     }
-    for header in ["x-real-ip", "remote-addr"] {
-        if let Some(address) = headers.get(header).and_then(|value| parse_ip(value)) {
-            return Some(address.to_string());
-        }
+    if let Some(value) = real_ip {
+        return value.and_then(parse_forwarded_ip).or(peer);
     }
 
-    peer_key()
+    peer
 }
 
-/// Find the client inside one `X-Forwarded-For` value.
-///
-/// The rightmost entry that is not a trusted proxy is the client. Entries that
-/// do not parse are skipped: a bucket key must be an address, and a trusted
-/// proxy always appends the real peer to the right of any junk.
-fn client_from_forwarded_for(value: &str, trusted_proxies: &[IpCidr]) -> Option<String> {
-    let mut leftmost: Option<IpAddr> = None;
-    let mut rightmost_untrusted: Option<IpAddr> = None;
+/// Resolve from an Actix header map. Duplicate `X-Forwarded-For` headers are
+/// read in order without a merge step.
+#[inline]
+pub fn resolve_from_headers(
+    headers: &HeaderMap,
+    peer_addr: Option<IpAddr>,
+    trusted_proxies: &TrustedProxies,
+) -> Option<IpAddr> {
+    resolve(
+        headers
+            .get_all("x-forwarded-for")
+            .map(|value| value.to_str().ok()),
+        headers.get("x-real-ip").map(|value| value.to_str().ok()),
+        peer_addr,
+        trusted_proxies,
+    )
+}
 
-    for entry in value.split(',') {
-        let Some(address) = parse_ip(entry) else {
-            continue;
+/// Find the client across the `X-Forwarded-For` values.
+///
+/// The rightmost entry that is not a trusted proxy is the client. A malformed
+/// hop invalidates the chain; skipping it could expose a spoofed entry farther
+/// left when a proxy emits an unsupported representation of the real client.
+fn client_from_forwarded_for<'a>(
+    values: impl DoubleEndedIterator<Item = Option<&'a str>>,
+    trusted_proxies: &TrustedProxies,
+) -> Result<Option<IpAddr>, ()> {
+    let mut leftmost: Option<IpAddr> = None;
+
+    for value in values.rev() {
+        let Some(value) = value else {
+            return Err(());
         };
-        if leftmost.is_none() {
+        for entry in value.rsplit(',') {
+            let Some(address) = parse_forwarded_ip(entry) else {
+                return Err(());
+            };
             leftmost = Some(address);
-        }
-        if !is_trusted(&address, trusted_proxies) {
-            rightmost_untrusted = Some(address);
+            if !trusted_proxies.contains(&address) {
+                return Ok(Some(address));
+            }
         }
     }
 
-    rightmost_untrusted.or(leftmost).map(|ip| ip.to_string())
+    Ok(leftmost)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use actix_web::http::header::{HeaderName, HeaderValue};
 
-    fn cidrs(entries: &[&str]) -> Vec<IpCidr> {
-        entries.iter().map(|e| IpCidr::parse(e).unwrap()).collect()
+    // Keep expectations readable while the production API stays allocation-free.
+    fn resolve(
+        headers: &HeaderMap,
+        peer_addr: Option<&str>,
+        trusted_proxies: &TrustedProxies,
+    ) -> Option<String> {
+        resolve_from_headers(headers, peer_addr.and_then(parse_ip), trusted_proxies)
+            .map(|address| address.to_string())
     }
 
-    fn headers(pairs: &[(&str, &str)]) -> AHashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect()
+    fn proxies(entries: &[&str]) -> TrustedProxies {
+        TrustedProxies::parse(
+            &entries
+                .iter()
+                .map(|entry| entry.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn reads_duplicate_forwarded_for_headers_in_order() {
+        let resolved = resolve(
+            &headers(&[
+                ("x-forwarded-for", "1.1.1.1, 203.0.113.9"),
+                ("x-forwarded-for", "10.0.0.1"),
+            ]),
+            Some("10.0.0.1"),
+            &proxies(&["10.0.0.0/8"]),
+        );
+        assert_eq!(resolved.as_deref(), Some("203.0.113.9"));
     }
 
     #[test]
@@ -236,6 +350,13 @@ mod tests {
     }
 
     #[test]
+    fn accepts_an_explicit_ipv4_mapped_ipv6_proxy() {
+        let block = IpCidr::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(block.contains(&"::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!block.contains(&"::ffff:11.1.2.3".parse().unwrap()));
+    }
+
+    #[test]
     fn does_not_match_across_families() {
         let block = IpCidr::parse("10.0.0.0/8").unwrap();
         assert!(!block.contains(&"2001:db8::1".parse().unwrap()));
@@ -246,7 +367,7 @@ mod tests {
         let resolved = resolve(
             &headers(&[("x-forwarded-for", "1.2.3.4")]),
             Some("203.0.113.9"),
-            &[],
+            &TrustedProxies::default(),
         );
         assert_eq!(resolved.as_deref(), Some("203.0.113.9"));
     }
@@ -256,7 +377,7 @@ mod tests {
         let resolved = resolve(
             &headers(&[("x-forwarded-for", "1.2.3.4")]),
             Some("203.0.113.9"),
-            &cidrs(&["10.0.0.0/8"]),
+            &proxies(&["10.0.0.0/8"]),
         );
         assert_eq!(resolved.as_deref(), Some("203.0.113.9"));
     }
@@ -266,7 +387,7 @@ mod tests {
         let resolved = resolve(
             &headers(&[("x-forwarded-for", "203.0.113.9")]),
             Some("10.0.0.1"),
-            &cidrs(&["10.0.0.0/8"]),
+            &proxies(&["10.0.0.0/8"]),
         );
         assert_eq!(resolved.as_deref(), Some("203.0.113.9"));
     }
@@ -276,7 +397,7 @@ mod tests {
         let resolved = resolve(
             &headers(&[("x-forwarded-for", "203.0.113.9, 10.0.0.7, 10.0.0.1")]),
             Some("10.0.0.1"),
-            &cidrs(&["10.0.0.0/8"]),
+            &proxies(&["10.0.0.0/8"]),
         );
         assert_eq!(resolved.as_deref(), Some("203.0.113.9"));
     }
@@ -288,7 +409,7 @@ mod tests {
         let resolved = resolve(
             &headers(&[("x-forwarded-for", "1.1.1.1, 203.0.113.9, 10.0.0.1")]),
             Some("10.0.0.1"),
-            &cidrs(&["10.0.0.0/8"]),
+            &proxies(&["10.0.0.0/8"]),
         );
         assert_eq!(resolved.as_deref(), Some("203.0.113.9"));
     }
@@ -298,7 +419,7 @@ mod tests {
         let resolved = resolve(
             &headers(&[("x-forwarded-for", "10.0.0.55, 10.0.0.1")]),
             Some("10.0.0.1"),
-            &cidrs(&["10.0.0.0/8"]),
+            &proxies(&["10.0.0.0/8"]),
         );
         assert_eq!(resolved.as_deref(), Some("10.0.0.55"));
     }
@@ -308,7 +429,7 @@ mod tests {
         let resolved = resolve(
             &headers(&[("x-real-ip", "203.0.113.9")]),
             Some("10.0.0.1"),
-            &cidrs(&["10.0.0.0/8"]),
+            &proxies(&["10.0.0.0/8"]),
         );
         assert_eq!(resolved.as_deref(), Some("203.0.113.9"));
     }
@@ -318,20 +439,61 @@ mod tests {
         let resolved = resolve(
             &headers(&[("x-forwarded-for", "not-an-ip")]),
             Some("10.0.0.1"),
-            &cidrs(&["10.0.0.0/8"]),
+            &proxies(&["10.0.0.0/8"]),
+        );
+        assert_eq!(resolved.as_deref(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn malformed_hop_does_not_expose_a_spoofed_prefix() {
+        let resolved = resolve(
+            &headers(&[("x-forwarded-for", "1.1.1.1, not-an-ip, 10.0.0.1")]),
+            Some("10.0.0.1"),
+            &proxies(&["10.0.0.0/8"]),
+        );
+        assert_eq!(resolved.as_deref(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn accepts_ipv4_and_bracketed_ipv6_hops_with_ports() {
+        let trusted = proxies(&["10.0.0.0/8"]);
+        let ipv4 = resolve(
+            &headers(&[("x-forwarded-for", "203.0.113.9:54321")]),
+            Some("10.0.0.1"),
+            &trusted,
+        );
+        let ipv6 = resolve(
+            &headers(&[("x-forwarded-for", "[2001:db8::9]:54321")]),
+            Some("10.0.0.1"),
+            &trusted,
+        );
+        assert_eq!(ipv4.as_deref(), Some("203.0.113.9"));
+        assert_eq!(ipv6.as_deref(), Some("2001:db8::9"));
+    }
+
+    #[test]
+    fn rejects_a_malformed_x_real_ip() {
+        let resolved = resolve(
+            &headers(&[("x-real-ip", "attacker-chosen-bucket")]),
+            Some("10.0.0.1"),
+            &proxies(&["10.0.0.0/8"]),
         );
         assert_eq!(resolved.as_deref(), Some("10.0.0.1"));
     }
 
     #[test]
     fn normalizes_an_ipv4_mapped_peer_to_one_bucket() {
-        let plain = resolve(&headers(&[]), Some("10.0.0.1"), &[]);
-        let mapped = resolve(&headers(&[]), Some("::ffff:10.0.0.1"), &[]);
+        let proxies = TrustedProxies::default();
+        let plain = resolve(&headers(&[]), Some("10.0.0.1"), &proxies);
+        let mapped = resolve(&headers(&[]), Some("::ffff:10.0.0.1"), &proxies);
         assert_eq!(plain, mapped);
     }
 
     #[test]
     fn returns_none_without_a_peer_or_usable_header() {
-        assert_eq!(resolve(&headers(&[]), None, &[]), None);
+        assert_eq!(
+            resolve(&headers(&[]), None, &TrustedProxies::default()),
+            None
+        );
     }
 }

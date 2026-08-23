@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
-- **`@rate_limit(key="ip")` trusted `X-Forwarded-For`** - The key came from the leftmost entry of `X-Forwarded-For`, which the client sends. Behind a proxy that appends the header, and with Bolt exposed directly, a client changed one header and got a new bucket for every request. Bolt now keys on the peer address and ignores forwarding headers. Set `BOLT_TRUSTED_PROXIES` to the addresses or CIDR blocks of your proxies to read `X-Forwarded-For` again. Bolt then reads it from the right and takes the first entry that is not a listed proxy. **Add the setting if you run behind a proxy**, or every caller behind it shares one bucket. (#302)
+- **`@rate_limit(key="ip")` trusted `X-Forwarded-For`** - The key came from the leftmost entry of `X-Forwarded-For`, which the client sends. Behind a proxy that appends the header, and with Bolt exposed directly, a client changed one header and got a new bucket for every request. Bolt now uses one canonical client address for rate limiting, `request.META["REMOTE_ADDR"]`, and request logging: the peer address by default, or the first untrusted `X-Forwarded-For` hop when the peer matches `BOLT_TRUSTED_PROXIES`. Malformed chains fall back to the peer. **Add the setting if you run behind a proxy**, or every caller behind it shares one bucket. (#302)
 
 ### Fixed
 

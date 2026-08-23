@@ -90,6 +90,10 @@ Bolt then reads `X-Forwarded-For` from the right and takes the first entry that
 is not a listed proxy. A client cannot pick its own bucket, because the proxy
 appends the real address to the right of anything the client sent.
 
+The resolved address is also exposed as `request.META["REMOTE_ADDR"]`. If any
+forwarding hop is malformed, Bolt ignores the chain and uses the connection
+peer rather than searching farther left through client-controlled input.
+
 Set this whenever a proxy, a load balancer or a CDN is in front of Bolt.
 Without it every caller behind that proxy shares one bucket. See
 [BOLT_TRUSTED_PROXIES](../ref/settings.md#bolt_trusted_proxies).
