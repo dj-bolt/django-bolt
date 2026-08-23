@@ -408,6 +408,11 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     that is not a listed proxy. Without the setting, every caller behind the
     proxy shares one bucket.
 
+    `key="user"` counts per authenticated identity and `key="api_key"` counts
+    per authenticated API key. Both run after authentication. A caller with no
+    identity is counted per client address. Both need an auth backend on the
+    route or the API; the server refuses to start without one.
+
     Args:
         rps: Requests per second limit
         burst: Burst capacity (defaults to 2x rps)

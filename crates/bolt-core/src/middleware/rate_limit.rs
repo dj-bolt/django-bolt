@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::metadata::{RateLimitConfig, RateLimitKey};
+use crate::middleware::auth::AuthContext;
 use crate::response_builder;
 use crate::responses;
 
@@ -22,6 +23,7 @@ type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 enum LimiterKey {
     Ip(IpAddr),
     Header(Box<str>),
+    Identity(Box<str>),
     Unknown,
 }
 
@@ -30,6 +32,7 @@ impl fmt::Display for LimiterKey {
         match self {
             LimiterKey::Ip(ip) => ip.fmt(f),
             LimiterKey::Header(value) => f.write_str(value),
+            LimiterKey::Identity(value) => f.write_str(value),
             LimiterKey::Unknown => f.write_str("unknown"),
         }
     }
@@ -50,10 +53,46 @@ const MAX_LIMITERS: usize = 100_000;
 // SECURITY: Maximum key length to prevent memory attacks
 const MAX_KEY_LENGTH: usize = 256;
 
+/// The check for address and header keys. Runs before authentication so a
+/// flood never pays for token verification. Identity keys return `None` here.
+#[inline]
+pub fn check_before_auth(
+    handler_id: usize,
+    headers: &AHashMap<String, String>,
+    client_ip: Option<&IpAddr>,
+    config: &RateLimitConfig,
+    method: &str,
+    path: &str,
+) -> Option<HttpResponse> {
+    if config.key.needs_identity() {
+        return None;
+    }
+    check_rate_limit(handler_id, headers, client_ip, None, config, method, path)
+}
+
+/// The check for identity keys. Runs after authentication, with the
+/// `AuthContext` of the request. Other keys return `None` here.
+#[inline]
+pub fn check_after_auth(
+    handler_id: usize,
+    headers: &AHashMap<String, String>,
+    client_ip: Option<&IpAddr>,
+    auth_ctx: Option<&AuthContext>,
+    config: &RateLimitConfig,
+    method: &str,
+    path: &str,
+) -> Option<HttpResponse> {
+    if !config.key.needs_identity() {
+        return None;
+    }
+    check_rate_limit(handler_id, headers, client_ip, auth_ctx, config, method, path)
+}
+
 pub fn check_rate_limit(
     handler_id: usize,
     headers: &AHashMap<String, String>,
     client_ip: Option<&IpAddr>,
+    auth_ctx: Option<&AuthContext>,
     config: &RateLimitConfig,
     method: &str,
     path: &str,
@@ -79,6 +118,11 @@ pub fn check_rate_limit(
             Some(value) => Some(LimiterKey::Header(value.as_str().into())),
             None => None,
         },
+        // Identity keys run after authentication. A caller with no identity
+        // is limited per client address, so an unauthenticated flood cannot
+        // pick a fresh bucket per request.
+        RateLimitKey::User => identity_key(auth_ctx, client_ip, |_| true),
+        RateLimitKey::ApiKey => identity_key(auth_ctx, client_ip, |ctx| ctx.backend == "api_key"),
     }
     .unwrap_or(LimiterKey::Unknown);
 
@@ -125,6 +169,21 @@ pub fn check_rate_limit(
             ))
         }
     }
+}
+
+/// The authenticated identity when `accept` admits the backend, else the
+/// client address.
+#[inline]
+fn identity_key(
+    auth_ctx: Option<&AuthContext>,
+    client_ip: Option<&IpAddr>,
+    accept: impl Fn(&AuthContext) -> bool,
+) -> Option<LimiterKey> {
+    auth_ctx
+        .filter(|ctx| accept(ctx))
+        .and_then(|ctx| ctx.user_id.as_deref())
+        .map(|id| LimiterKey::Identity(id.into()))
+        .or_else(|| client_ip.map(|ip| LimiterKey::Ip(*ip)))
 }
 
 /// Cleanup old rate limiters when limit is reached

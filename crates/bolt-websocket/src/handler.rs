@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 
 use bolt_core::metadata::CorsConfig;
-use bolt_core::middleware::rate_limit::check_rate_limit;
+use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::state::{AppState, ROUTE_METADATA};
 use bolt_core::type_coercion::coerced_value_to_py;
 use bolt_core::type_coercion::{coerce_param, CoerceError, TYPE_STRING};
@@ -502,20 +502,20 @@ pub async fn handle_websocket_upgrade_with_handler(
         }
     }
 
-    // Check rate limiting BEFORE origin validation (reuse HTTP rate limit)
+    // Check rate limiting BEFORE origin validation (reuse HTTP rate limit).
+    // Address and header keys run here; identity keys run after auth below.
+    let mut client_ip = None;
     if let Some(route_metadata) = ROUTE_METADATA.get() {
         if let Some(route_meta) = route_metadata.get(handler_id) {
             if let Some(ref rate_config) = route_meta.rate_limit_config {
-                let client_ip = (rate_config.key == bolt_core::metadata::RateLimitKey::Ip)
-                    .then(|| {
-                        bolt_core::middleware::client_ip::resolve_from_headers(
-                            req.headers(),
-                            req.peer_addr().map(|address| address.ip()),
-                            &state.trusted_proxies,
-                        )
-                    })
-                    .flatten();
-                if let Some(response) = check_rate_limit(
+                if !matches!(rate_config.key, bolt_core::metadata::RateLimitKey::Header(_)) {
+                    client_ip = bolt_core::middleware::client_ip::resolve_from_headers(
+                        req.headers(),
+                        req.peer_addr().map(|address| address.ip()),
+                        &state.trusted_proxies,
+                    );
+                }
+                if let Some(response) = check_before_auth(
                     handler_id,
                     &headers,
                     client_ip.as_ref(),
@@ -542,8 +542,20 @@ pub async fn handle_websocket_upgrade_with_handler(
         if let Some(route_meta) = route_metadata.get(handler_id) {
             match validate_auth_and_guards(&headers, &route_meta.auth_backends, &route_meta.guards)
             {
-                AuthGuardResult::Allow(_ctx) => {
-                    // Guards passed, continue with WebSocket upgrade
+                AuthGuardResult::Allow(ctx) => {
+                    if let Some(ref rate_config) = route_meta.rate_limit_config {
+                        if let Some(response) = check_after_auth(
+                            handler_id,
+                            &headers,
+                            client_ip.as_ref(),
+                            ctx.as_ref(),
+                            rate_config,
+                            req.method().as_str(),
+                            req.path(),
+                        ) {
+                            return Ok(response);
+                        }
+                    }
                 }
                 AuthGuardResult::Unauthorized => {
                     return Ok(bolt_core::responses::error_401());

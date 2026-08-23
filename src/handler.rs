@@ -890,24 +890,25 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         None
     };
 
-    // Process rate limiting (Rust-native, no GIL)
-    if let Some(route_meta) = route_metadata {
-        if let Some(ref rate_config) = route_meta.rate_limit_config {
-            if let Some(headers_map) = headers.as_ref() {
-                if let Some(response) = middleware::rate_limit::check_rate_limit(
-                    handler_id,
-                    headers_map,
-                    client_ip.as_ref(),
-                    rate_config,
-                    &method,
-                    &path,
-                ) {
-                    // CORS headers will be added by CorsMiddleware
-                    return response;
-                }
-            } else {
-                debug_assert!(false, "rate-limited route missing extracted headers");
+    // Rate limiting (Rust-native, no GIL). Address and header keys run before
+    // authentication so a flood never pays for token verification. Identity
+    // keys run after it; see the second call below.
+    let rate_config = route_metadata.and_then(|m| m.rate_limit_config.as_ref());
+    if let Some(config) = rate_config {
+        if let Some(headers_map) = headers.as_ref() {
+            if let Some(response) = middleware::rate_limit::check_before_auth(
+                handler_id,
+                headers_map,
+                client_ip.as_ref(),
+                config,
+                &method,
+                &path,
+            ) {
+                // CORS headers will be added by CorsMiddleware
+                return response;
             }
+        } else {
+            debug_assert!(false, "rate-limited route missing extracted headers");
         }
     }
 
@@ -951,6 +952,23 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     } else {
         None
     };
+
+    if let Some(config) = rate_config {
+        if let Some(headers_map) = headers.as_ref() {
+            if let Some(response) = middleware::rate_limit::check_after_auth(
+                handler_id,
+                headers_map,
+                client_ip.as_ref(),
+                auth_ctx.as_ref(),
+                config,
+                &method,
+                &path,
+            ) {
+                // CORS headers will be added by CorsMiddleware
+                return response;
+            }
+        }
+    }
 
     // Optimization: Only parse cookies if handler needs them
     // Cookie parsing can be expensive for requests with many cookies
