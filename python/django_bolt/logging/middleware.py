@@ -119,13 +119,14 @@ class LoggingMiddleware:
                     data["body"] = f"<binary data, {len(body)} bytes>"
 
         if "client_ip" in self.config.request_log_fields:
-            # Try to get client IP from various headers
+            # Runtime requests expose Bolt's canonical, proxy-aware address via
+            # Django's existing REMOTE_ADDR. The header fallback is only for
+            # standalone dict inputs used outside Bolt's request pipeline.
             headers = request.get("headers", {})
-            client_ip = (
-                headers.get("x-forwarded-for", "").split(",")[0].strip()
-                or headers.get("x-real-ip", "")
-                or request.get("client", "")
-            )
+            meta = getattr(request, "META", None)
+            client_ip = meta.get("REMOTE_ADDR", "") if meta is not None else ""
+            if not client_ip and meta is None:
+                client_ip = headers.get("x-forwarded-for", "").split(",")[0].strip() or headers.get("x-real-ip", "")
             if client_ip:
                 data["client_ip"] = client_ip
 

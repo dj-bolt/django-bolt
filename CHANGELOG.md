@@ -4,12 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- **`@rate_limit(key="ip")` trusted `X-Forwarded-For`** - The key came from the leftmost entry of `X-Forwarded-For`, which the client sends. Behind a proxy that appends the header, and with Bolt exposed directly, a client changed one header and got a new bucket for every request. Bolt now uses one canonical client address for rate limiting, `request.META["REMOTE_ADDR"]`, and request logging: the peer address by default, or the first untrusted `X-Forwarded-For` hop when the peer matches `BOLT_TRUSTED_PROXIES`. Malformed chains fall back to the peer. **Add the setting if you run behind a proxy**, or every caller behind it shares one bucket. (#302)
+
 ### Changed
 
 - **`@rate_limit(key="user")` and `key="api_key"` raise** - Neither was implemented. The limit runs before authentication, so no identity is available. Both fell into the header catch-all, matched no header, and resolved to one shared bucket, thus a route marked "per user" was a single global limit that one caller could exhaust for everyone. Both keys now raise `ImproperlyConfigured` at import time. Use `key="ip"` or a request header name. (#301)
 
 ### Fixed
 
+- **bolt-mcp: loopback code delivery** - After consent, a loopback redirect URI (`http://localhost` / `127.0.0.1` / `[::1]`) receives an interstitial page on the issuer origin. Before, it received a raw 302. Some browsers block the `https → http://localhost` redirect. Firefox with HTTPS-Only mode is one example. The client then never received the code. The page navigates with JavaScript, keeps a click-through link, and shows the code for copy-paste. An `https` redirect URI keeps the plain 302. To change the post-consent response, override the new `AuthorizationServer.code_redirect_response(redirect_url)`. (#307)
 - **bolt-mcp 0.2.2: `resultType` on Python-built results** - `tools/call`, `resources/read` and `prompts/get` results now carry `resultType: "complete"` for 2026-07-28 clients. Claude Code and claude.ai connectors rejected every tool call without it. Legacy peers keep the old wire shape.
 
 ## [0.10.2]

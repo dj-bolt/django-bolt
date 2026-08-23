@@ -214,7 +214,16 @@ impl CorsConfig {
 pub struct RateLimitConfig {
     pub rps: u32,
     pub burst: u32,
-    pub key_type: String,
+    pub key: RateLimitKey,
+}
+
+/// What a rate limit buckets on. Decided once at registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitKey {
+    /// The resolved client address. See `middleware::client_ip`.
+    Ip,
+    /// One request header, stored lowercase for direct lookup.
+    Header(String),
 }
 
 impl Default for RateLimitConfig {
@@ -222,7 +231,7 @@ impl Default for RateLimitConfig {
         RateLimitConfig {
             rps: 100,
             burst: 200,
-            key_type: "ip".to_string(),
+            key: RateLimitKey::Ip,
         }
     }
 }
@@ -857,10 +866,10 @@ fn parse_rate_limit_config(
     // check can look them up directly (headers are stored lowercase).
     if let Some(key_py) = dict.get("key") {
         if let Ok(key_type) = key_py.extract::<String>(py) {
-            config.key_type = if key_type == "ip" {
-                key_type
+            config.key = if key_type.eq_ignore_ascii_case("ip") {
+                RateLimitKey::Ip
             } else {
-                key_type.to_lowercase()
+                RateLimitKey::Header(key_type.to_lowercase())
             };
         }
     }

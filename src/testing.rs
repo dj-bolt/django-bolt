@@ -31,7 +31,8 @@ use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
 use bolt_core::form_parsing::{
     parse_multipart, parse_urlencoded, FormParseResult, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
 };
-use bolt_core::metadata::{CorsConfig, RouteMetadata, RouteMetadataStore};
+use bolt_core::metadata::{CorsConfig, RateLimitKey, RouteMetadata, RouteMetadataStore};
+use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
@@ -121,6 +122,7 @@ pub struct TestAppState {
     /// Global compression config (mirrors production server). Drives the
     /// streaming-compression codec selection in `handler.rs`.
     pub global_compression_config: Option<Arc<bolt_core::metadata::CompressionConfig>>,
+    pub trusted_proxies: Arc<TrustedProxies>,
     pub debug: bool,
     pub max_payload_size: usize,
     /// Max byte length for parameter values (resolved once from
@@ -249,6 +251,8 @@ pub fn create_test_app(
     static_files_config: Option<&Bound<'_, PyDict>>,
     compression_config: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<u64> {
+    let trusted_proxies = Arc::new(TrustedProxies::from_django_settings(py)?);
+
     let global_cors_config = if let Some(cors_dict) = cors_config {
         Some(parse_cors_config_from_dict(cors_dict)?)
     } else {
@@ -340,6 +344,7 @@ pub fn create_test_app(
         dispatch: dispatch.clone_ref(py),
         global_cors_config,
         global_compression_config,
+        trusted_proxies,
         debug,
         max_payload_size,
         max_param_length: bolt_core::type_coercion::resolve_max_param_length(),
@@ -538,6 +543,7 @@ pub fn test_request(
                 dispatch,
                 global_cors_config,
                 global_compression_config,
+                trusted_proxies,
                 debug,
                 max_payload_size,
                 max_param_length,
@@ -554,6 +560,7 @@ pub fn test_request(
                     Python::attach(|py| state.dispatch.clone_ref(py)),
                     state.global_cors_config.clone(),
                     state.global_compression_config.clone(),
+                    state.trusted_proxies.clone(),
                     state.debug,
                     state.max_payload_size,
                     state.max_param_length,
@@ -575,6 +582,7 @@ pub fn test_request(
                 global_cors_config: global_cors_config.clone(),
                 cors_origin_regexes: vec![],
                 global_compression_config,
+                trusted_proxies,
                 router: Some(router.clone()),
                 route_metadata: Some(route_metadata.clone()),
                 asgi_mounts: Some(asgi_mounts.clone()),
@@ -870,16 +878,18 @@ async fn handle_test_request_internal(
         Err(response) => return response,
     };
 
-    let peer_addr = req.peer_addr().map(|addr| addr.ip().to_string());
+    let client_ip = bolt_core::middleware::client_ip::resolve_from_headers(
+        req.headers(),
+        req.peer_addr().map(|address| address.ip()),
+        &state.trusted_proxies,
+    );
 
-    // Get connection info from Actix - handles proxies, IPv6, etc. correctly
+    // Host and scheme retain Actix behavior; REMOTE_ADDR uses Bolt's explicit
+    // forwarding-header trust policy.
     let conn_info = req.connection_info();
     let conn_host = conn_info.host().to_owned();
     let conn_scheme = conn_info.scheme().to_owned();
-    let conn_remote_addr = conn_info
-        .realip_remote_addr()
-        .unwrap_or("127.0.0.1")
-        .to_owned();
+    let conn_remote_addr = client_ip;
 
     // Rate limiting
     if let Some(ref meta) = route_meta {
@@ -887,7 +897,7 @@ async fn handle_test_request_internal(
             if let Some(response) = middleware::rate_limit::check_rate_limit(
                 handler_id,
                 &headers,
-                peer_addr.as_deref(),
+                client_ip.as_ref(),
                 rate_config,
                 method,
                 path,
@@ -1205,7 +1215,7 @@ async fn handle_test_request_internal(
             meta_cache: std::sync::OnceLock::new(),
             conn_host: conn_host.clone(),
             conn_scheme: conn_scheme.clone(),
-            conn_remote_addr: conn_remote_addr.clone(),
+            conn_remote_addr,
         };
         let request_obj = Py::new(py, request)?;
 
@@ -1320,14 +1330,28 @@ pub fn handle_test_websocket(
 
     let handler_id = route.handler_id;
     let handler = route.handler.clone_ref(py);
-
     // Rate limiting for WebSocket
     if let Some(route_meta) = app.route_metadata.get(handler_id) {
         if let Some(ref rate_config) = route_meta.rate_limit_config {
+            let client_ip = (rate_config.key == RateLimitKey::Ip)
+                .then(|| {
+                    bolt_core::middleware::client_ip::resolve(
+                        header_map
+                            .get("x-forwarded-for")
+                            .into_iter()
+                            .map(|value| Some(value.as_str())),
+                        header_map
+                            .get("x-real-ip")
+                            .map(|value| Some(value.as_str())),
+                        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                        &app.trusted_proxies,
+                    )
+                })
+                .flatten();
             if bolt_core::middleware::rate_limit::check_rate_limit(
                 handler_id,
                 &header_map,
-                Some("127.0.0.1"),
+                client_ip.as_ref(),
                 rate_config,
                 "GET",
                 &path,

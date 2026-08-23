@@ -7,8 +7,10 @@ without server-side state. All interpolated values are HTML-escaped.
 
 from __future__ import annotations
 
+import json
 from html import escape
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from .config import AuthorizationServer
 
@@ -43,6 +45,10 @@ _PAGE = """<!doctype html>
    font-size:12px;margin-bottom:14px}}
  .scope{{display:inline-block;background:#1d2128;border:1px solid #2c313c;border-radius:6px;
    padding:2px 8px;margin:3px 4px 0 0;font-size:12px;color:#cfd4dd}}
+ a.btn{{display:block;text-align:center;padding:10px 14px;border-radius:9px;background:#4f7cff;
+   color:#fff;font-size:14px;font-weight:600;text-decoration:none}}
+ .code{{background:#0f1115;border:1px solid #2c313c;border-radius:9px;padding:10px 12px;margin-top:6px;
+   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;word-break:break-all}}
 </style></head><body><div class="card">{body}</div></body></html>"""
 
 
@@ -94,3 +100,36 @@ def consent_page(
   </div>
 </form>"""
     return _PAGE.format(title="Authorize", body=body)
+
+
+def is_loopback_uri(uri: str) -> bool:
+    """Tell if ``uri`` is an RFC 8252 loopback redirect URI (plain-http localhost)."""
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return False
+    return parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1")
+
+
+def code_delivery_page(redirect_url: str) -> str:
+    """Interstitial page that delivers the authorization code to a loopback client.
+
+    Browsers can block the cross-scheme ``302 https://issuer → http://localhost``
+    hop (for example Firefox with HTTPS-Only mode). This page navigates with JS,
+    keeps a click-through link (a user gesture succeeds in more configurations),
+    and shows the code for copy-paste as a last resort.
+    """
+    # The registered redirect URI may already contain query parameters, including
+    # a parameter named ``code``. The authorization response is appended last, so
+    # display the last value rather than a client-controlled earlier value.
+    code = parse_qs(urlsplit(redirect_url).query).get("code", [""])[-1]
+    # A JSON string literal is a valid JS string literal; escape "<" so the
+    # URL can never close the <script> block.
+    js_url = json.dumps(redirect_url).replace("<", "\\u003c")
+    body = f"""<h1>Authorization complete</h1>
+<p>Returning you to the application…</p>
+<a class="btn" href="{escape(redirect_url)}" rel="noreferrer">Click here if you are not redirected</a>
+<p style="margin:16px 0 0">If the application does not open, paste this code into it:</p>
+<div class="code">{escape(code)}</div>
+<script>location.assign({js_url});</script>"""
+    return _PAGE.format(title="Authorization complete", body=body)

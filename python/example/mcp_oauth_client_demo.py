@@ -34,13 +34,14 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import secrets
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
-REDIRECT_URI = "http://127.0.0.1:8765/callback"  # never actually served; we read the 302
+REDIRECT_URI = "http://127.0.0.1:8765/callback"  # never served; we read the code out of the response
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -71,6 +72,34 @@ def post_form(url: str, fields: dict, *, headers: dict | None = None):
     data = urllib.parse.urlencode(fields).encode()
     hdrs = {"Content-Type": "application/x-www-form-urlencoded", **(headers or {})}
     return http("POST", url, data=data, headers=hdrs)
+
+
+_INTERSTITIAL_SCRIPT = re.compile(r'<script>location\.(?:assign|replace)\((".*?")\);</script>')
+
+
+def interstitial_url(body: bytes) -> str | None:
+    """Return the client redirect URL if ``body`` is a code-delivery interstitial.
+
+    A loopback redirect URI (``http://localhost`` / ``127.0.0.1``) gets a 200
+    interstitial page on the issuer origin, because some browsers block the
+    ``https → http://localhost`` 302. The page navigates with JS. This script has
+    no JS engine, so it reads the same URL out of the page markup.
+    """
+    match = _INTERSTITIAL_SCRIPT.search(body.decode())
+    return json.loads(match.group(1)) if match else None
+
+
+def code_url(resp, body: bytes) -> str:
+    """Return the client redirect URL (with ``code``) from a post-consent response.
+
+    An ``https`` redirect URI gets a plain 302. A loopback one gets the interstitial.
+    """
+    if resp.status == 302:
+        return resp.headers["Location"]
+    url = interstitial_url(body)
+    if url is None:
+        sys.exit(f"no code in the post-consent response: {resp.status} {body[:500]!r}")
+    return url
 
 
 def step(n: int, text: str) -> None:
@@ -145,6 +174,11 @@ def main() -> None:
         location = login.headers["Location"]
     elif login.status == 200 and b"Invalid username or password" in login_body:
         sys.exit("login failed: invalid username or password (create the user first — see README)")
+    elif login.status == 200 and (login_interstitial := interstitial_url(login_body)):
+        # With auto_consent and a loopback redirect URI, the login response is already
+        # the code-delivery interstitial. It is not a consent page. A second approval
+        # would make the server issue a redundant authorization code.
+        location = login_interstitial
     elif login.status == 200:
         # ── 4. consent screen: approve with the session cookie ────────────────
         step(4, "consent: approve")
@@ -156,9 +190,10 @@ def main() -> None:
             {**oauth_params, "decision": "approve"},
             headers={"Origin": issuer, "Cookie": cookie},
         )
-        if consent.status != 302:
-            sys.exit(f"consent failed: {consent.status} {consent.read()[:500]!r}")
-        location = consent.headers["Location"]
+        consent_body = consent.read()
+        if consent.status not in (200, 302):
+            sys.exit(f"consent failed: {consent.status} {consent_body[:500]!r}")
+        location = code_url(consent, consent_body)
     else:
         sys.exit(f"authorize failed: {login.status} {login_body[:500]!r}")
 
