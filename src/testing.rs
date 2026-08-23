@@ -1388,24 +1388,6 @@ pub fn handle_test_websocket(
             None
         };
 
-        if let Some(rate_config) = route_meta.rate_limit_config.as_ref() {
-            if bolt_core::middleware::rate_limit::check_after_auth(
-                handler_id,
-                &header_map,
-                client_ip.as_ref(),
-                auth_ctx.as_ref(),
-                rate_config,
-                "GET",
-                &path,
-            )
-            .is_some()
-            {
-                return Err(pyo3::exceptions::PyPermissionError::new_err(
-                    "Rate limit exceeded",
-                ));
-            }
-        }
-
         if !route_meta.guards.is_empty() {
             match evaluate_guards(&route_meta.guards, auth_ctx.as_ref()) {
                 GuardResult::Allow => {}
@@ -1422,6 +1404,26 @@ pub fn handle_test_websocket(
                         ),
                     ));
                 }
+            }
+        }
+
+        // After guards, mirroring the production upgrade path: a rejected
+        // upgrade must not spend the bucket it would have been counted in.
+        if let Some(rate_config) = route_meta.rate_limit_config.as_ref() {
+            if bolt_core::middleware::rate_limit::check_after_auth(
+                handler_id,
+                &header_map,
+                client_ip.as_ref(),
+                auth_ctx.as_ref(),
+                rate_config,
+                "GET",
+                &path,
+            )
+            .is_some()
+            {
+                return Err(pyo3::exceptions::PyPermissionError::new_err(
+                    "Rate limit exceeded",
+                ));
             }
         }
     }

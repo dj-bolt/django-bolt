@@ -57,10 +57,25 @@ def test_unauthenticated_callers_share_the_peer_bucket(make_server_project):
 
 
 def test_guard_rejects_before_the_bucket_is_counted(make_server_project):
-    """A 401 spends nothing, for the peer or for the user that authenticates later."""
+    """A 401 spends nothing from the bucket it would have been counted in.
+
+    `/limited-by-api-key-guarded` keys on `api_key` but authenticates with
+    JWT, so the valid caller has no API-key identity and shares the
+    peer-address bucket with the rejected callers. On `/limited-by-user-guarded`
+    the two use different buckets, so it only shows that a 401 comes first.
+    """
     project = make_server_project(api_module=APP)
 
     with project.start() as server:
+        path = "/limited-by-api-key-guarded"
+        assert _statuses(server, path, BURST + 2) == [401] * (BURST + 2)
+        # Same bucket as the rejected calls above. Full burst means they left
+        # it untouched.
+        assert _statuses(server, path, BURST, _bearer("alice")) == [200] * BURST
+        # Spent now, which confirms the caller really was counted in that
+        # bucket rather than in one of its own.
+        assert _statuses(server, path, 1, _bearer("bob")) == [429]
+
         assert _statuses(server, "/limited-by-user-guarded", BURST + 2) == [401] * (BURST + 2)
         assert _statuses(server, "/limited-by-user-guarded", BURST, _bearer("alice")) == [200] * BURST
         assert _statuses(server, "/limited-by-user-guarded", 1, _bearer("alice")) == [429]

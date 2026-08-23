@@ -32,6 +32,15 @@ async def limited_by_user_guarded():
     return {"ok": True}
 
 
+# Keys on `api_key` but authenticates with JWT: a valid caller has no API-key
+# identity, so it shares the peer-address bucket with the rejected callers.
+# That makes a rejected request that still counted visible.
+@api.get("/limited-by-api-key-guarded", auth=JWT, guards=[IsAuthenticated()])
+@rate_limit(rps=1, burst=BURST, key="api_key")
+async def limited_by_api_key_guarded():
+    return {"ok": True}
+
+
 @api.get("/limited-by-api-key", auth=KEY)
 @rate_limit(rps=1, burst=BURST, key="api_key")
 async def limited_by_api_key():

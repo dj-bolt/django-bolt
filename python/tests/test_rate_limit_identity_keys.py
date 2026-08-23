@@ -13,10 +13,10 @@ import itertools
 import pytest
 from django.contrib.auth import get_user_model
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, WebSocket
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication, create_jwt_for_user
 from django_bolt.middleware import rate_limit
-from django_bolt.testing import TestClient
+from django_bolt.testing import TestClient, WebSocketTestClient
 
 SECRET = "rate-limit-identity-secret"
 BURST = 3
@@ -76,12 +76,20 @@ def test_user_key_unauthenticated_callers_share_an_ip_bucket(users):
 
 
 @pytest.mark.django_db
-def test_user_key_with_guard_rejects_before_counting(users):
-    """A 401 is not a spent token for the user that later authenticates."""
-    api = _make_api("user", [JWTAuthentication(secret=SECRET)], guards=[IsAuthenticated()])
+def test_guard_rejects_before_counting_on_the_shared_bucket(users):
+    """A rejected request spends nothing from the bucket it would have used.
+
+    The route keys on `api_key` but authenticates with JWT, so a valid caller
+    has no API-key identity and lands in the same no-identity bucket as the
+    rejected callers. A 401 that still counted would show up here.
+    """
+    api = _make_api("api_key", [JWTAuthentication(secret=SECRET)], guards=[IsAuthenticated()])
     with TestClient(api) as client:
-        assert _statuses(client, BURST + 1) == [401] * (BURST + 1)
+        assert _statuses(client, BURST + 2) == [401] * (BURST + 2)
         assert _statuses(client, BURST, headers=bearer(users[0])) == [200] * BURST
+        # The bucket is spent now, which proves the caller really was counted
+        # in it — so the earlier 401s shared it and left it untouched.
+        assert _statuses(client, 1, headers=bearer(users[1])) == [429]
 
 
 def test_api_key_gives_each_key_its_own_bucket():
@@ -117,3 +125,40 @@ def test_identity_key_without_auth_fails_at_startup(key):
     """No backend can ever produce an identity, so the route must not start."""
     with pytest.raises(ValueError, match=f'key="{key}"'):
         TestClient(_make_api(key, None))
+
+
+@pytest.mark.django_db
+@pytest.mark.asyncio
+async def test_websocket_guard_rejects_before_counting_on_the_shared_bucket(users):
+    """The WebSocket backend counts the bucket only after guards pass.
+
+    Same shape as the HTTP test: `api_key` key with JWT authentication, so
+    the rejected and the accepted caller share the no-identity bucket. A
+    rejected upgrade that still counted would exhaust it and turn a later
+    rejection into "Rate limit exceeded".
+    """
+    api = BoltAPI()
+
+    @api.websocket("/ws/limited", auth=[JWTAuthentication(secret=SECRET)], guards=[IsAuthenticated()])
+    @rate_limit(rps=next(_rps), burst=BURST, key="api_key")
+    async def limited(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    async def connect(headers=None):
+        async with WebSocketTestClient(
+            api, "/ws/limited", headers=headers, cors_allowed_origins=["*"], read_django_settings=False
+        ) as websocket:
+            return await websocket.receive_text()
+
+    for _ in range(BURST + 2):
+        with pytest.raises(PermissionError) as excinfo:
+            await connect()
+        assert "Authentication required" in str(excinfo.value)
+
+    for _ in range(BURST):
+        assert await connect(bearer(users[0])) == "connected"
+
+    with pytest.raises(PermissionError) as excinfo:
+        await connect(bearer(users[1]))
+    assert "Rate limit exceeded" in str(excinfo.value)
