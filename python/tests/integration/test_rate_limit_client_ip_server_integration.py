@@ -91,9 +91,7 @@ def test_a_header_key_buckets_on_the_header_value(make_server_project):
         # A long value is hashed like any other, so nothing caps its length.
         # `key="authorization"` with a JWT lands here.
         long_value = server.request("GET", "/limited-by-header", headers={"X-Tenant": "t" * 4096})
-        other_long_value = server.request(
-            "GET", "/limited-by-header", headers={"X-Tenant": "u" * 4096}
-        )
+        other_long_value = server.request("GET", "/limited-by-header", headers={"X-Tenant": "u" * 4096})
 
     assert other_tenant.status_code == 200, other_tenant.text
     assert same_tenant.status_code == 429, same_tenant.text

@@ -113,7 +113,9 @@ pub fn check_after_auth(
     if !config.key.needs_identity() {
         return None;
     }
-    check_rate_limit(handler_id, headers, client_ip, auth_ctx, config, method, path)
+    check_rate_limit(
+        handler_id, headers, client_ip, auth_ctx, config, method, path,
+    )
 }
 
 pub fn check_rate_limit(

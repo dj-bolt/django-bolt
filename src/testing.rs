@@ -892,7 +892,9 @@ async fn handle_test_request_internal(
     let conn_remote_addr = client_ip;
 
     // Rate limiting: address and header keys before auth, identity keys after.
-    let rate_config = route_meta.as_ref().and_then(|m| m.rate_limit_config.as_ref());
+    let rate_config = route_meta
+        .as_ref()
+        .and_then(|m| m.rate_limit_config.as_ref());
     if let Some(rate_config) = rate_config {
         if let Some(response) = middleware::rate_limit::check_before_auth(
             handler_id,

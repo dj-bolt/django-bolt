@@ -508,7 +508,10 @@ pub async fn handle_websocket_upgrade_with_handler(
     if let Some(route_metadata) = ROUTE_METADATA.get() {
         if let Some(route_meta) = route_metadata.get(handler_id) {
             if let Some(ref rate_config) = route_meta.rate_limit_config {
-                if !matches!(rate_config.key, bolt_core::metadata::RateLimitKey::Header(_)) {
+                if !matches!(
+                    rate_config.key,
+                    bolt_core::metadata::RateLimitKey::Header(_)
+                ) {
                     client_ip = bolt_core::middleware::client_ip::resolve_from_headers(
                         req.headers(),
                         req.peer_addr().map(|address| address.ip()),
