@@ -1,31 +1,32 @@
 """Let handler threads join the transaction of the test that started them.
 
-`TestClient` sends requests through the Rust pipeline, thus handlers run on
-framework threads. Django gives each thread its own database connection, so a
-test that holds an open transaction (Django's ``TestCase``, or pytest-django's
-plain ``django_db``) makes rows that no handler can read. On SQLite the write
-lock of the test also stops the query of the handler, which becomes an unclear
-500.
+`TestClient` sends requests through the Rust pipeline. Thus handlers run on
+framework threads. Django gives each thread its own database connection. A test
+that holds an open transaction does not commit. Django's ``TestCase`` and
+pytest-django's plain ``django_db`` are the two usual holders. Thus no handler
+can read the rows of such a test. On SQLite the write lock of the test also
+stops the query of the handler, which becomes an unclear 500.
 
-The answer Django uses for its own live-server tests is to give the other
-threads the connection of the main thread (``LiveServerThread`` plus
-``inc_thread_sharing()``). Bolt does not own the entry point of its threads, so
-this module replaces the thread-local store of the connection handler for the
-time that the client is open. Every thread then resolves to the connection of
-the test, and thus reads the rows of the test.
+Django has an answer for its own live-server tests. It gives the other threads
+the connection of the main thread, with ``LiveServerThread`` and
+``inc_thread_sharing()``. Bolt does not own the entry point of its threads.
+Thus this module replaces the thread-local store of the connection handler
+while the client is open. Every thread then resolves to the connection of the
+test, and reads the rows of the test.
 
 One connection cannot serve two threads at the same moment. Django gives back
-rows from the wrong query if you try, which shows as
+rows from the wrong query if you try. This shows as
 ``IndexError: list index out of range`` deep in the ORM. Thus each shared
-connection gets a lock that is held for the full life of a cursor, which makes
-concurrent database work wait instead of corrupt. A test that holds a cursor
-open across a request cannot be made to wait, because it is the holder. That
-one condition raises `SharedTestConnectionError`, which names the escape hatch.
+connection gets a lock. The lock is held for the full life of a cursor. Thus
+concurrent database work waits in place of corrupting rows. A test that holds a
+cursor open across a request cannot be made to wait, because it is the holder.
+That one condition raises `SharedTestConnectionError`, which names the fixes.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from typing import TYPE_CHECKING, Any
@@ -42,20 +43,64 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LOCK_TIMEOUT = 10.0
 
+# The store of the connection handler is process-wide, thus only one thread can
+# hold shared connections at a time. A second thread that entered its own client
+# would resolve aliases through this store and lend the connection of the first
+# test to its own handlers, which mixes the rows of two tests. Nesting on one
+# thread is legal, and the depth counts it.
+_active_lock = threading.Lock()
+_active_owner: int | None = None
+_active_depth = 0
+
 
 class SharedTestConnectionError(RuntimeError):
     """Two threads needed the shared test connection and neither could wait."""
 
 
+_CROSS_THREAD_MESSAGE = (
+    "Another thread already lends its database connection to handler threads.\n"
+    "\n"
+    "Cause: two threads entered a TestClient at the same time. The connection "
+    "store of Django is process-wide, so the second client would lend the "
+    "connection of the first test to its own handlers, and the rows of two "
+    "tests would mix.\n"
+    "\n"
+    "Fix — use one of these:\n"
+    "\n"
+    "  1. Run the tests one after the other. pytest-xdist and manage.py test "
+    "--parallel each use a separate process, thus they are safe.\n"
+    "\n"
+    "  2. Share one client between the threads, which is supported:\n"
+    "         with TestClient(api) as client:\n"
+    "             run_in_threads(lambda: client.get('/x'))\n"
+    "\n"
+    "  3. Switch the sharing off in the threads:\n"
+    "         TestClient(api, share_db_connection=False)"
+)
+
+
 def lock_timeout() -> float:
-    """Seconds to wait for the shared connection before the error is raised."""
+    """Seconds to wait for the shared connection before the error is raised.
+
+    Each bad value breaks the lock in its own way, thus none may pass. ``nan``
+    and a negative below -1 make ``acquire()`` raise, ``inf`` overflows the
+    platform time type, and -1 means wait forever, which hides the deadlock the
+    error exists to report.
+    """
     raw = os.environ.get("DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT")
     if not raw:
         return DEFAULT_LOCK_TIMEOUT
     try:
-        return float(raw)
+        timeout = float(raw)
     except ValueError:
-        return DEFAULT_LOCK_TIMEOUT
+        raise ValueError(
+            f"DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT must be a number of seconds, got {raw!r}."
+        ) from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(
+            f"DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT must be a finite number above zero, got {raw!r}."
+        )
+    return timeout
 
 
 class _SharedStore:
@@ -154,9 +199,25 @@ class SharedConnections:
         Returns True when sharing was installed. Nothing is shared when no
         connection is in a transaction, because then the rows of the test are
         committed already and the handler threads can read them by themselves.
+
+        Raises `SharedTestConnectionError` when another thread already shares
+        its connections. See the note on `_active_owner`.
         """
+        global _active_owner, _active_depth
+
         if connections is None:
             return False
+        with _active_lock:
+            if _active_owner is not None and _active_owner != threading.get_ident():
+                raise SharedTestConnectionError(_CROSS_THREAD_MESSAGE)
+            installed = self._install_locked()
+            if installed:
+                _active_owner = threading.get_ident()
+                _active_depth += 1
+            return installed
+
+    def _install_locked(self) -> bool:
+        """Do the installation. The caller holds ``_active_lock``."""
         try:
             initialized = list(connections.all(initialized_only=True))
         except Exception as exc:  # noqa: BLE001 - unconfigured settings, no databases
@@ -183,16 +244,22 @@ class SharedConnections:
         return True
 
     def uninstall(self) -> None:
+        global _active_owner, _active_depth
+
         if not self._installed:
             return
-        self._installed = False
-        connections._connections = self._previous_store
-        for restore in self._restores:
-            restore()
-        for conn in self._connections:
-            conn.dec_thread_sharing()
-        self._connections.clear()
-        self._restores.clear()
+        with _active_lock:
+            self._installed = False
+            connections._connections = self._previous_store
+            for restore in self._restores:
+                restore()
+            for conn in self._connections:
+                conn.dec_thread_sharing()
+            self._connections.clear()
+            self._restores.clear()
+            _active_depth -= 1
+            if _active_depth == 0:
+                _active_owner = None
 
     # -- guarding ----------------------------------------------------------
     def _guard(self, conn: Any) -> Callable[[], None]:

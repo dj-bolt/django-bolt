@@ -253,7 +253,7 @@ on framework threads. Django gives each thread its own database connection. The
 row that `User.objects.create()` made is in the transaction of the test and is
 not committed, thus a second connection cannot read it:
 
-```
+```text
 Test thread (connection A)          Handler thread (connection B)
 ──────────────────────────          ─────────────────────────────
 BEGIN TRANSACTION
@@ -271,7 +271,7 @@ While the client is open, `TestClient` lends the connection of the test to the
 handler threads. They are then in the same transaction, thus they read the same
 rows:
 
-```
+```text
 Test thread                         Handler thread
 ───────────                         ──────────────
 BEGIN TRANSACTION
@@ -286,16 +286,16 @@ ROLLBACK — the row is removed
 ```
 
 This is the mechanism Django uses for its own live-server tests. A row that a
-handler writes goes into the transaction of the test in the same way, thus the
+handler writes goes into the transaction of the test in the same way. Thus the
 test can read it, and rollback removes it.
 
 ### When to switch the sharing off
 
 One connection cannot serve two threads at the same moment. `TestClient` puts a
-lock on the shared connection, thus database work from the test and from a
-handler waits its turn in place of corrupting rows. One condition cannot be made
-to wait: a test that holds a cursor open across a request, because the test is
-the holder. `QuerySet.iterator()` is the usual cause:
+lock on the shared connection. Thus database work from the test and from a
+handler waits its turn, in place of corrupting rows. One condition cannot be
+made to wait: a test that holds a cursor open across a request, because the test
+is the holder. `QuerySet.iterator()` is the usual cause:
 
 ```python
 for user in User.objects.iterator():     # holds a cursor open

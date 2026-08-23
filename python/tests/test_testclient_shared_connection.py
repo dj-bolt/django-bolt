@@ -1,10 +1,10 @@
 """TestClient shares the database connection of the test that started it.
 
-Handlers run on framework threads. Django gives each thread its own connection,
-thus a test that holds an open transaction used to make rows that no handler
-could read. `TestClient` now lends its connection to those threads while it is
-open, so plain `TestCase` and plain `django_db` work, and `transaction=True` is
-no longer a condition of testing a handler that reads the database (issue #276).
+Handlers run on framework threads. Django gives each thread its own connection.
+Thus a test that holds an open transaction made rows that no handler could read.
+`TestClient` now lends its connection to those threads while it is open. Thus
+plain `TestCase` and plain `django_db` work. `transaction=True` is no longer a
+condition of testing a handler that reads the database (issue #276).
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from django_bolt import BoltAPI
 from django_bolt.testing import AsyncTestClient, TestClient
 from django_bolt.testing import client as client_module
 from django_bolt.testing.client import BoltTestClientWarning
-from django_bolt.testing.dbshare import SharedTestConnectionError
+from django_bolt.testing.dbshare import DEFAULT_LOCK_TIMEOUT, SharedTestConnectionError, lock_timeout
 
 User = get_user_model()
 
@@ -210,6 +210,67 @@ def test_nothing_is_shared_when_the_test_commits():
     with TestClient(_make_api()) as client:
         assert connections._connections is store_before
         assert client.get("/ping").status_code == 200
+
+
+# ── configuration and concurrent entry ────────────────────────────────────────
+@pytest.mark.parametrize("bad", ["nan", "inf", "-1", "-5", "abc"])
+def test_a_bad_lock_timeout_is_rejected(monkeypatch, bad):
+    """Every one of these breaks the lock, thus none may pass silently.
+
+    ``nan`` and ``-5`` make ``acquire()`` raise, ``inf`` overflows, ``-1`` means
+    wait forever, and text used to fall back to the default with no report.
+    """
+    monkeypatch.setenv("DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT", bad)
+    with pytest.raises(ValueError, match="DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT"):
+        lock_timeout()
+
+
+def test_an_unset_or_empty_lock_timeout_uses_the_default(monkeypatch):
+    monkeypatch.delenv("DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT", raising=False)
+    assert lock_timeout() == DEFAULT_LOCK_TIMEOUT
+    monkeypatch.setenv("DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT", "")
+    assert lock_timeout() == DEFAULT_LOCK_TIMEOUT
+    monkeypatch.setenv("DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT", "0.5")
+    assert lock_timeout() == 0.5
+
+
+@pytest.mark.django_db
+def test_a_second_thread_cannot_enter_its_own_client():
+    """The shared store is process-wide, thus a second test must not join it.
+
+    Two threads that each enter a client would lend the connection of one test
+    to the handlers of the other, which mixes their rows. No supported runner
+    runs two tests in one process at the same time, thus this is refused.
+    """
+    outcome: list[object] = []
+
+    def other_test():
+        try:
+            with TestClient(_make_api()):
+                outcome.append("entered")
+        except BaseException as exc:  # noqa: BLE001 - the outcome is the finding
+            outcome.append(exc)
+
+    with TestClient(_make_api()) as client:
+        assert client.get("/ping").status_code == 200
+        thread = threading.Thread(target=other_test)
+        thread.start()
+        thread.join()
+
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], SharedTestConnectionError), outcome[0]
+    assert "at the same time" in str(outcome[0])
+
+
+@pytest.mark.django_db
+def test_nested_clients_on_one_thread_still_work():
+    """Nesting on one thread is legal, and the outer client keeps working."""
+    User.objects.create(username="nested", email="n@example.com")
+
+    with TestClient(_make_api()) as outer:
+        with TestClient(_make_api()) as inner:
+            assert inner.get("/count").json()["n"] == 1
+        assert outer.get("/count").json()["n"] == 1
 
 
 # ── the client must leave Django as it found it ───────────────────────────────
