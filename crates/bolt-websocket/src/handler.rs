@@ -502,17 +502,23 @@ pub async fn handle_websocket_upgrade_with_handler(
         }
     }
 
-    // Get peer address for rate limiting
-    let peer_addr = req.peer_addr().map(|addr| addr.ip().to_string());
-
     // Check rate limiting BEFORE origin validation (reuse HTTP rate limit)
     if let Some(route_metadata) = ROUTE_METADATA.get() {
         if let Some(route_meta) = route_metadata.get(handler_id) {
             if let Some(ref rate_config) = route_meta.rate_limit_config {
+                let client_ip = (rate_config.key == bolt_core::metadata::RateLimitKey::Ip)
+                    .then(|| {
+                        bolt_core::middleware::client_ip::resolve_from_headers(
+                            req.headers(),
+                            req.peer_addr().map(|address| address.ip()),
+                            &state.trusted_proxies,
+                        )
+                    })
+                    .flatten();
                 if let Some(response) = check_rate_limit(
                     handler_id,
                     &headers,
-                    peer_addr.as_deref(),
+                    client_ip.as_ref(),
                     rate_config,
                     req.method().as_str(),
                     req.path(),

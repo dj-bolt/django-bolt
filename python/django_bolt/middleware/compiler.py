@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import decimal
 import inspect
+import ipaddress
 import uuid
 from collections.abc import Callable
 from typing import Annotated, Any, get_args, get_origin
@@ -423,6 +424,55 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     metadata["memory_spool_threshold"] = getattr(settings, "BOLT_MEMORY_SPOOL_THRESHOLD", 1024 * 1024)
 
     return metadata
+
+
+def get_trusted_proxies() -> list[str]:
+    """
+    Read and validate `settings.BOLT_TRUSTED_PROXIES`.
+
+    The setting holds the proxies that sit in front of Bolt, as addresses or
+    CIDR blocks. Bolt believes `X-Forwarded-For` only from a peer in this list.
+    The list is empty by default, so Bolt uses the peer address and ignores
+    forwarding headers.
+
+    Returns:
+        Normalized CIDR strings, for example `["10.0.0.0/8", "127.0.0.1/32"]`.
+
+    Raises:
+        ImproperlyConfigured: The setting is not a list or a tuple, or an entry
+            is not an address or a CIDR block.
+    """
+    configured = getattr(settings, "BOLT_TRUSTED_PROXIES", None)
+    if configured is None:
+        return []
+
+    # Check the type before the loop reads it. A string iterates one character
+    # at a time, a mapping iterates its keys, and anything else raises a bare
+    # TypeError from inside the loop. All three are configuration mistakes, and
+    # the two that iterate would otherwise produce a silently wrong proxy list.
+    if not isinstance(configured, (list, tuple)):
+        raise ImproperlyConfigured(
+            f"BOLT_TRUSTED_PROXIES must be a list of addresses or CIDR blocks, "
+            f"got {type(configured).__name__} {configured!r}."
+        )
+
+    normalized = []
+    for entry in configured:
+        # `ip_network` also accepts an int and turns 10 into 0.0.0.10/32.
+        # That is a silently wrong proxy, so accept only strings.
+        if not isinstance(entry, str):
+            raise ImproperlyConfigured(
+                f"BOLT_TRUSTED_PROXIES entry {entry!r} is not an address or CIDR block: "
+                f"expected a string, got {type(entry).__name__}."
+            )
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except (TypeError, ValueError) as e:
+            raise ImproperlyConfigured(
+                f"BOLT_TRUSTED_PROXIES entry {entry!r} is not an address or CIDR block: {e}"
+            ) from e
+        normalized.append(str(network))
+    return normalized
 
 
 def middleware_to_dict(mw: Any) -> dict[str, Any] | None:

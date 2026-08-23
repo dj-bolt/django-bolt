@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 
 use std::borrow::Cow;
+use std::net::IpAddr;
 use std::sync::OnceLock;
 
 /// Parse host:port from Actix's connection_info().host()
@@ -67,8 +68,8 @@ pub struct PyRequest {
     pub conn_host: String,
     /// Scheme: "http" or "https" (from X-Forwarded-Proto or request)
     pub conn_scheme: String,
-    /// Remote address: client IP (from X-Forwarded-For, X-Real-IP, or peer)
-    pub conn_remote_addr: String,
+    /// Resolved client address. Formatted only when `META` is read.
+    pub conn_remote_addr: Option<IpAddr>,
 }
 
 impl PyRequest {
@@ -303,10 +304,13 @@ impl PyRequest {
         meta.set_item("SERVER_PORT", server_port.to_string())?;
         meta.set_item("SERVER_PROTOCOL", "HTTP/1.1")?;
 
-        // REMOTE_ADDR from Actix's connection_info().realip_remote_addr()
-        // Actix handles X-Forwarded-For, Forwarded header, and peer_addr fallback
-        meta.set_item("REMOTE_ADDR", &self.conn_remote_addr)?;
-        meta.set_item("REMOTE_HOST", &self.conn_remote_addr)?;
+        // REMOTE_ADDR comes from `middleware::client_ip::resolve`.
+        let remote_addr = self
+            .conn_remote_addr
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        meta.set_item("REMOTE_ADDR", &remote_addr)?;
+        meta.set_item("REMOTE_HOST", &remote_addr)?;
 
         // SCRIPT_NAME is usually empty for Django apps
         meta.set_item("SCRIPT_NAME", "")?;
