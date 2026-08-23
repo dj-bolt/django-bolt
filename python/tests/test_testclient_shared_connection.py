@@ -122,8 +122,13 @@ def test_a_cursor_held_across_a_request_raises_a_named_error(monkeypatch):
             client.get("/count")
 
     message = str(excinfo.value)
+    assert "holds a cursor open across a request" in message, "the message must name the cause"
+    # Each of the three fixes must be spelled out, not merely alluded to.
+    assert "list(Model.objects.all())" in message
     assert "share_db_connection=False" in message
+    assert "transaction=True" in message
     assert "TransactionTestCase" in message
+    assert "DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT" in message
 
 
 # ── switching it off ──────────────────────────────────────────────────────────

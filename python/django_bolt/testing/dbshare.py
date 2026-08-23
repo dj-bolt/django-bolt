@@ -232,14 +232,30 @@ class SharedConnections:
         return guarded
 
     def _conflict_message(self, alias: str) -> str:
+        """State the cause, then give the fix as code the reader can copy."""
         return (
             f"The test and a handler both needed the {alias!r} database connection, and "
-            f"neither could wait ({self.timeout:g}s). TestClient shares the connection of "
-            "the test so that plain TestCase and django_db work, but a cursor that stays "
-            "open across a request cannot be shared — a QuerySet.iterator() loop that "
-            "makes requests is the usual cause. Read the rows into a list before the "
-            "request, or pass TestClient(api, share_db_connection=False) and use "
-            "TransactionTestCase (or django_db(transaction=True)) for this test."
+            f"neither could wait ({self.timeout:g}s).\n"
+            "\n"
+            "Cause: this test holds a cursor open across a request. TestClient lends its "
+            "connection to the handler threads, so that plain TestCase and django_db see "
+            "the rows of the test, and a cursor that stays open cannot be lent. A loop "
+            "over QuerySet.iterator() that makes a request in its body is the usual cause.\n"
+            "\n"
+            "Fix — use one of these:\n"
+            "\n"
+            "  1. Read the rows before the request:\n"
+            "         for row in list(Model.objects.all()):\n"
+            "             client.get(f'/x/{row.pk}')\n"
+            "\n"
+            "  2. Switch the sharing off, and commit the rows instead:\n"
+            "         @pytest.mark.django_db(transaction=True)   # or TransactionTestCase\n"
+            "         def test_x():\n"
+            "             with TestClient(api, share_db_connection=False) as client:\n"
+            "                 ...\n"
+            "\n"
+            "  3. Give the wait more time, if the request is only slow:\n"
+            "         DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT=60"
         )
 
     def raise_if_conflict(self) -> None:
