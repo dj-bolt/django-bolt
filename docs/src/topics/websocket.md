@@ -183,16 +183,46 @@ from django_bolt.auth import JWTAuthentication, IsAuthenticated
     guards=[IsAuthenticated()]
 )
 async def protected(websocket: WebSocket):
-    user_id = websocket.context.get("user_id")
     await websocket.accept()
-    await websocket.send_text(f"Welcome, user {user_id}")
+    await websocket.send_text("Welcome")
 ```
 
-The JWT token should be passed as a query parameter:
+The handshake reads the token from the request headers. Send it in the
+`Authorization` header:
+
+```python
+import websockets
+
+async with websockets.connect(
+    "ws://localhost:8000/ws/protected",
+    additional_headers={"Authorization": f"Bearer {token}"},
+) as ws:
+    print(await ws.recv())
+```
+
+### Authentication from a browser
+
+The browser `WebSocket` API cannot set request headers. Use a cookie instead.
+The browser sends cookies with the handshake:
+
+```python
+@api.websocket(
+    "/ws/protected",
+    auth=[JWTAuthentication(cookie="access_token")],
+    guards=[IsAuthenticated()],
+)
+async def protected(websocket: WebSocket):
+    await websocket.accept()
+```
 
 ```javascript
-const ws = new WebSocket("ws://localhost:8000/ws/protected?token=<jwt>");
+// The browser sends the access_token cookie with the handshake.
+const ws = new WebSocket("ws://localhost:8000/ws/protected");
 ```
+
+A query parameter does not authenticate the handshake. `auth=[...]` reads the
+headers only. To use a token from the URL, validate it in the handler and close
+the connection yourself — see [Query parameters](#query-parameters).
 
 ## WebSocket state
 
