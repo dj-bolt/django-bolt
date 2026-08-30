@@ -84,11 +84,11 @@ if "debug_toolbar" in settings.INSTALLED_APPS:
     api.mount_django("/__debug__", clear_root_path=True)
 ```
 
-The toolbar on a Bolt route calls `/__debug__/render_panel/` and `/__debug__/history_sidebar/`. The mount serves these paths. `clear_root_path=True` makes Django see the full `/__debug__/...` path, which matches the URLconf entry.
+**Why the `/__debug__` mount:** the toolbar's JavaScript loads panel data from `__debug__/...` URLs next to the page. On a Bolt route the page is at the site root, so it calls `/__debug__/render_panel/`. Only Django can serve that URL, so mount Django there. `clear_root_path=True` passes the full `/__debug__/...` path to the URLconf.
 
-A mounted Django view does not need this mount. The toolbar on a page under `api.mount_django("/django")` calls `/django/__debug__/...`, which the same mount serves.
+Pages inside `api.mount_django("/django")` do not need this. Their toolbar calls `/django/__debug__/...`, and that mount already serves it.
 
-Pass a list with only the toolbar middleware. `django_middleware=True` runs all of `settings.MIDDLEWARE` on Bolt routes, and `CsrfViewMiddleware` then rejects API `POST` requests with `403`. See [Middleware](middleware.md#django-middleware-integration) for the per-request cost.
+**Why a list, not `True`:** `django_middleware=True` runs all of `settings.MIDDLEWARE` on Bolt routes. That includes `CsrfViewMiddleware`, which rejects API `POST` requests with `403`. The list runs only the toolbar. See [Middleware](middleware.md#django-middleware-integration) for the per-request cost.
 
 ## Static files
 
