@@ -144,5 +144,5 @@ Each API response also has two headers you can read in the browser's network tab
 
 ```bash
 cd python/example
-python manage.py runbolt --dev --host 127.0.0.1 --port 8001
+python manage.py runbolt --dev
 ```
