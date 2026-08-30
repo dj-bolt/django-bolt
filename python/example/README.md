@@ -9,15 +9,12 @@ bolt-mcp. `nanodjango_helloworld.py` is a standalone single-file app
 
 ```bash
 python manage.py migrate            # includes the bolt_mcp.oauth tables
-python manage.py runbolt --dev --host 127.0.0.1 --port 8001
+python manage.py runbolt --host 127.0.0.1 --port 8001 --processes 1
 ```
 
-`--dev` runs one process with auto-reload. Set `DEBUG = True` in `testproject/settings.py`
-to turn on Django Debug Toolbar, which needs one process. See
-[docs/src/topics/debug-toolbar.md](../../docs/src/topics/debug-toolbar.md).
-
 Port 8001 matters for the MCP demo: the OAuth issuer in `mcp_demo/api.py` is
-pinned to `http://127.0.0.1:8001`.
+pinned to `http://127.0.0.1:8001`. A single worker is required for the stateful
+MCP tools (`sample`/`elicit`).
 
 ## MCP demo (`mcp_demo/api.py`)
 
