@@ -79,7 +79,7 @@ from .serialization import (
 )
 from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata, HandlerPattern
-from .views import APIView, ViewSet
+from .views import APIView, ViewSet, _layer
 from .websocket import mark_websocket_handler
 
 Response = ResponseWireV1
@@ -965,9 +965,7 @@ class BoltAPI:
                         raise ValueError(f"View class {view_cls.__name__} does not implement method '{method}'")
 
             # Class attribute is the middle layer: decorator kwarg > class > API.
-            merged_include_in_schema = include_in_schema
-            if merged_include_in_schema is None:
-                merged_include_in_schema = view_cls.include_in_schema
+            merged_include_in_schema = _layer(include_in_schema, view_cls.include_in_schema)
 
             # Register each method
             for method in methods_to_register:
@@ -1107,9 +1105,7 @@ class BoltAPI:
             vs_base = name if name is not None else viewset_cls.__name__
 
             # Class attribute is the middle layer: decorator kwarg > class > API.
-            merged_include_in_schema = include_in_schema
-            if merged_include_in_schema is None:
-                merged_include_in_schema = viewset_cls.include_in_schema
+            merged_include_in_schema = _layer(include_in_schema, viewset_cls.include_in_schema)
 
             # Define standard action mappings with HTTP-compliant status codes
             # Format: action_name: (method, path, default_status_code)
@@ -2985,12 +2981,13 @@ class BoltAPI:
 
             # Copy handler metadata (now keyed by handler_id for performance)
             if handler_id in app._handler_meta:
-                meta = app._handler_meta[handler_id]
                 # A route that inherits takes the mounted API's value here, so
                 # the next outer layer sees it as decided (Litestar layering).
-                if meta["include_in_schema"] is None and app.include_in_schema is not None:
-                    meta = {**meta, "include_in_schema": app.include_in_schema}
-                self._handler_meta[new_handler_id] = meta
+                meta = app._handler_meta[handler_id]
+                self._handler_meta[new_handler_id] = {
+                    **meta,
+                    "include_in_schema": _layer(meta["include_in_schema"], app.include_in_schema),
+                }
 
             # Copy middleware metadata (with path updated)
             if handler_id in app._handler_middleware:
