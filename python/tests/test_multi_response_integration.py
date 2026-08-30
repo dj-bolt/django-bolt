@@ -147,30 +147,31 @@ def test_ellipsis_catch_all():
 
 
 # ============================================================================
-# 7. Unmapped code without catch-all returns 500
+# 7. Unmapped code without catch-all is sent as-is
 # ============================================================================
 
 
-def test_unmapped_code_500():
-    """Unmapped status code without ellipsis catch-all returns 500."""
+def test_unmapped_code_sent_as_is():
+    """Unmapped status code without ellipsis catch-all encodes the body as-is."""
     api = BoltAPI()
 
     @api.get("/items/{item_id}", response_model={200: OkSchema, 400: ErrorSchema})
     async def get_item(item_id: int):
-        return 999, {"detail": "Unknown"}
+        return 418, {"detail": "Unknown"}
 
     with TestClient(api) as client:
         response = client.get("/items/1")
-        assert response.status_code == 500
+        assert response.status_code == 418
+        assert response.json() == {"detail": "Unknown"}
 
 
 # ============================================================================
-# 8. Validation failure returns 500
+# 8. Per-status bodies are not validated
 # ============================================================================
 
 
-def test_validation_failure_500():
-    """Data that doesn't match the schema returns 500."""
+def test_mismatched_body_is_not_validated():
+    """Data that doesn't match the declared schema is still sent as-is."""
     api = BoltAPI()
 
     @api.get("/items/{item_id}", response_model={200: OkSchema, 400: ErrorSchema})
@@ -179,7 +180,8 @@ def test_validation_failure_500():
 
     with TestClient(api) as client:
         response = client.get("/items/1")
-        assert response.status_code == 500
+        assert response.status_code == 200
+        assert response.json() == {"wrong_field": "no id or name"}
 
 
 # ============================================================================

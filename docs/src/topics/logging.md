@@ -306,6 +306,24 @@ LOGGING = {
 
 If no `LOGGING` is configured, Django-Bolt sets up sensible defaults with queue-based handlers.
 
+### Access log
+
+The Rust server writes one line for each response from a matched route to the `django.server` logger:
+
+```text
+GET /items/7 200 0.4ms
+```
+
+The log level follows the status code, the same as Django's `runserver`:
+
+| Status | Level |
+|---|---|
+| 1xx–3xx | `INFO` |
+| 4xx | `WARNING` |
+| 5xx | `ERROR` |
+
+Set `django.server` to `WARNING` to keep only the 4xx and 5xx lines. Set it above `WARNING` to turn the access log off. The check runs once at startup. When the log is off, the request path has no logging code.
+
 ## Example: Complete production setup
 
 ```python

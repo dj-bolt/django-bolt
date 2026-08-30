@@ -37,6 +37,18 @@ except ImportError:
     ExceptionReporter = None
 
 
+def _json_response(
+    status_code: int, headers: dict[str, str] | None, payload: Any
+) -> tuple[int, list[tuple[str, str]], bytes]:
+    """Encode ``payload`` as a JSON response tuple with optional extra headers."""
+    if headers:
+        response_headers = list(_DEFAULT_JSON_HEADERS)
+        response_headers.extend(headers.items())
+    else:
+        response_headers = _DEFAULT_JSON_HEADERS
+    return status_code, response_headers, _json.encode(payload)
+
+
 def format_error_response(
     status_code: int,
     detail: Any,
@@ -55,19 +67,9 @@ def format_error_response(
         Tuple of (status_code, headers, body)
     """
     error_body: dict[str, Any] = {"detail": detail}
-
     if extra is not None:
         error_body["extra"] = extra
-
-    body_bytes = _json.encode(error_body)
-
-    if headers:
-        response_headers = list(_DEFAULT_JSON_HEADERS)
-        response_headers.extend(headers.items())
-    else:
-        response_headers = _DEFAULT_JSON_HEADERS
-
-    return status_code, response_headers, body_bytes
+    return _json_response(status_code, headers, error_body)
 
 
 def serialize_django_response(response: Any) -> tuple[int, list[tuple[str, str]], bytes]:
@@ -118,14 +120,12 @@ def is_django_response(obj: Any) -> bool:
 
 
 def http_exception_handler(exc: HTTPException) -> tuple[int, list[tuple[str, str]], bytes]:
-    """Handle HTTPException and convert to error response.
+    """Convert an HTTPException to a response tuple.
 
-    Args:
-        exc: HTTPException instance
-
-    Returns:
-        Tuple of (status_code, headers, body)
+    A typed ``body`` is encoded as-is. Otherwise the ``detail`` envelope is used.
     """
+    if exc.body is not None:
+        return _json_response(exc.status_code, exc.headers, exc.body)
     return format_error_response(
         status_code=exc.status_code,
         detail=exc.detail,
