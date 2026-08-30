@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from typing import Annotated, Literal
 
+from django.conf import settings
 from django.urls import reverse
 from msgspec import Meta
 
@@ -15,7 +16,11 @@ from django_bolt.serializers import Serializer, field, field_validator
 from django_bolt.shortcuts import render
 from missions.models import Astronaut, Mission
 
-api = BoltAPI()
+# The debug toolbar renders into the HTML that /dashboard returns.
+DEBUG_TOOLBAR_MIDDLEWARE = (
+    ["debug_toolbar.middleware.DebugToolbarMiddleware"] if "debug_toolbar" in settings.INSTALLED_APPS else None
+)
+api = BoltAPI(django_middleware=DEBUG_TOOLBAR_MIDDLEWARE)
 
 
 # Schemas
