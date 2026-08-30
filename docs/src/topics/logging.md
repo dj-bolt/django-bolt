@@ -308,9 +308,9 @@ If no `LOGGING` is configured, Django-Bolt sets up sensible defaults with queue-
 
 ### Access log
 
-The Rust server writes one line per response to the `django.server` logger:
+The Rust server writes one line for each response from a matched route to the `django.server` logger:
 
-```
+```text
 GET /items/7 200 0.4ms
 ```
 
