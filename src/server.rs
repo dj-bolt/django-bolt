@@ -606,12 +606,14 @@ pub fn start_server(
         // Check Django's logging configuration to determine if access logging is enabled.
         // Uses the standard django.server logger — no extra settings needed.
         // Decision is made once at startup (Granian pattern: zero cost when off).
+        // Gate on WARNING: a logger at WARNING still receives the 4xx/5xx lines,
+        // and Python's own level check drops the INFO lines.
         let (access_log_enabled, access_logger_obj) = (|| -> (bool, Option<Py<PyAny>>) {
             let logging = match py.import("logging") {
                 Ok(m) => m,
                 Err(_) => return (false, None),
             };
-            let info_level: i32 = match logging.getattr("INFO").and_then(|v| v.extract()) {
+            let warning_level: i32 = match logging.getattr("WARNING").and_then(|v| v.extract()) {
                 Ok(v) => v,
                 Err(_) => return (false, None),
             };
@@ -620,7 +622,7 @@ pub fn start_server(
                 Err(_) => return (false, None),
             };
             let enabled = logger
-                .call_method1("isEnabledFor", (info_level,))
+                .call_method1("isEnabledFor", (warning_level,))
                 .and_then(|v| v.extract::<bool>())
                 .unwrap_or(false);
             if enabled {

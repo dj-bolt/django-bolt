@@ -1400,10 +1400,18 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
     // ACCESS_LOG: compiler eliminates this entire block when ACCESS_LOG=false (const generic).
     // When ACCESS_LOG=true, log method/path/status/duration via Django's logger.
+    // The level follows the status, like Django's runserver: 5xx error, 4xx warning, else info.
     if ACCESS_LOG {
         // access_log_start is always Some when ACCESS_LOG=true; unwrap is safe.
         let dur_ms = access_log_start.unwrap().elapsed().as_secs_f64() * 1000.0;
         let status = response.status().as_u16();
+        let level = if status >= 500 {
+            "error"
+        } else if status >= 400 {
+            "warning"
+        } else {
+            "info"
+        };
         // Format OUTSIDE the GIL — only the logger call itself needs Python.
         let msg = format!("{} {} {} {:.1}ms", method, path, status, dur_ms);
         // access_logger is always Some when ACCESS_LOG=true (guaranteed by server.rs startup).
@@ -1412,7 +1420,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 .access_logger
                 .as_ref()
                 .unwrap()
-                .call_method1(py, "info", (msg,));
+                .call_method1(py, level, (msg,));
         });
     }
 
