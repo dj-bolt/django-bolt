@@ -46,6 +46,10 @@ INTERNAL_IPS = ["127.0.0.1"]
 
 The toolbar shows only when `request.META["REMOTE_ADDR"]` is in `INTERNAL_IPS`. Bolt sets `REMOTE_ADDR` on Bolt routes and on mounted Django views. Behind a reverse proxy, set `BOLT_TRUSTED_PROXIES` so `REMOTE_ADDR` is the real client address. In Docker, use `debug_toolbar.middleware.show_toolbar_with_docker` as `SHOW_TOOLBAR_CALLBACK`.
 
+!!! note "Upgrading from Django-Bolt 0.10.3 or older"
+
+    Older versions did not set `REMOTE_ADDR` on Bolt routes. The `INTERNAL_IPS` check never matched. If you set `SHOW_TOOLBAR_CALLBACK` to work around that, remove the override. The default check works now.
+
 Add the toolbar URLs to your URLconf:
 
 ```python
