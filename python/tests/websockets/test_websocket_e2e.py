@@ -571,6 +571,15 @@ class TestWebSocketGuards:
             await websocket.accept()
             await websocket.send_text("has permission")
 
+        @api.websocket(
+            "/ws/cookie",
+            auth=[JWTAuthentication(secret=E2E_JWT_SECRET, cookie="access_token")],
+            guards=[IsAuthenticated()],
+        )
+        async def cookie_ws(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("cookie")
+
         return api
 
     @pytest.mark.asyncio
@@ -598,6 +607,16 @@ class TestWebSocketGuards:
         async with WebSocketTestClient(api, "/ws/protected", headers=headers) as ws:
             msg = await ws.receive_text()
             assert msg == "protected"
+
+    @pytest.mark.asyncio
+    async def test_protected_route_with_cookie(self, api):
+        """A cookie authenticates the handshake. Browsers cannot set headers."""
+        token = create_e2e_jwt(user_id=123)
+        headers = {"Cookie": f"access_token={token}"}
+
+        async with WebSocketTestClient(api, "/ws/cookie", headers=headers) as ws:
+            msg = await ws.receive_text()
+            assert msg == "cookie"
 
     @pytest.mark.asyncio
     async def test_admin_route_without_superuser(self, api):
