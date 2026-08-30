@@ -126,6 +126,24 @@ class TestLoadDjangoMiddleware:
         with pytest.raises(ImportError):
             load_django_middleware(["nonexistent.middleware.BrokenMiddleware"])
 
+    @pytest.mark.parametrize("key", ["include", "exclude"])
+    def test_dict_non_string_entry_raises(self, key):
+        """A class object in include/exclude is a configuration error, not a silent no-op."""
+        with (
+            override_settings(MIDDLEWARE=["django.contrib.sessions.middleware.SessionMiddleware"]),
+            pytest.raises(ImproperlyConfigured, match="dotted path"),
+        ):
+            load_django_middleware({key: [SessionMiddleware]})
+
+    @pytest.mark.parametrize("key", ["include", "exclude"])
+    def test_dict_scalar_string_raises(self, key):
+        """A bare string in include/exclude is a configuration error, not a set of characters."""
+        with (
+            override_settings(MIDDLEWARE=["django.contrib.sessions.middleware.SessionMiddleware"]),
+            pytest.raises(ImproperlyConfigured, match="dotted path"),
+        ):
+            load_django_middleware({key: "django.contrib.sessions.middleware.SessionMiddleware"})
+
 
 # =============================================================================
 # Test get_django_middleware_setting

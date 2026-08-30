@@ -25,7 +25,7 @@ SECRET_KEY = "django-insecure-8l7jd)6zngu@-^(&lt=q3smdfx4rcuu9tp3&6&y)ovqm%y=20t
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # DEBUG is on by default and turns on the debug toolbar. `DJANGO_DEBUG=0` turns it off.
-DEBUG = False
+DEBUG = os.environ.get("DJANGO_DEBUG", "1") != "0"
 
 ALLOWED_HOSTS = ["*"]
 

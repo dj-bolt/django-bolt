@@ -37,6 +37,15 @@ if TYPE_CHECKING:
 DEFAULT_EXCLUDED_MIDDLEWARE: set = set()  # Empty by default - load everything
 
 
+def _dotted_paths(value: Any) -> list[str]:
+    """Check that `value` is a collection of dotted path strings. Raise if it is not."""
+    if isinstance(value, str) or not all(isinstance(path, str) for path in value):
+        raise ImproperlyConfigured(
+            f"django_middleware include/exclude entries must be a list of dotted path strings, got {value!r}."
+        )
+    return list(value)
+
+
 def load_django_middleware(
     config: bool | list[str] | dict[str, Any] = True,
     *,
@@ -76,9 +85,9 @@ def load_django_middleware(
         include_set: set[str] | None = None
         if isinstance(config, dict):
             if "include" in config:
-                include_set = set(config["include"])
+                include_set = set(_dotted_paths(config["include"]))
             if "exclude" in config:
-                exclude_set.update(config["exclude"])
+                exclude_set.update(_dotted_paths(config["exclude"]))
         paths = [
             path
             for path in getattr(settings, "MIDDLEWARE", [])
