@@ -358,6 +358,9 @@ The `runbolt` management command accepts these options:
 | `--no-admin` | off | Disable admin integration |
 | `--backlog` | `1024` | Socket listen backlog |
 | `--keep-alive` | OS default | HTTP keep-alive timeout |
+| `--skip-checks` | off | Skip the Django system checks at startup |
+
+At startup, `runbolt` runs the Django system checks and the migration check, like `runserver`. A check error stops startup. The unapplied-migration warning prints before the banner. In `--dev` mode, each reload runs the checks again. Multi-process mode runs them once, in the parent process. `--skip-checks` skips the system checks; the migration check still runs.
 
 ### Examples
 
