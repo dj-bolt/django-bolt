@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 
 import pytest
 from django.core.management.base import CommandError
@@ -455,3 +456,88 @@ def test_mount_asgi_exception_surfaces_in_response(exc_class, exc_msg, expected_
     assert response.status_code == 500
     for fragment in expected_fragments:
         assert fragment in response.text
+
+
+def test_mount_asgi_send_after_timeout_is_a_noop(settings):
+    """Regression for #313.
+
+    Bolt times out and cancels the app. A task can outlive the cancellation
+    (Django <= 6.0 orphans ``process_request`` this way). That task must be
+    able to call ``send`` without ``http.response.start sent more than once``.
+    """
+    settings.BOLT_ASGI_MOUNT_TIMEOUT = 0.05
+    api = BoltAPI()
+    outcome: dict[str, object] = {}
+    done = threading.Event()
+
+    async def late_sender(send):
+        try:
+            await asyncio.sleep(0.2)
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"late", "more_body": False})
+            outcome["ok"] = True
+        except BaseException as exc:  # noqa: BLE001 - record what the orphan saw
+            outcome["error"] = repr(exc)
+        finally:
+            done.set()
+
+    async def orphaning_asgi(scope, receive, send):
+        await receive()
+        # shield() mimics asyncio.wait(): cancelling the outer task leaves the inner one running.
+        await asyncio.shield(late_sender(send))
+
+    api.mount_asgi("/slow", orphaning_asgi)
+
+    with TestClient(api) as client:
+        response = client.get("/slow")
+        assert response.status_code == 504
+        assert done.wait(timeout=2)
+
+    assert outcome == {"ok": True}
+
+
+def test_mount_asgi_duplicate_response_start_still_raises():
+    api = BoltAPI()
+    outcome: dict[str, object] = {}
+
+    async def double_start(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        try:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+        except RuntimeError as exc:
+            outcome["error"] = str(exc)
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    api.mount_asgi("/double", double_start)
+
+    with TestClient(api) as client:
+        assert client.get("/double").status_code == 200
+
+    assert outcome == {"error": "http.response.start sent more than once"}
+
+
+def test_mount_asgi_head_request_does_not_fake_a_disconnect():
+    api = BoltAPI()
+    seen: list[str] = []
+    done = threading.Event()
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        try:
+            message = await asyncio.wait_for(receive(), timeout=0.2)
+            seen.append(message["type"])
+        except TimeoutError:
+            seen.append("no-disconnect")
+        done.set()
+        await send({"type": "http.response.body", "body": b"body", "more_body": False})
+
+    api.mount_asgi("/h", app)
+
+    with TestClient(api) as client:
+        response = client.head("/h")
+        assert response.status_code == 200
+        assert done.wait(timeout=2)
+
+    assert seen == ["no-disconnect"]
