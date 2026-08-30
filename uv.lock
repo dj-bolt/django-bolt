@@ -318,6 +318,7 @@ dev = [
     { name = "bolt-mcp" },
     { name = "cryptography" },
     { name = "django" },
+    { name = "django-debug-toolbar" },
     { name = "maturin" },
     { name = "nanodjango" },
     { name = "openapi-spec-validator" },
@@ -355,6 +356,7 @@ dev = [
     { name = "bolt-mcp", editable = "python/bolt-mcp" },
     { name = "cryptography", specifier = ">=42" },
     { name = "django", specifier = "==6.1" },
+    { name = "django-debug-toolbar", specifier = ">=7.1.1" },
     { name = "maturin", specifier = ">=1.9.6" },
     { name = "nanodjango", specifier = ">=0.16" },
     { name = "openapi-spec-validator", specifier = ">=0.8.5" },
@@ -367,6 +369,19 @@ dev = [
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
 docs = [{ name = "zensical" }]
+
+[[package]]
+name = "django-debug-toolbar"
+version = "7.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "django" },
+    { name = "sqlparse" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/00/da/df67a8e407ab6141affee4ee5cb2704403b9d5465cc35abbb42f5190a3fa/django_debug_toolbar-7.1.1.tar.gz", hash = "sha256:2fb4093d95e6f87258606c55f4d2aa45d1847b17a415525a9dceac02e937a836", size = 363531, upload-time = "2026-08-14T13:18:47.219Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/de/c8/f473a965186510233129c2ab22e4808a1938afcbe9a287145d17693adf70/django_debug_toolbar-7.1.1-py3-none-any.whl", hash = "sha256:e1385b22fb17bff4dc51cf782679a7926676405e8d013ada1e3d8a6bfc47fdb3", size = 304387, upload-time = "2026-08-14T13:18:45.642Z" },
+]
 
 [[package]]
 name = "django-ninja"

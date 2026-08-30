@@ -298,9 +298,6 @@ _csrf_callback_not_exempt.csrf_exempt = False
 _EMPTY_TUPLE: tuple = ()
 _EMPTY_DICT: dict = {}
 
-# Frozenset for O(1) header skip check (avoid tuple creation in loop)
-_SKIP_HEADERS = frozenset(("content-type", "content-length"))
-
 
 # Known-safe Django middleware modules that don't do blocking I/O in hooks
 # These get the fast path (direct calls without sync_to_async)
@@ -784,8 +781,10 @@ def _to_django_request(request: Request) -> HttpRequest:
     django_request.path = request.path
     django_request.path_info = request.path
 
-    # Build META dict from headers
-    django_request.META = _build_meta(request)
+    # One META dict per request. Rust builds it once (REMOTE_ADDR from the
+    # client-ip resolver, SERVER_NAME from Host, HTTP_* headers) and caches it,
+    # so middleware writes (CSRF_COOKIE) are visible to the handler's request.META.
+    django_request.META = request.META
 
     # Copy cookies - use empty dict directly if no cookies
     # Note: When django_middleware is enabled, needs_cookies=True is set at registration
@@ -820,33 +819,6 @@ def _to_django_request(request: Request) -> HttpRequest:
     django_request._bolt_request = request
 
     return django_request
-
-
-def _build_meta(request: Request) -> dict:
-    """Build Django META dict from Bolt request headers."""
-    query_string = "&".join(f"{k}={v}" for k, v in request.query.items()) if request.query else ""
-
-    meta = {
-        "REQUEST_METHOD": request.method,
-        "PATH_INFO": request.path,
-        "QUERY_STRING": query_string,
-        "CONTENT_TYPE": request.headers.get("content-type", ""),
-        "CONTENT_LENGTH": str(len(request.body)) if request.body else "",
-        "SERVER_NAME": "localhost",
-        "SERVER_PORT": "8000",
-    }
-
-    # Convert headers to META format
-    for key, value in request.headers.items():
-        key_lower = key.lower()
-        # Skip content-type and content-length (already added) - O(1) frozenset lookup
-        if key_lower in _SKIP_HEADERS:
-            continue
-        # Convert to Django META format (HTTP_HEADER_NAME)
-        meta_key = f"HTTP_{key.upper().replace('-', '_')}"
-        meta[meta_key] = value
-
-    return meta
 
 
 def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
@@ -924,11 +896,6 @@ def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request)
     messages = getattr(django_request, "_messages", None)
     if messages is not None:
         bolt_request.state["_messages"] = messages
-
-    # Sync META for Django template compatibility (e.g., {% csrf_token %})
-    # Django's get_token() needs request.META['CSRF_COOKIE']
-    # Note: HttpRequest always has META, no need to check - direct access
-    bolt_request.state["META"] = django_request.META
 
     # Sync other common middleware attributes to state (use getattr pattern)
     csrf_processing_done = getattr(django_request, "csrf_processing_done", None)

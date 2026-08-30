@@ -17,6 +17,7 @@ from pathlib import Path
 from django.apps import apps
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import connections
 from django.template.autoreload import get_template_directories
 from django.utils.autoreload import iter_all_python_module_files
 
@@ -530,7 +531,12 @@ def _project_api_module_names(root_urlconf: str) -> list[str]:
 class Command(BaseCommand):
     help = "Run Django-Bolt server with autodiscovered APIs"
 
+    # Like runserver: handle() runs the checks itself, at the right point.
+    # The dev supervisor skips them; each spawned dev worker runs them.
+    requires_system_checks = []
+
     def add_arguments(self, parser):
+        parser.add_argument("--skip-checks", action="store_true", help="Skip system checks.")
         parser.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
         parser.add_argument("--port", type=int, default=8000, help="Port to bind to (default: 8000)")
         parser.add_argument("--processes", type=int, default=1, help="Number of processes (default: 1)")
@@ -614,12 +620,32 @@ class Command(BaseCommand):
 
             self.run_with_autoreload(options)
         else:
+            # Mirror runserver: run the checks before the port is bound.
+            # Multi-process mode runs them once here, before workers fork.
+            # In dev mode each spawned worker gets here, so a reload runs
+            # the checks again, like runserver's autoreload.
+            self.run_startup_checks(options)
+
             # Production mode. Worker recycling needs the supervising parent
             # even for a single worker, so route through start_multiprocess.
             if processes > 1 or (self._supervision_requested(options) and not dev_worker_mode):
                 self.start_multiprocess(options)
             else:
                 self.start_single_process(options, dev_mode=effective_dev_mode)
+
+    def run_startup_checks(self, options) -> None:
+        """Run Django's system checks and the unapplied-migration check.
+
+        A check error raises SystemCheckError, which stops startup with a
+        non-zero exit code, like runserver.
+        """
+        if not options.get("skip_checks"):
+            self.check(display_num_errors=True)
+        self.check_migrations()
+        # Close the connections that the migration check opened. Handlers
+        # and forked workers must open their own.
+        for connection in connections.all(initialized_only=True):
+            connection.close()
 
     def run_with_autoreload(self, options):
         """Run the server behind the native dev supervisor."""

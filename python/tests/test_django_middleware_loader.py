@@ -8,6 +8,10 @@ to ensure middleware runs and affects request/response behavior.
 from __future__ import annotations
 
 import pytest
+from django.contrib.sessions.middleware import SessionMiddleware
+from django.core.exceptions import ImproperlyConfigured
+from django.middleware.common import CommonMiddleware
+from django.test import override_settings
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import DjangoMiddlewareStack, TimingMiddleware
@@ -100,21 +104,45 @@ class TestLoadDjangoMiddleware:
         # The stack should only contain SessionMiddleware
         assert len(result[0].middleware_classes) == 1
 
-    def test_handles_invalid_middleware_gracefully(self):
-        """Test that invalid middleware paths are skipped gracefully."""
-        # load_django_middleware should skip invalid paths and not crash
-        result = load_django_middleware(
-            [
-                "django.contrib.sessions.middleware.SessionMiddleware",
-                "nonexistent.middleware.BrokenMiddleware",
-            ]
-        )
-
-        # Only valid middleware should be loaded (as a stack)
+    def test_list_loads_exactly_these_in_order(self):
+        """A list is loaded as given. It does not filter settings.MIDDLEWARE."""
+        with override_settings(MIDDLEWARE=[]):
+            result = load_django_middleware(
+                [
+                    "django.middleware.common.CommonMiddleware",
+                    "django.contrib.sessions.middleware.SessionMiddleware",
+                ]
+            )
         assert len(result) == 1
-        assert isinstance(result[0], DjangoMiddlewareStack)
-        # The stack should only contain SessionMiddleware
-        assert len(result[0].middleware_classes) == 1
+        assert result[0].middleware_classes == [CommonMiddleware, SessionMiddleware]
+
+    def test_non_string_entry_raises(self):
+        """A class object is a configuration error, as in settings.MIDDLEWARE."""
+        with pytest.raises(ImproperlyConfigured, match="dotted path"):
+            load_django_middleware([SessionMiddleware])
+
+    def test_bad_path_raises(self):
+        """A path that does not import fails at startup, as in Django."""
+        with pytest.raises(ImportError):
+            load_django_middleware(["nonexistent.middleware.BrokenMiddleware"])
+
+    @pytest.mark.parametrize("key", ["include", "exclude"])
+    def test_dict_non_string_entry_raises(self, key):
+        """A class object in include/exclude is a configuration error, not a silent no-op."""
+        with (
+            override_settings(MIDDLEWARE=["django.contrib.sessions.middleware.SessionMiddleware"]),
+            pytest.raises(ImproperlyConfigured, match="dotted path"),
+        ):
+            load_django_middleware({key: [SessionMiddleware]})
+
+    @pytest.mark.parametrize("key", ["include", "exclude"])
+    def test_dict_scalar_string_raises(self, key):
+        """A bare string in include/exclude is a configuration error, not a set of characters."""
+        with (
+            override_settings(MIDDLEWARE=["django.contrib.sessions.middleware.SessionMiddleware"]),
+            pytest.raises(ImproperlyConfigured, match="dotted path"),
+        ):
+            load_django_middleware({key: "django.contrib.sessions.middleware.SessionMiddleware"})
 
 
 # =============================================================================

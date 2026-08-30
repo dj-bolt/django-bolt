@@ -11,6 +11,12 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - **ASGI mount: a client that went away raised into the app** - Bolt had no client-disconnect signal for mounted apps. A mounted app that parked in `receive()` never got `http.disconnect`, and Actix kept its handler alive until the app wrote. After `BOLT_ASGI_MOUNT_TIMEOUT`, Bolt returned 504, cancelled the app, and dropped the response channel. On Django 4.2 to 6.0, `ASGIHandler.handle()` waits with `asyncio.wait()`, which does not cancel its child tasks. The orphaned `process_request` task finished the view, called `send()`, and got `RuntimeError: http.response.start sent more than once`. Django 6.1 uses a `TaskGroup` and was not affected. Bolt now does what hyper and uvicorn do. A read-side EOF while a handler runs is a disconnect (`h1_allow_half_closed(false)`). `receive()` then returns `http.disconnect`, before headers and mid-body. After Bolt closes a response, on disconnect, timeout, or app exit, `send()` is a no-op. A real second `http.response.start` still raises. (#313)
+- **`django_middleware=[...]` loads the list you pass** - The list form was a filter over `settings.MIDDLEWARE`. A path not in `settings.MIDDLEWARE`, a class object, or a typo was dropped with no error, and the route ran with no Django middleware. The list is now loaded as given, in order. A non-string entry raises `ImproperlyConfigured`. A path that does not import raises `ImportError` at startup, as in Django. The `include`/`exclude` dict form still filters `settings.MIDDLEWARE`.
+- **`django_middleware`: `request.META` is the Rust-built dict** - The adapter built a second `META` in Python with no `REMOTE_ADDR` and a fixed `SERVER_NAME`. Middleware that reads the client address (django-debug-toolbar, django-axes, django-ratelimit) got `KeyError` or never matched. Django middleware and the handler now share the one `META` that Rust builds and caches, with `REMOTE_ADDR` from the client-ip resolver and `SERVER_NAME` from `Host`. The `request.state["META"]` round trip is gone.
+
+### Added
+
+- **Django Debug Toolbar guide** - `docs/src/topics/debug-toolbar.md` shows the setup. The toolbar works on Bolt routes through `django_middleware=[...]` and on mounted Django views. The example project has the setup and a mounted Django view at `/django/missions/`.
 
 ## [0.10.3]
 

@@ -306,18 +306,18 @@ api = BoltAPI(django_middleware=True)
 # Disable Django middleware
 api = BoltAPI(django_middleware=False)
 
-# Load specific middleware only
+# Load exactly these, in this order (they do not need to be in settings.MIDDLEWARE)
 api = BoltAPI(django_middleware=[
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
 ])
 
-# Exclude specific middleware
+# Load settings.MIDDLEWARE without these
 api = BoltAPI(django_middleware={
     "exclude": ["django.middleware.csrf.CsrfViewMiddleware"]
 })
 
-# Include only specific middleware
+# Load only these entries of settings.MIDDLEWARE
 api = BoltAPI(django_middleware={
     "include": [
         "django.contrib.sessions.middleware.SessionMiddleware",

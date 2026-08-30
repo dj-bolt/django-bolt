@@ -10,6 +10,7 @@ from typing import Annotated, Protocol
 
 import msgspec
 import test_data
+from django.conf import settings
 from django.contrib.auth import aauthenticate, get_user_model
 
 from django_bolt import (
@@ -59,8 +60,15 @@ async def lifespan(app):
 # Example compression configurations:
 #
 # 1. Default compression (brotli with gzip fallback):
+DEBUG_TOOLBAR_MIDDLEWARE = (
+    ["debug_toolbar.middleware.DebugToolbarMiddleware"] if "debug_toolbar" in settings.INSTALLED_APPS else None
+)
+
 api = BoltAPI(
     lifespan=lifespan,
+    # Run only the debug toolbar middleware on Bolt routes, so they show up in
+    # its History panel. The full settings.MIDDLEWARE would add CSRF checks.
+    django_middleware=DEBUG_TOOLBAR_MIDDLEWARE,
     openapi_config=OpenAPIConfig(
         title="My API",
         version="1.0.0",
@@ -261,6 +269,10 @@ api.mount_asgi("/asgi-demo", asgi_mount_demo)
 # - /django/accounts/provider/callback/?code=demo&state=xyz
 # - /django/accounts/allauth/ (if django-allauth is installed/configured)
 api.mount_django("/django")
+
+if "debug_toolbar" in settings.INSTALLED_APPS:
+    # The toolbar on a Bolt route calls /__debug__/... at the site root.
+    api.mount_django("/__debug__", clear_root_path=True)
 
 
 @api.get("/health")

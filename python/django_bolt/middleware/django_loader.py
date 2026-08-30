@@ -20,10 +20,10 @@ Usage:
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
 
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 
 from .django_adapter import DjangoMiddlewareStack
@@ -37,90 +37,75 @@ if TYPE_CHECKING:
 DEFAULT_EXCLUDED_MIDDLEWARE: set = set()  # Empty by default - load everything
 
 
+def _dotted_paths(value: Any) -> list[str]:
+    """Check that `value` is a collection of dotted path strings. Raise if it is not."""
+    if isinstance(value, str) or not all(isinstance(path, str) for path in value):
+        raise ImproperlyConfigured(
+            f"django_middleware include/exclude entries must be a list of dotted path strings, got {value!r}."
+        )
+    return list(value)
+
+
 def load_django_middleware(
     config: bool | list[str] | dict[str, Any] = True,
     *,
     exclude_defaults: bool = True,
 ) -> list[MiddlewareType]:
     """
-    Load middleware from Django's settings.MIDDLEWARE configuration.
+    Load Django middleware for Bolt routes.
 
     Args:
         config: Middleware configuration. Can be:
             - True: Load all middleware from settings.MIDDLEWARE
             - False/None: Return empty list
-            - List[str]: Load only these specific middleware classes
-            - Dict with:
-                - "include": List of middleware to include (if specified, only these are used)
-                - "exclude": List of middleware to exclude
-        exclude_defaults: If True, exclude middleware that don't make sense for APIs
-                         (CSRF, Clickjacking, Messages). Default True.
+            - List[str]: Load exactly these dotted paths, in this order.
+              They do not need to be in settings.MIDDLEWARE.
+            - Dict that filters settings.MIDDLEWARE:
+                - "include": keep only these paths
+                - "exclude": drop these paths
+        exclude_defaults: If True, also drop DEFAULT_EXCLUDED_MIDDLEWARE.
 
     Returns:
-        List of wrapped Django middleware instances ready for use with Bolt.
+        A list with one DjangoMiddlewareStack, or an empty list.
 
-    Example:
-        # In your api.py
-        from django_bolt import BoltAPI
-        from django_bolt.middleware.django_loader import load_django_middleware
+    Raises:
+        ImproperlyConfigured: An entry is not a dotted path string.
+        ImportError: A dotted path does not import.
 
-        api = BoltAPI(
-            middleware=load_django_middleware()  # Uses settings.MIDDLEWARE
-        )
-
-        # Or with configuration
-        api = BoltAPI(
-            middleware=load_django_middleware({
-                "exclude": ["django.middleware.csrf.CsrfViewMiddleware"]
-            })
-        )
+    Like Django's own `load_middleware`, errors stop startup. Nothing is skipped
+    without a message.
     """
     if config is False or config is None:
         return []
 
-    # Get the middleware list from Django settings
-    django_middleware_list = getattr(settings, "MIDDLEWARE", [])
-
-    if not django_middleware_list:
-        return []
-
-    # Determine which middleware to include/exclude
-    include_set: set[str] | None = None
-    exclude_set: set[str] = set()
-
-    if exclude_defaults:
-        exclude_set.update(DEFAULT_EXCLUDED_MIDDLEWARE)
-
     if isinstance(config, list):
-        # Explicit list of middleware to include
-        include_set = set(config)
-    elif isinstance(config, dict):
-        if "include" in config:
-            include_set = set(config["include"])
-        if "exclude" in config:
-            exclude_set.update(config["exclude"])
-    # If config is True, use all from settings with default exclusions
+        paths = config
+    else:
+        exclude_set: set[str] = set(DEFAULT_EXCLUDED_MIDDLEWARE) if exclude_defaults else set()
+        include_set: set[str] | None = None
+        if isinstance(config, dict):
+            if "include" in config:
+                include_set = set(_dotted_paths(config["include"]))
+            if "exclude" in config:
+                exclude_set.update(_dotted_paths(config["exclude"]))
+        paths = [
+            path
+            for path in getattr(settings, "MIDDLEWARE", [])
+            if (include_set is None or path in include_set) and path not in exclude_set
+        ]
 
-    # Collect middleware classes (not instances)
     middleware_classes: list = []
+    for path in paths:
+        if not isinstance(path, str):
+            raise ImproperlyConfigured(
+                f"django_middleware entries must be dotted path strings, got {path!r}. "
+                "To use a middleware class directly, pass "
+                "BoltAPI(middleware=[DjangoMiddlewareStack([...])])."
+            )
+        middleware_classes.append(import_string(path))
 
-    for middleware_path in django_middleware_list:
-        # Check if we should include this middleware
-        if include_set is not None and middleware_path not in include_set:
-            continue
-        if middleware_path in exclude_set:
-            continue
-
-        try:
-            middleware_class = import_string(middleware_path)
-            middleware_classes.append(middleware_class)
-        except ImportError as e:
-            logging.getLogger("django_bolt").warning(f"Could not import Django middleware '{middleware_path}': {e}")
-
-    # Return a single DjangoMiddlewareStack that wraps ALL middleware
-    # This is a critical performance optimization:
-    # - Instead of N Bolt↔Django conversions (one per middleware)
-    # - We do just 1 conversion at start and 1 at end
+    # One DjangoMiddlewareStack for all middleware: one Bolt->Django request
+    # conversion at the start and one Django->Bolt response conversion at the end.
     if middleware_classes:
         return [DjangoMiddlewareStack(middleware_classes)]
     return []

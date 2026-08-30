@@ -4,8 +4,9 @@ import time
 import test_data
 from django.contrib.auth import authenticate, login, logout
 from django.http import JsonResponse, StreamingHttpResponse
-from django.shortcuts import redirect
+from django.shortcuts import redirect, render
 from django.urls import reverse
+from missions.models import Mission
 
 
 async def index(request):
@@ -113,3 +114,13 @@ def accounts_provider_callback(request):
             "query": dict(request.GET.items()),
         }
     )
+
+
+async def missions_page(request):
+    """A mounted Django view that renders a template from the async ORM.
+
+    Open it with the debug toolbar on to see the SQL and Templates panels
+    for a view that runs inside the Django ASGI mount.
+    """
+    missions = [mission async for mission in Mission.objects.all()[:20]]
+    return render(request, "missions/dashboard.html", {"missions": missions})
