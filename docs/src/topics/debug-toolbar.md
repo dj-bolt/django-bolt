@@ -65,8 +65,6 @@ if "debug_toolbar" in settings.INSTALLED_APPS:
     urlpatterns.append(path("__debug__/", include("debug_toolbar.urls")))
 ```
 
-Check `INSTALLED_APPS`, not `settings.DEBUG`. Test runners set `DEBUG = False` after the settings load. The middleware list is already built by then, and the toolbar middleware needs the `djdt` URL namespace.
-
 ## Enable the toolbar on Bolt routes
 
 Run the toolbar middleware on Bolt routes, and mount the toolbar views at the site root:
