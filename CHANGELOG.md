@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Access tokens carry a `jti`** - `create_token_pair` and `rotate_refresh_token` minted access tokens without a `jti`. A `JWTAuthentication` with a `revocation_store` sets `require_jti`, so it rejected every access token with `Authentication required`. Access tokens now get a fresh `jti` at issue and at each rotation. A store can now revoke one access token by its `jti`. (#304)
 - **`django_middleware=[...]` loads the list you pass** - The list form was a filter over `settings.MIDDLEWARE`. A path not in `settings.MIDDLEWARE`, a class object, or a typo was dropped with no error, and the route ran with no Django middleware. The list is now loaded as given, in order. A non-string entry raises `ImproperlyConfigured`. A path that does not import raises `ImportError` at startup, as in Django. The `include`/`exclude` dict form still filters `settings.MIDDLEWARE`.
 - **`django_middleware`: `request.META` is the Rust-built dict** - The adapter built a second `META` in Python with no `REMOTE_ADDR` and a fixed `SERVER_NAME`. Middleware that reads the client address (django-debug-toolbar, django-axes, django-ratelimit) got `KeyError` or never matched. Django middleware and the handler now share the one `META` that Rust builds and caches, with `REMOTE_ADDR` from the client-ip resolver and `SERVER_NAME` from `Host`. The `request.state["META"]` round trip is gone.
 

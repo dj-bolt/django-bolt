@@ -41,10 +41,13 @@ class TestCreateTokenPair:
         assert pair.refresh_claims["typ"] == "refresh"
         assert pair.access_claims["sub"] == "user-42"
         assert pair.refresh_claims["sub"] == "user-42"
-        # Refresh token has a jti and family; access token does not.
-        assert "jti" in pair.refresh_claims
+        # Both tokens carry a jti so a revocation store can identify them.
+        # Only the refresh token has a family.
+        assert pair.refresh_claims["jti"]
+        assert pair.access_claims["jti"]
+        assert pair.access_claims["jti"] != pair.refresh_claims["jti"]
         assert "fam" in pair.refresh_claims
-        assert "jti" not in pair.access_claims
+        assert "fam" not in pair.access_claims
         # Both carry the immutable origin-auth-time.
         assert pair.access_claims["oat"] == pair.refresh_claims["oat"]
         # Round-trips through the real secret.
@@ -448,6 +451,57 @@ class TestStorePrimitives:
         assert not await store.is_family_revoked("fam-1")
         await store.revoke_family("fam-1")
         assert await store.is_family_revoked("fam-1")
+
+
+class TestAccessTokenWithRevocationStore:
+    """Issue #304: a revocation store auto-enables ``require_jti``.
+
+    Access tokens must then carry a ``jti`` or every request is rejected.
+    """
+
+    def test_access_token_authenticates_when_revocation_is_configured(self):
+        store = InMemoryRevocation()
+        api = BoltAPI()
+
+        @api.get(
+            "/me",
+            auth=[JWTAuthentication(secret=SECRET, revocation_store=store)],
+            guards=[IsAuthenticated()],
+        )
+        async def me(request):
+            return {"sub": request["context"]["auth_claims"]["sub"]}
+
+        pair = create_token_pair("user-304", secret=SECRET)
+        with TestClient(api) as c:
+            r = c.get("/me", headers={"Authorization": f"Bearer {pair.access_token}"})
+            assert r.status_code == 200, r.text
+            assert r.json() == {"sub": "user-304"}
+
+    def test_access_token_can_be_revoked_by_jti(self):
+        store = InMemoryRevocation()
+        api = BoltAPI()
+
+        @api.get(
+            "/me",
+            auth=[JWTAuthentication(secret=SECRET, revocation_store=store)],
+            guards=[IsAuthenticated()],
+        )
+        async def me(request):
+            return {"ok": True}
+
+        pair = create_token_pair("user-304", secret=SECRET)
+        asyncio.run(store.revoke(pair.access_claims["jti"]))
+        with TestClient(api) as c:
+            r = c.get("/me", headers={"Authorization": f"Bearer {pair.access_token}"})
+            assert r.status_code == 401
+
+    @pytest.mark.parametrize("rotate", [True, False])
+    def test_rotated_access_token_has_fresh_jti(self, rotate):
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET)
+        new = asyncio.run(rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, rotate=rotate))
+        assert new.access_claims["jti"]
+        assert new.access_claims["jti"] != pair.access_claims["jti"]
 
 
 class TestRefreshEndpointTypEnforcement:
