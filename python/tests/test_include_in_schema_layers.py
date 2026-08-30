@@ -69,30 +69,30 @@ def test_view_class_attribute_and_decorator_kwarg():
     class HiddenView(APIView):
         include_in_schema = False
 
-        async def get(self):
+        async def get(self, request):
             return {}
 
     @api.view("/kw", include_in_schema=True)
     class OverriddenView(APIView):
         include_in_schema = False
 
-        async def get(self):
+        async def get(self, request):
             return {}
 
     @api.viewset("/vs")
     class HiddenViewSet(ViewSet):
         include_in_schema = False
 
-        async def list(self):
+        async def list(self, request):
             return []
 
         @action(detail=False, methods=["GET"])
-        async def custom(self):
+        async def custom(self, request):
             return {}
 
     @api.viewset("/vs2", include_in_schema=False)
     class KwViewSet(ViewSet):
-        async def list(self):
+        async def list(self, request):
             return []
 
     assert _paths(api) == {"/kw"}
