@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- **`Nested()` and the nested list item cap** - `Nested(max_items=...)`, `NestedConfig`, and the default cap of 1000 items on nested lists are gone, on input and on `from_model()` output. The type hint is the only nesting API: `author: AuthorSerializer` or `tags: list[TagSerializer]`. The request body size limit bounds input size.
+
 ### Performance
 
 - **`TCP_NODELAY` on every connection** - Bolt left Nagle's algorithm on. A response that Bolt writes in more than one segment waited for the delayed ACK of the client, about 40 ms per response. This hit every `StreamingResponse`, `EventSourceResponse`, and ASGI mount, `mount_django` included. On one keep-alive connection, an SSE route with three events went from 24 to 10,700 responses per second. A trivial ASGI mount went from 24 to 6,700. Single-write JSON responses did not change.

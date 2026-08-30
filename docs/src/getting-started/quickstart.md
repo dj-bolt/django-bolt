@@ -565,7 +565,7 @@ A few things to notice:
 
 - In async handlers, `await afrom_model()` is the safest default for response serializers. It keeps working if you later add related fields.
 - `from_model()` is still great when you're mapping already-loaded model data in sync code, or when you know your async response stays flat and fully loaded.
-- Plain `list[AstronautResponse]` is enough for nested response fields. You don't need `Nested(..., many=True)` just to express a list of child serializers.
+- Plain `list[AstronautResponse]` is enough for nested response fields. The type hint is the only nesting API.
 
 ## Response types
 

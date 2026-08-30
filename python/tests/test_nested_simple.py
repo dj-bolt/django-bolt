@@ -2,61 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
-
-import pytest
-
-from django_bolt.exceptions import RequestValidationError
-from django_bolt.serializers import Nested, Serializer
-
-
-def test_nested_import():
-    """Test that Nested can be imported."""
-    assert Nested is not None
-
-
-def test_nested_config_creation():
-    """Test creating Nested metadata for optional overrides."""
-    config = Nested()
-    assert config is not None
-    assert config.max_items == 1000
-
-
-def test_nested_with_max_items():
-    """Test Nested metadata with custom max_items."""
-    config = Nested(max_items=10)
-    assert config.max_items == 10
-
-
-def test_nested_rejects_removed_positional_api():
-    """Test that redundant positional Nested arguments are rejected."""
-
-    class TagSerializer(Serializer):
-        id: int
-        name: str
-
-    with pytest.raises(TypeError, match="type annotation"):
-        Nested(TagSerializer)  # type: ignore
-
-    with pytest.raises(TypeError, match="type annotation"):
-        Nested(many=True)  # type: ignore
-
-
-def test_nested_rejects_old_serializer_class_api_with_helpful_message():
-    """Test that the removed Nested(ChildSerializer) API gives migration guidance."""
-
-    class AuthorSerializer(Serializer):
-        id: int
-        username: str
-
-    with pytest.raises(TypeError) as exc_info:
-        Nested(AuthorSerializer)  # type: ignore[arg-type]
-
-    message = str(exc_info.value)
-    assert "no longer accepts serializer classes or many=" in message
-    assert "Nested fields are inferred from the type annotation." in message
-    assert "Use ChildSerializer or list[ChildSerializer]" in message
-    assert "Annotated[..., Nested(max_items=...)]" in message
+from django_bolt.serializers import Serializer
 
 
 def test_nested_annotation():
@@ -166,8 +112,8 @@ def test_nested_many_accepts_empty_list():
     assert book.tags == []
 
 
-def test_nested_many_custom_limit_metadata():
-    """Test that Annotated Nested metadata still provides max_items overrides."""
+def test_nested_many_has_no_default_limit():
+    """Nested lists have no built-in item cap."""
 
     class TagSerializer(Serializer):
         id: int
@@ -175,16 +121,10 @@ def test_nested_many_custom_limit_metadata():
 
     class BookSerializer(Serializer):
         title: str
-        tags: Annotated[list[TagSerializer], Nested(max_items=1)]
+        tags: list[TagSerializer]
 
-    with pytest.raises(RequestValidationError, match="Maximum allowed: 1"):
-        BookSerializer(
-            title="Test",
-            tags=[
-                {"id": 1, "name": "python"},
-                {"id": 2, "name": "django"},
-            ],
-        )
+    book = BookSerializer(title="Test", tags=[{"id": i, "name": f"t{i}"} for i in range(1001)])
+    assert len(book.tags) == 1001
 
 
 def test_list_of_ids_without_nested():

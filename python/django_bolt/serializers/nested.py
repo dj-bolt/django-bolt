@@ -4,23 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import UnionType
-from typing import TYPE_CHECKING, Annotated, Any, TypeVar, Union, cast, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, Union, cast, get_args, get_origin
 
 if TYPE_CHECKING:
     from .base import Serializer
-
-T = TypeVar("T", bound="Serializer")
-
-# Security: Maximum number of items allowed in nested many relationships
-# This prevents DoS attacks via extremely large nested object lists
-DEFAULT_MAX_NESTED_ITEMS = 1000
-
-
-@dataclass(frozen=True, slots=True)
-class NestedConfig:
-    """Optional metadata overrides for inferred nested serializer fields."""
-
-    max_items: int | None = DEFAULT_MAX_NESTED_ITEMS
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,31 +16,6 @@ class ResolvedNestedConfig:
 
     serializer_class: type[Serializer]
     many: bool
-    max_items: int | None
-
-
-def Nested(*args: Any, max_items: int | None = DEFAULT_MAX_NESTED_ITEMS, **kwargs: Any) -> NestedConfig:
-    """
-    Add optional nested-field metadata to an Annotated serializer type.
-
-    Nested fields are inferred from the type annotation itself:
-
-        author: AuthorSerializer
-        tags: list[TagSerializer]
-
-    Use Nested() only for extra nested options such as max_items:
-
-        tags: Annotated[list[TagSerializer], Nested(max_items=500)]
-    """
-    if args or kwargs:
-        raise TypeError(
-            "Nested() no longer accepts serializer classes or many=. "
-            "Nested fields are inferred from the type annotation. "
-            "Use ChildSerializer or list[ChildSerializer], and optionally "
-            "Annotated[..., Nested(max_items=...)] for extra limits."
-        )
-
-    return NestedConfig(max_items=max_items)
 
 
 def _is_serializer_type(field_type: Any) -> bool:
@@ -84,15 +46,13 @@ def _unwrap_nested_type(field_type: Any) -> Any:
 
 
 def resolve_nested_config(field_type: Any) -> ResolvedNestedConfig | None:
-    """Infer nested serializer behavior from a field type plus optional Nested() metadata."""
-    metadata = get_nested_config(field_type)
+    """Infer nested serializer behavior from a field type."""
     resolved_type = _unwrap_nested_type(field_type)
 
     if _is_serializer_type(resolved_type):
         return ResolvedNestedConfig(
             serializer_class=resolved_type,
             many=False,
-            max_items=None,
         )
 
     origin = get_origin(resolved_type)
@@ -104,7 +64,6 @@ def resolve_nested_config(field_type: Any) -> ResolvedNestedConfig | None:
                 return ResolvedNestedConfig(
                     serializer_class=item_type,
                     many=True,
-                    max_items=metadata.max_items if metadata is not None else DEFAULT_MAX_NESTED_ITEMS,
                 )
 
     return None
@@ -122,7 +81,7 @@ def validate_nested_field(
     serializer_class = nested_config.serializer_class
 
     if nested_config.many:
-        return _validate_many_nested(value, serializer_class, nested_config, field_name)
+        return _validate_many_nested(value, serializer_class, field_name)
     return _validate_single_nested(value, serializer_class, field_name)
 
 
@@ -151,20 +110,11 @@ def _validate_single_nested(
 def _validate_many_nested(
     value: Any,
     serializer_class: type[Serializer],
-    config: ResolvedNestedConfig,
     field_name: str,
 ) -> Any:
     """Validate a list of nested objects inferred from the field type."""
     if not isinstance(value, list):
         raise ValueError(f"{field_name}: Expected list for nested relationship, got {type(value).__name__}")
-
-    if config.max_items is not None and len(value) > config.max_items:
-        raise ValueError(
-            f"{field_name}: Too many items ({len(value)}). "
-            f"Maximum allowed: {config.max_items}. "
-            f"This limit prevents resource exhaustion attacks. "
-            f"If you need more items, increase max_items in Nested(max_items=...) metadata."
-        )
 
     result = []
     for idx, item in enumerate(value):
@@ -190,16 +140,3 @@ def _validate_many_nested(
 def is_nested_field(metadata: Any) -> bool:
     """Check if a field type resolves to a nested serializer field."""
     return resolve_nested_config(metadata) is not None
-
-
-def get_nested_config(metadata: Any) -> NestedConfig | None:
-    """Extract Nested() metadata from an Annotated type."""
-    if isinstance(metadata, NestedConfig):
-        return metadata
-
-    if hasattr(metadata, "__metadata__"):
-        for item in metadata.__metadata__:
-            if isinstance(item, NestedConfig):
-                return item
-
-    return None

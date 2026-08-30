@@ -8,7 +8,6 @@ from .base import Serializer, SerializerView
 from .decorators import computed_field, field_validator, model_validator
 from .fields import FieldConfig, field
 from .helpers import create_serializer, create_serializer_set
-from .nested import Nested
 
 # Re-export common types for convenience
 from .types import (
@@ -85,7 +84,6 @@ __all__ = [
     # Helpers
     "create_serializer",
     "create_serializer_set",
-    "Nested",
     # String lengths
     "Char50",
     "Char100",

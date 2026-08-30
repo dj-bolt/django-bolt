@@ -615,8 +615,7 @@ post = PostSerializer(id=1, title="Hello World", tags=tags)
 Nested fields are inferred directly from the type annotation:
 
 ```python
-from typing import Annotated
-from django_bolt.serializers import Serializer, Nested
+from django_bolt.serializers import Serializer
 
 class AuthorSerializer(Serializer):
     id: int
@@ -628,15 +627,6 @@ class BlogPostSerializer(Serializer):
     title: str
     author: AuthorSerializer
     tags: list[TagSerializer]
-```
-
-You only need `Nested(...)` when you want extra nested-field metadata, such as a custom list limit:
-
-```python
-class BlogPostSerializer(Serializer):
-    id: int
-    title: str
-    tags: Annotated[list[TagSerializer], Nested(max_items=200)]
 ```
 
 ## Django model integration
