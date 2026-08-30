@@ -24,7 +24,7 @@
     <a href="https://bolt.farhana.li/"><b>Documentation</b></a> ·
     <a href="#-quick-start"><b>Quick Start</b></a> ·
     <a href="#-features"><b>Features</b></a> ·
-    <a href="#-benchmarks"><b>Benchmarks</b></a> ·
+    <a href="https://bolt.farhana.li/benchmarks/"><b>Benchmarks</b></a> ·
     <a href="https://www.youtube.com/watch?v=Pukr-fT4MFY"><b>Video Tutorial</b></a> ·
     <a href="https://discord.gg/4xErptXK82"><b>Discord</b></a>
   </p>
@@ -269,41 +269,7 @@ Django middleware (sessions, messages, CSRF, your own) is supported too.
 
 All runtime settings and environment variables are listed in the [Settings reference](https://bolt.farhana.li/ref/settings/).
 
-## 📊 Benchmarks
-
-Measured with [bombardier](https://github.com/codesenberg/bombardier) on a single 12-core desktop (Ryzen 5 5600G), loopback, `C=100`, `N=100000`, **8 processes × 1 worker** (`runbolt --processes 8`). Absolute numbers are hardware-specific; run `just save-bench` to reproduce on your machine. Full results: [`python/benchmark/BENCHMARK.md`](python/benchmark/BENCHMARK.md).
-
-| Endpoint | Requests/sec | p99 latency |
-| --- | ---: | ---: |
-| Root JSON (`{"message": ...}`) | **~311,000** | 2.2 ms |
-| Path + query params (`/items/1?q=hello`) | **~264,000** | — |
-| PUT JSON body (`/items/1`) | **~257,000** | — |
-| JSON parse + validate (POST) | **~251,000** | — |
-| Form data (POST) | **~218,000** | — |
-| 10 KB JSON response | **~187,000** | 2.2 ms |
-| File upload (multipart) | **~178,000** | — |
-| JWT-authenticated (no DB) | **~160,000** | — |
-| Static 1 KB asset | **~159,000** | — |
-| ORM list, 10 rows (SQLite, async) | **~21,000–27,000** | — |
-
-**Server-Sent Events, 10,000 concurrent clients for 60 s:** 9,489 msg/s, 100% connections succeeded, ~236 MB RSS, 11.9% average CPU.
-
-### Against JavaScript runtimes
-
-The same JSON payloads served by Django-Bolt, [Elysia](https://elysiajs.com) (Bun), and [Hono](https://hono.dev) (Bun & Node), 8 processes each:
-
-| Payload | Django-Bolt | Elysia / Bun | Hono / Bun | Hono / Node |
-| --- | ---: | ---: | ---: | ---: |
-| 1 KB JSON | 251k | **264k** | 210k | 97k |
-| 10 KB JSON | **157k** | 124k | 111k | 79k |
-
-### Why so fast?
-
-- **Actix Web + Tokio** handle HTTP parsing and responses; **matchit** routes with zero-copy path matching.
-- **Auth, guards, CORS, rate limiting, compression** run in Rust — no GIL, no Python per-request overhead.
-- **msgspec** serialization is 5–10× faster than the standard library; response bodies cross to Rust zero-copy.
-- **Sync-dispatch bypass:** handlers that don't actually await are detected at registration and skip the async bridge entirely.
-- **Registration-time precomputation:** parameter extraction, dependency graphs, and middleware are compiled once, reused forever.
+Measured performance, conditions, and reproduction steps are on the [Benchmarks](https://bolt.farhana.li/benchmarks/) page.
 
 ## 🏗️ How it works
 

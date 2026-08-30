@@ -87,15 +87,26 @@ Reading: Elysia leads on tiny payloads at one process (1.2×) and ties Bolt at e
 
 ## Against Python frameworks
 
-The first benchmark committed to the repository (2025-09-20, same machine, `C=50`, `N=10000`, JSON hello-world, one process each, default settings) measured:
+A separate harness, [python-api-frameworks-benchmark](https://github.com/FarhanAliRaza/python-api-frameworks-benchmark),
+runs Django-Bolt, Litestar, and FastAPI against the same seven endpoints and the same PostgreSQL data (2026-08-30, same machine, Python 3.14, one process each).
+Each framework runs alone in a Docker container with a 750 MB memory limit and no CPU limit.
+bombardier runs on the host with `C=100` for 10 s per endpoint. Each framework starts twice;
+the table shows the median.
 
-| Framework | Req/s | Mean latency |
-| --- | ---: | ---: |
-| Django-Bolt (day-1 build) | 43,240 | 1.2 ms |
-| Robyn | 11,246 | 4.4 ms |
-| FastAPI + uvicorn | 3,813 | 13.1 ms |
+| Endpoint | What it exercises | Django-Bolt | Litestar + uvicorn | FastAPI + uvicorn |
+| --- | --- | ---: | ---: | ---: |
+| `/json-1k` | 1 KB JSON response | **43,541** | 15,477 | 7,517 |
+| `/json-10k` | 10 KB JSON response | **27,610** | 12,925 | 1,805 |
+| `/db` | 10 rows from PostgreSQL | **2,881** | 1,321 | 1,237 |
+| `/articles` | 20 articles + author + tags, paginated | **301** | 204 | 197 |
+| `/articles/1` | 1 article + author + tags + comments | **561** | 420 | 406 |
+| `/auth/me` | JWT cookie auth, load the user | **4,478** | 1,155 | 941 |
+| `/auth/articles` | JWT cookie auth + the paginated query | **285** | 173 | 175 |
 
-Django-Bolt's own number has since grown ~7× on the same machine (43k → 311k at 8 processes; 73k at one process), so treat this table as a **lower bound on the gap**. A fresh, multi-framework harness (FastAPI, Litestar, Django Ninja, Robyn, DRF — same payloads as `bench/js`) is planned; until it lands, the JavaScript comparison above is the most rigorous cross-runtime data the project publishes.
+Django-Bolt uses the Django ORM with psycopg 3 on a bounded thread pool. Litestar and FastAPI
+use SQLAlchemy with asyncpg. All three use the same pool size (8). Litestar and Django-Bolt
+serialize with msgspec; FastAPI serializes with Pydantic. The ORM rows compare two database
+stacks as well as two frameworks. Read them with that in mind.
 
 ## Reproduce
 
@@ -107,6 +118,16 @@ go install github.com/codesenberg/bombardier@latest
 just save-bench                    # full suite → python/benchmark/BENCHMARK.md
 just save-bench 127.0.0.1 8001 100 100000 8   # host port C N processes
 ```
+
+Cross-framework table (Docker, PostgreSQL, one process per framework):
+
+```bash
+git clone https://github.com/FarhanAliRaza/python-api-frameworks-benchmark.git && cd python-api-frameworks-benchmark
+./run_all.sh --docker --frameworks bolt litestar-uvicorn fastapi-uvicorn --restarts 2
+```
+
+The app code for each framework is in the repository root: `django_project/api.py` (Bolt),
+`litestar_app.py`, and `fastapi_app.py`.
 
 ## How to quote these numbers
 

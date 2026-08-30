@@ -41,7 +41,7 @@ site_url = "https://bolt.farhana.li/"
 #
 # Read more: https://zensical.org/docs/setup/basics/#copyright
 copyright = """
-Copyright &copy; 2025 Farhan Ali Raza
+Copyright &copy; 2026 Farhan Ali Raza
 """
 
 # Navigation structure following Django's progressive disclosure pattern:
