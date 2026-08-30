@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.11.0]
 
 ### Removed
 
@@ -23,6 +23,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`HTTPException(body=...)` for typed error responses** - Set `body` on the exception to send an error body as-is, with the status and headers of the exception. The return annotation of the handler stays the success type. Per-status bodies are no longer validated: the `response_model` dict documents the schema only. A tuple with a status code not in the dict is sent as-is in place of a 500. (#322)
+- **Access-log level follows the status** - The `django.server` access log writes 5xx at ERROR, 4xx at WARNING, and other responses at INFO, as `runserver` does. A logger set to WARNING still gets the error lines. (#322)
+- **`runbolt` runs the system checks and the migration check at startup** - Before it binds the port, `runbolt` runs the Django system checks and prints the unapplied-migration warning, as `runserver` does. A check error stops startup with a non-zero exit code. In dev mode each spawned worker runs the checks again on reload. A new `--skip-checks` flag skips the system checks. (#317)
 - **Layered `include_in_schema`** - The flag now works like Litestar. Set it on `BoltAPI(include_in_schema=False)` to hide every route of that API, on a mounted sub-API, on an `APIView`/`ViewSet` class attribute, in `@api.view(...)`/`@api.viewset(...)`, or on one route. The most specific layer wins. `None` inherits from the outer layer.
 - **Django Debug Toolbar guide** - `docs/src/topics/debug-toolbar.md` shows the setup. The toolbar works on Bolt routes through `django_middleware=[...]` and on mounted Django views. The example project has the setup and a mounted Django view at `/django/missions/`.
 
