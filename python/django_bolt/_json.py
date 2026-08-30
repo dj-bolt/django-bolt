@@ -35,6 +35,11 @@ T = TypeVar("T")
 # Default type encoders for non-JSON-native types
 # Maps type -> encoder function
 DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
+    # msgspec delegates str subclasses (for example Django's SafeString) to
+    # enc_hook. Call the base descriptor to guarantee an exact str --
+    # SafeString.__str__ returns itself. Ordinary strings stay on msgspec's
+    # native fast path and never reach this mapping.
+    str: str.__str__,
     # Enum members -> primitive value
     Enum: lambda v: v.value,
     # Paths
