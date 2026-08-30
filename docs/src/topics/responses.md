@@ -442,7 +442,7 @@ async def get_user(user_id: int) -> User:
 
 ### Per-status-code response schemas
 
-`response_model` also accepts a dict mapping status codes to types. This enables per-status-code validation and generates separate OpenAPI response entries for each code.
+`response_model` also accepts a dict mapping status codes to types. Each code gets its own OpenAPI response entry. Bolt encodes the body as-is and does not validate it.
 
 ```python
 import msgspec
@@ -465,8 +465,8 @@ async def get_item(item_id: int):
 **Tuple return** — Return `(status_code, data)` to select the schema by code:
 
 ```python
-return 200, {"id": 1, "name": "Alice"}   # validates against Item
-return 404, {"detail": "Not found"}       # validates against Error
+return 200, {"id": 1, "name": "Alice"}   # documented as Item
+return 404, {"detail": "Not found"}       # documented as Error
 ```
 
 **JSON() return** — `JSON(data, status_code=...)` also selects the schema:
@@ -480,7 +480,7 @@ return JSON({"detail": "Not found"}, status_code=404)
 ```python
 @api.get("/items", response_model={200: list[Item], 400: Error})
 async def list_items():
-    return [{"id": 1, "name": "Alice"}]  # validates against list[Item] at 200
+    return [{"id": 1, "name": "Alice"}]  # documented as list[Item] at 200
 ```
 
 **204 No Content** — Use `{204: None}` with `return (204, None)` for empty body responses:
@@ -494,12 +494,12 @@ async def delete_item(item_id: int):
     return 204, None
 ```
 
-**Ellipsis catch-all** — Use `...` as a key to match any unmapped status code:
+**Ellipsis catch-all** — Use `...` as a key to document any unmapped status code:
 
 ```python
 @api.get("/items/{item_id}", response_model={200: Item, ...: Error})
 async def get_item(item_id: int):
-    ...  # any non-200 status code validates against Error
+    ...  # any non-200 status code is documented as Error
 ```
 
 **Explicit status_code** — Override the auto-detected default status code:
@@ -510,7 +510,17 @@ async def create_item():
     return {"id": 1, "name": "New"}  # bare return uses 201 instead of auto-detected
 ```
 
-**Validation** — If the returned data doesn't match the schema for the status code, a 500 error is returned.
+**Typed error bodies** — Raise `HTTPException` with `body=` to send a typed body from anywhere. The handler return annotation stays the success type, so type checkers can check it:
+
+```python
+@api.post("/plans/{pk}/start", response_model={200: Plan, 400: Error})
+async def start_plan(request, pk: int) -> Plan:
+    if not healthy:
+        raise HTTPException(400, body=Error(detail="not healthy"))
+    return Plan(id=pk)
+```
+
+`body` replaces the default `{"detail": ...}` envelope. Bolt encodes it as-is and does not validate it. An unmapped status code is sent as-is too.
 
 ## Setting default status codes
 

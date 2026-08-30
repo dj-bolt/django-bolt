@@ -40,7 +40,7 @@ from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import default_django_user_loader, resolve_user_loader
 from .concurrency import run_in_orm_executor, sync_to_thread
 from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
-from .error_handlers import handle_exception
+from .error_handlers import handle_exception, http_exception_handler
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
 from .middleware import CompressionConfig
@@ -1581,11 +1581,16 @@ class BoltAPI:
                 resolved_metas: dict[int | type(...), dict] = {}
                 field_names_map = meta.get("response_field_names_map", {})
                 handler_default_status = meta["default_status_code"]
-                for code, resp_type in meta["response_map"].items():
+                # Per-status bodies are encoded as-is, never validated.
+                # The dict documents the schema only.
+                response_map = meta["response_map"]
+                if ... not in response_map:
+                    response_map = {**response_map, ...: Any}
+                for code, resp_type in response_map.items():
                     entry: dict = {
                         "response_type": resp_type,
                         "default_status_code": code if isinstance(code, int) else handler_default_status,
-                        "validate_response": route_validate_response,
+                        "validate_response": False,
                         "_stream_info": _extract_stream_item_type(resp_type),
                     }
                     if code in field_names_map:
@@ -1771,14 +1776,10 @@ class BoltAPI:
             default_status = meta["default_status_code"]
             default_entry = resolved_metas.get(default_status) or next(iter(resolved_metas.values()))
 
+            catch_all_entry = resolved_metas[...]
+
             def _lookup(code: int) -> dict:
-                entry = resolved_metas.get(code)
-                if entry is None:
-                    entry = resolved_metas.get(...)  # ellipsis catch-all
-                if entry is None:
-                    defined = sorted(c for c in resolved_metas if c is not ...)
-                    raise TypeError(f"Status {code} has no response schema. Defined: {defined}")
-                return entry
+                return resolved_metas.get(code, catch_all_entry)
 
             async def _dispatch_multi_async(result: Any) -> ResponseWireV1:
                 # Tuple (status, data): the primary multi-response return pattern.
@@ -1797,9 +1798,8 @@ class BoltAPI:
 
                 # JSON() with explicit status: pick schema by its status_code.
                 if isinstance(result, _JSONResponse):
-                    entry = resolved_metas.get(result.status_code) or resolved_metas.get(...)
-                    if entry is not None:
-                        return await entry["_response_type_handler"](result)
+                    entry = _lookup(result.status_code)
+                    return await entry["_response_type_handler"](result)
 
                 # Bare dict/list or any other type: use the default status schema.
                 return await serialize_response(result, default_entry)
@@ -1820,9 +1820,8 @@ class BoltAPI:
 
                 # JSON() with explicit status: pick schema by its status_code.
                 if isinstance(result, _JSONResponse):
-                    entry = resolved_metas.get(result.status_code) or resolved_metas.get(...)
-                    if entry is not None:
-                        return entry["_response_type_handler_sync"](result)
+                    entry = _lookup(result.status_code)
+                    return entry["_response_type_handler_sync"](result)
 
                 return serialize_response_sync(result, default_entry)
 
@@ -2480,17 +2479,7 @@ class BoltAPI:
 
     def _handle_http_exception(self, he: HTTPException) -> Response:
         """Handle HTTPException and return response."""
-        try:
-            body = _json.encode({"detail": he.detail})
-            headers = [("content-type", "application/json")]
-        except Exception:
-            body = str(he.detail).encode()
-            headers = [("content-type", "text/plain; charset=utf-8")]
-
-        if he.headers:
-            headers.extend([(k.lower(), v) for k, v in he.headers.items()])
-
-        return _wire_from_error_parts(int(he.status_code), headers, body)
+        return _wire_from_error_parts(*http_exception_handler(he))
 
     def _handle_generic_exception(self, e: Exception, request: dict[str, Any] = None) -> Response:
         """Handle generic exception using error_handlers module."""

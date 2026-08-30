@@ -48,6 +48,8 @@ class HTTPException(BoltException):
     """Headers to attach to the response."""
     extra: dict[str, Any] | list[Any] | None = None
     """Additional data to include in the response."""
+    body: Any = None
+    """Typed response body. When set, it replaces the ``detail`` envelope."""
 
     def __init__(
         self,
@@ -55,6 +57,8 @@ class HTTPException(BoltException):
         detail: Any | None = None,
         headers: dict[str, str] | None = None,
         extra: dict[str, Any] | list[Any] | None = None,
+        *,
+        body: Any = None,
     ):
         """Initialize HTTPException.
 
@@ -63,6 +67,8 @@ class HTTPException(BoltException):
             detail: Exception details or message
             headers: HTTP headers to include in response
             extra: Additional data to include in response
+            body: Typed body (for example a msgspec Struct). Encoded as-is,
+                not validated. Declare its schema with ``response_model={code: Type}``.
         """
         # Handle detail
         if detail is None:
@@ -75,6 +81,7 @@ class HTTPException(BoltException):
         self.detail = detail_str if detail_str else HTTPStatus(self.status_code).phrase
         self.headers = headers or {}
         self.extra = extra
+        self.body = body
 
         # Update args for better error messages
         self.args = (f"{self.status_code}: {self.detail}",)
