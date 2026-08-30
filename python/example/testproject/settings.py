@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -23,6 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = "django-insecure-8l7jd)6zngu@-^(&lt=q3smdfx4rcuu9tp3&6&y)ovqm%y=20t"
 
 # SECURITY WARNING: don't run with debug turned on in production!
+# DEBUG is on by default and turns on the debug toolbar. `DJANGO_DEBUG=0` turns it off.
 DEBUG = False
 
 ALLOWED_HOSTS = ["*"]
@@ -49,11 +51,16 @@ INSTALLED_APPS = [
     "bolt_mcp.oauth",
 ]
 
+# Django Debug Toolbar. See docs/src/topics/debug-toolbar.md.
+if DEBUG:
+    INSTALLED_APPS.append("debug_toolbar")
+
 # Optional local-only app (gitignored): bulk payloads and scratch endpoints.
 if (BASE_DIR / "local").is_dir():
     INSTALLED_APPS.append("local")
 
 MIDDLEWARE = [
+    *(["debug_toolbar.middleware.DebugToolbarMiddleware"] if DEBUG else []),
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -259,3 +266,6 @@ BOLT_MAX_UPLOAD_SIZE = 30 * 1024 * 1024  # 10 mb
 # BOLT_DEFAULT_PERMISSION_CLASSES = [
 #     IsAuthenticated(),
 # ]
+
+# Django Debug Toolbar shows only for these client addresses.
+INTERNAL_IPS = ["127.0.0.1"]

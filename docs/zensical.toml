@@ -87,6 +87,7 @@ nav = [
     { "MCP Server (bolt-mcp)" = "topics/mcp.md" },
     { "OpenAPI" = "topics/openapi.md" },
     { "ASGI Mounts" = "topics/asgi-mounts.md" },
+    { "Django Debug Toolbar" = "topics/debug-toolbar.md" },
 
   ]},
   { "Reference" = [

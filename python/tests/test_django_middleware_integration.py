@@ -1753,3 +1753,37 @@ class TestAuserSetter:
             data = response.json()
             assert data["status"] == "ok"
             assert data["logged_out"] is True
+
+
+# =============================================================================
+# Test META is the Rust-built request.meta (REMOTE_ADDR, SERVER_NAME)
+# =============================================================================
+
+
+class RemoteAddrMiddleware:
+    """Reads the keys that django-debug-toolbar, django-axes and django-ratelimit read."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response["X-Remote-Addr"] = request.META["REMOTE_ADDR"]
+        response["X-Server-Name"] = request.META["SERVER_NAME"]
+        return response
+
+
+class TestDjangoMiddlewareMeta:
+    def test_middleware_and_handler_see_remote_addr(self):
+        api = BoltAPI(middleware=[DjangoMiddlewareStack([RemoteAddrMiddleware])])
+
+        @api.get("/meta")
+        async def meta_route(request):
+            return {"remote_addr": request.META["REMOTE_ADDR"]}
+
+        with TestClient(api) as client:
+            response = client.get("/meta", headers={"host": "example.com:8443"})
+            assert response.status_code == 200
+            assert response.headers["X-Remote-Addr"] == "127.0.0.1"
+            assert response.headers["X-Server-Name"] == "example.com"
+            assert response.json() == {"remote_addr": "127.0.0.1"}

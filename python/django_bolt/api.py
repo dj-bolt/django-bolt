@@ -364,7 +364,7 @@ class BoltAPI:
             django_middleware: Django middleware configuration. Can be:
                 - True: Use all middleware from settings.MIDDLEWARE (excluding CSRF, etc.)
                 - False/None: Don't use Django middleware
-                - List[str]: Use only these specific Django middleware
+                - List[str]: Load exactly these dotted paths, in this order
                 - Dict with "include"/"exclude" keys for fine control
             enable_logging: Enable request/response logging
             logging_config: Custom logging configuration
