@@ -119,6 +119,10 @@ That means Bolt-level middleware features (for example rate limits, Bolt auth gu
 - `BOLT_MAX_UPLOAD_SIZE` also applies to ASGI mount request bodies. Oversized bodies return `413 Payload Too Large`.
 - Request-body buffering for mounts currently has no dedicated read timeout before handoff to the mounted ASGI app. Enforce slow-client/read timeouts at your reverse proxy or ingress.
 
+## Client disconnects
+
+Bolt sends `http.disconnect` to `receive()` when the client goes away. This works before headers and mid-body. After that, `send()` is a no-op. The mounted app does not get an error for a client that is gone. A second `http.response.start` for a live client still raises. Django's `ASGIHandler` uses this signal to cancel the view.
+
 ## Testing
 
 `TestClient` and `AsyncTestClient` use the same mount conflict validation and mount dispatch behavior as production startup.
