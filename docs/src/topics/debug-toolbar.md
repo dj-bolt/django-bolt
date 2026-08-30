@@ -137,3 +137,12 @@ Each API response also has two headers you can read in the browser's network tab
 | Bolt route that returns JSON | `djdt-request-id` and `Server-Timing` headers. Open any page with the toolbar and use the History panel. |
 | Mounted Django HTML view | Toolbar is in the page. |
 | Streaming or compressed response | No toolbar. The toolbar only edits a complete, uncompressed `text/html` body. |
+
+## Example project
+
+`python/example` has this setup. `DEBUG` is on by default there.
+
+```bash
+cd python/example
+python manage.py runbolt --dev --host 127.0.0.1 --port 8001
+```
