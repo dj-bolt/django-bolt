@@ -7,6 +7,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
@@ -27,6 +28,47 @@ struct AsgiSendState {
     body_tx: Mutex<Option<mpsc::Sender<Bytes>>>,
     /// Exception message from the ASGI coroutine, set by `AsgiDoneCallback`.
     exception_msg: Mutex<Option<String>>,
+    /// Set when the response is over for Bolt: the coroutine finished, the
+    /// header timeout fired, or the client went away. After this, `send` is a
+    /// no-op (a task that outlives the request must not raise) and `receive`
+    /// returns `http.disconnect`.
+    closed: AtomicBool,
+    /// Wakes a parked `receive()` when `closed` flips.
+    response_done: Notify,
+}
+
+impl AsgiSendState {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.response_done.notify_waiters();
+    }
+}
+
+/// Dropped by Actix when the client goes away: before headers (the handler
+/// future is dropped) or mid-body (the body stream is dropped). Also dropped
+/// after a complete response, which is a no-op because `body_tx` is gone.
+struct ClientGoneGuard {
+    state: Arc<AsgiSendState>,
+    /// `false` when Bolt itself ends the response early (HEAD), so the drop
+    /// does not report a disconnect to an app that still has to send its body.
+    armed: bool,
+}
+
+impl Drop for ClientGoneGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let in_flight = self
+            .state
+            .body_tx
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+        if in_flight {
+            self.state.close();
+        }
+    }
 }
 
 const ASGI_MOUNT_BODY_CHANNEL_CAPACITY: usize = 32;
@@ -34,14 +76,14 @@ const ASGI_MOUNT_BODY_CHANNEL_CAPACITY: usize = 32;
 #[pyclass]
 struct AsgiReceive {
     body: Arc<AsyncMutex<Option<Vec<u8>>>>,
-    response_done: Arc<Notify>,
+    state: Arc<AsgiSendState>,
 }
 
 #[pymethods]
 impl AsgiReceive {
     fn __call__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let body = self.body.clone();
-        let response_done = self.response_done.clone();
+        let state = self.state.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut body_guard = body.lock().await;
@@ -56,7 +98,14 @@ impl AsgiReceive {
             }
             drop(body_guard);
 
-            response_done.notified().await;
+            // Register the waiter before reading the flag, so a `close()` that
+            // lands between the two cannot be missed.
+            let notified = state.response_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !state.closed.load(Ordering::Acquire) {
+                notified.await;
+            }
             Python::attach(|py| {
                 let message = PyDict::new(py);
                 message.set_item("type", "http.disconnect")?;
@@ -82,6 +131,10 @@ impl AsgiSend {
             .get_item("type")?
             .ok_or_else(|| PyValueError::new_err("Missing ASGI message type"))?
             .extract()?;
+
+        if self.state.closed.load(Ordering::Acquire) {
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(()) });
+        }
 
         match msg_type.as_str() {
             "http.response.start" => {
@@ -168,7 +221,6 @@ impl AsgiSend {
 #[pyclass]
 struct AsgiDoneCallback {
     state: Arc<AsgiSendState>,
-    response_done: Arc<Notify>,
 }
 
 #[pymethods]
@@ -207,7 +259,7 @@ impl AsgiDoneCallback {
             guard.take();
         }
 
-        self.response_done.notify_waiters();
+        self.state.close();
     }
 }
 
@@ -426,13 +478,18 @@ pub async fn handle_asgi_mount_request(
     // dispatching through spawn_blocking.
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(ASGI_MOUNT_BODY_CHANNEL_CAPACITY);
     let (start_tx, start_rx) = oneshot::channel::<AsgiResponseStart>();
-    let response_done = Arc::new(Notify::new());
 
     let send_state = Arc::new(AsgiSendState {
         response_start_tx: Mutex::new(Some(start_tx)),
         body_tx: Mutex::new(Some(body_tx)),
         exception_msg: Mutex::new(None),
+        closed: AtomicBool::new(false),
+        response_done: Notify::new(),
     });
+    let mut client_gone = ClientGoneGuard {
+        state: send_state.clone(),
+        armed: true,
+    };
 
     let py_future: Py<PyAny> = match Python::attach(|py| -> PyResult<Py<PyAny>> {
         let scope = build_scope(py, &req, mount)?;
@@ -440,7 +497,7 @@ pub async fn handle_asgi_mount_request(
             py,
             AsgiReceive {
                 body: Arc::new(AsyncMutex::new(Some(request_body))),
-                response_done: response_done.clone(),
+                state: send_state.clone(),
             },
         )?;
         let send_obj = Py::new(
@@ -456,7 +513,6 @@ pub async fn handle_asgi_mount_request(
             py,
             AsgiDoneCallback {
                 state: send_state.clone(),
-                response_done: response_done.clone(),
             },
         )?;
         py_future
@@ -494,10 +550,10 @@ pub async fn handle_asgi_mount_request(
             }
         }
         _ = tokio::time::sleep(asgi_mount_timeout) => {
+            send_state.close();
             Python::attach(|py| {
                 let _ = py_future.call_method0(py, "cancel");
             });
-            response_done.notify_waiters();
             return HttpResponse::GatewayTimeout()
                 .content_type("text/plain; charset=utf-8")
                 .body(format!(
@@ -552,13 +608,17 @@ pub async fn handle_asgi_mount_request(
     }
 
     if req.method() == Method::HEAD {
+        // The body channel stays open; the app's body messages are dropped.
+        client_gone.armed = false;
         return builder.body(Vec::<u8>::new());
     }
 
-    let body_stream = stream::unfold(body_rx, |mut rx| async move {
+    // The guard rides along with the stream: Actix drops it when the client
+    // disconnects mid-body, which flips `closed` and wakes `receive()`.
+    let body_stream = stream::unfold((body_rx, client_gone), |(mut rx, guard)| async move {
         rx.recv()
             .await
-            .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), rx))
+            .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), (rx, guard)))
     });
     builder.streaming(body_stream)
 }
