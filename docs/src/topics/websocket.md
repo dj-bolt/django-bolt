@@ -187,8 +187,8 @@ async def protected(websocket: WebSocket):
     await websocket.send_text("Welcome")
 ```
 
-The handshake reads the token from the request headers. Send it in the
-`Authorization` header:
+The handshake reads the token from the request headers. Send the token in
+the `Authorization` header:
 
 ```python
 import websockets
@@ -220,9 +220,10 @@ async def protected(websocket: WebSocket):
 const ws = new WebSocket("ws://localhost:8000/ws/protected");
 ```
 
-A query parameter does not authenticate the handshake. `auth=[...]` reads the
-headers only. To use a token from the URL, validate it in the handler and close
-the connection yourself — see [Query parameters](#query-parameters).
+A query parameter does not authenticate the handshake. `auth=[...]` reads only
+the headers. To use a token from the URL, validate the token in the handler.
+Close the connection if the token is not valid. See
+[Query parameters](#query-parameters).
 
 ## WebSocket state
 
