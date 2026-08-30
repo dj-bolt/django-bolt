@@ -23,7 +23,7 @@ Short, direct answers. Each answer links to the page with the full detail.
 | Third-party Django apps | ✅ Full | Anything that plugs into Django's ORM, admin, or middleware works. |
 | Templates / server-rendered views | ✅ | Existing Django URLconf views run through the ASGI mount alongside API routes. [ASGI mounts](topics/asgi-mounts.md) |
 
-The performance comes from *where* work runs (routing, auth, guards, CORS, rate limiting, compression in Rust without the GIL) — not from removing features. The [example project](https://github.com/dj-bolt/django-bolt/tree/master/python/example) used for the published benchmarks runs the full Django middleware stack, the admin, sessions, and CSRF.
+The performance comes from *where* work runs (routing, auth, guards, CORS, rate limiting, compression in Rust without the GIL) — not from removing features. Django middleware is opt-in per API (`BoltAPI(django_middleware=True)`); the [example project](https://github.com/dj-bolt/django-bolt/tree/master/python/example) used for the published benchmarks runs the admin and sessions but not `settings.MIDDLEWARE` on Bolt routes.
 
 ## Does Django-Bolt use WSGI? Is it synchronous?
 
