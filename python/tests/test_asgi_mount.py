@@ -3,7 +3,6 @@
 import asyncio
 import json
 import threading
-import time
 
 import pytest
 from django.core.management.base import CommandError
@@ -462,8 +461,8 @@ def test_mount_asgi_exception_surfaces_in_response(exc_class, exc_msg, expected_
 def test_mount_asgi_send_after_timeout_is_a_noop(settings):
     """Regression for #313.
 
-    After Bolt times out and cancels the app, a task that outlives the
-    cancellation (Django <= 6.0 orphans ``process_request`` this way) must be
+    Bolt times out and cancels the app. A task can outlive the cancellation
+    (Django <= 6.0 orphans ``process_request`` this way). That task must be
     able to call ``send`` without ``http.response.start sent more than once``.
     """
     settings.BOLT_ASGI_MOUNT_TIMEOUT = 0.05
@@ -521,6 +520,7 @@ def test_mount_asgi_duplicate_response_start_still_raises():
 def test_mount_asgi_head_request_does_not_fake_a_disconnect():
     api = BoltAPI()
     seen: list[str] = []
+    done = threading.Event()
 
     async def app(scope, receive, send):
         await receive()
@@ -530,6 +530,7 @@ def test_mount_asgi_head_request_does_not_fake_a_disconnect():
             seen.append(message["type"])
         except TimeoutError:
             seen.append("no-disconnect")
+        done.set()
         await send({"type": "http.response.body", "body": b"body", "more_body": False})
 
     api.mount_asgi("/h", app)
@@ -537,6 +538,6 @@ def test_mount_asgi_head_request_does_not_fake_a_disconnect():
     with TestClient(api) as client:
         response = client.head("/h")
         assert response.status_code == 200
-        time.sleep(0.3)
+        assert done.wait(timeout=2)
 
     assert seen == ["no-disconnect"]

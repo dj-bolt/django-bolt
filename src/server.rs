@@ -909,7 +909,9 @@ pub fn start_server(
                     // the Nagle + delayed-ACK 40 ms stall without TCP_NODELAY.
                     .on_connect(|conn, _ext| {
                         if let Some(stream) = conn.downcast_ref::<actix_web::rt::net::TcpStream>() {
-                            let _ = stream.set_nodelay(true);
+                            if let Err(err) = stream.set_nodelay(true) {
+                                eprintln!("[django-bolt] Failed to set TCP_NODELAY on connection: {err}");
+                            }
                         }
                     })
                     // A read-side EOF while a handler runs is a client that
