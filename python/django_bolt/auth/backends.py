@@ -242,6 +242,8 @@ class JWTAuthentication(BaseAuthentication):
                 )
         if leeway < 0:
             raise ImproperlyConfigured("JWTAuthentication leeway must be >= 0 seconds.")
+        if secret == "":
+            raise ImproperlyConfigured("JWTAuthentication secret must not be empty.")
         self._secret = secret
         self.public_key = public_key
         self.algorithms = ["HS256"] if algorithms is None else algorithms
