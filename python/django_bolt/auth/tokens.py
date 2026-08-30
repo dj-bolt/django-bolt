@@ -136,7 +136,9 @@ def create_token_pair(
     if method is not None:
         base["amr"] = [method] if not isinstance(method, list) else method
 
-    access_claims = {**base, "typ": "access", "exp": now + access_ttl}
+    # Both tokens get a jti. A revocation store sets ``require_jti`` on the
+    # backend, and it rejects access tokens without one (issue #304).
+    access_claims = {**base, "typ": "access", "exp": now + access_ttl, "jti": str(uuid.uuid4())}
     refresh_claims = {
         **base,
         "typ": "refresh",
@@ -318,6 +320,7 @@ async def rotate_refresh_token(
             "iat": now,
             "exp": now + effective_access_ttl,
             "typ": "access",
+            "jti": str(uuid.uuid4()),
             "ver": version,
         }
         if parsed_oat is not None:
