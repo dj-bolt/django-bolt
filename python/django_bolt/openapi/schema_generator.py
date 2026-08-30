@@ -23,6 +23,7 @@ from ..responses import (
 )
 from ..serializers.fields import _FieldMarker
 from ..typing import is_msgspec_struct, is_optional, unwrap_optional
+from ..views import _layer
 from .spec import (
     Example,
     OpenAPI,
@@ -522,7 +523,7 @@ class SchemaGenerator:
 
             # Get handler metadata
             meta = self.api._handler_meta.get(handler_id, {})
-            if not meta.get("include_in_schema", True):
+            if _layer(meta.get("include_in_schema"), self.api.include_in_schema) is False:
                 continue
 
             if path not in paths:
@@ -1254,231 +1255,69 @@ class SchemaGenerator:
         return list(tag_objects.values()) if tag_objects else None
 
     def _type_to_schema(self, type_annotation: Any, register_component: bool = False) -> Schema | Reference:
-        """Convert Python type annotation to OpenAPI Schema.
+        """Convert a Python type annotation or msgspec.inspect node to an OpenAPI Schema.
 
         Args:
-            type_annotation: Python type annotation.
+            type_annotation: Python type annotation or ``msgspec.inspect`` node.
             register_component: Whether to register complex types as components.
 
         Returns:
             Schema or Reference object.
         """
-        # Handle None/empty
         if type_annotation is None or type_annotation == inspect._empty:
             return Schema(type="object")
 
-        # Handle msgspec type info objects (IntType, StrType, BoolType, etc.)
-        type_name = type(type_annotation).__name__
+        # msgspec.inspect nodes (Metadata, IntType, StructType, ...) dispatch by
+        # class name; nodes without a handler (AnyType, NoneType, RawType, ...)
+        # are a generic object. Everything else is a ``typing`` annotation.
+        node_cls = type(type_annotation)
+        if node_cls.__module__ == "msgspec.inspect":
+            node_handler = _MSGSPEC_NODE_HANDLERS.get(node_cls.__name__)
+            if node_handler is None:
+                return Schema(type="object")
+            return node_handler(self, type_annotation, register_component)
+        return self._typing_to_schema(type_annotation, register_component)
 
-        # msgspec.inspect wraps an ``Annotated[T, Meta(...)]`` whose Meta carries
-        # informational fields (title/description/examples or an explicit
-        # extra_json_schema) in a ``Metadata`` node: ``.type`` is the underlying
-        # ``*Type`` (StrType/IntType/…) carrying the constraints, and
-        # ``.extra_json_schema`` holds the informational fields. A Meta with
-        # *only* constraints stays a bare ``*Type`` (handled below), but every
-        # documented custom type — Email, PositiveInt, HttpsURL, … i.e. all of
-        # ``serializers.types`` — gets this wrapper. Without unwrapping it here,
-        # those fields fall through every branch to the generic ``object``
-        # fallback and codegen tools (typescript-fetch, openapi-typescript)
-        # emit ``object`` instead of string/integer. (#235)
-        if type_name == "Metadata":
-            base = self._type_to_schema(type_annotation.type, register_component=register_component)
-            extra = getattr(type_annotation, "extra_json_schema", None)
-            # Constraints already live on ``base`` (from the wrapped *Type); only
-            # the docs need merging, and only onto an inline Schema — a $ref to a
-            # component (Struct) carries its own description and can't take siblings.
-            if extra and isinstance(base, Schema):
-                self._apply_json_schema_extra(base, extra)
-            return base
-
-        if hasattr(type_annotation, "__class__") and type_name.endswith("Type"):
-            # Numeric types with constraint support (ge/gt/le/lt/multiple_of)
-            if type_name == "IntType":
-                return self._numeric_type_schema(type_annotation, "integer")
-            if type_name == "FloatType":
-                return self._numeric_type_schema(type_annotation, "number")
-            # String type with constraint support (min_length/max_length/pattern)
-            if type_name == "StrType":
-                return Schema(
-                    **self._schema_kwargs(
-                        type="string",
-                        min_length=type_annotation.min_length,
-                        max_length=type_annotation.max_length,
-                        pattern=type_annotation.pattern,
-                    )
-                )
-            # Types without constraints — static map
-            msgspec_type_map = {
-                "BoolType": Schema(type="boolean"),
-                "BytesType": Schema(type="string", format="binary"),
-                "DateTimeType": Schema(type="string", format="date-time"),
-                "DateType": Schema(type="string", format="date"),
-                "TimeType": Schema(type="string", format="time"),
-                "UUIDType": Schema(type="string", format="uuid"),
-            }
-            if type_name in msgspec_type_map:
-                return msgspec_type_map[type_name]
-            # For list/array types from msgspec
-            if type_name == "StructType":
-                # Nested struct from msgspec.inspect — always register as a
-                # component so self-referential types emit a $ref instead of
-                # recursing infinitely.  The sentinel in
-                # _struct_to_component_schema guards against re-entry.
-                return self._struct_to_component_schema(type_annotation.cls)
-            if type_name == "UnionType" and hasattr(type_annotation, "types"):
-                # msgspec.inspect UnionType — the .types attr distinguishes
-                # this from Python's built-in types.UnionType (which uses
-                # .__args__ instead).
-                #
-                # String comparison: msgspec.inspect.NoneType is not the
-                # same object as builtins.NoneType.
-                types = list(type_annotation.types)
-                non_none_types = [t for t in types if type(t).__name__ != "NoneType"]
-                has_none = len(non_none_types) != len(types)
-
-                if not non_none_types:
-                    # `None`-only union (rare; e.g. Optional[NoneType])
-                    return Schema(type="null") if has_none else Schema(type="object")
-
-                inner_schemas = [self._type_to_schema(t, register_component=register_component) for t in non_none_types]
-                return self._union_schema(
-                    inner_schemas,
-                    has_none=has_none,
-                    tagged=_is_tagged_struct_union(non_none_types),
-                )
-            if type_name == "ListType":
-                item_type = getattr(type_annotation, "item_type", None)
-                if item_type:
-                    item_schema = self._type_to_schema(item_type, register_component=register_component)
-                    return Schema(type="array", items=item_schema)
-                return Schema(type="array", items=Schema(type="object"))
-            # For dict types from msgspec — recurse into the *value* type via
-            # _mapping_schema. An untyped value (bare dict / dict[str, Any],
-            # which msgspec models as AnyType) stays additionalProperties: true.
-            if type_name == "DictType":
-                value_type = getattr(type_annotation, "value_type", None)
-                typed = value_type is not None and type(value_type).__name__ != "AnyType"
-                return self._mapping_schema(
-                    self._type_to_schema(value_type, register_component=register_component) if typed else None
-                )
-            # For enum types from msgspec (EnumType for plain enums,
-            # CustomType for Django TextChoices/IntegerChoices which use
-            # a metaclass that msgspec doesn't recognise as a standard enum)
-            if (
-                type_name in ("EnumType", "CustomType")
-                and hasattr(type_annotation, "cls")
-                and issubclass(type_annotation.cls, enum.Enum)
-            ):
-                # Named enum classes (enum.Enum / msgspec EnumType / Django
-                # TextChoices/IntegerChoices) are promoted to named components +
-                # $ref in component contexts (request/response bodies), parallel
-                # to how Structs are registered — so consumers get a reusable
-                # type and the enum's docstring survives as `description`. In
-                # inline contexts (query params) they stay inline. Anonymous
-                # `Literal[...]` unions (LiteralType, below) always stay inline.
-                return self._enum_schema(type_annotation.cls, register_component=register_component)
-            # msgspec.inspect.type_info represents Literal fields on Structs as
-            # LiteralType, so keep this branch alongside the bare typing.Literal
-            # branch below.
-            if type_name == "LiteralType":
-                return self._enum_values_schema(type_annotation.values)
-
-        # Unwrap Optional
-        origin = get_origin(type_annotation)
-        args = get_args(type_annotation)
-
-        if origin is Annotated:
-            # A documented custom type (e.g. ``Email = Annotated[str, Meta(...)]``)
-            # used directly as a response model — bare (``-> Email``) or nested
-            # (``-> list[Email]``) — reaches here as a raw typing.Annotated still
-            # carrying its msgspec Meta. Normalize it through msgspec.inspect so it
-            # renders identically to the same type used as a Struct field (the
-            # Metadata branch above then applies constraints + docs). Param markers
-            # like Query()/Header() are not msgspec.Meta, so ``Annotated[T, Query()]``
-            # still falls through to the plain unwrap below. (#235)
+    def _typing_to_schema(self, type_annotation: Any, register_component: bool) -> Schema | Reference:
+        """Convert a raw ``typing`` annotation (not a msgspec.inspect node)."""
+        # A documented custom type (e.g. ``Email = Annotated[str, Meta(...)]``)
+        # used directly as a response model — bare or nested (``list[Email]``) —
+        # still carries its msgspec Meta. Normalize it through msgspec.inspect so
+        # it renders identically to the same type used as a Struct field. Param
+        # markers like Query() are not msgspec.Meta, so ``Annotated[T, Query()]``
+        # unwraps to ``T`` below. (#235)
+        if get_origin(type_annotation) is Annotated:
+            args = get_args(type_annotation)
             if any(isinstance(m, msgspec.Meta) for m in args[1:]):
                 return self._type_to_schema(
-                    msgspec.inspect.type_info(type_annotation),
-                    register_component=register_component,
+                    msgspec.inspect.type_info(type_annotation), register_component=register_component
                 )
-            # Unwrap Annotated[T, ...]
             type_annotation = args[0]
-            origin = get_origin(type_annotation)
-            args = get_args(type_annotation)
 
-        # Handle Optional[T] -> T (single non-None arg only; multi-arm unions
-        # like `A | B | None` fall through to the Union branch below so every
-        # arm is preserved).
+        # Optional[T] -> T (single non-None arg only; multi-arm unions like
+        # ``A | B | None`` go to _union_schema so every arm is preserved).
         if is_optional(type_annotation):
-            non_none_args = [arg for arg in args if arg is not type(None)]
+            non_none_args = [arg for arg in get_args(type_annotation) if arg is not type(None)]
             if len(non_none_args) == 1:
                 type_annotation = non_none_args[0]
-                origin = get_origin(type_annotation)
-                args = get_args(type_annotation)
 
-        # Handle UploadFile — list[UploadFile] flows through the list branch
-        # below and recurses back into this check for the item type.
+        origin_handler = _TYPING_ORIGIN_HANDLERS.get(get_origin(type_annotation))
+        if origin_handler is not None:
+            return origin_handler(self, get_args(type_annotation), register_component)
+
         if type_annotation is UploadFile:
             return Schema(type="string", format="binary")
-
-        # Handle msgspec.Struct — bare or parametrized (``Page[UserRead]``, keyed
-        # and named per parametrization like msgspec: ``Page_UserRead_``).
+        # Bare or parametrized Struct (``Page[UserRead]`` is keyed per parametrization).
         if _struct_origin(type_annotation) is not None:
             if register_component:
                 return self._struct_to_component_schema(type_annotation)
-            else:
-                return self._struct_to_schema(type_annotation)
-
-        # Handle bare enum classes (e.g. ``-> GateReason`` or ``list[GateReason]``).
-        # A named enum used as a Struct *field* reaches the msgspec.inspect
-        # EnumType/CustomType branch above; used directly as a (nested) response
-        # model it arrives here as a raw enum class via the typing path. Same
-        # promote-or-inline policy as the field path, via _enum_schema. (#246)
+            return self._struct_to_schema(type_annotation)
+        # Bare enum classes (``-> GateReason``): same promote-or-inline policy
+        # as the msgspec EnumType path. (#246)
         if isinstance(type_annotation, type) and issubclass(type_annotation, enum.Enum):
             return self._enum_schema(type_annotation, register_component=register_component)
-
-        if origin is Union or origin is UnionType:
-            non_none_args = [arg for arg in args if arg is not type(None)]
-            has_none = len(non_none_args) != len(args)
-            inner = [self._type_to_schema(arg, register_component=register_component) for arg in non_none_args]
-            return self._union_schema(inner, has_none=has_none, tagged=_is_tagged_struct_union(non_none_args))
-
-        # Handle list
-        if origin is list:
-            item_type = args[0] if args else Any
-            item_schema = self._type_to_schema(item_type, register_component=register_component)
-            return Schema(type="array", items=item_schema)
-
-        # Handle dict — recurse into the value type V of dict[K, V] via
-        # _mapping_schema. Bare dict[K] without a value type or dict[str, Any]
-        # stays additionalProperties: true (no value type to describe).
-        if origin is dict:
-            value_type = args[1] if len(args) == 2 else None
-            typed = value_type is not None and value_type is not Any
-            return self._mapping_schema(
-                self._type_to_schema(value_type, register_component=register_component) if typed else None
-            )
-
-        # Bare typing.Literal annotations don't come through
-        # msgspec.inspect.type_info, so they need their own path here.
-        if origin is Literal:
-            return self._enum_values_schema(args)
-
-        # Handle primitive types
-        type_map = {
-            str: Schema(type="string"),
-            int: Schema(type="integer"),
-            float: Schema(type="number"),
-            bool: Schema(type="boolean"),
-            bytes: Schema(type="string", format="binary"),
-        }
-
-        for py_type, schema in type_map.items():
-            if type_annotation == py_type:
-                return schema
-
-        # Default to generic object
-        return Schema(type="object")
+        primitive = _PRIMITIVE_SCHEMAS.get(type_annotation)
+        return Schema(**primitive) if primitive is not None else Schema(type="object")
 
     def _struct_to_schema(self, struct_type: type, *, register_component: bool = False) -> Schema:
         """Convert msgspec.Struct to inline OpenAPI Schema.
@@ -1642,3 +1481,133 @@ class SchemaGenerator:
         for name, cls in names.items():
             self._component_ref[cls].ref = f"#/components/schemas/{name}"
             self.schemas[name] = self._component_schema[cls]
+
+
+# --- _type_to_schema dispatch tables ---------------------------------------
+#
+# Handlers receive ``(generator, node_or_args, register_component)``. The
+# msgspec table is keyed by the ``msgspec.inspect`` node class name; the typing
+# table is keyed by ``get_origin(annotation)`` and receives ``get_args``.
+
+
+def _node_metadata(gen: SchemaGenerator, node: Any, register: bool) -> Schema | Reference:
+    # ``Annotated[T, Meta(...)]`` with informational fields (title/description/
+    # examples/extra_json_schema) arrives as a ``Metadata`` wrapper: ``.type`` is
+    # the constrained ``*Type``; ``.extra_json_schema`` holds the docs. Every
+    # documented custom type in ``serializers.types`` takes this path. (#235)
+    base = gen._type_to_schema(node.type, register_component=register)
+    extra = getattr(node, "extra_json_schema", None)
+    # Constraints already live on ``base``; docs only merge onto an inline
+    # Schema — a $ref to a component cannot take siblings.
+    if extra and isinstance(base, Schema):
+        gen._apply_json_schema_extra(base, extra)
+    return base
+
+
+def _node_str(gen: SchemaGenerator, node: Any, register: bool) -> Schema:
+    return Schema(
+        **gen._schema_kwargs(
+            type="string", min_length=node.min_length, max_length=node.max_length, pattern=node.pattern
+        )
+    )
+
+
+def _node_struct(gen: SchemaGenerator, node: Any, register: bool) -> Schema | Reference:
+    # Always a component so self-referential types emit a $ref instead of
+    # recursing forever; _struct_to_component_schema guards re-entry.
+    return gen._struct_to_component_schema(node.cls)
+
+
+def _node_union(gen: SchemaGenerator, node: Any, register: bool) -> Schema | Reference:
+    # String comparison: msgspec.inspect.NoneType is not builtins.NoneType.
+    types = list(node.types)
+    non_none = [t for t in types if type(t).__name__ != "NoneType"]
+    has_none = len(non_none) != len(types)
+    if not non_none:
+        return Schema(type="null") if has_none else Schema(type="object")
+    inner = [gen._type_to_schema(t, register_component=register) for t in non_none]
+    return gen._union_schema(inner, has_none=has_none, tagged=_is_tagged_struct_union(non_none))
+
+
+def _node_list(gen: SchemaGenerator, node: Any, register: bool) -> Schema:
+    item_type = getattr(node, "item_type", None)
+    if item_type:
+        return Schema(type="array", items=gen._type_to_schema(item_type, register_component=register))
+    return Schema(type="array", items=Schema(type="object"))
+
+
+def _node_dict(gen: SchemaGenerator, node: Any, register: bool) -> Schema:
+    # An untyped value (bare dict / dict[str, Any] -> AnyType) stays
+    # additionalProperties: true.
+    value_type = getattr(node, "value_type", None)
+    typed = value_type is not None and type(value_type).__name__ != "AnyType"
+    return gen._mapping_schema(gen._type_to_schema(value_type, register_component=register) if typed else None)
+
+
+def _node_enum(gen: SchemaGenerator, node: Any, register: bool) -> Schema | Reference:
+    # EnumType for plain enums; CustomType for Django TextChoices/IntegerChoices
+    # (a metaclass msgspec does not see as a standard enum). Named enums become
+    # components + $ref in body contexts and stay inline for params; anonymous
+    # ``Literal[...]`` (LiteralType) always stays inline.
+    cls = getattr(node, "cls", None)
+    if cls is not None and issubclass(cls, enum.Enum):
+        return gen._enum_schema(cls, register_component=register)
+    return Schema(type="object")
+
+
+_MSGSPEC_NODE_HANDLERS: dict[str, Callable[[SchemaGenerator, Any, bool], Schema | Reference]] = {
+    "Metadata": _node_metadata,
+    "IntType": lambda gen, node, _r: gen._numeric_type_schema(node, "integer"),
+    "FloatType": lambda gen, node, _r: gen._numeric_type_schema(node, "number"),
+    "StrType": _node_str,
+    "BoolType": lambda _g, _n, _r: Schema(type="boolean"),
+    "BytesType": lambda _g, _n, _r: Schema(type="string", format="binary"),
+    "DateTimeType": lambda _g, _n, _r: Schema(type="string", format="date-time"),
+    "DateType": lambda _g, _n, _r: Schema(type="string", format="date"),
+    "TimeType": lambda _g, _n, _r: Schema(type="string", format="time"),
+    "UUIDType": lambda _g, _n, _r: Schema(type="string", format="uuid"),
+    "StructType": _node_struct,
+    "UnionType": _node_union,
+    "ListType": _node_list,
+    "DictType": _node_dict,
+    "EnumType": _node_enum,
+    "CustomType": _node_enum,
+    "LiteralType": lambda gen, node, _r: gen._enum_values_schema(node.values),
+}
+
+
+def _origin_union(gen: SchemaGenerator, args: tuple[Any, ...], register: bool) -> Schema | Reference:
+    non_none = [arg for arg in args if arg is not type(None)]
+    inner = [gen._type_to_schema(arg, register_component=register) for arg in non_none]
+    return gen._union_schema(inner, has_none=len(non_none) != len(args), tagged=_is_tagged_struct_union(non_none))
+
+
+def _origin_list(gen: SchemaGenerator, args: tuple[Any, ...], register: bool) -> Schema:
+    item_type = args[0] if args else Any
+    return Schema(type="array", items=gen._type_to_schema(item_type, register_component=register))
+
+
+def _origin_dict(gen: SchemaGenerator, args: tuple[Any, ...], register: bool) -> Schema:
+    # dict[K] without a value type or dict[str, Any] stays additionalProperties: true.
+    value_type = args[1] if len(args) == 2 else None
+    typed = value_type is not None and value_type is not Any
+    return gen._mapping_schema(gen._type_to_schema(value_type, register_component=register) if typed else None)
+
+
+_TYPING_ORIGIN_HANDLERS: dict[Any, Callable[[SchemaGenerator, tuple[Any, ...], bool], Schema | Reference]] = {
+    Union: _origin_union,
+    UnionType: _origin_union,
+    list: _origin_list,
+    dict: _origin_dict,
+    # Bare typing.Literal does not go through msgspec.inspect.type_info.
+    Literal: lambda gen, args, _r: gen._enum_values_schema(args),
+}
+
+# Kwargs, not Schema instances: callers may mutate the returned Schema.
+_PRIMITIVE_SCHEMAS: dict[Any, dict[str, str]] = {
+    str: {"type": "string"},
+    int: {"type": "integer"},
+    float: {"type": "number"},
+    bool: {"type": "boolean"},
+    bytes: {"type": "string", "format": "binary"},
+}

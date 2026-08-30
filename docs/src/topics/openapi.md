@@ -379,13 +379,34 @@ async def search(
 
 ## Hiding endpoints
 
-Remove endpoints from the documentation. The server continues to serve them:
+Set `include_in_schema=False` to remove endpoints from the documentation. The
+server continues to serve them. The flag is layered. You can set it on a route,
+on a view class, or on a `BoltAPI`. The most specific layer wins:
 
 ```python
 @api.get("/internal", include_in_schema=False)
 async def internal():
     return {"internal": True}
+
+
+@api.view("/admin", include_in_schema=False)
+class AdminView(APIView):
+    async def get(self):
+        return {}
+
+
+class InternalViewSet(ViewSet):
+    include_in_schema = False  # the class attribute is the middle layer
+    ...
+
+
+# Hide a whole sub-API. A route with include_in_schema=True stays visible.
+internal_api = BoltAPI(include_in_schema=False)
+api.mount("/internal", internal_api)
 ```
+
+The default value at each layer is `None`. `None` inherits from the outer layer.
+The root `BoltAPI` resolves `None` to `True`.
 
 ## Non-JSON responses
 

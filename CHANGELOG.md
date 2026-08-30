@@ -23,6 +23,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Layered `include_in_schema`** - The flag now works like Litestar. Set it on `BoltAPI(include_in_schema=False)` to hide every route of that API, on a mounted sub-API, on an `APIView`/`ViewSet` class attribute, in `@api.view(...)`/`@api.viewset(...)`, or on one route. The most specific layer wins. `None` inherits from the outer layer.
 - **Django Debug Toolbar guide** - `docs/src/topics/debug-toolbar.md` shows the setup. The toolbar works on Bolt routes through `django_middleware=[...]` and on mounted Django views. The example project has the setup and a mounted Django view at `/django/missions/`.
 
 ## [0.10.3]

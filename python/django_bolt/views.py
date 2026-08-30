@@ -30,6 +30,11 @@ from .request import Request
 from .serializers.base import Serializer
 
 
+def _layer(value: bool | None, outer: bool | None) -> bool | None:
+    """Return ``value`` when it is set, else the next outer layer's value."""
+    return outer if value is None else value
+
+
 class APIView:
     """
     Base class for class-based views in Django-Bolt.
@@ -48,6 +53,7 @@ class APIView:
     auth: list[Any] | None = None
     status_code: int | None = None
     validate_response: bool | None = None
+    include_in_schema: bool | None = None
 
     def __init__(self, **kwargs):
         """

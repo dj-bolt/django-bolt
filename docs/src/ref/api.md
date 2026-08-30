@@ -28,6 +28,7 @@ BoltAPI(
     logging_config=None,       # Custom logging configuration
     compression=None,          # CompressionConfig for response compression
     openapi_config=None,       # OpenAPIConfig for documentation
+    include_in_schema=None,    # OpenAPI visibility default for this API's routes
 )
 ```
 
@@ -43,6 +44,7 @@ BoltAPI(
 | `logging_config` | `LoggingConfig` | `None` | Custom logging configuration |
 | `compression` | `CompressionConfig` | `None` | Response compression settings |
 | `openapi_config` | `OpenAPIConfig` | `None` | Configuration for OpenAPI documentation |
+| `include_in_schema` | `bool` or `None` | `None` | Default OpenAPI visibility for this API's routes. A route, view, or viewset value wins. `None` inherits from the API this one is mounted into |
 
 `middleware` fails fast for unsupported instances. Pass middleware classes (`pass class, not instance`) for global/router lists.
 
@@ -187,7 +189,7 @@ All route decorators accept these options:
 | `tags` | `list[str]` | OpenAPI tags for grouping |
 | `auth` | `list` | Authentication backends |
 | `guards` | `list` | Permission guards |
-| `include_in_schema` | `bool` | Include in OpenAPI docs |
+| `include_in_schema` | `bool` or `None` | Include in OpenAPI docs. `None` inherits from the view class, then from the `BoltAPI` |
 
 ### Class-based view decorators
 
