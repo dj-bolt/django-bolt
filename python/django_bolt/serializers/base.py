@@ -76,7 +76,6 @@ class _ModelOutputNested:
 
     serializer_class: type[Serializer]
     many: bool
-    max_items: int | None
 
 
 @dataclass(frozen=True)
@@ -192,7 +191,7 @@ def _resolve_dump_default(default_value: Any) -> Any:
 
 
 def _get_model_output_nested(field_type: Any) -> _ModelOutputNested | None:
-    """Infer nested output behavior from the type hint plus optional Nested() metadata."""
+    """Infer nested output behavior from the type hint."""
     nested_config = resolve_nested_config(field_type)
     if nested_config is None:
         return None
@@ -200,7 +199,6 @@ def _get_model_output_nested(field_type: Any) -> _ModelOutputNested | None:
     return _ModelOutputNested(
         serializer_class=nested_config.serializer_class,
         many=nested_config.many,
-        max_items=nested_config.max_items,
     )
 
 
@@ -1485,26 +1483,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         return value
 
     @classmethod
-    def _validate_nested_item_limit(
-        cls,
-        *,
-        field_name: str,
-        nested_output: _ModelOutputNested,
-        item_count: int,
-    ) -> None:
-        """Enforce nested list size limits for output serialization too."""
-        if nested_output.max_items is not None and item_count > nested_output.max_items:
-            raise SerializationError(
-                f"{cls.__name__}.{field_name} resolved {item_count} nested items. "
-                f"Maximum allowed: {nested_output.max_items}."
-            )
-
-    @classmethod
     def _convert_nested_from_model_value(
         cls,
         value: Any,
         *,
-        field_name: str,
         nested_output: _ModelOutputNested,
         _depth: int,
         max_depth: int,
@@ -1517,7 +1499,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         if nested_output.many:
             items = cls._normalize_many_relation_value(value)
-            cls._validate_nested_item_limit(field_name=field_name, nested_output=nested_output, item_count=len(items))
 
             result = []
             for item in items:
@@ -1544,7 +1525,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls,
         value: Any,
         *,
-        field_name: str,
         nested_output: _ModelOutputNested,
         _depth: int,
         max_depth: int,
@@ -1557,7 +1537,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         if nested_output.many:
             items = cls._normalize_many_relation_value(value)
-            cls._validate_nested_item_limit(field_name=field_name, nested_output=nested_output, item_count=len(items))
 
             async def convert_item(item: Any) -> Any:
                 if isinstance(item, serializer_class):
@@ -1602,7 +1581,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         if spec.nested is not None:
             return cls._convert_nested_from_model_value(
                 value,
-                field_name=spec.field_name,
                 nested_output=spec.nested,
                 _depth=_depth,
                 max_depth=max_depth,
@@ -1635,7 +1613,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         if spec.nested is not None:
             return await cls._convert_nested_from_model_value_async(
                 value,
-                field_name=spec.field_name,
                 nested_output=spec.nested,
                 _depth=_depth,
                 max_depth=max_depth,
