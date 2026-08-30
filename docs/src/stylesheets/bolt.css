@@ -1,0 +1,183 @@
+/* Home page layout */
+
+.bolt-hero {
+  text-align: center;
+  padding: 2.5rem 0 1.5rem;
+}
+
+.bolt-hero__eyebrow {
+  margin: 0 0 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--md-primary-fg-color);
+}
+
+.bolt-hero__title {
+  font-size: 2.6rem;
+  font-weight: 700;
+  line-height: 1.1;
+  margin: 0 0 1rem;
+}
+
+.bolt-hero__tagline {
+  max-width: 40rem;
+  margin: 0 auto 1.5rem;
+  font-size: 0.95rem;
+  line-height: 1.6;
+  color: var(--md-default-fg-color--light);
+}
+
+.bolt-hero__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.bolt-hero__actions .md-button {
+  margin: 0;
+}
+
+.bolt-hero__install code {
+  display: inline-block;
+  padding: 0.5em 1.2em;
+  font-size: 0.8rem;
+  border-radius: 0.3rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  background: var(--md-code-bg-color);
+}
+
+.bolt-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  max-width: 40rem;
+  margin: 2rem auto 0.5rem;
+}
+
+.bolt-stat {
+  display: flex;
+  flex-direction: column;
+  padding: 1rem 0.5rem;
+  border-radius: 0.4rem;
+  background: var(--md-code-bg-color);
+}
+
+.bolt-stat__value {
+  font-size: 1.8rem;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--md-primary-fg-color);
+}
+
+.bolt-stat__label {
+  margin-top: 0.3rem;
+  font-size: 0.65rem;
+  color: var(--md-default-fg-color--light);
+}
+
+.bolt-stats__note {
+  margin-top: 1.5rem;
+  font-size: 0.65rem;
+  color: var(--md-default-fg-color--light);
+  margin: 0;
+}
+
+.bolt-example {
+  max-width: 40rem;
+  margin: 0 auto 2rem;
+}
+
+.bolt-section__title {
+  margin-top: 3rem;
+}
+
+.bolt-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.bolt-card {
+  padding: 1rem 1.2rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.4rem;
+  background: var(--md-default-bg-color);
+}
+
+.bolt-card h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.bolt-card h3 .twemoji {
+  color: var(--md-primary-fg-color);
+  margin-right: 0.3em;
+}
+
+.bolt-card p,
+.bolt-card > :last-child {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  color: var(--md-default-fg-color--light);
+}
+
+.bolt-card--link {
+  display: block;
+  color: inherit;
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.bolt-card--link:hover {
+  border-color: var(--md-primary-fg-color);
+  transform: translateY(-2px);
+  color: inherit;
+}
+
+.bolt-card--link strong {
+  display: block;
+  margin-bottom: 0.2rem;
+  font-size: 0.85rem;
+  color: var(--md-default-fg-color);
+}
+
+.bolt-ok {
+  color: #2e7d32;
+}
+
+@media screen and (max-width: 44.9375em) {
+  .bolt-hero__title {
+    font-size: 2.2rem;
+  }
+  .bolt-stats {
+    grid-template-columns: 1fr;
+  }
+}
+
+.md-typeset a.bolt-card--link,
+.md-typeset a.bolt-card--link:hover {
+  text-decoration: none;
+}
+
+.md-typeset a.bolt-card--link,
+.md-typeset a.bolt-card--link p {
+  color: var(--md-default-fg-color--light);
+}
+
+
+[data-md-color-scheme="slate"] .bolt-ok {
+  color: #66bb6a;
+}
+
+.bolt-hero__logo {
+  display: block;
+  width: 140px;
+  height: auto;
+  margin: 0 auto 1rem;
+}

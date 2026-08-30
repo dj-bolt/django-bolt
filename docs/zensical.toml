@@ -121,6 +121,8 @@ extra_css = ["stylesheets/bolt.css"]
 # ----------------------------------------------------------------------------
 [project.theme]
 
+logo = "images/bolt-logo.png"
+
 # change this to "classic" to use the traditional Material for MkDocs look.
 #variant = "classic"
 
@@ -142,7 +144,7 @@ extra_css = ["stylesheets/bolt.css"]
 # - https://zensical.org/docs/setup/logo-and-icons/#favicon
 # - https://developer.mozilla.org/en-US/docs/Glossary/Favicon
 #
-#favicon = "images/favicon.png"
+favicon = "images/bolt-logo.png"
 
 # Zensical supports more than 60 different languages. This means that the
 # labels and tooltips that Zensical's templates produce are translated.
@@ -354,7 +356,6 @@ code = "JetBrains Mono"
 # - https://zensical.org/docs/authoring/icons-emojis/#search
 # ----------------------------------------------------------------------------
 [project.theme.icon]
-logo = "lucide/zap"
 repo = "fontawesome/brands/github"
 
 # ----------------------------------------------------------------------------

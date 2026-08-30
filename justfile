@@ -203,8 +203,8 @@ docs: docs-serve
 
 # Serve documentation locally
 docs-serve:
-    cd docs && uv run python build_llms_full.py && uv run zensical serve -a localhost:8080
+    cd docs && uv run python build_llms_full.py && uv run --group docs zensical serve -a localhost:8080
 
 # Build documentation (also regenerates llms-full.txt for AI crawlers)
 docs-build:
-    cd docs && uv run python build_llms_full.py && uv run zensical build --clean
+    cd docs && uv run python build_llms_full.py && uv run --group docs zensical build --clean
