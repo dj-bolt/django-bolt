@@ -12,8 +12,8 @@ python manage.py migrate            # includes the bolt_mcp.oauth tables
 python manage.py runbolt --dev --host 127.0.0.1 --port 8001
 ```
 
-`--dev` runs one process with auto-reload. `DEBUG` is on by default, with Django Debug
-Toolbar, which needs one process. `DJANGO_DEBUG=0` turns it off. See
+`--dev` runs one process with auto-reload. Set `DEBUG = True` in `testproject/settings.py`
+to turn on Django Debug Toolbar, which needs one process. See
 [docs/src/topics/debug-toolbar.md](../../docs/src/topics/debug-toolbar.md).
 
 Port 8001 matters for the MCP demo: the OAuth issuer in `mcp_demo/api.py` is

@@ -140,7 +140,7 @@ Each API response also has two headers you can read in the browser's network tab
 
 ## Example project
 
-`python/example` has this setup. `DEBUG` is on by default there.
+`python/example` has this setup. Set `DEBUG = True` in `testproject/settings.py`.
 
 ```bash
 cd python/example

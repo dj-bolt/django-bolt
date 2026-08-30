@@ -10,7 +10,6 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
-import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -24,8 +23,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = "django-insecure-8l7jd)6zngu@-^(&lt=q3smdfx4rcuu9tp3&6&y)ovqm%y=20t"
 
 # SECURITY WARNING: don't run with debug turned on in production!
-# DEBUG is on by default and turns on the debug toolbar. `DJANGO_DEBUG=0` turns it off.
-DEBUG = os.environ.get("DJANGO_DEBUG", "1") != "0"
+# DEBUG = True also turns on the debug toolbar.
+DEBUG = False
 
 ALLOWED_HOSTS = ["*"]
 
