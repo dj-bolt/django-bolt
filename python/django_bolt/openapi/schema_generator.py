@@ -267,6 +267,13 @@ def _build_union_examples(response_type: Any) -> dict[str, Example] | None:
 class SchemaGenerator:
     """Generate OpenAPI schema from BoltAPI routes."""
 
+    def _hidden(self, meta: dict[str, Any]) -> bool:
+        """Resolve layered ``include_in_schema``: route value, else the API value, else True."""
+        include = meta.get("include_in_schema")
+        if include is None:
+            include = self.api.include_in_schema
+        return include is False
+
     def __init__(self, api: BoltAPI, config: OpenAPIConfig) -> None:
         """Initialize schema generator.
 
@@ -522,7 +529,7 @@ class SchemaGenerator:
 
             # Get handler metadata
             meta = self.api._handler_meta.get(handler_id, {})
-            if not meta.get("include_in_schema", True):
+            if self._hidden(meta):
                 continue
 
             if path not in paths:

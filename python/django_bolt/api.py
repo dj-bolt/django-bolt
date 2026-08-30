@@ -345,6 +345,7 @@ class BoltAPI:
         compression: Any | None = None,
         openapi_config: Any | None = None,
         validate_response: bool = True,
+        include_in_schema: bool | None = None,
         lifespan: Callable | None = None,
     ) -> None:
         """
@@ -375,6 +376,9 @@ class BoltAPI:
                 this argument in production.
             openapi_config: OpenAPI documentation configuration
             validate_response: Default response validation policy for registered routes
+            include_in_schema: Default OpenAPI visibility for the routes of this API.
+                A route, view, or viewset that sets its own value wins. ``None``
+                inherits from the API this one is mounted into. The root defaults to True.
             lifespan: Async context manager factory for startup/shutdown lifecycle.
                 Receives the BoltAPI instance as argument.
         """
@@ -390,6 +394,7 @@ class BoltAPI:
         self.trailing_slash = trailing_slash  # Mode: "strip", "append", or "keep"
         self.namespace = namespace  # Opt-in reverse namespace; see django_bolt.urls
         self._validate_response_default = validate_response
+        self.include_in_schema = include_in_schema
 
         # Build middleware list: Django middleware first, then custom middleware
         self._middleware = []
@@ -549,7 +554,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
     ):
         return self._route_decorator(
             "GET",
@@ -581,7 +586,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
     ):
         return self._route_decorator(
             "POST",
@@ -613,7 +618,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
     ):
         return self._route_decorator(
             "PUT",
@@ -645,7 +650,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
     ):
         return self._route_decorator(
             "PATCH",
@@ -677,7 +682,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
     ):
         return self._route_decorator(
             "DELETE",
@@ -709,7 +714,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
     ):
         return self._route_decorator(
             "HEAD",
@@ -741,7 +746,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
     ):
         return self._route_decorator(
             "OPTIONS",
@@ -773,7 +778,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
     ):
         return self._route_decorator(
             "QUERY",
@@ -907,6 +912,7 @@ class BoltAPI:
         status_code: int | None = None,
         validate_response: bool | None = None,
         tags: list[str] | None = None,
+        include_in_schema: bool | None = None,
     ):
         """
         Register a class-based view as a decorator.
@@ -958,6 +964,11 @@ class BoltAPI:
                     if method not in available_methods:
                         raise ValueError(f"View class {view_cls.__name__} does not implement method '{method}'")
 
+            # Class attribute is the middle layer: decorator kwarg > class > API.
+            merged_include_in_schema = include_in_schema
+            if merged_include_in_schema is None:
+                merged_include_in_schema = view_cls.include_in_schema
+
             # Register each method
             for method in methods_to_register:
                 method_upper = method.upper()
@@ -1001,6 +1012,7 @@ class BoltAPI:
                     guards=merged_guards,
                     auth=merged_auth,
                     tags=tags,
+                    include_in_schema=merged_include_in_schema,
                 )
 
                 # Apply decorator to register the handler
@@ -1009,7 +1021,13 @@ class BoltAPI:
             # Scan for custom action methods (methods decorated with @action)
             # Note: api.view() doesn't have base path context for @action decorator
             # Custom actions with @action should use api.viewset() instead
-            self._register_custom_actions(view_cls, base_path=None, lookup_field=None, base_name=None)
+            self._register_custom_actions(
+                view_cls,
+                base_path=None,
+                lookup_field=None,
+                base_name=None,
+                include_in_schema=merged_include_in_schema,
+            )
 
             return view_cls
 
@@ -1026,6 +1044,7 @@ class BoltAPI:
         validate_response: bool | None = None,
         lookup_field: str = "pk",
         tags: list[str] | None = None,
+        include_in_schema: bool | None = None,
     ):
         """
         Register a ViewSet with automatic CRUD route generation as a decorator.
@@ -1086,6 +1105,11 @@ class BoltAPI:
             # Reverse-name base for all generated routes. Both an explicit name and
             # the class-name fallback are used verbatim.
             vs_base = name if name is not None else viewset_cls.__name__
+
+            # Class attribute is the middle layer: decorator kwarg > class > API.
+            merged_include_in_schema = include_in_schema
+            if merged_include_in_schema is None:
+                merged_include_in_schema = viewset_cls.include_in_schema
 
             # Define standard action mappings with HTTP-compliant status codes
             # Format: action_name: (method, path, default_status_code)
@@ -1190,6 +1214,7 @@ class BoltAPI:
                     guards=merged_guards,
                     auth=merged_auth,
                     tags=tags,
+                    include_in_schema=merged_include_in_schema,
                 )
                 route_decorator(handler)
 
@@ -1198,6 +1223,7 @@ class BoltAPI:
                 viewset_cls,
                 base_path=path,
                 lookup_field=actual_lookup_field,
+                include_in_schema=merged_include_in_schema,
                 base_name=vs_base,
                 base_name_explicit=name is not None,
             )
@@ -1226,6 +1252,7 @@ class BoltAPI:
         lookup_field: str | None,
         base_name: str | None = None,
         base_name_explicit: bool = False,
+        include_in_schema: bool | None = None,
     ):
         """
         Scan a ViewSet class for custom action methods and register them.
@@ -1364,6 +1391,7 @@ class BoltAPI:
                         tags=attr.tags,
                         summary=attr.summary,
                         description=attr.description,
+                        include_in_schema=include_in_schema,
                     )
                     decorator(custom_action_handler)
 
@@ -1382,7 +1410,7 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         response_class: type | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
         _name_explicit: bool = True,
         _skip_prefix: bool = False,
         _router_middleware: list[Any] | None = None,
@@ -2957,7 +2985,12 @@ class BoltAPI:
 
             # Copy handler metadata (now keyed by handler_id for performance)
             if handler_id in app._handler_meta:
-                self._handler_meta[new_handler_id] = app._handler_meta[handler_id]
+                meta = app._handler_meta[handler_id]
+                # A route that inherits takes the mounted API's value here, so
+                # the next outer layer sees it as decided (Litestar layering).
+                if meta["include_in_schema"] is None and app.include_in_schema is not None:
+                    meta = {**meta, "include_in_schema": app.include_in_schema}
+                self._handler_meta[new_handler_id] = meta
 
             # Copy middleware metadata (with path updated)
             if handler_id in app._handler_middleware:

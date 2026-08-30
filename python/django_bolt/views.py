@@ -48,6 +48,7 @@ class APIView:
     auth: list[Any] | None = None
     status_code: int | None = None
     validate_response: bool | None = None
+    include_in_schema: bool | None = None
 
     def __init__(self, **kwargs):
         """
