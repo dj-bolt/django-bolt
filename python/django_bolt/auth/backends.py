@@ -242,7 +242,9 @@ class JWTAuthentication(BaseAuthentication):
                 )
         if leeway < 0:
             raise ImproperlyConfigured("JWTAuthentication leeway must be >= 0 seconds.")
-        self.secret = secret
+        if secret == "":
+            raise ImproperlyConfigured("JWTAuthentication secret must not be empty.")
+        self._secret = secret
         self.public_key = public_key
         self.algorithms = ["HS256"] if algorithms is None else algorithms
         if not self.algorithms:
@@ -261,29 +263,6 @@ class JWTAuthentication(BaseAuthentication):
         self._jwks_refresh_lock = threading.Lock()
         self._jwks_refreshed_at = 0.0
 
-        # If no key material provided at all (and no JWKS), fall back to
-        # Django's SECRET_KEY.
-        if self.secret is None and self.public_key is None and jwks_url is None and jwks is None:
-            try:
-                if not hasattr(settings, "SECRET_KEY"):
-                    raise ImproperlyConfigured(
-                        "JWTAuthentication requires a 'secret' parameter or Django's SECRET_KEY setting. "
-                        "Neither was provided."
-                    )
-
-                self.secret = settings.SECRET_KEY
-
-                if not self.secret or self.secret == "":
-                    raise ImproperlyConfigured(
-                        "JWTAuthentication secret cannot be empty. "
-                        "Please provide a non-empty 'secret' parameter or set Django's SECRET_KEY."
-                    )
-            except ImportError as e:
-                raise ImproperlyConfigured(
-                    "JWTAuthentication requires Django to be installed and configured, "
-                    "or a 'secret' parameter must be explicitly provided."
-                ) from e
-
         # Revocation support (OPTIONAL - only checked if provided)
         self.revoked_token_handler = revoked_token_handler
         self.revocation_store = revocation_store
@@ -296,6 +275,17 @@ class JWTAuthentication(BaseAuthentication):
         # If revocation_store provided, create handler from it
         if revocation_store and not revoked_token_handler:
             self.revoked_token_handler = create_revocation_handler(revocation_store)
+
+    @property
+    def secret(self) -> str | None:
+        """Return the HMAC secret, or Django's ``SECRET_KEY`` when none was given.
+
+        Read on access, not in ``__init__``: ``BOLT_AUTHENTICATION_CLASSES``
+        holds instances, so split settings files can set ``SECRET_KEY`` after
+        they build the backend. Django raises ``ImproperlyConfigured`` if
+        ``SECRET_KEY`` is empty.
+        """
+        return self._secret if self._secret is not None else settings.SECRET_KEY
 
     @property
     def scheme_name(self) -> str:

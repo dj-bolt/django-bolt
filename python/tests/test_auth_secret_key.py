@@ -77,6 +77,40 @@ def test_global_auth_with_django_secret():
         del settings.BOLT_AUTHENTICATION_CLASSES
 
 
+def test_secret_key_is_read_lazily_not_at_construction():
+    """A backend built before SECRET_KEY is final must verify with the final key.
+
+    Split settings files often set SECRET_KEY after BOLT_AUTHENTICATION_CLASSES.
+    """
+    from django.test import override_settings  # noqa: PLC0415
+
+    from django_bolt.auth import create_jwt_for_user  # noqa: PLC0415
+    from django_bolt.testing import TestClient  # noqa: PLC0415
+
+    auth = JWTAuthentication()  # Constructed while SECRET_KEY is still the placeholder
+
+    class User:
+        id = 1
+        username = "late"
+        is_staff = False
+        is_superuser = False
+        is_active = True
+
+    with override_settings(SECRET_KEY="late-final-secret"):
+        assert auth.secret == "late-final-secret"
+        assert auth.to_metadata()["secret"] == "late-final-secret"
+
+        api = BoltAPI()
+
+        @api.get("/protected", auth=[auth], guards=[IsAuthenticated()])
+        async def protected_endpoint():
+            return {"ok": True}
+
+        token = create_jwt_for_user(User())
+        with TestClient(api) as client:
+            assert client.get("/protected", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+
+
 if __name__ == "__main__":
     test_jwt_auth_uses_django_secret_key()
     test_jwt_auth_explicit_secret_overrides()

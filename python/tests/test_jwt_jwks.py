@@ -128,6 +128,10 @@ class TestJwks:
         with pytest.raises(ImproperlyConfigured, match="must not be empty"):
             JWTAuthentication(jwks=JWKS, algorithms=[])
 
+    def test_empty_secret_is_rejected(self):
+        with pytest.raises(ImproperlyConfigured, match="secret must not be empty"):
+            JWTAuthentication(secret="")
+
     def test_remote_jwks_requires_https(self):
         with pytest.raises(ImproperlyConfigured, match="HTTPS"):
             JWTAuthentication(
