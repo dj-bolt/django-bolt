@@ -137,17 +137,3 @@ Each API response also has two headers you can read in the browser's network tab
 | Bolt route that returns JSON | `djdt-request-id` and `Server-Timing` headers. Open any page with the toolbar and use the History panel. |
 | Mounted Django HTML view | Toolbar is in the page. |
 | Streaming or compressed response | No toolbar. The toolbar only edits a complete, uncompressed `text/html` body. |
-
-## Example project
-
-`python/example` has this setup. `DEBUG` is on by default there. Start it and open these pages:
-
-```bash
-cd python/example
-python manage.py runbolt --dev --host 127.0.0.1 --port 8001
-```
-
-- `http://127.0.0.1:8001/dashboard` - a Bolt route that renders a template with the async ORM. The SQL panel shows the query.
-- `http://127.0.0.1:8001/django/missions/` - a mounted Django view that renders the same template. The SQL and Templates panels show the query and the context.
-- `http://127.0.0.1:8001/django/admin/login/` - the mounted Django admin.
-- `http://127.0.0.1:8001/health` - a Bolt JSON route. Find it in the History panel.
