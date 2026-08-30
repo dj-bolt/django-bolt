@@ -910,7 +910,9 @@ pub fn start_server(
                     .on_connect(|conn, _ext| {
                         if let Some(stream) = conn.downcast_ref::<actix_web::rt::net::TcpStream>() {
                             if let Err(err) = stream.set_nodelay(true) {
-                                eprintln!("[django-bolt] Failed to set TCP_NODELAY on connection: {err}");
+                                eprintln!(
+                                    "[django-bolt] Failed to set TCP_NODELAY on connection: {err}"
+                                );
                             }
                         }
                     })
