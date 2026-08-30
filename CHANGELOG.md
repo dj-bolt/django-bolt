@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Performance
+
+- **`TCP_NODELAY` on every connection** - Bolt left Nagle's algorithm on. A response that Bolt writes in more than one segment waited for the delayed ACK of the client, about 40 ms per response. This hit every `StreamingResponse`, `EventSourceResponse`, and ASGI mount, `mount_django` included. On one keep-alive connection, an SSE route with three events went from 24 to 10,700 responses per second. A trivial ASGI mount went from 24 to 6,700. Single-write JSON responses did not change.
+
+### Fixed
+
+- **ASGI mount: a client that went away raised into the app** - Bolt had no client-disconnect signal for mounted apps. A mounted app that parked in `receive()` never got `http.disconnect`, and Actix kept its handler alive until the app wrote. After `BOLT_ASGI_MOUNT_TIMEOUT`, Bolt returned 504, cancelled the app, and dropped the response channel. On Django 4.2 to 6.0, `ASGIHandler.handle()` waits with `asyncio.wait()`, which does not cancel its child tasks. The orphaned `process_request` task finished the view, called `send()`, and got `RuntimeError: http.response.start sent more than once`. Django 6.1 uses a `TaskGroup` and was not affected. Bolt now does what hyper and uvicorn do. A read-side EOF while a handler runs is a disconnect (`h1_allow_half_closed(false)`). `receive()` then returns `http.disconnect`, before headers and mid-body. After Bolt closes a response, on disconnect, timeout, or app exit, `send()` is a no-op. A real second `http.response.start` still raises. (#313)
+
 ## [0.10.3]
 
 ### Added

@@ -905,6 +905,17 @@ pub fn start_server(
                         }
                     })
                     .keep_alive(keep_alive)
+                    // Multi-write responses (streaming, SSE, ASGI mounts) hit
+                    // the Nagle + delayed-ACK 40 ms stall without TCP_NODELAY.
+                    .on_connect(|conn, _ext| {
+                        if let Some(stream) = conn.downcast_ref::<actix_web::rt::net::TcpStream>() {
+                            let _ = stream.set_nodelay(true);
+                        }
+                    })
+                    // A read-side EOF while a handler runs is a client that
+                    // went away. Drop the handler, so ASGI mounts get
+                    // `http.disconnect` (same as hyper/uvicorn).
+                    .h1_allow_half_closed(false)
                     .client_request_timeout(std::time::Duration::from_secs(0))
                     // Signals are handled by our own task below (WebSocket
                     // drain must run before the Actix graceful stop).
