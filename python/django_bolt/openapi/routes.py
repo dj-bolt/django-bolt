@@ -22,13 +22,14 @@ if TYPE_CHECKING:
 class OpenAPIRouteRegistrar:
     """Handles registration of OpenAPI documentation routes."""
 
-    def __init__(self, api: BoltAPI):
+    def __init__(self, api: BoltAPI, *, middleware: list[Any] | None = None):
         """Initialize the registrar with a BoltAPI instance.
 
         Args:
             api: The BoltAPI instance to register routes on
         """
         self.api = api
+        self._middleware = middleware
         self._docs_api = None  # Separate API for docs when using django_auth
 
     def _get_django_auth_decorator(self):
@@ -100,6 +101,9 @@ class OpenAPIRouteRegistrar:
 
         # Get the API to register routes on (separate API if using django_auth)
         docs_api = self._get_docs_api()
+        if docs_api is not self.api:
+            # Authenticated docs already run the Django middleware stack.
+            self._middleware = None
         use_django_auth = self.api._openapi_config.django_auth is not None
 
         # Get guards and auth from config for protecting doc routes
@@ -129,7 +133,12 @@ class OpenAPIRouteRegistrar:
 
         openapi_json_handler = self._apply_django_auth(openapi_json_handler)
         docs_api._route_decorator(
-            "GET", f"{route_prefix}/openapi.json", guards=guards, auth=auth, _skip_prefix=skip_prefix
+            "GET",
+            f"{route_prefix}/openapi.json",
+            guards=guards,
+            auth=auth,
+            _skip_prefix=skip_prefix,
+            _router_middleware=self._middleware,
         )(openapi_json_handler)
 
         # Always register YAML endpoints
@@ -143,7 +152,12 @@ class OpenAPIRouteRegistrar:
 
         openapi_yaml_handler = self._apply_django_auth(openapi_yaml_handler)
         docs_api._route_decorator(
-            "GET", f"{route_prefix}/openapi.yaml", guards=guards, auth=auth, _skip_prefix=skip_prefix
+            "GET",
+            f"{route_prefix}/openapi.yaml",
+            guards=guards,
+            auth=auth,
+            _skip_prefix=skip_prefix,
+            _router_middleware=self._middleware,
         )(openapi_yaml_handler)
 
         async def openapi_yml_handler(request):
@@ -154,7 +168,12 @@ class OpenAPIRouteRegistrar:
 
         openapi_yml_handler = self._apply_django_auth(openapi_yml_handler)
         docs_api._route_decorator(
-            "GET", f"{route_prefix}/openapi.yml", guards=guards, auth=auth, _skip_prefix=skip_prefix
+            "GET",
+            f"{route_prefix}/openapi.yml",
+            guards=guards,
+            auth=auth,
+            _skip_prefix=skip_prefix,
+            _router_middleware=self._middleware,
         )(openapi_yml_handler)
 
         # Register UI plugin routes
@@ -195,12 +214,20 @@ class OpenAPIRouteRegistrar:
 
                 # Create closure to capture plugin reference
                 def make_handler(p):
+                    response_class = (
+                        JSON
+                        if isinstance(p, JsonRenderPlugin)
+                        else PlainText
+                        if isinstance(p, YamlRenderPlugin)
+                        else HTML
+                    )
+
                     async def ui_handler(request):
                         """Serve OpenAPI UI."""
                         try:
                             schema = self._get_schema()
                             rendered = p.render(schema, schema_url)
-                            return HTML(rendered, status_code=200, headers={"content-type": p.media_type})
+                            return response_class(rendered, status_code=200, headers={"content-type": p.media_type})
                         except Exception as e:
                             raise Exception(
                                 f"Failed to render OpenAPI UI plugin {p.__class__.__name__}: "
@@ -211,7 +238,14 @@ class OpenAPIRouteRegistrar:
 
                 handler = make_handler(plugin)
                 handler = self._apply_django_auth(handler)
-                docs_api._route_decorator("GET", full_path, guards=guards, auth=auth, _skip_prefix=skip_prefix)(handler)
+                docs_api._route_decorator(
+                    "GET",
+                    full_path,
+                    guards=guards,
+                    auth=auth,
+                    _skip_prefix=skip_prefix,
+                    _router_middleware=self._middleware,
+                )(handler)
 
     def _register_root_redirect(self, docs_api, route_prefix: str, skip_prefix: bool) -> None:
         """Register root path to serve default UI directly.
@@ -235,12 +269,16 @@ class OpenAPIRouteRegistrar:
 
             # Capture plugin in closure
             def make_root_handler(p, url):
+                response_class = (
+                    JSON if isinstance(p, JsonRenderPlugin) else PlainText if isinstance(p, YamlRenderPlugin) else HTML
+                )
+
                 async def openapi_root_handler(request):
                     """Serve default OpenAPI UI at root path."""
                     try:
                         schema = self._get_schema()
                         rendered = p.render(schema, url)
-                        return HTML(rendered, status_code=200, headers={"content-type": p.media_type})
+                        return response_class(rendered, status_code=200, headers={"content-type": p.media_type})
                     except Exception as e:
                         raise Exception(f"Failed to render OpenAPI UI: {type(e).__name__}: {str(e)}") from e
 
@@ -248,4 +286,11 @@ class OpenAPIRouteRegistrar:
 
             handler = make_root_handler(plugin, schema_url)
             handler = self._apply_django_auth(handler)
-            docs_api._route_decorator("GET", root_path, guards=guards, auth=auth, _skip_prefix=skip_prefix)(handler)
+            docs_api._route_decorator(
+                "GET",
+                root_path,
+                guards=guards,
+                auth=auth,
+                _skip_prefix=skip_prefix,
+                _router_middleware=self._middleware,
+            )(handler)

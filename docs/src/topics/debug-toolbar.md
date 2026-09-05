@@ -90,6 +90,16 @@ Pages inside `api.mount_django("/django")` do not need this. Their toolbar calls
 
 **Why a list, not `True`:** `django_middleware=True` runs all of `settings.MIDDLEWARE` on Bolt routes. That includes `CsrfViewMiddleware`, which rejects API `POST` requests with `403`. The list runs only the toolbar. See [Middleware](middleware.md#django-middleware-integration) for the per-request cost.
 
+## API documentation
+
+The same middleware runs on the API documentation routes.
+When `runbolt` combines APIs, docs use the middleware from the API that supplies the OpenAPI configuration.
+With the setup above, Scalar (`/docs`) and Swagger (`/docs/swagger`) can show the toolbar.
+The JSON schema response cannot contain toolbar HTML.
+
+Custom HTML render plugins must include a closing `</body>` tag.
+The toolbar inserts its HTML before that tag.
+
 ## Static files
 
 The toolbar ships its CSS and JS as app static files. In `DEBUG`, Bolt serves them through Django's staticfiles finders. No extra setup is needed. See [Static Files](static-files.md).

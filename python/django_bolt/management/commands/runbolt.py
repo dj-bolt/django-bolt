@@ -765,7 +765,7 @@ class Command(BaseCommand):
                 openapi_config = api._openapi_config
                 if openapi_config.enabled:
                     merged_api._openapi_config = openapi_config
-                    merged_api._register_openapi_routes()
+                    merged_api._register_openapi_routes(middleware=api._middleware if merged_api is not api else None)
                     features.append(("Docs", f"{banner_base_url}{openapi_config.path}"))
                 break
 
@@ -870,7 +870,7 @@ class Command(BaseCommand):
         if openapi_enabled and openapi_config:
             # Transfer OpenAPI config to merged API
             merged_api._openapi_config = openapi_config
-            merged_api._register_openapi_routes()
+            merged_api._register_openapi_routes(middleware=api._middleware if merged_api is not api else None)
             features.append(("Docs", f"{banner_base_url}{openapi_config.path}"))
 
         # Register Django admin routes if not disabled
