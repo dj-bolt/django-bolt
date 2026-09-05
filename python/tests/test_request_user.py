@@ -119,6 +119,44 @@ def custom_auth_api():
 class TestJWTUserLoading:
     """Test request.user loading with JWT authentication."""
 
+    @pytest.mark.django_db(transaction=True)
+    def test_auser_returns_jwt_user_without_django_middleware(self):
+        """Both getters return the JWT user when Django middleware is absent."""
+        api = BoltAPI(django_middleware=[])
+
+        @api.get("/async-me", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
+        async def get_async_me(request):
+            user = await request.auser()
+            again = await request.auser()
+            return {
+                "username": user.username,
+                "user_id": user.pk,
+                "same_user": user is request.user and again is user,
+            }
+
+        user = User.objects.create(username="async_jwt_user")
+        token = create_jwt_token(user_id=str(user.pk))
+        with TestClient(api) as client:
+            response = client.get("/async-me", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"username": user.username, "user_id": user.pk, "same_user": True}
+
+    def test_auser_returns_anonymous_without_authentication(self):
+        """The async getter still returns an anonymous user without authentication."""
+        api = BoltAPI(django_middleware=[])
+
+        @api.get("/async-public")
+        async def get_async_public(request):
+            user = await request.auser()
+            return {"is_anonymous": user.is_anonymous, "is_authenticated": user.is_authenticated}
+
+        with TestClient(api) as client:
+            response = client.get("/async-public")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"is_anonymous": True, "is_authenticated": False}
+
     @pytest.mark.django_db(transaction=True)  # Use real database transaction
     def test_authenticated_request_has_user(self, jwt_api):
         """Test that authenticated request with existing user returns 200."""

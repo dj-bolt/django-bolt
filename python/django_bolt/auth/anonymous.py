@@ -1,28 +1,21 @@
 """
-Anonymous user fallback for when Django middleware is not configured.
-
-This module provides the auser_fallback async function that returns
-AnonymousUser, matching Django's behavior when AuthenticationMiddleware
-is not configured.
+Async user fallback for requests without Django authentication middleware.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 from django.contrib.auth.models import AnonymousUser
 
 
-async def auser_fallback() -> AnonymousUser:
+async def auser_fallback(user: Any = None) -> Any:
     """
-    Async fallback that returns AnonymousUser.
+    Return the Bolt user, or an anonymous user if no user is set.
 
-    This is used when Django's AuthenticationMiddleware is not configured,
-    ensuring that `await request.auser()` always returns a valid user object
-    (either the authenticated user or AnonymousUser).
-
-    Returns:
-        AnonymousUser instance
+    Keep the same lazy user object as request.user to share its cached result.
     """
-    return AnonymousUser()
+    return user if user is not None else AnonymousUser()
 
 
 __all__ = ["auser_fallback"]
