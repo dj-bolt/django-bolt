@@ -11,12 +11,13 @@ from typing import Annotated
 
 import jwt
 import msgspec
+import pytest
 from django.contrib.admin.views.decorators import staff_member_required
 
 from django_bolt import BoltAPI
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
 from django_bolt.datastructures import UploadFile
-from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
+from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, SwaggerRenderPlugin
 from django_bolt.openapi.spec import Components, SecurityScheme
 from django_bolt.params import File, Form
 from django_bolt.serializers import Serializer, field
@@ -105,6 +106,35 @@ def test_swagger_ui_endpoint():
         # Should contain Swagger UI indicators
         html = response.text
         assert "swagger" in html.lower() or "openapi" in html.lower()
+
+
+@pytest.mark.parametrize(
+    ("options", "expected_url"),
+    [
+        ({}, "https://cdn.jsdelivr.net/npm/redoc@2.5.3/bundles/redoc.standalone.js"),
+        ({"version": "2.5.1"}, "https://cdn.jsdelivr.net/npm/redoc@2.5.1/bundles/redoc.standalone.js"),
+        ({"version": "2.5.1", "js_url": "/static/redoc.js"}, "/static/redoc.js"),
+    ],
+)
+def test_redoc_endpoint_uses_available_bundle(options, expected_url):
+    """Use a published bundle by default and preserve explicit URL overrides."""
+    api = BoltAPI(
+        openapi_config=OpenAPIConfig(title="ReDoc API", version="1.0.0", render_plugins=[RedocRenderPlugin(**options)])
+    )
+
+    @api.get("/items")
+    async def get_items():
+        return []
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        response = client.get("/docs/redoc/")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert f'<script src="{expected_url}" crossorigin></script>' in response.text
+    assert "Redoc.init(" in response.text
+    assert '"/items"' in response.text
 
 
 def test_swagger_ui_supports_openapi_3_2_query_specs():
