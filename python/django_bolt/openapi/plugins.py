@@ -67,7 +67,7 @@ class OpenAPIRenderPlugin(ABC):
         return _json.encode(openapi_schema).decode("utf-8")
 
     @abstractmethod
-    def render(self, openapi_schema: dict[str, Any], schema_url: str) -> str:
+    def render(self, openapi_schema: dict[str, Any], schema_url: str) -> str | dict[str, Any]:
         """Render the OpenAPI UI.
 
         Args:
@@ -75,7 +75,7 @@ class OpenAPIRenderPlugin(ABC):
             schema_url: URL to the OpenAPI JSON schema.
 
         Returns:
-            The rendered HTML or data as string.
+            The rendered text or schema dictionary.
         """
         raise NotImplementedError
 
@@ -311,6 +311,7 @@ class ScalarRenderPlugin(OpenAPIRenderPlugin):
                 """
 
         body = f"""
+              <body>
                 <noscript>
                     Scalar requires Javascript to function. Please enable it to browse the documentation.
                 </noscript>
@@ -320,6 +321,7 @@ class ScalarRenderPlugin(OpenAPIRenderPlugin):
                 </script>
                 {options_script}
                 <script src="{self.js_url}" crossorigin></script>
+              </body>
                 """
 
         return f"""

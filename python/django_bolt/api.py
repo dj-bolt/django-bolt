@@ -2861,13 +2861,13 @@ class BoltAPI:
 
         return self._openapi_schema
 
-    def _register_openapi_routes(self) -> None:
+    def _register_openapi_routes(self, *, middleware: list[Any] | None = None) -> None:
         """Register OpenAPI documentation routes.
 
         Delegates to OpenAPIRouteRegistrar for cleaner separation of concerns.
         """
 
-        registrar = OpenAPIRouteRegistrar(self)
+        registrar = OpenAPIRouteRegistrar(self, middleware=middleware)
         registrar.register_routes()
 
     def _register_admin_routes(self, host: str = "localhost", port: int = 8000) -> None:
