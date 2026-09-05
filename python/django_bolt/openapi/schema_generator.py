@@ -1065,7 +1065,7 @@ class SchemaGenerator:
             else:
                 # Opaque JSON: nothing to type. Recorded for strict mode.
                 self._opaque_operations.append(f"{method} {path}")
-                responses["200"] = OpenAPIResponse(
+                responses[str(default_status)] = OpenAPIResponse(
                     description="Successful response",
                     content={
                         "application/json": OpenAPIMediaType(schema=Schema(type="object")),
