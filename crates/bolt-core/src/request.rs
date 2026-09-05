@@ -352,8 +352,8 @@ impl PyRequest {
     ///
     /// Returns:
     ///     Async callable that returns the user when awaited.
-    ///     If Django middleware is not configured, returns a callable that
-    ///     returns AnonymousUser (matching Django's behavior).
+    ///     Otherwise, returns a callable for the Bolt user, or AnonymousUser
+    ///     if no user is set.
     #[getter]
     fn auser<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         // Get "auser" from state dict (set by Django middleware adapter)
@@ -362,11 +362,11 @@ impl PyRequest {
         match state_dict.get_item("auser") {
             Ok(Some(auser)) => Ok(auser.unbind()),
             _ => {
-                // Return async callable that returns AnonymousUser
-                // This matches Django's behavior when AuthenticationMiddleware isn't configured
+                // Share the Bolt user when no middleware provides an async getter.
                 let django_bolt_module = py.import("django_bolt.auth.anonymous")?;
                 let auser_fallback = django_bolt_module.getattr("auser_fallback")?;
-                Ok(auser_fallback.unbind())
+                let partial = py.import("functools")?.getattr("partial")?;
+                Ok(partial.call1((auser_fallback, self.user(py)))?.unbind())
             }
         }
     }
