@@ -532,6 +532,8 @@ async def create_user():
     return {"id": 1, "username": "john"}
 ```
 
+OpenAPI documents this status code even when the handler has no response annotation.
+
 ## Returning strings and bytes
 
 Returning a string creates a plain text response:
@@ -557,7 +559,7 @@ For 204 No Content responses:
 ```python
 from django_bolt import Response
 
-@api.delete("/items/{item_id}")
+@api.delete("/items/{item_id}", status_code=204)
 async def delete_item(item_id: int):
     # ... delete the item ...
     return Response(status_code=204)
