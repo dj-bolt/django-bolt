@@ -46,7 +46,7 @@ impl AsgiMount {
 }
 
 #[inline]
-fn find_mount_in_slice<'a>(mounts: &'a [AsgiMount], path: &str) -> Option<&'a AsgiMount> {
+pub fn find_mount_in_slice<'a>(mounts: &'a [AsgiMount], path: &str) -> Option<&'a AsgiMount> {
     // Mounts are pre-sorted by descending prefix length.
     mounts.iter().find(|mount| mount.matches_path(path))
 }
