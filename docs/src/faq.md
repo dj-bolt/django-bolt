@@ -67,7 +67,7 @@ Yes. Swagger UI, ReDoc, Scalar, RapiDoc, and Stoplight Elements are served at `/
 
 ## Which Python and Django versions are supported?
 
-Python 3.12, 3.13, 3.14 (CPython and PyPy). Django 4.2, 5.0, 5.1, 5.2, 6.0.
+Python 3.12, 3.13, 3.14 (CPython and PyPy), and the free-threaded build of CPython 3.14 (`3.14t`). Django 4.2, 5.0, 5.1, 5.2, 6.0, 6.1. See [Free-threaded Python](getting-started/deployment.md#free-threaded-python).
 
 ## Where can I get help?
 

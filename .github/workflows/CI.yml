@@ -19,9 +19,15 @@ jobs:
     name: Read Python versions from pyproject.toml
     runs-on: ubuntu-latest
     outputs:
+      # GIL builds only (one abi3 wheel covers them all).
       versions-json: ${{ steps.extract.outputs.versions-json }}
-      versions: ${{ steps.extract.outputs.versions }}
-      min-max-json: ${{ steps.extract.outputs.min-max-json }}
+      # GIL builds plus the free-threaded builds (3.14t, ...): the test matrix
+      # and the wheel `--interpreter` list. Free-threaded builds are emitted
+      # only while the "Free Threading" classifier is present.
+      test-versions-json: ${{ steps.extract.outputs.test-versions-json }}
+      interpreters: ${{ steps.extract.outputs.interpreters }}
+      # Oldest, newest, and newest free-threaded: the server-integration matrix.
+      integration-versions-json: ${{ steps.extract.outputs.integration-versions-json }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -42,9 +48,16 @@ jobs:
               key=lambda v: tuple(map(int, v.split("."))),
           )
           assert versions, "no 'Programming Language :: Python :: 3.X' classifiers in pyproject.toml"
+          # CPython supports free threading from 3.14; PyO3 0.29 dropped 3.13t.
+          free_threaded = (
+              [f"{v}t" for v in versions if tuple(map(int, v.split("."))) >= (3, 14)]
+              if any(c.startswith("Programming Language :: Python :: Free Threading") for c in classifiers)
+              else []
+          )
           print(f"versions-json={json.dumps(versions)}")
-          print(f"versions={' '.join(versions)}")
-          print(f"min-max-json={json.dumps([versions[0], versions[-1]])}")
+          print(f"test-versions-json={json.dumps(versions + free_threaded)}")
+          print(f"interpreters={' '.join(versions + free_threaded)}")
+          print(f"integration-versions-json={json.dumps([versions[0], versions[-1], *free_threaded[-1:]])}")
           EOF
 
   # Run tests across Python versions
@@ -55,7 +68,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ fromJSON(needs.python-versions.outputs.versions-json) }}
+        # Includes the free-threaded builds (e.g. 3.14t): `uv python install`
+        # resolves the "t" suffix, and maturin builds a cp314t module for it.
+        python-version: ${{ fromJSON(needs.python-versions.outputs.test-versions-json) }}
         # Newest supported Django on every Python; older Django series on the
         # newest Python each of them supports (see pyproject classifiers).
         django-version: ["6.1"]
@@ -85,7 +100,10 @@ jobs:
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           rustflags: "" # action defaults to -D warnings; don't block tests on warnings
@@ -137,7 +155,10 @@ jobs:
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           rustflags: "" # action defaults to -D warnings; don't block tests on warnings
@@ -158,7 +179,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ fromJSON(needs.python-versions.outputs.min-max-json) }}
+        python-version: ${{ fromJSON(needs.python-versions.outputs.integration-versions-json) }}
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -182,7 +203,10 @@ jobs:
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           rustflags: "" # action defaults to -D warnings; don't block tests on warnings
@@ -230,7 +254,10 @@ jobs:
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           rustflags: "" # action defaults to -D warnings; don't block tests on warnings
@@ -264,7 +291,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x86_64
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
           sccache: "true"
           manylinux: auto
           docker-options: --pull always
@@ -295,7 +322,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: aarch64
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
           sccache: "true"
           manylinux: auto
           docker-options: --pull always
@@ -317,11 +344,18 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up free-threaded Python
+        # The GIL interpreters come from the runner tool cache; the
+        # free-threaded one (python3.14t) must be installed for maturin to find.
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14t"
+
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: universal2-apple-darwin
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
           sccache: "true"
 
       - name: Upload wheels
@@ -341,11 +375,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up free-threaded Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14t"
+
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x64
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
           sccache: "true"
 
       - name: Upload wheels
@@ -476,7 +515,10 @@ jobs:
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           rustflags: "" # action defaults to -D warnings; don't block tests on warnings

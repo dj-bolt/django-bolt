@@ -249,9 +249,9 @@ BOLT_COMPRESSION = CompressionConfig(
 
 ## Workers vs Processes
 
-You might wonder about Actix's worker threads. Django-Bolt uses 1 worker per process by default because **Python's GIL is the bottleneck**, not Rust.
+Actix worker threads and Python processes scale different things. `--workers` sets the Actix worker threads in one process. `--processes` sets the number of processes.
 
-Workers are threads within a single process. Due to Python's Global Interpreter Lock, only one thread can execute Python code at a time. More workers just means more threads waiting:
+On a standard CPython build, Django-Bolt uses 1 worker thread per process. **Python's GIL is the bottleneck**, not Rust. Only one thread can run Python code at a time. More threads only wait:
 
 ```
 Process with 4 workers:
@@ -261,8 +261,32 @@ Process with 4 workers:
 └── Worker 3: [waiting for GIL]
 ```
 
-The Rust parts (HTTP parsing, routing, compression) take microseconds. Your Python handler takes milliseconds. You won't saturate the Rust side.
+The Rust parts (HTTP parsing, routing, compression) take microseconds. Your Python handler takes milliseconds. You will not saturate the Rust side.
 
-**Use processes for parallelism**, not workers. Each process has its own GIL, enabling true parallel execution.
+**Use processes for parallelism** on a standard build. Each process has its own GIL, so handlers run in parallel.
 
-`runbolt` currently pins one worker per process. Scale with `--processes` for parallelism.
+## Free-threaded Python
+
+Django-Bolt supports the free-threaded build of CPython 3.14 (`python3.14t`, [PEP 703](https://peps.python.org/pep-0703/)). Wheels for `cp314t` are on PyPI. The Rust extension declares that it does not need the GIL, so the interpreter keeps the GIL disabled when it imports `django_bolt`.
+
+With the GIL disabled, `runbolt` defaults `--workers` to the CPU count. Each Actix worker thread runs Python handlers, so one process runs handlers in parallel:
+
+```bash
+# One process, one worker thread per CPU
+python3.14t manage.py runbolt
+
+# Four processes with two worker threads each
+python3.14t manage.py runbolt --processes 4 --workers 2
+```
+
+The startup banner shows the mode, for example `Workers: 1 process · 8 threads each · free-threaded`.
+
+What runs in parallel:
+
+- Sync handlers, and async handlers that never await, run on the worker thread that accepted the request.
+- An async handler runs on the worker thread until its first suspension. After that, its continuations run on the process-wide worker loop, one at a time.
+- Auth, guards, CORS, rate limiting, and compression run in Rust, as on every build.
+
+Each worker thread holds its own Django database connection, as in any threaded server. Size your connection pool for `processes * workers`. Verify that your own code and third-party packages are thread-safe before you run them with the GIL disabled. Django itself does not yet declare free-threading support.
+
+To keep the GIL on a free-threaded interpreter, start Python with `-X gil=1` or set `PYTHON_GIL=1`. `runbolt` then uses 1 worker thread again.
