@@ -30,7 +30,15 @@ from ..middleware_response import (
 )
 
 try:
-    from asgiref.sync import async_to_sync, iscoroutinefunction, markcoroutinefunction, sync_to_async
+    from asgiref.sync import (
+        SyncToAsync,
+        ThreadSensitiveContext,
+        async_to_sync,
+        iscoroutinefunction,
+        markcoroutinefunction,
+        sync_to_async,
+    )
+    from django.db import connections
     from django.http import HttpRequest, HttpResponse, QueryDict
     from django.utils.functional import LazyObject, empty
     from django.utils.module_loading import import_string
@@ -39,9 +47,12 @@ try:
 except ImportError:
     DJANGO_AVAILABLE = False
     async_to_sync = None
+    ThreadSensitiveContext = None
+    SyncToAsync = None
     HttpRequest = None
     HttpResponse = None
     QueryDict = None
+    connections = None
     import_string = None
     sync_to_async = None
     iscoroutinefunction = None
@@ -76,6 +87,14 @@ _PRESERVED_BODY_KIND_ATTR = "_bolt_preserved_body_kind"
 _PRESERVED_BODY_KINDS = frozenset((_BODY_FILE, _BODY_STREAM))
 _REBUILT_BODY_HEADER_NAMES = frozenset(("content-length", "transfer-encoding"))
 _DEFAULT_DJANGO_RESPONSE_CONTENT_TYPE = "application/json"
+_SHARED_TEST_CONNECTION_ATTR = "_django_bolt_shared_test_connection"
+
+
+def _close_request_connections() -> None:
+    """Close request-owned connections before their worker thread exits."""
+    for connection in connections.all(initialized_only=True):
+        if not getattr(connection, _SHARED_TEST_CONNECTION_ATTR, False):
+            connection.close()
 
 
 class DjangoMiddleware:
@@ -648,6 +667,20 @@ class DjangoMiddlewareStack:
         return chain
 
     async def __call__(self, request: Request) -> Response:
+        """Run the complete Django stack in one request-owned sync context."""
+        # Django's ASGI handler uses this boundary. It keeps thread-local
+        # middleware state and later thread-sensitive ORM work on one thread.
+        async with ThreadSensitiveContext() as thread_context:
+            try:
+                return await self._call(request)
+            finally:
+                # Do not create a worker for an async-only request. When work
+                # used the request executor, close its thread-local DB state
+                # before ThreadSensitiveContext shuts that executor down.
+                if thread_context in SyncToAsync.context_to_thread_executor:
+                    await sync_to_async(_close_request_connections, thread_sensitive=True)()
+
+    async def _call(self, request: Request) -> Response:
         """
         Process request through the Django middleware stack.
 

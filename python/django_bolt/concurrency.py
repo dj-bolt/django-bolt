@@ -18,6 +18,8 @@ import threading
 from collections.abc import Callable
 from functools import partial
 
+from asgiref.sync import SyncToAsync, sync_to_async
+
 logger = logging.getLogger(__name__)
 
 __all__ = ("in_orm_executor_thread", "run_in_orm_executor", "run_orm_blocking", "sync_to_thread")
@@ -200,6 +202,12 @@ async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
     a rare path, in exchange for neither deadlocking nor tripping the
     async-unsafe check.
     """
+    # A Django middleware stack owns thread-local request state, such as a
+    # tenant-selected database schema. Its ThreadSensitiveContext requires
+    # every ORM call to use the request's dedicated worker.
+    if SyncToAsync.thread_sensitive_context.get(None) is not None:
+        return await sync_to_async(fn, thread_sensitive=True)(*args)
+
     ctx = contextvars.copy_context()
     loop = asyncio.get_running_loop()
     if in_orm_executor_thread():
