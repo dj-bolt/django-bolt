@@ -38,7 +38,7 @@ from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler
 from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import default_django_user_loader, resolve_user_loader
-from .concurrency import run_in_orm_executor, sync_to_thread
+from .concurrency import _drop_broken_connections, run_in_orm_executor, sync_to_thread
 from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
 from .error_handlers import handle_exception, http_exception_handler
 from .exceptions import HTTPException
@@ -2788,6 +2788,9 @@ class BoltAPI:
             # BlackSheep pattern: only log unhandled exceptions (rare path)
             if self._logging_middleware:
                 self._logging_middleware.log_exception(request, e, exc_info=True)
+            # A handler that ran the ORM inline on this thread may have left
+            # a dead connection behind; drop it so the next request reconnects.
+            _drop_broken_connections()
             return self._handle_generic_exception(e, request=request)
         finally:
             # Auto-cleanup UploadFiles to prevent resource leaks
@@ -2839,6 +2842,9 @@ class BoltAPI:
             # BlackSheep pattern: only log unhandled exceptions (rare path)
             if self._logging_middleware:
                 self._logging_middleware.log_exception(request, e, exc_info=True)
+            # A handler that ran the ORM inline on this thread may have left
+            # a dead connection behind; drop it so the next request reconnects.
+            _drop_broken_connections()
             return self._handle_generic_exception(e, request=request)
         finally:
             if meta["has_file_uploads"]:

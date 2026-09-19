@@ -318,16 +318,10 @@ BOLT_EMIT_SIGNALS = True
 
 Django-Bolt disables signals by default for maximum performance. Enable this setting when:
 
-- Using `CONN_MAX_AGE` with a value other than `None` (required for connection recycling)
-- Using third-party packages that depend on request signals (e.g., django-debug-toolbar)
+- Using third-party packages that depend on request signals (e.g. django-debug-toolbar)
 - Implementing custom signal receivers for request lifecycle events
 
-!!! warning "Required for CONN_MAX_AGE"
-    If you set `CONN_MAX_AGE=600` (or any non-None value), you **must** enable signals for Django to properly close old connections:
-    ```python
-    CONN_MAX_AGE = 600
-    BOLT_EMIT_SIGNALS = True  # Required!
-    ```
+`CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` do not need signals. Bolt runs Django's connection check on the executor thread when a database sets either of them. See [Database Connection Management](../topics/signals.md#database-connection-management).
 
 See [Django Signals](../topics/signals.md) for detailed documentation.
 
