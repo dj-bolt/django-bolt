@@ -291,6 +291,44 @@ Because each worker thread has its own asyncio loop, loop-bound objects (`asynci
 
 Module-level constants that every request reads do not scale with threads on a free-threaded build: the interpreter must synchronize their reference counts across threads. Build the response per request, or split the constant per thread.
 
-Each worker thread holds its own Django database connection, as in any threaded server. Size your connection pool for `processes * workers`. Verify that your own code and third-party packages are thread-safe before you run them with the GIL disabled. Django itself does not yet declare free-threading support.
+Each worker thread holds its own Django database connection, as in any threaded server. Each pool thread also holds one. Verify that your own code and third-party packages are thread-safe before you run them with the GIL disabled. Django itself does not yet declare free-threading support.
+
+### Size the database thread pools
+
+An async handler that returns a QuerySet does not run the query on its worker thread. Django-Bolt evaluates the QuerySet on the ORM thread pool. One process has one ORM pool, and all worker threads in that process share it.
+
+The pool has 1 thread when every database is SQLite, and 4 threads for other databases. These defaults fit a build with the GIL, where more threads in one process add no parallelism. With the GIL disabled, a small pool becomes the limit: the worker threads wait for it and the CPUs stay idle.
+
+Set `DJANGO_BOLT_ORM_THREADS` when you run many worker threads in one process:
+
+```bash
+# 12 worker threads share 8 ORM threads
+DJANGO_BOLT_ORM_THREADS=8 python3.14t manage.py runbolt --workers 12
+```
+
+Measured on the example project (SQLite, 12 hardware threads, 100 connections, async handler that returns 10 users):
+
+| Configuration | ORM threads | Requests per second |
+|---|---|---|
+| `python3.14t`, 1 process, 12 workers | 1 (default) | 4,771 |
+| `python3.14t`, 1 process, 12 workers | 4 | 14,689 |
+| `python3.14t`, 1 process, 12 workers | 8 | 20,357 |
+| `python3.14`, 1 process, 12 workers | 1 (default) | 3,260 |
+| `python3.14`, 1 process, 12 workers | 8 | 1,907 |
+| `python3.14`, 8 processes, 1 worker each | 1 per process | 20,799 |
+
+One free-threaded process with 8 ORM threads equals 8 processes with the GIL. Do not increase the pool on a build with the GIL: there, more SQLite connections decrease throughput.
+
+Start with one ORM thread for every one or two worker threads, then measure. Each ORM thread holds one database connection. Size your database connection limit for `processes * (workers + ORM threads)`.
+
+A blocking sync handler does not use the ORM pool. It runs on the shared executor pool, which has `CPU count + 4` threads (maximum 32). Set `DJANGO_BOLT_EXECUTOR_THREADS` to change it.
+
+An async handler that reads the lazy `request.user` blocks its worker thread until the ORM pool loads the user. In an async handler, prefer `await request.auser()`.
+
+### Compare equal topologies
+
+Compare a free-threaded server and a server with the GIL at the same process and worker counts. Eight processes with the GIL already run handlers in parallel, so a free-threaded build cannot exceed them by a large margin. The free-threaded build gives the same throughput from one process. One process loads your project once and lets worker threads share in-process state.
+
+In one process with 12 workers, the free-threaded build measured 1.5 to 12 times the throughput of the GIL build on the database endpoints.
 
 To keep the GIL on a free-threaded interpreter, start Python with `-X gil=1` or set `PYTHON_GIL=1`. `runbolt` then uses 1 worker thread again.
