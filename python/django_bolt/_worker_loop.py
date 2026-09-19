@@ -1,14 +1,18 @@
-"""Process-lived asyncio loop used by Bolt's worker-local HTTP dispatch.
+"""Per-worker-thread asyncio loop used by Bolt's HTTP dispatch.
 
-The loop keeps one identity for the life of the process.  It is a real
-``asyncio.SelectorEventLoop`` subclass, so transports, ``sock_*`` helpers,
-DNS, pipes, TLS, and subprocesses come from the stdlib; the ready queue,
-timers, signals, and file-descriptor readiness are driven by Rust/Tokio
-(see ``src/worker_loop.rs`` and ``src/worker_fd.rs``).
+Each Actix worker thread owns one loop for the life of the process, pumped
+by Tokio on that same thread. Entry points that are not Actix workers
+(``TestClient``, MCP transports) share one loop whose pump task migrates
+between Tokio runtime threads.  It is a real ``asyncio.SelectorEventLoop``
+subclass, so transports, ``sock_*`` helpers, DNS, pipes, TLS, and
+subprocesses come from the stdlib; the ready queue, timers, signals, and
+file-descriptor readiness are driven by Rust/Tokio (see
+``crates/bolt-loop``).
 
-Callbacks may resume on a different OS thread after a suspension (the Tokio
-pump task can migrate between worker threads).  Contextvars are preserved via
-Handle contexts; ``threading.local`` state is not carried across awaits.
+On a worker thread's loop, callbacks resume on that same thread, so
+``threading.local`` state (Django DB connections) survives an await.  On the
+shared loop, callbacks may resume on a different OS thread; contextvars are
+preserved via Handle contexts.
 
 Known deviation from stdlib loops: ``remove_signal_handler`` stops delivering
 the signal to Python but cannot restore the default disposition — Tokio's
@@ -46,8 +50,10 @@ class _NoSelector(selectors.BaseSelector):
 class WorkerLoop(asyncio.SelectorEventLoop):
     """An asyncio loop whose ready queue and reactor are serviced by Tokio.
 
-    There is one instance per process, so tasks may outlive an HTTP response
-    and loop-bound objects can safely be reused by later requests.  The stdlib
+    Each instance lives as long as the process, so tasks may outlive an HTTP
+    response and loop-bound objects can safely be reused by later requests on
+    the same worker thread.  Loop-bound objects (locks, queues, futures) must
+    not be shared between worker threads: each thread has its own loop.  The stdlib
     selector loop supplies transports, ``sock_*`` helpers, DNS, pipes, TLS,
     and subprocesses; this subclass replaces the four primitives they are all
     built on (``_add_reader``/``_add_writer``/``_remove_reader``/
@@ -77,7 +83,7 @@ class WorkerLoop(asyncio.SelectorEventLoop):
         return None
 
     def __del__(self):
-        # Process-lived: never warn or close from the finalizer.
+        # Lives as long as the process: never warn or close from the finalizer.
         return None
 
     def is_running(self):

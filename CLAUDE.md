@@ -23,7 +23,7 @@ Supported: Python 3.12–3.14 (source of truth: `pyproject.toml` classifiers), D
 Cargo workspace, layered bottom-up with no back-edges: `bolt-loop` → `bolt-core` → {`bolt-asgi`, `bolt-websocket`, `bolt-mcp`} → root `django-bolt` (`src/`, the `_core` PyO3 module).
 
 - `src/` — `lib.rs` (module entry), `server.rs` (Actix + tokio, CORS/compression), `handler.rs` (dispatch, `DispatchOutcome`), `testing.rs` (`TestClient` backend), `dev_reload.rs`
-- `crates/bolt-loop` — process-lived asyncio `WorkerLoop` (a real `SelectorEventLoop` on the Tokio reactor), timer thread
+- `crates/bolt-loop` — per-worker-thread asyncio `WorkerLoop` (a real `SelectorEventLoop` on the Tokio reactor; one shared loop for TestClient/MCP), timer thread
 - `crates/bolt-core` — router (matchit), `request_pipeline.rs`, `validation.rs`, `type_coercion.rs`, `middleware/` (auth, rate_limit), `permissions.rs`, `streaming.rs`, `response_meta.rs` / `response_builder.rs`, `form_parsing.rs`, `metadata.rs`, `error.rs`
 - `crates/bolt-asgi`, `crates/bolt-websocket`, `crates/bolt-mcp` — ASGI mounts, WebSocket, MCP transport (rmcp)
 - `python/django_bolt/` — `api.py` (BoltAPI, decorators, `_dispatch`/`_dispatch_sync`), `_kwargs/` (param extraction/injectors), `serialization.py` (ResponseWireV1, meta tags), `responses.py`, `params.py`, `dependencies.py`, `auth/`, `middleware/` (`compiler.py` → Rust metadata), `serializers/`, `openapi/`, `pagination.py`, `viewsets.py`, `concurrency.py`, `workers.py`, `management/commands/runbolt.py`, `testing/`
@@ -34,7 +34,7 @@ Cargo workspace, layered bottom-up with no back-edges: `bolt-loop` → `bolt-cor
 - **ResponseWireV1**: Python returns `(status, meta, body_kind, body)`; meta is an int tag (0=JSON,1=text,2=octet,3=empty → static Rust `ResponseMeta`) or a `(response_type, custom_ct, headers, cookies)` tuple; body_kind 0=bytes (zero-copy `PyBackedBytes`), 1=stream, 2=file. Sync routes may return bare `bytes` for (default status, JSON). New common response type ⇒ add both the Python constant and the Rust static.
 - **Cookies are serialized in Rust** from raw 9-tuples; `MiddlewareResponse` never serializes them.
 - **Executors**: QuerySet-returning async handlers evaluate on the bounded ORM pool (`concurrency.run_in_orm_executor`, `DJANGO_BOLT_ORM_THREADS`); generic `sync_to_thread` shares one bounded default pool (`DJANGO_BOLT_EXECUTOR_THREADS`). Do not add another implicit pool. Avoid `async for`/`acount()` on hot paths; return the QuerySet.
-- **WorkerLoop** callbacks may resume on a different OS thread (contextvars survive, `threading.local` does not). Keep the pump fast (`call_soon` ≈ 0.75–0.85x uvloop).
+- **WorkerLoop**: one per Actix worker thread, pumped on that thread (callbacks resume on the same thread). The shared loop (TestClient, MCP) may resume on a different OS thread (contextvars survive, `threading.local` does not). Keep the pump fast (`call_soon` ≈ 0.75–0.85x uvloop).
 - Auth, guards, CORS, rate limiting, compression run in Rust without the GIL; middleware config is compiled to Rust metadata at startup.
 
 ## Hot-path rules
