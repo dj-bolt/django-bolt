@@ -4,6 +4,7 @@ use bolt_core::request::PyRequest;
 
 mod dev_reload;
 mod handler;
+mod response_body;
 mod server;
 mod testing;
 

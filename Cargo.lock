@@ -955,6 +955,7 @@ dependencies = [
  "parking_lot",
  "pyo3",
  "pyo3-async-runtimes",
+ "pyo3-build-config",
  "regex",
  "socket2 0.6.2",
  "tikv-jemallocator",
