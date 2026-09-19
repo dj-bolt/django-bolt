@@ -283,9 +283,13 @@ The startup banner shows the mode, for example `Workers: 1 process · 8 threads 
 
 What runs in parallel:
 
-- Sync handlers, and async handlers that never await, run on the worker thread that accepted the request.
-- An async handler runs on the worker thread until its first suspension. After that, its continuations run on the process-wide worker loop, one at a time.
+- Sync handlers, and async handlers that never await, run on the worker thread that accepted the request. A sync handler that Django-Bolt detects as blocking (ORM access, `time.sleep`, `requests`) runs on the shared executor pool instead, so it does not stall the worker thread.
+- Each worker thread owns its own asyncio loop. An async handler runs on the worker thread that accepted the request, and it resumes on that same thread after each await. Handlers on different worker threads run in parallel.
 - Auth, guards, CORS, rate limiting, and compression run in Rust, as on every build.
+
+Because each worker thread has its own asyncio loop, loop-bound objects (`asyncio.Lock`, `asyncio.Queue`, futures) cannot be shared between handlers on different worker threads. Treat worker threads like processes for shared asyncio state. With `--workers 1` (the default with the GIL) there is one loop, as before.
+
+Module-level constants that every request reads do not scale with threads on a free-threaded build: the interpreter must synchronize their reference counts across threads. Build the response per request, or split the constant per thread.
 
 Each worker thread holds its own Django database connection, as in any threaded server. Size your connection pool for `processes * workers`. Verify that your own code and third-party packages are thread-safe before you run them with the GIL disabled. Django itself does not yet declare free-threading support.
 

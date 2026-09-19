@@ -22,6 +22,7 @@ import sys
 import sysconfig
 from concurrent.futures import ThreadPoolExecutor
 
+import httpx
 import pytest
 
 from django_bolt.management.commands.runbolt import default_worker_threads
@@ -96,7 +97,17 @@ def test_real_server_keeps_interpreter_gil_state_under_load(make_server_project)
     GIL. The load phase drives sync, trivially-async, and awaiting routes from
     16 client threads at once.
     """
-    project = make_server_project(api_module=app_module("free_threading"))
+    # The harness reads logs at shutdown. Keep successful requests out of that pipe.
+    project = make_server_project(
+        api_module=app_module("free_threading"),
+        settings_extra="""
+        LOGGING = {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "loggers": {"django.server": {"level": "WARNING"}},
+        }
+        """,
+    )
 
     with project.start() as server:
         assert server.get("/gil").json() == {
@@ -126,6 +137,40 @@ def test_runbolt_workers_option_sets_actix_threads(make_server_project):
 
     assert "3 threads each" in stdout, stdout
     assert ("free-threaded" in stdout) is GIL_DISABLED, stdout
+
+
+@pytest.mark.server_integration
+def test_async_handlers_stay_on_their_worker_thread(make_server_project):
+    """Each Actix worker thread owns one WorkerLoop.
+
+    An async handler resumes on the thread that accepted its request, so
+    ``threading.local`` state (Django DB connections) survives an await, and
+    two worker threads never run callbacks of one asyncio loop at once.
+    """
+    project = make_server_project(api_module=app_module("free_threading"))
+    requests_per_thread = 8
+
+    with project.start(extra_args=["--workers", "2"]) as server:
+
+        def worker(worker_id: int) -> list[dict]:
+            bodies = []
+            with httpx.Client(timeout=30) as client:
+                for i in range(requests_per_thread):
+                    n = worker_id * 100 + i
+                    response = client.get(server.url(f"/thread/{n}"))
+                    assert response.status_code == 200, response.text
+                    bodies.append(response.json())
+            return bodies
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            bodies = [body for batch in pool.map(worker, range(16)) for body in batch]
+
+    moved = [body for body in bodies if body["thread_before"] != body["thread_after"]]
+    assert not moved, moved[:3]
+    loops_by_thread = {body["thread_before"]: body["loop"] for body in bodies}
+    # 16 keep-alive connections reach both Actix workers.
+    assert len(loops_by_thread) == 2, loops_by_thread
+    assert len(set(loops_by_thread.values())) == 2, loops_by_thread
 
 
 @pytest.mark.server_integration

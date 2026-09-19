@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - **Free-threaded Python** - Django-Bolt now runs on the free-threaded build of CPython 3.14 (`python3.14t`, PEP 703). The Rust extension declares `gil_used = false`, so the interpreter keeps the GIL disabled when it imports `django_bolt`. CI tests the full suite on `3.14t` and publishes `cp314t` wheels next to the `abi3` wheels. The stable-ABI wheels still cover every GIL build from 3.12.
 - **`runbolt --workers`** - Sets the Actix worker threads per process. The default is 1 with the GIL and the CPU count on a free-threaded interpreter. Each thread runs Python handlers, so a free-threaded process runs sync handlers in parallel. The startup banner shows the thread count and `free-threaded` when the GIL is off.
+- **One asyncio loop per worker thread** - Each Actix worker thread owns its own `WorkerLoop`, pumped on that thread. An async handler resumes on the thread that accepted its request, so `threading.local` state survives an await and worker threads run async handlers in parallel. Before, every thread fed one shared loop, which serialized all awaits on one thread. Loop-bound asyncio objects cannot be shared between worker threads.
 
 ## [0.11.0]
 
