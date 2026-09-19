@@ -300,6 +300,11 @@ async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.
     # The caller's contextvars context is carried into the thread via ctx.run.
     # run_in_executor only forwards positional args — keyword args (e.g. Rust
     # prebound keyword-bound params) must be bound via partial.
+    # A Django middleware stack owns thread-local request state. Use the
+    # request's dedicated worker, as run_in_orm_executor does.
+    if SyncToAsync.thread_sensitive_context.get(None) is not None:
+        return await sync_to_async(_call_guarded, thread_sensitive=True)(fn, *args, **kwargs)
+
     loop = asyncio.get_running_loop()
     ctx = contextvars.copy_context()
     if kwargs:

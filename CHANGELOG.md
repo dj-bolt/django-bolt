@@ -11,6 +11,10 @@ All notable changes to this project will be documented in this file.
 - **One asyncio loop per worker thread** - Each Actix worker thread owns its own `WorkerLoop`, pumped on that thread. An async handler resumes on the thread that accepted its request, so `threading.local` state survives an await and worker threads run async handlers in parallel. Before, every thread fed one shared loop, which serialized all awaits on one thread. Loop-bound asyncio objects cannot be shared between worker threads.
 - **Dead database connections are dropped on error** - Bolt keeps Django connections open across requests. When a handler or QuerySet evaluation on the executor pool raises, Bolt now runs Django's `close_if_unusable_or_obsolete()` on that thread, so a broken connection does not fail every later request on the same thread. The check adds no cost on the success path. When a database sets `CONN_MAX_AGE` or `CONN_HEALTH_CHECKS`, the same check also runs before each executor call, so timed recycling and health checks work without `BOLT_EMIT_SIGNALS`.
 
+### Fixed
+
+- **Django middleware state stays with its request** - Middleware that keeps request state in `threading.local`, such as the tenant schema of django-tenants, leaked that state between concurrent requests. `DjangoMiddleware` and `DjangoMiddlewareStack` now run each request in an asgiref `ThreadSensitiveContext`, as Django's ASGI handler does. The middleware, sync handlers, `sync_to_thread`, QuerySet evaluation, and Django's async ORM calls all use one thread per request. Bolt closes the database connections of that thread when the request ends. A request that runs no sync code creates no thread. Each such request opens its own database connection, thus use a connection pooler such as PgBouncer under high concurrency.
+
 ## [0.11.0]
 
 ### Removed

@@ -97,6 +97,25 @@ def _close_request_connections() -> None:
             connection.close()
 
 
+async def _run_request_affine(call: Callable, request: Request) -> Response:
+    """Run ``call`` in one request-owned sync context."""
+    # Django's ASGI handler uses this boundary. It keeps thread-local
+    # middleware state and later thread-sensitive work on one thread.
+    # An outer Django wrapper already owns the context. A nested context
+    # would move the inner work to a different thread.
+    if SyncToAsync.thread_sensitive_context.get(None) is not None:
+        return await call(request)
+    async with ThreadSensitiveContext() as thread_context:
+        try:
+            return await call(request)
+        finally:
+            # Do not create a worker for an async-only request. When work
+            # used the request executor, close its thread-local DB state
+            # before ThreadSensitiveContext shuts that executor down.
+            if thread_context in SyncToAsync.context_to_thread_executor:
+                await sync_to_async(_close_request_connections, thread_sensitive=True)()
+
+
 class DjangoMiddleware:
     """
     Wraps a Django middleware class to work with Django-Bolt.
@@ -240,6 +259,10 @@ class DjangoMiddleware:
         self._middleware_is_async = iscoroutinefunction(self._middleware_instance)
 
     async def __call__(self, request: Request) -> Response:
+        """Run the Django middleware in one request-owned sync context."""
+        return await _run_request_affine(self._call, request)
+
+    async def _call(self, request: Request) -> Response:
         """
         Process request through the Django middleware.
 
@@ -668,17 +691,7 @@ class DjangoMiddlewareStack:
 
     async def __call__(self, request: Request) -> Response:
         """Run the complete Django stack in one request-owned sync context."""
-        # Django's ASGI handler uses this boundary. It keeps thread-local
-        # middleware state and later thread-sensitive ORM work on one thread.
-        async with ThreadSensitiveContext() as thread_context:
-            try:
-                return await self._call(request)
-            finally:
-                # Do not create a worker for an async-only request. When work
-                # used the request executor, close its thread-local DB state
-                # before ThreadSensitiveContext shuts that executor down.
-                if thread_context in SyncToAsync.context_to_thread_executor:
-                    await sync_to_async(_close_request_connections, thread_sensitive=True)()
+        return await _run_request_affine(self._call, request)
 
     async def _call(self, request: Request) -> Response:
         """
