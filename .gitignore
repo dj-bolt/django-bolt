@@ -8,6 +8,7 @@ wheels/
 target/
 # Virtual environments
 .venv
+.venv-ft
 ignore/
 db.sqlite3
 python/django_bolt/_core.cpython-312-x86_64-linux-gnu.so
