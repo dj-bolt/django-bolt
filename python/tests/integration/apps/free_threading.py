@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import sysconfig
+import threading
 
 from django_bolt import BoltAPI
 from django_bolt.responses import StreamingResponse
@@ -60,6 +61,15 @@ async def awaiting_route(n: int):
     await asyncio.sleep(0)
     parts = await asyncio.gather(*(_double(i) for i in range(3)))
     return {"n": n, "kind": "awaiting", "parts": list(parts)}
+
+
+@api.get("/thread/{n}")
+async def thread_route(n: int):
+    """Reports the OS thread and loop before and after a real suspension."""
+    before = threading.get_ident()
+    loop_id = id(asyncio.get_running_loop())
+    await asyncio.sleep(0)
+    return {"n": n, "thread_before": before, "thread_after": threading.get_ident(), "loop": loop_id}
 
 
 @api.get("/stream/{n}")

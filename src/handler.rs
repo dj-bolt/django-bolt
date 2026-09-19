@@ -1348,8 +1348,8 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             };
             Ok(DispatchOutcome::Ready(response))
         } else {
-            // ASYNC PATH: submit to the process-lived WorkerLoop whose ready
-            // queue is serviced by a persistent Tokio pump.
+            // ASYNC PATH: submit to this worker thread's WorkerLoop, whose
+            // ready queue is serviced by a persistent Tokio pump on this thread.
             let dispatch = route.dispatch.clone_ref(py);
             let fut = bolt_loop::dispatch(dispatch, request_obj.into());
             Ok(DispatchOutcome::Pending(Box::pin(fut)))
