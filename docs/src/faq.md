@@ -163,7 +163,7 @@ Python 3.12, 3.13, 3.14 (CPython and PyPy), and the free-threaded build of CPyth
    "name": "Which Python and Django versions are supported?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "Python 3.12, 3.13, 3.14 (CPython and PyPy). Django 4.2, 5.0, 5.1, 5.2, 6.0."
+    "text": "Python 3.12, 3.13, 3.14 (CPython and PyPy), and the free-threaded build of CPython 3.14 (3.14t). Django 4.2, 5.0, 5.1, 5.2, 6.0, 6.1."
    }
   }
  ]

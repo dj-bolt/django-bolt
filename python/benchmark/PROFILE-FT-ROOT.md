@@ -27,8 +27,8 @@ The relevant code is:
 
 - [Response ownership](../../src/handler.rs#L1288): `PyBackedBytes` and `Bytes::from_owner`.
 - [Python dispatch](../django_bolt/api.py#L2824): metadata lookup and `request.get("auth")`.
-- [PyO3 reference release](/home/farhan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-0.29.2/src/instance.rs:2284).
-- [PyO3 queue and mutex](/home/farhan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-0.29.2/src/internal/state.rs:191).
+- PyO3 reference release: `pyo3-0.29.2`, `src/instance.rs`, line 2284.
+- PyO3 queue and mutex: `pyo3-0.29.2`, `src/internal/state.rs`, line 191.
 
 Native stacks captured this wait on root requests:
 

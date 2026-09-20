@@ -107,7 +107,8 @@ A separate probe measures this life cycle alone. Each thread repeats: create a o
 One executor cycle is 2.8 times slower on FT.
 Twelve FT threads give only 2.8 times the rate of one thread.
 Eight GIL processes do not share the lock, so their capacity is about 8 × 12k cycles per second.
-This explains why FT loses on this route in both topologies (3.2k and 3.9k against 6.5k).
+This explains why both FT topologies lose on this route against GIL 8 × 1 (3.2k and 3.9k against 6.5k).
+At 1 × 12, FT is faster than GIL (3.2k against 0.7k).
 The per-request executor came with the request-affine middleware change (PR #338).
 
 ## Limits

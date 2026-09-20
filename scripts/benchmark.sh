@@ -110,7 +110,7 @@ stop_server() {
 trap stop_server EXIT INT TERM
 
 start_server() {
-  $SETSID_BIN uv run python manage.py runbolt --host $HOST --port $PORT --processes $P --workers $WORKERS >/dev/null 2>&1 &
+  ${SETSID_BIN:+"$SETSID_BIN"} uv run python manage.py runbolt --host "$HOST" --port "$PORT" --processes "$P" --workers "$WORKERS" >/dev/null 2>&1 &
   SERVER_PID=$!
   SERVER_PGID=$(ps -o pgid= -p "$SERVER_PID" | tr -d ' ')
   if [ -z "$SERVER_PGID" ] || [ "$SERVER_PGID" != "$SERVER_PID" ]; then
