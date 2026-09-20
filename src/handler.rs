@@ -865,6 +865,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     let skip_cors = plan.map_or(false, |p| p.skip_cors());
     let skip_compression = plan.map_or(false, |p| p.skip_compression());
     let can_sync_dispatch = plan.map_or(false, |p| p.can_sync_dispatch());
+    let can_lane_dispatch = plan.map_or(false, |p| p.can_lane_dispatch());
     let is_async_handler = plan.map_or(false, |p| p.is_async());
 
     // Extract and validate headers
@@ -1347,6 +1348,13 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 }
             };
             Ok(DispatchOutcome::Ready(response))
+        } else if can_lane_dispatch {
+            // LANE PATH: one lane thread runs the complete sync request (bolt_core::lane).
+            let fut = bolt_core::lane::dispatch(
+                route.dispatch_sync.clone_ref(py),
+                request_obj.into_any(),
+            );
+            Ok(DispatchOutcome::Pending(Box::pin(fut)))
         } else {
             // ASYNC PATH: submit to this worker thread's WorkerLoop, whose
             // ready queue is serviced by a persistent Tokio pump on this thread.

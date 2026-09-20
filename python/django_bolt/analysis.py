@@ -256,6 +256,10 @@ class HandlerAnalysis:
         return self.uses_orm or self.has_blocking_io
 
 
+# Names that django.db exports for database connections.
+DB_CONNECTION_NAMES = frozenset(("connection", "connections"))
+
+
 class OrmVisitor(ast.NodeVisitor):
     """
     AST visitor that detects Django ORM usage patterns.
@@ -338,6 +342,14 @@ class OrmVisitor(ast.NodeVisitor):
         # Check for .objects manager access
         if attr_name in ORM_MANAGER_ATTRS:
             self.analysis.uses_orm = True
+
+        # A raw cursor is blocking database work too: connection.cursor() and
+        # connections["alias"].cursor().
+        if attr_name == "cursor":
+            owner = node.value.value if isinstance(node.value, ast.Subscript) else node.value
+            if isinstance(owner, ast.Name) and owner.id in DB_CONNECTION_NAMES:
+                self.analysis.uses_orm = True
+                self.analysis.orm_operations.add("cursor")
 
         # Check for ORM method calls - ONLY if in an .objects chain
         # This reduces false positives like dict.get(), response.get(), etc.

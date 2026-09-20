@@ -19,8 +19,11 @@ import contextvars
 import functools
 import io
 from collections.abc import Callable
+from inspect import iscoroutine
 from typing import TYPE_CHECKING, Any
 
+from .._core import RequestLane
+from ..concurrency import drive_on_lane, in_lane_mode
 from ..middleware_response import (
     _BODY_BYTES,
     _BODY_FILE,
@@ -30,8 +33,16 @@ from ..middleware_response import (
 )
 
 try:
-    from asgiref.sync import async_to_sync, iscoroutinefunction, markcoroutinefunction, sync_to_async
+    from asgiref.sync import (
+        SyncToAsync,
+        ThreadSensitiveContext,
+        async_to_sync,
+        iscoroutinefunction,
+        markcoroutinefunction,
+        sync_to_async,
+    )
     from django.http import HttpRequest, HttpResponse, QueryDict
+    from django.utils.deprecation import MiddlewareMixin
     from django.utils.functional import LazyObject, empty
     from django.utils.module_loading import import_string
 
@@ -39,10 +50,13 @@ try:
 except ImportError:
     DJANGO_AVAILABLE = False
     async_to_sync = None
+    ThreadSensitiveContext = None
+    SyncToAsync = None
     HttpRequest = None
     HttpResponse = None
     QueryDict = None
     import_string = None
+    MiddlewareMixin = None
     sync_to_async = None
     iscoroutinefunction = None
     markcoroutinefunction = None
@@ -76,6 +90,53 @@ _PRESERVED_BODY_KIND_ATTR = "_bolt_preserved_body_kind"
 _PRESERVED_BODY_KINDS = frozenset((_BODY_FILE, _BODY_STREAM))
 _REBUILT_BODY_HEADER_NAMES = frozenset(("content-length", "transfer-encoding"))
 _DEFAULT_DJANGO_RESPONSE_CONTENT_TYPE = "application/json"
+# Attributes that HttpRequest.__init__ sets, and those that Bolt copies by name.
+# All other public attributes come from middleware and go to request.state.
+# This is a literal set: HttpRequest() needs configured settings, and
+# nanodjango imports this module before it configures them.
+_STANDARD_REQUEST_ATTRS = frozenset(
+    (
+        "GET",
+        "POST",
+        "COOKIES",
+        "META",
+        "FILES",
+        "path",
+        "path_info",
+        "method",
+        "resolver_match",
+        "content_type",
+        "content_params",
+        # cached_property values land in __dict__ after the first read.
+        "headers",
+        "accepted_types",
+        "accepted_types_by_precedence",
+        "user",
+        "auser",
+        "session",
+        "csrf_processing_done",
+        "csrf_cookie_needs_reset",
+    )
+)
+
+
+async def _run_request_affine(call: Callable, request: Request) -> Response:
+    """Run ``call`` with one request-owned thread for its sync work."""
+    # This is the boundary of Django's ASGI handler (ThreadSensitiveContext).
+    # The request takes a Rust lane at its first sync call (see lane.rs).
+    # A lane or an outer Django wrapper that owns the thread gets no nested context.
+    if in_lane_mode() or SyncToAsync.thread_sensitive_context.get(None) is not None:
+        return await call(request)
+    context = ThreadSensitiveContext()
+    lane = RequestLane()
+    SyncToAsync.context_to_thread_executor[context] = lane
+    token = SyncToAsync.thread_sensitive_context.set(context)
+    try:
+        return await call(request)
+    finally:
+        SyncToAsync.thread_sensitive_context.reset(token)
+        del SyncToAsync.context_to_thread_executor[context]
+        lane.release()
 
 
 class DjangoMiddleware:
@@ -125,6 +186,8 @@ class DjangoMiddleware:
         "get_response",
         "_middleware_instance",
         "_middleware_is_async",
+        "_sync_call_override",
+        "_lane_instance",
     )
 
     def __init__(self, middleware_class_or_get_response: type | str | Callable, **init_kwargs: Any):
@@ -164,6 +227,8 @@ class DjangoMiddleware:
         self.get_response = None
         self._middleware_instance = None
         self._middleware_is_async = None
+        self._sync_call_override = False
+        self._lane_instance = None
 
     def _create_middleware_instance(self, get_response: Callable) -> None:
         """
@@ -198,11 +263,13 @@ class DjangoMiddleware:
 
             bolt_request = ctx["bolt_request"]
 
+            # Copy the middleware attributes before the handler reads them.
+            _sync_request_attributes(django_request, bolt_request)
+
             # Await the async get_response directly - no bridging needed
             bolt_resp = await self.get_response(bolt_request)
 
             ctx["bolt_response"] = bolt_resp
-            _sync_request_attributes(django_request, bolt_request)
             return _to_django_response(bolt_resp)
 
         # Mark the bridge as a coroutine function so Django's MiddlewareMixin
@@ -219,8 +286,47 @@ class DjangoMiddleware:
         # by wrapping them in sync_to_async. Doing it ourselves causes double-wrapping
         # and severe performance degradation.
         self._middleware_is_async = iscoroutinefunction(self._middleware_instance)
+        # MiddlewareMixin marks each instance as async. A subclass with its own
+        # sync ``__call__`` must run on the thread of the request. Its result is
+        # a response, or the coroutine of ``super().__call__``.
+        # ``middleware_class`` can be a factory, so look at the instance that it returns.
+        instance_call = type(self._middleware_instance).__call__
+        self._sync_call_override = (
+            isinstance(self._middleware_instance, MiddlewareMixin)
+            and instance_call is not MiddlewareMixin.__call__
+            and not iscoroutinefunction(instance_call)
+        )
+
+        if self.supports_lane_dispatch:
+            # A lane has no event loop. It uses a second instance in sync mode,
+            # which is the mode that Django uses under WSGI.
+            def lane_get_response(django_request: HttpRequest) -> HttpResponse:
+                ctx = _request_context.get()
+                bolt_request = ctx["bolt_request"]
+                _sync_request_attributes(django_request, bolt_request)
+                bolt_resp = drive_on_lane(self.get_response(bolt_request))
+                ctx["bolt_response"] = bolt_resp
+                return _to_django_response(bolt_resp)
+
+            self._lane_instance = self.middleware_class(lane_get_response, **self.init_kwargs)
+
+    @property
+    def supports_lane_dispatch(self) -> bool:
+        """Whether a lane can run this middleware in sync mode, with no event loop."""
+        middleware_class = self.middleware_class
+        return (
+            isinstance(middleware_class, type)
+            and getattr(middleware_class, "sync_capable", True)
+            and not iscoroutinefunction(middleware_class.__call__)
+            # A subclass can put logic in ``__acall__``, which sync mode does not run.
+            and getattr(middleware_class, "__acall__", MiddlewareMixin.__acall__) is MiddlewareMixin.__acall__
+        )
 
     async def __call__(self, request: Request) -> Response:
+        """Run the Django middleware in one request-owned sync context."""
+        return await _run_request_affine(self._call, request)
+
+    async def _call(self, request: Request) -> Response:
         """
         Process request through the Django middleware.
 
@@ -256,7 +362,16 @@ class DjangoMiddleware:
             token = _request_context.set(ctx)
 
         try:
-            if self._middleware_is_async:
+            if in_lane_mode():
+                django_response = self._lane_instance(django_request)
+            elif self._sync_call_override:
+                # The bound method has no coroutine mark, where the instance has one.
+                django_response = await sync_to_async(self._middleware_instance.__call__, thread_sensitive=True)(
+                    django_request
+                )
+                if iscoroutine(django_response):
+                    django_response = await django_response
+            elif self._middleware_is_async:
                 # Async-capable middleware (e.g., using MiddlewareMixin with async get_response)
                 # MiddlewareMixin.__acall__ handles process_request/process_response internally
                 # by wrapping them in sync_to_async - we don't need to do it ourselves
@@ -366,6 +481,8 @@ class DjangoMiddlewareStack:
         "_thirdparty_hook_middleware",  # Third-party: safe path (sync_to_async)
         "_call_middleware_chain",  # __call__-only middleware chain (or None)
         "_call_middleware_chain_async",  # Precomputed sync_to_async wrapper
+        "_request_phase_async",  # One thread hop for all request-phase hooks
+        "_response_phase_async",  # One thread hop for all response-phase hooks
         "_compatibility_chain",  # Correctness-first mixed hook/call-only path
         "_ordered_hook_middleware",  # Hook middleware in declared order
         # Pre-computed for hot path (avoid hasattr/reversed in loops)
@@ -396,6 +513,8 @@ class DjangoMiddlewareStack:
         self._thirdparty_hook_middleware = []  # Third-party: sync_to_async
         self._call_middleware_chain = None  # __call__-only: sync chain
         self._call_middleware_chain_async = None
+        self._request_phase_async = None
+        self._response_phase_async = None
         self._compatibility_chain = None
         self._ordered_hook_middleware = []
         # Pre-computed lists (populated in _create_middleware_instance)
@@ -406,6 +525,19 @@ class DjangoMiddlewareStack:
         self._thirdparty_process_response_reversed = []
         self._thirdparty_process_view = []
 
+    @property
+    def supports_lane_dispatch(self) -> bool:
+        """Whether a lane can run this stack with no event loop.
+
+        A middleware with an async ``__call__`` can await, so it needs the event
+        loop. ``sync_capable`` is the flag that Django reads for a class or a factory.
+        """
+        return not any(
+            not getattr(middleware, "sync_capable", True)
+            or (isinstance(middleware, type) and iscoroutinefunction(middleware.__call__))
+            for middleware in self.middleware_classes
+        )
+
     @staticmethod
     def _has_hook_methods(middleware_class: type) -> bool:
         """Return True if middleware defines any Django hook methods."""
@@ -414,60 +546,30 @@ class DjangoMiddlewareStack:
             for method_name in ("process_request", "process_view", "process_response")
         )
 
-    @staticmethod
-    def _prepare_hook_method(
-        instance: Any,
-        method_name: str,
-        *,
-        direct: bool,
-    ) -> tuple[Callable | None, bool]:
-        """Return (callable, is_async_callable) for a hook method."""
-        hook_method = getattr(instance, method_name, None)
-        if hook_method is None:
-            return None, False
-        if direct:
-            return hook_method, False
-        return sync_to_async(hook_method, thread_sensitive=True), True
-
     def _create_hook_entry(self, middleware_class: type) -> dict[str, Any]:
         """Create a middleware hook entry with precomputed wrappers."""
         is_django_builtin = _is_django_builtin_middleware(middleware_class)
         instance = middleware_class(_noop_get_response)
+        entry = {"instance": instance, "is_django_builtin": is_django_builtin}
+        for name in ("process_request", "process_view", "process_response"):
+            raw = getattr(instance, name, None)
+            # The plain sync hook. One thread hop runs all of them in order.
+            entry[f"raw_{name}"] = raw
+            # The compatibility chain calls hook by hook. A third-party hook can
+            # block, so there it runs on the thread of the request.
+            if raw is None or is_django_builtin:
+                entry[name] = raw
+            else:
+                entry[name] = sync_to_async(raw, thread_sensitive=True)
+        return entry
 
-        process_request, process_request_is_async = self._prepare_hook_method(
-            instance,
-            "process_request",
-            direct=is_django_builtin,
-        )
-        process_view, process_view_is_async = self._prepare_hook_method(
-            instance,
-            "process_view",
-            direct=is_django_builtin,
-        )
-        process_response, process_response_is_async = self._prepare_hook_method(
-            instance,
-            "process_response",
-            direct=is_django_builtin,
-        )
-
-        return {
-            "instance": instance,
-            "is_django_builtin": is_django_builtin,
-            "process_request": process_request,
-            "process_request_is_async": process_request_is_async,
-            "process_view": process_view,
-            "process_view_is_async": process_view_is_async,
-            "process_response": process_response,
-            "process_response_is_async": process_response_is_async,
-        }
-
-    async def _invoke_hook(self, hook_callable: Callable | None, is_async_callable: bool, *args: Any) -> Any:
-        """Invoke a precomputed hook callable."""
-        if hook_callable is None:
+    async def _invoke_hook(self, raw: Callable | None, hook: Callable | None, *args: Any) -> Any:
+        """Call one hook of the compatibility chain. ``hook`` is ``raw`` or its thread hop."""
+        if raw is None:
             return None
-        if is_async_callable:
-            return await hook_callable(*args)
-        return hook_callable(*args)
+        if hook is raw or in_lane_mode():
+            return raw(*args)
+        return await hook(*args)
 
     def _create_middleware_instance(self, get_response: Callable) -> None:
         """
@@ -481,6 +583,8 @@ class DjangoMiddlewareStack:
         self._thirdparty_hook_middleware = []
         self._call_middleware_chain = None
         self._call_middleware_chain_async = None
+        self._request_phase_async = None
+        self._response_phase_async = None
         self._compatibility_chain = None
         self._ordered_hook_middleware = []
         self._django_process_request = []
@@ -526,6 +630,15 @@ class DjangoMiddlewareStack:
             )
         )
 
+        # A third-party hook can block, so it needs the request's thread. One hop
+        # then runs all hooks of a phase, the Django built-in ones too.
+        if self._thirdparty_hook_middleware:
+            entries = self._ordered_hook_middleware
+            if any(e["raw_process_request"] or e["raw_process_view"] for e in entries):
+                self._request_phase_async = sync_to_async(self._run_request_phase, thread_sensitive=True)
+            if any(e["raw_process_response"] for e in entries):
+                self._response_phase_async = sync_to_async(self._run_response_phase, thread_sensitive=True)
+
         has_hook_middleware = bool(self._ordered_hook_middleware)
         has_call_only_middleware = bool(call_only_classes)
 
@@ -540,6 +653,42 @@ class DjangoMiddlewareStack:
             self._call_middleware_chain = self._build_call_only_chain(call_only_classes)
             self._call_middleware_chain_async = sync_to_async(self._call_middleware_chain, thread_sensitive=True)
 
+    def _run_request_phase(self, django_request: HttpRequest, request: Request) -> tuple[HttpResponse | None, int]:
+        """Run process_request and process_view of all hooks, in declared order.
+
+        Return the short-circuit response, if one exists, and the count of
+        middleware that the request entered.
+        """
+        entries = self._ordered_hook_middleware
+        entered = 0
+        for entry in entries:
+            entered += 1
+            hook = entry["raw_process_request"]
+            if hook is not None:
+                response = hook(django_request)
+                if response is not None:
+                    return response, entered
+
+        _sync_request_attributes(django_request, request)
+        csrf_exempt = request.state.get("_csrf_exempt", False) if request.state else False
+        csrf_callback = _csrf_callback_exempt if csrf_exempt else _csrf_callback_not_exempt
+        for entry in entries:
+            hook = entry["raw_process_view"]
+            if hook is not None:
+                response = hook(django_request, csrf_callback, _EMPTY_TUPLE, _EMPTY_DICT)
+                if response is not None:
+                    return response, entered
+        return None, entered
+
+    def _run_response_phase(self, django_request: HttpRequest, django_response: HttpResponse, entered: int):
+        """Run process_response of each entered middleware, in reverse order."""
+        entries = self._ordered_hook_middleware
+        for index in range(entered - 1, -1, -1):
+            hook = entries[index]["raw_process_response"]
+            if hook is not None:
+                django_response = hook(django_request, django_response)
+        return django_response
+
     def _build_call_only_chain(self, call_only_classes: list) -> Callable:
         """Build the sync middleware chain for __call__-only middleware."""
 
@@ -549,7 +698,10 @@ class DjangoMiddlewareStack:
             bolt_request = ctx["bolt_request"]
 
             _sync_request_attributes(django_request, bolt_request)
-            bolt_resp = async_to_sync(self.get_response)(bolt_request)
+            if in_lane_mode():
+                bolt_resp = drive_on_lane(self.get_response(bolt_request))
+            else:
+                bolt_resp = async_to_sync(self.get_response)(bolt_request)
             ctx["bolt_response"] = bolt_resp
 
             return _to_django_response(bolt_resp)
@@ -577,8 +729,8 @@ class DjangoMiddlewareStack:
                 if entry["process_view"] is None:
                     continue
                 response = await self._invoke_hook(
+                    entry["raw_process_view"],
                     entry["process_view"],
-                    entry["process_view_is_async"],
                     django_request,
                     csrf_callback,
                     _EMPTY_TUPLE,
@@ -605,8 +757,8 @@ class DjangoMiddlewareStack:
                         response = None
                         if _entry["process_request"] is not None:
                             response = await self._invoke_hook(
+                                _entry["raw_process_request"],
                                 _entry["process_request"],
-                                _entry["process_request_is_async"],
                                 django_request,
                             )
                         if response is None:
@@ -616,8 +768,8 @@ class DjangoMiddlewareStack:
 
                     if _entry["process_response"] is not None:
                         response = await self._invoke_hook(
+                            _entry["raw_process_response"],
                             _entry["process_response"],
-                            _entry["process_response_is_async"],
                             django_request,
                             response,
                         )
@@ -629,6 +781,8 @@ class DjangoMiddlewareStack:
             next_layer = chain
 
             def get_response_sync(django_request, _next=next_layer):
+                if in_lane_mode():
+                    return drive_on_lane(_next(django_request))
                 return async_to_sync(_next)(django_request)
 
             instance = middleware_class(get_response_sync)
@@ -641,6 +795,8 @@ class DjangoMiddlewareStack:
                 call_layer_async = sync_to_async(instance, thread_sensitive=True)
 
                 async def call_layer(django_request, *, _call_layer=call_layer_async):
+                    if in_lane_mode():
+                        return _call_layer.func(django_request)
                     return await _call_layer(django_request)
 
             chain = call_layer
@@ -648,20 +804,20 @@ class DjangoMiddlewareStack:
         return chain
 
     async def __call__(self, request: Request) -> Response:
+        """Run the complete Django stack in one request-owned sync context."""
+        return await _run_request_affine(self._call, request)
+
+    async def _call(self, request: Request) -> Response:
         """
         Process request through the Django middleware stack.
 
-        HYBRID APPROACH WITH SAFETY:
-        1. Convert Bolt request to Django request ONCE
-        2. Run Django built-in process_request hooks DIRECTLY (fast, safe!)
-        3. Run third-party process_request hooks via sync_to_async (safe for blocking I/O)
-        4. Run process_view hooks (for CSRF validation, etc.)
-        5. Either:
-           a. If no __call__-only middleware: await handler directly (fast!)
-           b. If __call__-only middleware: run chain via sync_to_async (slow but necessary)
-        6. Run third-party process_response hooks via sync_to_async (reverse order)
-        7. Run Django built-in process_response hooks DIRECTLY (reverse order)
-        8. Convert Django response to Bolt response ONCE
+        1. Convert the Bolt request to a Django request one time.
+        2. Select the path:
+           a. Hook and ``__call__`` middleware together: the compatibility chain.
+           b. Hook middleware only: the request phase, the handler, the response phase.
+              A phase with a third-party hook runs on the thread of the request.
+           c. ``__call__`` middleware only: one sync chain on the thread of the request.
+        3. Convert the Django response to a Bolt response one time.
         """
         # 1. Single Bolt→Django conversion
         django_request = _to_django_request(request)
@@ -681,62 +837,20 @@ class DjangoMiddlewareStack:
                 _request_context.reset(token)
             return _to_bolt_response(django_response)
 
-        # Hook-only optimized path with strict declared ordering.
+        # Hook-only path. A phase with a third-party hook uses one thread hop,
+        # because that hook can block. All other phases run direct.
         if self._ordered_hook_middleware:
-            entered_hook_entries = []
-            django_response = None
-
-            # Run process_request hooks in declared order.
-            for entry in self._ordered_hook_middleware:
-                entered_hook_entries.append(entry)
-                if entry["process_request"] is None:
-                    continue
-                response = await self._invoke_hook(
-                    entry["process_request"],
-                    entry["process_request_is_async"],
-                    django_request,
-                )
-                if response is not None:
-                    django_response = response
-                    break
-
-            # No request short-circuit: run process_view hooks, then handler.
+            inline = in_lane_mode()
+            if inline or self._request_phase_async is None:
+                django_response, entered = self._run_request_phase(django_request, request)
+            else:
+                django_response, entered = await self._request_phase_async(django_request, request)
             if django_response is None:
-                _sync_request_attributes(django_request, request)
-
-                csrf_exempt = request.state.get("_csrf_exempt", False) if request.state else False
-                csrf_callback = _csrf_callback_exempt if csrf_exempt else _csrf_callback_not_exempt
-
-                for entry in entered_hook_entries:
-                    if entry["process_view"] is None:
-                        continue
-                    response = await self._invoke_hook(
-                        entry["process_view"],
-                        entry["process_view_is_async"],
-                        django_request,
-                        csrf_callback,
-                        _EMPTY_TUPLE,
-                        _EMPTY_DICT,
-                    )
-                    if response is not None:
-                        django_response = response
-                        break
-
-                if django_response is None:
-                    bolt_response = await self.get_response(request)
-                    django_response = _to_django_response(bolt_response)
-
-            # Apply process_response hooks in reverse order for all entered middleware.
-            for entry in reversed(entered_hook_entries):
-                if entry["process_response"] is None:
-                    continue
-                django_response = await self._invoke_hook(
-                    entry["process_response"],
-                    entry["process_response_is_async"],
-                    django_request,
-                    django_response,
-                )
-
+                django_response = _to_django_response(await self.get_response(request))
+            if inline or self._response_phase_async is None:
+                django_response = self._run_response_phase(django_request, django_response, entered)
+            else:
+                django_response = await self._response_phase_async(django_request, django_response, entered)
             return _to_bolt_response(django_response)
 
         # __call__-only path (no hook middleware).
@@ -748,7 +862,10 @@ class DjangoMiddlewareStack:
             }
             token = _request_context.set(ctx)
             try:
-                django_response = await self._call_middleware_chain_async(django_request)
+                if in_lane_mode():
+                    django_response = self._call_middleware_chain(django_request)
+                else:
+                    django_response = await self._call_middleware_chain_async(django_request)
             finally:
                 _request_context.reset(token)
             return _to_bolt_response(django_response)
@@ -905,6 +1022,12 @@ def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request)
     csrf_cookie_needs_reset = getattr(django_request, "csrf_cookie_needs_reset", None)
     if csrf_cookie_needs_reset is not None:
         bolt_request.state["csrf_cookie_needs_reset"] = csrf_cookie_needs_reset
+
+    # Copy custom middleware attributes, such as the ``tenant`` of
+    # django-tenants. An async handler can then read them on any thread.
+    for name, value in django_request.__dict__.items():
+        if name not in _STANDARD_REQUEST_ATTRS and name[0] != "_":
+            bolt_request.state[name] = value
 
 
 def _extract_preserved_body(response: Any) -> tuple[int, Any] | None:
