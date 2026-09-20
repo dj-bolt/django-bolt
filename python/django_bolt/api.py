@@ -38,12 +38,17 @@ from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler
 from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import default_django_user_loader, resolve_user_loader
-from .concurrency import run_in_orm_executor, sync_to_thread
+from .concurrency import (
+    _drop_broken_connections,
+    run_in_orm_executor,
+    run_on_request_lane,
+    sync_to_thread,
+)
 from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
 from .error_handlers import handle_exception, http_exception_handler
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
-from .middleware import CompressionConfig
+from .middleware import CompressionConfig, DjangoMiddleware, DjangoMiddlewareStack
 from .middleware.compiler import _compile_rust_arg_bindings, add_optimization_flags_to_metadata, compile_middleware_meta
 from .middleware.django_loader import load_django_middleware
 from .middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
@@ -409,6 +414,9 @@ class BoltAPI:
         if middleware:
             self._middleware.extend(normalize_middleware_specs(middleware, context="api"))
         self._has_python_global_middleware = any(self._is_python_middleware_spec(spec) for spec in self._middleware)
+        self._has_django_wrapper_middleware = any(
+            isinstance(spec, (DjangoMiddleware, DjangoMiddlewareStack)) for spec in self._middleware
+        )
 
         # Logging configuration (opt-in, setup happens at server startup)
         self._enable_logging = enable_logging
@@ -1492,7 +1500,12 @@ class BoltAPI:
                 if getattr(dep_needs, needs_key):
                     meta[needs_key] = True
 
-            meta["is_blocking"] = handler_analysis.is_blocking
+            # Django middleware can keep request state in threading.local. A sync
+            # handler must then run on the thread of its request, not inline on
+            # the event loop, so treat it as blocking work.
+            meta["is_blocking"] = handler_analysis.is_blocking or (
+                not meta["is_async"] and self._has_django_wrapper_middleware
+            )
 
             # Determine final response type with proper priority:
             # 1. response_model parameter (explicit, takes precedence)
@@ -1724,6 +1737,23 @@ class BoltAPI:
                 and not revocation_handlers
             )
             middleware_meta["can_sync_dispatch"] = can_sync_dispatch
+            # Lane dispatch (crates/bolt-core/src/lane.rs) requires a request
+            # flow with no real await.
+            python_specs = [spec for spec in self._middleware if self._is_python_middleware_spec(spec)]
+            can_lane_dispatch = (
+                not meta["is_async"]
+                and not meta["injector_is_async"]
+                and bool(python_specs)
+                and all(
+                    isinstance(spec, (DjangoMiddleware, DjangoMiddlewareStack)) and spec.supports_lane_dispatch
+                    for spec in python_specs
+                )
+                and not meta["_has_route_python_middleware"]
+                and not self._emit_signals
+                and not revocation_handlers
+            )
+            meta["can_lane_dispatch"] = can_lane_dispatch
+            middleware_meta["can_lane_dispatch"] = can_lane_dispatch
             # Rust installs WorkerLoop as the running loop while executing the
             # trivially-async sync fast path. This keeps create_task() and
             # get_running_loop() valid even when the coroutine never awaits.
@@ -2788,6 +2818,9 @@ class BoltAPI:
             # BlackSheep pattern: only log unhandled exceptions (rare path)
             if self._logging_middleware:
                 self._logging_middleware.log_exception(request, e, exc_info=True)
+            # A handler that ran the ORM inline on this thread may have left
+            # a dead connection behind; drop it so the next request reconnects.
+            _drop_broken_connections()
             return self._handle_generic_exception(e, request=request)
         finally:
             # Auto-cleanup UploadFiles to prevent resource leaks
@@ -2816,10 +2849,15 @@ class BoltAPI:
         - No Python middleware (global or route-level)
         - No Django middleware
         - No signals
-        """
-        try:
-            meta = self._handler_meta[handler_id]
 
+        A route with can_lane_dispatch also comes here, on a request lane. It
+        has Django middleware, and the lane runs the full ``_dispatch`` flow.
+        """
+        meta = self._handler_meta[handler_id]
+        if meta["can_lane_dispatch"]:
+            return run_on_request_lane(self._dispatch, handler, request, handler_id)
+
+        try:
             # Lazy user loading: only set when auth context has a user_id.
             # Skip setting user=None — PyRequest.user getter already returns None.
             auth_context = request.get("auth")
@@ -2839,6 +2877,9 @@ class BoltAPI:
             # BlackSheep pattern: only log unhandled exceptions (rare path)
             if self._logging_middleware:
                 self._logging_middleware.log_exception(request, e, exc_info=True)
+            # A handler that ran the ORM inline on this thread may have left
+            # a dead connection behind; drop it so the next request reconnects.
+            _drop_broken_connections()
             return self._handle_generic_exception(e, request=request)
         finally:
             if meta["has_file_uploads"]:
