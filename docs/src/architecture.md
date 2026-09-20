@@ -30,7 +30,7 @@ Guards (Rust)
    ▼
 Dispatch decision
    ├─ sync fast path: handler needs no event loop → one GIL block, response built in Rust
-   └─ async path: handler awaits → scheduled on a persistent per-process worker loop
+   └─ async path: handler awaits → scheduled on the worker thread's persistent asyncio loop
    │
    ▼
 Your Python handler
@@ -66,7 +66,7 @@ Your Django project is loaded once per process at startup (`django.setup()`), th
 1. **Rust owns the hot path.** HTTP, routing, auth, guards, CORS, rate limiting, and compression never take the GIL.
 2. **Registration-time precomputation.** Parameter extractors, dependency graphs, response metadata, and middleware are compiled once when routes register, not per request.
 3. **Sync dispatch bypass.** Handlers that don't actually suspend (detected at registration by bytecode analysis) skip the async machinery entirely — one GIL acquisition, response built in the same block.
-4. **Persistent worker loop.** Truly async handlers run on a process-lived loop serviced by Tokio; there is no per-request task/thread creation.
+4. **Persistent worker loop.** Truly async handlers run on a process-lived loop owned by their Actix worker thread and serviced by Tokio on that thread; there is no per-request task/thread creation, and worker threads never share a loop.
 5. **Zero-copy responses.** Serialized bodies cross to Rust without a memcpy; common response shapes use static metadata with zero allocation.
 6. **msgspec.** Validation and encoding are C-accelerated and schema-compiled.
 

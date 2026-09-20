@@ -842,6 +842,12 @@ pub fn start_server(
 
                 {
                     let server = HttpServer::new(move || {
+                        // Actix runs this factory once on every worker thread,
+                        // inside that worker's runtime: bind the thread's own
+                        // WorkerLoop here so async dispatch never crosses threads.
+                        Python::attach(|py| bolt_loop::bind_thread_loop(py)).unwrap_or_else(|e| {
+                            panic!("failed to create the worker asyncio loop: {e}")
+                        });
                         let mut app = App::new()
                             .app_data(web::Data::new(app_state.clone()))
                             .app_data(web::PayloadConfig::new(max_payload_size)) // Configure max request body size from BOLT_MAX_UPLOAD_SIZE

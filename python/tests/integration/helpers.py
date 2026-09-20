@@ -80,6 +80,7 @@ def generate_load(
     max_attempts: int = 4,
     on_tick: Callable[[], None] | None = None,
     tick_interval: float = 0.25,
+    expected_status: int | None = None,
 ) -> LoadResult:
     """Bombard *url* with concurrent keep-alive requests for *duration_s*.
 
@@ -93,6 +94,9 @@ def generate_load(
     if every attempt fails, which is the true "server dropped the request /
     there was no accepting process" signal. Transient errors that a retry
     recovers from are counted in ``retried`` (see :class:`LoadResult`).
+
+    With ``expected_status``, only a response with that status is a success.
+    If not, each status below 500 is a success.
 
     ``on_tick`` is invoked from a side thread every ``tick_interval`` seconds
     (e.g. to sample worker PIDs) for the duration of the run.
@@ -115,8 +119,11 @@ def generate_load(
                 for attempt in range(max_attempts):
                     try:
                         response = client.get(url)
-                        if response.status_code < 500:
-                            succeeded = True
+                        if expected_status is None:
+                            succeeded = response.status_code < 500
+                        else:
+                            succeeded = response.status_code == expected_status
+                        if succeeded:
                             break
                         local_errors[f"status={response.status_code}"] += 1
                     except httpx.HTTPError as exc:

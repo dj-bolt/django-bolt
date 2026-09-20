@@ -23,6 +23,46 @@ build:
 build-release:
     uv run maturin develop --release
 
+# Free-threaded CPython (python3.14t, no GIL) lives in its own environment so
+# the default .venv stays untouched. `uv sync` installs the interpreter and
+# the dev dependencies; maturin builds the extension into that environment.
+ft_env := ".venv-ft"
+
+# Create the free-threaded environment and build the extension into it
+build-ft:
+    UV_PROJECT_ENVIRONMENT={{ft_env}} uv sync --python 3.14t
+    UV_PROJECT_ENVIRONMENT={{ft_env}} uv run maturin develop --release
+    UV_PROJECT_ENVIRONMENT={{ft_env}} uv run python -c "import sys; print(sys.version); print('GIL enabled:', sys._is_gil_enabled())"
+
+# Stop when `.venv-ft` does not hold a free-threaded interpreter. `uv run` can
+# create it with a standard interpreter, because the project accepts Python >=3.12.
+_require-ft:
+    @{{ft_env}}/bin/python -c "import sys; sys.exit(sys._is_gil_enabled())" 2>/dev/null || (echo "No free-threaded build in {{ft_env}}. Run 'just build-ft' first." && exit 1)
+
+# Run Python tests on the free-threaded build
+test-ft: _require-ft
+    UV_PROJECT_ENVIRONMENT={{ft_env}} uv run --with pytest --with pytest-xdist pytest python/tests -s -vv -n auto
+
+# Run the example project on the free-threaded build (one process, all worker threads)
+run-dev-ft: _require-ft
+    UV_PROJECT_ENVIRONMENT={{ft_env}} uv run python python/example/manage.py runbolt --dev --port 8001
+
+# Run any command inside the free-threaded environment: just ft python -c "..."
+ft +args: _require-ft
+    UV_PROJECT_ENVIRONMENT={{ft_env}} uv run {{args}}
+
+# Benchmark the free-threaded build: one process, one worker thread per CPU
+# (the GIL benchmark uses `p` processes with one thread each). Results go to
+# python/benchmark/BENCHMARK-FT.md so the GIL numbers stay untouched.
+save-bench-ft host=host port=port c=c n=n p="1" workers=`nproc`: _require-ft
+    #!/usr/bin/env bash
+    mkdir -p python/benchmark
+    UV_PROJECT_ENVIRONMENT={{ft_env}} P={{p}} WORKERS={{workers}} C={{c}} N={{n}} HOST={{host}} PORT={{port}} ./scripts/benchmark.sh > python/benchmark/BENCHMARK-FT.md
+    echo "✅ Results saved to python/benchmark/BENCHMARK-FT.md"
+    echo ""
+    echo "=== ROOT RPS ==="
+    grep "Reqs/sec" python/benchmark/BENCHMARK-FT.md | head -2
+
 
 # Kill any servers on PORT
 kill port=port:

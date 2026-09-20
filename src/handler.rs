@@ -41,6 +41,8 @@ use bolt_core::validation::{parse_cookies_inline, validate_auth_and_guards, Auth
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::response_body::AttachedBytes;
+
 /// Result of the unified dispatch block.
 /// Sync-eligible routes return Ready (no async bridge overhead).
 /// Async routes return Pending (existing coroutine + future path).
@@ -266,9 +268,8 @@ pub fn form_result_to_py(
 
 enum ResponseWireBody {
     Bytes(Vec<u8>),
-    /// Zero-copy path: PyBackedBytes holds a reference to the Python bytes object.
-    /// bytes::Bytes::from_owner wraps it directly — no memcpy at any point.
-    ZeroCopyBytes(PyBackedBytes),
+    /// Keep Python storage alive until the HTTP body is released.
+    ZeroCopyBytes(AttachedBytes),
     FilePath(String),
     Stream {
         media_type: PyBackedStr,
@@ -336,10 +337,9 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
     //   0 = bytes, 1 = stream, 2 = file
     let body = match body_kind {
         0 => {
-            // Zero-copy path: PyBackedBytes holds a Python reference + slice pointer.
-            // No memcpy here. bytes::Bytes::from_owner (outside GIL) wraps it directly.
+            // Keep the Python buffer without copying its contents.
             if let Ok(backed) = payload.extract::<PyBackedBytes>() {
-                ResponseWireBody::ZeroCopyBytes(backed)
+                ResponseWireBody::ZeroCopyBytes(AttachedBytes::from(backed))
             } else {
                 // Fallback for non-bytes payloads (uncommon).
                 ResponseWireBody::Bytes(payload.extract::<Vec<u8>>()?)
@@ -1285,7 +1285,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // body when (status, meta) == (route default, JSON). Skips the
             // 4-tuple construction in Python and its parsing here.
             if result_obj.bind(py).is_instance_of::<PyBytes>() {
-                let backed: PyBackedBytes = result_obj.extract(py)?;
+                let backed = AttachedBytes::from(result_obj.extract::<PyBackedBytes>(py)?);
                 let status = route_metadata
                     .map(|m| StatusCode::from_u16(m.default_status_code).unwrap_or(StatusCode::OK))
                     .unwrap_or(StatusCode::OK);
@@ -1348,8 +1348,8 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             };
             Ok(DispatchOutcome::Ready(response))
         } else {
-            // ASYNC PATH: submit to the process-lived WorkerLoop whose ready
-            // queue is serviced by a persistent Tokio pump.
+            // ASYNC PATH: submit to this worker thread's WorkerLoop, whose
+            // ready queue is serviced by a persistent Tokio pump on this thread.
             let dispatch = route.dispatch.clone_ref(py);
             let fut = bolt_loop::dispatch(dispatch, request_obj.into());
             Ok(DispatchOutcome::Pending(Box::pin(fut)))

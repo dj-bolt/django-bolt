@@ -4,6 +4,7 @@ use bolt_core::request::PyRequest;
 
 mod dev_reload;
 mod handler;
+mod response_body;
 mod server;
 mod testing;
 
@@ -32,7 +33,14 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[pymodule]
+// `gil_used = false` attests that this module is safe to run with the GIL
+// disabled (free-threaded CPython, PEP 703). Without the attestation the
+// interpreter re-enables the GIL at import and prints a RuntimeWarning.
+// Shared state is Rust-owned: the router and metadata are read-only after
+// registration, and the mutable parts use `OnceLock`, atomics, `DashMap`,
+// or a `Mutex`. Every `#[pyclass]` is `frozen` or belongs to one request,
+// stream, or connection.
+#[pymodule(gil_used = false)]
 fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     use crate::dev_reload::run_dev_reloader;
     use crate::server::{

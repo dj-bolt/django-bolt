@@ -671,17 +671,17 @@ pub async fn handle_websocket_upgrade_with_handler(
                     handler.call1(py, (&websocket,))?
                 };
 
-                // Run the handler on the WorkerLoop — the same loop as async
-                // HTTP dispatch — so futures/queues/locks shared between a
-                // WebSocket handler and an HTTP handler stay same-loop.
-                // (Cross-loop, `set_result` queues a wakeup that never rouses
-                // the foreign selector and the WebSocket side hangs.) The
-                // receive/send futures created by `future_into_py` follow the
-                // running loop, so they migrate with the handler.
+                // Run the handler on this thread's WorkerLoop — the loop that
+                // runs async HTTP dispatch here — so futures/queues/locks
+                // shared between a WebSocket handler and an HTTP handler
+                // stay same-loop. (Cross-loop, `set_result` queues a wakeup
+                // that never rouses the foreign selector and the WebSocket
+                // side hangs.) The receive/send futures created by
+                // `future_into_py` follow the running loop, so they migrate
+                // with the handler.
                 let locals = bolt_loop::worker_task_locals(py)?;
 
-                // Convert Python coroutine to Rust future using the shared event loop
-                pyo3_async_runtimes::into_future_with_locals(locals, coro.bind(py).clone())
+                pyo3_async_runtimes::into_future_with_locals(&locals, coro.bind(py).clone())
             });
 
             match future_result {

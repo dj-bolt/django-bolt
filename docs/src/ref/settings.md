@@ -173,6 +173,30 @@ export DJANGO_BOLT_MAX_PARAM_LENGTH=65536
 
 This value is read once at startup (first access) and then cached. Missing, empty, non-integer, or `0` values are ignored and the default is used.
 
+### DJANGO_BOLT_ORM_THREADS
+
+Number of threads in the ORM pool of each process. Django-Bolt evaluates the QuerySets that async handlers return on this pool. It also loads `request.user` on this pool.
+
+```bash
+export DJANGO_BOLT_ORM_THREADS=8
+```
+
+**Default:** `1` when every database is SQLite, otherwise `4`.
+
+Each thread holds one database connection. Increase the value when one free-threaded process runs many worker threads. See [Size the database thread pools](../getting-started/deployment.md#size-the-database-thread-pools). An invalid value logs a warning, and the default applies. A value below `1` gives a pool of one thread.
+
+### DJANGO_BOLT_EXECUTOR_THREADS
+
+Number of threads in the shared executor pool of each process. Blocking sync handlers and `sync_to_thread` calls run on this pool.
+
+```bash
+export DJANGO_BOLT_EXECUTOR_THREADS=16
+```
+
+**Default:** CPU count + 4, maximum `32`.
+
+An invalid value logs a warning, and the default applies. A value below `1` gives a pool of one thread.
+
 ## File serving settings
 
 ### BOLT_ALLOWED_FILE_PATHS
@@ -352,7 +376,7 @@ The `runbolt` management command accepts these options:
 |--------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8000` | Bind port |
-| `--workers` | `1` | Workers per process |
+| `--workers` | `1`, or the CPU count on free-threaded Python | Actix worker threads per process. Each thread runs Python handlers. |
 | `--processes` | `1` | Number of processes |
 | `--dev` | off | Enable auto-reload |
 | `--no-admin` | off | Disable admin integration |
@@ -456,3 +480,5 @@ api = BoltAPI(
 | `BOLT_AUTHENTICATION_CLASSES` | `list` | `[]` | Default authentication backends |
 | `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |
 | `DJANGO_BOLT_MAX_PARAM_LENGTH` | `int` (env var) | `8192` | Max path/query/form parameter size in bytes, clamped to `1048576` (1 MB); requests over the limit return `422` |
+| `DJANGO_BOLT_ORM_THREADS` | `int` (env var) | `1` (SQLite) or `4` | Threads in the ORM pool of each process |
+| `DJANGO_BOLT_EXECUTOR_THREADS` | `int` (env var) | CPU count + 4 (max `32`) | Threads in the shared executor pool of each process |
