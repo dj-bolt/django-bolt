@@ -131,13 +131,13 @@ Use `.venv/bin/python` for the installed GIL environment.
 
 Raw evidence and the exact temporary HTTP launchers are retained in `/tmp/bolt-ft-profile`:
 
-- [Encoding measurements](/tmp/bolt-ft-profile/micro-results.jsonl)
-- [HTTP measurements](/tmp/bolt-ft-profile/http-results.jsonl)
-- [Python 3.14 GIL control](/tmp/bolt-ft-profile/same-version-results.jsonl)
-- [Cached JSON response control](/tmp/bolt-ft-profile/http-json-bytes-results.jsonl)
-- [Shared-fixture stack snapshot](/tmp/bolt-ft-profile/ft-1p-12w-baseline-gdb-0.txt)
-- [Private-fixture stack snapshot](/tmp/bolt-ft-profile/ft-1p-12w-local-data-gdb-0.txt)
-- [HTTP benchmark driver](/tmp/bolt-ft-profile/run_http.py)
-- [Temporary server launcher](/tmp/bolt-ft-profile/server.py)
+- Encoding measurements: `/tmp/bolt-ft-profile/micro-results.jsonl`
+- HTTP measurements: `/tmp/bolt-ft-profile/http-results.jsonl`
+- Python 3.14 GIL control: `/tmp/bolt-ft-profile/same-version-results.jsonl`
+- Cached JSON response control: `/tmp/bolt-ft-profile/http-json-bytes-results.jsonl`
+- Shared-fixture stack snapshot: `/tmp/bolt-ft-profile/ft-1p-12w-baseline-gdb-0.txt`
+- Private-fixture stack snapshot: `/tmp/bolt-ft-profile/ft-1p-12w-local-data-gdb-0.txt`
+- HTTP benchmark driver: `/tmp/bolt-ft-profile/run_http.py`
+- Temporary server launcher: `/tmp/bolt-ft-profile/server.py`
 
 Production handlers, framework code, and the original benchmark reports were not changed by this investigation.
