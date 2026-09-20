@@ -9,7 +9,6 @@ pub mod cors;
 pub mod error;
 pub mod form_parsing;
 pub mod json;
-pub mod lane;
 pub mod metadata;
 pub mod middleware;
 pub mod permissions;

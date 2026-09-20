@@ -25,10 +25,15 @@ BOLT_EMIT_SIGNALS = True
 
 ### Database Connection Management
 
-Django Bolt keeps database connections open across requests. Bolt does not need the request signals to manage them:
+Django Bolt disables signals by default, which means Django's automatic connection cleanup doesn't run. For async applications, Django [recommends using connection pooling](https://docs.djangoproject.com/en/5.1/ref/databases/#persistent-connections) instead of relying on signals.
 
-- When a handler or QuerySet evaluation on the executor pool raises, Bolt runs `close_if_unusable_or_obsolete()` on that thread. A dead connection is dropped and the next request reconnects.
-- When a database sets `CONN_MAX_AGE` or `CONN_HEALTH_CHECKS`, Bolt runs the same check before each executor call. Timed recycling and health checks then work as in Django.
+**Recommended: Use connection pooling (no signals needed)**
+
+See [Database connections](../getting-started/deployment.md#database-connections) in the deployment guide for setup instructions.
+
+**Alternative: Enable signals for `CONN_MAX_AGE`**
+
+If you need Django's timed connection recycling:
 
 ```python
 # settings.py
@@ -36,13 +41,14 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": "mydb",
-        "CONN_MAX_AGE": 600,  # Recycle connections older than 600s
-        "CONN_HEALTH_CHECKS": True,  # Ping before the first query of a request
+        "CONN_MAX_AGE": 600,  # Close connections after 600s idle
+        "CONN_HEALTH_CHECKS": True,  # Verify connections before use
     }
 }
+BOLT_EMIT_SIGNALS = True  # Required for CONN_MAX_AGE to work!
 ```
 
-The check before each call costs about 2 µs per open connection. Leave both settings unset to skip it. For PostgreSQL, a connection pool is the better option. See [Database connections](../getting-started/deployment.md#database-connections) in the deployment guide.
+Django's `request_finished` signal triggers `close_old_connections()` which checks `CONN_MAX_AGE` and closes stale connections.
 
 ### Third-Party Packages
 
@@ -63,6 +69,6 @@ BOLT_EMIT_SIGNALS = True
 | Setting | Performance | Use Case |
 |---------|-------------|----------|
 | `BOLT_EMIT_SIGNALS=False` (default) | Maximum | Most APIs with connection pooling |
-| `BOLT_EMIT_SIGNALS=True` | Slight overhead | Debug tools, signal receivers |
+| `BOLT_EMIT_SIGNALS=True` | Slight overhead | Need `CONN_MAX_AGE`, debug tools, signal receivers |
 
 **Rule of thumb:** Use connection pooling and keep signals disabled unless you have a specific reason to enable them.

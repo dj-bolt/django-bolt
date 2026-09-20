@@ -822,9 +822,6 @@ async fn handle_test_request_internal(
 
     // Get route metadata
     let route_meta = route_metadata.get(handler_id).cloned();
-    let can_lane_dispatch = route_meta
-        .as_ref()
-        .map_or(false, |m| m.plan.can_lane_dispatch());
 
     // Parse query string
     let needs_query = route_meta
@@ -1236,18 +1233,6 @@ async fn handle_test_request_internal(
             conn_remote_addr,
         };
         let request_obj = Py::new(py, request)?;
-
-        // LANE PATH: mirrors production `handle_request`.
-        if can_lane_dispatch {
-            if let Some(route_match) = router.find(method, path) {
-                let dispatch_sync = route_match.route().dispatch_sync.clone_ref(py);
-                return bolt_core::lane::dispatch_blocking(
-                    py,
-                    dispatch_sync,
-                    request_obj.into_any(),
-                );
-            }
-        }
 
         // Get the event loop from TASK_LOCALS (initialized by ensure_task_locals_initialized)
         let locals = TASK_LOCALS.get().ok_or_else(|| {

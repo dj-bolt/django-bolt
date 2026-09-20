@@ -366,7 +366,6 @@ impl RouteExecutionPlan {
     const HAS_RATE_LIMIT: u16 = 1 << 8;
     const CAN_SYNC_DISPATCH: u16 = 1 << 9;
     const IS_ASYNC: u16 = 1 << 10;
-    const CAN_LANE_DISPATCH: u16 = 1 << 11;
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
@@ -381,7 +380,6 @@ impl RouteExecutionPlan {
         has_rate_limit: bool,
         can_sync_dispatch: bool,
         is_async: bool,
-        can_lane_dispatch: bool,
     ) -> Self {
         let mut bits = 0u16;
         if needs_body {
@@ -416,9 +414,6 @@ impl RouteExecutionPlan {
         }
         if is_async {
             bits |= Self::IS_ASYNC;
-        }
-        if can_lane_dispatch {
-            bits |= Self::CAN_LANE_DISPATCH;
         }
         Self { bits }
     }
@@ -471,11 +466,6 @@ impl RouteExecutionPlan {
     #[inline]
     pub const fn can_sync_dispatch(self) -> bool {
         (self.bits & Self::CAN_SYNC_DISPATCH) != 0
-    }
-
-    #[inline]
-    pub const fn can_lane_dispatch(self) -> bool {
-        (self.bits & Self::CAN_LANE_DISPATCH) != 0
     }
 
     #[inline]
@@ -713,12 +703,6 @@ impl RouteMetadata {
             .flatten()
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false);
-        let can_lane_dispatch = py_meta
-            .get_item("can_lane_dispatch")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract::<bool>().ok())
-            .unwrap_or(false);
         let plan = RouteExecutionPlan::from_parts(
             needs_body,
             needs_query,
@@ -731,7 +715,6 @@ impl RouteMetadata {
             has_rate_limit,
             can_sync_dispatch,
             is_async,
-            can_lane_dispatch,
         );
 
         // Form field type hints (same format as param_types)

@@ -331,8 +331,4 @@ Compare a free-threaded server and a server with the GIL at the same process and
 
 In one process with 12 workers, the free-threaded build measured 1.5 to 12 times the throughput of the GIL build on the database endpoints.
 
-### Django middleware cost
-
-Each request that goes through a Django middleware stack gets its own thread for sync work. Thread creation costs more on a free-threaded build, and the threads share one process-wide lock. The example middleware endpoint measured 3,200 requests per second in one free-threaded process and 6,500 in 8 processes with the GIL. If Django middleware is on your hot path, use more processes with fewer workers each.
-
 To keep the GIL on a free-threaded interpreter, start Python with `-X gil=1` or set `PYTHON_GIL=1`. `runbolt` then uses 1 worker thread again.

@@ -45,7 +45,6 @@ except ImportError:  # Django is optional for parts of the test suite
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOCK_TIMEOUT = 10.0
-_SHARED_TEST_CONNECTION_ATTR = "_django_bolt_shared_test_connection"
 
 # The store of the connection handler is process-wide, thus only one thread can
 # hold shared connections at a time. A second thread that entered its own client
@@ -276,7 +275,6 @@ class SharedConnections:
         # raises DatabaseError.
         shared: dict[str, Any] = {}
         for conn in initialized:
-            setattr(conn, _SHARED_TEST_CONNECTION_ATTR, True)
             conn.inc_thread_sharing()
             self._connections.append(conn)
             self.aliases.append(conn.alias)
@@ -301,7 +299,6 @@ class SharedConnections:
                 restore()
             for conn in self._connections:
                 conn.dec_thread_sharing()
-                delattr(conn, _SHARED_TEST_CONNECTION_ATTR)
             self._connections.clear()
             self._gates.clear()
             self._restores.clear()
