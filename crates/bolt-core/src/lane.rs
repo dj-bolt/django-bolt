@@ -14,10 +14,10 @@
 //! - `RequestLane` gives an async request one lane for its sync work. asgiref
 //!   uses it as the executor of the request's thread-sensitive context.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
@@ -58,7 +58,9 @@ enum Job {
         future: Py<PyAny>,
     },
     Release,
-    Stop,
+    /// Stop the lane. The sender, if one exists, gets a message after the
+    /// lane closed its database connections.
+    Stop(Option<Sender<()>>),
 }
 
 /// Where the result of a complete request goes.
@@ -80,6 +82,8 @@ struct IdleLane {
 static IDLE_LANES: Mutex<Vec<IdleLane>> = Mutex::new(Vec::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 static STOPPING: AtomicBool = AtomicBool::new(false);
+/// The count of lane threads that are alive, idle or not.
+static LIVE_LANES: AtomicUsize = AtomicUsize::new(0);
 /// `concurrent.futures.Future`, which `RequestLane.submit` creates for each call.
 static FUTURE_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
@@ -104,11 +108,13 @@ fn spawn_lane() -> PyResult<Sender<Job>> {
 }
 
 fn lane_main(id: u64, sender: Sender<Job>, receiver: Receiver<Job>) {
+    LIVE_LANES.fetch_add(1, Ordering::Relaxed);
     crate::state::pin_python_thread_state();
     call_concurrency("mark_lane_thread");
     let idle = idle_time();
     // The spawner owns a new lane, so the first job arrives with no idle wait.
     let mut owned = true;
+    let mut stopped = None;
     // An async request is open from its first `Call` to its `Release`.
     let mut request_open = false;
     loop {
@@ -180,11 +186,18 @@ fn lane_main(id: u64, sender: Sender<Job>, receiver: Receiver<Job>) {
                     break;
                 }
             }
-            Job::Stop => break,
+            Job::Stop(ack) => {
+                stopped = ack;
+                break;
+            }
         }
     }
     call_concurrency("close_lane_connections");
     crate::state::unpin_python_thread_state();
+    LIVE_LANES.fetch_sub(1, Ordering::Relaxed);
+    if let Some(ack) = stopped {
+        let _ = ack.send(());
+    }
 }
 
 /// Put the lane on the idle list. Return false when the server stops.
@@ -280,8 +293,38 @@ pub fn shutdown() {
     STOPPING.store(true, Ordering::Relaxed);
     let idle = std::mem::take(&mut *IDLE_LANES.lock());
     for lane in idle {
-        let _ = lane.sender.send(Job::Stop);
+        // A send fails only when the lane thread is gone. Then no stop is necessary.
+        let _ = lane.sender.send(Job::Stop(None));
     }
+}
+
+/// Stop all lanes and wait until each one closed its database connections.
+/// The test clients call this at exit. If not, a lane connection stays open
+/// for the idle time, and it blocks the drop of the test database.
+///
+/// A lane that just served an async request goes idle a moment after the
+/// response. Thus this waits for such lanes, up to `STOP_WAIT`. A lane that
+/// a different client still uses stays alive after that time.
+#[pyfunction]
+pub fn stop_idle_lanes(py: Python<'_>) {
+    const STOP_WAIT: Duration = Duration::from_secs(2);
+    py.detach(|| {
+        let deadline = Instant::now() + STOP_WAIT;
+        loop {
+            let idle = std::mem::take(&mut *IDLE_LANES.lock());
+            let (ack, stopped) = channel();
+            for lane in idle {
+                let _ = lane.sender.send(Job::Stop(Some(ack.clone())));
+            }
+            drop(ack);
+            // The channel closes after the last stopped lane sent its message.
+            while stopped.recv().is_ok() {}
+            if LIVE_LANES.load(Ordering::Relaxed) == 0 || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
 }
 
 /// The lane of one async request. It takes a lane at the first `submit`, so a
@@ -336,6 +379,7 @@ impl RequestLane {
     /// Give the lane back. The request calls this at its end.
     fn release(&self) {
         if let Some(sender) = self.sender.lock().take() {
+            // A send fails only when the lane thread is gone. Then no release is necessary.
             let _ = sender.send(Job::Release);
         }
     }

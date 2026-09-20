@@ -811,17 +811,13 @@ class DjangoMiddlewareStack:
         """
         Process request through the Django middleware stack.
 
-        HYBRID APPROACH WITH SAFETY:
-        1. Convert Bolt request to Django request ONCE
-        2. Run Django built-in process_request hooks DIRECTLY (fast, safe!)
-        3. Run third-party process_request hooks via sync_to_async (safe for blocking I/O)
-        4. Run process_view hooks (for CSRF validation, etc.)
-        5. Either:
-           a. If no __call__-only middleware: await handler directly (fast!)
-           b. If __call__-only middleware: run chain via sync_to_async (slow but necessary)
-        6. Run third-party process_response hooks via sync_to_async (reverse order)
-        7. Run Django built-in process_response hooks DIRECTLY (reverse order)
-        8. Convert Django response to Bolt response ONCE
+        1. Convert the Bolt request to a Django request one time.
+        2. Select the path:
+           a. Hook and ``__call__`` middleware together: the compatibility chain.
+           b. Hook middleware only: the request phase, the handler, the response phase.
+              A phase with a third-party hook runs on the thread of the request.
+           c. ``__call__`` middleware only: one sync chain on the thread of the request.
+        3. Convert the Django response to a Bolt response one time.
         """
         # 1. Single Bolt→Django conversion
         django_request = _to_django_request(request)

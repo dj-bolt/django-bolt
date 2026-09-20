@@ -10,6 +10,7 @@ from typing import Annotated
 import pytest
 from asgiref.sync import async_to_sync, markcoroutinefunction
 from django.contrib.auth.models import User
+from django.db.backends.signals import connection_created
 from django.http import HttpResponse
 from django.utils.decorators import async_only_middleware
 from django.utils.deprecation import MiddlewareMixin
@@ -441,3 +442,64 @@ def test_single_wrapper_inspects_the_instance_that_a_factory_returns():
 
     with TestClient(api) as client:
         assert client.get("/guarded").status_code == 403
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync", "async"])
+def test_test_client_exit_closes_the_connections_of_its_lanes(handler_is_async):
+    """An open lane connection blocks the drop of the test database at teardown."""
+    lane_connections = []
+
+    def track(sender, connection, **kwargs):
+        lane_connections.append(connection)
+
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
+
+    if handler_is_async:
+
+        @api.get("/users")
+        async def users():
+            await asyncio.sleep(0)
+            return {"count": await sync_to_thread(User.objects.count)}
+    else:
+
+        @api.get("/users")
+        def users():
+            return {"count": User.objects.count()}
+
+    connection_created.connect(track)
+    try:
+        with TestClient(api) as client:
+            assert client.get("/users").json() == {"count": 0}
+            assert lane_connections
+    finally:
+        connection_created.disconnect(track)
+
+    assert [conn.connection for conn in lane_connections] == [None] * len(lane_connections)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_test_client_exit_closes_the_connections_of_its_lanes():
+    lane_connections = []
+
+    def track(sender, connection, **kwargs):
+        lane_connections.append(connection)
+
+    api = _sync_to_thread_api([DjangoMiddlewareStack([_TenantMixinMiddleware])])
+
+    @api.get("/users")
+    async def users():
+        return {"count": await sync_to_thread(User.objects.count)}
+
+    async def run_request():
+        async with AsyncTestClient(api) as client:
+            return (await client.get("/users")).json()
+
+    connection_created.connect(track)
+    try:
+        assert asyncio.run(run_request()) == {"count": 0}
+    finally:
+        connection_created.disconnect(track)
+
+    assert lane_connections
+    assert [conn.connection for conn in lane_connections] == [None] * len(lane_connections)

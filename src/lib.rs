@@ -59,6 +59,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bolt_loop::worker_timer_count, m)?)?;
     m.add_function(wrap_pyfunction!(bolt_loop::worker_fd_watcher_count, m)?)?;
     m.add_class::<bolt_core::lane::RequestLane>()?;
+    m.add_function(wrap_pyfunction!(bolt_core::lane::stop_idle_lanes, m)?)?;
 
     // Production server functions
     m.add_function(wrap_pyfunction!(register_routes, m)?)?;

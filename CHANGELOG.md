@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The test clients close the database connections of their lanes at exit** - A lane keeps its connection open for 10 seconds after a test. With `@pytest.mark.django_db(transaction=True)` on PostgreSQL, pytest-django then could not drop the test database ("database is being accessed by other users"). `TestClient` and `AsyncTestClient` now stop their idle lanes at exit.
 - **Django middleware state stays with its request** - Middleware that keeps request state in `threading.local`, such as the tenant schema of django-tenants, leaked that state between concurrent requests. Bolt now gives each request with Django middleware one thread for its sync work, as Django's ASGI handler does. The middleware, sync handlers, `sync_to_thread`, QuerySet evaluation, and Django's async ORM calls of one request all use that thread.
 - **`DjangoMiddleware` runs a `MiddlewareMixin` subclass that has its own sync `__call__`** - `MiddlewareMixin` marks each instance as async, so Bolt awaited the response of the sync `__call__` and the request failed. Bolt now runs such a middleware on the thread of the request.
 - **Sync handlers behind Django middleware run on the thread of the request** - A sync handler with no ORM call ran inline on the event loop thread. It then read thread-local state that the middleware did not set. Such a handler now runs on the lane of its request.
