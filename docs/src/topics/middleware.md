@@ -409,6 +409,59 @@ Available synced attributes:
 | Messages | MessageMiddleware | `request.state["_messages"]` |
 | META | All middleware | `request.state["META"]` |
 | CSRF token | CsrfViewMiddleware | `request.state["_csrf_token"]` |
+| Custom attributes | Your middleware | `request.state["<name>"]` |
+
+Bolt copies each public attribute that a middleware sets on the Django request to `request.state`. For example, django-tenants sets `request.tenant`, thus read `request.state["tenant"]`. Bolt does not copy names that start with `_`.
+
+### Thread-local state and django-tenants
+
+Some libraries keep request state on the thread-local database connection. For example, django-tenants stores the tenant in `connection.tenant` and `connection.schema_name`.
+
+Bolt gives each request with Django middleware one request thread, which Bolt calls a lane. Django's ASGI handler has the same rule. These parts run on the lane and read the correct state:
+
+- The Django middleware.
+- Sync handlers.
+- ORM calls from async handlers, such as `await Item.objects.aget()` and a returned QuerySet.
+- Code that you pass to `sync_to_thread` or `sync_to_async`.
+
+The body of an `async def` handler runs on the event loop thread. That thread has a different connection, which the middleware did not configure. In the handler body, `connection.schema_name` reads `public`. Django ASGI async views have the same behavior.
+
+These django-tenants features read the connection on the calling thread. In an async handler body they use the `public` tenant:
+
+- The tenant cache key function (`django_tenants.cache.make_key`). Tenants then share cache entries.
+- `TenantFileSystemStorage`.
+- The tenant template loaders.
+- The tenant log filter.
+
+Obey these rules with django-tenants:
+
+1. Use sync handlers when the handler uses the cache, file storage, or templates.
+2. In an async handler, read the tenant from `request.state["tenant"]`.
+3. In an async handler, call tenant-aware code through `sync_to_thread`.
+
+```python
+from django.core.cache import cache
+from django_bolt.concurrency import sync_to_thread
+
+@api.get("/report")
+async def report(request: Request):
+    tenant = request.state["tenant"]                  # correct on any thread
+    cached = await sync_to_thread(cache.get, "report")  # tenant cache key
+    return {"tenant": tenant.schema_name, "cached": cached}
+```
+
+### Request lanes
+
+A lane is a thread that Rust owns. One lane serves one request at a time, so thread-local state cannot mix between concurrent requests. A lane stays alive between requests and keeps its database connections open, as a WSGI worker thread does.
+
+- **Sync handler:** one lane runs the complete request: the middleware, the handler, and the serializer. The request uses no asyncio. This path applies when all global middleware of the API is `DjangoMiddlewareStack` or `DjangoMiddleware`, and each middleware class can run in sync mode. A class with an async `__call__`, its own `__acall__`, or `sync_capable = False` cannot. For `DjangoMiddleware`, the lane uses a second middleware instance in sync mode, as Django does under WSGI. The route must have no async dependency, no Python route middleware, and no token revocation handler. A sync handler on a route that does not qualify still runs on the lane of its request.
+- **Async handler:** the handler body runs on the event loop. The middleware hooks, ORM calls, and `sync_to_thread` calls of that request all go to one lane.
+
+In an async request, one thread hop runs all `process_request` and `process_view` hooks, and one more runs all `process_response` hooks. A stack with only Django built-in hooks needs no hop.
+
+Lanes need no configuration. A request takes an idle lane, or Bolt starts a new one. A lane that stays idle for 10 seconds closes its database connections and stops. [`DJANGO_BOLT_LANE_IDLE_SECONDS`](../ref/settings.md#django_bolt_lane_idle_seconds) changes this time. At peak load, the lane count equals the count of concurrent requests that run sync code. Each lane holds one connection for each database that it used, so set `max_connections` of the database, or use a pooler such as PgBouncer, for your peak concurrency.
+
+Bolt applies `CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` on lanes when you set them. With the default `CONN_MAX_AGE = 0`, a lane keeps its connection until the lane stops.
 
 ### Performance notes
 

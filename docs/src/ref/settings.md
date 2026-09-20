@@ -185,6 +185,16 @@ export DJANGO_BOLT_ORM_THREADS=8
 
 Each thread holds one database connection. Increase the value when one free-threaded process runs many worker threads. See [Size the database thread pools](../getting-started/deployment.md#size-the-database-thread-pools). An invalid value logs a warning, and the default applies.
 
+### DJANGO_BOLT_LANE_IDLE_SECONDS
+
+Idle time, in seconds, after which a request lane closes its database connections and stops. Routes with Django middleware use request lanes. See [Request lanes](../topics/middleware.md#request-lanes).
+
+```bash
+export DJANGO_BOLT_LANE_IDLE_SECONDS=30
+```
+
+**Default:** `10`. A fraction such as `0.5` is valid. An invalid value or a value that is not positive gives the default.
+
 ### DJANGO_BOLT_EXECUTOR_THREADS
 
 Number of threads in the shared executor pool of each process. Blocking sync handlers and `sync_to_thread` calls run on this pool.
@@ -475,4 +485,5 @@ api = BoltAPI(
 | `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |
 | `DJANGO_BOLT_MAX_PARAM_LENGTH` | `int` (env var) | `8192` | Max path/query/form parameter size in bytes, clamped to `1048576` (1 MB); requests over the limit return `422` |
 | `DJANGO_BOLT_ORM_THREADS` | `int` (env var) | `1` (SQLite) or `4` | Threads in the ORM pool of each process |
+| `DJANGO_BOLT_LANE_IDLE_SECONDS` | `float` (env var) | `10` | Idle time after which a request lane stops |
 | `DJANGO_BOLT_EXECUTOR_THREADS` | `int` (env var) | CPU count + 4 (max `32`) | Threads in the shared executor pool of each process |
