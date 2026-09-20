@@ -261,7 +261,7 @@ Process with 4 workers:
 └── Worker 3: [waiting for GIL]
 ```
 
-The Rust parts (HTTP parsing, routing, compression) take microseconds. Your Python handler takes milliseconds. You will not saturate the Rust side.
+The Rust parts (HTTP parsing and routing) usually take much less time than your Python handler. Compression of a large response can take longer. Measure your workload before you select the process count and the worker count.
 
 **Use processes for parallelism** on a standard build. Each process has its own GIL, so handlers run in parallel.
 
@@ -289,7 +289,7 @@ What runs in parallel:
 
 Because each worker thread has its own asyncio loop, loop-bound objects (`asyncio.Lock`, `asyncio.Queue`, futures) cannot be shared between handlers on different worker threads. Treat worker threads like processes for shared asyncio state. With `--workers 1` (the default with the GIL) there is one loop, as before.
 
-Module-level constants that every request reads do not scale with threads on a free-threaded build: the interpreter must synchronize their reference counts across threads. Build the response per request, or split the constant per thread.
+A module-level list or dict that every request reads can limit scaling on a free-threaded build. The interpreter and msgspec lock a container while they read it, so worker threads wait for each other. Immutable constants, such as strings and numbers, do not have this cost. Measure your workload. If a shared container is the limit, build the data per request, or keep one copy per thread. See `python/benchmark/PROFILE-FT-JSON.md` for a measured example.
 
 Each worker thread holds its own Django database connection, as in any threaded server. Each pool thread also holds one. Verify that your own code and third-party packages are thread-safe before you run them with the GIL disabled. Django itself does not yet declare free-threading support.
 

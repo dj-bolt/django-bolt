@@ -20,6 +20,8 @@ p.add_argument(
 )
 p.add_argument("--seconds", type=float, default=1.5)
 a = p.parse_args()
+if a.threads < 1:
+    p.error("--threads must be 1 or more")
 raw = (Path(__file__).resolve().parents[1] / "example/test_data/10K.json").read_bytes()
 payload = msgspec.json.decode(raw)
 encoder = msgspec.json.Encoder()
