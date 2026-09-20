@@ -116,7 +116,7 @@ def test_real_server_keeps_interpreter_gil_state_under_load(make_server_project)
         }
 
         for path, kind in ROUTES:
-            result = generate_load(server.url(path.format(n=42)), duration_s=1.0, concurrency=16)
+            result = generate_load(server.url(path.format(n=42)), duration_s=1.0, concurrency=16, expected_status=200)
             assert result.failed == 0, (kind, result)
             assert result.ok > 0, (kind, result)
 
@@ -196,3 +196,29 @@ def test_runbolt_rejects_zero_workers(make_server_project):
 
     assert process.returncode != 0
     assert "--workers must be at least 1" in stderr, stdout + stderr
+
+
+@pytest.mark.server_integration
+def test_streams_on_different_worker_threads_do_not_share_a_context(make_server_project):
+    """Each WorkerLoop runs its stream tasks in its own ``contextvars.Context``.
+
+    Python does not let two threads enter one Context at the same time. A
+    stream task that cannot enter its context sends no data.
+    """
+    project = make_server_project(api_module=app_module("free_threading"))
+
+    with project.start(extra_args=["--workers", "4"]) as server:
+
+        def worker(worker_id: int) -> list[str]:
+            with httpx.Client(timeout=30) as client:
+                return [client.get(server.url(f"/stream/{worker_id * 100 + i}")).text for i in range(40)]
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            bodies = [
+                (w * 100 + i, body)
+                for w, batch in enumerate(pool.map(worker, range(16)))
+                for i, body in enumerate(batch)
+            ]
+
+    wrong = [(n, body) for n, body in bodies if body != "".join(f"{n}:{i}\n" for i in range(3))]
+    assert not wrong, wrong[:3]

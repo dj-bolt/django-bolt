@@ -173,12 +173,15 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
 
     try:
         with project.start(
+            # The shared-lock probe needs one loop. A free-threaded build
+            # starts one worker thread, and thus one loop, for each CPU.
+            extra_args=["--workers", "1"],
             env={
                 "BOLT_PROBE_TCP_PORT": str(echo_server.server_address[1]),
                 "BOLT_PROBE_STARTTLS_PORT": str(starttls_server.server_address[1]),
                 "BOLT_PROBE_SLOW_SINK_PORT": str(slow_sink_server.server_address[1]),
                 "BOLT_PROBE_HTTP_URL": f"https://127.0.0.1:{http_server.server_address[1]}/",
-            }
+            },
         ) as server:
             _assert_probes(server)
 

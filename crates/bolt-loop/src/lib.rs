@@ -127,19 +127,19 @@ impl WorkerLoop {
     /// coroutines or resolves Python futures on it (e.g. the streaming
     /// forwarder and its backpressure futures).
     ///
-    /// The context is the startup one, not a fresh `copy_context()`: this
-    /// snapshot is initialized lazily from whichever request first streams
-    /// or upgrades, and is then inherited by every stream/WebSocket task on
-    /// this loop for the process lifetime — so copying here would pin that
-    /// request's contextvars forever.
+    /// The context is a copy of the startup one. Python does not let two
+    /// threads enter one `Context` at the same time, so each loop needs its
+    /// own. A `copy_context()` here would copy the context of the request
+    /// that streams first, and keep its contextvars for the process lifetime.
     pub fn task_locals(&self, py: Python<'_>) -> PyResult<&pyo3_async_runtimes::TaskLocals> {
         self.task_locals.get_or_try_init(py, || {
             let startup = TASK_LOCALS.get().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
             })?;
+            let context = startup.context(py).call_method0("copy")?;
             Ok(
                 pyo3_async_runtimes::TaskLocals::new(self.loop_obj.bind(py).clone())
-                    .with_context(startup.context(py)),
+                    .with_context(context),
             )
         })
     }
