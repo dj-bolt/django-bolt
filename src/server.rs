@@ -1013,7 +1013,10 @@ pub fn start_server(
                         handle.stop(graceful).await;
                     });
 
-                    server.await
+                    let served = server.await;
+                    // Idle lanes close their database connections and stop.
+                    bolt_core::lane::shutdown();
+                    served
                 }
             })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))

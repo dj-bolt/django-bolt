@@ -15,12 +15,146 @@ import contextvars
 import logging
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from functools import partial
+
+from asgiref.sync import SyncToAsync, ThreadSensitiveContext, sync_to_async
+from django.db import connections
 
 logger = logging.getLogger(__name__)
 
 __all__ = ("in_orm_executor_thread", "run_in_orm_executor", "run_orm_blocking", "sync_to_thread")
+
+
+# Bolt keeps Django connections open across requests and does not run
+# ``close_old_connections`` on every request. A connection that died would
+# stay on its thread forever. The pool hand-offs below drop unusable
+# connections on the error path only (zero cost when the call succeeds).
+# When CONN_MAX_AGE or CONN_HEALTH_CHECKS is set, the same check also runs
+# before each call so Django can age out and health-check connections.
+_check_before_call = False
+
+
+def configure_connection_checks() -> None:
+    """Enable the pre-call connection check when the database settings ask for it."""
+    global _check_before_call
+    from django.conf import settings  # noqa: PLC0415 — needs configured settings, resolved lazily
+
+    if not settings.configured:
+        return
+    for db in connections.settings.values():
+        if db["CONN_MAX_AGE"] or db["CONN_HEALTH_CHECKS"]:
+            _check_before_call = True
+            return
+
+
+def _drop_broken_connections() -> None:
+    """Close the calling thread's connections that Django reports as unusable or obsolete.
+
+    A connection inside an open ``atomic`` block is left alone: its autocommit
+    state is off by design, and the block restores it on exit. Django's test
+    client skips ``close_old_connections`` for the same reason.
+    """
+    for conn in connections.all(initialized_only=True):
+        if not conn.in_atomic_block:
+            conn.close_if_unusable_or_obsolete()
+
+
+def _call_guarded[T](fn: Callable[..., T], *args: object, **kwargs: object) -> T:
+    """Call ``fn`` on the pool thread and drop dead connections when it raises."""
+    # A lane does this check one time, at the start of its request.
+    if _check_before_call and not _on_lane_thread():
+        _drop_broken_connections()
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        _drop_broken_connections()
+        raise
+
+
+# Request lanes: see crates/bolt-core/src/lane.rs.
+_lane_state = threading.local()
+_SHARED_TEST_CONNECTION_ATTR = "_django_bolt_shared_test_connection"
+
+
+def mark_lane_thread() -> None:
+    """Mark the calling thread as a lane. Rust calls this when a lane starts."""
+    _lane_state.is_lane = True
+    # A lane checks its own connections, so it must not depend on the start of a pool.
+    configure_connection_checks()
+
+
+def _on_lane_thread() -> bool:
+    return getattr(_lane_state, "is_lane", False)
+
+
+def in_lane_mode() -> bool:
+    """Whether the calling thread is a request lane that runs a complete request."""
+    return getattr(_lane_state, "active", False)
+
+
+def run_on_request_lane[T](coro_fn: Callable[..., Coroutine[object, object, T]], *args: object) -> T:
+    """Run a complete request on the calling lane thread.
+
+    ``coro_fn(*args)`` must not suspend. In lane mode, each thread hop in the
+    dispatch path runs inline, so the coroutine ends in one step.
+    """
+    open_lane_request()
+    # A lane serves many requests. A new context keeps the context variables
+    # of one request away from the next one, as a new asyncio task does.
+    return contextvars.Context().run(_drive_in_lane_mode, coro_fn, args)
+
+
+def _drive_in_lane_mode[T](coro_fn: Callable[..., Coroutine[object, object, T]], args: tuple[object, ...]) -> T:
+    # Lane mode ends with the request. The next owner of this lane can be an
+    # async request, whose coroutines do suspend.
+    _lane_state.active = True
+    # ``async_to_sync`` in a sync handler runs its coroutine on a different
+    # thread. With this context, its thread-sensitive work returns to the lane.
+    SyncToAsync.thread_sensitive_context.set(ThreadSensitiveContext())
+    try:
+        return drive_on_lane(coro_fn(*args))
+    finally:
+        _lane_state.active = False
+        close_lane_request()
+
+
+def drive_on_lane[T](coro: Coroutine[object, object, T]) -> T:
+    """Run a coroutine that does not suspend. On a lane, each thread hop runs inline."""
+    try:
+        coro.send(None)
+    except StopIteration as done:
+        return done.value
+    coro.close()
+    raise RuntimeError(
+        "A coroutine suspended on a request lane. Lane dispatch supports request flows with no await only."
+    )
+
+
+def open_lane_request() -> None:
+    """Start a request on a lane. Rust calls this before the first sync call of an async request."""
+    if _check_before_call:
+        _drop_broken_connections()
+
+
+def close_lane_request() -> None:
+    """End a request on a lane. For an async request, Rust calls this when the lane comes back.
+
+    Bolt does not see a database error that user code handles, or one from a
+    direct ``sync_to_async`` call. Django does this check on ``request_finished``.
+    """
+    for conn in connections.all(initialized_only=True):
+        if conn.errors_occurred and not conn.in_atomic_block:
+            conn.close_if_unusable_or_obsolete()
+
+
+def close_lane_connections() -> None:
+    """Close the connections of a lane that stops. Rust calls this on the lane thread."""
+    for conn in connections.all(initialized_only=True):
+        # The TestClient shares one connection between threads. Its owner closes it.
+        if not getattr(conn, _SHARED_TEST_CONNECTION_ATTR, False):
+            conn.close()
+
 
 # Shared default pool for generic blocking work. Passing an explicit executor
 # keeps the compatibility asyncio loop and WorkerLoop from each lazily creating
@@ -53,6 +187,7 @@ def _get_default_executor() -> concurrent.futures.ThreadPoolExecutor:
                     raw,
                     workers,
                 )
+            configure_connection_checks()
             _default_executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(1, workers), thread_name_prefix="bolt_default"
             )
@@ -131,6 +266,7 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
                     raw,
                     workers,
                 )
+            configure_connection_checks()
             _orm_executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(1, workers),
                 thread_name_prefix="bolt_orm",
@@ -144,7 +280,7 @@ def _submit_blocking(
 ) -> object:
     """Submit ``fn`` to ``executor`` with the caller's context and block on it."""
     ctx = contextvars.copy_context()
-    return executor.submit(ctx.run, fn, *args).result()
+    return executor.submit(ctx.run, _call_guarded, fn, *args).result()
 
 
 def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
@@ -162,7 +298,9 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     context so ContextVar writes stay scoped the same way as on the
     executor path.
     """
-    if in_orm_executor_thread():
+    # A lane thread owns its request, in lane mode and when it runs the sync
+    # work of an async request. The ORM pool would use a different connection.
+    if in_orm_executor_thread() or _on_lane_thread():
         return contextvars.copy_context().run(fn, *args)
     return _submit_blocking(_get_orm_executor(), fn, *args)
 
@@ -200,11 +338,19 @@ async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
     a rare path, in exchange for neither deadlocking nor tripping the
     async-unsafe check.
     """
+    # A Django middleware stack owns thread-local request state, such as a
+    # tenant-selected database schema. Its ThreadSensitiveContext requires
+    # every ORM call to use the request's dedicated worker.
+    if in_lane_mode():
+        return _call_guarded(fn, *args)
+    if SyncToAsync.thread_sensitive_context.get(None) is not None:
+        return await sync_to_async(_call_guarded, thread_sensitive=True)(fn, *args)
+
     ctx = contextvars.copy_context()
     loop = asyncio.get_running_loop()
     if in_orm_executor_thread():
-        return await loop.run_in_executor(_get_default_executor(), ctx.run, fn, *args)
-    return await loop.run_in_executor(_get_orm_executor(), ctx.run, fn, *args)
+        return await loop.run_in_executor(_get_default_executor(), ctx.run, _call_guarded, fn, *args)
+    return await loop.run_in_executor(_get_orm_executor(), ctx.run, _call_guarded, fn, *args)
 
 
 async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
@@ -243,8 +389,15 @@ async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.
     # The caller's contextvars context is carried into the thread via ctx.run.
     # run_in_executor only forwards positional args — keyword args (e.g. Rust
     # prebound keyword-bound params) must be bound via partial.
+    # A Django middleware stack owns thread-local request state. Use the
+    # request's dedicated worker, as run_in_orm_executor does.
+    if in_lane_mode():
+        return _call_guarded(fn, *args, **kwargs)
+    if SyncToAsync.thread_sensitive_context.get(None) is not None:
+        return await sync_to_async(_call_guarded, thread_sensitive=True)(fn, *args, **kwargs)
+
     loop = asyncio.get_running_loop()
     ctx = contextvars.copy_context()
     if kwargs:
-        return await loop.run_in_executor(_get_default_executor(), partial(ctx.run, fn, *args, **kwargs))
-    return await loop.run_in_executor(_get_default_executor(), ctx.run, fn, *args)
+        return await loop.run_in_executor(_get_default_executor(), partial(ctx.run, _call_guarded, fn, *args, **kwargs))
+    return await loop.run_in_executor(_get_default_executor(), ctx.run, _call_guarded, fn, *args)
