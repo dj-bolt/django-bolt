@@ -286,7 +286,7 @@ wheels = [
 
 [[package]]
 name = "django-bolt"
-version = "0.12.0rc2"
+version = "0.12.0rc3"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
