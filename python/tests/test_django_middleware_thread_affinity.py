@@ -612,3 +612,83 @@ def test_lazy_user_forced_on_a_lane_loads_on_that_lane():
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["loaded_on"] == body["handler_thread"]
+
+
+class _ShieldCallOnlyMiddleware(MiddlewareMixin):
+    """An async-only mixin subclass with no hooks. Its plain ``__call__`` returns a Future."""
+
+    sync_capable = False
+    async_capable = True
+
+    def __call__(self, request):
+        return asyncio.shield(self._respond(request))
+
+    async def _respond(self, request):
+        response = await super().__call__(request)
+        response["X-Shielded"] = "yes"
+        return response
+
+
+class _AsyncOnlyHeaderMiddleware:
+    """A plain async-only middleware that awaits ``get_response``."""
+
+    sync_capable = False
+    async_capable = True
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+        markcoroutinefunction(self)
+
+    async def __call__(self, request):
+        await asyncio.sleep(0)
+        response = await self.get_response(request)
+        response["X-Async-Only"] = "yes"
+        return response
+
+
+def _stack_with_async_only_api(middleware_classes: list) -> BoltAPI:
+    api = BoltAPI(middleware=[DjangoMiddlewareStack(middleware_classes)])
+
+    @api.get("/sync/{tenant}")
+    def sync_route(tenant: str):
+        return {"expected": tenant, "actual": _read_tenant()}
+
+    @api.get("/async/{tenant}")
+    async def async_route(tenant: str):
+        await asyncio.sleep(0)
+        return {"expected": tenant, "actual": await sync_to_thread(_read_tenant)}
+
+    return api
+
+
+@pytest.mark.parametrize(
+    ("middleware_class", "header"),
+    [(_ShieldCallOnlyMiddleware, "x-shielded"), (_AsyncOnlyHeaderMiddleware, "x-async-only")],
+    ids=["mixin_future", "plain_async"],
+)
+def test_stack_awaits_an_async_only_middleware_that_calls_get_response(middleware_class, header):
+    """A ``__call__``-only stack gives an async-only middleware an async ``get_response``."""
+    api = _stack_with_async_only_api([middleware_class])
+
+    with TestClient(api) as client:
+        for path in ("/sync/acme", "/async/acme"):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.headers[header] == "yes"
+
+
+@pytest.mark.parametrize(
+    ("middleware_class", "header"),
+    [(_ShieldCallOnlyMiddleware, "x-shielded"), (_AsyncOnlyHeaderMiddleware, "x-async-only")],
+    ids=["mixin_future", "plain_async"],
+)
+def test_mixed_stack_keeps_thread_affinity_through_an_async_only_middleware(middleware_class, header):
+    """Hooks before an async-only layer and the handler after it share the request's lane."""
+    api = _stack_with_async_only_api([_TenantMixinMiddleware, middleware_class])
+
+    with TestClient(api) as client:
+        for path in ("/sync/acme", "/async/acme"):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.headers[header] == "yes"
+            assert response.json() == {"expected": "acme", "actual": "acme"}

@@ -454,6 +454,17 @@ def _is_django_builtin_middleware(middleware_class: type) -> bool:
     return any(module.startswith(prefix) for prefix in _DJANGO_SAFE_MIDDLEWARE_PREFIXES)
 
 
+def _needs_event_loop(middleware: Any) -> bool:
+    """Whether a middleware class or factory must run on the event loop.
+
+    ``sync_capable`` is the flag that Django reads for a class or a factory.
+    A class with an async ``__call__`` can await, so it needs the loop too.
+    """
+    return not getattr(middleware, "sync_capable", True) or (
+        isinstance(middleware, type) and iscoroutinefunction(middleware.__call__)
+    )
+
+
 class DjangoMiddlewareStack:
     """
     Wraps MULTIPLE Django middleware classes into a SINGLE Bolt middleware.
@@ -535,16 +546,8 @@ class DjangoMiddlewareStack:
 
     @property
     def supports_lane_dispatch(self) -> bool:
-        """Whether a lane can run this stack with no event loop.
-
-        A middleware with an async ``__call__`` can await, so it needs the event
-        loop. ``sync_capable`` is the flag that Django reads for a class or a factory.
-        """
-        return not any(
-            not getattr(middleware, "sync_capable", True)
-            or (isinstance(middleware, type) and iscoroutinefunction(middleware.__call__))
-            for middleware in self.middleware_classes
-        )
+        """Whether a lane can run this stack with no event loop."""
+        return not any(_needs_event_loop(middleware) for middleware in self.middleware_classes)
 
     @staticmethod
     def _has_hook_methods(middleware_class: type) -> bool:
@@ -585,6 +588,7 @@ class DjangoMiddlewareStack:
         1. Django built-in hook-based -> direct calls (fast, safe)
         2. Third-party hook-based -> sync_to_async (slower, but safe for blocking I/O)
         3. __call__-only -> sync chain with sync_to_async
+        An async-only __call__ middleware goes to the compatibility chain, which awaits it.
         """
         self.get_response = get_response
         self._django_hook_middleware = []
@@ -652,7 +656,9 @@ class DjangoMiddlewareStack:
 
         # Compatibility fallback: mixed hook + __call__ middleware cannot be safely flattened
         # while preserving strict declared order and process_view semantics.
-        if has_hook_middleware and has_call_only_middleware:
+        # An async-only middleware awaits on the event loop, so the sync chain
+        # below cannot run it. The compatibility chain gives it an async get_response.
+        if (has_hook_middleware and has_call_only_middleware) or any(map(_needs_event_loop, call_only_classes)):
             self._compatibility_chain = self._build_compatibility_chain()
             return
 
@@ -788,6 +794,17 @@ class DjangoMiddlewareStack:
 
             next_layer = chain
 
+            if _needs_event_loop(middleware_class):
+                # Django gives an async-only middleware an async get_response.
+                # The layer awaits its result, which can be any awaitable.
+                instance = middleware_class(next_layer)
+
+                async def call_layer(django_request, *, _instance=instance):
+                    return await _instance(django_request)
+
+                chain = call_layer
+                continue
+
             def get_response_sync(django_request, _next=next_layer):
                 if in_lane_mode():
                     return drive_on_lane(_next(django_request))
@@ -825,6 +842,7 @@ class DjangoMiddlewareStack:
            b. Hook middleware only: the request phase, the handler, the response phase.
               A phase with a third-party hook runs on the thread of the request.
            c. ``__call__`` middleware only: one sync chain on the thread of the request.
+              A stack with an async-only middleware uses the compatibility chain (a).
         3. Convert the Django response to a Bolt response one time.
         """
         # 1. Single Bolt→Django conversion
