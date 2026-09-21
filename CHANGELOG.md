@@ -17,7 +17,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- **The CI test matrix is derived from the `pyproject.toml` classifiers** - The Django axis is now read from the `Framework :: Django :: X.Y` classifiers, as the Python axis already was, so the declared support matrix and the versions actually tested cannot disagree. A new `support-matrix` workflow checks those classifiers against [endoflife.date](https://endoflife.date) weekly and opens an issue when a series goes end of life or a new one ships. Run `python scripts/check_support_matrix.py` to check locally.
+- **The CI test matrix is derived from the `pyproject.toml` classifiers** - The Django axis is now read from the `Framework :: Django :: X.Y` classifiers, as the Python axis already was. The declared support matrix and the versions actually tested can no longer disagree. A new `support-matrix` workflow checks those classifiers against [endoflife.date](https://endoflife.date) every week. It opens an issue when a series goes end of life, or when a new one ships. Run `python scripts/check_support_matrix.py` to check locally.
 
 ### Performance
 

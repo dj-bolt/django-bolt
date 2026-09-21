@@ -13,6 +13,14 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+# One run at a time: the "find an open issue, then create one" sequence is not
+# atomic, so two overlapping runs could file duplicate issues or close one using
+# state from before the other's edit. Queue rather than cancel, so a manual
+# dispatch never discards the scheduled run's result.
+concurrency:
+  group: support-matrix
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

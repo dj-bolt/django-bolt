@@ -13,8 +13,8 @@ It reports drift in either direction:
 * a declared version upstream no longer supports (it went EOL -- drop it),
 * a maintained Django series that is not declared (a new release shipped),
 * a ``Django>=`` floor that disagrees with the oldest declared series,
-* a declared Django series that does not support the oldest declared Python,
-  which would invalidate the pairing the derived CI matrix assumes.
+* a Django/Python pairing the derived CI matrix runs that upstream does not
+  support, which would fail CI while looking fine here.
 
 Python is checked in one direction only: EOL interpreters must not be declared,
 but the floor is deliberately higher than Python's own EOL schedule (Django 6.x
@@ -121,6 +121,34 @@ def _backoff_delay(attempt: int, retry_after: str | None) -> float:
     return ceiling * (0.5 + random.random() / 2)  # noqa: S311 - jitter, not crypto
 
 
+def _validate_releases(url: str, payload: Any) -> list[dict[str, Any]]:
+    """Return ``payload``'s release records, or abort if the shape is wrong.
+
+    Everything here would otherwise surface as an unhandled ``AttributeError``,
+    ``KeyError`` or ``ValueError``, and an unhandled exception exits 1 -- the
+    status that means "the matrix drifted". An API that changed shape would then
+    be reported as drift, with an empty report body, so each level is checked
+    explicitly and routed to ``die()`` (status 2) instead.
+    """
+    if not isinstance(payload, dict):
+        die(f"{url} returned a JSON {type(payload).__name__}, expected an object")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        die(f"{url}: 'result' is missing or not an object; the API shape may have changed")
+    releases = result.get("releases")
+    if not isinstance(releases, list) or not releases:
+        die(f"{url}: 'result.releases' is missing or not a non-empty list; the API shape may have changed")
+    for entry in releases:
+        if not isinstance(entry, dict):
+            die(f"{url}: a release entry is a {type(entry).__name__}, expected an object")
+        name = entry.get("name")
+        # `name` is used as a dict key and parsed by _version_key, which would
+        # raise on anything that is not dotted digits.
+        if not isinstance(name, str) or not re.fullmatch(r"\d+(\.\d+)*", name):
+            die(f"{url}: release name {name!r} is not a dotted version; the API shape may have changed")
+    return releases
+
+
 def fetch_releases(product: str, max_attempts: int = MAX_ATTEMPTS) -> list[dict[str, Any]]:
     """Return endoflife.date's release records for ``product``, newest first.
 
@@ -149,10 +177,7 @@ def fetch_releases(product: str, max_attempts: int = MAX_ATTEMPTS) -> list[dict[
             # Usually a truncated body or an intercepting proxy's error page.
             last_error = f"invalid JSON: {exc}"
         else:
-            releases = payload.get("result", {}).get("releases")
-            if not releases:
-                die(f"{url} returned no releases; the API shape may have changed")
-            return releases
+            return _validate_releases(url, payload)
 
         if attempt < max_attempts:
             delay = _backoff_delay(attempt, retry_after)
@@ -287,8 +312,13 @@ def check(pyproject: Path, max_attempts: int = MAX_ATTEMPTS) -> tuple[list[Drift
                 )
             )
 
-    # --- the CI matrix pairs every declared Django with the oldest Python ---
+    # --- every pairing the derived CI matrix actually runs must be supported ---
+    # The matrix (see the `test` job) runs the newest Django on every declared
+    # Python and each older series on the oldest one, so both rules are checked.
+    # Free-threaded builds need no special case: 3.14t's base version, 3.14, is
+    # itself a declared Python and is covered by the newest-Django rule.
     oldest_python = pythons[0]
+    newest_django = djangos[-1]
     by_name = {r["name"]: r for r in django_releases}
     for version in djangos:
         release = by_name.get(version)
@@ -300,14 +330,20 @@ def check(pyproject: Path, max_attempts: int = MAX_ATTEMPTS) -> tuple[list[Drift
             notes.append(f"Django {version}: upstream Python range not machine-readable; pairing not checked")
             continue
         low, high = window
-        if not (_version_key(low) <= _version_key(oldest_python) <= _version_key(high)):
+        paired = pythons if version == newest_django else [oldest_python]
+        for python in paired:
+            if _version_key(low) <= _version_key(python) <= _version_key(high):
+                continue
+            role = (
+                "the newest declared Django runs on every declared Python"
+                if version == newest_django
+                else "older Django series run on the oldest declared Python"
+            )
             drift.append(
                 Drift(
-                    f"Django {version} + Python {oldest_python}",
-                    f"Django {version} supports Python {low} - {high}, "
-                    f"which excludes the oldest declared Python ({oldest_python})",
-                    "the derived CI matrix pairs older Django series with the oldest Python; "
-                    "pin this series to a compatible Python in the test matrix instead",
+                    f"Django {version} + Python {python}",
+                    f"the CI matrix pairs them, but Django {version} supports Python {low} - {high}",
+                    f"{role}; drop one of the two versions, or pin this pairing explicitly in the test matrix",
                 )
             )
 
