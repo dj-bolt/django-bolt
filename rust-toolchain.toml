@@ -3,6 +3,6 @@
 # automatically for every cargo/rustfmt invocation in the repo. Renovate keeps
 # the channel current via its built-in rust-toolchain manager.
 [toolchain]
-channel = "1.96.0"
+channel = "1.98.1"
 profile = "minimal"
 components = ["rustfmt"]

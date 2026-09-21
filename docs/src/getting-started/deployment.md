@@ -171,7 +171,7 @@ For ASGI deployments, keep persistent connections disabled (`CONN_MAX_AGE = 0`) 
 
 ### Option 1: psycopg pool (recommended)
 
-Django 5.1+ has native PostgreSQL connection pooling support with psycopg:
+Django supports native PostgreSQL connection pooling with psycopg:
 
 ```python
 # settings.py
