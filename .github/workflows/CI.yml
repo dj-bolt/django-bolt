@@ -484,14 +484,23 @@ jobs:
           uvx pip-audit --requirement audit-reqs.txt --no-deps
 
   artifact_smoke:
-    name: Artifact Smoke ${{ matrix.artifact-kind }}
+    name: Artifact Smoke ${{ matrix.artifact-kind }} Python ${{ matrix.python-version }}
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     needs: [linux-amd64, sdist]
     strategy:
       fail-fast: false
       matrix:
-        artifact-kind: ["wheel", "sdist"]
+        include:
+          - artifact-kind: wheel
+            python-version: "3.13"
+            artifact-pattern: "django_bolt-*-abi3-*.whl"
+          - artifact-kind: wheel
+            python-version: "3.14t"
+            artifact-pattern: "django_bolt-*-cp314-cp314t-*.whl"
+          - artifact-kind: sdist
+            python-version: "3.13"
+            artifact-pattern: "django_bolt-*.tar.gz"
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -506,10 +515,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
       - name: Create virtual environment
-        run: uv venv
+        run: uv venv --python "${{ matrix.python-version }}"
 
       - name: Install Rust
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
@@ -546,14 +555,15 @@ jobs:
       - name: Resolve artifact path
         id: artifact
         shell: bash
+        env:
+          ARTIFACT_PATTERN: ${{ matrix.artifact-pattern }}
         run: |
-          if [ "${{ matrix.artifact-kind }}" = "wheel" ]; then
-            artifact_path=$(find dist -name 'django_bolt-*.whl' | head -n 1)
-          else
-            artifact_path=$(find dist -name 'django_bolt-*.tar.gz' | head -n 1)
+          mapfile -t artifacts < <(find dist -maxdepth 1 -name "$ARTIFACT_PATTERN" -type f)
+          if [ "${#artifacts[@]}" -ne 1 ]; then
+            echo "Expected one artifact matching $ARTIFACT_PATTERN; found ${#artifacts[@]}" >&2
+            exit 1
           fi
-          test -n "$artifact_path"
-          echo "path=$artifact_path" >> "$GITHUB_OUTPUT"
+          echo "path=${artifacts[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Run artifact smoke tests
         env:
