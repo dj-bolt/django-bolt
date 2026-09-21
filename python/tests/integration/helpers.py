@@ -33,9 +33,13 @@ def child_pids(parent_pid: int) -> set[int]:
 
     Used to observe worker recycling: the ``runbolt`` supervisor forks one
     worker per slot, so a changing child-PID set is proof of recycles.
+
+    ``pgrep -P`` is in both procps (Linux) and the BSD tools (macOS). The GNU
+    ``ps --ppid`` option is not: macOS ``ps`` rejects it, and the set came
+    back empty. ``pgrep`` exits 1 when there is no child, with empty output.
     """
     result = subprocess.run(
-        ["ps", "--ppid", str(parent_pid), "-o", "pid="],
+        ["pgrep", "-P", str(parent_pid)],
         capture_output=True,
         text=True,
     )
