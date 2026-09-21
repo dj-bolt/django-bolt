@@ -4,6 +4,19 @@ Bolt keeps Django connections open across requests (no
 ``close_old_connections``). A connection that died stays on its thread, so
 every later request on that thread must fail unless the framework drops it
 on the error path.
+
+Two tiers, both in ``concurrency._call_guarded``:
+
+- Always: a pool call that raises drops the unusable connections of its
+  thread. The request that met the dead connection fails, the next one
+  reconnects.
+- With ``CONN_MAX_AGE`` or ``CONN_HEALTH_CHECKS`` set (the
+  ``_check_before_call`` gate): the same check also runs before each call, so
+  Django's health check finds a dead connection before the query, and no
+  request fails.
+
+``test_dead_connection_recovery_server_integration.py`` runs the user-loading
+path against PostgreSQL on a real server.
 """
 
 from __future__ import annotations
@@ -12,12 +25,17 @@ import concurrent.futures
 import sqlite3
 import time
 
+import jwt
 import pytest
-from django.db import connection
+from django.contrib.auth.models import User
+from django.db import connection, connections
 from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteWrapper
 
 from django_bolt import BoltAPI, concurrency
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.testing import TestClient
+
+SECRET = "broken-connection-recovery-secret-key-32b"
 
 
 def _sqlite_is_usable(self) -> bool:
@@ -25,7 +43,7 @@ def _sqlite_is_usable(self) -> bool:
     # as the networked backends do, so a dead connection is detected.
     try:
         self.connection.execute("SELECT 1")
-    except sqlite3.ProgrammingError:
+    except sqlite3.Error:
         return False
     return True
 
@@ -100,3 +118,130 @@ def test_orm_executor_recovers_after_dead_connection(single_thread_pool):
         response = client.get("/ping")
         assert response.status_code == 200
         assert response.json()["value"] == 1
+
+
+# --- The user-loading path and the _check_before_call gate ------------------
+
+
+class _DeadDbapiConnection:
+    """A DBAPI connection whose server side went away.
+
+    A closed sqlite3 connection raises ``ProgrammingError``, which
+    ``get_user_sync`` treats as a lookup failure and swallows. A networked
+    backend raises ``OperationalError`` for a dead connection, and that is the
+    error the user-loading path re-raises, so this stand-in raises it too.
+    """
+
+    def cursor(self, *args, **kwargs):
+        raise sqlite3.OperationalError("the connection is closed")
+
+    execute = cursor
+
+    def close(self) -> None:
+        pass
+
+
+def _kill_silently() -> None:
+    """Replace the connection of this thread without using it: Django records no error."""
+    connection.ensure_connection()
+    connection.connection.close()
+    connection.connection = _DeadDbapiConnection()
+
+
+def _make_token(user_id: int) -> str:
+    now = int(time.time())
+    return jwt.encode({"sub": str(user_id), "iat": now, "exp": now + 3600}, SECRET, algorithm="HS256")
+
+
+def _user_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.get("/kill")
+    async def kill():
+        await concurrency.run_in_orm_executor(_kill_silently)
+        return {"killed": True}
+
+    @api.get("/me", auth=[JWTAuthentication(secret=SECRET)], guards=[IsAuthenticated()])
+    async def me(request):
+        # The lazy load runs get_user_sync on the ORM pool through run_orm_blocking.
+        return {"username": request.user.username}
+
+    return api
+
+
+@pytest.fixture
+def pooled_user_headers() -> dict[str, str]:
+    user = User.objects.create_user(username="pooled")
+    return {"Authorization": f"Bearer {_make_token(user.id)}"}
+
+
+@pytest.fixture
+def health_checks_on(monkeypatch):
+    """Persistent connections with health checks, as a production project sets them.
+
+    ``CONN_MAX_AGE`` must be positive here: Django closes a connection with
+    the default age of 0 as obsolete on the same check, which would hide the
+    health check under test.
+    """
+    monkeypatch.setattr(concurrency, "_check_before_call", concurrency._check_before_call)
+    monkeypatch.setitem(connections.settings["default"], "CONN_MAX_AGE", 600)
+    monkeypatch.setitem(connections.settings["default"], "CONN_HEALTH_CHECKS", True)
+    concurrency.configure_connection_checks()
+    assert concurrency._check_before_call is True
+
+
+@pytest.mark.django_db(transaction=True)
+def test_user_load_on_the_orm_pool_recovers_after_dead_connection(single_thread_pool, pooled_user_headers):
+    """Default settings: the gate is off, so only the error path drops the connection.
+
+    The request that meets the dead connection fails. Without the drop in
+    ``_call_guarded``, every later request on that thread fails too.
+    """
+    assert concurrency._check_before_call is False
+
+    with TestClient(_user_api()) as client:
+        assert client.get("/me", headers=pooled_user_headers).json() == {"username": "pooled"}
+        assert client.get("/kill").json() == {"killed": True}
+
+        assert client.get("/me", headers=pooled_user_headers).status_code == 500
+        response = client.get("/me", headers=pooled_user_headers)
+        assert response.status_code == 200
+        assert response.json() == {"username": "pooled"}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_health_check_before_the_call_serves_the_first_request(
+    single_thread_pool, health_checks_on, pooled_user_headers
+):
+    """With the gate on, the check before the call re-arms Django's health check.
+
+    The health check finds the dead connection before the query and replaces
+    it, so no request fails.
+    """
+    with TestClient(_user_api()) as client:
+        assert client.get("/me", headers=pooled_user_headers).json() == {"username": "pooled"}
+        assert client.get("/kill").json() == {"killed": True}
+
+        response = client.get("/me", headers=pooled_user_headers)
+        assert response.status_code == 200
+        assert response.json() == {"username": "pooled"}
+
+
+@pytest.mark.parametrize(
+    ("database", "expected"),
+    [
+        ({}, False),
+        ({"CONN_MAX_AGE": 60}, True),
+        # An unlimited age has nothing to age out.
+        ({"CONN_MAX_AGE": None}, False),
+        ({"CONN_HEALTH_CHECKS": True}, True),
+    ],
+)
+def test_check_before_call_gate_follows_the_database_settings(monkeypatch, database, expected):
+    monkeypatch.setattr(concurrency, "_check_before_call", False)
+    for key, value in database.items():
+        monkeypatch.setitem(connections.settings["default"], key, value)
+
+    concurrency.configure_connection_checks()
+
+    assert concurrency._check_before_call is expected
