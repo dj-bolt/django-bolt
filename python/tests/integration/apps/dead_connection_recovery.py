@@ -2,7 +2,7 @@
 
 ``/me`` is the path that failed in production: an async handler behind the
 default ``JWTAuthentication`` reads ``request.user``. The lazy load runs
-``get_user_sync`` on the bounded ORM pool through ``run_orm_blocking``, so the
+``get_user_sync`` on the bounded ORM pool through ``run_orm_blocking``. The
 Django connection it uses is parked on a pool thread between requests. When
 the database server closes that connection, the next load must fail once at
 most, and the request after it must reconnect.

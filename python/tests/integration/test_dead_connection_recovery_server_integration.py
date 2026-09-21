@@ -88,7 +88,7 @@ def terminate_backends(params: dict[str, Any], application_name: str, timeout: f
     """Kill every backend of the server with this ``application_name``.
 
     Returns the number of backends killed, after they are gone from
-    ``pg_stat_activity``: ``pg_terminate_backend`` returns before the backend
+    ``pg_stat_activity``. ``pg_terminate_backend`` returns before the backend
     exits, and a request that arrives first would still be served.
     """
     with psycopg.connect(**params, autocommit=True) as conn:

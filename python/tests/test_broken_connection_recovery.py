@@ -11,9 +11,9 @@ Two tiers, both in ``concurrency._call_guarded``:
   thread. The request that met the dead connection fails, the next one
   reconnects.
 - With ``CONN_MAX_AGE`` or ``CONN_HEALTH_CHECKS`` set (the
-  ``_check_before_call`` gate): the same check also runs before each call, so
-  Django's health check finds a dead connection before the query, and no
-  request fails.
+  ``_check_before_call`` gate): the same check also runs before each call.
+  Django's health check then finds a dead connection before the query, and
+  no request fails.
 
 ``test_dead_connection_recovery_server_integration.py`` runs the user-loading
 path against PostgreSQL on a real server.
@@ -176,52 +176,45 @@ def pooled_user_headers() -> dict[str, str]:
 
 
 @pytest.fixture
-def health_checks_on(monkeypatch):
-    """Persistent connections with health checks, as a production project sets them.
-
-    ``CONN_MAX_AGE`` must be positive here: Django closes a connection with
-    the default age of 0 as obsolete on the same check, which would hide the
-    health check under test.
-    """
+def database_settings(request, monkeypatch):
+    """Apply the connection settings of the parameter and run the gate again."""
     monkeypatch.setattr(concurrency, "_check_before_call", concurrency._check_before_call)
-    monkeypatch.setitem(connections.settings["default"], "CONN_MAX_AGE", 600)
-    monkeypatch.setitem(connections.settings["default"], "CONN_HEALTH_CHECKS", True)
+    for key, value in request.param.items():
+        monkeypatch.setitem(connections.settings["default"], key, value)
     concurrency.configure_connection_checks()
-    assert concurrency._check_before_call is True
+    return request.param
 
 
 @pytest.mark.django_db(transaction=True)
-def test_user_load_on_the_orm_pool_recovers_after_dead_connection(single_thread_pool, pooled_user_headers):
-    """Default settings: the gate is off, so only the error path drops the connection.
-
-    The request that meets the dead connection fails. Without the drop in
-    ``_call_guarded``, every later request on that thread fails too.
-    """
-    assert concurrency._check_before_call is False
-
-    with TestClient(_user_api()) as client:
-        assert client.get("/me", headers=pooled_user_headers).json() == {"username": "pooled"}
-        assert client.get("/kill").json() == {"killed": True}
-
-        assert client.get("/me", headers=pooled_user_headers).status_code == 500
-        response = client.get("/me", headers=pooled_user_headers)
-        assert response.status_code == 200
-        assert response.json() == {"username": "pooled"}
-
-
-@pytest.mark.django_db(transaction=True)
-def test_health_check_before_the_call_serves_the_first_request(
-    single_thread_pool, health_checks_on, pooled_user_headers
+@pytest.mark.parametrize(
+    ("database_settings", "first_status_after_kill"),
+    [
+        # Gate off: only the error path drops the connection, so the request that meets it fails.
+        pytest.param({}, 500, id="default"),
+        # Gate on, no health check: the check before the call sees no error and a young connection.
+        pytest.param({"CONN_MAX_AGE": 600}, 500, id="max-age-only"),
+        # Gate on with health check: the dead connection is replaced before the query.
+        # CONN_MAX_AGE must be positive here. With the default of 0, Django closes
+        # the connection as obsolete on the same check, which would hide the health check.
+        pytest.param({"CONN_MAX_AGE": 600, "CONN_HEALTH_CHECKS": True}, 200, id="health-checks"),
+    ],
+    indirect=["database_settings"],
+)
+def test_user_load_on_the_orm_pool_after_dead_connection(
+    single_thread_pool, database_settings, pooled_user_headers, first_status_after_kill
 ):
-    """With the gate on, the check before the call re-arms Django's health check.
+    """The lazy ``request.user`` load runs on the ORM pool through ``run_orm_blocking``.
 
-    The health check finds the dead connection before the query and replaces
-    it, so no request fails.
+    ``/kill`` replaces the connection of that thread without using it. The
+    settings decide whether the check before the call can find it. On every
+    setting, the request after the failure reconnects. Without the drop in
+    ``_call_guarded``, every later request on that thread fails.
     """
     with TestClient(_user_api()) as client:
         assert client.get("/me", headers=pooled_user_headers).json() == {"username": "pooled"}
         assert client.get("/kill").json() == {"killed": True}
 
+        assert client.get("/me", headers=pooled_user_headers).status_code == first_status_after_kill
         response = client.get("/me", headers=pooled_user_headers)
         assert response.status_code == 200
         assert response.json() == {"username": "pooled"}

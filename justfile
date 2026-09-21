@@ -128,6 +128,7 @@ test-pg pg_port=pg_port:
         docker exec "$name" pg_isready -U postgres >/dev/null 2>&1 && break
         sleep 0.5
     done
+    docker exec "$name" pg_isready -U postgres
     DJANGO_BOLT_TEST_POSTGRES_DSN="postgresql://postgres:postgres@127.0.0.1:{{pg_port}}/postgres" \
         uv run --with pytest pytest python/tests -m postgres -s -vv
 

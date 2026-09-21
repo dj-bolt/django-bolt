@@ -27,10 +27,10 @@ BOLT_EMIT_SIGNALS = True
 
 Django Bolt keeps database connections open across requests. Bolt does not need the request signals to manage them:
 
-- Always: when a handler, a QuerySet evaluation, or the load of `request.user` on the executor pool raises, Bolt runs `close_if_unusable_or_obsolete()` on that thread. A dead connection is dropped and the next request reconnects. The request that met the dead connection fails: the connection looks fine until it is used.
+- Always: a handler, a QuerySet evaluation, or the load of `request.user` on the executor pool can raise. Bolt then runs `close_if_unusable_or_obsolete()` on that thread. A dead connection is dropped and the next request reconnects. The request that met the dead connection fails: the connection looks fine until it is used.
 - With a positive `CONN_MAX_AGE` or with `CONN_HEALTH_CHECKS`: Bolt runs the same check before each executor call too. Timed recycling and health checks then work as in Django. A health check finds a dead connection before the query and replaces it, so no request fails.
 
-Neither setting is on by default. A project that sets neither gets the first tier only: after a database failover or a restart of PostgreSQL, one request on each executor thread fails, and the ones after it serve. Set `CONN_HEALTH_CHECKS = True` with a positive `CONN_MAX_AGE` to serve them all. `CONN_MAX_AGE` must be positive for that: with the default of `0`, Django closes the connection as obsolete on the same check, before every call.
+Neither setting is on by default. A project that sets neither gets the first tier only. After a database failover or a restart of PostgreSQL, one request on each executor thread fails. The ones after it serve. Set `CONN_HEALTH_CHECKS = True` with a positive `CONN_MAX_AGE` to serve them all. `CONN_MAX_AGE` must be positive for that. With the default of `0`, Django closes the connection as obsolete on the same check, before every call.
 
 ```python
 # settings.py

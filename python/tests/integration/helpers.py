@@ -43,6 +43,8 @@ def child_pids(parent_pid: int) -> set[int]:
         capture_output=True,
         text=True,
     )
+    if result.returncode not in (0, 1):
+        result.check_returncode()
     return {int(token) for token in result.stdout.split()}
 
 
