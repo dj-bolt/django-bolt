@@ -11,7 +11,7 @@ from typing import Annotated
 
 import jwt
 import pytest
-from asgiref.sync import async_to_sync, markcoroutinefunction
+from asgiref.sync import async_to_sync, markcoroutinefunction, sync_to_async
 from django.contrib.auth.models import User
 from django.db import connection
 from django.db.backends.signals import connection_created
@@ -743,6 +743,97 @@ def test_lazy_user_forced_on_the_event_loop_loads_on_the_lane_of_its_request(han
 
     assert response.status_code == 200, response.text
     assert response.headers["x-user-tenant"] == "acme"
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync_handler", "async_handler"])
+@pytest.mark.parametrize("orm_bridge", ["blocking", "async", "asgiref"])
+def test_async_user_loader_returns_orm_work_to_the_lane_that_forced_the_user(handler_is_async, orm_bridge):
+    """A lane waiting for async user loading must keep servicing its nested ORM work."""
+
+    def load_user():
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        return SimpleNamespace(tenant=_read_tenant(), loaded_on=threading.get_ident())
+
+    class AsyncTenantAuth(JWTAuthentication):
+        async def get_user(self, user_id, auth_context):
+            await asyncio.sleep(0)
+            if orm_bridge == "blocking":
+                return run_orm_blocking(load_user)
+            if orm_bridge == "async":
+                return await run_in_orm_executor(load_user)
+            return await sync_to_async(load_user, thread_sensitive=True)()
+
+    def force_user(request):
+        user = request.user
+        return {
+            "tenant": user.tenant,
+            "loaded_on": user.loaded_on,
+            "forced_on": threading.get_ident(),
+            "lane_mode": in_lane_mode(),
+        }
+
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
+    auth = AsyncTenantAuth(secret=_TEST_JWT_SECRET)
+
+    if handler_is_async:
+
+        @api.get("/tenant/{tenant}", auth=[auth])
+        async def endpoint(tenant: str, request: Request):
+            return await sync_to_thread(force_user, request)
+    else:
+
+        @api.get("/tenant/{tenant}", auth=[auth])
+        def endpoint(tenant: str, request: Request):
+            return force_user(request)
+
+    with TestClient(api, share_db_connection=False) as client:
+        for tenant in ("acme", "beta"):
+            response = client.get(f"/tenant/{tenant}", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["tenant"] == tenant
+            assert body["loaded_on"] == body["forced_on"]
+            assert body["lane_mode"] is (not handler_is_async)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_sync_user_loader_async_bridge_does_not_return_to_the_blocked_request_loop():
+    """A loop forcing a lazy user cannot service the loader's ``async_to_sync`` call."""
+
+    class RecordTenantLane(_TenantMixinMiddleware):
+        def process_request(self, request):
+            super().process_request(request)
+            request.lane_thread = threading.get_ident()
+
+    def load_user():
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        return SimpleNamespace(tenant=_read_tenant(), loaded_on=threading.get_ident())
+
+    async def async_user():
+        await asyncio.sleep(0)
+        return await sync_to_async(load_user, thread_sensitive=True)()
+
+    class SyncBridgeAuth(JWTAuthentication):
+        def get_user_sync(self, user_id):
+            return async_to_sync(async_user)()
+
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([RecordTenantLane])])
+
+    @api.get("/tenant/{tenant}", auth=[SyncBridgeAuth(secret=_TEST_JWT_SECRET)])
+    async def endpoint(tenant: str, request: Request):
+        user = request.user
+        return {"tenant": user.tenant, "loaded_on": user.loaded_on, "lane_thread": request.state["lane_thread"]}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["tenant"] == "acme"
+    assert body["loaded_on"] == body["lane_thread"]
 
 
 class _NeitherCapableMiddleware:

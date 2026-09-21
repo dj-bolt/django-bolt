@@ -18,6 +18,7 @@ import threading
 from collections.abc import Callable, Coroutine
 from functools import partial
 
+from asgiref.current_thread_executor import CurrentThreadExecutor
 from asgiref.sync import AsyncToSync, SyncToAsync, ThreadSensitiveContext, sync_to_async
 from django.db import connections
 
@@ -275,9 +276,7 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
         return _orm_executor
 
 
-def _submit_blocking(
-    executor: concurrent.futures.ThreadPoolExecutor, fn: Callable[..., object], *args: object
-) -> object:
+def _submit_blocking(executor: concurrent.futures.Executor, fn: Callable[..., object], *args: object) -> object:
     """Submit ``fn`` to ``executor`` with the caller's context and block on it."""
     ctx = contextvars.copy_context()
     return executor.submit(ctx.run, _call_guarded, fn, *args).result()
@@ -308,8 +307,19 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
         return contextvars.copy_context().run(fn, *args)
     executor = _request_thread_executor()
     if executor is not None:
-        return _submit_blocking(executor, fn, *args)
+        return _submit_blocking(executor, _call_without_parent_loop, fn, *args)
     return _submit_blocking(_get_orm_executor(), fn, *args)
+
+
+def _call_without_parent_loop[T](fn: Callable[..., T], *args: object) -> T:
+    """Keep nested ``async_to_sync`` calls away from the blocked caller's event loop."""
+    threadlocal = SyncToAsync.threadlocal
+    previous = getattr(threadlocal, "main_event_loop", None)
+    threadlocal.main_event_loop = None
+    try:
+        return fn(*args)
+    finally:
+        threadlocal.main_event_loop = previous
 
 
 def _request_thread_executor() -> concurrent.futures.Executor | None:
@@ -340,10 +350,29 @@ def _run_default_blocking[T](fn: Callable[..., T], *args: object) -> T:
     slot for its full duration. A caller already on an ORM worker runs the
     shim inline instead — blocking on another pool while holding an ORM slot
     would let the coroutine's own ORM submission deadlock against that slot.
+
+    A lane processes callbacks while it waits. Nested ORM work then uses the
+    lane's connection and thread-local state without waiting for the lane to return.
     """
     if in_orm_executor_thread():
         return contextvars.copy_context().run(fn, *args)
+    if _on_lane_thread():
+        return _run_default_from_lane(fn, *args)
     return _submit_blocking(_get_default_executor(), fn, *args)
+
+
+def _run_default_from_lane[T](fn: Callable[..., T], *args: object) -> T:
+    """Run pool work while the calling lane processes its thread-sensitive callbacks."""
+    previous = getattr(AsyncToSync.executors, "current", None)
+    executor = CurrentThreadExecutor(previous)
+    AsyncToSync.executors.current = executor
+    try:
+        ctx = contextvars.copy_context()
+        future = _get_default_executor().submit(ctx.run, _call_guarded, fn, *args)
+        executor.run_until_future(future)
+        return future.result()
+    finally:
+        AsyncToSync.executors.current = previous
 
 
 async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:

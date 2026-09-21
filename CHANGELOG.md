@@ -17,11 +17,13 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **asgiref 3.9.1 or later is required** - Nested user loading uses its support for parent thread executors.
 - **`load_user_sync()` no longer takes `is_async_context`** - The loader reads the calling thread when it runs. A call with the old fourth argument raises `TypeError`.
 - **A trivially-async handler with `DJANGO_ALLOW_ASYNC_UNSAFE=1` loads `request.user` on the ORM pool** - Rust installs the event loop around the sync fast path of an `async def` handler with no await. The user query ran inline on the worker thread there. It now runs on the ORM pool, as in an async handler.
 
 ### Fixed
 
+- **Nested user loaders keep the request lane** - A lane now processes callbacks while it waits for an async user loader. Nested database work keeps the lane's thread-local state and connection. A synchronous loader can also call async code without returning to the blocked event loop.
 - **The test clients close the database connections of their lanes at exit** - A lane keeps its connection open for 10 seconds after a test. With `@pytest.mark.django_db(transaction=True)` on PostgreSQL, pytest-django then could not drop the test database ("database is being accessed by other users"). `TestClient` and `AsyncTestClient` now stop their idle lanes at exit.
 - **Django middleware state stays with its request** - Middleware that keeps request state in `threading.local`, such as the tenant schema of django-tenants, leaked that state between concurrent requests. Bolt now gives each request with Django middleware one thread for its sync work, as Django's ASGI handler does. The middleware, sync handlers, `sync_to_thread`, QuerySet evaluation, and Django's async ORM calls of one request all use that thread.
 - **`DjangoMiddleware` runs a `MiddlewareMixin` subclass that has its own sync `__call__`** - `MiddlewareMixin` marks each instance as async, so Bolt awaited the response of the sync `__call__` and the request failed. Bolt now runs such a middleware on the thread of the request.

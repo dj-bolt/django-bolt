@@ -289,6 +289,7 @@ name = "django-bolt"
 version = "0.12.0rc3"
 source = { editable = "." }
 dependencies = [
+    { name = "asgiref" },
     { name = "click" },
     { name = "django" },
     { name = "httpx" },
@@ -336,6 +337,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
+    { name = "asgiref", specifier = ">=3.9.1" },
     { name = "bolt-mcp", marker = "extra == 'bolt-mcp'", editable = "python/bolt-mcp" },
     { name = "bolt-mcp", marker = "extra == 'mcp'", editable = "python/bolt-mcp" },
     { name = "click", specifier = ">=8.1" },
