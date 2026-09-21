@@ -92,6 +92,19 @@ def _version_key(v: str) -> tuple[int, ...]:
     return tuple(int(part) for part in v.split("."))
 
 
+def _release_key(v: str) -> tuple[int, ...]:
+    """Ordering key with trailing zero components dropped.
+
+    `Django>=5.2.0` and the `Framework :: Django :: 5.2` classifier name the
+    same release, so an equality test between them must not see (5, 2, 0) and
+    (5, 2) as different.
+    """
+    parts = list(_version_key(v))
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
 def _retry_after_seconds(value: str | None) -> float | None:
     """Parse a ``Retry-After`` header -- delta-seconds or an HTTP date."""
     if not value:
@@ -146,6 +159,19 @@ def _validate_releases(url: str, payload: Any) -> list[dict[str, Any]]:
         # raise on anything that is not dotted digits.
         if not isinstance(name, str) or not re.fullmatch(r"\d+(\.\d+)*", name):
             die(f"{url}: release name {name!r} is not a dotted version; the API shape may have changed")
+        # Every other field this script reads off a release. Left unchecked, a
+        # missing `isMaintained` silently reclassifies a release as EOL, and a
+        # `custom` or `supportedPythonVersions` of the wrong type raises inside
+        # supported_pythons() -- exiting 1, the "drifted" status.
+        if not isinstance(entry.get("isMaintained"), bool):
+            die(f"{url}: release {name} has no boolean 'isMaintained'; the API shape may have changed")
+        custom = entry.get("custom")
+        if custom is not None and not isinstance(custom, dict):
+            die(f"{url}: release {name} has a non-object 'custom'; the API shape may have changed")
+        if isinstance(custom, dict):
+            window = custom.get("supportedPythonVersions")
+            if window is not None and not isinstance(window, str):
+                die(f"{url}: release {name} has a non-string 'supportedPythonVersions'; the API shape may have changed")
     return releases
 
 
@@ -291,7 +317,7 @@ def check(pyproject: Path, max_attempts: int = MAX_ATTEMPTS) -> tuple[list[Drift
     oldest_declared = djangos[0]
     if floor is None:
         notes.append("could not find a `Django>=X.Y` entry in [project].dependencies; floor not checked")
-    elif _version_key(floor) != _version_key(oldest_declared):
+    elif _release_key(floor) != _release_key(oldest_declared):
         drift.append(
             Drift(
                 f"Django>={floor}",
