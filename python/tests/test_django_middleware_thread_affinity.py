@@ -5,17 +5,22 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import threading
+import time
+from types import SimpleNamespace
 from typing import Annotated
 
+import jwt
 import pytest
 from asgiref.sync import async_to_sync, markcoroutinefunction
 from django.contrib.auth.models import User
+from django.db import connection
 from django.db.backends.signals import connection_created
 from django.http import HttpResponse
 from django.utils.decorators import async_only_middleware
 from django.utils.deprecation import MiddlewareMixin
 
 from django_bolt import BoltAPI, Depends, Request
+from django_bolt.auth import JWTAuthentication
 from django_bolt.concurrency import in_lane_mode, run_in_orm_executor, run_orm_blocking, sync_to_thread
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack
 from django_bolt.testing import AsyncTestClient, TestClient
@@ -503,3 +508,107 @@ def test_async_test_client_exit_closes_the_connections_of_its_lanes():
 
     assert lane_connections
     assert [conn.connection for conn in lane_connections] == [None] * len(lane_connections)
+
+
+class _ShieldMiddleware(MiddlewareMixin):
+    """An async-only mixin subclass with a plain ``def __call__`` that returns a Future."""
+
+    sync_capable = False
+    async_capable = True
+
+    def __call__(self, request):
+        return asyncio.shield(super().__call__(request))
+
+    def process_response(self, request, response):
+        response["X-Shielded"] = "yes"
+        return response
+
+
+def test_single_wrapper_awaits_an_async_only_call_override_on_the_event_loop():
+    """A ``sync_capable=False`` middleware needs the loop, even with a sync ``__call__``."""
+    api = BoltAPI(middleware=[DjangoMiddleware(_ShieldMiddleware)])
+
+    @api.get("/x")
+    async def endpoint():
+        await asyncio.sleep(0)
+        return {"ok": True}
+
+    @api.get("/sync")
+    def sync_endpoint():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        for path in ("/x", "/sync"):
+            response = client.get(path)
+            assert response.status_code == 200, response.text
+            assert response.json() == {"ok": True}
+            assert response.headers["x-shielded"] == "yes"
+
+
+_TEST_JWT_SECRET = "test-only-secret-longer-than-32-characters"
+
+
+class _DatabaseAuth(JWTAuthentication):
+    """A backend whose sync user loader runs a raw database query."""
+
+    def get_user_sync(self, user_id):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        return SimpleNamespace(username="bob", loaded_on=threading.current_thread().name)
+
+
+class _NoOpDjangoMiddleware(MiddlewareMixin):
+    def process_request(self, request):
+        pass
+
+
+class _ReadUserMiddleware:
+    """Async Python middleware that forces the lazy user on the event loop."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    async def __call__(self, request):
+        username = request.user.username
+        response = await self.get_response(request)
+        response.headers["X-Middleware-User"] = username
+        return response
+
+
+def _database_auth_token() -> str:
+    return jwt.encode({"sub": "1", "exp": int(time.time()) + 60}, _TEST_JWT_SECRET, algorithm="HS256")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_middleware_forces_the_lazy_user_of_a_sync_handler_off_the_event_loop():
+    """A sync handler behind Django middleware runs on a lane. Its lazy user can still be forced on the loop."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_NoOpDjangoMiddleware]), _ReadUserMiddleware])
+
+    @api.get("/x", auth=[_DatabaseAuth(secret=_TEST_JWT_SECRET)])
+    def endpoint(request: Request):
+        return {"ok": True, "username": request.user.username}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/x", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True, "username": "bob"}
+    assert response.headers["x-middleware-user"] == "bob"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_lazy_user_forced_on_a_lane_loads_on_that_lane():
+    """A lazy user that a lane forces must not leave the lane for the ORM pool."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_NoOpDjangoMiddleware])])
+
+    @api.get("/x", auth=[_DatabaseAuth(secret=_TEST_JWT_SECRET)])
+    def endpoint(request: Request):
+        user = request.user
+        return {"handler_thread": threading.current_thread().name, "loaded_on": user.loaded_on}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/x", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["loaded_on"] == body["handler_thread"]

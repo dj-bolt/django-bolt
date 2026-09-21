@@ -19,7 +19,7 @@ import contextvars
 import functools
 import io
 from collections.abc import Callable
-from inspect import iscoroutine
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from .._core import RequestLane
@@ -285,14 +285,21 @@ class DjangoMiddleware:
         # because MiddlewareMixin already handles these methods correctly in __acall__
         # by wrapping them in sync_to_async. Doing it ourselves causes double-wrapping
         # and severe performance degradation.
-        self._middleware_is_async = iscoroutinefunction(self._middleware_instance)
-        # MiddlewareMixin marks each instance as async. A subclass with its own
-        # sync ``__call__`` must run on the thread of the request. Its result is
-        # a response, or the coroutine of ``super().__call__``.
-        # ``middleware_class`` can be a factory, so look at the instance that it returns.
+        # ``sync_capable`` is the flag that Django reads for a class or a factory.
+        # ``middleware_class`` can be a factory, so look at the instance that it returns too.
+        sync_capable = getattr(self.middleware_class, "sync_capable", True) and getattr(
+            type(self._middleware_instance), "sync_capable", True
+        )
+        # An async-only middleware needs the event loop. Its ``__call__`` can be a
+        # plain function that returns an awaitable, for example a Future.
+        self._middleware_is_async = iscoroutinefunction(self._middleware_instance) or not sync_capable
+        # MiddlewareMixin marks each instance as async. A sync-capable subclass with
+        # its own sync ``__call__`` must run on the thread of the request. Its result
+        # is a response, or an awaitable such as the coroutine of ``super().__call__``.
         instance_call = type(self._middleware_instance).__call__
         self._sync_call_override = (
-            isinstance(self._middleware_instance, MiddlewareMixin)
+            sync_capable
+            and isinstance(self._middleware_instance, MiddlewareMixin)
             and instance_call is not MiddlewareMixin.__call__
             and not iscoroutinefunction(instance_call)
         )
@@ -369,12 +376,13 @@ class DjangoMiddleware:
                 django_response = await sync_to_async(self._middleware_instance.__call__, thread_sensitive=True)(
                     django_request
                 )
-                if iscoroutine(django_response):
+                if isawaitable(django_response):
                     django_response = await django_response
             elif self._middleware_is_async:
                 # Async-capable middleware (e.g., using MiddlewareMixin with async get_response)
                 # MiddlewareMixin.__acall__ handles process_request/process_response internally
-                # by wrapping them in sync_to_async - we don't need to do it ourselves
+                # by wrapping them in sync_to_async - we don't need to do it ourselves.
+                # An async-only middleware can return any awaitable, a Future included.
                 django_response = await self._middleware_instance(django_request)
             else:
                 # Sync middleware without async support - run in thread pool

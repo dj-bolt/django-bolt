@@ -1709,14 +1709,6 @@ class BoltAPI:
                     user_loaders[backend.scheme_name] = resolve_user_loader(backend)
             meta["_user_loaders"] = user_loaders
 
-            # Execution context for request.user loads on the async dispatch
-            # path: async handlers run on the event loop, and non-blocking
-            # sync handlers are run inline on it too — both need the loader
-            # to use the executor (sync ORM on the loop thread raises
-            # SynchronousOnlyOperation). Only blocking sync handlers run in
-            # a worker thread, where a direct ORM call is safe and faster.
-            meta["_user_load_is_async_ctx"] = meta["is_async"] or not meta["is_blocking"]
-
             # scheme_name → handler. Lookup at dispatch is O(1) via the
             # matched backend's name. None when no backend has revocation.
             revocation_handlers: dict[str, Callable] = {
@@ -2788,11 +2780,12 @@ class BoltAPI:
                     # fall back to the default pk query. A loader of None
                     # means the backend has no user resolution — leave
                     # request.user unset (PyRequest getter returns None).
+                    # The loader looks at the thread that forces the user: an
+                    # async Python middleware can force it on the event loop
+                    # before a sync handler runs on its lane.
                     loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
                     if loader is not None:
-                        request["user"] = SimpleLazyObject(
-                            partial(loader, user_id, auth_context, meta["_user_load_is_async_ctx"])
-                        )
+                        request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context))
 
             # 3. Check if we need to execute middleware
             # Middleware runs for:
@@ -2866,7 +2859,7 @@ class BoltAPI:
                 if user_id:
                     loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
                     if loader is not None:
-                        request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context, False))
+                        request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context))
 
             # Call pre-compiled sync executor directly (no coroutine, no await)
             return meta["_sync_executor"](handler, request)

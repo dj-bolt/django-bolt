@@ -12,12 +12,21 @@ stored in the handler meta keyed by scheme name), so the per-request path is a
 single dict lookup plus a call. Resolution must be per-route, not per scheme
 name: two JWTAuthentication subclasses share scheme_name "jwt" but can carry
 different get_user overrides.
+
+A lazy user is forced on the thread that first reads request.user. That thread
+is not known at registration: a sync handler behind Django middleware runs on
+a request lane, but an async Python middleware around it can force the user on
+the event loop thread first. The loader thus looks at the calling thread when
+it runs (_in_async_context). A thread with a running event loop cannot run the
+ORM inline, so the query goes to the ORM pool. Any other thread, a request lane
+included, runs the query inline, which keeps the thread affinity of the lane.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+from asyncio.events import _get_running_loop
 from collections.abc import Callable
 from typing import Any
 
@@ -45,9 +54,19 @@ _FRAMEWORK_GET_USER_SYNC = (JWTAuthentication.get_user_sync,)
 # Global registry of auth backend instances for user resolution
 _auth_backend_registry: dict[str, Any] = {}
 
-# (backend_name) -> resolved loader (user_id, auth_context, is_async_context) -> user,
+# (backend_name) -> resolved loader (user_id, auth_context) -> user,
 # or None when the backend has no user resolution. Built at registration time.
-_resolved_loader_registry: dict[str, Callable[[str, dict | None, bool], Any] | None] = {}
+_resolved_loader_registry: dict[str, Callable[[str, dict | None], Any] | None] = {}
+
+
+def _in_async_context() -> bool:
+    """Whether the calling thread has a running event loop.
+
+    This is the check of Django's ``async_unsafe``: a sync ORM call on such a
+    thread raises ``SynchronousOnlyOperation``. It is a C call, and it runs one
+    time per forced user, next to the database query.
+    """
+    return _get_running_loop() is not None
 
 
 def _has_custom_get_user_sync(cls: type) -> bool:
@@ -60,7 +79,7 @@ def _has_custom_get_user(cls: type) -> bool:
     return method is not None and method not in _FRAMEWORK_GET_USER
 
 
-def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any] | None:
+def resolve_user_loader(backend: Any) -> Callable[[str, dict | None], Any] | None:
     """
     Resolve the sync user-loading strategy for a backend, once at registration.
 
@@ -69,6 +88,9 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
     2. Overridden get_user (async or sync)
     3. Framework default get_user_sync (JWTAuthentication pk lookup)
     4. None — backend has no user resolution (e.g. plain APIKeyAuthentication)
+
+    The loader runs when the lazy user is forced. It decides on that thread
+    whether the query can run inline (see _in_async_context).
     """
     cls = type(backend)
     custom_sync = _has_custom_get_user_sync(cls)
@@ -77,8 +99,8 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
 
     if custom_sync or (has_framework_sync and not custom_async):
 
-        def load_via_sync(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
-            if is_async_context:
+        def load_via_sync(user_id: str, auth_context: dict | None) -> Any:
+            if _in_async_context():
                 return run_orm_blocking(backend.get_user_sync, user_id)
             return backend.get_user_sync(user_id)
 
@@ -89,16 +111,16 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
 
         if not inspect.iscoroutinefunction(get_user):
 
-            def load_via_plain(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
-                if is_async_context:
+            def load_via_plain(user_id: str, auth_context: dict | None) -> Any:
+                if _in_async_context():
                     return run_orm_blocking(get_user, user_id, auth_context or {})
                 return get_user(user_id, auth_context or {})
 
             return load_via_plain
 
-        def load_via_async(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
+        def load_via_async(user_id: str, auth_context: dict | None) -> Any:
             # asyncio.run needs a thread without a running loop — always cross,
-            # regardless of handler context. The shim goes to the generic
+            # regardless of the calling thread. The shim goes to the generic
             # default pool, not the ORM pool: the coroutine may await
             # non-database work (an external identity provider), and parking
             # its whole lifetime on a bounded ORM slot would queue every
@@ -115,7 +137,7 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None, bool], Any]
     return None
 
 
-def default_django_user_loader(user_id: str, auth_context: dict | None, is_async_context: bool) -> Any:
+def default_django_user_loader(user_id: str, auth_context: dict | None) -> Any:
     """Default user query for schemes with no backend instance on the route
     (e.g. Rust-side session auth), via the pre-compiled pk query.
 
@@ -124,7 +146,7 @@ def default_django_user_loader(user_id: str, auth_context: dict | None, is_async
     """
     User = get_user_model()
 
-    if is_async_context:
+    if _in_async_context():
         return run_orm_blocking(load_user_by_pk_sync, User, user_id)
     return load_user_by_pk_sync(User, user_id)
 
@@ -185,19 +207,17 @@ def load_user_sync(
     user_id: str | None,
     backend_name: str | None,
     auth_context: dict | None = None,
-    is_async_context: bool = False,
 ) -> Any | None:
     """
     Synchronously load user from auth context.
 
     This is the sync version used by SimpleLazyObject for lazy loading.
-    Handles thread pool wrapping for async contexts.
+    On a thread with a running event loop, the query runs on the ORM pool.
 
     Args:
         user_id: User identifier from auth context
         backend_name: Authentication backend name (e.g., "jwt", "api_key")
         auth_context: Full authentication context dict
-        is_async_context: Whether we're in an async handler (use thread pool)
 
     Returns:
         User object, or None if not found or no user_id
@@ -210,7 +230,7 @@ def load_user_sync(
         if loader is None:
             # Backend provides no user resolution (e.g. plain APIKeyAuthentication)
             return None
-        return loader(user_id, auth_context, is_async_context)
+        return loader(user_id, auth_context)
 
     # Unregistered backend (e.g. session auth): default Django user query
-    return default_django_user_loader(user_id, auth_context, is_async_context)
+    return default_django_user_loader(user_id, auth_context)

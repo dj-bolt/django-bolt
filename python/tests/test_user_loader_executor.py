@@ -132,6 +132,19 @@ def _make_user(username: str = "orm-pool"):
     return User.objects.create(username=username, email=f"{username}@example.com", password="x")
 
 
+def _force_on_event_loop(loader, *args):
+    """Force a lazy user on a thread with a running loop, as an async handler or middleware does.
+
+    The loader reads the calling thread: with a running loop, the sync ORM
+    cannot run inline, so the query must cross to the ORM pool.
+    """
+
+    async def force():
+        return loader(*args)
+
+    return asyncio.run(force())
+
+
 def test_default_user_loader_runs_on_orm_executor(fresh_orm_executor, monkeypatch):
     """The no-backend default loader (Rust session auth) uses the ORM pool."""
     fresh_orm_executor()
@@ -146,7 +159,7 @@ def test_default_user_loader_runs_on_orm_executor(fresh_orm_executor, monkeypatc
 
     monkeypatch.setattr(user_loader, "load_user_by_pk_sync", recording_pk_load)
 
-    loaded = default_django_user_loader(str(user.pk), None, True)
+    loaded = _force_on_event_loop(default_django_user_loader, str(user.pk), None)
     assert loaded is not None
     assert loaded.pk == user.pk
 
@@ -164,7 +177,7 @@ def test_backend_user_loader_runs_on_orm_executor(fresh_orm_executor):
     loader = resolve_user_loader(backend)
     assert loader is not None
 
-    loaded = loader(str(user.pk), None, True)
+    loaded = _force_on_event_loop(loader, str(user.pk), None)
     assert loaded is not None
     assert loaded.pk == user.pk
 
@@ -188,7 +201,7 @@ def test_user_loading_respects_orm_thread_budget(fresh_orm_executor):
     # the second cannot enter get_user_sync while the first is parked there.
     callers = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     try:
-        pending = [callers.submit(loader, str(user.pk), None, True) for _ in range(2)]
+        pending = [callers.submit(_force_on_event_loop, loader, str(user.pk), None) for _ in range(2)]
         assert backend.entered.acquire(timeout=5), "no user load started"
         # A wide pool would admit the second load here; a one-thread budget
         # cannot until the first returns.
@@ -210,9 +223,9 @@ def test_user_loading_respects_orm_thread_budget(fresh_orm_executor):
 def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
     """A user load already on an ORM thread runs there, not via a second hand-off.
 
-    `request.user` is a SimpleLazyObject carrying the route's async-context
-    flag, so it can be forced during work that already runs on the ORM pool
-    (a serializer enc_hook touching the user while a QuerySet evaluates).
+    `request.user` is a SimpleLazyObject, so it can be forced during work
+    that already runs on the ORM pool (a serializer enc_hook touching the
+    user while a QuerySet evaluates).
     Submitting back into the pool from its own worker waits on a slot the
     caller is holding — under the SQLite default of one thread that never
     resolves, so the query must run inline instead.
@@ -234,7 +247,7 @@ def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
 
     def resolve_inside_pool():
         assert concurrency.in_orm_executor_thread()
-        return threading.current_thread().name, default_django_user_loader(str(user.pk), None, True)
+        return threading.current_thread().name, default_django_user_loader(str(user.pk), None)
 
     pool_thread, loaded = concurrency._get_orm_executor().submit(resolve_inside_pool).result(timeout=5)
 
@@ -394,7 +407,7 @@ def test_custom_async_get_user_shim_runs_off_the_orm_pool(fresh_orm_executor):
     loader = resolve_user_loader(backend)
     assert loader is not None
 
-    loaded = loader(str(user.pk), None, True)
+    loaded = _force_on_event_loop(loader, str(user.pk), None)
     assert loaded is not None
     assert loaded.pk == user.pk
 
@@ -426,7 +439,7 @@ def test_custom_async_get_user_forced_from_orm_worker_keeps_the_shim_inline(fres
 
     def force_inside_pool():
         assert concurrency.in_orm_executor_thread()
-        return threading.current_thread().name, loader(str(user.pk), None, True)
+        return threading.current_thread().name, loader(str(user.pk), None)
 
     outer, loaded = concurrency._get_orm_executor().submit(force_inside_pool).result(timeout=10)
 
