@@ -22,9 +22,10 @@ from django.http import HttpResponse
 from django.middleware.common import CommonMiddleware
 from django.middleware.csrf import _does_token_match
 from django.template import RequestContext, Template
+from django.utils.deprecation import MiddlewareMixin
 from django.views.decorators.csrf import csrf_exempt
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Request
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, TimingMiddleware
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
@@ -354,6 +355,47 @@ class TestCustomMiddlewareHTTPCycle:
             response = client.get("/allowed")
             assert response.status_code == 200
             assert response.json() == {"status": "allowed"}
+
+
+class TenantHookMiddleware(MiddlewareMixin):
+    """Hook middleware that sets a custom request attribute, as django-tenants does."""
+
+    def process_request(self, request):
+        request.tenant = "acme"
+
+
+class TenantCallMiddleware:
+    """__call__ middleware that sets a custom request attribute."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        request.tenant = "acme"
+        return self.get_response(request)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "middleware",
+    [
+        lambda: DjangoMiddlewareStack([TenantHookMiddleware]),
+        lambda: DjangoMiddlewareStack([TenantCallMiddleware]),
+        lambda: DjangoMiddlewareStack([TenantHookMiddleware, HeaderAddingMiddleware]),
+        lambda: DjangoMiddleware(TenantHookMiddleware),
+    ],
+    ids=["hook_stack", "call_stack", "mixed_stack", "single_wrapper"],
+)
+def test_custom_request_attribute_reaches_async_handler(middleware):
+    """An async handler reads a custom middleware attribute from request.state."""
+    api = BoltAPI(middleware=[middleware()])
+
+    @api.get("/tenant")
+    async def tenant(request: Request):
+        return {"tenant": request.state.get("tenant")}
+
+    with TestClient(api) as client:
+        assert client.get("/tenant").json() == {"tenant": "acme"}
 
 
 # =============================================================================
@@ -1787,3 +1829,76 @@ class TestDjangoMiddlewareMeta:
             assert response.headers["X-Remote-Addr"] == "127.0.0.1"
             assert response.headers["X-Server-Name"] == "example.com"
             assert response.json() == {"remote_addr": "127.0.0.1"}
+
+
+def _order_recording_middleware(name: str, calls: list[str], *, short_circuit: bool = False) -> type:
+    class Recorder(MiddlewareMixin):
+        def process_request(self, request):
+            calls.append(f"{name}.request")
+            if short_circuit:
+                return HttpResponse("stopped", status=418)
+            return None
+
+        def process_response(self, request, response):
+            calls.append(f"{name}.response")
+            return response
+
+    return Recorder
+
+
+@pytest.mark.parametrize("handler_kind", ["async", "sync"])
+def test_short_circuit_runs_process_response_of_entered_middleware_only(handler_kind):
+    """The async flow (one hop for each phase) and the lane flow keep Django's hook order."""
+    calls: list[str] = []
+    stack = DjangoMiddlewareStack(
+        [
+            _order_recording_middleware("a", calls),
+            _order_recording_middleware("b", calls, short_circuit=True),
+            _order_recording_middleware("c", calls),
+        ]
+    )
+    api = BoltAPI(middleware=[stack])
+
+    if handler_kind == "async":
+
+        @api.get("/x")
+        async def x():
+            calls.append("handler")
+            return {"ok": True}
+    else:
+
+        @api.get("/x")
+        def x():
+            calls.append("handler")
+            return {"ok": True}
+
+    with TestClient(api) as client:
+        response = client.get("/x")
+
+    assert response.status_code == 418
+    assert calls == ["a.request", "b.request", "b.response", "a.response"]
+
+
+@pytest.mark.parametrize("handler_kind", ["async", "sync"])
+def test_full_pass_runs_hooks_in_declared_and_reverse_order(handler_kind):
+    calls: list[str] = []
+    stack = DjangoMiddlewareStack([_order_recording_middleware("a", calls), _order_recording_middleware("b", calls)])
+    api = BoltAPI(middleware=[stack])
+
+    if handler_kind == "async":
+
+        @api.get("/x")
+        async def x():
+            calls.append("handler")
+            return {"ok": True}
+    else:
+
+        @api.get("/x")
+        def x():
+            calls.append("handler")
+            return {"ok": True}
+
+    with TestClient(api) as client:
+        assert client.get("/x").status_code == 200
+
+    assert calls == ["a.request", "b.request", "handler", "b.response", "a.response"]
