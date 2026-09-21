@@ -222,6 +222,7 @@ class DjangoMiddleware:
             self.middleware_class = import_string(middleware_class_or_get_response)
         else:
             self.middleware_class = middleware_class_or_get_response
+        _check_capabilities(self.middleware_class)
 
         self.init_kwargs = init_kwargs
         self.get_response = None
@@ -454,6 +455,13 @@ def _is_django_builtin_middleware(middleware_class: type) -> bool:
     return any(module.startswith(prefix) for prefix in _DJANGO_SAFE_MIDDLEWARE_PREFIXES)
 
 
+def _check_capabilities(middleware: Any) -> None:
+    """Reject a middleware that can run in no mode, as Django does at load."""
+    if not getattr(middleware, "sync_capable", True) and not getattr(middleware, "async_capable", False):
+        name = getattr(middleware, "__qualname__", repr(middleware))
+        raise RuntimeError(f"Middleware {name} must have at least one of sync_capable/async_capable set to True.")
+
+
 def _needs_event_loop(middleware: Any) -> bool:
     """Whether a middleware class or factory must run on the event loop.
 
@@ -526,6 +534,8 @@ class DjangoMiddlewareStack:
                 "Django is required to use DjangoMiddlewareStack. Install Django with: pip install django"
             )
 
+        for middleware in middleware_classes:
+            _check_capabilities(middleware)
         self.middleware_classes = middleware_classes
         self.get_response = None
         self._django_hook_middleware = []  # Django built-in: direct calls
@@ -551,7 +561,11 @@ class DjangoMiddlewareStack:
 
     @staticmethod
     def _has_hook_methods(middleware_class: type) -> bool:
-        """Return True if middleware defines any Django hook methods."""
+        """Return True if middleware defines any Django hook methods.
+
+        Such a middleware runs through its hooks. The stack does not call its
+        ``__call__``, so ``process_view`` runs as with Django's ``MiddlewareMixin``.
+        """
         return any(
             hasattr(middleware_class, method_name)
             for method_name in ("process_request", "process_view", "process_response")

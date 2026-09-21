@@ -13,13 +13,13 @@ single dict lookup plus a call. Resolution must be per-route, not per scheme
 name: two JWTAuthentication subclasses share scheme_name "jwt" but can carry
 different get_user overrides.
 
-A lazy user is forced on the thread that first reads request.user. That thread
-is not known at registration: a sync handler behind Django middleware runs on
-a request lane, but an async Python middleware around it can force the user on
-the event loop thread first. The loader thus looks at the calling thread when
-it runs (_in_async_context). A thread with a running event loop cannot run the
-ORM inline, so the query goes to the ORM pool. Any other thread, a request lane
-included, runs the query inline, which keeps the thread affinity of the lane.
+The thread that first reads request.user forces the lazy user. Registration
+does not know that thread. A sync handler behind Django middleware runs on a
+request lane. An async Python middleware around it can force the user on the
+event loop thread first. The loader thus looks at the calling thread when it
+runs (_in_async_context). A thread with a running event loop cannot run the
+ORM inline, so the query goes to a worker thread. A request lane runs the
+query inline, which keeps the thread affinity of the lane.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ def resolve_user_loader(backend: Any) -> Callable[[str, dict | None], Any] | Non
     3. Framework default get_user_sync (JWTAuthentication pk lookup)
     4. None — backend has no user resolution (e.g. plain APIKeyAuthentication)
 
-    The loader runs when the lazy user is forced. It decides on that thread
+    The loader runs when code forces the lazy user. It decides on that thread
     whether the query can run inline (see _in_async_context).
     """
     cls = type(backend)

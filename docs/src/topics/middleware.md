@@ -479,6 +479,8 @@ Django-Bolt optimizes middleware execution with a three-tier system:
 2. **Third-party middleware with hooks** - Wrapped in `sync_to_async` for safety
 3. **Custom `__call__` middleware** - Executed as a chain via single `sync_to_async` call
 
+A class with hook methods is in tier 1 or 2, also when it defines its own `__call__`. `DjangoMiddlewareStack` runs its hooks and does not call its `__call__`. Use `DjangoMiddleware` for a class whose `__call__` must run.
+
 The `DjangoMiddlewareStack` automatically categorizes your middleware for optimal performance.
 
 If a `DjangoMiddlewareStack` mixes hook middleware (`process_request` / `process_view` / `process_response`) with `__call__`-only middleware, Django-Bolt uses a correctness-first compatibility path to preserve strict declared order and hook semantics. This path is slower than the pure hook fast path.

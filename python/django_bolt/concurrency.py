@@ -18,7 +18,7 @@ import threading
 from collections.abc import Callable, Coroutine
 from functools import partial
 
-from asgiref.sync import SyncToAsync, ThreadSensitiveContext, sync_to_async
+from asgiref.sync import AsyncToSync, SyncToAsync, ThreadSensitiveContext, sync_to_async
 from django.db import connections
 
 logger = logging.getLogger(__name__)
@@ -297,12 +297,39 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     on a slot this thread is holding. The inline call still runs in a copied
     context so ContextVar writes stay scoped the same way as on the
     executor path.
+
+    A request with Django middleware owns a lane. A caller on the event loop
+    of such a request sends the query to that lane, as ``sync_to_thread``
+    does. The thread-local state of the middleware then applies to the query.
     """
     # A lane thread owns its request, in lane mode and when it runs the sync
     # work of an async request. The ORM pool would use a different connection.
     if in_orm_executor_thread() or _on_lane_thread():
         return contextvars.copy_context().run(fn, *args)
+    executor = _request_thread_executor()
+    if executor is not None:
+        return _submit_blocking(executor, fn, *args)
     return _submit_blocking(_get_orm_executor(), fn, *args)
+
+
+def _request_thread_executor() -> concurrent.futures.Executor | None:
+    """The executor of the thread that owns the request of the caller, or None.
+
+    This is the selection of ``sync_to_async(thread_sensitive=True)``. A lane
+    that waits in ``async_to_sync`` runs work items of its
+    ``CurrentThreadExecutor`` only, so that executor comes first. A job sent
+    to such a lane would wait until the lane returns, and the lane waits for
+    the caller.
+    """
+    current = getattr(AsyncToSync.executors, "current", None)
+    if current is not None:
+        return current
+    context = SyncToAsync.thread_sensitive_context.get(None)
+    if context is None:
+        return None
+    # Lane mode sets a context with no executor. Then the caller is not on the
+    # lane, and the ORM pool is the only option.
+    return SyncToAsync.context_to_thread_executor.get(context)
 
 
 def _run_default_blocking[T](fn: Callable[..., T], *args: object) -> T:

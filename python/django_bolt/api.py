@@ -2780,7 +2780,7 @@ class BoltAPI:
                     # fall back to the default pk query. A loader of None
                     # means the backend has no user resolution — leave
                     # request.user unset (PyRequest getter returns None).
-                    # The loader looks at the thread that forces the user: an
+                    # The loader looks at the thread that forces the user. An
                     # async Python middleware can force it on the event loop
                     # before a sync handler runs on its lane.
                     loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)

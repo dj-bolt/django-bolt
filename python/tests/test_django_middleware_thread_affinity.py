@@ -598,7 +598,11 @@ def test_async_middleware_forces_the_lazy_user_of_a_sync_handler_off_the_event_l
 
 @pytest.mark.django_db(transaction=True)
 def test_lazy_user_forced_on_a_lane_loads_on_that_lane():
-    """A lazy user that a lane forces must not leave the lane for the ORM pool."""
+    """A lazy user that a lane forces must not leave the lane for the ORM pool.
+
+    This guards an invariant of ``run_orm_blocking``, not a change of this
+    fix. The test is green on the code before the loader change too.
+    """
     api = BoltAPI(middleware=[DjangoMiddlewareStack([_NoOpDjangoMiddleware])])
 
     @api.get("/x", auth=[_DatabaseAuth(secret=_TEST_JWT_SECRET)])
@@ -692,3 +696,72 @@ def test_mixed_stack_keeps_thread_affinity_through_an_async_only_middleware(midd
             assert response.status_code == 200, (path, response.text)
             assert response.headers[header] == "yes"
             assert response.json() == {"expected": "acme", "actual": "acme"}
+
+
+class _TenantDatabaseAuth(JWTAuthentication):
+    """A backend whose user loader reads the tenant that a Django hook set on the lane."""
+
+    def get_user_sync(self, user_id):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        return SimpleNamespace(username="bob", tenant=_read_tenant())
+
+
+class _ReadUserTenantMiddleware:
+    """Async Python middleware that forces the lazy user on the event loop."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    async def __call__(self, request):
+        tenant = request.user.tenant
+        response = await self.get_response(request)
+        response.headers["X-User-Tenant"] = tenant
+        return response
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync", "async"])
+def test_lazy_user_forced_on_the_event_loop_loads_on_the_lane_of_its_request(handler_is_async):
+    """The user query must see the thread-local state that the Django hook set on the lane."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware]), _ReadUserTenantMiddleware])
+
+    if handler_is_async:
+
+        @api.get("/tenant/{tenant}", auth=[_TenantDatabaseAuth(secret=_TEST_JWT_SECRET)])
+        async def endpoint(tenant: str):
+            await asyncio.sleep(0)
+            return {"expected": tenant}
+    else:
+
+        @api.get("/tenant/{tenant}", auth=[_TenantDatabaseAuth(secret=_TEST_JWT_SECRET)])
+        def endpoint(tenant: str):
+            return {"expected": tenant}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+
+    assert response.status_code == 200, response.text
+    assert response.headers["x-user-tenant"] == "acme"
+
+
+class _NeitherCapableMiddleware:
+    sync_capable = False
+    async_capable = False
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        return self.get_response(request)
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [lambda: DjangoMiddlewareStack([_NeitherCapableMiddleware]), lambda: DjangoMiddleware(_NeitherCapableMiddleware)],
+    ids=["stack", "single_wrapper"],
+)
+def test_a_middleware_with_no_capability_is_rejected(wrap):
+    """Django rejects such a middleware at load. Bolt must not run it."""
+    with pytest.raises(RuntimeError, match="sync_capable"):
+        wrap()
