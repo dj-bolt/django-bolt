@@ -37,7 +37,7 @@ pytestmark = pytest.mark.server_integration
 
 RECYCLE_TIMEOUT = 30.0
 
-# child_pids()/get_rss_bytes() rely on POSIX /proc + ps and fork-based workers.
+# child_pids()/get_rss_bytes() rely on POSIX pgrep/ps (or /proc) and fork-based workers.
 _requires_posix = pytest.mark.skipif(
     platform.system() == "Windows",
     reason="worker recycling under load requires POSIX fork + /proc RSS reading",
