@@ -26,9 +26,6 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
     "Programming Language :: Rust",
     "Framework :: Django",
-    "Framework :: Django :: 4.2",
-    "Framework :: Django :: 5.0",
-    "Framework :: Django :: 5.1",
     "Framework :: Django :: 5.2",
     "Framework :: Django :: 6.0",
     "Framework :: Django :: 6.1",
@@ -37,7 +34,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
-    "Django>=4.2",
+    "Django>=5.2",
     "asgiref>=3.9.1",  # nested thread-sensitive callbacks use CurrentThreadExecutor
     "click>=8.1",
     "httpx>=0.28.1",

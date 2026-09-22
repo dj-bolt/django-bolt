@@ -341,7 +341,7 @@ requires-dist = [
     { name = "bolt-mcp", marker = "extra == 'bolt-mcp'", editable = "python/bolt-mcp" },
     { name = "bolt-mcp", marker = "extra == 'mcp'", editable = "python/bolt-mcp" },
     { name = "click", specifier = ">=8.1" },
-    { name = "django", specifier = ">=4.2" },
+    { name = "django", specifier = ">=5.2" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "msgspec", specifier = ">=0.20" },
     { name = "nanodjango", marker = "extra == 'nanodjango'", specifier = ">=0.16" },

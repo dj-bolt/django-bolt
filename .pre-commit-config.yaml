@@ -29,13 +29,17 @@ repos:
         exclude: '^python/tests/integration/apps/jwt_rs256_provider\.py$'
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: 3b3f7c3f57fe9925356faf5fe6230835138be230  # frozen: v0.15.17
+    rev: 2eeb5678de71a00c0902cbda7105d328432f72cb  # frozen: v0.16.8
     hooks:
       # Lint (autofix what is safe). Keep before the formatter per ruff guidance.
       - id: ruff-check
         args: [--fix]
-      # Format.
+      # Format. v0.16 added `markdown` to this hook's file types, which
+      # reformats the Python blocks in docs/ and README: it de-aligns the
+      # column-aligned teaching comments and explodes single-line import
+      # examples. Keep the hook on code only; docs snippets stay as authored.
       - id: ruff-format
+        types_or: [python, pyi, jupyter]
 
   # Rust formatting gate. System hook — needs `cargo` on PATH: contributors
   # have it locally, and the Lint workflow installs the stable toolchain

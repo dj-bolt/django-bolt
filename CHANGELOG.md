@@ -11,15 +11,20 @@ All notable changes to this project will be documented in this file.
 - **One asyncio loop per worker thread** - Each Actix worker thread owns its own `WorkerLoop`, pumped on that thread. An async handler resumes on the thread that accepted its request, so `threading.local` state survives an await and worker threads run async handlers in parallel. Before, every thread fed one shared loop, which serialized all awaits on one thread. Loop-bound asyncio objects cannot be shared between worker threads.
 - **Dead database connections are dropped on error** - Bolt keeps Django connections open across requests. When a handler or QuerySet evaluation on the executor pool raises, Bolt now runs Django's `close_if_unusable_or_obsolete()` on that thread, so a broken connection does not fail every later request on the same thread. The check adds no cost on the success path. When a database sets `CONN_MAX_AGE` or `CONN_HEALTH_CHECKS`, the same check also runs before each executor call, so timed recycling and health checks work without `BOLT_EMIT_SIGNALS`.
 
-### Performance
+### Removed
 
-- **Request lanes for Django middleware routes** - A route with Django middleware runs each request on a lane. A lane is a thread that Rust owns, and it keeps its database connections open between requests. A sync handler behind `DjangoMiddlewareStack` runs the complete request on one lane with no asyncio. An async handler sends all sync work of its request to one lane, and all hooks of a phase run together. Lanes need no configuration. A lane that stays idle for 10 seconds stops (`DJANGO_BOLT_LANE_IDLE_SECONDS`). Measured in one process with no network, an async request with four middleware takes 514 microseconds, down from 707. With django-tenants on PostgreSQL, one process, and 64 connections, a sync ORM route serves 1066 requests per second. django-ninja serves 795 on gunicorn with 32 threads and persistent connections. An async ORM route serves 914 against 310 for django-ninja on uvicorn.
+- **Django 4.2, 5.0, and 5.1** - All three reached end of life upstream (5.0 in April 2025, 5.1 in December 2025, 4.2 LTS in April 2026) and are no longer supported. The minimum is now Django 5.2 LTS, and the supported series are 5.2, 6.0, and 6.1. Projects on an end-of-life Django receive no upstream security fixes; pin `django-bolt<0.12` if you cannot upgrade Django yet.
 
 ### Changed
 
+- **The CI test matrix is derived from the `pyproject.toml` classifiers** - The Django axis is now read from the `Framework :: Django :: X.Y` classifiers, as the Python axis already was. The declared support matrix and the versions actually tested can no longer disagree. A new `support-matrix` workflow checks those classifiers against [endoflife.date](https://endoflife.date) every week. It opens an issue when a series goes end of life, or when a new one ships. Run `python scripts/check_support_matrix.py` to check locally.
 - **asgiref 3.9.1 or later is required** - Nested user loading uses its support for parent thread executors.
 - **`load_user_sync()` no longer takes `is_async_context`** - The loader reads the calling thread when it runs. A call with the old fourth argument raises `TypeError`.
 - **A trivially-async handler with `DJANGO_ALLOW_ASYNC_UNSAFE=1` loads `request.user` on the ORM pool** - Rust installs the event loop around the sync fast path of an `async def` handler with no await. The user query ran inline on the worker thread there. It now runs on the ORM pool, as in an async handler.
+
+### Performance
+
+- **Request lanes for Django middleware routes** - A route with Django middleware runs each request on a lane. A lane is a thread that Rust owns, and it keeps its database connections open between requests. A sync handler behind `DjangoMiddlewareStack` runs the complete request on one lane with no asyncio. An async handler sends all sync work of its request to one lane, and all hooks of a phase run together. Lanes need no configuration. A lane that stays idle for 10 seconds stops (`DJANGO_BOLT_LANE_IDLE_SECONDS`). Measured in one process with no network, an async request with four middleware takes 514 microseconds, down from 707. With django-tenants on PostgreSQL, one process, and 64 connections, a sync ORM route serves 1066 requests per second. django-ninja serves 795 on gunicorn with 32 threads and persistent connections. An async ORM route serves 914 against 310 for django-ninja on uvicorn.
 
 ### Fixed
 

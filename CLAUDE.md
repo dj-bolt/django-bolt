@@ -16,7 +16,8 @@ python manage.py runbolt --dev              # from python/example
 just release VERSION=0.2.2 [DRY_RUN=1]      # bump, commit, tag, push
 ```
 
-Supported: Python 3.12–3.14 (source of truth: `pyproject.toml` classifiers), Django 4.2–6.1.
+Supported: Python 3.12–3.14 and Django 5.2–6.1 (source of truth: `pyproject.toml` classifiers;
+only upstream-supported Django series, enforced by `scripts/check_support_matrix.py`).
 
 ## Layout
 
