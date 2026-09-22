@@ -167,7 +167,7 @@ BOLT_EMIT_SIGNALS = False
 
 With signals disabled, don't rely on request-signal-driven connection recycling.
 
-Bolt keeps each thread's connection open between requests. It drops the connection when a query on it raises. A connection that the database closed therefore costs one failed request per thread, not a process restart. To serve every request through a database failover, set `CONN_HEALTH_CHECKS = True` with a positive `CONN_MAX_AGE`. Bolt then runs Django's connection check before each executor call. The health check replaces a dead connection before the query. Neither setting is on by default. See [Database Connection Management](../topics/signals.md#database-connection-management).
+Bolt keeps each thread's connection open between requests. It drops the connection when a query on it raises. A connection that the database closed therefore costs one failed request per thread, not a process restart. To serve every request through a database failover, set `CONN_HEALTH_CHECKS = True`. Bolt then runs Django's connection check before each executor call. The health check replaces a dead connection before the query. Add a positive `CONN_MAX_AGE` to keep connections between calls. Neither setting is on by default. See [Database Connection Management](../topics/signals.md#database-connection-management).
 
 For ASGI deployments, keep persistent connections disabled (`CONN_MAX_AGE = 0`) and use pooling. See [Persistent connections](https://docs.djangoproject.com/en/6.0/ref/databases/#persistent-connections).
 
