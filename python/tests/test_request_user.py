@@ -7,6 +7,7 @@ for different authentication backends via actual HTTP requests.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import jwt
@@ -144,6 +145,62 @@ class TestJWTUserLoading:
 
         assert response.status_code == 200, response.text
         assert response.json() == {"username": user.username, "user_id": user.pk, "same_user": True}
+
+    @pytest.mark.django_db(transaction=True)
+    def test_concurrent_auser_calls_share_one_query(self):
+        """Two ``auser()`` calls of one request that run at the same time load the user one time."""
+        queries = []
+
+        class CountingJWT(JWTAuthentication):
+            def get_user_sync(self, user_id):
+                queries.append(user_id)
+                return User.objects.get(pk=user_id)
+
+        api = BoltAPI(django_middleware=[])
+
+        @api.get("/me", auth=[CountingJWT(secret="test-secret")])
+        async def me(request):
+            first, second = await asyncio.gather(request.auser(), request.auser())
+            return {"same": first is second, "shared": first is object.__getattribute__(request.user, "_wrapped")}
+
+        user = User.objects.create(username="gather_user")
+        token = create_jwt_token(user_id=str(user.pk))
+        with TestClient(api) as client:
+            response = client.get("/me", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"same": True, "shared": True}
+        assert len(queries) == 1
+
+    @pytest.mark.django_db(transaction=True)
+    def test_sync_read_during_auser_keeps_one_user(self):
+        """A sync read while ``auser()`` waits loads the user first. ``auser()`` must keep that user.
+
+        Otherwise ``request.user`` changes to a second object in the middle of
+        the request, and a write to the first object is lost.
+        """
+        api = BoltAPI(django_middleware=[])
+
+        @api.get("/me", auth=[JWTAuthentication(secret="test-secret")])
+        async def me(request):
+            pending = asyncio.ensure_future(request.auser())
+            await asyncio.sleep(0)
+            request.user.marker = "kept"
+            first = object.__getattribute__(request.user, "_wrapped")
+            loaded = await pending
+            return {
+                "auser_is_first": loaded is first,
+                "user_is_first": object.__getattribute__(request.user, "_wrapped") is first,
+                "marker": getattr(request.user, "marker", None),
+            }
+
+        user = User.objects.create(username="race_user")
+        token = create_jwt_token(user_id=str(user.pk))
+        with TestClient(api) as client:
+            response = client.get("/me", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"auser_is_first": True, "user_is_first": True, "marker": "kept"}
 
     def test_auser_returns_anonymous_without_authentication(self):
         """The async getter still returns an anonymous user without authentication."""

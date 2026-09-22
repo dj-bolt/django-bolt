@@ -131,7 +131,9 @@ async def get_me(request):
     return {"id": user.id}
 ```
 
-`request.auser()` loads the user on the request lane or on the ORM pool and does not block the event loop. `request.user` then returns the same user with no second query. A sync read of `request.user` in async code blocks the worker thread until the query returns, and the query does not see the thread-local state of the request lane.
+`request.auser()` does not block the event loop. It awaits an async `get_user` directly. It runs `get_user_sync` on the request lane or on the ORM pool. `request.user` then returns the same user with no second query.
+
+A sync read of `request.user` in async code blocks the worker thread until the ORM pool returns the user. With Django middleware, the request keeps its thread-local state on its lane, and a query on the pool does not see that state. Thus in async code behind Django middleware, a sync read of `request.user` raises `RuntimeError`. Use `await request.auser()` there.
 
 ### Custom user query
 

@@ -244,7 +244,8 @@ class TestBoltAuthUserPrecedence:
 
         @api.get("/jwt-peeked", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
         async def jwt_peeked(request):
-            user = request.user
+            # An async handler behind Django middleware loads its user with auser().
+            user = await request.auser()
             return {"username": getattr(user, "username", None)}
 
         user = User.objects.create(username="peeked_user")

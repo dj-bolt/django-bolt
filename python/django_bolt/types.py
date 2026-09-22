@@ -336,10 +336,12 @@ class Request(Protocol):
         From a type-checking perspective, this behaves exactly like a UserType.
 
         ``request.user`` is sync. The query runs on the thread that reads it. In async
-        code, the query runs on the ORM pool and the event loop waits for it. Use
-        ``await request.auser()`` in async code. It does not block the event loop, and
-        ``request.user`` then returns the same user with no second query. A backend
-        with only an async ``get_user`` serves ``await request.auser()`` only.
+        code, the query runs on the ORM pool and the event loop waits for it. In async
+        code behind Django middleware, a sync read raises ``RuntimeError``: the query
+        must run on the lane of the request. Use ``await request.auser()`` in async code.
+        It does not block the event loop, and ``request.user`` then returns the same
+        user with no second query. A backend with only an async ``get_user`` serves
+        ``await request.auser()`` only.
 
         Returns:
             Django User model instance (wrapped in LazyUser proxy) if authentication context

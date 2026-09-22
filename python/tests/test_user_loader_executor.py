@@ -251,6 +251,70 @@ def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
     )
 
 
+def test_run_in_orm_executor_reentry_leaves_the_callers_pool(fresh_orm_executor):
+    """Reentrant ORM work leaves the caller's pool — and the caller's thread.
+
+    User code can run an event loop on a pool worker, for example with
+    ``asyncio.run``. ORM work that the loop awaits then re-enters
+    ``run_in_orm_executor`` from inside the pool. Submitting back into the
+    pool waits on the slot that worker holds (a deadlock on a one-thread
+    pool), and running inline is impossible: the worker now has a running
+    event loop, so a real query raises Django's SynchronousOnlyOperation.
+    The work must cross to the default pool.
+
+    Bounded by result(timeout=...) so a deadlock regression fails instead of
+    wedging the run; the query is real so an async-unsafe regression fails
+    loudly too.
+    """
+    fresh_orm_executor(workers=1)
+    user = _make_user("nested")
+
+    def nested_orm_work():
+        return threading.current_thread().name, load_user_by_pk_sync(User, str(user.pk))
+
+    def drive_nested_loop():
+        assert concurrency.in_orm_executor_thread()
+        outer = threading.current_thread().name
+        inner, loaded = asyncio.run(concurrency.run_in_orm_executor(nested_orm_work))
+        return outer, inner, loaded
+
+    outer, inner, loaded = concurrency._get_orm_executor().submit(drive_nested_loop).result(timeout=10)
+    assert loaded is not None
+    assert loaded.pk == user.pk
+    assert inner != outer
+    assert inner.startswith(DEFAULT_THREAD_PREFIX), (
+        f"nested ORM work ran on {inner!r}; expected the default pool — submitting "
+        "into the ORM pool from one of its own workers deadlocks a one-thread pool"
+    )
+
+
+def test_user_forced_under_a_loop_on_an_orm_worker_leaves_the_callers_pool(fresh_orm_executor):
+    """The blocking hand-off has the same reentry case as ``run_in_orm_executor``.
+
+    The worker runs a loop, so the query cannot run inline. The one ORM slot
+    is the worker itself, so the query must cross to the default pool.
+    """
+    fresh_orm_executor(workers=1)
+    user = _make_user("nested-sync")
+    seen: list[str] = []
+
+    def recording_pk_load(model, user_id):
+        seen.append(threading.current_thread().name)
+        return load_user_by_pk_sync(model, user_id)
+
+    async def force():
+        return concurrency.run_orm_blocking(recording_pk_load, User, str(user.pk))
+
+    def drive_nested_loop():
+        assert concurrency.in_orm_executor_thread()
+        return asyncio.run(force())
+
+    loaded = concurrency._get_orm_executor().submit(drive_nested_loop).result(timeout=10)
+    assert loaded is not None
+    assert loaded.pk == user.pk
+    assert seen and seen[0].startswith(DEFAULT_THREAD_PREFIX), f"query ran on {seen!r}; expected the default pool"
+
+
 def test_orm_executor_is_built_once_under_concurrent_first_use(fresh_orm_executor, monkeypatch):
     """Racing first callers must share one pool.
 

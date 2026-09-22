@@ -404,12 +404,14 @@ Available synced attributes:
 | Attribute | Source | Access |
 |-----------|--------|--------|
 | User (async) | AuthenticationMiddleware | `await request.auser()` |
-| User (sync) | AuthenticationMiddleware | `request.user` |
+| User (sync) | AuthenticationMiddleware | `request.user` (sync code only) |
 | Session | SessionMiddleware | `request.session` |
 | Messages | MessageMiddleware | `request.state["_messages"]` |
 | META | All middleware | `request.state["META"]` |
 | CSRF token | CsrfViewMiddleware | `request.state["_csrf_token"]` |
 | Custom attributes | Your middleware | `request.state["<name>"]` |
+
+In async code behind Django middleware, read the user with `await request.auser()`. A sync read of a user that Bolt authenticated raises `RuntimeError` there, because its query must run on the lane of the request.
 
 Bolt copies each public attribute that a middleware sets on the Django request to `request.state`. For example, django-tenants sets `request.tenant`. Read it from `request.state["tenant"]`. Bolt does not copy names that start with `_`.
 

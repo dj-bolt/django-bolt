@@ -17,7 +17,8 @@ Each backend resolves to a pair of loaders:
 
 1. request.user is sync. It runs the query on the thread that reads it
    (run_orm_blocking). A thread with a running event loop sends the query to
-   the ORM pool, and the loop waits.
+   the ORM pool, and the loop waits. On the loop of a request with Django
+   middleware, the query would miss the state of the lane, so the read raises.
 2. await request.auser() is async. It awaits an async get_user as a coroutine.
    It sends a sync query through run_in_orm_executor, the hand-off of each
    framework query. A request with a lane keeps the query on that lane.
@@ -27,6 +28,7 @@ Each backend resolves to a pair of loaders:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Callable, Coroutine
 from functools import partial
@@ -78,13 +80,28 @@ class LazyUser(SimpleLazyObject):
     """
 
     def __init__(self, loaders: UserLoaders, user_id: str, auth_context: dict | None) -> None:
-        super().__init__(partial(loaders[0], user_id, auth_context))
+        # Set the state of SimpleLazyObject.__init__ directly. Each request with a
+        # user builds one, and the chain of __init__ calls costs more than the writes.
         # LazyObject.__setattr__ forwards other names to the wrapped user.
-        self.__dict__["_aloader"] = loaders[1]
+        state = self.__dict__
+        state["_setupfunc"] = partial(loaders[0], user_id, auth_context)
+        state["_wrapped"] = empty
+        state["_aloader"] = loaders[1]
 
     async def aload(self) -> Any:
         if self._wrapped is empty:
-            self._wrapped = await self._aloader(*self._setupfunc.args)
+            state = self.__dict__
+            lock = state.get("_aload_lock")
+            if lock is None:
+                lock = state["_aload_lock"] = asyncio.Lock()
+            # Concurrent calls of one request share one query.
+            async with lock:
+                if self._wrapped is empty:
+                    user = await self._aloader(*self._setupfunc.args)
+                    # A sync read can load the user during the await. Keep that user,
+                    # so request.user does not change in the middle of the request.
+                    if self._wrapped is empty:
+                        self._wrapped = user
         return self._wrapped
 
 

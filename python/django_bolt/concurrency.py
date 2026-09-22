@@ -282,6 +282,19 @@ def _submit_blocking(
     return executor.submit(ctx.run, _call_guarded, fn, *args).result()
 
 
+def _orm_executor_for_caller() -> concurrent.futures.ThreadPoolExecutor:
+    """The pool for an ORM hand-off from the calling thread.
+
+    An ORM pool worker can run an event loop, for example in ``asyncio.run``.
+    A hand-off from that loop cannot use the ORM pool: it waits on the slot
+    that the worker holds, and a one-thread pool never frees it. That rare
+    case uses the default pool and one connection outside the ORM budget.
+    """
+    if in_orm_executor_thread():
+        return _get_default_executor()
+    return _get_orm_executor()
+
+
 def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     """Blocking counterpart of :func:`run_in_orm_executor` for callers that cannot await.
 
@@ -291,19 +304,28 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     router applies to user loading as it does to QuerySet evaluation.
 
     A thread with no running event loop runs ``fn`` inline. This keeps a
-    request lane on its own connection and thread-local state. It also keeps
-    an ORM pool worker from a wait on the slot that it holds. A thread with a
-    running loop cannot run the ORM inline, so ``fn`` runs on the ORM pool.
-    That loop then waits for the query, and the query does not see the
-    thread-local state of a request lane. Code that can await uses
-    ``await request.auser()`` instead.
+    request lane on its own connection and thread-local state. A thread with
+    a running loop cannot run the ORM inline, so ``fn`` runs on the ORM pool,
+    and the loop waits for it.
+
+    A request with Django middleware keeps its thread-local state on its
+    lane, for example a tenant schema. A query on the pool does not see that
+    state, and a loop that waits for the lane can deadlock. Thus a caller on
+    the loop of such a request gets ``RuntimeError``. Code that can await
+    uses ``await request.auser()`` instead.
 
     Both branches run ``fn`` in a copied context, so ContextVar writes stay
     scoped the same way.
     """
     if _get_running_loop() is None:
         return contextvars.copy_context().run(fn, *args)
-    return _submit_blocking(_get_orm_executor(), fn, *args)
+    if SyncToAsync.thread_sensitive_context.get(None) is not None:
+        raise RuntimeError(
+            "request.user was read synchronously on the event loop of a request with Django middleware. "
+            "The user query must run on the thread of the request, and the event loop cannot wait for it. "
+            "Use `await request.auser()`."
+        )
+    return _submit_blocking(_orm_executor_for_caller(), fn, *args)
 
 
 async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
@@ -324,7 +346,7 @@ async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
 
     ctx = contextvars.copy_context()
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_get_orm_executor(), ctx.run, _call_guarded, fn, *args)
+    return await loop.run_in_executor(_orm_executor_for_caller(), ctx.run, _call_guarded, fn, *args)
 
 
 async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:

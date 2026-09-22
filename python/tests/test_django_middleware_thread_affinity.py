@@ -569,9 +569,12 @@ class _ReadUserMiddleware:
         self.get_response = get_response
 
     async def __call__(self, request):
-        username = request.user.username
+        try:
+            error = f"none: {request.user.username}"
+        except RuntimeError as exc:
+            error = str(exc)
         response = await self.get_response(request)
-        response.headers["X-Middleware-User"] = username
+        response.headers["X-Middleware-Error"] = error
         return response
 
 
@@ -580,20 +583,26 @@ def _database_auth_token() -> str:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_async_middleware_forces_the_lazy_user_of_a_sync_handler_off_the_event_loop():
-    """A sync handler behind Django middleware runs on a lane. Its lazy user can still be forced on the loop."""
+def test_a_sync_user_read_on_the_event_loop_of_a_lane_request_raises():
+    """The loop cannot reach the lane of the request, so a sync read there raises.
+
+    The query would miss the thread-local state of the Django middleware. The
+    failed read must not leave a user for the handler, which then loads its
+    user on the lane.
+    """
     api = BoltAPI(middleware=[DjangoMiddlewareStack([_NoOpDjangoMiddleware]), _ReadUserMiddleware])
 
     @api.get("/x", auth=[_DatabaseAuth(secret=_TEST_JWT_SECRET)])
     def endpoint(request: Request):
-        return {"ok": True, "username": request.user.username}
+        return {"handler_on": threading.current_thread().name, "loaded_on": request.user.loaded_on}
 
     with TestClient(api, share_db_connection=False) as client:
         response = client.get("/x", headers={"Authorization": f"Bearer {_database_auth_token()}"})
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"ok": True, "username": "bob"}
-    assert response.headers["x-middleware-user"] == "bob"
+    assert "await request.auser()" in response.headers["x-middleware-error"]
+    body = response.json()
+    assert body["loaded_on"] == body["handler_on"]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -717,9 +726,10 @@ class _AwaitUserTenantMiddleware:
         self.get_response = get_response
 
     async def __call__(self, request):
-        user = await request.auser()
+        # Read the tenant before the handler can force the user on the lane.
+        tenant = (await request.auser()).tenant
         response = await self.get_response(request)
-        response.headers["X-User-Tenant"] = user.tenant
+        response.headers["X-User-Tenant"] = tenant
         return response
 
 
@@ -863,8 +873,9 @@ def test_sync_access_to_the_user_of_an_async_only_get_user_raises(handler_is_asy
 def test_sync_user_loader_with_an_async_bridge_completes_when_forced_on_the_event_loop():
     """A lazy user forced on the event loop blocks that loop until the query returns.
 
-    The query then runs on the ORM pool, away from the lane. A loader that
-    calls ``async_to_sync`` there must get a loop of its own and complete.
+    A request with no Django middleware has no lane, so the query runs on the
+    ORM pool. A loader that calls ``async_to_sync`` there must get a loop of
+    its own and complete.
     """
 
     def load_user():
@@ -880,7 +891,7 @@ def test_sync_user_loader_with_an_async_bridge_completes_when_forced_on_the_even
         def get_user_sync(self, user_id):
             return async_to_sync(async_user)()
 
-    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
+    api = BoltAPI()
 
     @api.get("/tenant/{tenant}", auth=[SyncBridgeAuth(secret=_TEST_JWT_SECRET)])
     async def endpoint(tenant: str, request: Request):
@@ -891,6 +902,56 @@ def test_sync_user_loader_with_an_async_bridge_completes_when_forced_on_the_even
 
     assert response.status_code == 200, response.text
     assert response.json()["loaded_on"].startswith("bolt_orm")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_sync_user_read_in_an_async_handler_of_a_lane_request_raises():
+    """An async handler behind Django middleware must not load its user off the lane."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
+    auth = _TenantDatabaseAuth(secret=_TEST_JWT_SECRET)
+
+    @api.get("/tenant/{tenant}", auth=[auth])
+    async def endpoint(tenant: str, request: Request):
+        try:
+            return {"tenant": request.user.tenant}
+        except RuntimeError as exc:
+            return {"error": str(exc), "tenant": (await request.auser()).tenant}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "await request.auser()" in body["error"]
+    assert body["tenant"] == "acme"
+    assert auth.queries == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_sync_user_read_under_async_to_sync_on_a_lane_raises():
+    """``async_to_sync`` in a lane handler runs its coroutine on a loop away from the lane."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
+
+    @api.get("/tenant/{tenant}", auth=[_TenantDatabaseAuth(secret=_TEST_JWT_SECRET)])
+    def endpoint(tenant: str, request: Request):
+        async def read_sync():
+            try:
+                return request.user.tenant
+            except RuntimeError as exc:
+                return str(exc)
+
+        async def read_async():
+            return (await request.auser()).tenant
+
+        return {"sync": async_to_sync(read_sync)(), "async": async_to_sync(read_async)()}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "await request.auser()" in body["sync"]
+    assert body["async"] == "acme"
 
 
 class _NeitherCapableMiddleware:

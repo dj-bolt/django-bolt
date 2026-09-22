@@ -991,13 +991,17 @@ def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
 
     Rules:
     - No Bolt user set → adopt Django's user (plain Django behavior).
+    - Django user is already the request user → adopt it again. Each
+      ``DjangoMiddleware`` wrapper copies the attributes, and a later copy
+      must keep Django's ``auser`` for a user that an earlier copy adopted.
     - Django user is AuthenticationMiddleware's still-unevaluated lazy
       default → keep the Bolt user (also avoids forcing a session query).
     - Django user was evaluated or explicitly assigned (login(),
       impersonation middleware) → adopt it only if it is actually
       authenticated; an anonymous result never overrides Bolt auth.
     """
-    if bolt_request.user is None:
+    bolt_user = bolt_request.user
+    if bolt_user is None or bolt_user is django_user:
         return True
     if isinstance(django_user, LazyObject) and django_user._wrapped is empty:
         return False
@@ -1031,8 +1035,8 @@ def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request)
                 bolt_request.state["auser"] = auser
         else:
             # Keep the Bolt-auth user. Without a state entry, request.auser
-            # falls back to the async loader of that user, not to Django's
-            # session-based (anonymous) auser.
+            # falls back to the async loader of that user (LazyUser.aload),
+            # not to Django's session-based (anonymous) auser.
             bolt_request.state.pop("auser", None)
     elif auser is not None:
         bolt_request.state["auser"] = auser
