@@ -110,7 +110,7 @@ Django-Bolt provides lazy user loading via `request.user`:
 
 ```python
 @api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
-async def get_me(request):
+def get_me(request):
     user = request.user  # Lazily loads from database
 
     return {
@@ -121,6 +121,17 @@ async def get_me(request):
 ```
 
 The user is only loaded from the database when you access `request.user`. If you don't need the full user object, use `request.context` which is available without a database query.
+
+In an async handler or an async middleware, use `await request.auser()`:
+
+```python
+@api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+async def get_me(request):
+    user = await request.auser()
+    return {"id": user.id}
+```
+
+`request.auser()` loads the user on the request lane or on the ORM pool and does not block the event loop. `request.user` then returns the same user with no second query. A sync read of `request.user` in async code blocks the worker thread until the query returns, and the query does not see the thread-local state of the request lane.
 
 ### Custom user query
 
@@ -140,7 +151,7 @@ class MyJWT(JWTAuthentication):
 
 @api.get("/tasks", auth=[MyJWT()], guards=[IsAuthenticated()])
 async def tasks(request):
-    user = request.user  # loaded with your query
+    user = await request.auser()  # loaded with your query
     ...
 ```
 
@@ -148,6 +159,10 @@ Overriding the async `get_user` or the sync `get_user_sync` both work —
 either alone is enough. If you define both, sync handlers use
 `get_user_sync` directly (no event-loop overhead) and it is also preferred
 for async handlers via a worker thread.
+
+A backend that overrides only the async `get_user` serves `await request.auser()`.
+A sync read of `request.user` cannot run a coroutine, so it raises `RuntimeError`.
+Define `get_user_sync` as well when sync handlers or sync middleware read `request.user`.
 
 The override is scoped to the routes that use that backend instance —
 routes authenticated with a plain `JWTAuthentication` keep the default

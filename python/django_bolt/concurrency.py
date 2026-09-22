@@ -18,8 +18,7 @@ import threading
 from collections.abc import Callable, Coroutine
 from functools import partial
 
-from asgiref.current_thread_executor import CurrentThreadExecutor
-from asgiref.sync import AsyncToSync, SyncToAsync, ThreadSensitiveContext, sync_to_async
+from asgiref.sync import SyncToAsync, ThreadSensitiveContext, sync_to_async
 from django.db import connections
 
 logger = logging.getLogger(__name__)
@@ -163,9 +162,7 @@ def close_lane_connections() -> None:
 # from the database-aware ORM pool below.
 _default_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
-# Guards lazy construction, like the ORM pool's lock below. First use was once
-# confined to event loop threads; the user-load shim and the reentrant ORM
-# hand-off now reach this from arbitrary threads, where two racing callers
+# Guards lazy construction, like the ORM pool's lock below: two racing callers
 # would each build a pool and the loser's threads would leak.
 _default_executor_lock = threading.Lock()
 
@@ -276,7 +273,9 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
         return _orm_executor
 
 
-def _submit_blocking(executor: concurrent.futures.Executor, fn: Callable[..., object], *args: object) -> object:
+def _submit_blocking(
+    executor: concurrent.futures.ThreadPoolExecutor, fn: Callable[..., object], *args: object
+) -> object:
     """Submit ``fn`` to ``executor`` with the caller's context and block on it."""
     ctx = contextvars.copy_context()
     return executor.submit(ctx.run, _call_guarded, fn, *args).result()
@@ -297,82 +296,15 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     context so ContextVar writes stay scoped the same way as on the
     executor path.
 
-    A request with Django middleware owns a lane. A caller on the event loop
-    of such a request sends the query to that lane, as ``sync_to_thread``
-    does. The thread-local state of the middleware then applies to the query.
+    A caller on an event loop blocks that loop until the query returns, and
+    the query does not see the thread-local state of a request lane. Code
+    that can await uses ``await request.auser()`` instead.
     """
     # A lane thread owns its request, in lane mode and when it runs the sync
     # work of an async request. The ORM pool would use a different connection.
     if in_orm_executor_thread() or _on_lane_thread():
         return contextvars.copy_context().run(fn, *args)
-    executor = _request_thread_executor()
-    if executor is not None:
-        return _submit_blocking(executor, _call_without_parent_loop, fn, *args)
     return _submit_blocking(_get_orm_executor(), fn, *args)
-
-
-def _call_without_parent_loop[T](fn: Callable[..., T], *args: object) -> T:
-    """Keep nested ``async_to_sync`` calls away from the blocked caller's event loop."""
-    threadlocal = SyncToAsync.threadlocal
-    previous = getattr(threadlocal, "main_event_loop", None)
-    threadlocal.main_event_loop = None
-    try:
-        return fn(*args)
-    finally:
-        threadlocal.main_event_loop = previous
-
-
-def _request_thread_executor() -> concurrent.futures.Executor | None:
-    """The executor of the thread that owns the request of the caller, or None.
-
-    This is the selection of ``sync_to_async(thread_sensitive=True)``. A lane
-    that waits in ``async_to_sync`` runs work items of its
-    ``CurrentThreadExecutor`` only, so that executor comes first. A job sent
-    to such a lane would wait until the lane returns, and the lane waits for
-    the caller.
-    """
-    current = getattr(AsyncToSync.executors, "current", None)
-    if current is not None:
-        return current
-    context = SyncToAsync.thread_sensitive_context.get(None)
-    if context is None:
-        return None
-    # Lane mode sets a context with no executor. Then the caller is not on the
-    # lane, and the ORM pool is the only option.
-    return SyncToAsync.context_to_thread_executor.get(context)
-
-
-def _run_default_blocking[T](fn: Callable[..., T], *args: object) -> T:
-    """Blocking hand-off to the generic default pool (internal).
-
-    Hosts the ``asyncio.run`` shim for a custom async ``get_user``: the
-    coroutine may await non-database work, which must not pin a bounded ORM
-    slot for its full duration. A caller already on an ORM worker runs the
-    shim inline instead — blocking on another pool while holding an ORM slot
-    would let the coroutine's own ORM submission deadlock against that slot.
-
-    A lane processes callbacks while it waits. Nested ORM work then uses the
-    lane's connection and thread-local state without waiting for the lane to return.
-    """
-    if in_orm_executor_thread():
-        return contextvars.copy_context().run(fn, *args)
-    if _on_lane_thread():
-        return _run_default_from_lane(fn, *args)
-    return _submit_blocking(_get_default_executor(), fn, *args)
-
-
-def _run_default_from_lane[T](fn: Callable[..., T], *args: object) -> T:
-    """Run pool work while the calling lane processes its thread-sensitive callbacks."""
-    previous = getattr(AsyncToSync.executors, "current", None)
-    executor = CurrentThreadExecutor(previous)
-    AsyncToSync.executors.current = executor
-    try:
-        ctx = contextvars.copy_context()
-        future = _get_default_executor().submit(ctx.run, _call_guarded, fn, *args)
-        executor.run_until_future(future)
-        return future.result()
-    finally:
-        AsyncToSync.executors.current = previous
 
 
 async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
@@ -382,17 +314,6 @@ async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
     request-scoped state (e.g. a tenant-aware database router) must be
     visible while the QuerySet evaluates, exactly as it was under
     ``sync_to_async``.
-
-    A caller already on a pool thread — reached through a loop nested inside
-    a pool worker, i.e. a custom async ``get_user`` driven by ``asyncio.run``
-    while a lazy ``request.user`` is forced from ORM work — cannot use the
-    pool: submitting waits on the slot that worker is holding (never resolves
-    on a one-thread pool), and running inline is impossible because the
-    worker now has a running event loop, so sync ORM raises Django's
-    ``SynchronousOnlyOperation``. That reentrant case crosses to the generic
-    default pool instead: one transient connection outside the ORM budget on
-    a rare path, in exchange for neither deadlocking nor tripping the
-    async-unsafe check.
     """
     # A Django middleware stack owns thread-local request state, such as a
     # tenant-selected database schema. Its ThreadSensitiveContext requires
@@ -404,8 +325,6 @@ async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
 
     ctx = contextvars.copy_context()
     loop = asyncio.get_running_loop()
-    if in_orm_executor_thread():
-        return await loop.run_in_executor(_get_default_executor(), ctx.run, _call_guarded, fn, *args)
     return await loop.run_in_executor(_get_orm_executor(), ctx.run, _call_guarded, fn, *args)
 
 

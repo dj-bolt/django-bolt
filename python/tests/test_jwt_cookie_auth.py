@@ -197,11 +197,12 @@ class TestGetUserOverrideResolution:
 
     @pytest.mark.django_db(transaction=True)
     def test_async_get_user_override_alone_is_used(self):
-        """Overriding ONLY the async get_user must drive request.user.
+        """Overriding ONLY the async get_user must drive ``await request.auser()``.
 
         The token's sub is a username, which the default pk-based query can
         never resolve — so a 200 with the right username proves the override
         ran, and inheriting the default get_user_sync did not shadow it.
+        Sync access to request.user cannot run an async get_user, so it raises.
         """
         user = User.objects.create(username="asyncoverride")
 
@@ -217,14 +218,24 @@ class TestGetUserOverrideResolution:
             guards=[IsAuthenticated()],
         )
         async def me(request):
-            u = request.user
-            return {"username": u.username if u else None}
+            u = await request.auser()
+            return {"username": u.username if u else None, "same": request.user == u}
+
+        @api.get("/sync-access", auth=[UsernameJWT(secret=SECRET)], guards=[IsAuthenticated()])
+        async def sync_access(request):
+            try:
+                return {"username": request.user.username}
+            except RuntimeError as exc:
+                return {"error": str(exc)}
 
         token = create_token(user_id=user.username)
         with TestClient(api) as client:
             response = client.get("/async-override", headers={"Authorization": f"Bearer {token}"})
             assert response.status_code == 200
-            assert response.json()["username"] == "asyncoverride"
+            assert response.json() == {"username": "asyncoverride", "same": True}
+            response = client.get("/sync-access", headers={"Authorization": f"Bearer {token}"})
+            assert response.status_code == 200
+            assert "await request.auser()" in response.json()["error"]
 
     @pytest.mark.django_db(transaction=True)
     def test_sync_get_user_sync_override_alone_is_used(self):
@@ -275,7 +286,7 @@ class TestGetUserOverrideResolution:
 
         @api.get("/custom-me", auth=[UsernameJWT(secret=SECRET)], guards=[IsAuthenticated()])
         async def custom_me(request):
-            u = request.user
+            u = await request.auser()
             return {"username": u.username if u else None}
 
         token = create_token(user_id=user.username)

@@ -35,7 +35,6 @@ classifiers = [
 ]
 dependencies = [
     "Django>=5.2",
-    "asgiref>=3.9.1",  # nested thread-sensitive callbacks use CurrentThreadExecutor
     "click>=8.1",
     "httpx>=0.28.1",
     "msgspec>=0.20",

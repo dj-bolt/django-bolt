@@ -106,21 +106,13 @@ class RecordingJWTAuth(JWTAuthentication):
 
 
 class AsyncGetUserAuth(JWTAuthentication):
-    """Backend with a custom async get_user, recording where each part runs.
-
-    ``shim_threads`` records the thread hosting the coroutine (the
-    ``asyncio.run`` shim); ``orm_threads`` records where the database query
-    itself lands.
-    """
+    """Backend with a custom async get_user. ``orm_threads`` records where the query lands."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.shim_threads: list[str] = []
         self.orm_threads: list[str] = []
 
     async def get_user(self, user_id, auth_context):
-        self.shim_threads.append(threading.current_thread().name)
-
         def query():
             self.orm_threads.append(threading.current_thread().name)
             return load_user_by_pk_sync(User, user_id)
@@ -174,7 +166,7 @@ def test_backend_user_loader_runs_on_orm_executor(fresh_orm_executor):
 
     backend = RecordingJWTAuth(secret="user-loader-orm-pool-test-secret", algorithms=["HS256"])
     backend.release.set()
-    loader = resolve_user_loader(backend)
+    loader, _ = resolve_user_loader(backend)
     assert loader is not None
 
     loaded = _force_on_event_loop(loader, str(user.pk), None)
@@ -195,7 +187,7 @@ def test_user_loading_respects_orm_thread_budget(fresh_orm_executor):
     user = _make_user("budget")
 
     backend = RecordingJWTAuth(secret="user-loader-orm-pool-test-secret", algorithms=["HS256"])
-    loader = resolve_user_loader(backend)
+    loader, _ = resolve_user_loader(backend)
 
     # Two loads requested at once against a one-thread budget must serialize:
     # the second cannot enter get_user_sync while the first is parked there.
@@ -256,46 +248,6 @@ def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
     assert seen == [pool_thread], (
         f"query ran on {seen!r} instead of inline on {pool_thread!r}; "
         "re-submitting into the ORM pool from its own worker deadlocks a one-thread pool"
-    )
-
-
-def test_run_in_orm_executor_reentry_leaves_the_callers_pool(fresh_orm_executor):
-    """Reentrant ORM work leaves the caller's pool — and the caller's thread.
-
-    A custom async `get_user` is driven by `asyncio.run` on a pool worker, so
-    ORM work it awaits re-enters `run_in_orm_executor` from inside the pool.
-    Submitting back into the pool waits on the slot that worker holds (a
-    deadlock on a one-thread pool), and running inline is impossible: the
-    worker now has a running event loop, so a real query raises Django's
-    SynchronousOnlyOperation. The work must cross to the default pool.
-
-    Bounded by result(timeout=...) so a deadlock regression fails instead of
-    wedging the run; the query is real so an async-unsafe regression fails
-    loudly too.
-    """
-    fresh_orm_executor(workers=1)
-    user = _make_user("nested")
-
-    def nested_orm_work():
-        return threading.current_thread().name, load_user_by_pk_sync(User, str(user.pk))
-
-    def drive_nested_loop():
-        assert concurrency.in_orm_executor_thread()
-        outer = threading.current_thread().name
-        # Mirrors load_via_async: a nested event loop on a pool worker.
-        inner, loaded = asyncio.run(concurrency.run_in_orm_executor(nested_orm_work))
-        return outer, inner, loaded
-
-    outer, inner, loaded = concurrency._get_orm_executor().submit(drive_nested_loop).result(timeout=10)
-    assert loaded is not None
-    assert loaded.pk == user.pk
-    assert inner != outer, (
-        "nested ORM work ran on the pool worker that holds the slot; a real query "
-        "there runs under the nested event loop and raises SynchronousOnlyOperation"
-    )
-    assert inner.startswith(DEFAULT_THREAD_PREFIX), (
-        f"nested ORM work ran on {inner!r}; expected the default pool — submitting "
-        "into the ORM pool from one of its own workers deadlocks a one-thread pool"
     )
 
 
@@ -391,69 +343,33 @@ def test_default_executor_is_built_once_under_concurrent_first_use(monkeypatch):
     assert len(built) == 1, f"{len(built)} default pools were constructed; the loser's threads leak"
 
 
-def test_custom_async_get_user_shim_runs_off_the_orm_pool(fresh_orm_executor):
-    """The asyncio.run shim for a custom async get_user must not hold an ORM slot.
+def test_async_only_get_user_rejects_sync_access(fresh_orm_executor):
+    """A backend with an async ``get_user`` and no ``get_user_sync`` has no sync loader.
 
-    The coroutine may await non-database work (an external identity provider);
-    parking its whole lifetime on a bounded ORM slot queues every QuerySet
-    evaluation behind it — on the SQLite one-thread default, all of them. The
-    shim belongs on the generic default pool; only the database portions the
-    coroutine hands to `run_in_orm_executor` may occupy ORM slots.
+    Sync access to ``request.user`` cannot drive the coroutine without a
+    second event loop on a pool thread. Bolt raises instead. The async loader
+    of ``await request.auser()`` awaits ``get_user`` as a coroutine of the
+    request and sends its query to the ORM pool.
     """
     fresh_orm_executor(workers=1)
-    user = _make_user("async-shim")
+    user = _make_user("async-only")
 
     backend = AsyncGetUserAuth(secret="user-loader-orm-pool-test-secret", algorithms=["HS256"])
-    loader = resolve_user_loader(backend)
-    assert loader is not None
+    loaders = resolve_user_loader(backend)
+    assert loaders is not None
+    loader, aloader = loaders
 
-    loaded = _force_on_event_loop(loader, str(user.pk), None)
+    with pytest.raises(RuntimeError, match="request.auser"):
+        loader(str(user.pk), None)
+    with pytest.raises(RuntimeError, match="request.auser"):
+        _force_on_event_loop(loader, str(user.pk), None)
+    assert backend.orm_threads == []
+
+    loaded = asyncio.run(aloader(str(user.pk), None))
     assert loaded is not None
     assert loaded.pk == user.pk
-
-    assert backend.shim_threads, "get_user never ran"
-    assert backend.shim_threads[0].startswith(DEFAULT_THREAD_PREFIX), (
-        f"the asyncio.run shim ran on {backend.shim_threads[0]!r}; expected the default pool. "
-        "Hosting the coroutine on an ORM slot blocks QuerySet evaluation for its full "
-        "duration, including non-database awaits."
-    )
     assert backend.orm_threads[0].startswith(ORM_THREAD_PREFIX), (
         f"the database query ran on {backend.orm_threads[0]!r}; expected the bounded ORM pool."
-    )
-
-
-def test_custom_async_get_user_forced_from_orm_worker_keeps_the_shim_inline(fresh_orm_executor):
-    """Reentry guard for the shim: a load forced from an ORM worker hosts it inline.
-
-    If the shim crossed to the default pool here, this worker would block on
-    the default pool while the coroutine's own ORM hand-off waits for the
-    slot this worker is holding — a cycle that never resolves on a one-thread
-    pool. Bounded by result(timeout=...) so a regression fails instead of
-    wedging the run.
-    """
-    fresh_orm_executor(workers=1)
-    user = _make_user("async-reentrant")
-
-    backend = AsyncGetUserAuth(secret="user-loader-orm-pool-test-secret", algorithms=["HS256"])
-    loader = resolve_user_loader(backend)
-
-    def force_inside_pool():
-        assert concurrency.in_orm_executor_thread()
-        return threading.current_thread().name, loader(str(user.pk), None)
-
-    outer, loaded = concurrency._get_orm_executor().submit(force_inside_pool).result(timeout=10)
-
-    assert loaded is not None
-    assert loaded.pk == user.pk
-    assert backend.shim_threads == [outer], (
-        f"shim ran on {backend.shim_threads!r} instead of inline on {outer!r}; "
-        "crossing pools while holding the only ORM slot deadlocks"
-    )
-    # The coroutine's own ORM hand-off cannot use the pool (this worker holds
-    # the only slot) nor this thread (its loop is running) — it crosses to the
-    # default pool.
-    assert backend.orm_threads and backend.orm_threads[0].startswith(DEFAULT_THREAD_PREFIX), (
-        f"nested query ran on {backend.orm_threads!r}; expected the default pool"
     )
 
 

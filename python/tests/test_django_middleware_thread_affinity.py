@@ -701,81 +701,143 @@ def test_mixed_stack_keeps_thread_affinity_through_an_async_only_middleware(midd
 class _TenantDatabaseAuth(JWTAuthentication):
     """A backend whose user loader reads the tenant that a Django hook set on the lane."""
 
+    queries = 0
+
     def get_user_sync(self, user_id):
+        self.queries += 1
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1")
         return SimpleNamespace(username="bob", tenant=_read_tenant())
 
 
-class _ReadUserTenantMiddleware:
-    """Async Python middleware that forces the lazy user on the event loop."""
+class _AwaitUserTenantMiddleware:
+    """Async Python middleware that loads the user with ``await request.auser()``."""
 
     def __init__(self, get_response):
         self.get_response = get_response
 
     async def __call__(self, request):
-        tenant = request.user.tenant
+        user = await request.auser()
         response = await self.get_response(request)
-        response.headers["X-User-Tenant"] = tenant
+        response.headers["X-User-Tenant"] = user.tenant
         return response
 
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync", "async"])
-def test_lazy_user_forced_on_the_event_loop_loads_on_the_lane_of_its_request(handler_is_async):
-    """The user query must see the thread-local state that the Django hook set on the lane."""
-    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware]), _ReadUserTenantMiddleware])
+def test_auser_awaited_on_the_event_loop_loads_on_the_lane_of_its_request(handler_is_async):
+    """The user query must see the thread-local state that the Django hook set on the lane.
+
+    The handler then reads ``request.user`` with no second query.
+    """
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware]), _AwaitUserTenantMiddleware])
+    auth = _TenantDatabaseAuth(secret=_TEST_JWT_SECRET)
 
     if handler_is_async:
 
-        @api.get("/tenant/{tenant}", auth=[_TenantDatabaseAuth(secret=_TEST_JWT_SECRET)])
-        async def endpoint(tenant: str):
+        @api.get("/tenant/{tenant}", auth=[auth])
+        async def endpoint(tenant: str, request: Request):
             await asyncio.sleep(0)
-            return {"expected": tenant}
+            return {"expected": tenant, "handler_saw": request.user.tenant}
     else:
 
-        @api.get("/tenant/{tenant}", auth=[_TenantDatabaseAuth(secret=_TEST_JWT_SECRET)])
-        def endpoint(tenant: str):
-            return {"expected": tenant}
+        @api.get("/tenant/{tenant}", auth=[auth])
+        def endpoint(tenant: str, request: Request):
+            return {"expected": tenant, "handler_saw": request.user.tenant}
 
     with TestClient(api, share_db_connection=False) as client:
         response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
 
     assert response.status_code == 200, response.text
     assert response.headers["x-user-tenant"] == "acme"
+    assert response.json() == {"expected": "acme", "handler_saw": "acme"}
+    assert auth.queries == 1
 
 
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync_handler", "async_handler"])
-@pytest.mark.parametrize("orm_bridge", ["blocking", "async", "asgiref"])
-def test_async_user_loader_returns_orm_work_to_the_lane_that_forced_the_user(handler_is_async, orm_bridge):
-    """A lane waiting for async user loading must keep servicing its nested ORM work."""
+def test_auser_awaits_an_async_get_user_on_the_thread_of_its_request():
+    """``await request.auser()`` runs an async ``get_user`` as a coroutine of the request.
 
-    def load_user():
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT 1")
-        return SimpleNamespace(tenant=_read_tenant(), loaded_on=threading.get_ident())
+    The coroutine must not go to a pool thread with its own event loop. Its
+    nested thread-sensitive work must reach the lane of the request.
+    """
 
     class AsyncTenantAuth(JWTAuthentication):
         async def get_user(self, user_id, auth_context):
             await asyncio.sleep(0)
-            if orm_bridge == "blocking":
-                return run_orm_blocking(load_user)
-            if orm_bridge == "async":
-                return await run_in_orm_executor(load_user)
-            return await sync_to_async(load_user, thread_sensitive=True)()
-
-    def force_user(request):
-        user = request.user
-        return {
-            "tenant": user.tenant,
-            "loaded_on": user.loaded_on,
-            "forced_on": threading.get_ident(),
-            "lane_mode": in_lane_mode(),
-        }
+            tenant = await sync_to_async(_read_tenant, thread_sensitive=True)()
+            return SimpleNamespace(tenant=tenant, loaded_on=threading.get_ident())
 
     api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
-    auth = AsyncTenantAuth(secret=_TEST_JWT_SECRET)
+
+    @api.get("/tenant/{tenant}", auth=[AsyncTenantAuth(secret=_TEST_JWT_SECRET)])
+    async def endpoint(tenant: str, request: Request):
+        user = await request.auser()
+        return {"tenant": user.tenant, "loaded_on": user.loaded_on, "handler_on": threading.get_ident()}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["tenant"] == "acme"
+    assert body["loaded_on"] == body["handler_on"]
+
+
+def _load_tenant_user():
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT 1")
+    return SimpleNamespace(tenant=_read_tenant(), loaded_on=threading.get_ident())
+
+
+class _AsyncOnlyTenantAuth(JWTAuthentication):
+    """A backend with an async ``get_user`` only. Its query goes through one of two async bridges."""
+
+    def __init__(self, orm_bridge: str, **kwargs):
+        super().__init__(**kwargs)
+        self.orm_bridge = orm_bridge
+
+    async def get_user(self, user_id, auth_context):
+        await asyncio.sleep(0)
+        if self.orm_bridge == "async":
+            return await run_in_orm_executor(_load_tenant_user)
+        return await sync_to_async(_load_tenant_user, thread_sensitive=True)()
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("orm_bridge", ["async", "asgiref"])
+def test_auser_sends_the_orm_work_of_an_async_get_user_to_the_lane(orm_bridge):
+    """The query of an awaited ``get_user`` must run on the lane, with either async bridge."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
+
+    @api.get("/tenant/{tenant}", auth=[_AsyncOnlyTenantAuth(orm_bridge, secret=_TEST_JWT_SECRET)])
+    async def endpoint(tenant: str, request: Request):
+        user = await request.auser()
+        lane = await sync_to_thread(threading.get_ident)
+        return {"tenant": user.tenant, "loaded_on": user.loaded_on, "lane": lane}
+
+    with TestClient(api, share_db_connection=False) as client:
+        for tenant in ("acme", "beta"):
+            response = client.get(f"/tenant/{tenant}", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["tenant"] == tenant
+            assert body["loaded_on"] == body["lane"]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync_handler", "async_handler"])
+def test_sync_access_to_the_user_of_an_async_only_get_user_raises(handler_is_async):
+    """Sync ``request.user`` cannot drive an async ``get_user``. Bolt raises and names ``auser``."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
+    auth = _AsyncOnlyTenantAuth("async", secret=_TEST_JWT_SECRET)
+
+    def force_user(request):
+        try:
+            tenant = request.user.tenant
+        except RuntimeError as exc:
+            return {"error": str(exc), "lane_mode": in_lane_mode()}
+        return {"error": None, "tenant": tenant}
 
     if handler_is_async:
 
@@ -789,28 +851,26 @@ def test_async_user_loader_returns_orm_work_to_the_lane_that_forced_the_user(han
             return force_user(request)
 
     with TestClient(api, share_db_connection=False) as client:
-        for tenant in ("acme", "beta"):
-            response = client.get(f"/tenant/{tenant}", headers={"Authorization": f"Bearer {_database_auth_token()}"})
-            assert response.status_code == 200, response.text
-            body = response.json()
-            assert body["tenant"] == tenant
-            assert body["loaded_on"] == body["forced_on"]
-            assert body["lane_mode"] is (not handler_is_async)
+        response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "request.auser" in body["error"]
+    assert body["lane_mode"] is (not handler_is_async)
 
 
 @pytest.mark.django_db(transaction=True)
-def test_sync_user_loader_async_bridge_does_not_return_to_the_blocked_request_loop():
-    """A loop forcing a lazy user cannot service the loader's ``async_to_sync`` call."""
+def test_sync_user_loader_with_an_async_bridge_completes_when_forced_on_the_event_loop():
+    """A lazy user forced on the event loop blocks that loop until the query returns.
 
-    class RecordTenantLane(_TenantMixinMiddleware):
-        def process_request(self, request):
-            super().process_request(request)
-            request.lane_thread = threading.get_ident()
+    The query then runs on the ORM pool, away from the lane. A loader that
+    calls ``async_to_sync`` there must get a loop of its own and complete.
+    """
 
     def load_user():
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1")
-        return SimpleNamespace(tenant=_read_tenant(), loaded_on=threading.get_ident())
+        return SimpleNamespace(loaded_on=threading.current_thread().name)
 
     async def async_user():
         await asyncio.sleep(0)
@@ -820,20 +880,17 @@ def test_sync_user_loader_async_bridge_does_not_return_to_the_blocked_request_lo
         def get_user_sync(self, user_id):
             return async_to_sync(async_user)()
 
-    api = BoltAPI(middleware=[DjangoMiddlewareStack([RecordTenantLane])])
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
 
     @api.get("/tenant/{tenant}", auth=[SyncBridgeAuth(secret=_TEST_JWT_SECRET)])
     async def endpoint(tenant: str, request: Request):
-        user = request.user
-        return {"tenant": user.tenant, "loaded_on": user.loaded_on, "lane_thread": request.state["lane_thread"]}
+        return {"loaded_on": request.user.loaded_on}
 
     with TestClient(api, share_db_connection=False) as client:
         response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
 
     assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["tenant"] == "acme"
-    assert body["loaded_on"] == body["lane_thread"]
+    assert response.json()["loaded_on"].startswith("bolt_orm")
 
 
 class _NeitherCapableMiddleware:

@@ -8,7 +8,6 @@ import sys
 import threading
 from collections.abc import Callable
 from contextlib import suppress
-from functools import partial
 from typing import Any, get_origin, get_type_hints
 
 # Django import - may fail if Django not configured
@@ -24,7 +23,6 @@ from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
-from django.utils.functional import SimpleLazyObject
 
 from . import _json
 from ._kwargs import (
@@ -37,7 +35,7 @@ from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler
 from .auth import get_default_authentication_classes, register_auth_backend
-from .auth.user_loader import default_django_user_loader, resolve_user_loader
+from .auth.user_loader import DEFAULT_USER_LOADERS, LazyUser, resolve_user_loader
 from .concurrency import (
     _drop_broken_connections,
     run_in_orm_executor,
@@ -2764,7 +2762,7 @@ class BoltAPI:
             # Integer hashing is O(1) with minimal overhead vs callable hashing
             meta = self._handler_meta[handler_id]
 
-            # 2. Lazy user loading using SimpleLazyObject (Django pattern)
+            # 2. Lazy user loading (Django pattern)
             # User is only loaded from DB when request.user is actually accessed
             # Skip setting user=None — PyRequest.user getter already returns None.
             auth_context = request.get("auth")
@@ -2775,17 +2773,16 @@ class BoltAPI:
 
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    # Route-local loader for the scheme that authenticated;
+                    # Route-local loaders for the scheme that authenticated;
                     # schemes with no backend instance (Rust session auth)
-                    # fall back to the default pk query. A loader of None
-                    # means the backend has no user resolution — leave
+                    # fall back to the default pk query. Loaders of None
+                    # mean the backend has no user resolution — leave
                     # request.user unset (PyRequest getter returns None).
-                    # The loader looks at the thread that forces the user. An
-                    # async Python middleware can force it on the event loop
-                    # before a sync handler runs on its lane.
-                    loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
-                    if loader is not None:
-                        request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context))
+                    # The sync loader looks at the thread that forces the
+                    # user. ``await request.auser()`` uses the async loader.
+                    loaders = meta["_user_loaders"].get(auth_context.get("auth_backend"), DEFAULT_USER_LOADERS)
+                    if loaders is not None:
+                        request["user"] = LazyUser(loaders, user_id, auth_context)
 
             # 3. Check if we need to execute middleware
             # Middleware runs for:
@@ -2857,9 +2854,9 @@ class BoltAPI:
             if auth_context:
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
-                    if loader is not None:
-                        request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context))
+                    loaders = meta["_user_loaders"].get(auth_context.get("auth_backend"), DEFAULT_USER_LOADERS)
+                    if loaders is not None:
+                        request["user"] = LazyUser(loaders, user_id, auth_context)
 
             # Call pre-compiled sync executor directly (no coroutine, no await)
             return meta["_sync_executor"](handler, request)

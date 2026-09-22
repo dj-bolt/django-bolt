@@ -121,7 +121,10 @@ class TestJWTUserLoading:
 
     @pytest.mark.django_db(transaction=True)
     def test_auser_returns_jwt_user_without_django_middleware(self):
-        """Both getters return the JWT user when Django middleware is absent."""
+        """Both getters return the JWT user when Django middleware is absent.
+
+        ``auser()`` loads the user one time. ``request.user`` shares that result.
+        """
         api = BoltAPI(django_middleware=[])
 
         @api.get("/async-me", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
@@ -131,7 +134,7 @@ class TestJWTUserLoading:
             return {
                 "username": user.username,
                 "user_id": user.pk,
-                "same_user": user is request.user and again is user,
+                "same_user": user == request.user and again is user,
             }
 
         user = User.objects.create(username="async_jwt_user")
@@ -338,20 +341,20 @@ class TestRequestUserSyncHandlers:
 
 
 class TestSyncHandlerWithCustomBackend:
-    """Test request.user in sync handlers with custom backends (currently fails)."""
+    """Test request.user in sync handlers with custom backends."""
 
     @pytest.mark.django_db(transaction=True)
     def test_sync_handler_with_custom_backend_should_load_user(self):
-        """Test that sync handler with custom backend loads user."""
+        """A sync handler reads request.user through the backend's get_user_sync."""
 
         class CustomSyncKeyAuth(APIKeyAuthentication):
-            """Custom API key that maps keys to users (async get_user)."""
+            """Custom API key that maps keys to users (sync get_user_sync)."""
 
-            async def get_user(self, user_id: str, auth_context: dict):
+            def get_user_sync(self, user_id: str):
                 """Map API key identifier to actual user."""
                 if user_id == "apikey:test-key":
                     try:
-                        return await User.objects.aget(username="testuser")
+                        return User.objects.get(username="testuser")
                     except User.DoesNotExist:
                         return None
                 return None
@@ -407,11 +410,23 @@ class TestSyncHandlerWithCustomBackend:
         )
         async def async_custom_handler(request):
             """Async handler with custom backend."""
-            user = request.user
+            user = await request.auser()
             return {
                 "user_loaded": user is not None,
                 "username": user.username if user else None,
             }
+
+        @api.get(
+            "/async-custom-sync-read",
+            auth=[CustomAsyncKeyAuth(api_keys={"async-key"})],
+            guards=[IsAuthenticated()],
+        )
+        async def async_custom_sync_read(request):
+            """Sync access to request.user cannot run an async-only get_user."""
+            try:
+                return {"username": request.user.username}
+            except RuntimeError as exc:
+                return {"error": str(exc)}
 
         # Create test user
         User.objects.create(username="asyncuser")
@@ -419,11 +434,14 @@ class TestSyncHandlerWithCustomBackend:
         with TestClient(api) as client:
             response = client.get("/async-custom", headers={"X-API-Key": "async-key"})
 
-            # This should work because async handlers use ThreadPoolExecutor
             assert response.status_code == 200, f"Response: {response.text}"
             data = response.json()
             assert data["user_loaded"] is True
             assert data["username"] == "asyncuser"
+
+            response = client.get("/async-custom-sync-read", headers={"X-API-Key": "async-key"})
+            assert response.status_code == 200, f"Response: {response.text}"
+            assert "await request.auser()" in response.json()["error"]
 
 
 class TestRequestUserGuardBehavior:

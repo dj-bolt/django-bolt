@@ -23,6 +23,7 @@ from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from .._core import RequestLane
+from ..auth.user_loader import aload_bolt_user
 from ..concurrency import drive_on_lane, in_lane_mode
 from ..middleware_response import (
     _BODY_BYTES,
@@ -1005,12 +1006,6 @@ def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
     return bool(getattr(django_user, "is_authenticated", False))
 
 
-async def _static_auser(user):
-    """Module-level `auser` replacement bound via functools.partial — avoids
-    allocating a fresh coroutine function per request."""
-    return user
-
-
 def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request) -> None:
     """
     Sync attributes added by Django middleware to Bolt request.
@@ -1039,7 +1034,7 @@ def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request)
         else:
             # Keep the Bolt-auth user and make auser consistent with it,
             # instead of Django's session-based (anonymous) auser.
-            bolt_request.state["auser"] = functools.partial(_static_auser, bolt_request.user)
+            bolt_request.state["auser"] = functools.partial(aload_bolt_user, bolt_request.user)
     elif auser is not None:
         bolt_request.state["auser"] = auser
 
