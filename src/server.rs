@@ -22,12 +22,12 @@ use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
 use bolt_core::state::{
-    AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, ROUTE_METADATA,
-    ROUTE_METADATA_TEMP, TASK_LOCALS,
+    find_asgi_mount, AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
+    ROUTE_METADATA, ROUTE_METADATA_TEMP, TASK_LOCALS,
 };
 use bolt_core::static_files::handle_file;
 use bolt_websocket::{
-    handle_websocket_upgrade_with_handler, is_websocket_upgrade, WebSocketRouter,
+    handle_websocket_upgrade, is_websocket_upgrade, WebSocketRouter, WsTarget,
     GLOBAL_WEBSOCKET_ROUTER,
 };
 
@@ -1131,14 +1131,16 @@ pub async fn websocket_upgrade_handler(
                 )
             });
             // Pass AppState to WebSocket handler for CORS validation and connection tracking
-            return handle_websocket_upgrade_with_handler(
+            return handle_websocket_upgrade(
                 req,
                 stream,
-                handler,
-                route.handler_id,
-                path_params,
+                WsTarget::Route {
+                    handler,
+                    handler_id: route.handler_id,
+                    path_params,
+                    injector,
+                },
                 state.get_ref().clone(),
-                injector,
             )
             .await;
         }
@@ -1182,6 +1184,27 @@ impl
 async fn websocket_not_found_handler(
     req: HttpRequest,
     stream: web::Payload,
+    state: web::Data<Arc<AppState>>,
 ) -> actix_web::Result<HttpResponse> {
+    // No WebSocket route matched. Try a mounted ASGI app, as the HTTP path does.
+    let path = req.path();
+    let normalized_path = if path.len() > 1 && path.ends_with('/') {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+
+    if let Some(mount) = find_asgi_mount(state.get_ref(), normalized_path) {
+        let app = Python::attach(|py| mount.app.clone_ref(py));
+        let mount_prefix = mount.prefix.clone();
+        return handle_websocket_upgrade(
+            req,
+            stream,
+            WsTarget::AsgiMount { app, mount_prefix },
+            state.get_ref().clone(),
+        )
+        .await;
+    }
+
     actix_web_actors::ws::start(WebSocketNotFoundActor, &req, stream)
 }

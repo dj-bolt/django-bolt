@@ -196,6 +196,10 @@ class WebSocketTestClient:
         if ws_routes:
             _core.register_test_websocket_routes(self._app_id, ws_routes)
 
+        # Register ASGI mounts so an unmatched path can fall back to one
+        if self.api._asgi_mounts:
+            _core.register_test_asgi_mounts(self._app_id, list(self.api._asgi_mounts))
+
         # Register middleware metadata for guards/auth
         if self.api._handler_middleware:
             middleware_data = [(handler_id, meta) for handler_id, meta in self.api._handler_middleware.items()]
@@ -210,13 +214,13 @@ class WebSocketTestClient:
                 _core.destroy_test_app(self._app_id)
             self._app_id = None
 
-    def _find_handler_via_rust(self) -> tuple[bool, int, Callable, dict[str, Any], dict[str, Any]]:
+    def _find_handler_via_rust(self) -> tuple[bool, bool, int, Callable, dict[str, Any], dict[str, Any]]:
         """Find WebSocket handler and build scope via Rust.
 
         Routes through Rust for path matching, auth, and guard evaluation.
 
         Returns:
-            Tuple of (found, handler_id, handler, path_params, scope)
+            Tuple of (found, is_asgi_mount, handler_id, handler, path_params, scope)
 
         Raises:
             ValueError: If no handler found for path
@@ -228,7 +232,7 @@ class WebSocketTestClient:
         headers_list = list(self.headers.items())
 
         try:
-            found, handler_id, handler, path_params, scope = _core.handle_test_websocket(
+            found, is_asgi_mount, handler_id, handler, path_params, scope = _core.handle_test_websocket(
                 app_id,
                 self.path,
                 headers_list,
@@ -246,13 +250,16 @@ class WebSocketTestClient:
 
         # Convert scope from Rust dict to Python dict and add extras
         scope_dict = dict(scope) if scope else {}
-        scope_dict["subprotocols"] = self.subprotocols
 
-        # Add auth context if provided (for Python-side guard evaluation fallback)
-        if self.auth_context is not None:
-            scope_dict["auth_context"] = self.auth_context
+        # A mounted app gets the ASGI scope exactly as Rust built it.
+        if not is_asgi_mount:
+            scope_dict["subprotocols"] = self.subprotocols
 
-        return found, handler_id, handler, path_params_dict, scope_dict
+            # Add auth context if provided (for Python-side guard evaluation fallback)
+            if self.auth_context is not None:
+                scope_dict["auth_context"] = self.auth_context
+
+        return found, is_asgi_mount, handler_id, handler, path_params_dict, scope_dict
 
     async def _receive(self) -> dict[str, Any]:
         """ASGI receive callable - gets messages from client queue."""
@@ -280,7 +287,24 @@ class WebSocketTestClient:
         Uses the same production code path as Rust for parameter injection.
         """
         # Use Rust for path matching, auth, and guard evaluation
-        _found, handler_id, handler, path_params, scope = self._find_handler_via_rust()
+        (
+            _found,
+            is_asgi_mount,
+            handler_id,
+            handler,
+            path_params,
+            scope,
+        ) = self._find_handler_via_rust()
+
+        if is_asgi_mount:
+            # A mounted app takes the raw triple. Rust sends websocket.connect
+            # on the server. This transport must do the same.
+            await self._client_to_server.put({"type": "websocket.connect"})
+            args = [scope, self._receive, self._send]
+            kwargs = {}
+            self._handler_task = asyncio.create_task(self._run_handler(handler, args, kwargs))
+            await asyncio.sleep(0)
+            return self
 
         # Create WebSocket instance
         ws = WebSocket(scope, self._receive, self._send)
@@ -311,28 +335,29 @@ class WebSocketTestClient:
             kwargs = {}
 
         # Start handler in background task
-        async def run_handler():
-            try:
-                await handler(*args, **kwargs)
-            except Exception as e:
-                self._handler_exception = e
-                # Send disconnect on error
-                if not self._closed:
-                    await self._server_to_client.put(
-                        {
-                            "type": "websocket.close",
-                            "code": CloseCode.INTERNAL_ERROR,
-                        }
-                    )
-                    self._closed = True
-                    self._close_code = CloseCode.INTERNAL_ERROR
-
-        self._handler_task = asyncio.create_task(run_handler())
+        self._handler_task = asyncio.create_task(self._run_handler(handler, args, kwargs))
 
         # Give handler a chance to start
         await asyncio.sleep(0)
 
         return self
+
+    async def _run_handler(self, handler: Callable, args: list, kwargs: dict) -> None:
+        """Run the handler, recording any error as an internal-error close."""
+        try:
+            await handler(*args, **kwargs)
+        except Exception as e:
+            self._handler_exception = e
+            # Send disconnect on error
+            if not self._closed:
+                await self._server_to_client.put(
+                    {
+                        "type": "websocket.close",
+                        "code": CloseCode.INTERNAL_ERROR,
+                    }
+                )
+                self._closed = True
+                self._close_code = CloseCode.INTERNAL_ERROR
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Exit async context - close connection and cleanup."""

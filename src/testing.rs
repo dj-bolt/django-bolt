@@ -36,7 +36,10 @@ use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
-use bolt_core::state::{find_asgi_mount, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS};
+use bolt_core::state::{
+    find_asgi_mount, find_mount_in_slice, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS,
+};
+use bolt_websocket::handler::build_asgi_scope_from_parts;
 use bolt_websocket::WebSocketRouter;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -1297,6 +1300,10 @@ async fn handle_test_request_internal(
 }
 
 /// Handle WebSocket test request - validates and routes WebSocket connections
+///
+/// Returns `(found, is_asgi_mount, handler_id, handler, path_params, scope)`.
+/// When `is_asgi_mount` is true, `handler` is a raw ASGI application and the
+/// caller must drive it with the scope, receive, and send triple.
 #[pyfunction]
 pub fn handle_test_websocket(
     py: Python<'_>,
@@ -1304,7 +1311,7 @@ pub fn handle_test_websocket(
     path: String,
     headers: Vec<(String, String)>,
     query_string: Option<String>,
-) -> PyResult<(bool, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
+) -> PyResult<(bool, bool, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
     use bolt_core::middleware::auth::authenticate;
     use bolt_core::permissions::{evaluate_guards, GuardResult};
 
@@ -1355,7 +1362,33 @@ pub fn handle_test_websocket(
     // Find WebSocket route
     let (route, path_params) = match app.websocket_router.find(normalized_path) {
         Some((route, params)) => (route, params),
-        None => return Ok((false, 0, py.None(), py.None(), py.None())),
+        // No route matched: fall back to a mounted ASGI app, as the server does.
+        None => {
+            return match find_mount_in_slice(&app.asgi_mounts, normalized_path) {
+                Some(mount) => {
+                    let scope = build_asgi_scope_from_parts(
+                        py,
+                        &mount.prefix,
+                        normalized_path,
+                        query_string.as_deref().unwrap_or_default().as_bytes(),
+                        header_map
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_str())),
+                        false,
+                        Some(("127.0.0.1".to_string(), 0)),
+                    )?;
+                    Ok((
+                        true,
+                        true,
+                        0,
+                        mount.app.clone_ref(py),
+                        pyo3::types::PyDict::new(py).into(),
+                        scope,
+                    ))
+                }
+                None => Ok((false, false, 0, py.None(), py.None(), py.None())),
+            };
+        }
     };
 
     let handler_id = route.handler_id;
@@ -1563,6 +1596,7 @@ pub fn handle_test_websocket(
 
     Ok((
         true,
+        false,
         handler_id,
         handler,
         path_params_dict.into(),

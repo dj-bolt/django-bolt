@@ -4,7 +4,7 @@ icon: lucide/plug
 
 # ASGI Mounts
 
-This guide explains how to mount HTTP ASGI applications inside Django-Bolt.
+This guide explains how to mount ASGI applications inside Django-Bolt.
 
 Use this when you want to serve existing Django URLconf apps (for example admin, allauth, or legacy ASGI apps) under a path prefix, while keeping Bolt routes fast.
 
@@ -12,10 +12,51 @@ Use this when you want to serve existing Django URLconf apps (for example admin,
 
 Django-Bolt provides two mount APIs:
 
-- `api.mount_asgi(path, app)`: Mount any HTTP ASGI callable.
+- `api.mount_asgi(path, app)`: Mount any HTTP or WebSocket ASGI callable.
 - `api.mount_django(path, app=None, *, clear_root_path=False)`: Mount Django's ASGI app (or a provided ASGI app).
 
-These mounts are HTTP-only (no WebSocket/lifespan support in this mount bridge).
+These mounts do not support the lifespan protocol. Start and stop the app yourself.
+
+## WebSocket mounts
+
+A mounted app also serves WebSocket connections. Bolt matches the WebSocket routes first. If no route matches the path, Bolt gives the connection to the mounted app.
+
+The scope follows the ASGI specification. `path` keeps the mount prefix, `root_path` reports the prefix, and `headers` is a list of byte pairs. This differs from an HTTP mount, which removes the prefix from `path`. A WebSocket router strips `root_path` itself, so a path with the prefix already removed makes the router strip it twice.
+
+```python
+async def echo_app(scope, receive, send):
+    assert scope["type"] == "websocket"
+
+    await receive()  # websocket.connect
+    await send({"type": "websocket.accept"})
+
+    while True:
+        message = await receive()
+        if message["type"] == "websocket.disconnect":
+            return
+        await send({"type": "websocket.send", "text": message["text"]})
+
+
+api.mount_asgi("/ws", echo_app)
+```
+
+Bolt completes the HTTP upgrade before it runs the app. Therefore `websocket.accept` cannot refuse the handshake. A `websocket.close` before the accept sends a close frame instead of an HTTP error.
+
+Auth and guards do not run for a mounted app. Read the scope and do these checks in the app.
+
+A mount does not route. The mount prefix must be static, so Bolt cannot read URL captures for the app. Give the mount a router to get them:
+
+```python
+from channels.routing import URLRouter
+from django.urls import path
+
+api.mount_asgi(
+    "/ws",
+    URLRouter([path("room/<str:room_name>", RoomConsumer.as_asgi())]),
+)
+```
+
+The router sets `scope["url_route"]["kwargs"]`. Use `@api.websocket("/ws/room/{room_name}")` instead when you want Bolt to read the captures, and to run auth and guards in Rust.
 
 ## `mount_asgi()`
 
@@ -126,6 +167,14 @@ Bolt sends `http.disconnect` to `receive()` when the client goes away. This work
 ## Testing
 
 `TestClient` and `AsyncTestClient` use the same mount conflict validation and mount dispatch behavior as production startup.
+
+`WebSocketTestClient` also dispatches to a mounted app. Rust builds the scope, as it does on the server.
+
+```python
+async with WebSocketTestClient(api, "/ws/room") as ws:
+    await ws.send_text("hello")
+    assert await ws.receive_text() == "hello"
+```
 
 ## Performance note
 
