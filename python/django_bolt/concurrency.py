@@ -15,6 +15,7 @@ import contextvars
 import logging
 import os
 import threading
+from asyncio.events import _get_running_loop
 from collections.abc import Callable, Coroutine
 from functools import partial
 
@@ -285,24 +286,22 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     """Blocking counterpart of :func:`run_in_orm_executor` for callers that cannot await.
 
     Exists for the synchronous user-loading path: ``request.user`` is a
-    ``SimpleLazyObject`` forced from code that cannot await. Same contract as
-    the async variant — the query runs on the bounded ORM pool with the
-    caller's contextvars visible, so a request-scoped database router applies
-    to user loading exactly as it does to QuerySet evaluation.
+    ``SimpleLazyObject`` forced from code that cannot await. The query runs
+    with the caller's contextvars visible, so a request-scoped database
+    router applies to user loading as it does to QuerySet evaluation.
 
-    A caller already on an ORM pool worker (a lazy ``request.user`` forced
-    while a QuerySet evaluates) runs inline: blocking on the pool would wait
-    on a slot this thread is holding. The inline call still runs in a copied
-    context so ContextVar writes stay scoped the same way as on the
-    executor path.
+    A thread with no running event loop runs ``fn`` inline. This keeps a
+    request lane on its own connection and thread-local state. It also keeps
+    an ORM pool worker from a wait on the slot that it holds. A thread with a
+    running loop cannot run the ORM inline, so ``fn`` runs on the ORM pool.
+    That loop then waits for the query, and the query does not see the
+    thread-local state of a request lane. Code that can await uses
+    ``await request.auser()`` instead.
 
-    A caller on an event loop blocks that loop until the query returns, and
-    the query does not see the thread-local state of a request lane. Code
-    that can await uses ``await request.auser()`` instead.
+    Both branches run ``fn`` in a copied context, so ContextVar writes stay
+    scoped the same way.
     """
-    # A lane thread owns its request, in lane mode and when it runs the sync
-    # work of an async request. The ORM pool would use a different connection.
-    if in_orm_executor_thread() or _on_lane_thread():
+    if _get_running_loop() is None:
         return contextvars.copy_context().run(fn, *args)
     return _submit_blocking(_get_orm_executor(), fn, *args)
 

@@ -13,22 +13,21 @@ single dict lookup plus a call. Resolution must be per-route, not per scheme
 name: two JWTAuthentication subclasses share scheme_name "jwt" but can carry
 different get_user overrides.
 
-Each backend resolves to a pair of loaders. The sync loader runs when code
-reads request.user. The thread that first reads it forces the lazy user, and
-registration does not know that thread. The loader checks for a running loop
-when it runs. A thread with a running loop cannot run the ORM inline, so the
-query goes to the ORM pool and blocks that loop. A request lane runs the
-query inline, which keeps its thread affinity. The async loader runs when
-code awaits request.auser(). It awaits an async get_user as a coroutine of
-the request, and it sends a sync query to the lane of the request or to the
-ORM pool. A backend with an async get_user only has no sync loader: sync
-access to request.user raises.
+Each backend resolves to a pair of loaders:
+
+1. request.user is sync. It runs the query on the thread that reads it
+   (run_orm_blocking). A thread with a running event loop sends the query to
+   the ORM pool, and the loop waits.
+2. await request.auser() is async. It awaits an async get_user as a coroutine.
+   It sends a sync query through run_in_orm_executor, the hand-off of each
+   framework query. A request with a lane keeps the query on that lane.
+3. A backend with only an async get_user serves request.auser() only. Sync
+   access to request.user raises and names the fix.
 """
 
 from __future__ import annotations
 
 import inspect
-from asyncio.events import _get_running_loop
 from collections.abc import Callable, Coroutine
 from functools import partial
 from typing import Any
@@ -118,9 +117,7 @@ def resolve_user_loader(backend: Any) -> UserLoaders | None:
     4. None — backend has no user resolution (e.g. plain APIKeyAuthentication)
 
     Returns the sync loader of ``request.user`` and the async loader of
-    ``await request.auser()``. The sync loader runs when code forces the lazy
-    user. It decides on that thread whether a running event loop prevents an
-    inline query.
+    ``await request.auser()``.
     """
     cls = type(backend)
     custom_sync = _has_custom_get_user_sync(cls)
@@ -131,9 +128,7 @@ def resolve_user_loader(backend: Any) -> UserLoaders | None:
         get_user_sync = backend.get_user_sync
 
         def load_via_sync(user_id: str, auth_context: dict | None) -> Any:
-            if _get_running_loop() is not None:
-                return run_orm_blocking(get_user_sync, user_id)
-            return get_user_sync(user_id)
+            return run_orm_blocking(get_user_sync, user_id)
 
         async def aload_via_sync(user_id: str, auth_context: dict | None) -> Any:
             return await run_in_orm_executor(get_user_sync, user_id)
@@ -146,9 +141,7 @@ def resolve_user_loader(backend: Any) -> UserLoaders | None:
         if not inspect.iscoroutinefunction(get_user):
 
             def load_via_plain(user_id: str, auth_context: dict | None) -> Any:
-                if _get_running_loop() is not None:
-                    return run_orm_blocking(get_user, user_id, auth_context or {})
-                return get_user(user_id, auth_context or {})
+                return run_orm_blocking(get_user, user_id, auth_context or {})
 
             async def aload_via_plain(user_id: str, auth_context: dict | None) -> Any:
                 return await run_in_orm_executor(get_user, user_id, auth_context or {})
@@ -176,11 +169,7 @@ def default_django_user_loader(user_id: str, auth_context: dict | None) -> Any:
     Returns None for a stale user_id (user deleted after the session/token
     was issued), mirroring the framework get_user/get_user_sync defaults.
     """
-    User = get_user_model()
-
-    if _get_running_loop() is not None:
-        return run_orm_blocking(load_user_by_pk_sync, User, user_id)
-    return load_user_by_pk_sync(User, user_id)
+    return run_orm_blocking(load_user_by_pk_sync, get_user_model(), user_id)
 
 
 async def default_django_user_aloader(user_id: str, auth_context: dict | None) -> Any:
@@ -244,7 +233,8 @@ def load_user_sync(
     Synchronously load user from auth context.
 
     This is the sync version used by SimpleLazyObject for lazy loading.
-    With a running loop, queries use the request lane or the ORM pool.
+    The query runs on the calling thread. With a running loop, it runs on
+    the ORM pool.
 
     Args:
         user_id: User identifier from auth context

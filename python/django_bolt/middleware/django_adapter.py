@@ -16,14 +16,12 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import functools
 import io
 from collections.abc import Callable
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from .._core import RequestLane
-from ..auth.user_loader import aload_bolt_user
 from ..concurrency import drive_on_lane, in_lane_mode
 from ..middleware_response import (
     _BODY_BYTES,
@@ -1032,9 +1030,10 @@ def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request)
             if auser is not None:
                 bolt_request.state["auser"] = auser
         else:
-            # Keep the Bolt-auth user and make auser consistent with it,
-            # instead of Django's session-based (anonymous) auser.
-            bolt_request.state["auser"] = functools.partial(aload_bolt_user, bolt_request.user)
+            # Keep the Bolt-auth user. Without a state entry, request.auser
+            # falls back to the async loader of that user, not to Django's
+            # session-based (anonymous) auser.
+            bolt_request.state.pop("auser", None)
     elif auser is not None:
         bolt_request.state["auser"] = auser
 

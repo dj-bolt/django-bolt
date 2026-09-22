@@ -129,7 +129,7 @@ def test_cookie_csrf_over_real_server(make_server_project):
 
 
 def test_custom_get_user_over_real_server(make_server_project):
-    """request.user loads via the subclass's get_user in a real server.
+    """``await request.auser()`` loads via the subclass's get_user in a real server.
 
     The token's ``sub`` is a username, which the default pk-based query can
     never resolve — a 200 with the right username proves the backend
