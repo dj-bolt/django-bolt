@@ -6,7 +6,7 @@ icon: lucide/radio
 
 Django Bolt supports optional Django signal emission for compatibility with Django ecosystem features that depend on `request_started` and `request_finished` signals.
 
-For more information on Django signals, see the [Django Signals documentation](https://docs.djangoproject.com/en/5.1/topics/signals/).
+For more information on Django signals, see the [Django Signals documentation](https://docs.djangoproject.com/en/stable/topics/signals/).
 
 ## Why Signals Are Optional
 

@@ -11,7 +11,7 @@
   <p>
     <a href="https://pypi.org/project/django-bolt/"><img src="https://img.shields.io/pypi/v/django-bolt.svg?color=blue" alt="PyPI"/></a>
     <a href="https://pypi.org/project/django-bolt/"><img src="https://img.shields.io/pypi/pyversions/django-bolt.svg" alt="Python versions"/></a>
-    <a href="https://pypi.org/project/django-bolt/"><img src="https://img.shields.io/badge/Django-4.2%20%7C%205.x%20%7C%206.0-0C4B33?logo=django&logoColor=white" alt="Django versions"/></a>
+    <a href="https://pypi.org/project/django-bolt/"><img src="https://img.shields.io/badge/Django-5.2%20%7C%206.0%20%7C%206.1-0C4B33?logo=django&logoColor=white" alt="Django versions"/></a>
     <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"/></a>
     <br/>
     <a href="https://pepy.tech/projects/django-bolt"><img src="https://static.pepy.tech/personalized-badge/django-bolt?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="Downloads"/></a>

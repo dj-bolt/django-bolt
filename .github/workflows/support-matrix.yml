@@ -1,0 +1,120 @@
+name: Support matrix
+
+# Watches the Python/Django support matrix declared in pyproject.toml against
+# upstream release schedules and files an issue when it drifts -- a Django
+# series going EOL, or a new one shipping. Deliberately NOT part of CI: the
+# check talks to endoflife.date, and a live external API has no business
+# failing an unrelated pull request.
+
+on:
+  schedule:
+    # Mondays, 06:00 UTC. Django's EOL dates are published years ahead, so
+    # weekly is responsive enough to catch a transition within days.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# One run at a time: the "find an open issue, then create one" sequence is not
+# atomic, so two overlapping runs could file duplicate issues or close one using
+# state from before the other's edit. Queue rather than cancel, so a manual
+# dispatch never discards the scheduled run's result.
+concurrency:
+  group: support-matrix
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check declared versions against upstream
+    runs-on: ubuntu-latest
+    # The check retries transient API failures with backoff; cap the job so a
+    # pathological stall cannot hold a runner.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # The checker is stdlib-only, so any interpreter this project supports
+          # will do: read the floor from `requires-python` rather than naming a
+          # version here that could drift out of the supported set.
+          python-version-file: pyproject.toml
+
+      - name: Check support matrix
+        id: check
+        # The script exits 1 on drift, which is a finding rather than a
+        # failure: record it and let the reporting steps act on it.
+        run: |
+          set +e
+          python scripts/check_support_matrix.py --format md > report.md
+          echo "drifted=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          cat report.md
+
+      - name: Ensure tracking label exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # --force makes this idempotent: creates the label, or updates it in place.
+        run: gh label create support-matrix --force --color FBCA04 --description "Declared support matrix vs upstream release schedules"
+
+      - name: Find existing drift issue
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          number=$(gh issue list --state open --label support-matrix --limit 1 --json number --jq '.[0].number // empty')
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the drift issue
+        if: steps.check.outputs.drifted == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXISTING: ${{ steps.existing.outputs.number }}
+        run: |
+          {
+            echo "Detected by the \`support-matrix\` workflow on $(date -u +%Y-%m-%d) against <https://endoflife.date>."
+            echo
+            cat report.md
+            echo
+            echo "Reproduce locally with \`python scripts/check_support_matrix.py\`."
+            echo "This issue is rewritten on each run and closed automatically once the matrix is current again."
+          } > issue.md
+
+          if [ -n "$EXISTING" ]; then
+            # Rewrite the body rather than commenting, so the issue always
+            # reflects the current state instead of accruing stale reports.
+            gh issue edit "$EXISTING" --body-file issue.md
+            echo "Updated issue #$EXISTING"
+          else
+            gh issue create \
+              --title "Support matrix has drifted from upstream release schedules" \
+              --label support-matrix \
+              --body-file issue.md
+          fi
+
+      - name: Close a stale drift issue
+        if: steps.check.outputs.drifted == '0' && steps.existing.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXISTING: ${{ steps.existing.outputs.number }}
+        run: |
+          gh issue close "$EXISTING" \
+            --comment "The declared support matrix matches upstream release schedules again; closing automatically."
+
+      - name: Fail if the check errored
+        # Exit codes other than 0 (current) and 1 (drifted) mean the check
+        # itself broke -- an unreachable API or a changed response shape.
+        # Surface that instead of reporting a green matrix.
+        if: steps.check.outputs.drifted != '0' && steps.check.outputs.drifted != '1'
+        env:
+          STATUS: ${{ steps.check.outputs.drifted }}
+        run: |
+          echo "::error::check_support_matrix.py exited with $STATUS"
+          exit 1
