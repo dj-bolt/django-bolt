@@ -10,6 +10,8 @@ c := "100"
 n := "100000"
 p := "8"
 workers := "1"
+# Host port of the throwaway PostgreSQL server that `just test-pg` starts
+pg_port := "55432"
 
 # List available recipes
 default:
@@ -111,6 +113,24 @@ run-dev:
 # Run Python tests (verbose)
 test-py:
     uv run --with pytest --with pytest-xdist pytest python/tests -s -vv -n auto
+
+# Run the tests that need PostgreSQL (`@pytest.mark.postgres`) against a
+# throwaway Docker server. These skip in `test-py` unless
+# DJANGO_BOLT_TEST_POSTGRES_DSN is set.
+test-pg pg_port=pg_port:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    name=django-bolt-test-pg
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker run -d --name "$name" -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:{{pg_port}}:5432 postgres:18-alpine >/dev/null
+    trap 'docker rm -f "$name" >/dev/null' EXIT
+    for _ in $(seq 1 60); do
+        docker exec "$name" pg_isready -U postgres >/dev/null 2>&1 && break
+        sleep 0.5
+    done
+    docker exec "$name" pg_isready -U postgres
+    DJANGO_BOLT_TEST_POSTGRES_DSN="postgresql://postgres:postgres@127.0.0.1:{{pg_port}}/postgres" \
+        uv run --with pytest pytest python/tests -m postgres -s -vv
 
 # Run ruff linter (checks all code)
 lint:

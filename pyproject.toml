@@ -91,6 +91,8 @@ dev = [
     "cryptography>=42", # RSA/EC keypair generation for asymmetric JWT tests
     "bolt-mcp", # workspace member: MCP server support (editable)
     "django-debug-toolbar>=7.1.1",
+    # Pure-Python wheel (no cp314t build of psycopg-binary exists); needs libpq at run time.
+    "psycopg>=3.2", # PostgreSQL recovery tests (`just test-pg`)
 ]
 docs = [
     "zensical",
