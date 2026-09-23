@@ -22,7 +22,8 @@ Type-Safe Requests:
 
     @api.get("/profile", guards=[IsAuthenticated()])
     async def profile(request: Request[User, JWTClaims, dict]) -> dict:
-        return {"email": request.user.email}  # IDE knows User has email
+        user = await request.auser()
+        return {"email": user.email}
 
 Middleware:
     from django_bolt import BoltAPI

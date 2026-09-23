@@ -498,6 +498,10 @@ Python middleware execution order is explicit and strict:
 
 For responses, the order is reversed.
 
+`BoltAPI(django_middleware=...)` puts the Django middleware before the entries of `middleware=[...]`. A `DjangoMiddleware` or `DjangoMiddlewareStack` in `middleware=[...]` runs at its position in the list.
+
+A Python middleware before the Django middleware runs before any Django hook, as in Django's `MIDDLEWARE` order. It does not run on the lane of the request, and it does not see the thread-local state of the Django middleware, for example the tenant of django-tenants. If it loads `request.user`, it loads the user without that state, and the handler then gets the same user. Put a middleware that reads the user after the Django middleware.
+
 Rust-handled middleware configs (for example `@cors` and `@rate_limit`) are still compiled from metadata and executed in Rust.
 
 ## Performance

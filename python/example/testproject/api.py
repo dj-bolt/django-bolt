@@ -309,15 +309,17 @@ class CustomRequest(Request, Protocol):
 )
 async def get_me(request: CustomRequest):
     """
-    Returns the authenticated user's information using request.user.
+    Returns the authenticated user's information using request.auser().
 
     Requires a valid JWT token in the Authorization header:
     Authorization: Bearer <jwt_token>
 
-    The request.user property is automatically populated by the authentication
-    system and contains the Django User instance for the authenticated user.
+    The authentication system loads the Django User instance for the
+    authenticated user. An async handler loads it with ``await request.auser()``.
+    A sync read of ``request.user`` raises here when the debug toolbar
+    middleware is on, because the query must run on the request lane.
     """
-    user = request.user
+    user = await request.auser()
     if not user:
         return {"error": "User not authenticated"}
 

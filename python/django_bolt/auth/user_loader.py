@@ -249,9 +249,9 @@ def load_user_sync(
     """
     Synchronously load user from auth context.
 
-    This is the sync version used by SimpleLazyObject for lazy loading.
-    The query runs on the calling thread. With a running loop, it runs on
-    the ORM pool.
+    This is the sync form of :func:`load_user`, with the rules of
+    ``request.user``: the query runs on the calling thread. With a running
+    loop, it runs on the ORM pool.
 
     Args:
         user_id: User identifier from auth context

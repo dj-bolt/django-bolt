@@ -274,25 +274,50 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
         return _orm_executor
 
 
+# True in the context of each call that the ORM pool runs. ``async_to_sync``
+# on a worker starts its loop on a new thread, and it carries this value there.
+_holds_orm_slot: contextvars.ContextVar[bool] = contextvars.ContextVar("django_bolt_holds_orm_slot", default=False)
+
+
+def _call_in_orm_slot[T](fn: Callable[..., T], *args: object) -> T:
+    """Call ``fn`` on an ORM pool worker and mark the context as the holder of the slot."""
+    _holds_orm_slot.set(True)
+    return _call_guarded(fn, *args)
+
+
 def _submit_blocking(
-    executor: concurrent.futures.ThreadPoolExecutor, fn: Callable[..., object], *args: object
+    executor: concurrent.futures.ThreadPoolExecutor,
+    call: Callable[..., object],
+    fn: Callable[..., object],
+    *args: object,
 ) -> object:
-    """Submit ``fn`` to ``executor`` with the caller's context and block on it."""
+    """Submit ``call(fn, *args)`` to ``executor`` with the caller's context and block on it."""
     ctx = contextvars.copy_context()
-    return executor.submit(ctx.run, _call_guarded, fn, *args).result()
+    return executor.submit(ctx.run, call, fn, *args).result()
 
 
-def _orm_executor_for_caller() -> concurrent.futures.ThreadPoolExecutor:
-    """The pool for an ORM hand-off from the calling thread.
+def _orm_handoff() -> tuple[concurrent.futures.ThreadPoolExecutor, Callable[..., object]]:
+    """The pool and the call wrapper for an ORM hand-off from the calling context.
 
-    An ORM pool worker can run an event loop, for example in ``asyncio.run``.
-    A hand-off from that loop cannot use the ORM pool: it waits on the slot
-    that the worker holds, and a one-thread pool never frees it. That rare
-    case uses the default pool and one connection outside the ORM budget.
+    An ORM pool worker can run an event loop, on its own thread in
+    ``asyncio.run``, or on a new thread in ``async_to_sync``. A hand-off from
+    that loop cannot use the ORM pool: it waits on the slot that the worker
+    holds, and a one-thread pool never frees it. That rare case uses the
+    default pool and one connection outside the ORM budget.
     """
-    if in_orm_executor_thread():
-        return _get_default_executor()
-    return _get_orm_executor()
+    if in_orm_executor_thread() or _holds_orm_slot.get():
+        return _get_default_executor(), _call_guarded
+    return _get_orm_executor(), _call_in_orm_slot
+
+
+# Bound once: ``run_orm_blocking`` reads it on each forced ``request.user``.
+_thread_sensitive_context = SyncToAsync.thread_sensitive_context
+
+_OFF_LANE_ORM_CALL = (
+    "A sync ORM call, such as a read of request.user, ran away from the thread of a request with "
+    "Django middleware. The query must run on the lane of the request, which keeps its thread-local "
+    "state. In async code, use `await request.auser()`. Or read request.user in a sync handler."
+)
 
 
 def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
@@ -309,23 +334,22 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     and the loop waits for it.
 
     A request with Django middleware keeps its thread-local state on its
-    lane, for example a tenant schema. A query on the pool does not see that
-    state, and a loop that waits for the lane can deadlock. Thus a caller on
-    the loop of such a request gets ``RuntimeError``. Code that can await
-    uses ``await request.auser()`` instead.
+    lane, for example a tenant schema. A query on another thread does not
+    see that state, and a loop that waits for the lane can deadlock. Thus
+    in such a request, a caller that is not on the lane gets ``RuntimeError``.
+    That includes the event loop and a thread from ``asyncio.to_thread``.
+    Code that can await uses ``await request.auser()`` instead.
 
     Both branches run ``fn`` in a copied context, so ContextVar writes stay
     scoped the same way.
     """
     if _get_running_loop() is None:
-        return contextvars.copy_context().run(fn, *args)
-    if SyncToAsync.thread_sensitive_context.get(None) is not None:
-        raise RuntimeError(
-            "request.user was read synchronously on the event loop of a request with Django middleware. "
-            "The user query must run on the thread of the request, and the event loop cannot wait for it. "
-            "Use `await request.auser()`."
-        )
-    return _submit_blocking(_orm_executor_for_caller(), fn, *args)
+        if _thread_sensitive_context.get(None) is None or getattr(_lane_state, "is_lane", False):
+            return contextvars.copy_context().run(fn, *args)
+        raise RuntimeError(_OFF_LANE_ORM_CALL)
+    if _thread_sensitive_context.get(None) is not None:
+        raise RuntimeError(_OFF_LANE_ORM_CALL)
+    return _submit_blocking(*_orm_handoff(), fn, *args)
 
 
 async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
@@ -346,7 +370,8 @@ async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
 
     ctx = contextvars.copy_context()
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_orm_executor_for_caller(), ctx.run, _call_guarded, fn, *args)
+    executor, call = _orm_handoff()
+    return await loop.run_in_executor(executor, ctx.run, call, fn, *args)
 
 
 async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:

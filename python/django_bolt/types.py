@@ -372,6 +372,23 @@ class Request(Protocol):
         """
         ...
 
+    async def auser(self) -> UserType | None:
+        """
+        Load the user of the request without blocking the event loop (Django-style).
+
+        Use it in async code. ``request.user`` then returns the same user with no
+        second query. With no authentication, it returns ``AnonymousUser``.
+
+        Example:
+            ```python
+            @api.get("/me")
+            async def me(request: Request):
+                user = await request.auser()
+                return {"username": user.username}
+            ```
+        """
+        ...
+
     @property
     def session(self) -> "SessionBase":  # noqa: UP037 - quotes needed for forward ref
         """

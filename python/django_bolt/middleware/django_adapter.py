@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import io
+from asyncio.events import _get_running_loop
 from collections.abc import Callable
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
@@ -276,7 +277,21 @@ class DjangoMiddleware:
         # detects it as async and enables async_mode
         markcoroutinefunction(get_response_bridge)
 
-        # Create middleware instance with the async bridge
+        if not getattr(self.middleware_class, "async_capable", False):
+            # Django gives a middleware that is not async-capable a sync get_response.
+            # Such a middleware runs on the lane, with no event loop, and must get a
+            # response there. A factory with no flags can still return an async
+            # function, which calls this bridge on the loop and awaits the coroutine.
+            get_response_async = get_response_bridge
+
+            def get_response_bridge(django_request: HttpRequest) -> HttpResponse:
+                if _get_running_loop() is None:
+                    return async_to_sync(get_response_async)(django_request)
+                return get_response_async(django_request)
+
+            markcoroutinefunction(get_response_bridge)
+
+        # Create middleware instance with the bridge
         self._middleware_instance = self.middleware_class(get_response_bridge, **self.init_kwargs)
 
         # Check if the middleware instance is async-capable

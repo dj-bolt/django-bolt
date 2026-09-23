@@ -90,6 +90,8 @@ Pages inside `api.mount_django("/django")` do not need this. Their toolbar calls
 
 **Why a list, not `True`:** `django_middleware=True` runs all of `settings.MIDDLEWARE` on Bolt routes. That includes `CsrfViewMiddleware`, which rejects API `POST` requests with `403`. The list runs only the toolbar. See [Middleware](middleware.md#django-middleware-integration) for the per-request cost.
 
+**Read the user with `await request.auser()` in async handlers.** The toolbar is Django middleware, so each request gets a lane. In an async handler, a sync read of `request.user` then raises `RuntimeError`. This also applies to `bool(request.user)` and to a template that uses `{{ user }}`. See [Accessing Django request attributes](middleware.md#accessing-django-request-attributes).
+
 ## API documentation
 
 The same middleware runs on the API documentation routes.

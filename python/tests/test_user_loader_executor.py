@@ -24,6 +24,7 @@ import threading
 import time
 
 import pytest
+from asgiref.sync import async_to_sync
 from django.contrib.auth import get_user_model
 
 from django_bolt import concurrency
@@ -310,6 +311,40 @@ def test_user_forced_under_a_loop_on_an_orm_worker_leaves_the_callers_pool(fresh
         return asyncio.run(force())
 
     loaded = concurrency._get_orm_executor().submit(drive_nested_loop).result(timeout=10)
+    assert loaded is not None
+    assert loaded.pk == user.pk
+    assert seen and seen[0].startswith(DEFAULT_THREAD_PREFIX), f"query ran on {seen!r}; expected the default pool"
+
+
+@pytest.mark.parametrize("handoff", ["async", "blocking"])
+def test_async_to_sync_on_an_orm_worker_leaves_the_callers_pool(fresh_orm_executor, handoff):
+    """``async_to_sync`` on an ORM worker runs its loop on a new thread, not on the worker.
+
+    A ``get_user_sync`` that wraps an async ``get_user`` does this. The new
+    thread is not a pool thread, but the worker still holds the one ORM slot.
+    The hand-offs of that loop must use the default pool.
+    """
+    fresh_orm_executor(workers=1)
+    user = _make_user(f"a2s-{handoff}")
+    seen: list[str] = []
+
+    def recording_pk_load(model, user_id):
+        seen.append(threading.current_thread().name)
+        return load_user_by_pk_sync(model, user_id)
+
+    async def nested():
+        if handoff == "async":
+            return await concurrency.run_in_orm_executor(recording_pk_load, User, str(user.pk))
+        return concurrency.run_orm_blocking(recording_pk_load, User, str(user.pk))
+
+    def on_worker():
+        assert concurrency.in_orm_executor_thread()
+        return async_to_sync(nested)()
+
+    async def drive():
+        return await asyncio.wait_for(concurrency.run_in_orm_executor(on_worker), timeout=10)
+
+    loaded = asyncio.run(drive())
     assert loaded is not None
     assert loaded.pk == user.pk
     assert seen and seen[0].startswith(DEFAULT_THREAD_PREFIX), f"query ran on {seen!r}; expected the default pool"

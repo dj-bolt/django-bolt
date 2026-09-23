@@ -1498,11 +1498,31 @@ class BoltAPI:
                 if getattr(dep_needs, needs_key):
                     meta[needs_key] = True
 
+            # Normalize route-level middleware declared via @middleware / @cors / @rate_limit.
+            # Validation happens at registration time to fail fast and deterministically.
+            route_middleware = normalize_middleware_specs(
+                getattr(fn, "__bolt_middleware__", []),
+                context="route",
+                allow_function_middleware=True,
+            )
+            if route_middleware or hasattr(fn, "__bolt_middleware__"):
+                fn.__bolt_middleware__ = route_middleware
+
+            router_middleware = normalize_middleware_specs(_router_middleware, context="router")
+
             # Django middleware can keep request state in threading.local. A sync
             # handler must then run on the thread of its request, not inline on
-            # the event loop, so treat it as blocking work.
+            # the event loop, so treat it as blocking work. The middleware can be
+            # on the API, on a router, or on the route.
             meta["is_blocking"] = handler_analysis.is_blocking or (
-                not meta["is_async"] and self._has_django_wrapper_middleware
+                not meta["is_async"]
+                and (
+                    self._has_django_wrapper_middleware
+                    or any(
+                        isinstance(spec, (DjangoMiddleware, DjangoMiddlewareStack))
+                        for spec in (*router_middleware, *route_middleware)
+                    )
+                )
             )
 
             # Determine final response type with proper priority:
@@ -1657,18 +1677,6 @@ class BoltAPI:
             if body_struct_type is not None and "body_struct_type" not in meta:
                 meta["body_struct_param"] = "body"
                 meta["body_struct_type"] = body_struct_type
-
-            # Normalize route-level middleware declared via @middleware / @cors / @rate_limit.
-            # Validation happens at registration time to fail fast and deterministically.
-            route_middleware = normalize_middleware_specs(
-                getattr(fn, "__bolt_middleware__", []),
-                context="route",
-                allow_function_middleware=True,
-            )
-            if route_middleware or hasattr(fn, "__bolt_middleware__"):
-                fn.__bolt_middleware__ = route_middleware
-
-            router_middleware = normalize_middleware_specs(_router_middleware, context="router")
 
             # Preserve normalized middleware layers in handler metadata for runtime execution.
             meta["_router_middleware"] = router_middleware
