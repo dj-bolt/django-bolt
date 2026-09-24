@@ -339,155 +339,38 @@ fn parse_time(value: &str) -> Result<CoercedValue, String> {
     ))
 }
 
-/// Convert a string value to Python object based on type hint.
-/// Handles all supported types including datetime, uuid, and decimal.
-/// Returns PyResult to properly handle validation errors.
-/// `max_length` is the startup-resolved limit (`AppState.max_param_length`),
-/// passed in so the `params_to_py_dict` hot loop never re-resolves config.
-#[inline]
-pub fn coerce_to_py(
-    py: pyo3::Python<'_>,
-    value: &str,
-    type_hint: u8,
-    max_length: usize,
-) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-    // Security: Validate length for ALL types (defense in depth)
-    if value.len() > max_length {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Parameter too long: {} bytes (max {} bytes)",
-            value.len(),
-            max_length
-        )));
-    }
-
-    match type_hint {
-        TYPE_INT => Ok(value
-            .parse::<i64>()
-            .unwrap_or(0)
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-        TYPE_FLOAT => Ok(value
-            .parse::<f64>()
-            .unwrap_or(0.0)
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-        TYPE_BOOL => {
-            let is_true = matches!(value.to_lowercase().as_str(), "true" | "1" | "yes" | "on");
-            Ok(is_true
-                .into_pyobject(py)
-                .unwrap()
-                .to_owned()
-                .unbind()
-                .into_any())
-        }
-        TYPE_UUID => {
-            // Parse UUID in Rust, construct uuid.UUID from the 128-bit value —
-            // no 36-char string alloc, no hex re-parse on the Python side.
-            match Uuid::parse_str(value) {
-                Ok(uuid) => uuid_to_py(py, uuid),
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid UUID '{}': {}",
-                    value, e
-                ))),
-            }
-        }
-        TYPE_DATETIME => {
-            // Parse datetime in Rust, construct datetime.datetime directly via
-            // pyo3's chrono integration (C-API construction, no ISO round trip).
-            match parse_datetime(value) {
-                Ok(CoercedValue::DateTime(dt)) => Ok(dt.into_pyobject(py)?.into_any().unbind()),
-                Ok(CoercedValue::NaiveDateTime(ndt)) => {
-                    Ok(ndt.into_pyobject(py)?.into_any().unbind())
-                }
-                Ok(_) => {
-                    // Shouldn't happen, but fallback to string
-                    Ok(value
-                        .to_string()
-                        .into_pyobject(py)
-                        .unwrap()
-                        .into_any()
-                        .unbind())
-                }
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
-            }
-        }
-        TYPE_DECIMAL => {
-            // Validate decimal in Rust, convert to Python Decimal
-            // OPTIMIZATION: Use cached Decimal class (avoids py.import per call)
-            if is_valid_decimal_literal(value) {
-                // Pass the original validated string: Python's Decimal
-                // normalizes it, and this avoids expanding large exponents.
-                Ok(get_decimal_class(py).call1(py, (value,))?)
-            } else {
-                Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid decimal '{}'",
-                    value
-                )))
-            }
-        }
-        TYPE_DATE => {
-            // Parse date in Rust, construct datetime.date directly (chrono).
-            match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-                Ok(date) => Ok(date.into_pyobject(py)?.into_any().unbind()),
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid date '{}': {}",
-                    value, e
-                ))),
-            }
-        }
-        TYPE_TIME => {
-            // Parse time in Rust, construct datetime.time directly (chrono).
-            match parse_time(value) {
-                Ok(CoercedValue::Time(time)) => Ok(time.into_pyobject(py)?.into_any().unbind()),
-                Ok(_) => {
-                    // Shouldn't happen, but fallback to string
-                    Ok(value
-                        .to_string()
-                        .into_pyobject(py)
-                        .unwrap()
-                        .into_any()
-                        .unbind())
-                }
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
-            }
-        }
-        _ => Ok(value
-            .to_string()
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-    }
-}
-
-/// Convert a map of string params to a Python dict with type coercion.
-/// Used by both production handler and test handler.
-/// Returns PyResult to properly handle coercion errors.
+/// Build a Python dict from a map of string values.
 ///
-/// Keys declared in `param_types` (a bounded, registration-time set) are
-/// interned so repeated requests reuse one PyString per name. Arbitrary
-/// client-supplied names are NOT interned — interned strings are effectively
-/// immortal, which would be a memory-growth vector.
-pub fn params_to_py_dict<'py>(
-    py: pyo3::Python<'py>,
-    params: &ahash::AHashMap<String, String>,
-    param_types: &std::collections::HashMap<String, u8>,
-    max_param_length: usize,
-) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
-    let dict = pyo3::types::PyDict::new(py);
-    for (name, value) in params {
-        match param_types.get(name) {
-            Some(&type_hint) => {
-                let py_value = coerce_to_py(py, value, type_hint, max_param_length)?;
-                let _ = dict.set_item(pyo3::types::PyString::intern(py, name), py_value);
+/// A value in `coerced` replaces the string for its name. The request pipeline
+/// validates and coerces those values before the GIL is taken, so this step
+/// cannot fail on bad input. Used for path, query, header and cookie values.
+///
+/// Coerced names come from registration-time type hints (a bounded set), so
+/// they are interned and repeated requests reuse one PyString per name.
+/// Arbitrary client-supplied names are NOT interned — interned strings are
+/// effectively immortal, which would be a memory-growth vector.
+#[inline]
+pub fn string_map_to_py_dict<'py>(
+    py: Python<'py>,
+    values: &ahash::AHashMap<String, String>,
+    coerced: Option<&ahash::AHashMap<String, CoercedValue>>,
+) -> PyResult<pyo3::Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    match coerced {
+        Some(coerced) => {
+            for (name, value) in values {
+                match coerced.get(name) {
+                    Some(typed) => dict.set_item(
+                        pyo3::types::PyString::intern(py, name),
+                        coerced_value_to_py(py, typed),
+                    )?,
+                    None => dict.set_item(name, value)?,
+                }
             }
-            None => {
-                let py_value = coerce_to_py(py, value, TYPE_STRING, max_param_length)?;
-                let _ = dict.set_item(name, py_value);
+        }
+        None => {
+            for (name, value) in values {
+                dict.set_item(name, value)?;
             }
         }
     }

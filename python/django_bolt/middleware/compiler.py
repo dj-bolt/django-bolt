@@ -219,6 +219,34 @@ def _extract_type_hints_from_field(field: Any, target: dict[str, int], skip_stri
         target[field.name] = type_hint
 
 
+def _header_wire_name(name: str) -> str:
+    """Return the HTTP header name that the header extractors look up."""
+    return name.lower().replace("_", "-")
+
+
+def _extract_wire_type_hints(field: Any, target: dict[str, int], header: bool) -> None:
+    """Put the non-string type hints of a header or cookie field into target.
+
+    The keys are the wire names that the extractors look up. A header key is
+    lowercase with hyphens. A cookie key is the alias or the name as written.
+    For struct fields, the key comes from the msgspec encoded name.
+    """
+    unwrapped = unwrap_optional(field.annotation)
+    if is_msgspec_struct(unwrapped):
+        for struct_field in msgspec.structs.fields(unwrapped):
+            type_hint = get_type_hint_id(struct_field.type)
+            if type_hint == TYPE_STRING:
+                continue
+            encoded_name = struct_field.encode_name
+            target[_header_wire_name(encoded_name) if header else encoded_name] = type_hint
+        return
+    type_hint = get_type_hint_id(field.annotation)
+    if type_hint == TYPE_STRING:
+        return
+    wire_name = field.alias or field.name
+    target[_header_wire_name(wire_name) if header else wire_name] = type_hint
+
+
 _SEQUENCE_ORIGINS_FOR_FORM = (list, set, frozenset, tuple)
 
 
@@ -295,7 +323,7 @@ def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, A
         arg_kind = "keyword" if has_optional or field.kind is inspect.Parameter.KEYWORD_ONLY else "positional"
 
         if field.source == "header":
-            lookup_key = (field.alias or field.name).lower().replace("_", "-")
+            lookup_key = _header_wire_name(field.alias or field.name)
         else:
             lookup_key = field.alias or field.name
 
@@ -325,8 +353,8 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     These flags indicate which request components the handler actually needs,
     allowing Rust to skip parsing unused data.
 
-    Also extracts type hints for path and query parameters to enable
-    Rust-side type coercion (avoiding Python's convert_primitive overhead).
+    Also extracts type hints for path, query, header and cookie parameters.
+    Rust uses them to convert and validate the values before Python runs.
 
     Args:
         metadata: Existing middleware metadata dict (or None to create new)
@@ -360,16 +388,25 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     # Extract type hints for all parameter sources
     # This enables Rust-side type coercion, eliminating Python overhead
     # Format: {"param_name": type_hint_id, ...}
+    # Each source has its own map, so a header and a query parameter with
+    # the same name do not clash. Header and cookie maps use wire names.
     param_types: dict[str, int] = {}
+    header_types: dict[str, int] = {}
+    cookie_types: dict[str, int] = {}
     form_type_hints: dict[str, int] = {}
     form_seq_fields: set[str] = set()
     file_constraints: dict[str, dict[str, Any]] = {}
 
     fields = handler_meta.get("fields", [])
     for field in fields:
-        # Include type hints for path, query, header, cookie
-        if field.source in ("path", "query", "header", "cookie"):
+        if field.source in ("path", "query"):
             _extract_type_hints_from_field(field, param_types, skip_string=True)
+
+        elif field.source == "header":
+            _extract_wire_type_hints(field, header_types, header=True)
+
+        elif field.source == "cookie":
+            _extract_wire_type_hints(field, cookie_types, header=False)
 
         # Form fields - extract type hints for Rust-side form parsing
         elif field.source == "form":
@@ -394,6 +431,12 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
 
     if param_types:
         metadata["param_types"] = param_types
+
+    if header_types:
+        metadata["header_types"] = header_types
+
+    if cookie_types:
+        metadata["cookie_types"] = cookie_types
 
     if form_type_hints:
         metadata["form_type_hints"] = form_type_hints

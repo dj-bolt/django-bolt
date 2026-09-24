@@ -160,6 +160,27 @@ async def optional_header(
     return {"custom": custom}
 ```
 
+### Typed headers
+
+Declare a header as `int`, `float`, `bool`, `uuid.UUID`, `decimal.Decimal`,
+`datetime`, `date` or `time`. Rust converts the value before the handler runs.
+A value that does not convert gives a 422 that names the header:
+
+```python
+@api.get("/items")
+async def list_items(x_page_size: Annotated[int, Header()] = 20):
+    return {"page_size": x_page_size}
+```
+
+`X-Page-Size: 50` gives the integer `50`. `X-Page-Size: abc` gives this 422:
+
+```json
+{"detail": "Header 'x-page-size': Invalid integer 'abc': invalid digit found in string"}
+```
+
+The converted value also replaces the string in `request.headers`.
+`request.META` keeps a string, the `str()` of the converted value.
+
 ### All headers
 
 Access all headers from the request:
@@ -184,6 +205,15 @@ async def get_session(
     session_id: Annotated[str, Cookie(alias="sessionid")]
 ):
     return {"session_id": session_id}
+```
+
+Typed cookies work as typed headers do. Rust converts the value, and a value
+that does not convert gives a 422 that names the cookie:
+
+```python
+@api.get("/feed")
+async def feed(page: Annotated[int, Cookie()] = 1):
+    return {"page": page}
 ```
 
 ## Sessions
@@ -694,4 +724,6 @@ Common validation scenarios that return 422:
 | Missing required form field | `Missing required form field: username` |
 | Missing required file | `Missing required file: document` |
 | Type conversion failure | `Invalid integer value: 'abc'` |
+| Header type conversion failure | `Header 'x-count': Invalid integer 'abc': ...` |
+| Cookie type conversion failure | `Cookie 'page': Invalid integer 'abc': ...` |
 | Struct field validation | `name: Name must be at least 3 characters` |

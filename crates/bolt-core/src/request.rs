@@ -319,7 +319,13 @@ impl PyRequest {
         // Header keys are already lowercase (normalized by http crate)
         if let Some(headers_py) = &self.headers {
             for (key, value) in headers_py.bind(py).iter() {
-                if let (Ok(k), Ok(v)) = (key.extract::<String>(), value.extract::<String>()) {
+                // A typed header parameter holds its converted value here.
+                // META keeps Django's string contract, so use str() of it.
+                let text = match value.extract::<String>() {
+                    Ok(text) => Ok(text),
+                    Err(_) => value.str().map(|text| text.to_string()),
+                };
+                if let (Ok(k), Ok(v)) = (key.extract::<String>(), text) {
                     let meta_key = if k == "content-type" {
                         "CONTENT_TYPE".to_string()
                     } else if k == "content-length" {

@@ -111,8 +111,11 @@ def create_header_extractor(name: str, annotation: Any, default: Any, alias: str
     When annotation is a msgspec.Struct or Serializer, extracts all struct
     fields from the headers and constructs the struct instance.
 
-    Note: Rust pre-converts values to typed Python objects (int, float, bool,
-    str, uuid.UUID, decimal.Decimal, datetime, date, time) for both HTTP and WebSocket.
+    Note: The compiler puts the non-string header types into ``header_types``,
+    keyed by header name. Rust converts and validates those values for HTTP
+    and WebSocket, and a bad value gives a 422 (HTTP) or a rejected upgrade.
+    The extractor thus reads typed objects (int, float, bool, uuid.UUID,
+    decimal.Decimal, datetime, date, time) and does no conversion.
     """
     # Check if annotation is a Struct/Serializer type
     unwrapped = unwrap_optional(annotation)
@@ -149,8 +152,11 @@ def create_cookie_extractor(name: str, annotation: Any, default: Any, alias: str
     When annotation is a msgspec.Struct or Serializer, extracts all struct
     fields from the cookies and constructs the struct instance.
 
-    Note: Rust pre-converts values to typed Python objects (int, float, bool,
-    str, uuid.UUID, decimal.Decimal, datetime, date, time) for both HTTP and WebSocket.
+    Note: The compiler puts the non-string cookie types into ``cookie_types``,
+    keyed by cookie name. Rust converts and validates those values for HTTP
+    and WebSocket, and a bad value gives a 422 (HTTP) or a rejected upgrade.
+    The extractor thus reads typed objects (int, float, bool, uuid.UUID,
+    decimal.Decimal, datetime, date, time) and does no conversion.
     """
     # Check if annotation is a Struct/Serializer type
     unwrapped = unwrap_optional(annotation)
@@ -440,7 +446,8 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     snake_case to kebab-case for HTTP header lookup. Supports msgspec field
     aliases (field(name=...)) and rename strategies.
 
-    Note: Rust pre-converts values to typed Python objects (int, float, bool, str).
+    Note: Rust converts the typed struct fields before this runs (see
+    ``create_header_extractor``), so msgspec gets typed values.
 
     Args:
         struct_type: The msgspec.Struct or Serializer class

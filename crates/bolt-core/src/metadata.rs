@@ -532,6 +532,11 @@ pub struct RouteMetadata {
     // Type hints for path/query parameters (enables Rust-side type coercion)
     // Maps parameter name to type hint constant (see type_coercion.rs)
     pub param_types: HashMap<String, u8>,
+    // Type hints for header and cookie parameters, keyed by wire name.
+    // A header key is lowercase with hyphens. A cookie key is the cookie name.
+    // Only non-string types are present.
+    pub header_types: HashMap<String, u8>,
+    pub cookie_types: HashMap<String, u8>,
 
     // Form-related metadata for Rust-side form parsing
     pub form_type_hints: HashMap<String, u8>,
@@ -674,6 +679,20 @@ impl RouteMetadata {
             .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
             .unwrap_or_default();
 
+        // Header and cookie type hints use the same format, keyed by wire name.
+        let header_types: HashMap<String, u8> = py_meta
+            .get_item("header_types")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
+            .unwrap_or_default();
+        let cookie_types: HashMap<String, u8> = py_meta
+            .get_item("cookie_types")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
+            .unwrap_or_default();
+
         // Parse form-related metadata for Rust-side form parsing
         let needs_form_parsing = py_meta
             .get_item("needs_form_parsing")
@@ -790,6 +809,8 @@ impl RouteMetadata {
             needs_path_params,
             is_static_route,
             param_types,
+            header_types,
+            cookie_types,
             form_type_hints,
             form_seq_fields,
             file_constraints,
