@@ -151,6 +151,19 @@ def home(user: OptionalCurrentUser):
 
 An async handler can also read `request.user`. When the source of the handler reads it, Bolt loads the user with `await request.auser()` before the handler runs. The read then does not block the event loop. The rule does not depend on the database. The load also makes the read work for a backend with only an async `get_user`, and for the session user of `AuthenticationMiddleware`. A read that is not in the source of the handler, for example in a helper or a template, loads the user when it occurs. The worker thread waits for that query. The query runs on the ORM pool, or on the lane of a request with Django middleware. On the lane, it sees the thread-local state of the request, for example a tenant schema. With `DEBUG = True` or `runbolt --dev`, Bolt logs each such read that blocks the event loop for more than 50 ms, with its file and line.
 
+A handler that does not read `request.user` loads nothing. Rust auth, guards and `request.context` need no query. When the source reads `request.user` in a branch, Bolt loads the user for each request, also when the branch does not run. For a read that runs only on some requests, use `await request.auser()` in the branch. Bolt does not load the user first for `auser()`, so the query runs only when the branch runs:
+
+```python
+@api.get("/items", auth=[JWTAuthentication()])
+async def items(request, mine: bool = False):
+    if not mine:
+        return await list_public_items()
+    user = await request.auser()  # a query only when mine=true
+    return await list_items_of(user)
+```
+
+In async code, prefer `await request.auser()` or `CurrentUser`. Use `request.user` in sync handlers, templates and sync helpers.
+
 A thread with no event loop that is not the lane cannot wait for the lane, for example a thread from `asyncio.to_thread`. A sync read there raises `LaneAffinityError`, a subclass of `RuntimeError`. Its message names the route and the handler. With `DEBUG = True` or `runbolt --dev`, Bolt also logs the fix one time for each route.
 
 ### Custom user query

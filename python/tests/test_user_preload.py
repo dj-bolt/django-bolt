@@ -96,18 +96,58 @@ def test_an_async_handler_with_no_await_gets_its_user_loaded():
 
 
 def test_a_handler_that_does_not_read_the_user_loads_nothing():
+    """Bolt loads the user first only for a handler whose source reads ``request.user``.
+
+    The other handlers keep the lazy user and run no query, also when they read
+    the claims that Rust authenticated.
+    """
     api = BoltAPI()
     auth = _AsyncOnlyAuth(secret=SECRET)
 
-    @api.get("/ping", auth=[auth])
-    async def ping(request: Request):
+    @api.get("/async", auth=[auth])
+    async def with_await(request: Request):
         await asyncio.sleep(0)
         return {"ok": True}
 
+    @api.get("/async-no-await", auth=[auth])
+    async def no_await(request: Request):
+        return {"ok": True}
+
+    @api.get("/sync", auth=[auth])
+    def sync(request: Request):
+        return {"ok": True}
+
+    @api.get("/context", auth=[auth])
+    async def context(request: Request):
+        return {"user_id": request.context["user_id"]}
+
     with TestClient(api) as client:
-        assert client.get("/ping", headers=_headers()).json() == {"ok": True}
+        for path in ("/async", "/async-no-await", "/sync"):
+            assert client.get(path, headers=_headers()).json() == {"ok": True}, path
+        assert client.get("/context", headers=_headers()).json() == {"user_id": "1"}
 
     assert auth.calls == 0
+
+
+def test_a_conditional_read_with_auser_loads_only_when_it_runs():
+    """``await request.auser()`` is not a read of ``request.user``, so the route stays lazy.
+
+    A read that runs only on some requests then queries only on those requests.
+    """
+    api = BoltAPI()
+    auth = _AsyncOnlyAuth(secret=SECRET)
+
+    @api.get("/items", auth=[auth])
+    async def items(request: Request, mine: bool = False):
+        if not mine:
+            return {"owner": None}
+        return {"owner": (await request.auser()).username}
+
+    with TestClient(api) as client:
+        assert client.get("/items", headers=_headers()).json() == {"owner": None}
+        assert auth.calls == 0
+        assert client.get("/items?mine=true", headers=_headers()).json() == {"owner": "bob"}
+        assert auth.calls == 1
 
 
 @pytest.mark.django_db(transaction=True)
