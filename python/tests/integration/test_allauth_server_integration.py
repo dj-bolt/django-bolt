@@ -256,6 +256,15 @@ def test_jwt_authentication_accepts_the_access_token_of_the_allauth_jwt_strategy
         assert client.get("/token/me/current").status_code == 401
 
 
+def test_jwt_authentication_rejects_the_refresh_token_of_the_allauth_jwt_strategy(allauth_server):
+    """allauth marks a refresh token with ``token_use``, not ``typ``. It must not act as an access token."""
+    meta = _app_login(allauth_server, "alice")
+    with _client(allauth_server) as client:
+        for route in TOKEN_ROUTES:
+            response = client.get(route, headers={"Authorization": f"Bearer {meta['refresh_token']}"})
+            assert response.status_code == 401, (route, response.text)
+
+
 def test_a_dependency_reads_the_user_of_an_x_session_token(allauth_server):
     tokens = {name: _app_login(allauth_server, name)["session_token"] for name in USERS}
 

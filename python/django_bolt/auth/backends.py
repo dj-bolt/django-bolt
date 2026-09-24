@@ -134,9 +134,12 @@ class JWTAuthentication(BaseAuthentication):
             validation (default: 60).
         token_type: Expected ``typ`` claim. When set (e.g. ``"refresh"`` for
             a token-rotation endpoint), tokens must carry exactly that
-            ``typ``. When left as None (normal access routes), tokens
-            carrying ``typ: "refresh"`` are rejected so refresh tokens can
-            never authenticate a regular endpoint.
+            ``typ``, and no other type claim that disagrees. When left as
+            None (normal access routes), a token is rejected when its
+            ``typ``, ``token_type`` (djangorestframework-simplejwt) or
+            ``token_use`` (django-allauth, AWS Cognito) is ``"refresh"``.
+            So a refresh token of these issuers never authenticates a
+            regular endpoint.
         csrf: When the token is read from a ``cookie``, enforce a cross-site
             origin check on unsafe (state-changing) HTTP methods, since bolt
             bypasses Django's ``CsrfViewMiddleware`` and cookies are attached

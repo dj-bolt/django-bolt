@@ -31,7 +31,7 @@ from allauth.headless.internal.sessionkit import authenticate_by_x_session_token
 from asgiref.sync import sync_to_async
 
 from django_bolt import BoltAPI, CurrentUser, Depends, OptionalCurrentUser, Request
-from django_bolt.auth import JWTAuthentication
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.exceptions import Unauthorized
 from django_bolt.middleware import DjangoMiddleware
 
@@ -46,6 +46,7 @@ api = BoltAPI(django_middleware=DJANGO_MIDDLEWARE)
 single_api = BoltAPI(middleware=[DjangoMiddleware(path) for path in DJANGO_MIDDLEWARE])
 token_api = BoltAPI()
 JWT = [JWTAuthentication()]
+AUTHENTICATED = [IsAuthenticated()]
 
 
 def _describe(user) -> dict:
@@ -106,22 +107,22 @@ def _register(target: BoltAPI) -> None:
         return _describe(user)
 
 
-@token_api.get("/me/sync", auth=JWT)
+@token_api.get("/me/sync", auth=JWT, guards=AUTHENTICATED)
 def token_me_sync(request: Request):
     return _describe(request.user)
 
 
-@token_api.get("/me/async", auth=JWT)
+@token_api.get("/me/async", auth=JWT, guards=AUTHENTICATED)
 async def token_me_async(request: Request):
     return _describe(request.user)
 
 
-@token_api.get("/me/current", auth=JWT)
+@token_api.get("/me/current", auth=JWT, guards=AUTHENTICATED)
 async def token_me_current(user: CurrentUser):
     return _describe(user)
 
 
-@token_api.get("/me/current-sync", auth=JWT)
+@token_api.get("/me/current-sync", auth=JWT, guards=AUTHENTICATED)
 def token_me_current_sync(user: CurrentUser):
     return _describe(user)
 
