@@ -128,14 +128,23 @@ pub fn error_422_validation(detail: &str) -> HttpResponse {
     // Pre-allocate based on expected size (avoid reallocation)
     let mut body = Vec::with_capacity(32 + detail.len());
     body.extend_from_slice(br#"{"detail":""#);
-    // Escape any quotes in the detail message
+    // The detail echoes client input. Escape quotes, backslashes, and all
+    // control characters, so that the body is always valid JSON.
+    // Bytes of multi-byte UTF-8 characters are 0x80 or more and stay as they are.
     for byte in detail.bytes() {
-        if byte == b'"' {
-            body.extend_from_slice(br#"\""#);
-        } else if byte == b'\\' {
-            body.extend_from_slice(br#"\\"#);
-        } else {
-            body.push(byte);
+        match byte {
+            b'"' => body.extend_from_slice(br#"\""#),
+            b'\\' => body.extend_from_slice(br#"\\"#),
+            b'\n' => body.extend_from_slice(br#"\n"#),
+            b'\r' => body.extend_from_slice(br#"\r"#),
+            b'\t' => body.extend_from_slice(br#"\t"#),
+            0x00..=0x1F => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                body.extend_from_slice(br#"\u00"#);
+                body.push(HEX[(byte >> 4) as usize]);
+                body.push(HEX[(byte & 0x0F) as usize]);
+            }
+            _ => body.push(byte),
         }
     }
     body.extend_from_slice(br#""}"#);
@@ -166,6 +175,32 @@ mod tests {
             response.status(),
             actix_web::http::StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[test]
+    fn test_error_422_validation_escapes_to_valid_json() {
+        use actix_web::body::MessageBody;
+
+        // Every control character, quotes, backslash, and non-ASCII text.
+        let mut detail: String = (0u8..0x20).map(char::from).collect();
+        detail.push_str("\"\\ caf\u{e9} \u{1f600}");
+
+        let response = error_422_validation(&detail);
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body = response
+            .into_body()
+            .try_into_bytes()
+            .ok()
+            .expect("body is bytes");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("422 body is valid JSON");
+        assert_eq!(json["detail"], detail.as_str());
+        assert!(body.starts_with(br#"{"detail":"\u0000\u0001"#));
+        let short_forms = br#"\t\n\u000b\u000c\r"#;
+        assert!(body.windows(short_forms.len()).any(|w| w == short_forms));
     }
 
     #[test]
