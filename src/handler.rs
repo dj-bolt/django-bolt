@@ -28,6 +28,7 @@ use bolt_core::middleware::auth::populate_auth_context;
 use bolt_core::request::PyRequest;
 use bolt_core::request_pipeline::{
     build_validation_error_response, extract_headers, validate_and_cache_typed_params,
+    validate_typed_values,
 };
 use bolt_core::response_builder;
 use bolt_core::response_meta::ResponseMeta;
@@ -983,6 +984,30 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         None
     };
 
+    // Type validation for the headers and cookies that the handler declares (Rust-native, no GIL)
+    if let Some(route_meta) = route_metadata {
+        if let Some(headers_map) = headers.as_ref() {
+            if let Err(response) = validate_typed_values(
+                headers_map,
+                &route_meta.header_types,
+                max_param_length,
+                "Header",
+            ) {
+                return response;
+            }
+        }
+        if let Some(cookies_map) = cookies.as_ref() {
+            if let Err(response) = validate_typed_values(
+                cookies_map,
+                &route_meta.cookie_types,
+                max_param_length,
+                "Cookie",
+            ) {
+                return response;
+            }
+        }
+    }
+
     // Derive connection info from already-extracted headers (avoids a second header-parse pass).
     // conn_info is only used for request.META (Django templates) and build_absolute_uri().
     // When headers weren't extracted (pure API routes with no auth/cookies/middleware),
@@ -1148,11 +1173,14 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             None
         };
 
-        // Get type hints for type coercion
-        let empty_param_types: HashMap<String, u8> = HashMap::new();
-        let param_types = route_metadata
-            .map(|m| &m.param_types)
-            .unwrap_or(&empty_param_types);
+        // Get type hints for header and cookie coercion
+        let empty_types: HashMap<String, u8> = HashMap::new();
+        let header_types = route_metadata
+            .map(|m| &m.header_types)
+            .unwrap_or(&empty_types);
+        let cookie_types = route_metadata
+            .map(|m| &m.cookie_types)
+            .unwrap_or(&empty_types);
 
         // OPTIMIZATION: Create typed PyDicts only when non-empty.
         // Saves 1 Python heap alloc per empty source (up to 4 for simple API handlers).
@@ -1187,7 +1215,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
         let headers_py: Option<Py<PyDict>> = if needs_headers {
             if let Some(headers_map) = headers.as_ref() {
-                Some(params_to_py_dict(py, headers_map, param_types, max_param_length)?.unbind())
+                Some(params_to_py_dict(py, headers_map, header_types, max_param_length)?.unbind())
             } else {
                 Some(PyDict::new(py).unbind())
             }
@@ -1196,7 +1224,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         };
         let cookies_py: Option<Py<PyDict>> = if needs_cookies {
             if let Some(cookies_map) = cookies.as_ref() {
-                Some(params_to_py_dict(py, cookies_map, param_types, max_param_length)?.unbind())
+                Some(params_to_py_dict(py, cookies_map, cookie_types, max_param_length)?.unbind())
             } else {
                 Some(PyDict::new(py).unbind())
             }

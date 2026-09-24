@@ -361,29 +361,11 @@ pub fn coerce_to_py(
     }
 
     match type_hint {
-        TYPE_INT => Ok(value
-            .parse::<i64>()
-            .unwrap_or(0)
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-        TYPE_FLOAT => Ok(value
-            .parse::<f64>()
-            .unwrap_or(0.0)
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-        TYPE_BOOL => {
-            let is_true = matches!(value.to_lowercase().as_str(), "true" | "1" | "yes" | "on");
-            Ok(is_true
-                .into_pyobject(py)
-                .unwrap()
-                .to_owned()
-                .unbind()
-                .into_any())
-        }
+        // An invalid value is an error. It never becomes 0, 0.0 or false.
+        TYPE_INT | TYPE_FLOAT | TYPE_BOOL => match coerce_typed(value, type_hint) {
+            Ok(coerced) => Ok(coerced_value_to_py(py, &coerced)),
+            Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
+        },
         TYPE_UUID => {
             // Parse UUID in Rust, construct uuid.UUID from the 128-bit value —
             // no 36-char string alloc, no hex re-parse on the Python side.

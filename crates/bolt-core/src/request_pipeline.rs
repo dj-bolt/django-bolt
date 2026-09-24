@@ -101,6 +101,29 @@ pub fn validate_and_cache_typed_params(
     Ok((path_coerced, query_coerced))
 }
 
+/// Validate the typed values that a handler declares for one header or cookie map.
+///
+/// Only the keys in `value_types` are checked. The handler does not read the
+/// other entries, so they stay unchecked. `source` names the map in the error.
+pub fn validate_typed_values(
+    values: &AHashMap<String, String>,
+    value_types: &HashMap<String, u8>,
+    max_length: usize,
+    source: &str,
+) -> Result<(), HttpResponse> {
+    for (name, &type_hint) in value_types {
+        if let Some(value) = values.get(name) {
+            if let Err(error) = coerce_param(value, type_hint, max_length) {
+                return Err(responses::error_422_validation(&format!(
+                    "{} '{}': {}",
+                    source, name, error
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Extract headers from request with validation
 /// OPTIMIZATION: HeaderName::as_str() already returns lowercase (http crate canonical form)
 /// so we skip the redundant to_ascii_lowercase() call (~50ns saved per header)
@@ -138,4 +161,58 @@ pub fn build_validation_error_response(error: &ValidationError) -> HttpResponse 
     HttpResponse::UnprocessableEntity()
         .content_type("application/json")
         .body(body.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::type_coercion::TYPE_INT;
+
+    fn values(pairs: &[(&str, &str)]) -> AHashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn int_types(names: &[&str]) -> HashMap<String, u8> {
+        names.iter().map(|n| (n.to_string(), TYPE_INT)).collect()
+    }
+
+    #[test]
+    fn typed_values_accept_valid_and_absent_keys() {
+        let map = values(&[("x-count", "4"), ("host", "example.com")]);
+        assert!(
+            validate_typed_values(&map, &int_types(&["x-count", "x-missing"]), 100, "Header")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn typed_values_reject_bad_declared_value() {
+        let map = values(&[("x-count", "abc")]);
+        let response =
+            validate_typed_values(&map, &int_types(&["x-count"]), 100, "Header").unwrap_err();
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn typed_values_ignore_undeclared_keys() {
+        let map = values(&[("id", "tracking")]);
+        assert!(validate_typed_values(&map, &HashMap::new(), 100, "Cookie").is_ok());
+    }
+
+    #[test]
+    fn typed_values_reject_too_long_value() {
+        let map = values(&[("x-count", "12345")]);
+        let response =
+            validate_typed_values(&map, &int_types(&["x-count"]), 3, "Header").unwrap_err();
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
 }

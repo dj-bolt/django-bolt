@@ -729,7 +729,9 @@ async fn handle_test_request_internal(
     use bolt_core::middleware;
     use bolt_core::middleware::auth::populate_auth_context;
     use bolt_core::request::PyRequest;
-    use bolt_core::request_pipeline::{build_validation_error_response, extract_headers};
+    use bolt_core::request_pipeline::{
+        build_validation_error_response, extract_headers, validate_typed_values,
+    };
     use bolt_core::responses;
     use bolt_core::router::parse_query_string;
     use bolt_core::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
@@ -960,6 +962,20 @@ async fn handle_test_request_internal(
         AHashMap::new()
     };
 
+    // Type validation for the headers and cookies that the handler declares
+    if let Some(ref meta) = route_meta {
+        if let Err(response) =
+            validate_typed_values(&headers, &meta.header_types, max_param_length, "Header")
+        {
+            return response;
+        }
+        if let Err(response) =
+            validate_typed_values(&cookies, &meta.cookie_types, max_param_length, "Cookie")
+        {
+            return response;
+        }
+    }
+
     // Form parsing (URL-encoded and multipart)
     let needs_form_parsing = route_meta
         .as_ref()
@@ -1118,10 +1134,15 @@ async fn handle_test_request_internal(
             None
         };
 
-        // Get param_types from route metadata for typed conversion
-        let param_types = route_meta
+        // Get header and cookie type hints from route metadata for typed conversion
+        let header_types = route_meta
             .as_ref()
-            .map(|m| &m.param_types)
+            .map(|m| &m.header_types)
+            .cloned()
+            .unwrap_or_default();
+        let cookie_types = route_meta
+            .as_ref()
+            .map(|m| &m.cookie_types)
             .cloned()
             .unwrap_or_default();
 
@@ -1155,14 +1176,14 @@ async fn handle_test_request_internal(
         };
 
         let headers_dict = match &headers_for_python {
-            Some(h) => Some(params_to_py_dict(py, h, &param_types, max_param_length)?),
+            Some(h) => Some(params_to_py_dict(py, h, &header_types, max_param_length)?),
             None => None,
         };
         let cookies_dict = if needs_cookies {
             Some(params_to_py_dict(
                 py,
                 &cookies,
-                &param_types,
+                &cookie_types,
                 max_param_length,
             )?)
         } else {
