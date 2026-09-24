@@ -574,6 +574,10 @@ class ServerProject:
         if extra_args:
             command.extend(extra_args)
 
+        return _spawn_process(command, cwd=self.root, env=self._process_env(env)), port
+
+    def _process_env(self, env: dict[str, str] | None = None) -> dict[str, str]:
+        """The environment of a subprocess of this project, with its PYTHONPATH."""
         process_env = os.environ.copy()
         process_env.update(env or {})
         existing_pythonpath = process_env.get("PYTHONPATH", "")
@@ -581,8 +585,21 @@ class ServerProject:
         if self.preserve_pythonpath and existing_pythonpath:
             pythonpath_parts.append(existing_pythonpath)
         process_env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+        return process_env
 
-        return _spawn_process(command, cwd=self.root, env=process_env), port
+    def manage(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        """Run ``manage.py <args>`` for this project, for example ``migrate``, before the server starts.
+
+        Raises ``subprocess.CalledProcessError`` with the output when the command fails.
+        """
+        return subprocess.run(
+            [self.python_executable, str(self.path("manage.py")), *args],
+            cwd=self.root,
+            env=self._process_env(env),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     def start(
         self,

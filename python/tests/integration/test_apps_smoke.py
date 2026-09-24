@@ -27,8 +27,9 @@ _MODULE_NAMES = sorted(info.name for info in pkgutil.iter_modules(apps.__path__)
 # builds: ``reload_import_dep`` imports a sibling top-level ``reload_helper``
 # module that exists only there, and ``docs_middleware`` makes a ``BoltAPI``
 # with ``debug_toolbar`` middleware, which needs ``debug_toolbar`` in
-# ``INSTALLED_APPS``. They get a syntax check instead.
-_PROJECT_ONLY_MODULES = ["docs_middleware", "reload_import_dep"]
+# ``INSTALLED_APPS``. ``allauth_session`` loads allauth's middleware, which
+# needs ``allauth`` in ``INSTALLED_APPS`` too. They get a syntax check instead.
+_PROJECT_ONLY_MODULES = ["allauth_session", "docs_middleware", "reload_import_dep"]
 _IMPORTABLE_MODULE_NAMES = [name for name in _MODULE_NAMES if name not in _PROJECT_ONLY_MODULES]
 
 

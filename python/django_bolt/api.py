@@ -1957,6 +1957,14 @@ class BoltAPI:
                     args, kwargs = prebound_args, prebound_kwargs
                 elif injector_is_async:
                     args, kwargs = await injector(request)
+                elif is_blocking and not is_async:
+                    # The sync injector runs in the thread hop of the handler, so its
+                    # sync dependencies run on that thread (the lane behind Django middleware).
+                    def _run_blocking_multi_injected() -> ResponseWireV1:
+                        injected_args, injected_kwargs = injector(request)
+                        return _dispatch_multi_sync(handler(*injected_args, **injected_kwargs))
+
+                    return await sync_to_thread(_run_blocking_multi_injected)
                 else:
                     args, kwargs = injector(request)
 
@@ -2572,6 +2580,14 @@ class BoltAPI:
                     args, kwargs = prebound_args, prebound_kwargs
                 elif injector_is_async:
                     args, kwargs = await injector(request)
+                elif is_blocking and not is_async:
+                    # The sync injector runs in the thread hop of the handler, so its
+                    # sync dependencies run on that thread (the lane behind Django middleware).
+                    def _run_blocking_injected() -> ResponseWireV1:
+                        injected_args, injected_kwargs = injector(request)
+                        return serialize_response_sync(handler(*injected_args, **injected_kwargs), meta)
+
+                    return await sync_to_thread(_run_blocking_injected)
                 else:
                     args, kwargs = injector(request)
 

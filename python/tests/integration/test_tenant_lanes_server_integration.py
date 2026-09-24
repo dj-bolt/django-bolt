@@ -16,9 +16,6 @@ runs these tests. Without the variable, they skip.
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -28,7 +25,7 @@ import httpx
 import jwt
 import pytest
 
-from .apps import PACKAGE_ROOT, app_module
+from .apps import app_module
 from .apps.tenant_lanes import SECRET, TENANTS
 from .helpers import postgres_settings
 
@@ -66,20 +63,8 @@ def _start_tenant_server(make_server_project, params: dict[str, Any]):
     project = make_server_project(api_module=app_module("tenant_lanes"), settings_extra=_tenant_settings(params))
     # The middleware reads the domain table on each request, so the tables
     # and the tenants must exist before the readiness probe.
-    subprocess.run(
-        [sys.executable, str(project.path("manage.py")), "seed_tenants"],
-        cwd=project.root,
-        env=_subprocess_env(project),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    project.manage("seed_tenants")
     return project.start()
-
-
-def _subprocess_env(project) -> dict[str, str]:
-    pythonpath = [str(project.root), str(PACKAGE_ROOT), os.environ.get("PYTHONPATH", "")]
-    return {**os.environ, "PYTHONPATH": os.pathsep.join(part for part in pythonpath if part)}
 
 
 def _headers(tenant: str) -> dict[str, str]:
