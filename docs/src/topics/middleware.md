@@ -404,14 +404,14 @@ Available synced attributes:
 | Attribute | Source | Access |
 |-----------|--------|--------|
 | User (async) | AuthenticationMiddleware | `await request.auser()` |
-| User (sync) | AuthenticationMiddleware | `request.user` (sync code only) |
+| User (sync) | AuthenticationMiddleware | `request.user` (in async code, see below) |
 | Session | SessionMiddleware | `request.session` |
 | Messages | MessageMiddleware | `request.state["_messages"]` |
 | META | All middleware | `request.state["META"]` |
 | CSRF token | CsrfViewMiddleware | `request.state["_csrf_token"]` |
 | Custom attributes | Your middleware | `request.state["<name>"]` |
 
-In async code behind Django middleware, `request.user` works. Its query runs on the lane of the request. When an async handler reads `request.user` in its own source, Bolt can load the user before the handler with `await request.auser()`, so the read does not block the event loop (see [Authentication](authentication.md#accessing-the-authenticated-user)). On a route with `AuthenticationMiddleware`, Bolt always loads the session user first, because a sync read of it cannot work on the event loop.
+In async code behind Django middleware, `request.user` works. Its query runs on the lane of the request. When an async handler reads `request.user` in its own source, Bolt can load the user before the handler with `await request.auser()`. The read then does not block the event loop (see [Authentication](authentication.md#accessing-the-authenticated-user)). On a route with `AuthenticationMiddleware`, Bolt always loads the session user first when the handler reads `request.user`. A sync read of the session user cannot work on the event loop. A read of the session user elsewhere in async code, for example in a helper, raises `SynchronousOnlyOperation`, as in Django. Use `await request.auser()` there.
 
 Bolt copies each public attribute that a middleware sets on the Django request to `request.state`. For example, django-tenants sets `request.tenant`. Read it from `request.state["tenant"]`. Bolt does not copy names that start with `_`.
 
@@ -500,7 +500,7 @@ For responses, the order is reversed.
 
 `BoltAPI(django_middleware=...)` puts the Django middleware before the entries of `middleware=[...]`. A `DjangoMiddleware` or `DjangoMiddlewareStack` in `middleware=[...]` runs at its position in the list.
 
-A Python middleware before the Django middleware runs before any Django hook, as in Django's `MIDDLEWARE` order. It does not run on the lane of the request, and it does not see the thread-local state of the Django middleware, for example the tenant of django-tenants. If it loads `request.user`, it loads the user without that state, and the handler then gets the same user. Put a middleware that reads the user after the Django middleware.
+A Python middleware before the Django middleware runs before any Django hook, as in Django's `MIDDLEWARE` order. It does not run on the lane of the request. It does not see the thread-local state of the Django middleware, for example the tenant of django-tenants. If it loads `request.user`, it loads the user without that state, and the handler then gets the same user. Put a middleware that reads the user after the Django middleware.
 
 Rust-handled middleware configs (for example `@cors` and `@rate_limit`) are still compiled from metadata and executed in Rust.
 

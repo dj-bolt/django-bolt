@@ -4,6 +4,12 @@ The user loader reads the running loop of the calling thread. Rust installs
 the WorkerLoop around the trivially-async fast path, so the loader must send
 the query to the ORM pool there. The plain sync fast path has no running
 loop, so the query runs inline on the worker thread.
+
+This needs a real server: ``TestClient`` never takes the sync-dispatch branch
+(``can_sync_dispatch``), so it cannot reach either fast path. On a
+free-threaded build, Bolt loads the user of ``/me-trivial`` before the
+handler, so that route takes the async path there. Its query still runs on
+the ORM pool.
 """
 
 from __future__ import annotations
