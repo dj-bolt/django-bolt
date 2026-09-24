@@ -43,8 +43,6 @@ from .auth.backends import revocation_takes_claims
 from .auth.user_loader import (
     DEFAULT_USER_LOADERS,
     LazyUser,
-    needs_async_load,
-    preload_is_faster,
     preload_request_user,
     resolve_user_loader,
 )
@@ -114,30 +112,6 @@ def _revocation_handlers(backends: list[Any]) -> dict[str, tuple[Callable, bool]
         if getattr(backend, "revoked_token_handler", None) is not None
     }
     return handlers or None
-
-
-def _has_authentication_middleware(middleware_specs: list[Any]) -> bool:
-    """Whether a Django wrapper in these specs runs AuthenticationMiddleware or a subclass.
-
-    Its lazy session user cannot load with a sync read on the event loop.
-    """
-    # The module imports auth models, which need the app registry. Routes register after it is ready.
-    from django.contrib.auth.middleware import AuthenticationMiddleware  # noqa: PLC0415
-    from django.utils.module_loading import import_string  # noqa: PLC0415
-
-    for spec in middleware_specs:
-        if isinstance(spec, DjangoMiddleware):
-            classes = [spec.middleware_class]
-        elif isinstance(spec, DjangoMiddlewareStack):
-            classes = spec.middleware_classes
-        else:
-            continue
-        for middleware_class in classes:
-            if isinstance(middleware_class, str):
-                middleware_class = import_string(middleware_class)
-            if isinstance(middleware_class, type) and issubclass(middleware_class, AuthenticationMiddleware):
-                return True
-    return False
 
 
 def _with_preloaded_user(executor: Callable[..., Any]) -> Callable[..., Any]:
@@ -1801,21 +1775,11 @@ class BoltAPI:
                     user_loaders[backend.scheme_name] = resolve_user_loader(backend)
             meta["_user_loaders"] = user_loaders
 
-            # An async handler that reads request.user can get the user loaded
-            # before it runs, so its sync read does not block the event loop. With
-            # the GIL and only SQLite, a blocking read is faster (preload_is_faster).
-            # A sync read that cannot work keeps the load: a backend with only an
-            # async get_user, or the session user of AuthenticationMiddleware. The
-            # load awaits, so the route cannot use the sync fast path.
-            if (
-                meta["is_async"]
-                and handler_analysis.request_reads_user
-                and (
-                    preload_is_faster()
-                    or needs_async_load(user_loaders)
-                    or _has_authentication_middleware([*self._middleware, *router_middleware, *route_middleware])
-                )
-            ):
+            # An async handler that reads request.user gets the user loaded before
+            # it runs, so its sync read does not block the event loop. The rule
+            # does not depend on the database, so tests and production take the
+            # same path. The load awaits, so the route cannot use the sync fast path.
+            if meta["is_async"] and handler_analysis.request_reads_user:
                 meta["_handler_executor"] = _with_preloaded_user(meta["_handler_executor"])
                 meta.pop("_sync_executor", None)
 
