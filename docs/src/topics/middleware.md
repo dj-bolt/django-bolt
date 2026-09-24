@@ -411,7 +411,7 @@ Available synced attributes:
 | CSRF token | CsrfViewMiddleware | `request.state["_csrf_token"]` |
 | Custom attributes | Your middleware | `request.state["<name>"]` |
 
-In async code behind Django middleware, `request.user` works. Its query runs on the lane of the request. When an async handler reads `request.user` in its own source, Bolt loads the user before the handler with `await request.auser()`, so the read does not block the event loop. This also applies to the session user of `AuthenticationMiddleware`.
+In async code behind Django middleware, `request.user` works. Its query runs on the lane of the request. When an async handler reads `request.user` in its own source, Bolt can load the user before the handler with `await request.auser()`, so the read does not block the event loop (see [Authentication](authentication.md#accessing-the-authenticated-user)). On a route with `AuthenticationMiddleware`, Bolt always loads the session user first, because a sync read of it cannot work on the event loop.
 
 Bolt copies each public attribute that a middleware sets on the Django request to `request.state`. For example, django-tenants sets `request.tenant`. Read it from `request.state["tenant"]`. Bolt does not copy names that start with `_`.
 

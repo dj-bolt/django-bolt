@@ -8,6 +8,7 @@ of such a user raises, and a loaded user does not.
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -19,7 +20,9 @@ from django.contrib.auth import alogin
 from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.auth.models import User
 from django.contrib.sessions.middleware import SessionMiddleware
+from django.test import override_settings
 from django.utils.deprecation import MiddlewareMixin
+from django.utils.functional import empty
 
 from django_bolt import BoltAPI, Request
 from django_bolt.auth import JWTAuthentication
@@ -130,3 +133,52 @@ def test_the_session_user_of_django_loads_before_the_handler():
 
     assert response.status_code == 200, response.text
     assert response.json() == {"username": "session_reader", "authenticated": True}
+
+
+class _SyncAuth(JWTAuthentication):
+    """A backend with a sync loader. A blocking read of its user works."""
+
+    def get_user_sync(self, user_id):
+        return SimpleNamespace(username="bob")
+
+
+def _preload_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.get("/me", auth=[_SyncAuth(secret=SECRET)])
+    async def me(request: Request):
+        # The handler reads request.user, so Bolt can load it before the handler runs.
+        loaded = object.__getattribute__(request.user, "_wrapped") is not empty
+        return {"loaded_before_handler": loaded, "username": request.user.username}
+
+    return api
+
+
+def test_sqlite_with_the_gil_reads_the_user_when_the_handler_does():
+    """A local SQLite query is faster as a blocking read than as an async hand-off under the GIL.
+
+    The test settings use SQLite only. On a free-threaded build, there is no GIL
+    contention, so Bolt loads the user before the handler.
+    """
+    with TestClient(_preload_api()) as client:
+        response = client.get("/me", headers=_headers())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"loaded_before_handler": not _gil_enabled(), "username": "bob"}
+
+
+def test_a_networked_database_gets_the_user_loaded_before_the_handler():
+    """With a database that is not SQLite, a blocking read would stall the event loop for longer."""
+    networked = {"default": {"ENGINE": "django.db.backends.postgresql", "NAME": "unused"}}
+    with override_settings(DATABASES=networked):
+        api = _preload_api()
+
+    with TestClient(api) as client:
+        response = client.get("/me", headers=_headers())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"loaded_before_handler": True, "username": "bob"}
+
+
+def _gil_enabled() -> bool:
+    return getattr(sys, "_is_gil_enabled", lambda: True)()

@@ -338,6 +338,8 @@ class Request(Protocol):
         ``request.user`` is sync. The query runs on the thread that reads it. When an
         async handler reads ``request.user`` in its own source, Bolt loads the user
         first with ``await request.auser()``, so the read does not block the event loop.
+        With the GIL and only SQLite databases, Bolt reads the user when the handler
+        does, because a local SQLite query is faster as a blocking read.
         Another read in async code, for example in a helper, blocks the event loop
         for the query. It runs on the ORM pool, or on the lane of the request when the
         request has Django middleware. A backend with only an async ``get_user`` serves

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 from collections.abc import Callable, Coroutine
 from functools import partial
 from typing import Any
@@ -37,7 +38,7 @@ from typing import Any
 from django.contrib.auth import get_user_model
 from django.utils.functional import SimpleLazyObject, empty
 
-from ..concurrency import run_in_orm_executor, run_orm_blocking
+from ..concurrency import all_databases_sqlite, run_in_orm_executor, run_orm_blocking
 from .backends import BaseAuthentication, JWTAuthentication
 from .pk_loader import load_user_by_pk_sync
 
@@ -121,6 +122,25 @@ async def aload_bolt_user(user: Any) -> Any:
     return user
 
 
+def preload_is_faster() -> bool:
+    """Whether loading the user before an async handler beats a blocking read in the handler.
+
+    The load hands the query to the ORM pool and awaits it. With the GIL, the
+    loop thread and the ORM thread then compete for the GIL while the query
+    runs. A local SQLite query is fast enough that a blocking read costs less
+    (measured in PR #343: 19k against 14k requests per second). A networked
+    database, or a build with no GIL, makes the load faster instead.
+    """
+    return not (getattr(sys, "_is_gil_enabled", lambda: True)() and all_databases_sqlite())
+
+
+def needs_async_load(user_loaders: dict[str, UserLoaders | None]) -> bool:
+    """Whether a sync read of the user of these loaders raises, so the user must load first."""
+    return any(
+        loaders is not None and getattr(loaders[0], "needs_async_load", False) for loaders in user_loaders.values()
+    )
+
+
 async def preload_request_user(request: Any) -> None:
     """Load ``request.user`` before an async handler that reads it.
 
@@ -199,6 +219,9 @@ def resolve_user_loader(backend: Any) -> UserLoaders | None:
                 f"{cls.__qualname__}.get_user is async, so sync access to request.user cannot run it. "
                 "Use `await request.auser()`, or define get_user_sync on the backend."
             )
+
+        # A sync read of this user cannot work, so an async handler always loads it first.
+        reject_sync_access.needs_async_load = True
 
         async def aload_via_async(user_id: str, auth_context: dict | None) -> Any:
             return await get_user(user_id, auth_context or {})

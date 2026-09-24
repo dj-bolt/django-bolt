@@ -217,14 +217,17 @@ def _default_orm_workers() -> int:
     from parallel connections instead. Override with DJANGO_BOLT_ORM_THREADS.
     """
     try:
-        from django.conf import settings  # noqa: PLC0415 — needs configured settings, resolved lazily
-
-        engines = {db.get("ENGINE", "") for db in settings.DATABASES.values()}
-        if engines and all("sqlite" in engine for engine in engines):
+        if all_databases_sqlite():
             return 1
     except Exception as exc:  # unconfigured settings etc. — fall back to the parallel default
         logger.debug("ORM executor vendor detection failed, using default pool size: %s", exc)
     return 4
+
+
+def all_databases_sqlite() -> bool:
+    """Whether every configured database is SQLite, a local database with fast queries."""
+    engines = {db.get("ENGINE", "") for db in settings.DATABASES.values()}
+    return bool(engines) and all("sqlite" in engine for engine in engines)
 
 
 # Set on every ORM pool thread so callers already running inside the pool can
