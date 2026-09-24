@@ -1,9 +1,17 @@
-"""django-allauth session login, read by Bolt routes on a real ``runbolt`` server.
+"""django-allauth logins, read by Bolt routes on a real ``runbolt`` server.
 
-The user logs in through the login form of allauth, which Django serves under
-``/accounts`` (``api.mount_django``). Bolt routes then read the session user
-through ``AuthenticationMiddleware`` and allauth's ``AccountMiddleware``, in
-each supported way, and with both wrappers (see ``apps/allauth_session.py``).
+The user logs in through the login form of allauth under ``/accounts``, or
+through its headless API under ``/_allauth`` (both ``api.mount_django``):
+
+- A form login or a headless browser login starts a session. Bolt routes read
+  the session user through ``AuthenticationMiddleware`` and allauth's
+  ``AccountMiddleware``, in each supported way, and with both wrappers.
+- A headless app login with the JWT strategy gives an access token. Bolt's
+  ``JWTAuthentication`` accepts it and loads the user.
+- The same app login gives a session token. A small dependency reads the user
+  from the ``X-Session-Token`` header, also on the request lanes.
+
+See ``apps/allauth_session.py`` for the routes.
 
 This needs a server project: allauth needs its own apps, URLconf, templates,
 and migrations, which the shared test settings of ``TestClient`` do not have.
@@ -26,8 +34,15 @@ pytestmark = pytest.mark.server_integration
 USERS = {"alice": "alice-password-for-tests-1", "bob": "bob-password-for-tests-2"}
 PREFIXES = ("", "/single")
 ROUTES = ("/me/sync", "/me/async", "/me/auser", "/me/current", "/me/current-sync")
+TOKEN_ROUTES = ("/token/me/sync", "/token/me/async", "/token/me/current", "/token/me/current-sync")
+SESSION_TOKEN_ROUTES = ("/me/session-token", "/me/session-token-sync")
+HEADLESS = "/_allauth"
 
 _SETTINGS = """
+# The JWT strategy of allauth signs with SECRET_KEY for HS256, as JWTAuthentication verifies by default.
+SECRET_KEY = "django-bolt-server-integration-allauth-jwt-secret-key"
+HEADLESS_TOKEN_STRATEGY = "allauth.headless.tokens.strategies.jwt.JWTTokenStrategy"
+HEADLESS_JWT_ALGORITHM = "HS256"
 AUTHENTICATION_BACKENDS = [
     "django.contrib.auth.backends.ModelBackend",
     "allauth.account.auth_backends.AuthenticationBackend",
@@ -41,7 +56,10 @@ LOGIN_REDIRECT_URL = "/me/sync"
 _URLS = """
 from django.urls import include, path
 
-urlpatterns = [path("accounts/", include("allauth.urls"))]
+urlpatterns = [
+    path("accounts/", include("allauth.urls")),
+    path("_allauth/", include("allauth.headless.urls")),
+]
 """
 
 _TEMPLATES = [
@@ -64,7 +82,13 @@ _TEMPLATES = [
 def allauth_server(make_server_project):
     project = make_server_project(
         api_module=app_module("allauth_session"),
-        installed_apps=["django.contrib.sessions", "django.contrib.messages", "allauth", "allauth.account"],
+        installed_apps=[
+            "django.contrib.sessions",
+            "django.contrib.messages",
+            "allauth",
+            "allauth.account",
+            "allauth.headless",
+        ],
         middleware=[
             "django.contrib.sessions.middleware.SessionMiddleware",
             "django.middleware.common.CommonMiddleware",
@@ -112,6 +136,36 @@ def _login(server, username: str) -> Iterator[httpx.Client]:
         assert response.status_code == 302, response.text[:500]
         assert "sessionid" in client.cookies
         yield client
+
+
+@contextlib.contextmanager
+def _browser_login(server, username: str) -> Iterator[httpx.Client]:
+    """A client with the session of a login through the headless browser API."""
+    with _client(server) as client:
+        # A headless browser view sets the CSRF cookie; the next unsafe request sends it back as a header.
+        session = client.get(f"{HEADLESS}/browser/v1/auth/session")
+        assert session.status_code == 401, session.text[:500]
+        response = client.post(
+            f"{HEADLESS}/browser/v1/auth/login",
+            json={"username": username, "password": USERS[username]},
+            headers={"X-CSRFToken": client.cookies["csrftoken"]},
+        )
+        assert response.status_code == 200, response.text[:500]
+        assert response.json()["meta"]["is_authenticated"] is True
+        assert "sessionid" in client.cookies
+        yield client
+
+
+def _app_login(server, username: str) -> dict:
+    """The ``meta`` of a login through the headless app API: session token, access and refresh tokens."""
+    with _client(server) as client:
+        response = client.post(
+            f"{HEADLESS}/app/v1/auth/login", json={"username": username, "password": USERS[username]}
+        )
+        assert response.status_code == 200, response.text[:500]
+        meta = response.json()["meta"]
+        assert {"session_token", "access_token", "refresh_token"} <= meta.keys(), meta
+        return meta
 
 
 def _check_user(client: httpx.Client, prefix: str, username: str) -> None:
@@ -173,3 +227,70 @@ def test_two_sessions_do_not_mix(allauth_server):
     cases = [(name, prefix) for _ in range(20) for name in USERS for prefix in PREFIXES]
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(check, cases))
+
+
+def test_a_headless_browser_login_reaches_each_way_to_read_the_user(allauth_server):
+    with _browser_login(allauth_server, "alice") as client:
+        for prefix in PREFIXES:
+            _check_user(client, prefix, "alice")
+
+
+def test_a_headless_browser_logout_ends_the_session_for_bolt_routes(allauth_server):
+    with _browser_login(allauth_server, "alice") as client:
+        response = client.delete(
+            f"{HEADLESS}/browser/v1/auth/session", headers={"X-CSRFToken": client.cookies["csrftoken"]}
+        )
+        assert response.status_code == 401, response.text[:500]
+        for prefix in PREFIXES:
+            assert client.get(prefix + "/me/current").status_code == 401
+            assert client.get(prefix + "/me/sync").json()["authenticated"] is False
+
+
+def test_jwt_authentication_accepts_the_access_token_of_the_allauth_jwt_strategy(allauth_server):
+    meta = _app_login(allauth_server, "alice")
+    with _client(allauth_server) as client:
+        for route in TOKEN_ROUTES:
+            response = client.get(route, headers={"Authorization": f"Bearer {meta['access_token']}"})
+            assert response.status_code == 200, (route, response.text)
+            assert response.json() == {"authenticated": True, "username": "alice"}, route
+        assert client.get("/token/me/current").status_code == 401
+
+
+def test_a_dependency_reads_the_user_of_an_x_session_token(allauth_server):
+    tokens = {name: _app_login(allauth_server, name)["session_token"] for name in USERS}
+
+    def check(case: tuple[str, str, str]) -> None:
+        name, prefix, route = case
+        with _client(allauth_server) as client:
+            response = client.get(prefix + route, headers={"X-Session-Token": tokens[name]})
+            assert response.status_code == 200, (prefix + route, response.text)
+            assert response.json() == {"authenticated": True, "username": name}, prefix + route
+
+    # Concurrent requests of two users, on the lanes of the stack and with the single wrappers.
+    cases = [
+        (name, prefix, route)
+        for _ in range(10)
+        for name in USERS
+        for prefix in PREFIXES
+        for route in SESSION_TOKEN_ROUTES
+    ]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(check, cases))
+
+    with _client(allauth_server) as client:
+        for prefix in PREFIXES:
+            for route in SESSION_TOKEN_ROUTES:
+                assert client.get(prefix + route).status_code == 401
+                assert client.get(prefix + route, headers={"X-Session-Token": "not-a-session"}).status_code == 401
+
+
+def test_a_headless_app_logout_ends_the_x_session_token(allauth_server):
+    token = _app_login(allauth_server, "alice")["session_token"]
+    with _client(allauth_server) as client:
+        headers = {"X-Session-Token": token}
+        assert client.get("/me/session-token-sync", headers=headers).status_code == 200
+        response = client.delete(f"{HEADLESS}/app/v1/auth/session", headers=headers)
+        assert response.status_code == 401, response.text[:500]
+        for prefix in PREFIXES:
+            for route in SESSION_TOKEN_ROUTES:
+                assert client.get(prefix + route, headers=headers).status_code == 401
