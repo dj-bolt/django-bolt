@@ -122,7 +122,7 @@ Guidelines:
       assert client.get("/hello").status_code == 200
   ```
 
-- **PostgreSQL tests** (`@pytest.mark.postgres`) skip unless `DJANGO_BOLT_TEST_POSTGRES_DSN` is set. `just test-pg` starts a Docker server and runs them. On macOS, set `PGGSSENCMODE=disable` (for example `PGGSSENCMODE=disable just test-pg`), because forked `runbolt` workers can hang in libpq. See [PostgreSQL on macOS with forked workers](docs/src/getting-started/deployment.md#postgresql-on-macos-with-forked-workers).
+- **PostgreSQL tests** (`@pytest.mark.postgres`) skip unless `DJANGO_BOLT_TEST_POSTGRES_DSN` is set. `just test-pg` starts a Docker server and runs them. On macOS, set `PGGSSENCMODE=disable` (for example `PGGSSENCMODE=disable just test-pg`), because forked `runbolt` workers can hang in libpq. See [the FAQ](docs/src/faq.md#why-does-runbolt-hang-on-macos-when-it-connects-to-postgresql).
 - **Subprocess (`runbolt`) tests** are only for behavior `TestClient` cannot exercise: startup wiring, auto-reload, multi-process, real TCP, streaming, WebSocket handshakes. Mark them `@pytest.mark.server_integration` and author the app as a real module in `python/tests/integration/apps/`.
 - **Test behavior, not implementation.** Assert on HTTP responses and observable side effects.
 - **Don't delete or skip failing asserts** to make a test pass — investigate the root cause.
