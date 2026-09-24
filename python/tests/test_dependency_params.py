@@ -15,7 +15,7 @@ import pytest
 from django_bolt import BoltAPI, Depends, UploadFile
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
-from django_bolt.param_functions import Cookie, File, Form, Header, Query
+from django_bolt.param_functions import Body, Cookie, File, Form, Header, Query
 from django_bolt.testing import TestClient
 
 
@@ -315,3 +315,62 @@ def test_the_schema_names_a_header_as_bolt_reads_it():
         SchemaGenerator(api, OpenAPIConfig(title="Test", version="1")).generate().paths["/headers"].get.parameters
     )
     assert {(p.param_in, p.name) for p in parameters} == {("header", "x-request-id"), ("header", "X-Token")}
+
+
+class ItemName(msgspec.Struct):
+    name: str
+
+
+def sync_item_object(item: Item) -> Item:
+    return item
+
+
+async def async_item_object(item: Item) -> Item:
+    return item
+
+
+def sync_item_name(item: Annotated[ItemName, Body()]) -> str:
+    return item.name
+
+
+async def async_item_name(item: Annotated[ItemName, Body()]) -> str:
+    return item.name
+
+
+@pytest.fixture(scope="module")
+def shared_body_client():
+    api = BoltAPI()
+
+    @api.post("/async/same-type")
+    async def async_same_type(item: Item, from_dependency=Depends(async_item_object)):
+        return {"same_object": item is from_dependency, "count": item.count}
+
+    @api.post("/sync/same-type")
+    def sync_same_type(item: Item, from_dependency=Depends(sync_item_object)):
+        return {"same_object": item is from_dependency, "count": item.count}
+
+    @api.post("/async/other-type")
+    async def async_other_type(item: Item, name=Depends(async_item_name)):
+        return {"name": name, "count": item.count}
+
+    @api.post("/sync/other-type")
+    def sync_other_type(item: Item, name=Depends(sync_item_name)):
+        return {"name": name, "count": item.count}
+
+    with TestClient(api) as c:
+        yield c
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_handler_and_a_dependency_share_one_decode_of_the_same_body_type(shared_body_client, mode):
+    response = shared_body_client.post(f"/{mode}/same-type", json={"name": "bolt", "count": 3})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"same_object": True, "count": 3}
+    assert shared_body_client.post(f"/{mode}/same-type", json={"name": "bolt"}).status_code == 422
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_handler_and_a_dependency_decode_other_body_types_separately(shared_body_client, mode):
+    response = shared_body_client.post(f"/{mode}/other-type", json={"name": "bolt", "count": 3})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"name": "bolt", "count": 3}

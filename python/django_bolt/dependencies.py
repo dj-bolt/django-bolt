@@ -115,6 +115,22 @@ def dependency_fields(meta: dict[str, Any], compile_dep_fn: Callable[[Callable],
     return fields
 
 
+_NOT_DECODED = object()
+
+
+def decode_body_once(request_cache: dict[Any, Any], extractor: Callable, body: bytes) -> Any:
+    """Decode the request body one time for each body type in a request.
+
+    There is one body extractor for each type, so it is the cache key. A
+    handler and its dependencies that take the same type share one object.
+    ``request_cache`` is the dependency cache of the request.
+    """
+    value = request_cache.get(extractor, _NOT_DECODED)
+    if value is _NOT_DECODED:
+        value = request_cache[extractor] = extractor(body)
+    return value
+
+
 def _dep_meta(
     dep_fn: Callable,
     handler_meta: dict[Callable, dict[str, Any]],
@@ -206,7 +222,7 @@ async def resolve_dependency(
                     path,
                 )
         args, kwargs = _bind_dependency_args(
-            plan, request, params_map, query_map, headers_map, cookies_map, nested_values
+            plan, request, dep_cache, params_map, query_map, headers_map, cookies_map, nested_values
         )
         if is_async:
             value = await dep_fn(*args, **kwargs)
@@ -267,7 +283,7 @@ def resolve_dependency_sync(
                     path,
                 )
         args, kwargs = _bind_dependency_args(
-            plan, request, params_map, query_map, headers_map, cookies_map, nested_values
+            plan, request, dep_cache, params_map, query_map, headers_map, cookies_map, nested_values
         )
         value = dep_fn(*args, **kwargs)
 
@@ -280,6 +296,7 @@ def resolve_dependency_sync(
 def _bind_dependency_args(
     plan: list[tuple[int, Any, bool, str]],
     request: dict[str, Any],
+    dep_cache: dict[Any, Any],
     params_map: dict[str, Any],
     query_map: dict[str, Any],
     headers_map: dict[str, str],
@@ -308,7 +325,7 @@ def _bind_dependency_args(
         elif src == _SRC_DEPENDENCY:
             dval = nested_values[name]
         elif src == _SRC_BODY:
-            dval = extractor(request["body"])
+            dval = decode_body_once(dep_cache, extractor, request["body"])
         elif src == _SRC_FORM:
             dval = extractor(request.form)
         elif src == _SRC_FORM_WITH_FILES:

@@ -16,7 +16,12 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 import msgspec
 
 from ..analysis import resolve_introspection_target
-from ..dependencies import dependency_needs_event_loop, resolve_dependency, resolve_dependency_sync
+from ..dependencies import (
+    decode_body_once,
+    dependency_needs_event_loop,
+    resolve_dependency,
+    resolve_dependency_sync,
+)
 from ..params import Depends as DependsMarker
 from ..params import Param
 from ..typing import (
@@ -764,10 +769,8 @@ def compile_argument_injector(
                     elif src_id == _SRC_FILE_D:
                         value = extractor(files_map)
                     elif src_id == _SRC_BODY_D:
-                        if not body_loaded:
-                            body_obj = extractor(request["body"])
-                            body_loaded = True
-                        value = body_obj
+                        # A dependency with the same body type shares this decode.
+                        value = decode_body_once(dep_cache, extractor, request["body"])
                     else:
                         field = _dep_fallback_by_name[name]
                         value, body_obj, body_loaded = extract_parameter_value(
@@ -889,10 +892,8 @@ def compile_argument_injector(
                 elif src_id == _SRC_FILE_D:
                     value = extractor(files_map)
                 elif src_id == _SRC_BODY_D:
-                    if not body_loaded:
-                        body_obj = extractor(request["body"])
-                        body_loaded = True
-                    value = body_obj
+                    # A dependency with the same body type shares this decode.
+                    value = decode_body_once(dep_cache, extractor, request["body"])
                 else:
                     field = _dep_fallback_by_name[name]
                     value, body_obj, body_loaded = extract_parameter_value(
