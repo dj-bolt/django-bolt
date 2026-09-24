@@ -48,6 +48,7 @@ def _compile_dep_arg_plan(dep_meta: dict[str, Any]) -> list[tuple[int, Any, bool
     """
     plan: list[tuple[int, Any, bool, str]] = []
     nested: list[tuple[str, DependsMarker]] = []
+    nested_sync: list[tuple[str, DependsMarker]] = []
     for field in dep_meta["fields"]:
         src = _SOURCE_IDS.get(field.source)
         if src is None:
@@ -56,12 +57,25 @@ def _compile_dep_arg_plan(dep_meta: dict[str, Any]) -> list[tuple[int, Any, bool
             if field.dependency is None:
                 raise ValueError(f"Depends for parameter {field.name} requires a callable")
             nested.append((field.name, field.dependency))
+            nested_sync.append((field.name, sync_form(field.dependency)))
         elif src == _SRC_FORM and getattr(field.extractor, "needs_files_map", False):
             src = _SRC_FORM_WITH_FILES
         plan.append((src, field.extractor, field.kind in _POSITIONAL_KINDS, field.name))
     dep_meta["_dep_nested"] = nested
+    dep_meta["_dep_nested_sync"] = nested_sync
     dep_meta["_dep_arg_plan"] = plan
     return plan
+
+
+def sync_form(marker: DependsMarker) -> DependsMarker:
+    """The marker of the sync form of a dependency, for example ``get_current_user_sync``.
+
+    A dependency with no ``_bolt_sync_variant`` keeps its marker.
+    """
+    sync_variant = getattr(marker.dependency, "_bolt_sync_variant", None)
+    if sync_variant is None:
+        return marker
+    return DependsMarker(dependency=sync_variant, use_cache=marker.use_cache)
 
 
 def dependency_needs_event_loop(
@@ -70,19 +84,26 @@ def dependency_needs_event_loop(
     compile_binder: Callable,
     http_method: str,
     path: str,
+    *,
+    sync_handler: bool,
 ) -> bool:
     """Whether ``dep_fn``, or a dependency that it depends on, is async.
 
-    The sync injector can resolve a dependency only when this is false.
+    The sync injector can resolve a dependency only when this is false. For a
+    sync handler, a nested dependency counts in its sync form, as
+    :func:`resolve_dependency_sync` resolves it.
     """
     if inspect.iscoroutinefunction(dep_fn):
         return True
     dep_meta = _dep_meta(dep_fn, handler_meta, compile_binder, http_method, path)
     if "_dep_arg_plan" not in dep_meta:
         _compile_dep_arg_plan(dep_meta)
+    nested = dep_meta["_dep_nested_sync"] if sync_handler else dep_meta["_dep_nested"]
     return any(
-        dependency_needs_event_loop(marker.dependency, handler_meta, compile_binder, http_method, path)
-        for _, marker in dep_meta["_dep_nested"]
+        dependency_needs_event_loop(
+            marker.dependency, handler_meta, compile_binder, http_method, path, sync_handler=sync_handler
+        )
+        for _, marker in nested
     )
 
 
@@ -265,9 +286,9 @@ def resolve_dependency_sync(
         if plan is None:
             plan = _compile_dep_arg_plan(dep_meta)
         nested_values = None
-        if dep_meta["_dep_nested"]:
+        if dep_meta["_dep_nested_sync"]:
             nested_values = {}
-            for name, marker in dep_meta["_dep_nested"]:
+            for name, marker in dep_meta["_dep_nested_sync"]:
                 nested_values[name] = resolve_dependency_sync(
                     marker.dependency,
                     marker,

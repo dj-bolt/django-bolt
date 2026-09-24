@@ -117,6 +117,29 @@ def test_current_user_in_a_sync_handler_keeps_lane_dispatch():
     assert auth.queries == 1
 
 
+def _tenant_of_user(user=Depends(get_current_user)) -> str:
+    """A sync dependency that depends on get_current_user."""
+    return user.tenant
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_nested_get_current_user_in_a_sync_handler_keeps_lane_dispatch():
+    """A sync handler gets the sync form of get_current_user also when another dependency depends on it."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMiddleware])])
+    auth = _TenantAuth(secret=SECRET)
+
+    @api.get("/tenant/{tenant}", auth=[auth])
+    def endpoint(tenant: str, user_tenant: Annotated[str, Depends(_tenant_of_user)]):
+        return {"tenant": user_tenant, "lane_mode": in_lane_mode()}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/tenant/acme", headers=_headers())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenant": "acme", "lane_mode": True}
+    assert auth.queries == 1
+
+
 @pytest.mark.parametrize("handler_is_async", [True, False], ids=["async", "sync"])
 def test_current_user_rejects_a_request_with_no_user(handler_is_async):
     """``CurrentUser`` answers 401 with no authenticated user. ``OptionalCurrentUser`` gives ``None``."""

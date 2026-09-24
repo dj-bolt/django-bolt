@@ -21,6 +21,7 @@ from ..dependencies import (
     dependency_needs_event_loop,
     resolve_dependency,
     resolve_dependency_sync,
+    sync_form,
 )
 from ..params import Depends as DependsMarker
 from ..params import Param
@@ -684,9 +685,7 @@ def compile_argument_injector(
             if src_id == _SRC_DEP:
                 dependency = f.dependency
                 if handler_is_sync and dependency is not None:
-                    sync_variant = getattr(dependency.dependency, "_bolt_sync_variant", None)
-                    if sync_variant is not None:
-                        dependency = DependsMarker(dependency=sync_variant, use_cache=dependency.use_cache)
+                    dependency = sync_form(dependency)
                 _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, dependency))
             elif src_id == _SRC_REQUEST_D:
                 _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, None))
@@ -709,7 +708,7 @@ def compile_argument_injector(
             dep = _dep_plan[idx][5]  # dependency marker
             # A sync dependency of an async dependency also needs the async injector.
             if dep is not None and dependency_needs_event_loop(
-                dep.dependency, handler_meta_dict, compile_binder_fn, http_method, path
+                dep.dependency, handler_meta_dict, compile_binder_fn, http_method, path, sync_handler=handler_is_sync
             ):
                 _async_dep_fns.append(idx)
         _can_parallel = len(_async_dep_fns) >= 2
