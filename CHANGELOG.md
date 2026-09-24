@@ -35,7 +35,7 @@ All notable changes to this project will be documented in this file.
 
 ### Documentation
 
-- **PostgreSQL on macOS with forked workers** - In local development on macOS, a forked `runbolt` worker can hang when libpq opens a PostgreSQL connection. The GSSAPI negotiation of libpq calls the macOS Kerberos framework, which is not safe after `fork()`. The FAQ and `CONTRIBUTING.md` now show the fix: set `PGGSSENCMODE=disable`, or `"gssencmode": "disable"` in `DATABASES[...]["OPTIONS"]`. Linux does not need it. See [the FAQ](docs/src/faq.md#why-does-runbolt-hang-on-macos-when-it-connects-to-postgresql).
+- **PostgreSQL on macOS with forked workers** - In local development on macOS, a forked `runbolt` worker can hang when libpq opens a PostgreSQL connection. When libpq is built with GSSAPI support, its GSSAPI negotiation calls the macOS Kerberos framework, which is not safe after `fork()`. The FAQ and `CONTRIBUTING.md` now show the fix: set `PGGSSENCMODE=disable`, or `"gssencmode": "disable"` in `DATABASES[...]["OPTIONS"]`. Linux does not need it. See [the FAQ](docs/src/faq.md#why-does-runbolt-hang-on-macos-when-it-connects-to-postgresql).
 
 ## [0.11.0]
 

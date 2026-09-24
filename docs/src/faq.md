@@ -71,7 +71,7 @@ Python 3.12, 3.13, 3.14 (CPython and PyPy), and the free-threaded build of CPyth
 
 ## Why does `runbolt` hang on macOS when it connects to PostgreSQL?
 
-This affects local development on macOS with libpq (psycopg). A forked `runbolt` worker can hang when it opens a PostgreSQL connection. Workers fork with `--processes 2` or more, and with a worker recycling option (`--max-rss`, `--workers-lifetime`, `--respawn-failed-workers`). The libpq option `gssencmode` is `prefer` by default. With `prefer`, libpq calls the macOS Kerberos (GSS) framework on each TCP connection. That framework is not safe to use after `fork()`.
+This affects local development on macOS with libpq (psycopg). A forked `runbolt` worker can hang when it opens a PostgreSQL connection. Workers fork with `--processes 2` or more, and with a worker recycling option (`--max-rss`, `--workers-lifetime`, `--respawn-failed-workers`). When libpq is built with GSSAPI support, the libpq option `gssencmode` is `prefer` by default. With `prefer`, libpq calls the macOS Kerberos (GSS) framework on each TCP connection. That framework is not safe to use after `fork()`. A libpq build without GSSAPI support does not call the framework, so this cause does not apply to it.
 
 To prevent the hang, disable GSSAPI encryption. Set the environment variable before you start the server:
 
@@ -92,7 +92,7 @@ DATABASES = {
 }
 ```
 
-Do not use this setting if your database server requires GSSAPI encryption. Linux does not need this setting.
+This setting turns off GSSAPI encryption only. If the connection must be encrypted, use TLS with `sslmode` (for example `verify-full`). A server that accepts only GSSAPI-encrypted connections refuses the connection with this setting. Linux does not need this setting.
 
 ## Where can I get help?
 
@@ -196,7 +196,7 @@ Do not use this setting if your database server requires GSSAPI encryption. Linu
    "name": "Why does runbolt hang on macOS when it connects to PostgreSQL?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "This affects local development on macOS with libpq (psycopg). A forked runbolt worker can hang when it opens a PostgreSQL connection. Workers fork with --processes 2 or more, and with a worker recycling option. The libpq option gssencmode is prefer by default, so libpq calls the macOS Kerberos (GSS) framework, which is not safe to use after fork(). Set PGGSSENCMODE=disable, or set \"gssencmode\": \"disable\" in DATABASES[\"default\"][\"OPTIONS\"]. Linux does not need this setting."
+    "text": "This affects local development on macOS with libpq (psycopg). A forked runbolt worker can hang when it opens a PostgreSQL connection. Workers fork with --processes 2 or more, and with a worker recycling option. When libpq is built with GSSAPI support, gssencmode is prefer by default, so libpq calls the macOS Kerberos (GSS) framework, which is not safe to use after fork(). Set PGGSSENCMODE=disable, or set \"gssencmode\": \"disable\" in DATABASES[\"default\"][\"OPTIONS\"]. This turns off GSSAPI encryption only; use TLS with sslmode if the connection must be encrypted. Linux does not need this setting."
    }
   }
  ]
