@@ -243,6 +243,12 @@ class HandlerAnalysis:
     request_needs_cookies: bool = False
     """Whether the handler reads request.cookies"""
 
+    request_user_line: int | None = None
+    """Source line of the first read of request.user in the handler body, not in a nested function"""
+
+    source_file: str | None = None
+    """Source file of the handler"""
+
     # Analysis metadata
     analysis_failed: bool = False
     """Whether AST analysis failed (e.g., couldn't get source)"""
@@ -278,6 +284,9 @@ class OrmVisitor(ast.NodeVisitor):
         self.analysis = HandlerAnalysis()
         self._in_objects_chain = False
         self.request_param_names = request_param_names or set()
+        # Depth of nested functions and lambdas. Their code can run on another
+        # thread, for example through sync_to_thread.
+        self._nested = 0
 
     def _is_request_name(self, node: ast.AST) -> bool:
         return isinstance(node, ast.Name) and node.id in self.request_param_names
@@ -338,6 +347,13 @@ class OrmVisitor(ast.NodeVisitor):
 
         if self._is_request_name(node.value):
             self._mark_request_component_attr(attr_name)
+            if (
+                attr_name == "user"
+                and isinstance(node.ctx, ast.Load)
+                and not self._nested
+                and self.analysis.request_user_line is None
+            ):
+                self.analysis.request_user_line = node.lineno
 
         # Check for .objects manager access
         if attr_name in ORM_MANAGER_ATTRS:
@@ -367,6 +383,15 @@ class OrmVisitor(ast.NodeVisitor):
 
         # Continue visiting children
         self.generic_visit(node)
+
+    def _visit_nested(self, node: ast.AST) -> None:
+        self._nested += 1
+        self.generic_visit(node)
+        self._nested -= 1
+
+    visit_FunctionDef = _visit_nested
+    visit_AsyncFunctionDef = _visit_nested
+    visit_Lambda = _visit_nested
 
     def visit_Call(self, node: ast.Call) -> None:
         """Detect function calls that might be blocking."""
@@ -458,7 +483,7 @@ def analyze_handler(
 
     # Try to get source code
     try:
-        source = inspect.getsource(unwraped_source)
+        source_lines, first_line = inspect.getsourcelines(unwraped_source)
     except (OSError, TypeError) as e:
         # Can't get source (e.g., built-in, C extension, or lambda)
         analysis.analysis_failed = True
@@ -466,7 +491,7 @@ def analyze_handler(
         return analysis
 
     # Dedent source code (handles indented methods)
-    source = textwrap.dedent(source)
+    source = textwrap.dedent("".join(source_lines))
 
     # Parse AST
     try:
@@ -487,7 +512,12 @@ def analyze_handler(
                 visitor.visit(stmt)
             break  # Only analyze the first function found
 
-    return visitor.analysis
+    analysis = visitor.analysis
+    if analysis.request_user_line is not None:
+        # AST lines count from the first line of the source that was parsed.
+        analysis.request_user_line += first_line - 1
+        analysis.source_file = inspect.getsourcefile(unwraped_source)
+    return analysis
 
 
 _REQUEST_PARAM_NAMES = frozenset({"request", "req"})

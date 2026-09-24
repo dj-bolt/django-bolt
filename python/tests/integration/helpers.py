@@ -614,6 +614,23 @@ class ServerProject:
         )
 
 
+def postgres_settings(params: dict[str, Any], *, engine: str = "django.db.backends.postgresql", **options: Any) -> str:
+    """Django ``DATABASES["default"]`` for the settings of a server project.
+
+    ``params`` comes from the ``postgres_database`` fixture.
+    """
+    database = {
+        "ENGINE": engine,
+        "NAME": params["dbname"],
+        "USER": params.get("user", ""),
+        "PASSWORD": params.get("password", ""),
+        "HOST": params.get("host", ""),
+        "PORT": params.get("port", ""),
+        **options,
+    }
+    return f'DATABASES["default"] = {database!r}'
+
+
 def create_server_project(
     root: Path,
     *,

@@ -6,6 +6,7 @@ import dis
 import inspect
 import sys
 import threading
+import warnings
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any, get_origin, get_type_hints
@@ -1465,8 +1466,13 @@ class BoltAPI:
                 field.name for field in meta.get("fields", []) if getattr(field, "source", None) == "request"
             }
 
-            # Static ORM + request-component analysis at registration time
-            handler_analysis = analyze_handler(fn, request_param_names=request_param_names)
+            # Static ORM + request-component analysis at registration time.
+            # A handler with only a request parameter has no fields, but the
+            # analysis still needs the name to find reads of request.user.
+            analyzed_request_names = request_param_names
+            if not analyzed_request_names and meta["mode"] == "request_only":
+                analyzed_request_names = {next(iter(meta["sig"].parameters))}
+            handler_analysis = analyze_handler(fn, request_param_names=analyzed_request_names)
 
             if request_param_names:
                 if handler_analysis.analysis_failed:
@@ -1514,16 +1520,23 @@ class BoltAPI:
             # handler must then run on the thread of its request, not inline on
             # the event loop, so treat it as blocking work. The middleware can be
             # on the API, on a router, or on the route.
-            meta["is_blocking"] = handler_analysis.is_blocking or (
-                not meta["is_async"]
-                and (
-                    self._has_django_wrapper_middleware
-                    or any(
-                        isinstance(spec, (DjangoMiddleware, DjangoMiddlewareStack))
-                        for spec in (*router_middleware, *route_middleware)
-                    )
-                )
+            has_django_middleware = self._has_django_wrapper_middleware or any(
+                isinstance(spec, (DjangoMiddleware, DjangoMiddlewareStack))
+                for spec in (*router_middleware, *route_middleware)
             )
+            meta["is_blocking"] = handler_analysis.is_blocking or (not meta["is_async"] and has_django_middleware)
+
+            # In an async handler behind Django middleware, a sync read of
+            # request.user raises at request time. Say so at startup.
+            if meta["is_async"] and has_django_middleware and handler_analysis.request_user_line is not None:
+                warnings.warn_explicit(
+                    f"{fn.__qualname__} reads request.user synchronously in an async handler on a route "
+                    "with Django middleware. The read raises RuntimeError when a request runs it. "
+                    "Use `await request.auser()` or a `CurrentUser` parameter.",
+                    RuntimeWarning,
+                    handler_analysis.source_file,
+                    handler_analysis.request_user_line,
+                )
 
             # Determine final response type with proper priority:
             # 1. response_model parameter (explicit, takes precedence)

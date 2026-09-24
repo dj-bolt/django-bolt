@@ -133,7 +133,19 @@ async def get_me(request):
 
 `request.auser()` does not block the event loop. It awaits an async `get_user` directly. It runs `get_user_sync` on the request lane or on the ORM pool. `request.user` then returns the same user with no second query.
 
-A sync read of `request.user` in async code blocks the worker thread until the ORM pool returns the user. With Django middleware, the request keeps its thread-local state on its lane, and a query on the pool does not see that state. Thus in async code behind Django middleware, a sync read of `request.user` raises `RuntimeError`. Use `await request.auser()` there.
+To get the user as a parameter, use `CurrentUser`. It works in sync and async handlers:
+
+```python
+from django_bolt import CurrentUser
+
+@api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+async def get_me(user: CurrentUser):
+    return {"id": user.id}
+```
+
+`CurrentUser` loads the user with `await request.auser()`, and gives `None` when the request has no user. For the type of your user model, make your own alias: `Annotated[User, Depends(get_current_user)]`.
+
+A sync read of `request.user` in async code blocks the worker thread until the ORM pool returns the user. With Django middleware, the request keeps its thread-local state on its lane, and a query on the pool does not see that state. Thus in async code behind Django middleware, a sync read of `request.user` raises `RuntimeError`. Use `await request.auser()` there. Bolt finds such a read in an async handler when it registers the route. It then gives a `RuntimeWarning` at startup, with the handler and the line.
 
 ### Custom user query
 

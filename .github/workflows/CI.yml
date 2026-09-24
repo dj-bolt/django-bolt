@@ -254,8 +254,9 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ${{ fromJSON(needs.python-versions.outputs.integration-versions-json) }}
-    # The dead-connection recovery tests (`-m postgres`) skip without a DSN,
-    # so the service is what keeps that fix from regressing in silence.
+    # The PostgreSQL tests (`-m postgres`: dead-connection recovery and the
+    # django-tenants request lanes) skip without a DSN, so the service is what
+    # keeps those fixes from regressing in silence.
     services:
       postgres:
         image: postgres:18
