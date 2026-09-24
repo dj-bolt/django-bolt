@@ -315,9 +315,9 @@ async def get_me(request: CustomRequest):
     Authorization: Bearer <jwt_token>
 
     The authentication system loads the Django User instance for the
-    authenticated user. An async handler loads it with ``await request.auser()``.
-    A sync read of ``request.user`` raises here when the debug toolbar
-    middleware is on, because the query must run on the request lane.
+    authenticated user. An async handler loads it with ``await request.auser()``,
+    which does not block the event loop. ``request.user`` works too, but the
+    event loop waits for its query.
     """
     user = await request.auser()
     if not user:

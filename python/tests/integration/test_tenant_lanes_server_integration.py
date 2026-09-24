@@ -41,7 +41,7 @@ _SHARED_APPS = [
 ]
 _TENANT_APPS = ["django.contrib.contenttypes", "django.contrib.auth"]
 
-ROUTES = ("/sync/me", "/async/me", "/async/current")
+ROUTES = ("/sync/me", "/async/me", "/async/current", "/async/sync-read")
 
 
 def _tenant_settings(params: dict[str, Any]) -> str:

@@ -57,3 +57,9 @@ async def async_me(request: Request):
 @api.get("/async/current", auth=auth, guards=[IsAuthenticated()])
 async def async_current(user: CurrentUser):
     return {"username": user.username, "schema": await sync_to_thread(_schema_name)}
+
+
+@api.get("/async/sync-read", auth=auth, guards=[IsAuthenticated()])
+async def async_sync_read(request: Request):
+    # The loop waits for the lane to run the user query.
+    return {"username": request.user.username, "schema": await sync_to_thread(_schema_name)}

@@ -325,7 +325,7 @@ Start with one ORM thread for every one or two worker threads, then measure. Eac
 
 A blocking sync handler does not use the ORM pool. It runs on the shared executor pool, which has `CPU count + 4` threads (maximum 32). Set `DJANGO_BOLT_EXECUTOR_THREADS` to change it.
 
-An async handler that reads the lazy `request.user` blocks its worker thread until the ORM pool loads the user. Behind Django middleware, that read raises `RuntimeError`. In an async handler, use `await request.auser()`. The worker serves other requests while the user loads.
+An async handler that reads the lazy `request.user` blocks its worker thread until the user loads, on the ORM pool or on the lane of the request. In an async handler, prefer `await request.auser()`. The worker serves other requests while the user loads.
 
 ### Compare equal topologies
 

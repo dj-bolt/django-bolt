@@ -18,7 +18,7 @@ Each backend resolves to a pair of loaders:
 1. request.user is sync. It runs the query on the thread that reads it
    (run_orm_blocking). A thread with a running event loop sends the query to
    the ORM pool, and the loop waits. On the loop of a request with Django
-   middleware, the query would miss the state of the lane, so the read raises.
+   middleware, the query runs on the lane of the request, and the loop waits.
 2. await request.auser() is async. It awaits an async get_user as a coroutine.
    It sends a sync query through run_in_orm_executor, the hand-off of each
    framework query. A request with a lane keeps the query on that lane.

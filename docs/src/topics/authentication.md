@@ -145,7 +145,9 @@ async def get_me(user: CurrentUser):
 
 `CurrentUser` loads the user with `await request.auser()`, and gives `None` when the request has no user. For the type of your user model, make your own alias: `Annotated[User, Depends(get_current_user)]`.
 
-A sync read of `request.user` in async code blocks the worker thread until the ORM pool returns the user. With Django middleware, the request keeps its thread-local state on its lane, and a query on the pool does not see that state. Thus in async code behind Django middleware, a sync read of `request.user` raises `RuntimeError`. Use `await request.auser()` there. Bolt finds such a read in an async handler when it registers the route. It then gives a `RuntimeWarning` at startup, with the handler and the line.
+A sync read of `request.user` in async code blocks the worker thread until the user loads. The query runs on the ORM pool. With Django middleware, the request keeps its thread-local state on its lane, for example a tenant schema. The query then runs on that lane, so it sees that state. Thus `request.user` works in sync and async code. In async code, `await request.auser()` is faster, because the worker serves other requests while the user loads.
+
+A thread with no event loop that is not the lane cannot wait for the lane, for example a thread from `asyncio.to_thread`. A sync read there raises `LaneAffinityError`, a subclass of `RuntimeError`. Its message names the route and the handler. With `DEBUG = True` or `runbolt --dev`, Bolt also logs the fix one time for each route.
 
 ### Custom user query
 

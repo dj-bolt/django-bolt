@@ -4,9 +4,10 @@ import asyncio
 import contextlib
 import dis
 import inspect
+import logging
+import os
 import sys
 import threading
-import warnings
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any, get_origin, get_type_hints
@@ -38,6 +39,7 @@ from .analysis import analyze_dependency_tree, analyze_handler
 from .auth import get_default_authentication_classes, register_auth_backend
 from .auth.user_loader import DEFAULT_USER_LOADERS, LazyUser, resolve_user_loader
 from .concurrency import (
+    LaneAffinityError,
     _drop_broken_connections,
     run_in_orm_executor,
     run_on_request_lane,
@@ -85,6 +87,8 @@ from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata, HandlerPattern
 from .views import APIView, ViewSet, _layer
 from .websocket import mark_websocket_handler
+
+logger = logging.getLogger(__name__)
 
 Response = ResponseWireV1
 
@@ -387,6 +391,8 @@ class BoltAPI:
                 Receives the BoltAPI instance as argument.
         """
         self._routes: list[tuple[str, str, int, Callable]] = []
+        # Handler IDs whose lane affinity error was logged with its fix, one time each.
+        self._lane_affinity_hinted: set[int] = set()
         self._websocket_routes: list[tuple[str, int, Callable]] = []  # (path, handler_id, handler)
         self._handlers: dict[int, Callable] = {}
         # OPTIMIZATION: Use handler_id (int) as key instead of callable
@@ -1466,13 +1472,8 @@ class BoltAPI:
                 field.name for field in meta.get("fields", []) if getattr(field, "source", None) == "request"
             }
 
-            # Static ORM + request-component analysis at registration time.
-            # A handler with only a request parameter has no fields, but the
-            # analysis still needs the name to find reads of request.user.
-            analyzed_request_names = request_param_names
-            if not analyzed_request_names and meta["mode"] == "request_only":
-                analyzed_request_names = {next(iter(meta["sig"].parameters))}
-            handler_analysis = analyze_handler(fn, request_param_names=analyzed_request_names)
+            # Static ORM + request-component analysis at registration time
+            handler_analysis = analyze_handler(fn, request_param_names=request_param_names)
 
             if request_param_names:
                 if handler_analysis.analysis_failed:
@@ -1525,18 +1526,6 @@ class BoltAPI:
                 for spec in (*router_middleware, *route_middleware)
             )
             meta["is_blocking"] = handler_analysis.is_blocking or (not meta["is_async"] and has_django_middleware)
-
-            # In an async handler behind Django middleware, a sync read of
-            # request.user raises at request time. Say so at startup.
-            if meta["is_async"] and has_django_middleware and handler_analysis.request_user_line is not None:
-                warnings.warn_explicit(
-                    f"{fn.__qualname__} reads request.user synchronously in an async handler on a route "
-                    "with Django middleware. The read raises RuntimeError when a request runs it. "
-                    "Use `await request.auser()` or a `CurrentUser` parameter.",
-                    RuntimeWarning,
-                    handler_analysis.source_file,
-                    handler_analysis.request_user_line,
-                )
 
             # Determine final response type with proper priority:
             # 1. response_model parameter (explicit, takes precedence)
@@ -2546,6 +2535,35 @@ class BoltAPI:
         """Handle HTTPException and return response."""
         return _wire_from_error_parts(*http_exception_handler(he))
 
+    def _describe_lane_affinity_error(self, error: LaneAffinityError, handler: Callable, handler_id: int) -> None:
+        """Add the route and the handler to the message. In dev mode, log the fix one time per route.
+
+        The read of ``request.user`` can be indirect, for example in a template,
+        so the message must say where the request ran. This runs on the error path only.
+        """
+        if getattr(error, "_bolt_route_described", False):
+            return
+        error._bolt_route_described = True
+        route = next((f"{method} {path}" for method, path, route_id, _ in self._routes if route_id == handler_id), None)
+        target = inspect.unwrap(handler)
+        code = getattr(target, "__code__", None)
+        where = f"{target.__module__}.{target.__qualname__}"
+        if code is not None:
+            where += f" ({code.co_filename}:{code.co_firstlineno})"
+        description = f"Route: {route or 'unknown'}. Handler: {where}."
+        error.args = (f"{error.args[0]} {description}", *error.args[1:])
+
+        dev_mode = django_settings.DEBUG or os.environ.get("DJANGO_BOLT_DEV_WORKER") == "1"
+        if dev_mode and handler_id not in self._lane_affinity_hinted:
+            self._lane_affinity_hinted.add(handler_id)
+            logger.warning(
+                "%s reads request.user synchronously on a thread that cannot reach the request lane. %s "
+                "Use `await request.auser()` or a `CurrentUser` parameter. "
+                "Bolt logs this one time for each route.",
+                where,
+                description,
+            )
+
     def _handle_generic_exception(self, e: Exception, request: dict[str, Any] = None) -> Response:
         """Handle generic exception using error_handlers module."""
         # Use the error handler which respects Django DEBUG setting
@@ -2826,6 +2844,8 @@ class BoltAPI:
         except HTTPException as he:
             return self._handle_http_exception(he)
         except Exception as e:
+            if isinstance(e, LaneAffinityError):
+                self._describe_lane_affinity_error(e, handler, handler_id)
             # BlackSheep pattern: only log unhandled exceptions (rare path)
             if self._logging_middleware:
                 self._logging_middleware.log_exception(request, e, exc_info=True)

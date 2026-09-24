@@ -19,12 +19,12 @@ from asyncio.events import _get_running_loop
 from collections.abc import Callable, Coroutine
 from functools import partial
 
-from asgiref.sync import SyncToAsync, ThreadSensitiveContext, sync_to_async
+from asgiref.sync import AsyncToSync, SyncToAsync, ThreadSensitiveContext, sync_to_async
 from django.db import connections
 
 logger = logging.getLogger(__name__)
 
-__all__ = ("in_orm_executor_thread", "run_in_orm_executor", "run_orm_blocking", "sync_to_thread")
+__all__ = ("LaneAffinityError", "in_orm_executor_thread", "run_in_orm_executor", "run_orm_blocking", "sync_to_thread")
 
 
 # Bolt keeps Django connections open across requests and does not run
@@ -313,10 +313,23 @@ def _orm_handoff() -> tuple[concurrent.futures.ThreadPoolExecutor, Callable[...,
 # Bound once: ``run_orm_blocking`` reads it on each forced ``request.user``.
 _thread_sensitive_context = SyncToAsync.thread_sensitive_context
 
+
+class LaneAffinityError(RuntimeError):
+    """A sync ORM call ran away from the lane of a request with Django middleware.
+
+    A thread with no event loop that is not the lane raises it, for example
+    a thread from ``asyncio.to_thread``. That thread cannot wait for the
+    lane, because the lane can wait for it. A request whose lane is gone,
+    for example a task that runs after the response, raises it too. The
+    dispatch of the request adds the route and the handler to the message.
+    """
+
+
 _OFF_LANE_ORM_CALL = (
-    "A sync ORM call, such as a read of request.user, ran away from the thread of a request with "
-    "Django middleware. The query must run on the lane of the request, which keeps its thread-local "
-    "state. In async code, use `await request.auser()`. Or read request.user in a sync handler."
+    "A sync ORM call, such as a read of request.user, ran on a thread that cannot reach the lane of "
+    "a request with Django middleware. The query must run on the lane, which keeps the thread-local "
+    "state of the request. Read request.user on the thread of the request, or use "
+    "`await request.auser()` in async code."
 )
 
 
@@ -335,10 +348,13 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
 
     A request with Django middleware keeps its thread-local state on its
     lane, for example a tenant schema. A query on another thread does not
-    see that state, and a loop that waits for the lane can deadlock. Thus
-    in such a request, a caller that is not on the lane gets ``RuntimeError``.
-    That includes the event loop and a thread from ``asyncio.to_thread``.
-    Code that can await uses ``await request.auser()`` instead.
+    see that state. Thus on the loop of such a request, ``fn`` runs on the
+    lane, and the loop waits for it. The lane can itself wait for the loop
+    in ``async_to_sync``. It then runs work only through its asgiref
+    ``CurrentThreadExecutor``, so ``fn`` goes there, as asgiref sends
+    thread-sensitive work. A thread with no loop that is not the lane gets
+    :class:`LaneAffinityError`: the lane can wait for that thread.
+    ``await request.auser()`` does not block the loop.
 
     Both branches run ``fn`` in a copied context, so ContextVar writes stay
     scoped the same way.
@@ -346,9 +362,18 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     if _get_running_loop() is None:
         if _thread_sensitive_context.get(None) is None or getattr(_lane_state, "is_lane", False):
             return contextvars.copy_context().run(fn, *args)
-        raise RuntimeError(_OFF_LANE_ORM_CALL)
-    if _thread_sensitive_context.get(None) is not None:
-        raise RuntimeError(_OFF_LANE_ORM_CALL)
+        raise LaneAffinityError(_OFF_LANE_ORM_CALL)
+    context = _thread_sensitive_context.get(None)
+    if context is not None:
+        # The loop waits for the lane of the request. Pick the executor that
+        # asgiref picks for thread-sensitive work: a lane that waits for the
+        # loop in async_to_sync runs work only through its CurrentThreadExecutor.
+        executor = getattr(AsyncToSync.executors, "current", None) or SyncToAsync.context_to_thread_executor.get(
+            context
+        )
+        if executor is None:
+            raise LaneAffinityError(_OFF_LANE_ORM_CALL)
+        return executor.submit(contextvars.copy_context().run, _call_guarded, fn, *args).result()
     return _submit_blocking(*_orm_handoff(), fn, *args)
 
 

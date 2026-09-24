@@ -113,7 +113,7 @@ async def show_page(request: Request):
     })
 ```
 
-The `auth` context processor gives the template the `user` of the request. In an async handler behind Django middleware, a template that reads `{{ user }}` raises `RuntimeError`, because the user query must run on the request lane. Load the user first:
+The `auth` context processor gives the template the `user` of the request. In an async handler, a template that reads `{{ user }}` loads the user, and the event loop waits for the query. To not block the loop, load the user first:
 
 ```python
 @api.get("/account")

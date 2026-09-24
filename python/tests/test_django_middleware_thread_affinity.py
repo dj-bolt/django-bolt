@@ -570,12 +570,9 @@ class _ReadUserMiddleware:
         self.get_response = get_response
 
     async def __call__(self, request):
-        try:
-            error = f"none: {request.user.username}"
-        except RuntimeError as exc:
-            error = str(exc)
+        loaded_on = request.user.loaded_on
         response = await self.get_response(request)
-        response.headers["X-Middleware-Error"] = error
+        response.headers["X-Middleware-Loaded-On"] = loaded_on
         return response
 
 
@@ -584,12 +581,11 @@ def _database_auth_token() -> str:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_a_sync_user_read_on_the_event_loop_of_a_lane_request_raises():
-    """The loop cannot reach the lane of the request, so a sync read there raises.
+def test_a_sync_user_read_in_async_middleware_waits_for_the_lane():
+    """A sync read on the event loop runs the query on the lane of the request.
 
-    The query would miss the thread-local state of the Django middleware. The
-    failed read must not leave a user for the handler, which then loads its
-    user on the lane.
+    A query on another thread would miss the thread-local state of the Django
+    middleware, and the handler on the lane would then use that user.
     """
     api = BoltAPI(middleware=[DjangoMiddlewareStack([_NoOpDjangoMiddleware]), _ReadUserMiddleware])
 
@@ -601,8 +597,8 @@ def test_a_sync_user_read_on_the_event_loop_of_a_lane_request_raises():
         response = client.get("/x", headers={"Authorization": f"Bearer {_database_auth_token()}"})
 
     assert response.status_code == 200, response.text
-    assert "await request.auser()" in response.headers["x-middleware-error"]
     body = response.json()
+    assert response.headers["x-middleware-loaded-on"] == body["handler_on"]
     assert body["loaded_on"] == body["handler_on"]
 
 
@@ -906,40 +902,36 @@ def test_sync_user_loader_with_an_async_bridge_completes_when_forced_on_the_even
 
 
 @pytest.mark.django_db(transaction=True)
-def test_a_sync_user_read_in_an_async_handler_of_a_lane_request_raises():
+def test_a_sync_user_read_in_an_async_handler_loads_on_the_lane():
     """An async handler behind Django middleware must not load its user off the lane."""
     api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
     auth = _TenantDatabaseAuth(secret=_TEST_JWT_SECRET)
 
     @api.get("/tenant/{tenant}", auth=[auth])
     async def endpoint(tenant: str, request: Request):
-        try:
-            return {"tenant": request.user.tenant}
-        except RuntimeError as exc:
-            return {"error": str(exc), "tenant": (await request.auser()).tenant}
+        return {"tenant": request.user.tenant, "again": (await request.auser()).tenant}
 
     with TestClient(api, share_db_connection=False) as client:
         response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
 
     assert response.status_code == 200, response.text
-    body = response.json()
-    assert "await request.auser()" in body["error"]
-    assert body["tenant"] == "acme"
+    assert response.json() == {"tenant": "acme", "again": "acme"}
     assert auth.queries == 1
 
 
 @pytest.mark.django_db(transaction=True)
-def test_a_sync_user_read_under_async_to_sync_on_a_lane_raises():
-    """``async_to_sync`` in a lane handler runs its coroutine on a loop away from the lane."""
+def test_a_sync_user_read_under_async_to_sync_on_a_lane_loads_on_the_lane():
+    """``async_to_sync`` in a lane handler runs its coroutine on a loop away from the lane.
+
+    The lane waits for that loop, so the query goes through the
+    ``CurrentThreadExecutor`` of the lane.
+    """
     api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
 
     @api.get("/tenant/{tenant}", auth=[_TenantDatabaseAuth(secret=_TEST_JWT_SECRET)])
     def endpoint(tenant: str, request: Request):
         async def read_sync():
-            try:
-                return request.user.tenant
-            except RuntimeError as exc:
-                return str(exc)
+            return request.user.tenant
 
         async def read_async():
             return (await request.auser()).tenant
@@ -950,9 +942,7 @@ def test_a_sync_user_read_under_async_to_sync_on_a_lane_raises():
         response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
 
     assert response.status_code == 200, response.text
-    body = response.json()
-    assert "await request.auser()" in body["sync"]
-    assert body["async"] == "acme"
+    assert response.json() == {"sync": "acme", "async": "acme"}
 
 
 class _NeitherCapableMiddleware:
@@ -1099,11 +1089,12 @@ def test_a_sync_user_read_on_another_thread_of_a_lane_request_raises(hop):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_template_reads_the_user_that_auser_loaded():
+def test_a_template_reads_the_user_in_an_async_handler():
     """The auth context processor gives a template ``request.user``.
 
-    In an async handler behind Django middleware, the template can read it
-    after ``await request.auser()`` loads it. Without that, the read raises.
+    In an async handler behind Django middleware, the template reads the user
+    that ``await request.auser()`` loaded. Without that, its read waits for
+    the lane and loads the user there.
     """
     template = engines["django"].from_string("{{ user.tenant }}")
     api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
@@ -1116,12 +1107,9 @@ def test_template_reads_the_user_that_auser_loaded():
 
     @api.get("/lazy/{tenant}", auth=[auth])
     async def lazy(tenant: str, request: Request):
-        try:
-            return {"page": template.render({}, request)}
-        except RuntimeError as exc:
-            return {"error": str(exc)}
+        return {"page": template.render({}, request)}
 
     headers = {"Authorization": f"Bearer {_database_auth_token()}"}
     with TestClient(api, share_db_connection=False) as client:
         assert client.get("/loaded/acme", headers=headers).json() == {"page": "acme"}
-        assert "await request.auser()" in client.get("/lazy/acme", headers=headers).json()["error"]
+        assert client.get("/lazy/acme", headers=headers).json() == {"page": "acme"}
