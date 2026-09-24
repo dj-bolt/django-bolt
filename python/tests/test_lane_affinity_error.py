@@ -27,6 +27,16 @@ from django_bolt.testing import TestClient
 SECRET = "lane-affinity-error-secret-longer-than-32-characters"
 
 
+@pytest.fixture(autouse=True)
+def _bolt_logs_reach_caplog(monkeypatch):
+    """Bolt's logging setup stops ``django_bolt`` records at its own handler.
+
+    An earlier test can leave that setup in place. ``caplog`` listens on the
+    root logger, so the records must propagate for these tests.
+    """
+    monkeypatch.setattr(logging.getLogger("django_bolt"), "propagate", True)
+
+
 class _NoOpMiddleware(MiddlewareMixin):
     def process_request(self, request):
         pass
