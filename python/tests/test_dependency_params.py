@@ -1,17 +1,21 @@
 """The parameters of a dependency bind like the parameters of a handler.
 
 Each case runs with an async dependency on an async handler, and with a sync
-dependency on a sync handler (the sync injector).
+dependency on a sync handler (the sync injector). The route also documents
+the parameters and the body of its dependencies in its OpenAPI schema.
 """
 
 from __future__ import annotations
 
 from typing import Annotated
 
+import msgspec
 import pytest
 
-from django_bolt import BoltAPI, Depends
-from django_bolt.param_functions import Cookie, Header, Query
+from django_bolt import BoltAPI, Depends, UploadFile
+from django_bolt.openapi import OpenAPIConfig
+from django_bolt.openapi.schema_generator import SchemaGenerator
+from django_bolt.param_functions import Cookie, File, Form, Header, Query
 from django_bolt.testing import TestClient
 
 
@@ -166,3 +170,148 @@ def test_a_handler_field_keeps_its_type_when_a_dependency_has_the_same_name(clie
     response = client.get("/page-as-text?page=7")
     assert response.status_code == 200, response.text
     assert response.json() == {"page": "7", "number": "7"}
+
+
+class Item(msgspec.Struct):
+    name: str
+    count: int
+
+
+def sync_item(item: Item) -> dict:
+    return {"name": item.name, "count": item.count}
+
+
+async def async_item(item: Item) -> dict:
+    return {"name": item.name, "count": item.count}
+
+
+def sync_form(name: Annotated[str, Form()], count: Annotated[int, Form()] = 0) -> dict:
+    return {"name": name, "count": count}
+
+
+async def async_form(name: Annotated[str, Form()], count: Annotated[int, Form()] = 0) -> dict:
+    return {"name": name, "count": count}
+
+
+UPLOADS: list[UploadFile] = []
+
+
+def sync_upload(upload: Annotated[UploadFile, File(max_size=16)]) -> dict:
+    UPLOADS.append(upload)
+    return {"filename": upload.filename, "size": upload.size}
+
+
+async def async_upload(upload: Annotated[UploadFile, File(max_size=16)]) -> dict:
+    UPLOADS.append(upload)
+    return {"filename": upload.filename, "size": upload.size}
+
+
+def _body_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.post("/async/body")
+    async def async_body_route(item=Depends(async_item)):
+        return item
+
+    @api.post("/sync/body")
+    def sync_body_route(item=Depends(sync_item)):
+        return item
+
+    @api.post("/async/form")
+    async def async_form_route(values=Depends(async_form)):
+        return values
+
+    @api.post("/sync/form")
+    def sync_form_route(values=Depends(sync_form)):
+        return values
+
+    @api.post("/async/upload")
+    async def async_upload_route(values=Depends(async_upload)):
+        return values
+
+    @api.post("/sync/upload")
+    def sync_upload_route(values=Depends(sync_upload)):
+        return values
+
+    @api.get("/documented")
+    async def documented_route(
+        values=Depends(async_values),
+        outer=Depends(async_outer),
+        tenant=Depends(async_required),
+        same_tenant=Depends(sync_required),
+    ):
+        return values
+
+    return api
+
+
+@pytest.fixture(scope="module")
+def body_client():
+    with TestClient(_body_api()) as c:
+        yield c
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_gets_the_json_body(body_client, mode):
+    response = body_client.post(f"/{mode}/body", json={"name": "bolt", "count": 2})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"name": "bolt", "count": 2}
+    assert body_client.post(f"/{mode}/body", json={"name": "bolt"}).status_code == 422
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_gets_typed_form_fields(body_client, mode):
+    response = body_client.post(f"/{mode}/form", data={"name": "bolt", "count": "5"})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"name": "bolt", "count": 5}
+    assert body_client.post(f"/{mode}/form", data={"count": "5"}).status_code == 422
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_gets_an_upload_within_its_constraints(body_client, mode):
+    UPLOADS.clear()
+    response = body_client.post(f"/{mode}/upload", files={"upload": ("a.txt", b"hello", "text/plain")})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"filename": "a.txt", "size": 5}
+    # Bolt closes the upload after the response, as for an upload of a handler.
+    assert UPLOADS and UPLOADS[0]._file.closed is True
+
+    too_big = body_client.post(f"/{mode}/upload", files={"upload": ("b.txt", b"x" * 64, "text/plain")})
+    assert too_big.status_code == 422, too_big.text
+
+
+def test_the_schema_documents_the_parameters_and_body_of_dependencies():
+    schema = SchemaGenerator(_body_api(), OpenAPIConfig(title="Test", version="1")).generate()
+
+    documented = schema.paths["/documented"].get
+    locations = {(p.param_in, p.name) for p in documented.parameters}
+    # From async_values, and once only although async_outer depends on it too.
+    assert {("header", "X-Api-Token"), ("cookie", "theme"), ("query", "page")} <= locations
+    # Two dependencies read the same header: it is documented one time.
+    assert [p.name for p in documented.parameters].count("x-tenant") == 1
+    assert len(documented.parameters) == len(locations)
+
+    body = schema.paths["/async/body"].post.request_body
+    assert body is not None and "application/json" in body.content
+
+    form = schema.paths["/async/form"].post.request_body
+    assert form is not None
+    form_schema = form.content["multipart/form-data"].schema
+    assert set(form_schema.properties) == {"name", "count"}
+    assert form_schema.required == ["name"]
+
+    upload = schema.paths["/async/upload"].post.request_body
+    assert upload is not None and "upload" in upload.content["multipart/form-data"].schema.properties
+
+
+def test_the_schema_names_a_header_as_bolt_reads_it():
+    api = BoltAPI()
+
+    @api.get("/headers")
+    async def headers_route(x_request_id: Annotated[str, Header()], token: Annotated[str, Header(alias="X-Token")]):
+        return {}
+
+    parameters = (
+        SchemaGenerator(api, OpenAPIConfig(title="Test", version="1")).generate().paths["/headers"].get.parameters
+    )
+    assert {(p.param_in, p.name) for p in parameters} == {("header", "x-request-id"), ("header", "X-Token")}

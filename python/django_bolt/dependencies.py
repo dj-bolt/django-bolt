@@ -19,7 +19,10 @@ _SRC_QUERY = 2
 _SRC_HEADER = 3
 _SRC_COOKIE = 4
 _SRC_DEPENDENCY = 5
-_SRC_OTHER = 6
+_SRC_BODY = 6
+_SRC_FORM = 7
+_SRC_FORM_WITH_FILES = 8
+_SRC_FILE = 9
 
 _SOURCE_IDS = {
     "request": _SRC_REQUEST,
@@ -28,26 +31,33 @@ _SOURCE_IDS = {
     "header": _SRC_HEADER,
     "cookie": _SRC_COOKIE,
     "dependency": _SRC_DEPENDENCY,
+    "body": _SRC_BODY,
+    "form": _SRC_FORM,
+    "file": _SRC_FILE,
 }
 
 
 def _compile_dep_arg_plan(dep_meta: dict[str, Any]) -> list[tuple[int, Any, bool, str]]:
     """Compile the per-field extraction plan for a dependency ONCE.
 
-    Each entry is (source_id, extractor, positional, arg_name). A path, query,
-    header or cookie field uses the extractor of its field, as a handler does.
-    So names, aliases, defaults and missing-value errors are the same as for a
-    handler. The markers of nested dependencies go to ``_dep_nested``.
+    Each entry is (source_id, extractor, positional, arg_name). Each field
+    uses the extractor of its field, as a handler does. So names, aliases,
+    defaults and missing-value errors are the same as for a handler. The
+    markers of nested dependencies go to ``_dep_nested``.
     Both are cached in dep_meta, so each request iterates plain tuples.
     """
     plan: list[tuple[int, Any, bool, str]] = []
     nested: list[tuple[str, DependsMarker]] = []
     for field in dep_meta["fields"]:
-        src = _SOURCE_IDS.get(field.source, _SRC_OTHER)
+        src = _SOURCE_IDS.get(field.source)
+        if src is None:
+            raise TypeError(f"Dependency parameter {field.name!r} has an unsupported source {field.source!r}")
         if src == _SRC_DEPENDENCY:
             if field.dependency is None:
                 raise ValueError(f"Depends for parameter {field.name} requires a callable")
             nested.append((field.name, field.dependency))
+        elif src == _SRC_FORM and getattr(field.extractor, "needs_files_map", False):
+            src = _SRC_FORM_WITH_FILES
         plan.append((src, field.extractor, field.kind in _POSITIONAL_KINDS, field.name))
     dep_meta["_dep_nested"] = nested
     dep_meta["_dep_arg_plan"] = plan
@@ -76,14 +86,16 @@ def dependency_needs_event_loop(
     )
 
 
-_TYPED_PARAM_SOURCES = ("path", "query", "header", "cookie")
+_REQUEST_DATA_SOURCES = frozenset(("path", "query", "header", "cookie", "body", "form", "file"))
 
 
-def dependency_param_fields(meta: dict[str, Any], compile_dep_fn: Callable[[Callable], dict[str, Any]]) -> list[Any]:
-    """The path, query, header and cookie fields of each dependency in the tree of ``meta``.
+def dependency_fields(meta: dict[str, Any], compile_dep_fn: Callable[[Callable], dict[str, Any]]) -> list[Any]:
+    """The request data fields of each dependency in the tree of ``meta``.
 
-    Rust converts the values of these fields to their types, as it does for the
-    fields of the handler. Each dependency is visited one time.
+    These are the path, query, header, cookie, body, form and file fields. The
+    route uses them with the fields of its handler: for its parsing flags, for
+    the Rust metadata, and for its OpenAPI schema. Each dependency is visited
+    one time.
     """
     fields: list[Any] = []
     visited: set[int] = set()
@@ -98,7 +110,7 @@ def dependency_param_fields(meta: dict[str, Any], compile_dep_fn: Callable[[Call
                 continue
             visited.add(id(dep_fn))
             dep_meta = compile_dep_fn(dep_fn)
-            fields.extend(f for f in dep_meta["fields"] if f.source in _TYPED_PARAM_SOURCES)
+            fields.extend(f for f in dep_meta["fields"] if f.source in _REQUEST_DATA_SOURCES)
             pending.append(dep_meta)
     return fields
 
@@ -295,8 +307,14 @@ def _bind_dependency_args(
             dval = extractor(cookies_map)
         elif src == _SRC_DEPENDENCY:
             dval = nested_values[name]
+        elif src == _SRC_BODY:
+            dval = extractor(request["body"])
+        elif src == _SRC_FORM:
+            dval = extractor(request.form)
+        elif src == _SRC_FORM_WITH_FILES:
+            dval = extractor(request.form, request.files)
         else:
-            dval = None
+            dval = extractor(request.files)
 
         if positional:
             dep_args.append(dval)

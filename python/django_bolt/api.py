@@ -32,6 +32,7 @@ from ._kwargs import (
     compile_binder,
     compile_websocket_binder,
     extract_response_metadata,
+    field_has_upload_file,
 )
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
@@ -53,7 +54,7 @@ from .concurrency import (
     sync_to_thread,
 )
 from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
-from .dependencies import dependency_param_fields
+from .dependencies import dependency_fields
 from .error_handlers import handle_exception, http_exception_handler
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
@@ -1549,7 +1550,14 @@ class BoltAPI:
                 return compiled
 
             dep_needs = analyze_dependency_tree(meta, _compile_dep)
-            meta["dependency_param_fields"] = dependency_param_fields(meta, _compile_dep)
+            # The request data of the dependencies sets the parsing flags of the route too.
+            dep_fields = dependency_fields(meta, _compile_dep)
+            meta["dependency_fields"] = dep_fields
+            if any(f.source in ("form", "file") for f in dep_fields):
+                meta["needs_form_parsing"] = True
+                meta["needs_headers"] = True
+            if any(f.source == "file" or field_has_upload_file(f) for f in dep_fields):
+                meta["has_file_uploads"] = True
             for needs_key in ("needs_body", "needs_query", "needs_headers", "needs_cookies"):
                 if getattr(dep_needs, needs_key):
                     meta[needs_key] = True
