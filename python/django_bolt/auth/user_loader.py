@@ -88,6 +88,13 @@ class LazyUser(SimpleLazyObject):
         state["_wrapped"] = empty
         state["_aloader"] = loaders[1]
 
+    def __repr__(self) -> str:
+        # The arguments of the loader hold the auth context with the token claims.
+        # A repr can reach a debug page or a log, so it shows the user ID only.
+        if self._wrapped is empty:
+            return f"<LazyUser: user_id={self._setupfunc.args[0]!r}, not loaded>"
+        return f"<LazyUser: {self._wrapped!r}>"
+
     async def aload(self) -> Any:
         if self._wrapped is empty:
             state = self.__dict__

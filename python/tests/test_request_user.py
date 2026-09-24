@@ -202,6 +202,31 @@ class TestJWTUserLoading:
         assert response.status_code == 200, response.text
         assert response.json() == {"auser_is_first": True, "user_is_first": True, "marker": "kept"}
 
+    @pytest.mark.django_db(transaction=True)
+    def test_repr_of_the_lazy_user_hides_the_claims(self):
+        """``repr(request.user)`` can reach a debug page or a log. It must not show the token claims.
+
+        It must not load the user either.
+        """
+        api = BoltAPI(django_middleware=[])
+
+        @api.get("/me", auth=[JWTAuthentication(secret="test-secret")])
+        def me(request):
+            before = repr(request.user)
+            return {"before": before, "after": repr(request.user) if request.user.username else ""}
+
+        user = User.objects.create(username="repr_user")
+        token = create_jwt_token(user_id=str(user.pk), email="private@example.com", role="owner")
+        with TestClient(api) as client:
+            response = client.get("/me", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert "private@example.com" not in body["before"]
+        assert "owner" not in body["before"]
+        assert body["before"] == f"<LazyUser: user_id={str(user.pk)!r}, not loaded>"
+        assert "repr_user" in body["after"]
+
     def test_auser_returns_anonymous_without_authentication(self):
         """The async getter still returns an anonymous user without authentication."""
         api = BoltAPI(django_middleware=[])
