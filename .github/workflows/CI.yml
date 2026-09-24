@@ -14,10 +14,96 @@ permissions:
   contents: read
 
 jobs:
-  # Supported Python versions, parsed from the pyproject.toml classifiers
+  # Find if a pull request changes documentation only. Such a pull request
+  # skips the build and test jobs. The ci-ok job reports one result for all.
+  # Other events (push, tag, workflow_dispatch) always run the full pipeline.
+  changes:
+    name: Detect doc-only changes
+    runs-on: ubuntu-latest
+    outputs:
+      # "true" when every changed file is documentation.
+      docs-only: ${{ steps.classify.outputs.docs-only }}
+      # "true" when docs/ or the docs toolchain changed. This starts the
+      # docs build.
+      docs: ${{ steps.classify.outputs.docs }}
+    steps:
+      # The pull_request checkout is the test merge commit. Depth 2 also
+      # fetches its first parent, the tip of the base branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Classify the changed files
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "Event $EVENT_NAME always runs the full pipeline."
+            echo "docs-only=false" >> "$GITHUB_OUTPUT"
+            echo "docs=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Documentation is docs/** and each *.md file, with two exceptions.
+          # The package readmes are build inputs: `twine check` in the
+          # validate job renders README.md, and the bolt-mcp build reads
+          # python/bolt-mcp/README.md. No other build step or test reads a
+          # Markdown file.
+          is_doc() {
+            case "$1" in
+              README.md | python/bolt-mcp/README.md) return 1 ;;
+              docs/* | *.md) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # --no-renames lists the old and the new path of a moved file.
+          total=0
+          code=0
+          docs=false
+          {
+            echo "### Changed files"
+            echo
+            echo "| File | Class |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r -d '' file; do
+            total=$((total + 1))
+            if is_doc "$file"; then
+              class=doc
+            else
+              class=code
+              code=$((code + 1))
+            fi
+            # uv.lock and pyproject.toml pin the docs toolchain.
+            case "$file" in docs/* | uv.lock | pyproject.toml) docs=true ;; esac
+            echo "$class  $file"
+            echo "| \`$file\` | $class |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(git diff --name-only --no-renames -z HEAD^1 HEAD)
+
+          # An empty diff is not doc-only, so it runs the full pipeline.
+          if [ "$total" -gt 0 ] && [ "$code" -eq 0 ]; then
+            docs_only=true
+          else
+            docs_only=false
+          fi
+          echo "files=$total code=$code docs-only=$docs_only docs=$docs"
+          printf '\ndocs-only=%s, docs=%s\n' "$docs_only" "$docs" >> "$GITHUB_STEP_SUMMARY"
+          echo "docs-only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "docs=$docs" >> "$GITHUB_OUTPUT"
+
+  # Supported Python versions, parsed from the pyproject.toml classifiers.
+  # A doc-only pull request skips this job. Each job that needs it then skips
+  # too: test, server_smoke_linux, server_integration_linux, and the wheels.
   python-versions:
     name: Read Python versions from pyproject.toml
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs-only != 'true'
     outputs:
       # GIL builds only (one abi3 wheel covers them all).
       versions-json: ${{ steps.extract.outputs.versions-json }}
@@ -499,6 +585,8 @@ jobs:
   sdist:
     name: Build source distribution
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs-only != 'true'
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -555,6 +643,8 @@ jobs:
   audit:
     name: Security audit
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs-only != 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -672,6 +762,73 @@ jobs:
         env:
           DJANGO_BOLT_ARTIFACT_PATH: ${{ steps.artifact.outputs.path }}
         run: uv run pytest python/tests/integration/test_artifact_smoke.py -m artifact_smoke -s -vv
+
+  # Build the documentation site when a pull request changes docs/, uv.lock,
+  # or pyproject.toml. This job only builds. The Documentation workflow
+  # deploys on push to master.
+  docs:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "latest"
+
+      # --only-group installs the locked docs group and not the project, so
+      # the Rust extension does not build. This matches `just docs-build`.
+      - name: Build llms-full.txt
+        run: uv run --locked --only-group docs python build_llms_full.py
+        working-directory: docs
+
+      - name: Build the site
+        run: uv run --locked --only-group docs zensical build --clean
+        working-directory: docs
+
+  # One check for branch protection. A skipped job reports one check under its
+  # matrix template name, so a required matrix check never passes. This job
+  # passes when each needed job succeeds or skips. It fails on each other
+  # result, for example failure or cancelled.
+  ci-ok:
+    name: CI OK
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - changes
+      - python-versions
+      - test
+      - server_smoke_linux
+      - server_integration_linux
+      - platform_smoke
+      - linux-amd64
+      - linux-arm64
+      - macos
+      - windows
+      - sdist
+      - validate
+      - audit
+      - artifact_smoke
+      - docs
+
+    steps:
+      - name: Check the results of the needed jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.value.result)  \(.key)"' <<< "$NEEDS"
+          bad=$(jq '[.[] | select(.result != "success" and .result != "skipped")] | length' <<< "$NEEDS")
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$bad needed job(s) did not succeed or skip."
+            exit 1
+          fi
 
   # Release to PyPI
   release:
