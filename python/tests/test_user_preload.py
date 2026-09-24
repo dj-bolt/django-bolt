@@ -8,7 +8,6 @@ of such a user raises, and a loaded user does not.
 from __future__ import annotations
 
 import asyncio
-import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -154,31 +153,21 @@ def _preload_api() -> BoltAPI:
     return api
 
 
-def test_sqlite_with_the_gil_reads_the_user_when_the_handler_does():
-    """A local SQLite query is faster as a blocking read than as an async hand-off under the GIL.
-
-    The test settings use SQLite only. On a free-threaded build, there is no GIL
-    contention, so Bolt loads the user before the handler.
-    """
-    with TestClient(_preload_api()) as client:
-        response = client.get("/me", headers=_headers())
-
-    assert response.status_code == 200, response.text
-    assert response.json() == {"loaded_before_handler": not _gil_enabled(), "username": "bob"}
-
-
-def test_a_networked_database_gets_the_user_loaded_before_the_handler():
-    """With a database that is not SQLite, a blocking read would stall the event loop for longer."""
-    networked = {"default": {"ENGINE": "django.db.backends.postgresql", "NAME": "unused"}}
-    with override_settings(DATABASES=networked):
+@pytest.mark.parametrize(
+    "databases",
+    [None, {"default": {"ENGINE": "django.db.backends.postgresql", "NAME": "unused"}}],
+    ids=["sqlite", "postgresql"],
+)
+def test_the_user_is_loaded_before_the_handler_on_each_database(databases):
+    """The rule does not depend on the database: the tests and production take the same path."""
+    if databases is None:
         api = _preload_api()
+    else:
+        with override_settings(DATABASES=databases):
+            api = _preload_api()
 
     with TestClient(api) as client:
         response = client.get("/me", headers=_headers())
 
     assert response.status_code == 200, response.text
     assert response.json() == {"loaded_before_handler": True, "username": "bob"}
-
-
-def _gil_enabled() -> bool:
-    return getattr(sys, "_is_gil_enabled", lambda: True)()
