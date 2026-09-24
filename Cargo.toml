@@ -32,6 +32,7 @@ base64 = "0.22"  # base64url token-segment decoding for the JWT validation loop
 dashmap = "6"  # Fast concurrent hashmap for rate limiting
 parking_lot = "0.12"  # Fast RwLock for shared state
 serde = { version = "1", features = ["derive"] }
+memchr = "2"  # SIMD byte search for the path param decode check
 serde_json = "1"
 ahash = "0.8"
 # Memory allocators (optional features)

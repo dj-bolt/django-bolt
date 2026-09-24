@@ -127,27 +127,12 @@ pub fn error_400_header_too_large(max_size: usize) -> HttpResponse {
 pub fn error_422_validation(detail: &str) -> HttpResponse {
     // Pre-allocate based on expected size (avoid reallocation)
     let mut body = Vec::with_capacity(32 + detail.len());
-    body.extend_from_slice(br#"{"detail":""#);
-    // The detail echoes client input. Escape quotes, backslashes, and all
-    // control characters, so that the body is always valid JSON.
-    // Bytes of multi-byte UTF-8 characters are 0x80 or more and stay as they are.
-    for byte in detail.bytes() {
-        match byte {
-            b'"' => body.extend_from_slice(br#"\""#),
-            b'\\' => body.extend_from_slice(br#"\\"#),
-            b'\n' => body.extend_from_slice(br#"\n"#),
-            b'\r' => body.extend_from_slice(br#"\r"#),
-            b'\t' => body.extend_from_slice(br#"\t"#),
-            0x00..=0x1F => {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                body.extend_from_slice(br#"\u00"#);
-                body.push(HEX[(byte >> 4) as usize]);
-                body.push(HEX[(byte & 0x0F) as usize]);
-            }
-            _ => body.push(byte),
-        }
-    }
-    body.extend_from_slice(br#""}"#);
+    body.extend_from_slice(br#"{"detail":"#);
+    // The detail echoes client input. serde_json escapes quotes, backslashes,
+    // and all control characters, so the body is always valid JSON.
+    // It copies the unescaped runs as blocks, which is faster than a byte loop.
+    serde_json::to_writer(&mut body, detail).expect("a write to a Vec cannot fail");
+    body.push(b'}');
 
     HttpResponse::UnprocessableEntity()
         .content_type("application/json")
@@ -199,7 +184,7 @@ mod tests {
             serde_json::from_slice(&body).expect("422 body is valid JSON");
         assert_eq!(json["detail"], detail.as_str());
         assert!(body.starts_with(br#"{"detail":"\u0000\u0001"#));
-        let short_forms = br#"\t\n\u000b\u000c\r"#;
+        let short_forms = br#"\t\n\u000b\f\r"#;
         assert!(body.windows(short_forms.len()).any(|w| w == short_forms));
     }
 
