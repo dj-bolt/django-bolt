@@ -865,6 +865,62 @@ Requires a model with `jti` (unique, indexed) and `expires_at`
 `expires_at < now()`. Slower than cache-based stores; only use when you
 don't have a cache layer.
 
+### Custom revocation handler
+
+Pass `revoked_token_handler=` to decide revocation with your own code.
+Bolt calls it for each authenticated request, before the handler runs.
+When it returns `True`, the request gets `401 Unauthorized`.
+
+A handler with one parameter gets the `jti` of the token. A handler with
+two parameters also gets the verified claims. Bolt reads the number of
+parameters one time, at registration.
+
+```python
+async def is_revoked(jti: str) -> bool: ...
+
+async def is_revoked_by_claims(jti: str, claims: dict) -> bool: ...
+```
+
+### Session-bound tokens (django-allauth)
+
+Some issuers bind an access token to a server-side session. For example,
+the JWT token strategy of django-allauth headless puts the session in the
+`sid` claim. When the user logs out, allauth ends that session. Bolt still
+accepts the access token until it expires, because the signature stays
+valid.
+
+To reject the token at logout, check its session in a revocation handler:
+
+```python
+from allauth.headless.tokens.strategies.jwt.internal import get_token_session, validate_token_user
+
+from django_bolt.auth import JWTAuthentication
+from django_bolt.concurrency import sync_to_thread
+
+
+def _session_is_valid(claims: dict) -> bool:
+    session = get_token_session(claims)
+    return session is not None and validate_token_user(claims, session) is not None
+
+
+async def allauth_session_ended(jti: str, claims: dict) -> bool:
+    return not await sync_to_thread(_session_is_valid, claims)
+
+
+auth = JWTAuthentication(revoked_token_handler=allauth_session_ended)
+```
+
+This is the same check as `HEADLESS_JWT_STATEFUL_VALIDATION_ENABLED` in
+allauth. It reads the session for each request. The two functions are in
+an internal module of allauth, so check them when you upgrade allauth.
+
+!!! note "Use HS256 with the same key"
+
+    With `HEADLESS_JWT_ALGORITHM = "HS256"`, allauth signs with `SECRET_KEY`.
+    `JWTAuthentication()` verifies with `SECRET_KEY` by default. For `RS256`,
+    pass `algorithms=["RS256"]` and the public key of `HEADLESS_JWT_PRIVATE_KEY`
+    as `public_key=`.
+
 ### Per-call vs per-instance TTL
 
 `revoke()` resolves the entry's lifetime in this order:

@@ -35,6 +35,7 @@ USERS = {"alice": "alice-password-for-tests-1", "bob": "bob-password-for-tests-2
 PREFIXES = ("", "/single")
 ROUTES = ("/me/sync", "/me/async", "/me/auser", "/me/current", "/me/current-sync")
 TOKEN_ROUTES = ("/token/me/sync", "/token/me/async", "/token/me/current", "/token/me/current-sync")
+SESSION_BOUND_ROUTES = ("/token/session/me/sync", "/token/session/me/current")
 SESSION_TOKEN_ROUTES = ("/me/session-token", "/me/session-token-sync")
 HEADLESS = "/_allauth"
 
@@ -303,3 +304,20 @@ def test_a_headless_app_logout_ends_the_x_session_token(allauth_server):
         for prefix in PREFIXES:
             for route in SESSION_TOKEN_ROUTES:
                 assert client.get(prefix + route, headers=headers).status_code == 401
+
+
+def test_an_allauth_logout_ends_its_access_token_for_bolt_routes(allauth_server):
+    """The /session routes check the session of the token, as allauth's stateful validation does."""
+    meta = _app_login(allauth_server, "alice")
+    with _client(allauth_server) as client:
+        bearer = {"Authorization": f"Bearer {meta['access_token']}"}
+        for route in SESSION_BOUND_ROUTES:
+            assert client.get(route, headers=bearer).json() == {"authenticated": True, "username": "alice"}, route
+
+        response = client.delete(f"{HEADLESS}/app/v1/auth/session", headers={"X-Session-Token": meta["session_token"]})
+        assert response.status_code == 401, response.text
+
+        for route in SESSION_BOUND_ROUTES:
+            assert client.get(route, headers=bearer).status_code == 401, route
+        # A route with no session check accepts the token until it expires.
+        assert client.get("/token/me/current", headers=bearer).status_code == 200

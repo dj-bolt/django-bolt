@@ -17,6 +17,7 @@ Performance: ~60k+ RPS with JWT validation happening entirely in Rust.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sys
 import threading
@@ -37,7 +38,21 @@ from .pk_loader import load_user_by_pk_sync
 from .revocation import create_revocation_handler
 
 # (jti) -> True if the token is revoked, False otherwise.
-RevokedTokenHandler = Callable[[str], Awaitable[bool]]
+RevokedTokenHandler = Callable[[str], Awaitable[bool]] | Callable[[str, dict[str, Any]], Awaitable[bool]]
+
+_POSITIONAL = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+
+
+def revocation_takes_claims(handler: RevokedTokenHandler) -> bool:
+    """Whether a ``revoked_token_handler`` takes the claims as its second argument.
+
+    Bolt reads this one time, at registration.
+    """
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return sum(1 for parameter in parameters if parameter.kind in _POSITIONAL) >= 2
 
 
 @dataclass
@@ -126,6 +141,12 @@ class JWTAuthentication(BaseAuthentication):
         audience: Optional JWT audience claim to validate. Required with
             ``jwks_url`` to prevent cross-application token substitution.
         issuer: Optional JWT issuer claim to validate
+        revoked_token_handler: Async callable that returns True when a token is
+            revoked. Bolt calls it for each authenticated request, with the
+            ``jti`` of the token: ``handler(jti)``. A handler with two
+            parameters also gets the verified claims: ``handler(jti, claims)``.
+            Use the claims to reject a token whose session ended, for example
+            the ``sid`` of a django-allauth access token.
         public_key: PEM-encoded public key for asymmetric algorithms
             (RS*/PS*/ES*/EdDSA). Preferred over passing a PEM via ``secret``
             (which also works, for compatibility). Mutually exclusive with

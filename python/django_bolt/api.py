@@ -38,6 +38,7 @@ from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler
 from .auth import get_default_authentication_classes, register_auth_backend
+from .auth.backends import revocation_takes_claims
 from .auth.user_loader import (
     DEFAULT_USER_LOADERS,
     LazyUser,
@@ -1792,10 +1793,10 @@ class BoltAPI:
                 meta["_handler_executor"] = _with_preloaded_user(meta["_handler_executor"])
                 meta.pop("_sync_executor", None)
 
-            # scheme_name → handler. Lookup at dispatch is O(1) via the
-            # matched backend's name. None when no backend has revocation.
-            revocation_handlers: dict[str, Callable] = {
-                b.scheme_name: b.revoked_token_handler
+            # scheme_name → (handler, takes_claims). Lookup at dispatch is O(1)
+            # via the matched backend's name. None when no backend has revocation.
+            revocation_handlers: dict[str, tuple[Callable, bool]] = {
+                b.scheme_name: (b.revoked_token_handler, revocation_takes_claims(b.revoked_token_handler))
                 for b in effective_auth_backends
                 if getattr(b, "revoked_token_handler", None) is not None
             }
@@ -2843,17 +2844,19 @@ class BoltAPI:
     async def _check_revocation(
         self,
         auth_context: dict[str, Any],
-        revocation_handlers: dict[str, Callable],
+        revocation_handlers: dict[str, tuple[Callable, bool]],
     ) -> None:
-        """Reject the request if the authenticated token's JTI is revoked."""
-        handler = revocation_handlers.get(auth_context["auth_backend"])
-        if handler is None:
+        """Reject the request if the authenticated token is revoked."""
+        entry = revocation_handlers.get(auth_context["auth_backend"])
+        if entry is None:
             # Matched backend has no revocation (e.g., API-key auth on a
             # route where only JWT configured one).
             return
+        handler, takes_claims = entry
 
         # When auth_context is set, Rust guarantees auth_claims is too.
-        jti = auth_context["auth_claims"].get("jti")
+        claims = auth_context["auth_claims"]
+        jti = claims.get("jti")
         if not jti:
             # Without a JTI we cannot identify which token to check.
             # Rejecting is safer than silently honoring.
@@ -2861,7 +2864,8 @@ class BoltAPI:
                 status_code=401,
                 detail="Token missing 'jti' claim required for revocation",
             )
-        if await handler(jti):
+        revoked = await handler(jti, claims) if takes_claims else await handler(jti)
+        if revoked:
             raise HTTPException(status_code=401, detail="Token has been revoked")
 
     async def _dispatch(self, handler: Callable, request: dict[str, Any], handler_id: int = None) -> Response:

@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 - **Dev-mode report of a blocking `request.user` read** - A read in a helper or a template is not in the source of the handler, so it blocks the event loop for the query. With `DEBUG = True` or `runbolt --dev`, Bolt logs each such read that blocks the loop for more than 50 ms. The log names the file and the line, one time for each line.
 - **`LaneAffinityError` names the route** - A sync read of `request.user` on a thread that cannot reach the request lane raises `LaneAffinityError`, a subclass of `RuntimeError` (see Changed). Its message names the route and the handler, with the file and the line. With `DEBUG = True` or `runbolt --dev`, Bolt also logs the fix one time for each route.
 
+- **A `revoked_token_handler` can read the claims of the token** - A handler with two parameters gets the verified claims: `handler(jti, claims)`. A handler with one parameter still gets the `jti` only. Bolt reads the number of parameters one time, at registration. Use it to reject a token whose session ended. For example, a django-allauth access token names its session in `sid`, and allauth ends that session at logout. See [Session-bound tokens](docs/src/topics/authentication.md#session-bound-tokens-django-allauth).
+
 ### Removed
 
 - **Django 4.2, 5.0, and 5.1** - All three reached end of life upstream (5.0 in April 2025, 5.1 in December 2025, 4.2 LTS in April 2026) and are no longer supported. The minimum is now Django 5.2 LTS, and the supported series are 5.2, 6.0, and 6.1. Projects on an end-of-life Django receive no upstream security fixes; pin `django-bolt<0.12` if you cannot upgrade Django yet.
