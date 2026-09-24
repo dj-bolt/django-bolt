@@ -27,6 +27,8 @@ Only a server project with allauth installed can import this module (see
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from allauth.headless.internal.sessionkit import authenticate_by_x_session_token
 from asgiref.sync import sync_to_async
 
@@ -34,6 +36,7 @@ from django_bolt import BoltAPI, CurrentUser, Depends, OptionalCurrentUser, Requ
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.exceptions import Unauthorized
 from django_bolt.middleware import DjangoMiddleware
+from django_bolt.param_functions import Header
 
 DJANGO_MIDDLEWARE = [
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -59,15 +62,16 @@ def _session_token_user(found: tuple | None):
     return found[0]
 
 
-def session_token_user(request: Request):
+SessionToken = Annotated[str | None, Header(alias="X-Session-Token")]
+
+
+def session_token_user(token: SessionToken = None):
     """The user of an allauth app session. The ORM query runs in the thread of a sync handler."""
-    token = request.headers.get("x-session-token")
     return _session_token_user(authenticate_by_x_session_token(token) if token else None)
 
 
-async def asession_token_user(request: Request):
+async def asession_token_user(token: SessionToken = None):
     """The async form, for an async handler. Behind the stack, ``sync_to_async`` runs the query on the lane."""
-    token = request.headers.get("x-session-token")
     found = await sync_to_async(authenticate_by_x_session_token)(token) if token else None
     return _session_token_user(found)
 

@@ -37,6 +37,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The parameters of a dependency bind like the parameters of a handler** - A dependency used its own copy of the parameter binding, which had these bugs:
+  - A `Header()` parameter such as `x_api_version` looked up `x_api_version`, not the `x-api-version` header. So it never found the header.
+  - A default value was ignored. A missing header or cookie raised `ValueError`, which became a 500, and a missing query value became `None`.
+  - Query and path values were not converted to their types, so `page: int` got a string.
+  - A nested dependency (`def outer(values=Depends(inner))`) got `None`, and so did the dependencies below it.
+  A dependency now uses the same extractors as a handler. It gets the same names, aliases, defaults, type conversion and 422 errors. When a handler parameter and a dependency parameter have the same name, the handler keeps its type. A sync handler uses the sync injector only when no dependency in its tree is async.
 - **`JWTAuthentication` rejects the refresh tokens of other issuers** - A route with no `token_type` rejected a token with `typ: "refresh"` only. Other issuers put the token type in other claims: `token_type` (djangorestframework-simplejwt) and `token_use` (django-allauth headless, AWS Cognito). When such an issuer signs with the same key, its refresh token authenticated each Bolt route as an access token. For example, allauth signs with `SECRET_KEY` for `HS256`, and so does `JWTAuthentication` by default. A route with no `token_type` now rejects a token when any of these claims is `"refresh"`. A route with a `token_type` also rejects a token when one of these claims has a different type.
 - **The test clients close the database connections of their lanes at exit** - A lane keeps its connection open for 10 seconds after a test. With `@pytest.mark.django_db(transaction=True)` on PostgreSQL, pytest-django then could not drop the test database ("database is being accessed by other users"). `TestClient` and `AsyncTestClient` now stop their idle lanes at exit.
 - **Django middleware state stays with its request** - Middleware that keeps request state in `threading.local`, such as the tenant schema of django-tenants, leaked that state between concurrent requests. Bolt now gives each request with Django middleware one thread for its sync work, as Django's ASGI handler does. The middleware, sync handlers, `sync_to_thread`, QuerySet evaluation, and Django's async ORM calls of one request all use that thread.

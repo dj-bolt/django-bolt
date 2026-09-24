@@ -392,6 +392,13 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
             if constraints:
                 file_constraints[field.name] = constraints
 
+    # Rust also converts the path and query values of dependencies. A handler
+    # field with the same name keeps its own type.
+    handler_param_names = {field.name for field in fields if field.source in ("path", "query", "header", "cookie")}
+    for field in handler_meta.get("dependency_param_fields", ()):
+        if field.name not in handler_param_names:
+            _extract_type_hints_from_field(field, param_types, skip_string=True)
+
     if param_types:
         metadata["param_types"] = param_types
 

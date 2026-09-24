@@ -16,7 +16,7 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 import msgspec
 
 from ..analysis import resolve_introspection_target
-from ..dependencies import resolve_dependency, resolve_dependency_sync
+from ..dependencies import dependency_needs_event_loop, resolve_dependency, resolve_dependency_sync
 from ..params import Depends as DependsMarker
 from ..params import Param
 from ..typing import (
@@ -702,7 +702,10 @@ def compile_argument_injector(
         _async_dep_fns = []
         for idx in _dep_indices:
             dep = _dep_plan[idx][5]  # dependency marker
-            if dep is not None and inspect.iscoroutinefunction(dep.dependency):
+            # A sync dependency of an async dependency also needs the async injector.
+            if dep is not None and dependency_needs_event_loop(
+                dep.dependency, handler_meta_dict, compile_binder_fn, http_method, path
+            ):
                 _async_dep_fns.append(idx)
         _can_parallel = len(_async_dep_fns) >= 2
 

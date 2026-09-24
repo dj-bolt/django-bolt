@@ -53,6 +53,7 @@ from .concurrency import (
     sync_to_thread,
 )
 from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
+from .dependencies import dependency_param_fields
 from .error_handlers import handle_exception, http_exception_handler
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
@@ -1548,6 +1549,7 @@ class BoltAPI:
                 return compiled
 
             dep_needs = analyze_dependency_tree(meta, _compile_dep)
+            meta["dependency_param_fields"] = dependency_param_fields(meta, _compile_dep)
             for needs_key in ("needs_body", "needs_query", "needs_headers", "needs_cookies"):
                 if getattr(dep_needs, needs_key):
                     meta[needs_key] = True
