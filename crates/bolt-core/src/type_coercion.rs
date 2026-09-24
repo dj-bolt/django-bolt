@@ -14,6 +14,8 @@ use uuid::Uuid;
 // Each import costs ~50-100ns, caching eliminates this overhead for repeated coercions
 static UUID_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static DECIMAL_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static OBJECT_NEW: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SAFE_UUID_UNKNOWN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 #[inline]
 pub fn get_uuid_class(py: Python<'_>) -> &Py<PyAny> {
@@ -646,12 +648,53 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
 }
 
 /// Build a Python `uuid.UUID` from the parsed 128-bit value.
+///
+/// `uuid.UUID(int=...)` runs the Python `__init__`, which checks its arguments
+/// again. This function builds the object as CPython 3.14 `UUID._from_int` does:
+/// `object.__new__(UUID)`, then it sets the `int` and `is_safe` slots.
+/// `UUID.__setattr__` blocks assignment, so the slots are set with the generic
+/// setter, as `object.__setattr__` does. The 128-bit value is always in range.
 #[inline]
 pub fn uuid_to_py(py: Python<'_>, v: uuid::Uuid) -> PyResult<Py<PyAny>> {
-    let kwargs = PyDict::new(py);
-    kwargs.set_item(pyo3::intern!(py, "int"), v.as_u128())?;
-    Ok(get_uuid_class(py)
-        .bind(py)
-        .call((), Some(&kwargs))?
-        .unbind())
+    let object_new = OBJECT_NEW.get_or_init(py, || {
+        py.import("builtins")
+            .unwrap()
+            .getattr("object")
+            .unwrap()
+            .getattr("__new__")
+            .unwrap()
+            .unbind()
+    });
+    let safe_unknown = SAFE_UUID_UNKNOWN.get_or_init(py, || {
+        py.import("uuid")
+            .unwrap()
+            .getattr("SafeUUID")
+            .unwrap()
+            .getattr("unknown")
+            .unwrap()
+            .unbind()
+    });
+    let value = object_new.bind(py).call1((get_uuid_class(py).bind(py),))?;
+    let int = v.as_u128().into_pyobject(py)?;
+    set_slot(&value, pyo3::intern!(py, "int"), int.as_any())?;
+    set_slot(&value, pyo3::intern!(py, "is_safe"), safe_unknown.bind(py))?;
+    Ok(value.unbind())
+}
+
+/// Set an attribute with the generic setter, as `object.__setattr__` does.
+#[inline]
+fn set_slot(
+    object: &pyo3::Bound<'_, PyAny>,
+    name: &pyo3::Bound<'_, pyo3::types::PyString>,
+    value: &pyo3::Bound<'_, PyAny>,
+) -> PyResult<()> {
+    // SAFETY: the three pointers are valid for the call: the Bound references keep them alive.
+    let status = unsafe {
+        pyo3::ffi::PyObject_GenericSetAttr(object.as_ptr(), name.as_ptr(), value.as_ptr())
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(pyo3::PyErr::fetch(object.py()))
+    }
 }
