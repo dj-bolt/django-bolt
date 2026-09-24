@@ -3,13 +3,15 @@
 This file tests the TestClient (V2) that routes through Rust with per-instance state.
 """
 
+import asyncio
 from typing import Annotated
 
 import msgspec
+import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, _core
 from django_bolt.param_functions import Header
-from django_bolt.testing import TestClient
+from django_bolt.testing import AsyncTestClient, TestClient
 
 
 def test_simple_get_request():
@@ -146,3 +148,57 @@ def test_status_code():
         response = client.post("/created")
         assert response.status_code == 201
         assert response.json() == {"created": True}
+
+
+def _percent_encoded_path_api():
+    api = BoltAPI()
+
+    @api.get("/int/{value}")
+    async def get_int(value: int):
+        return {"value": value}
+
+    @api.get("/str/{value}")
+    async def get_str(value: str):
+        return {"value": value}
+
+    return api
+
+
+def test_percent_encoded_path_params():
+    """The client sends the encoded path, and Bolt decodes path params as in production."""
+    with TestClient(_percent_encoded_path_api()) as client:
+        response = client.get("/int/%0A")
+        assert response.status_code == 422
+
+        response = client.get("/str/hello%20world")
+        assert response.status_code == 200
+        assert response.json() == {"value": "hello world"}
+
+        response = client.get("/str/a%2Fb")
+        assert response.status_code == 200
+        assert response.json() == {"value": "a/b"}
+
+
+def test_percent_encoded_path_params_async_client():
+    """AsyncTestClient sends the encoded path too."""
+
+    async def run():
+        async with AsyncTestClient(_percent_encoded_path_api()) as client:
+            bad = await client.get("/int/%09")
+            spaced = await client.get("/str/hello%20world")
+            return bad.status_code, spaced.status_code, spaced.json()
+
+    assert asyncio.run(run()) == (422, 200, {"value": "hello world"})
+
+
+def test_invalid_uri_raises_value_error():
+    """The Rust test backend rejects a URI that is not valid, and does not panic."""
+    with TestClient(_percent_encoded_path_api()) as client, pytest.raises(ValueError, match="Invalid request URI"):
+        _core.test_request(
+            app_id=client.app_id,
+            method="GET",
+            path="/int/\n",
+            headers=[],
+            body=b"",
+            query_string=None,
+        )

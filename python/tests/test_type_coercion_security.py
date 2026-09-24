@@ -1163,3 +1163,10 @@ class TestValidationErrorBodyIsJson:
         assert response.status_code == 422
         detail = response.json()["detail"]
         assert f"'{decoded}'" in detail
+
+    @pytest.mark.parametrize(("raw", "decoded"), [("%0A", "\n"), ("%09", "\t")])
+    def test_path_int_error_with_control_char(self, client, raw, decoded):
+        response = client.get(f"/int/{raw}")
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert f"'{decoded}'" in detail
