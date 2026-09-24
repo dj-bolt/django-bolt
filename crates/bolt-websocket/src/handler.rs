@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 
 use bolt_core::metadata::CorsConfig;
+use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::state::{AppState, ROUTE_METADATA};
 use bolt_core::type_coercion::coerced_value_to_py;
@@ -444,6 +445,19 @@ fn is_origin_allowed(
     false
 }
 
+/// Await the revocation check of a WebSocket route on this thread's WorkerLoop.
+async fn token_revoked(check: &Py<PyAny>, auth_ctx: &AuthContext) -> PyResult<bool> {
+    let future = Python::attach(|py| -> PyResult<_> {
+        let context = PyDict::new(py).unbind();
+        populate_auth_context(&context, auth_ctx, py);
+        let coro = check.call1(py, (context,))?;
+        let locals = bolt_loop::worker_task_locals(py)?;
+        pyo3_async_runtimes::into_future_with_locals(&locals, coro.bind(py).clone())
+    })?;
+    let revoked = future.await?;
+    Python::attach(|py| revoked.extract::<bool>(py))
+}
+
 /// HTTP handler for WebSocket upgrade with full Python integration
 ///
 /// Handles:
@@ -557,6 +571,21 @@ pub async fn handle_websocket_upgrade_with_handler(
                             req.path(),
                         ) {
                             return Ok(response);
+                        }
+                    }
+                    // A revoked token fails the handshake, as on an HTTP route.
+                    if let (Some(check), Some(auth_ctx)) =
+                        (route_meta.websocket_revocation_check.as_ref(), ctx.as_ref())
+                    {
+                        match token_revoked(check, auth_ctx).await {
+                            Ok(false) => {}
+                            Ok(true) => return Ok(bolt_core::responses::error_401()),
+                            Err(e) => {
+                                eprintln!("[django-bolt] WebSocket revocation check error: {}", e);
+                                return Ok(HttpResponse::InternalServerError()
+                                    .content_type("application/json")
+                                    .body(r#"{"detail":"Revocation check failed"}"#));
+                            }
                         }
                     }
                 }

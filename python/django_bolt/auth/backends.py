@@ -388,10 +388,6 @@ class JWTAuthentication(BaseAuthentication):
                 metadata["jwks_refresh"] = self._refresh_jwks
                 metadata["jwks_refresh_interval"] = self.jwks_refresh_interval
 
-        # Add revocation handler reference (will be called from Rust if present)
-        if self.revoked_token_handler:
-            metadata["has_revocation_handler"] = True
-
         return metadata
 
     async def get_user(self, user_id: str | None, auth_context: dict[str, Any]) -> Any | None:
