@@ -236,9 +236,14 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
             .map_err(|e| format!("Invalid float '{}': {}", value, e)),
 
         TYPE_BOOL => {
-            let lower = value.to_lowercase();
-            let is_true = matches!(lower.as_str(), "true" | "1" | "yes" | "on");
-            let is_false = matches!(lower.as_str(), "false" | "0" | "no" | "off");
+            // Compare without case. This does not allocate a lowercase copy of the value.
+            let is_true = ["true", "1", "yes", "on"]
+                .iter()
+                .any(|token| value.eq_ignore_ascii_case(token));
+            let is_false = !is_true
+                && ["false", "0", "no", "off"]
+                    .iter()
+                    .any(|token| value.eq_ignore_ascii_case(token));
             if is_true {
                 Ok(CoercedValue::Bool(true))
             } else if is_false {
@@ -407,6 +412,24 @@ mod tests {
 
     #[test]
     fn test_coerce_bool() {
+        for (value, expected) in [
+            ("TRUE", true),
+            ("Yes", true),
+            ("ON", true),
+            ("OFF", false),
+            ("No", false),
+        ] {
+            assert!(
+                matches!(coerce_param(value, TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Bool(b)) if b == expected),
+                "{value}"
+            );
+        }
+        for value in ["tru", "yess", "", "on "] {
+            assert!(
+                coerce_param(value, TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH).is_err(),
+                "{value}"
+            );
+        }
         assert!(matches!(
             coerce_param("true", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(true))

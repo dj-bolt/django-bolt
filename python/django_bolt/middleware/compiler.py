@@ -196,55 +196,41 @@ def compile_middleware_meta(
     return result
 
 
-def _extract_type_hints_from_field(field: Any, target: dict[str, int], skip_string: bool = False) -> None:
-    """Extract type hints from a field (struct or individual) into target dict.
-
-    For struct fields, registers both the attribute name and the encoded name
-    (for msgspec field aliases and rename strategies).
-    """
-    unwrapped = unwrap_optional(field.annotation)
-    if is_msgspec_struct(unwrapped):
-        for struct_field in msgspec.structs.fields(unwrapped):
-            struct_type_hint = get_type_hint_id(struct_field.type)
-            if skip_string and struct_type_hint == TYPE_STRING:
-                continue
-            target[struct_field.name] = struct_type_hint
-            encoded_name = getattr(struct_field, "encode_name", struct_field.name)
-            if encoded_name != struct_field.name:
-                target[encoded_name] = struct_type_hint
-    else:
-        type_hint = get_type_hint_id(field.annotation)
-        if skip_string and type_hint == TYPE_STRING:
-            return
-        target[field.name] = type_hint
-
-
 def _header_wire_name(name: str) -> str:
     """Return the HTTP header name that the header extractors look up."""
     return name.lower().replace("_", "-")
 
 
-def _extract_wire_type_hints(field: Any, target: dict[str, int], header: bool) -> None:
-    """Put the non-string type hints of a header or cookie field into target.
+def _extract_type_hints_from_field(field: Any, claims: dict[str, tuple[str, int]]) -> None:
+    """Record the type hint of each wire key that a field reads.
 
-    The keys are the wire names that the extractors look up. A header key is
-    lowercase with hyphens. A cookie key is the alias or the name as written.
-    For struct fields, the key comes from the msgspec encoded name.
+    Rust converts a value by the key that arrives on the wire. Thus the key is
+    the name that the extractor reads: the alias or the name, the msgspec
+    encoded name for struct fields, and the lowercase hyphen form for headers.
+    ``claims`` maps each wire key to the parameter that declared it and its type hint.
+
+    Raises:
+        TypeError: Two parameters read one wire key with different types.
+            Rust converts a wire value one time, so one of them would get the wrong type.
     """
     unwrapped = unwrap_optional(field.annotation)
     if is_msgspec_struct(unwrapped):
-        for struct_field in msgspec.structs.fields(unwrapped):
-            type_hint = get_type_hint_id(struct_field.type)
-            if type_hint == TYPE_STRING:
-                continue
-            encoded_name = struct_field.encode_name
-            target[_header_wire_name(encoded_name) if header else encoded_name] = type_hint
-        return
-    type_hint = get_type_hint_id(field.annotation)
-    if type_hint == TYPE_STRING:
-        return
-    wire_name = field.alias or field.name
-    target[_header_wire_name(wire_name) if header else wire_name] = type_hint
+        entries = [
+            (f"{field.name}.{struct_field.name}", struct_field.encode_name, struct_field.type)
+            for struct_field in msgspec.structs.fields(unwrapped)
+        ]
+    else:
+        entries = [(field.name, field.alias or field.name, field.annotation)]
+
+    for label, wire_name, annotation in entries:
+        key = _header_wire_name(wire_name) if field.source == "header" else wire_name
+        type_hint = get_type_hint_id(annotation)
+        owner, owner_type_hint = claims.setdefault(key, (label, type_hint))
+        if owner_type_hint != type_hint:
+            raise TypeError(
+                f"Parameters '{owner}' and '{label}' read the same {field.source} key '{key}' "
+                f"with different types. Give them the same type or different aliases."
+            )
 
 
 _SEQUENCE_ORIGINS_FOR_FORM = (list, set, frozenset, tuple)
@@ -387,30 +373,30 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
 
     # Extract type hints for all parameter sources
     # This enables Rust-side type coercion, eliminating Python overhead
-    # Format: {"param_name": type_hint_id, ...}
+    # Format: {"wire_key": type_hint_id, ...}
     # Each source has its own map, so a header and a query parameter with
-    # the same name do not clash. Header and cookie maps use wire names.
-    param_types: dict[str, int] = {}
-    header_types: dict[str, int] = {}
-    cookie_types: dict[str, int] = {}
-    form_type_hints: dict[str, int] = {}
+    # the same name do not clash. Path and query share one map in Rust.
+    param_claims: dict[str, tuple[str, int]] = {}
+    header_claims: dict[str, tuple[str, int]] = {}
+    cookie_claims: dict[str, tuple[str, int]] = {}
+    form_claims: dict[str, tuple[str, int]] = {}
     form_seq_fields: set[str] = set()
     file_constraints: dict[str, dict[str, Any]] = {}
 
     fields = handler_meta.get("fields", [])
     for field in fields:
         if field.source in ("path", "query"):
-            _extract_type_hints_from_field(field, param_types, skip_string=True)
+            _extract_type_hints_from_field(field, param_claims)
 
         elif field.source == "header":
-            _extract_wire_type_hints(field, header_types, header=True)
+            _extract_type_hints_from_field(field, header_claims)
 
         elif field.source == "cookie":
-            _extract_wire_type_hints(field, cookie_types, header=False)
+            _extract_type_hints_from_field(field, cookie_claims)
 
         # Form fields - extract type hints for Rust-side form parsing
         elif field.source == "form":
-            _extract_type_hints_from_field(field, form_type_hints, skip_string=False)
+            _extract_type_hints_from_field(field, form_claims)
             _collect_form_seq_field_names(field, form_seq_fields)
 
         # File fields - extract constraints for Rust-side validation
@@ -429,14 +415,17 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
             if constraints:
                 file_constraints[field.name] = constraints
 
-    if param_types:
-        metadata["param_types"] = param_types
+    # Rust keeps string values as they are, so leave string keys out of these maps.
+    for metadata_key, claims in (
+        ("param_types", param_claims),
+        ("header_types", header_claims),
+        ("cookie_types", cookie_claims),
+    ):
+        type_hints = {key: type_hint for key, (_, type_hint) in claims.items() if type_hint != TYPE_STRING}
+        if type_hints:
+            metadata[metadata_key] = type_hints
 
-    if header_types:
-        metadata["header_types"] = header_types
-
-    if cookie_types:
-        metadata["cookie_types"] = cookie_types
+    form_type_hints = {key: type_hint for key, (_, type_hint) in form_claims.items()}
 
     if form_type_hints:
         metadata["form_type_hints"] = form_type_hints
