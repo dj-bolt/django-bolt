@@ -47,7 +47,9 @@ use bolt_core::request_pipeline::{
 };
 use bolt_core::static_files::handle_file;
 use bolt_core::type_coercion::coerced_value_to_py;
-use bolt_core::type_coercion::{coerce_param, string_map_to_py_dict, CoerceError, TYPE_STRING};
+use bolt_core::type_coercion::{
+    coerce_param, string_map_to_py_dict, CoerceError, TypeHints, TYPE_STRING,
+};
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
@@ -861,7 +863,7 @@ async fn handle_test_request_internal(
             Err(response) => return response,
         }
     } else {
-        (None, None)
+        (Vec::new(), Vec::new())
     };
 
     // Extract headers
@@ -963,7 +965,7 @@ async fn handle_test_request_internal(
     };
 
     // Validate and pre-coerce the header and cookie values that Python receives.
-    let empty_types: &HashMap<String, u8> = &EMPTY_TYPES;
+    let empty_types: &TypeHints = &EMPTY_TYPES;
     let header_types = route_meta.as_ref().map_or(empty_types, |m| &m.header_types);
     let cookie_types = route_meta.as_ref().map_or(empty_types, |m| &m.cookie_types);
     let headers_coerced = if needs_headers {
@@ -972,7 +974,7 @@ async fn handle_test_request_internal(
             Err(response) => return response,
         }
     } else {
-        None
+        Vec::new()
     };
     let cookies_coerced = if needs_cookies {
         match validate_and_cache_source(&cookies, cookie_types, max_param_length, "Cookie") {
@@ -980,7 +982,7 @@ async fn handle_test_request_internal(
             Err(response) => return response,
         }
     } else {
-        None
+        Vec::new()
     };
 
     // Form parsing (URL-encoded and multipart)
@@ -1138,33 +1140,25 @@ async fn handle_test_request_internal(
         // Create typed dicts - reuse pre-coerced values from the validation phase.
         let path_params_dict = match path_params.as_ref() {
             Some(path_params) => {
-                Some(string_map_to_py_dict(py, path_params, path_coerced.as_ref())?.unbind())
+                Some(string_map_to_py_dict(py, path_params, &path_coerced)?.unbind())
             }
             None => None,
         };
 
         let query_params_dict = match query_params.as_ref() {
             Some(query_params) => {
-                Some(string_map_to_py_dict(py, query_params, query_coerced.as_ref())?.unbind())
+                Some(string_map_to_py_dict(py, query_params, &query_coerced)?.unbind())
             }
             None => None,
         };
 
         let headers_dict = if needs_headers {
-            Some(string_map_to_py_dict(
-                py,
-                &headers,
-                headers_coerced.as_ref(),
-            )?)
+            Some(string_map_to_py_dict(py, &headers, &headers_coerced)?)
         } else {
             None
         };
         let cookies_dict = if needs_cookies {
-            Some(string_map_to_py_dict(
-                py,
-                &cookies,
-                cookies_coerced.as_ref(),
-            )?)
+            Some(string_map_to_py_dict(py, &cookies, &cookies_coerced)?)
         } else {
             None
         };
@@ -1447,7 +1441,7 @@ pub fn handle_test_websocket(
 
     // Get type hints from route metadata for type coercion
     let ws_route_meta = app.route_metadata.get(handler_id);
-    let empty_types: &HashMap<String, u8> = &EMPTY_TYPES;
+    let empty_types: &TypeHints = &EMPTY_TYPES;
     let param_types = ws_route_meta.map_or(empty_types, |m| &m.param_types);
     let header_types = ws_route_meta.map_or(empty_types, |m| &m.header_types);
     let cookie_types = ws_route_meta.map_or(empty_types, |m| &m.cookie_types);

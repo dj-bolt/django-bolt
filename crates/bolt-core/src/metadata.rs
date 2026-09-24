@@ -17,6 +17,7 @@ use crate::middleware::auth::{
     RefreshingJwks,
 };
 use crate::permissions::{ClaimKey, Guard, GuardDenial, GuardSet, Quantifier};
+use crate::type_coercion::TypeHints;
 
 /// Request value source for Rust-side argument prebinding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,12 +532,12 @@ pub struct RouteMetadata {
 
     // Type hints for path/query parameters (enables Rust-side type coercion)
     // Maps parameter name to type hint constant (see type_coercion.rs)
-    pub param_types: HashMap<String, u8>,
+    pub param_types: TypeHints,
     // Type hints for header and cookie parameters, keyed by wire name.
     // A header key is lowercase with hyphens. A cookie key is the cookie name.
     // Only non-string types are present.
-    pub header_types: HashMap<String, u8>,
-    pub cookie_types: HashMap<String, u8>,
+    pub header_types: TypeHints,
+    pub cookie_types: TypeHints,
 
     // Form-related metadata for Rust-side form parsing
     pub form_type_hints: HashMap<String, u8>,
@@ -672,26 +673,11 @@ impl RouteMetadata {
         // Parse param_types for Rust-side type coercion
         // Format: {"param_name": type_hint_id, ...}
         // Type hint IDs match type_coercion.rs constants (TYPE_INT=1, TYPE_FLOAT=2, etc.)
-        let param_types: HashMap<String, u8> = py_meta
-            .get_item("param_types")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
-            .unwrap_or_default();
+        let param_types = extract_type_hints(py_meta, "param_types");
 
         // Header and cookie type hints use the same format, keyed by wire name.
-        let header_types: HashMap<String, u8> = py_meta
-            .get_item("header_types")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
-            .unwrap_or_default();
-        let cookie_types: HashMap<String, u8> = py_meta
-            .get_item("cookie_types")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
-            .unwrap_or_default();
+        let header_types = extract_type_hints(py_meta, "header_types");
+        let cookie_types = extract_type_hints(py_meta, "cookie_types");
 
         // Parse form-related metadata for Rust-side form parsing
         let needs_form_parsing = py_meta
@@ -1238,6 +1224,18 @@ fn parse_file_constraints(
 ///
 /// `required` defaults to true and `inject_none` to false so older metadata
 /// shapes keep the strict all-or-nothing behavior.
+/// Parse a `{"name": type_hint_id}` dict into `TypeHints`.
+/// Type hint IDs match type_coercion.rs constants (TYPE_INT=1, TYPE_FLOAT=2, etc.)
+fn extract_type_hints(py_meta: &Bound<'_, PyDict>, key: &str) -> TypeHints {
+    py_meta
+        .get_item(key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
+        .map(|hints| hints.into_iter().collect())
+        .unwrap_or_default()
+}
+
 fn parse_rust_arg_bindings(py_meta: &Bound<'_, PyDict>) -> Option<Vec<RustArgBinding>> {
     let py = py_meta.py();
     let bindings_obj = py_meta.get_item("rust_arg_bindings").ok().flatten()?;

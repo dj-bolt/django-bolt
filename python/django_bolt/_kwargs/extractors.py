@@ -131,16 +131,18 @@ def create_header_extractor(name: str, annotation: Any, default: Any, alias: str
     if optional:
         default_value = None if default is inspect.Parameter.empty else default
 
-        def extract(headers_map: dict[str, str]) -> Any:
+        def extract(headers_map: dict[str, Any]) -> Any:
             if key in headers_map:
                 return headers_map[key]
             return default_value
     else:
 
-        def extract(headers_map: dict[str, str]) -> Any:
-            if key not in headers_map:
-                raise HTTPException(status_code=422, detail=f"Missing required header: {key}")
-            return headers_map[key]
+        def extract(headers_map: dict[str, Any]) -> Any:
+            # One dict lookup on the hit path; the try block costs nothing there.
+            try:
+                return headers_map[key]
+            except KeyError:
+                raise HTTPException(status_code=422, detail=f"Missing required header: {key}") from None
 
     return extract
 
@@ -170,16 +172,18 @@ def create_cookie_extractor(name: str, annotation: Any, default: Any, alias: str
     if optional:
         default_value = None if default is inspect.Parameter.empty else default
 
-        def extract(cookies_map: dict[str, str]) -> Any:
+        def extract(cookies_map: dict[str, Any]) -> Any:
             if key in cookies_map:
                 return cookies_map[key]
             return default_value
     else:
 
-        def extract(cookies_map: dict[str, str]) -> Any:
-            if key not in cookies_map:
-                raise HTTPException(status_code=422, detail=f"Missing required cookie: {key}")
-            return cookies_map[key]
+        def extract(cookies_map: dict[str, Any]) -> Any:
+            # One dict lookup on the hit path; the try block costs nothing there.
+            try:
+                return cookies_map[key]
+            except KeyError:
+                raise HTTPException(status_code=422, detail=f"Missing required cookie: {key}") from None
 
     return extract
 

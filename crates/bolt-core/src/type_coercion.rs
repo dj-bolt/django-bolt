@@ -339,38 +339,38 @@ fn parse_time(value: &str) -> Result<CoercedValue, String> {
     ))
 }
 
+/// Non-string type hints of one request source, keyed by wire name.
+pub type TypeHints = ahash::AHashMap<String, u8>;
+
+/// Pre-coerced values of one request source. The names borrow from the
+/// request map or the route metadata, so no name is copied per request.
+pub type CoercedValues<'a> = Vec<(&'a str, CoercedValue)>;
+
 /// Build a Python dict from a map of string values.
 ///
 /// A value in `coerced` replaces the string for its name. The request pipeline
 /// validates and coerces those values before the GIL is taken, so this step
 /// cannot fail on bad input. Used for path, query, header and cookie values.
 ///
-/// Coerced names come from registration-time type hints (a bounded set), so
-/// they are interned and repeated requests reuse one PyString per name.
-/// Arbitrary client-supplied names are NOT interned — interned strings are
-/// effectively immortal, which would be a memory-growth vector.
+/// Names are not interned: interning costs a lookup per call, and interned
+/// client-supplied names would never be freed.
 #[inline]
 pub fn string_map_to_py_dict<'py>(
     py: Python<'py>,
     values: &ahash::AHashMap<String, String>,
-    coerced: Option<&ahash::AHashMap<String, CoercedValue>>,
+    coerced: &[(&str, CoercedValue)],
 ) -> PyResult<pyo3::Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    match coerced {
-        Some(coerced) => {
-            for (name, value) in values {
-                match coerced.get(name) {
-                    Some(typed) => dict.set_item(
-                        pyo3::types::PyString::intern(py, name),
-                        coerced_value_to_py(py, typed),
-                    )?,
-                    None => dict.set_item(name, value)?,
-                }
-            }
+    if coerced.is_empty() {
+        for (name, value) in values {
+            dict.set_item(name, value)?;
         }
-        None => {
-            for (name, value) in values {
-                dict.set_item(name, value)?;
+    } else {
+        // `coerced` holds a few entries, so a linear scan beats a hash lookup.
+        for (name, value) in values {
+            match coerced.iter().find(|(typed, _)| *typed == name.as_str()) {
+                Some((_, typed)) => dict.set_item(name, coerced_value_to_py(py, typed))?,
+                None => dict.set_item(name, value)?,
             }
         }
     }

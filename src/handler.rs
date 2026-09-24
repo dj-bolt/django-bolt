@@ -36,7 +36,7 @@ use bolt_core::responses;
 use bolt_core::router::parse_query_string;
 use bolt_core::state::{find_asgi_mount, AppState, GLOBAL_ROUTER, ROUTE_METADATA};
 use bolt_core::streaming::{create_python_stream, create_sse_stream};
-use bolt_core::type_coercion::{coerced_value_to_py, string_map_to_py_dict};
+use bolt_core::type_coercion::{coerced_value_to_py, string_map_to_py_dict, TypeHints};
 use bolt_core::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
 
 use std::future::Future;
@@ -850,7 +850,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             Err(response) => return response,
         }
     } else {
-        (None, None)
+        (Vec::new(), Vec::new())
     };
 
     let needs_headers = plan.map_or(true, |p| p.needs_headers());
@@ -986,7 +986,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
     // Type validation for the header and cookie values that Python receives
     // (Rust-native, no GIL). Same length limit and 422 format as path/query.
-    let empty_types: &HashMap<String, u8> = &EMPTY_TYPES;
+    let empty_types: &TypeHints = &EMPTY_TYPES;
     let header_types = route_metadata.map_or(empty_types, |m| &m.header_types);
     let cookie_types = route_metadata.map_or(empty_types, |m| &m.cookie_types);
     let headers_coerced = match headers.as_ref() {
@@ -996,7 +996,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 Err(response) => return response,
             }
         }
-        _ => None,
+        _ => Vec::new(),
     };
     let cookies_coerced = match cookies.as_ref() {
         Some(cookies_map) => {
@@ -1005,7 +1005,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 Err(response) => return response,
             }
         }
-        None => None,
+        None => Vec::new(),
     };
 
     // Derive connection info from already-extracted headers (avoids a second header-parse pass).
@@ -1177,21 +1177,21 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         // Saves 1 Python heap alloc per empty source (up to 4 for simple API handlers).
         let path_params_py: Option<Py<PyDict>> = match path_params.as_ref() {
             Some(path_params) => {
-                Some(string_map_to_py_dict(py, path_params, path_coerced.as_ref())?.unbind())
+                Some(string_map_to_py_dict(py, path_params, &path_coerced)?.unbind())
             }
             None => None,
         };
 
         let query_params_py: Option<Py<PyDict>> = match query_params.as_ref() {
             Some(query_params) => {
-                Some(string_map_to_py_dict(py, query_params, query_coerced.as_ref())?.unbind())
+                Some(string_map_to_py_dict(py, query_params, &query_coerced)?.unbind())
             }
             None => None,
         };
 
         let headers_py: Option<Py<PyDict>> = if needs_headers {
             if let Some(headers_map) = headers.as_ref() {
-                Some(string_map_to_py_dict(py, headers_map, headers_coerced.as_ref())?.unbind())
+                Some(string_map_to_py_dict(py, headers_map, &headers_coerced)?.unbind())
             } else {
                 Some(PyDict::new(py).unbind())
             }
@@ -1200,7 +1200,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         };
         let cookies_py: Option<Py<PyDict>> = if needs_cookies {
             if let Some(cookies_map) = cookies.as_ref() {
-                Some(string_map_to_py_dict(py, cookies_map, cookies_coerced.as_ref())?.unbind())
+                Some(string_map_to_py_dict(py, cookies_map, &cookies_coerced)?.unbind())
             } else {
                 Some(PyDict::new(py).unbind())
             }

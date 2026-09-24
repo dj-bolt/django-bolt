@@ -12,14 +12,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use std::collections::HashMap;
-
 use bolt_core::metadata::CorsConfig;
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::request_pipeline::{set_declared_item, EMPTY_TYPES};
 use bolt_core::state::{AppState, ROUTE_METADATA};
 use bolt_core::type_coercion::coerced_value_to_py;
-use bolt_core::type_coercion::{coerce_param, CoerceError, TYPE_STRING};
+use bolt_core::type_coercion::{coerce_param, CoerceError, TypeHints, TYPE_STRING};
 use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 
 use super::actor::WebSocketActor;
@@ -83,9 +81,9 @@ fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
     path_params: &AHashMap<String, String>,
-    param_types: &HashMap<String, u8>,
-    header_types: &HashMap<String, u8>,
-    cookie_types: &HashMap<String, u8>,
+    param_types: &TypeHints,
+    header_types: &TypeHints,
+    cookie_types: &TypeHints,
     max_param_length: usize,
 ) -> PyResult<Py<PyAny>> {
     let scope_dict = PyDict::new(py);
@@ -599,7 +597,7 @@ pub async fn handle_websocket_upgrade_with_handler(
 
     // Get type hints from route metadata for type coercion
     let route_meta = ROUTE_METADATA.get().and_then(|m| m.get(handler_id));
-    let empty_types: &HashMap<String, u8> = &EMPTY_TYPES;
+    let empty_types: &TypeHints = &EMPTY_TYPES;
     let param_types = route_meta.map_or(empty_types, |m| &m.param_types);
     let header_types = route_meta.map_or(empty_types, |m| &m.header_types);
     let cookie_types = route_meta.map_or(empty_types, |m| &m.cookie_types);

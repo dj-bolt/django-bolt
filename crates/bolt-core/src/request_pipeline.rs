@@ -5,45 +5,39 @@
 
 use actix_web::{HttpRequest, HttpResponse};
 use ahash::AHashMap;
-use std::collections::HashMap;
 
 use crate::form_parsing::ValidationError;
 use crate::responses;
-use crate::type_coercion::{coerce_param, coerced_value_to_py, CoercedValue, TYPE_STRING};
+use crate::type_coercion::{
+    coerce_param, coerced_value_to_py, CoercedValue, CoercedValues, TypeHints, TYPE_STRING,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 /// Empty type-hint map for requests that have no route metadata.
-pub static EMPTY_TYPES: std::sync::LazyLock<HashMap<String, u8>> =
-    std::sync::LazyLock::new(HashMap::new);
+pub static EMPTY_TYPES: std::sync::LazyLock<TypeHints> = std::sync::LazyLock::new(TypeHints::new);
 
 /// Validate and pre-coerce path/query parameters against type hints.
 ///
-/// Returns a pair of maps containing only non-string pre-coerced values, keyed by
-/// parameter name. String parameters are validated for length but left as-is.
-pub fn validate_and_cache_typed_params(
-    path_params: Option<&AHashMap<String, String>>,
-    query_params: Option<&AHashMap<String, String>>,
-    param_types: &HashMap<String, u8>,
+/// Returns the pre-coerced non-string values of each source. String
+/// parameters are validated for length but left as-is.
+pub fn validate_and_cache_typed_params<'a>(
+    path_params: Option<&'a AHashMap<String, String>>,
+    query_params: Option<&'a AHashMap<String, String>>,
+    param_types: &'a TypeHints,
     max_length: usize,
-) -> Result<
-    (
-        Option<AHashMap<String, CoercedValue>>,
-        Option<AHashMap<String, CoercedValue>>,
-    ),
-    HttpResponse,
-> {
+) -> Result<(CoercedValues<'a>, CoercedValues<'a>), HttpResponse> {
     let path_coerced = match path_params {
         Some(params) => {
             validate_and_cache_source(params, param_types, max_length, "Path parameter")?
         }
-        None => None,
+        None => Vec::new(),
     };
     let query_coerced = match query_params {
         Some(params) => {
             validate_and_cache_source(params, param_types, max_length, "Query parameter")?
         }
-        None => None,
+        None => Vec::new(),
     };
     Ok((path_coerced, query_coerced))
 }
@@ -53,39 +47,87 @@ pub fn validate_and_cache_typed_params(
 /// `label` names the source in the 422 detail, for example "Header".
 /// The length limit applies to all values, including strings. `types` holds
 /// the non-string type hints, keyed by the name in `values`. The result holds
-/// only the coerced values, or `None` when no value has a type hint.
-pub fn validate_and_cache_source(
-    values: &AHashMap<String, String>,
-    types: &HashMap<String, u8>,
+/// only the coerced values. An empty result does not allocate.
+///
+/// The loop walks the smaller side: a request has many headers but a route
+/// types few of them, while path and query maps are usually small.
+pub fn validate_and_cache_source<'a>(
+    values: &'a AHashMap<String, String>,
+    types: &'a TypeHints,
     max_length: usize,
     label: &str,
-) -> Result<Option<AHashMap<String, CoercedValue>>, HttpResponse> {
-    let mut coerced_values: Option<AHashMap<String, CoercedValue>> = None;
-    for (name, value) in values {
-        // Security: Always validate length for ALL parameters (including strings)
-        if value.len() > max_length {
-            return Err(responses::error_422_validation(&format!(
-                "{} '{}': Parameter too long: {} bytes (max {} bytes)",
-                label,
-                name,
-                value.len(),
-                max_length
-            )));
-        }
-        if types.is_empty() {
-            continue;
-        }
-        match coerce_declared_value(name, value, types, max_length, label) {
-            Ok(Some(coerced)) => {
-                coerced_values
-                    .get_or_insert_with(AHashMap::new)
-                    .insert(name.clone(), coerced);
+) -> Result<CoercedValues<'a>, HttpResponse> {
+    let mut coerced_values = CoercedValues::new();
+    if types.len() < values.len() {
+        for (name, value) in values {
+            // Security: Always validate length for ALL parameters (including strings)
+            if value.len() > max_length {
+                return Err(too_long(label, name, value.len(), max_length));
             }
-            Ok(None) => {}
-            Err(detail) => return Err(responses::error_422_validation(&detail)),
+        }
+        for (name, &type_hint) in types {
+            if let Some(value) = values.get(name) {
+                coerce_into(
+                    &mut coerced_values,
+                    name,
+                    value,
+                    type_hint,
+                    max_length,
+                    label,
+                )?;
+            }
+        }
+    } else {
+        for (name, value) in values {
+            // Security: Always validate length for ALL parameters (including strings)
+            if value.len() > max_length {
+                return Err(too_long(label, name, value.len(), max_length));
+            }
+            if let Some(&type_hint) = types.get(name) {
+                coerce_into(
+                    &mut coerced_values,
+                    name,
+                    value,
+                    type_hint,
+                    max_length,
+                    label,
+                )?;
+            }
         }
     }
     Ok(coerced_values)
+}
+
+#[cold]
+fn too_long(label: &str, name: &str, len: usize, max_length: usize) -> HttpResponse {
+    responses::error_422_validation(&format!(
+        "{} '{}': Parameter too long: {} bytes (max {} bytes)",
+        label, name, len, max_length
+    ))
+}
+
+#[inline]
+fn coerce_into<'a>(
+    coerced_values: &mut CoercedValues<'a>,
+    name: &'a str,
+    value: &str,
+    type_hint: u8,
+    max_length: usize,
+    label: &str,
+) -> Result<(), HttpResponse> {
+    if type_hint == TYPE_STRING {
+        return Ok(());
+    }
+    match coerce_param(value, type_hint, max_length) {
+        Ok(coerced) => {
+            coerced_values.push((name, coerced));
+            Ok(())
+        }
+        Err(error) => Err(responses::error_422_validation(&format!(
+            "{} '{}': {}",
+            label, name, error
+        ))),
+    }
 }
 
 /// Coerce one value when `types` gives it a non-string type hint.
@@ -96,7 +138,7 @@ pub fn validate_and_cache_source(
 pub fn coerce_declared_value(
     name: &str,
     value: &str,
-    types: &HashMap<String, u8>,
+    types: &TypeHints,
     max_length: usize,
     label: &str,
 ) -> Result<Option<CoercedValue>, String> {
@@ -117,7 +159,7 @@ pub fn set_declared_item(
     dict: &Bound<'_, PyDict>,
     name: &str,
     value: &str,
-    types: &HashMap<String, u8>,
+    types: &TypeHints,
     max_length: usize,
     label: &str,
 ) -> PyResult<()> {
@@ -180,7 +222,7 @@ mod tests {
             .collect()
     }
 
-    fn types(pairs: &[(&str, u8)]) -> HashMap<String, u8> {
+    fn types(pairs: &[(&str, u8)]) -> TypeHints {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
@@ -192,59 +234,64 @@ mod tests {
 
     #[test]
     fn source_coerces_only_typed_values() {
-        let coerced = validate_and_cache_source(
-            &values(&[
-                ("x-count", "5"),
-                ("x-debug", "yes"),
-                ("accept", "text/html"),
-            ]),
-            &types(&[("x-count", TYPE_INT), ("x-debug", TYPE_BOOL)]),
-            64,
-            "Header",
-        )
-        .unwrap()
-        .unwrap();
+        // Fewer types than values: the loop walks the types.
+        let headers = values(&[
+            ("x-count", "5"),
+            ("x-debug", "yes"),
+            ("accept", "text/html"),
+        ]);
+        let hints = types(&[("x-count", TYPE_INT), ("x-debug", TYPE_BOOL)]);
+        let mut coerced = validate_and_cache_source(&headers, &hints, 64, "Header").unwrap();
+        coerced.sort_by_key(|(name, _)| *name);
         assert_eq!(coerced.len(), 2);
-        assert!(matches!(coerced.get("x-count"), Some(CoercedValue::Int(5))));
-        assert!(matches!(
-            coerced.get("x-debug"),
-            Some(CoercedValue::Bool(true))
-        ));
+        assert!(matches!(coerced[0], ("x-count", CoercedValue::Int(5))));
+        assert!(matches!(coerced[1], ("x-debug", CoercedValue::Bool(true))));
     }
 
     #[test]
-    fn source_with_no_types_returns_none() {
-        let coerced =
-            validate_and_cache_source(&values(&[("accept", "*/*")]), &types(&[]), 64, "Header")
-                .unwrap();
-        assert!(coerced.is_none());
+    fn source_walks_values_when_types_are_more() {
+        let query = values(&[("page", "2")]);
+        let hints = types(&[("page", TYPE_INT), ("limit", TYPE_INT), ("q", TYPE_STRING)]);
+        let coerced = validate_and_cache_source(&query, &hints, 64, "Query parameter").unwrap();
+        assert!(matches!(coerced[..], [("page", CoercedValue::Int(2))]));
+        let bad = values(&[("limit", "x")]);
+        let response = validate_and_cache_source(&bad, &hints, 64, "Query parameter").unwrap_err();
+        assert!(detail(response).contains("Query parameter 'limit'"));
+    }
+
+    #[test]
+    fn source_with_no_types_does_not_allocate() {
+        let headers = values(&[("accept", "*/*")]);
+        let hints = types(&[]);
+        let coerced = validate_and_cache_source(&headers, &hints, 64, "Header").unwrap();
+        assert!(coerced.is_empty());
+        assert_eq!(coerced.capacity(), 0);
     }
 
     #[test]
     fn source_rejects_invalid_value_with_label_and_name() {
-        let response = validate_and_cache_source(
-            &values(&[("x-count", "abc")]),
-            &types(&[("x-count", TYPE_INT)]),
-            64,
-            "Header",
-        )
-        .unwrap_err();
+        let headers = values(&[("x-count", "abc")]);
+        let hints = types(&[("x-count", TYPE_INT)]);
+        let response = validate_and_cache_source(&headers, &hints, 64, "Header").unwrap_err();
         let body = detail(response);
         assert!(body.contains("Header 'x-count'"), "{body}");
         assert!(body.contains("abc"), "{body}");
     }
 
     #[test]
-    fn source_rejects_long_untyped_value() {
+    fn source_rejects_long_untyped_value_in_both_loop_orders() {
         let long = "a".repeat(65);
+        // More values than types: the length loop runs on its own.
+        let cookies = values(&[("a", "1"), ("b", "2"), ("session", &long)]);
         let response =
-            validate_and_cache_source(&values(&[("session", &long)]), &types(&[]), 64, "Cookie")
+            validate_and_cache_source(&cookies, &types(&[("a", TYPE_INT)]), 64, "Cookie")
                 .unwrap_err();
-        let body = detail(response);
-        assert!(
-            body.contains("Cookie 'session': Parameter too long"),
-            "{body}"
-        );
+        assert!(detail(response).contains("Cookie 'session': Parameter too long"));
+        // No more values than types: the length check runs in the value loop.
+        let single = values(&[("session", &long)]);
+        let response = validate_and_cache_source(&single, &types(&[("a", TYPE_INT)]), 64, "Cookie")
+            .unwrap_err();
+        assert!(detail(response).contains("Cookie 'session': Parameter too long"));
     }
 
     #[test]
@@ -261,13 +308,10 @@ mod tests {
     #[test]
     fn path_and_query_keep_their_labels() {
         let hints = types(&[("id", TYPE_INT)]);
-        let response =
-            validate_and_cache_typed_params(Some(&values(&[("id", "x")])), None, &hints, 64)
-                .unwrap_err();
+        let bad = values(&[("id", "x")]);
+        let response = validate_and_cache_typed_params(Some(&bad), None, &hints, 64).unwrap_err();
         assert!(detail(response).contains("Path parameter 'id'"));
-        let response =
-            validate_and_cache_typed_params(None, Some(&values(&[("id", "x")])), &hints, 64)
-                .unwrap_err();
+        let response = validate_and_cache_typed_params(None, Some(&bad), &hints, 64).unwrap_err();
         assert!(detail(response).contains("Query parameter 'id'"));
     }
 }
