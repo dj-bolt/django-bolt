@@ -158,9 +158,11 @@ class JWTAuthentication(BaseAuthentication):
             ``typ``, and no other type claim that disagrees. When left as
             None (normal access routes), a token is rejected when its
             ``typ``, ``token_type`` (djangorestframework-simplejwt) or
-            ``token_use`` (django-allauth, AWS Cognito) is ``"refresh"``.
-            So a refresh token of these issuers never authenticates a
-            regular endpoint.
+            ``token_use`` (django-allauth, AWS Cognito) names a refresh or
+            ID token: ``refresh``, ``offline`` or ``id``, in any case
+            (Keycloak writes ``Refresh``, ``Offline`` and ``ID``). So such a
+            token never authenticates a regular endpoint. An OIDC ID token
+            with no type claim still passes: set ``audience`` to reject it.
         csrf: When the token is read from a ``cookie``, enforce a cross-site
             origin check on unsafe (state-changing) HTTP methods, since bolt
             bypasses Django's ``CsrfViewMiddleware`` and cookies are attached

@@ -553,6 +553,19 @@ class TestRefreshEndpointTypEnforcement:
         r = client.get("/api", headers={"Authorization": f"Bearer {self._typed(claim, 'refresh')}"})
         assert r.status_code == 401
 
+    # Keycloak: typ Refresh, Offline and ID; AWS Cognito: token_use id. Case does not matter.
+    @pytest.mark.parametrize(
+        ("claim", "value"),
+        [("typ", "Refresh"), ("typ", "Offline"), ("typ", "ID"), ("token_use", "id"), ("token_type", "REFRESH")],
+    )
+    def test_a_non_access_token_type_is_rejected_on_api_route(self, client, claim, value):
+        r = client.get("/api", headers={"Authorization": f"Bearer {self._typed(claim, value)}"})
+        assert r.status_code == 401
+
+    def test_a_keycloak_access_token_type_works_on_api_route(self, client):
+        r = client.get("/api", headers={"Authorization": f"Bearer {self._typed('typ', 'Bearer')}"})
+        assert r.status_code == 200
+
     @pytest.mark.parametrize("claim", ["typ", "token_type", "token_use"])
     def test_access_type_in_any_type_claim_works_on_api_route(self, client, claim):
         r = client.get("/api", headers={"Authorization": f"Bearer {self._typed(claim, 'access')}"})
