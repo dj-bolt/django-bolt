@@ -215,6 +215,31 @@ DATABASES = {
 
 [PgBouncer](https://www.pgbouncer.org/) runs as a separate service and manages connections across all Django processes.
 
+### PostgreSQL on macOS with forked workers
+
+On macOS, a forked `runbolt` worker can hang when it opens a PostgreSQL connection through libpq (psycopg). This occurs with `--processes 2` or more, and in any setup that forks workers after libpq loads. The libpq option `gssencmode` is `prefer` by default. With `prefer`, libpq calls the macOS Kerberos (GSS) framework on each TCP connection. That framework is not safe to use after `fork()`.
+
+To prevent the hang, disable GSSAPI encryption. Set the environment variable before you start the server:
+
+```bash
+PGGSSENCMODE=disable python manage.py runbolt --processes 4
+```
+
+Alternatively, set the connection option in `DATABASES`:
+
+```python
+# settings.py
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        # ...
+        "OPTIONS": {"gssencmode": "disable"},
+    }
+}
+```
+
+Do not use this setting if your database server requires GSSAPI encryption. Linux does not need this setting.
+
 If you need signal compatibility for third-party packages, see [Django Signals](../topics/signals.md).
 
 ## Performance tuning

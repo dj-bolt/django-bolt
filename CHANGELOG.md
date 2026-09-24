@@ -33,6 +33,10 @@ All notable changes to this project will be documented in this file.
 - **Custom middleware attributes reach `request.state`** - Bolt copied only a fixed list of attributes from the Django request. Bolt now copies each public attribute that a middleware sets, for example `request.tenant` from django-tenants, to `request.state`. An async handler can read `request.state["tenant"]` on any thread. The copy costs about 0.5 microseconds per request.
 - **`DjangoMiddleware` copies attributes before the handler runs** - The single wrapper copied the session, the user, and other attributes after the handler returned. The handler thus could not read them. The copy now runs before the handler, as in `DjangoMiddlewareStack`.
 
+### Documentation
+
+- **PostgreSQL on macOS with forked workers** - On macOS, a forked `runbolt` worker can hang when libpq opens a PostgreSQL connection. The GSSAPI negotiation of libpq calls the macOS Kerberos framework, which is not safe after `fork()`. The deployment guide and `CONTRIBUTING.md` now show the fix: set `PGGSSENCMODE=disable`, or `"gssencmode": "disable"` in `DATABASES[...]["OPTIONS"]`. Linux does not need it. See [PostgreSQL on macOS with forked workers](docs/src/getting-started/deployment.md#postgresql-on-macos-with-forked-workers).
+
 ## [0.11.0]
 
 ### Removed
