@@ -63,3 +63,9 @@ async def async_current(user: CurrentUser):
 async def async_sync_read(request: Request):
     # The loop waits for the lane to run the user query.
     return {"username": request.user.username, "schema": await sync_to_thread(_schema_name)}
+
+
+@api.get("/sync/current", auth=auth)
+def sync_current(user: CurrentUser):
+    # A sync handler uses the sync form of the dependency, so the request stays on the lane.
+    return {"username": user.username, "schema": _schema_name()}

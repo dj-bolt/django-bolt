@@ -26,10 +26,14 @@ from .guards import (
 # JWT utilities for Django User integration
 from .jwt_utils import (
     CurrentUser,
+    OptionalCurrentUser,
     create_jwt_for_user,
     extract_user_id_from_context,
     get_auth_context,
     get_current_user,
+    get_current_user_sync,
+    require_current_user,
+    require_current_user_sync,
 )
 
 # Token revocation (optional)
@@ -78,7 +82,11 @@ __all__ = [
     "Token",
     "create_jwt_for_user",
     "get_current_user",
+    "get_current_user_sync",
+    "require_current_user",
+    "require_current_user_sync",
     "CurrentUser",
+    "OptionalCurrentUser",
     "extract_user_id_from_context",
     "get_auth_context",
     # Token pair lifecycle (access + refresh)

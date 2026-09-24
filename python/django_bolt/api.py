@@ -37,7 +37,7 @@ from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler
 from .auth import get_default_authentication_classes, register_auth_backend
-from .auth.user_loader import DEFAULT_USER_LOADERS, LazyUser, resolve_user_loader
+from .auth.user_loader import DEFAULT_USER_LOADERS, LazyUser, preload_request_user, resolve_user_loader
 from .concurrency import (
     LaneAffinityError,
     _drop_broken_connections,
@@ -89,6 +89,17 @@ from .views import APIView, ViewSet, _layer
 from .websocket import mark_websocket_handler
 
 logger = logging.getLogger(__name__)
+
+
+def _with_preloaded_user(executor: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap the executor of an async handler that reads request.user. See preload_request_user."""
+
+    async def execute_with_preloaded_user(handler: Callable, request: Any) -> Any:
+        await preload_request_user(request)
+        return await executor(handler, request)
+
+    return execute_with_preloaded_user
+
 
 Response = ResponseWireV1
 
@@ -1472,8 +1483,13 @@ class BoltAPI:
                 field.name for field in meta.get("fields", []) if getattr(field, "source", None) == "request"
             }
 
-            # Static ORM + request-component analysis at registration time
-            handler_analysis = analyze_handler(fn, request_param_names=request_param_names)
+            # Static ORM + request-component analysis at registration time.
+            # A handler with only a request parameter has no fields, but the
+            # analysis still needs the name to find reads of request.user.
+            analyzed_request_names = request_param_names
+            if not analyzed_request_names and meta["mode"] == "request_only":
+                analyzed_request_names = {next(iter(meta["sig"].parameters))}
+            handler_analysis = analyze_handler(fn, request_param_names=analyzed_request_names)
 
             if request_param_names:
                 if handler_analysis.analysis_failed:
@@ -1668,6 +1684,13 @@ class BoltAPI:
             meta["injector_is_async"] = inspect.iscoroutinefunction(injector)
             meta["_original_fn"] = fn
             meta["_handler_executor"] = self._compile_handler_executor(meta)
+
+            # An async handler that reads request.user gets the user loaded before
+            # it runs, so its sync read does not block the event loop. The load
+            # awaits, so the route cannot use the sync fast path.
+            if meta["is_async"] and handler_analysis.request_reads_user:
+                meta["_handler_executor"] = _with_preloaded_user(meta["_handler_executor"])
+                meta.pop("_sync_executor", None)
 
             # ViewSet write actions resolve their body type from the configured
             # serializer class. Inject it as a first-class body_struct_type so

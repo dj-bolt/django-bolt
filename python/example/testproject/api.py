@@ -316,8 +316,8 @@ async def get_me(request: CustomRequest):
 
     The authentication system loads the Django User instance for the
     authenticated user. An async handler loads it with ``await request.auser()``,
-    which does not block the event loop. ``request.user`` works too, but the
-    event loop waits for its query.
+    which does not block the event loop. A read of ``request.user`` in the
+    handler works too: Bolt loads the user before the handler.
     """
     user = await request.auser()
     if not user:

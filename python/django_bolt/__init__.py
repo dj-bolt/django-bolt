@@ -60,6 +60,7 @@ from .auth import (
     IsAuthenticated,
     # Authentication backends
     JWTAuthentication,
+    OptionalCurrentUser,
     Requires,
     Token,
     create_jwt_for_user,
@@ -250,6 +251,7 @@ __all__ = [
     "create_jwt_for_user",
     "get_current_user",
     "CurrentUser",
+    "OptionalCurrentUser",
     "extract_user_id_from_context",
     "get_auth_context",
     # OpenAPI

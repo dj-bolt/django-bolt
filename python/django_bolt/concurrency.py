@@ -14,12 +14,15 @@ import concurrent.futures
 import contextvars
 import logging
 import os
+import sys
 import threading
+import time
 from asyncio.events import _get_running_loop
 from collections.abc import Callable, Coroutine
 from functools import partial
 
 from asgiref.sync import AsyncToSync, SyncToAsync, ThreadSensitiveContext, sync_to_async
+from django.conf import settings
 from django.db import connections
 
 logger = logging.getLogger(__name__)
@@ -285,17 +288,6 @@ def _call_in_orm_slot[T](fn: Callable[..., T], *args: object) -> T:
     return _call_guarded(fn, *args)
 
 
-def _submit_blocking(
-    executor: concurrent.futures.ThreadPoolExecutor,
-    call: Callable[..., object],
-    fn: Callable[..., object],
-    *args: object,
-) -> object:
-    """Submit ``call(fn, *args)`` to ``executor`` with the caller's context and block on it."""
-    ctx = contextvars.copy_context()
-    return executor.submit(ctx.run, call, fn, *args).result()
-
-
 def _orm_handoff() -> tuple[concurrent.futures.ThreadPoolExecutor, Callable[..., object]]:
     """The pool and the call wrapper for an ORM hand-off from the calling context.
 
@@ -373,8 +365,47 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
         )
         if executor is None:
             raise LaneAffinityError(_OFF_LANE_ORM_CALL)
-        return executor.submit(contextvars.copy_context().run, _call_guarded, fn, *args).result()
-    return _submit_blocking(*_orm_handoff(), fn, *args)
+        future = executor.submit(contextvars.copy_context().run, _call_guarded, fn, *args)
+    else:
+        executor, call = _orm_handoff()
+        future = executor.submit(contextvars.copy_context().run, call, fn, *args)
+    started = time.perf_counter()
+    result = future.result()
+    waited = time.perf_counter() - started
+    if waited >= _SLOW_LOOP_WAIT_SECONDS:
+        _report_slow_loop_wait(waited)
+    return result
+
+
+# A sync read of request.user that blocks the event loop this long is reported in dev mode.
+_SLOW_LOOP_WAIT_SECONDS = 0.05
+# (file, line) of each read that was reported. Each is reported one time.
+_reported_slow_reads: set[tuple[str, int]] = set()
+_FRAMEWORK_PATH_PARTS = tuple(f"{os.sep}{name}{os.sep}" for name in ("django_bolt", "django", "asgiref"))
+
+
+def _report_slow_loop_wait(waited: float) -> None:
+    """In dev mode, log the line of a sync read of request.user that blocked the event loop.
+
+    The read can be in a helper, a template, or a serializer, where Bolt cannot
+    load the user before the handler. The line is the first caller outside
+    Bolt, Django, and asgiref. This runs only after a slow wait.
+    """
+    if not (settings.DEBUG or os.environ.get("DJANGO_BOLT_DEV_WORKER") == "1"):
+        return
+    frame = sys._getframe(2)
+    while frame is not None and any(part in frame.f_code.co_filename for part in _FRAMEWORK_PATH_PARTS):
+        frame = frame.f_back
+    where = (frame.f_code.co_filename, frame.f_lineno) if frame is not None else ("<unknown>", 0)
+    if where in _reported_slow_reads:
+        return
+    _reported_slow_reads.add(where)
+    logger.warning(
+        "A sync read of request.user blocked the event loop for %.0f ms at %s:%d. "
+        "Use `await request.auser()` or a `CurrentUser` parameter. Bolt logs this one time for each line.",
+        waited * 1000,
+        *where,
+    )
 
 
 async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:

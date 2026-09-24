@@ -8,13 +8,17 @@ extract user information from request context.
 from __future__ import annotations
 
 import time
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import jwt
 from django.conf import settings
 
+from django_bolt.exceptions import Unauthorized
 from django_bolt.params import Depends
 from django_bolt.types import Request
+
+if TYPE_CHECKING:
+    from django.contrib.auth.base_user import AbstractBaseUser
 
 
 def create_jwt_for_user(
@@ -135,8 +139,46 @@ async def get_current_user(request: Request) -> Any:
     return user
 
 
-# The current user as a parameter: ``def me(user: CurrentUser)``.
-CurrentUser = Annotated[Any, Depends(get_current_user)]
+def get_current_user_sync(request: Request) -> Any:
+    """Sync form of :func:`get_current_user`. A sync handler uses it in place of the async form.
+
+    It reads ``request.user`` on the thread of the handler, so a sync handler
+    keeps its sync dispatch, and a request with Django middleware stays on its lane.
+    """
+    user = request.user
+    if user is None or not user.is_authenticated:
+        return None
+    return user
+
+
+async def require_current_user(request: Request) -> Any:
+    """Dependency that gives the authenticated user, or answers 401 when there is none."""
+    user = await get_current_user(request)
+    if user is None:
+        raise Unauthorized(detail="Authentication required")
+    return user
+
+
+def require_current_user_sync(request: Request) -> Any:
+    """Sync form of :func:`require_current_user`."""
+    user = get_current_user_sync(request)
+    if user is None:
+        raise Unauthorized(detail="Authentication required")
+    return user
+
+
+# The injector of a sync handler uses the sync form of these dependencies.
+get_current_user._bolt_sync_variant = get_current_user_sync
+require_current_user._bolt_sync_variant = require_current_user_sync
+
+if TYPE_CHECKING:
+    CurrentUser = Annotated[AbstractBaseUser, Depends(require_current_user)]
+    OptionalCurrentUser = Annotated[AbstractBaseUser | None, Depends(get_current_user)]
+else:
+    # The current user as a parameter: ``def me(user: CurrentUser)``. It answers 401 with no user.
+    CurrentUser = Annotated[Any, Depends(require_current_user)]
+    # The current user, or None with no user: ``def home(user: OptionalCurrentUser)``.
+    OptionalCurrentUser = Annotated[Any, Depends(get_current_user)]
 
 
 def extract_user_id_from_context(request: Request) -> str | None:

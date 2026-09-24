@@ -19,10 +19,12 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import httpx
 import jwt
 import pytest
 
@@ -41,7 +43,7 @@ _SHARED_APPS = [
 ]
 _TENANT_APPS = ["django.contrib.contenttypes", "django.contrib.auth"]
 
-ROUTES = ("/sync/me", "/async/me", "/async/current", "/async/sync-read")
+ROUTES = ("/sync/me", "/sync/current", "/async/me", "/async/current", "/async/sync-read")
 
 
 def _tenant_settings(params: dict[str, Any]) -> str:
@@ -86,8 +88,11 @@ def _headers(tenant: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Host": f"{tenant}.localhost"}
 
 
-def _check(server, route: str, tenant: str) -> None:
-    response = server.get(route, headers=_headers(tenant))
+def _check(server, route: str, tenant: str, client: httpx.Client | None = None) -> None:
+    if client is None:
+        response = server.get(route, headers=_headers(tenant))
+    else:
+        response = client.get(server.url(route), headers=_headers(tenant))
     assert response.status_code == 200, (route, tenant, response.text)
     body = response.json()
     assert body["username"] == f"{tenant}-user", (route, tenant, body)
@@ -107,7 +112,23 @@ def test_each_tenant_loads_its_own_user(make_server_project, postgres_database):
 
 def test_concurrent_requests_of_two_tenants_do_not_mix(make_server_project, postgres_database):
     """Lanes serve one request at a time and are reused. The state of one tenant must not leak."""
+    # One client for each thread: the connection pool of httpx is not safe to
+    # share between threads on free-threaded Python.
+    clients = threading.local()
+    opened: list[httpx.Client] = []
+
+    def check_on_this_thread(case: tuple[str, str]) -> None:
+        client = getattr(clients, "client", None)
+        if client is None:
+            client = clients.client = httpx.Client(timeout=10)
+            opened.append(client)
+        _check(server, *case, client=client)
+
     with _start_tenant_server(make_server_project, postgres_database) as server:
         cases = [(route, TENANTS[i % 2]) for i in range(120) for route in ROUTES]
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            list(pool.map(lambda case: _check(server, *case), cases))
+        try:
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                list(pool.map(check_on_this_thread, cases))
+        finally:
+            for client in opened:
+                client.close()

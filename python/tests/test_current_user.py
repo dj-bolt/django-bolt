@@ -18,8 +18,9 @@ from django.contrib.auth.models import User
 from django.db import connection
 from django.utils.deprecation import MiddlewareMixin
 
-from django_bolt import BoltAPI, CurrentUser, Depends, Request, get_current_user
+from django_bolt import BoltAPI, CurrentUser, Depends, OptionalCurrentUser, Request, get_current_user
 from django_bolt.auth import JWTAuthentication
+from django_bolt.concurrency import in_lane_mode
 from django_bolt.middleware import DjangoMiddlewareStack
 from django_bolt.testing import TestClient
 
@@ -93,3 +94,72 @@ def test_get_current_user_returns_none_without_a_user():
         assert client.get("/me").json() == {"username": None}
         assert client.get("/me", headers=_headers(str(real.pk + 1000))).json() == {"username": None}
         assert client.get("/me", headers=_headers(str(real.pk))).json() == {"username": "real_user"}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_current_user_in_a_sync_handler_keeps_lane_dispatch():
+    """A sync handler loads its user with a sync dependency, so the request runs on the lane with no asyncio."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMiddleware])])
+    auth = _TenantAuth(secret=SECRET)
+
+    @api.get("/tenant/{tenant}", auth=[auth])
+    def endpoint(tenant: str, user: CurrentUser):
+        return {"tenant": user.tenant, "lane_mode": in_lane_mode()}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/tenant/acme", headers=_headers())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenant": "acme", "lane_mode": True}
+    assert auth.queries == 1
+
+
+@pytest.mark.parametrize("handler_is_async", [True, False], ids=["async", "sync"])
+def test_current_user_rejects_a_request_with_no_user(handler_is_async):
+    """``CurrentUser`` answers 401 with no authenticated user. ``OptionalCurrentUser`` gives ``None``."""
+    api = BoltAPI()
+
+    if handler_is_async:
+
+        @api.get("/required")
+        async def required(user: CurrentUser):
+            return {"username": user.username}
+
+        @api.get("/optional")
+        async def optional(user: OptionalCurrentUser):
+            return {"user": None if user is None else user.username}
+    else:
+
+        @api.get("/required")
+        def required(user: CurrentUser):
+            return {"username": user.username}
+
+        @api.get("/optional")
+        def optional(user: OptionalCurrentUser):
+            return {"user": None if user is None else user.username}
+
+    with TestClient(api) as client:
+        assert client.get("/required").status_code == 401
+        response = client.get("/optional")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"user": None}
+
+
+def _sync_dependency(request: Request) -> str:
+    return getattr(_local, "tenant", "<unset>")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_sync_handler_with_sync_dependencies_keeps_lane_dispatch():
+    """Sync dependencies of a sync handler do not need asyncio, so lane dispatch stays on."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMiddleware])])
+
+    @api.get("/tenant/{tenant}")
+    def endpoint(tenant: str, dep: Annotated[str, Depends(_sync_dependency)]):
+        return {"dep": dep, "lane_mode": in_lane_mode()}
+
+    with TestClient(api) as client:
+        response = client.get("/tenant/acme")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"dep": "acme", "lane_mode": True}

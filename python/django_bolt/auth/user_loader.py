@@ -44,6 +44,7 @@ from .pk_loader import load_user_by_pk_sync
 __all__ = [
     "LazyUser",
     "aload_bolt_user",
+    "preload_request_user",
     "load_user_by_pk_sync",
     "register_auth_backend",
     "get_registered_backend",
@@ -118,6 +119,27 @@ async def aload_bolt_user(user: Any) -> Any:
     if type(user) is LazyUser:
         return await user.aload()
     return user
+
+
+async def preload_request_user(request: Any) -> None:
+    """Load ``request.user`` before an async handler that reads it.
+
+    The handler then reads a loaded user, and its sync read does not block
+    the event loop. A user that Bolt authenticated loads with its async
+    loader. The lazy user of Django's ``AuthenticationMiddleware`` loads with
+    Django's ``auser``, which gives the same user without a sync query.
+    """
+    user = request.user
+    if user is None:
+        return
+    # ``type`` does not force a lazy object. ``isinstance`` does.
+    user_type = type(user)
+    if user_type is LazyUser:
+        await user.aload()
+    elif user_type is SimpleLazyObject and user._wrapped is empty:
+        loaded = await request.auser()
+        if loaded is not user:
+            user._wrapped = loaded
 
 
 def _has_custom_get_user_sync(cls: type) -> bool:

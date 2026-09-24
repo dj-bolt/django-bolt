@@ -37,6 +37,8 @@ When a handler parameter is annotated with `Depends()`, Django-Bolt:
 2. Passes the result to the handler
 3. Caches the result for subsequent uses in the same request
 
+When every dependency of a handler is a sync function, Bolt resolves them with no event loop. A sync handler then keeps its sync dispatch, and behind Django middleware its complete request runs on one lane.
+
 ## Dependency patterns
 
 ### Request access
