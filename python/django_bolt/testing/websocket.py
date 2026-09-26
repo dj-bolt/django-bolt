@@ -282,6 +282,13 @@ class WebSocketTestClient:
         # Use Rust for path matching, auth, and guard evaluation
         _found, handler_id, handler, path_params, scope = self._find_handler_via_rust()
 
+        # A revoked token fails the handshake, as the server checks before the upgrade.
+        revocation_auth = scope.pop("_bolt_revocation_auth", None)
+        if revocation_auth is not None:
+            check = self.api._handler_middleware[handler_id]["websocket_revocation_check"]
+            if await check(revocation_auth):
+                raise PermissionError("WebSocket connection denied: Token has been revoked")
+
         # Create WebSocket instance
         ws = WebSocket(scope, self._receive, self._send)
 

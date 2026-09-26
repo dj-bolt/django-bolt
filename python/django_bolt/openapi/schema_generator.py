@@ -805,6 +805,19 @@ class SchemaGenerator:
 
         return operation
 
+    @staticmethod
+    def _route_fields(meta: dict[str, Any]) -> list[Any]:
+        """The fields of the handler, then the request data fields of its dependencies.
+
+        A dependency field with the name of a handler field is left out, as at run time.
+        """
+        fields = meta.get("fields", [])
+        handler_names = {field.name for field in fields}
+        return [
+            *fields,
+            *(field for field in meta.get("dependency_fields", ()) if field.name not in handler_names),
+        ]
+
     def _extract_parameters(self, meta: dict[str, Any], path: str) -> list[Parameter]:
         """Extract OpenAPI parameters from handler metadata.
 
@@ -816,13 +829,17 @@ class SchemaGenerator:
             List of Parameter objects.
         """
         parameters: list[Parameter] = []
-        fields = meta.get("fields", [])
+        # Two dependencies can read the same header or query parameter.
+        documented: set[tuple[str, str]] = set()
 
-        for field in fields:
+        for field in self._route_fields(meta):
             # Access FieldDefinition attributes directly
             source = field.source
             name = field.name
             alias = field.alias or name
+            if source == "header":
+                # Bolt reads the x_request_id parameter from the x-request-id header.
+                alias = alias.replace("_", "-")
             annotation = field.annotation
             default = field.default
 
@@ -838,8 +855,9 @@ class SchemaGenerator:
                 "cookie": "cookie",
             }.get(source)
 
-            if not param_in:
+            if not param_in or (param_in, alias) in documented:
                 continue
+            documented.add((param_in, alias))
 
             # Determine if required
             required = (
@@ -911,10 +929,18 @@ class SchemaGenerator:
         """
         body_param = meta.get("body_struct_param")
         body_type = meta.get("body_struct_type")
+        fields = self._route_fields(meta)
+
+        if not body_param or not body_type:
+            # A dependency can read the JSON body.
+            dependency_body = next(
+                (f for f in meta.get("dependency_fields", ()) if f.source == "body" and f.is_msgspec_struct), None
+            )
+            if dependency_body is not None:
+                body_param, body_type = dependency_body.name, dependency_body.annotation
 
         if not body_param or not body_type:
             # Check for form/file fields
-            fields = meta.get("fields", [])
             form_fields = [f for f in fields if f.source in ("form", "file")]
 
             if form_fields:
@@ -1076,7 +1102,7 @@ class SchemaGenerator:
         if self.config.include_error_responses:
             # Check if request body is present (for 422 validation errors)
             has_request_body = meta.get("body_struct_param") or any(
-                f.source in ("body", "form", "file") for f in meta.get("fields", [])
+                f.source in ("body", "form", "file") for f in self._route_fields(meta)
             )
 
             if has_request_body:
