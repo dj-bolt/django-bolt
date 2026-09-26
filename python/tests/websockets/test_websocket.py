@@ -586,6 +586,23 @@ def injection_api():
             }
         )
 
+    # Typed header and cookie values are converted in Rust, as in HTTP.
+    @api.websocket("/ws/inject/typed")
+    async def typed_header_cookie_handler(
+        websocket: WebSocket,
+        x_count: Annotated[int, Header()],
+        page: Annotated[int, Cookie()] = 1,
+    ):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "x_count": x_count,
+                "x_count_type": type(x_count).__name__,
+                "page": page,
+                "page_type": type(page).__name__,
+            }
+        )
+
     # Mixed injection (path + query + header + cookie)
     @api.websocket("/ws/inject/mixed/{room_id}")
     async def mixed_inject_handler(
@@ -676,6 +693,32 @@ async def test_websocket_cookie_injection_default(injection_api):
         response = await ws.receive_json()
         assert response["session_id"] == "my-session"
         assert response["theme"] == "light"  # Default value
+
+
+@pytest.mark.asyncio
+async def test_websocket_typed_header_and_cookie(injection_api):
+    """Test typed Header() and Cookie() values arrive as their declared types."""
+    headers = {"X-Count": "5", "Cookie": "page=3"}
+    async with WebSocketTestClient(injection_api, "/ws/inject/typed", headers=headers) as ws:
+        response = await ws.receive_json()
+        assert response == {"x_count": 5, "x_count_type": "int", "page": 3, "page_type": "int"}
+
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_typed_header_rejects_upgrade(injection_api):
+    """Test a bad typed header value rejects the upgrade and names the header."""
+    with pytest.raises(ValueError, match="Header 'x-count'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/typed", headers={"X-Count": "abc"}):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_typed_cookie_rejects_upgrade(injection_api):
+    """Test a bad typed cookie value rejects the upgrade and names the cookie."""
+    headers = {"X-Count": "1", "Cookie": "page=last"}
+    with pytest.raises(ValueError, match="Cookie 'page'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/typed", headers=headers):
+            pass
 
 
 @pytest.mark.asyncio

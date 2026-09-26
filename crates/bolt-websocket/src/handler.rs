@@ -12,13 +12,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use std::collections::HashMap;
-
 use bolt_core::metadata::CorsConfig;
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
+use bolt_core::request_pipeline::{set_declared_item, EMPTY_TYPES};
 use bolt_core::state::{AppState, ROUTE_METADATA};
 use bolt_core::type_coercion::coerced_value_to_py;
-use bolt_core::type_coercion::{coerce_param, CoerceError, TYPE_STRING};
+use bolt_core::type_coercion::{coerce_param, CoerceError, TypeHints, TYPE_STRING};
 use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 
 use super::actor::WebSocketActor;
@@ -76,13 +75,15 @@ pub fn is_websocket_upgrade(req: &HttpRequest) -> bool {
 
 /// Build scope dict for Python WebSocket handler
 ///
-/// Parses and coerces query and path parameters to typed Python objects
-/// using the same type coercion as HTTP handlers.
+/// Parses and coerces query, path, header and cookie values to typed Python
+/// objects using the same type coercion as HTTP handlers.
 fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
     path_params: &AHashMap<String, String>,
-    param_types: &HashMap<String, u8>,
+    param_types: &TypeHints,
+    header_types: &TypeHints,
+    cookie_types: &TypeHints,
     max_param_length: usize,
 ) -> PyResult<Py<PyAny>> {
     let scope_dict = PyDict::new(py);
@@ -128,10 +129,19 @@ fn build_scope(
 
     // Add headers as dict (FastAPI style)
     // OPTIMIZATION: HeaderName::as_str() already returns lowercase (http crate canonical form)
+    // A typed header with a bad value rejects the upgrade, as in HTTP.
     let headers_dict = PyDict::new(py);
     for (key, value) in req.headers().iter() {
         if let Ok(v) = value.to_str() {
-            headers_dict.set_item(key.as_str(), v)?;
+            set_declared_item(
+                py,
+                &headers_dict,
+                key.as_str(),
+                v,
+                header_types,
+                max_param_length,
+                "Header",
+            )?;
         }
     }
     scope_dict.set_item("headers", headers_dict)?;
@@ -166,7 +176,15 @@ fn build_scope(
                 if let Some(eq_pos) = pair.find('=') {
                     let key = &pair[..eq_pos];
                     let value = &pair[eq_pos + 1..];
-                    cookies_dict.set_item(key, value)?;
+                    set_declared_item(
+                        py,
+                        &cookies_dict,
+                        key,
+                        value,
+                        cookie_types,
+                        max_param_length,
+                        "Cookie",
+                    )?;
                 }
             }
         }
@@ -577,16 +595,24 @@ pub async fn handle_websocket_upgrade_with_handler(
     // Create channels for bidirectional communication (configurable size)
     let (to_python_tx, to_python_rx) = mpsc::channel::<WsMessage>(config.channel_buffer_size);
 
-    // Get param_types from route metadata for type coercion
-    let param_types = ROUTE_METADATA
-        .get()
-        .and_then(|m| m.get(handler_id))
-        .map(|m| m.param_types.clone())
-        .unwrap_or_default();
+    // Get type hints from route metadata for type coercion
+    let route_meta = ROUTE_METADATA.get().and_then(|m| m.get(handler_id));
+    let empty_types: &TypeHints = &EMPTY_TYPES;
+    let param_types = route_meta.map_or(empty_types, |m| &m.param_types);
+    let header_types = route_meta.map_or(empty_types, |m| &m.header_types);
+    let cookie_types = route_meta.map_or(empty_types, |m| &m.cookie_types);
 
     // Build scope for Python - if this fails, decrement counter
     let scope = match Python::attach(|py| {
-        build_scope(py, &req, &path_params, &param_types, state.max_param_length)
+        build_scope(
+            py,
+            &req,
+            &path_params,
+            param_types,
+            header_types,
+            cookie_types,
+            state.max_param_length,
+        )
     }) {
         Ok(s) => s,
         Err(e) => {

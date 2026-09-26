@@ -14,6 +14,8 @@ use uuid::Uuid;
 // Each import costs ~50-100ns, caching eliminates this overhead for repeated coercions
 static UUID_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static DECIMAL_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static OBJECT_NEW: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SAFE_UUID_UNKNOWN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 #[inline]
 pub fn get_uuid_class(py: Python<'_>) -> &Py<PyAny> {
@@ -236,9 +238,14 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
             .map_err(|e| format!("Invalid float '{}': {}", value, e)),
 
         TYPE_BOOL => {
-            let lower = value.to_lowercase();
-            let is_true = matches!(lower.as_str(), "true" | "1" | "yes" | "on");
-            let is_false = matches!(lower.as_str(), "false" | "0" | "no" | "off");
+            // Compare without case. This does not allocate a lowercase copy of the value.
+            let is_true = ["true", "1", "yes", "on"]
+                .iter()
+                .any(|token| value.eq_ignore_ascii_case(token));
+            let is_false = !is_true
+                && ["false", "0", "no", "off"]
+                    .iter()
+                    .any(|token| value.eq_ignore_ascii_case(token));
             if is_true {
                 Ok(CoercedValue::Bool(true))
             } else if is_false {
@@ -339,155 +346,38 @@ fn parse_time(value: &str) -> Result<CoercedValue, String> {
     ))
 }
 
-/// Convert a string value to Python object based on type hint.
-/// Handles all supported types including datetime, uuid, and decimal.
-/// Returns PyResult to properly handle validation errors.
-/// `max_length` is the startup-resolved limit (`AppState.max_param_length`),
-/// passed in so the `params_to_py_dict` hot loop never re-resolves config.
-#[inline]
-pub fn coerce_to_py(
-    py: pyo3::Python<'_>,
-    value: &str,
-    type_hint: u8,
-    max_length: usize,
-) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-    // Security: Validate length for ALL types (defense in depth)
-    if value.len() > max_length {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Parameter too long: {} bytes (max {} bytes)",
-            value.len(),
-            max_length
-        )));
-    }
+/// Non-string type hints of one request source, keyed by wire name.
+pub type TypeHints = ahash::AHashMap<String, u8>;
 
-    match type_hint {
-        TYPE_INT => Ok(value
-            .parse::<i64>()
-            .unwrap_or(0)
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-        TYPE_FLOAT => Ok(value
-            .parse::<f64>()
-            .unwrap_or(0.0)
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-        TYPE_BOOL => {
-            let is_true = matches!(value.to_lowercase().as_str(), "true" | "1" | "yes" | "on");
-            Ok(is_true
-                .into_pyobject(py)
-                .unwrap()
-                .to_owned()
-                .unbind()
-                .into_any())
-        }
-        TYPE_UUID => {
-            // Parse UUID in Rust, construct uuid.UUID from the 128-bit value —
-            // no 36-char string alloc, no hex re-parse on the Python side.
-            match Uuid::parse_str(value) {
-                Ok(uuid) => uuid_to_py(py, uuid),
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid UUID '{}': {}",
-                    value, e
-                ))),
-            }
-        }
-        TYPE_DATETIME => {
-            // Parse datetime in Rust, construct datetime.datetime directly via
-            // pyo3's chrono integration (C-API construction, no ISO round trip).
-            match parse_datetime(value) {
-                Ok(CoercedValue::DateTime(dt)) => Ok(dt.into_pyobject(py)?.into_any().unbind()),
-                Ok(CoercedValue::NaiveDateTime(ndt)) => {
-                    Ok(ndt.into_pyobject(py)?.into_any().unbind())
-                }
-                Ok(_) => {
-                    // Shouldn't happen, but fallback to string
-                    Ok(value
-                        .to_string()
-                        .into_pyobject(py)
-                        .unwrap()
-                        .into_any()
-                        .unbind())
-                }
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
-            }
-        }
-        TYPE_DECIMAL => {
-            // Validate decimal in Rust, convert to Python Decimal
-            // OPTIMIZATION: Use cached Decimal class (avoids py.import per call)
-            if is_valid_decimal_literal(value) {
-                // Pass the original validated string: Python's Decimal
-                // normalizes it, and this avoids expanding large exponents.
-                Ok(get_decimal_class(py).call1(py, (value,))?)
-            } else {
-                Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid decimal '{}'",
-                    value
-                )))
-            }
-        }
-        TYPE_DATE => {
-            // Parse date in Rust, construct datetime.date directly (chrono).
-            match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-                Ok(date) => Ok(date.into_pyobject(py)?.into_any().unbind()),
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid date '{}': {}",
-                    value, e
-                ))),
-            }
-        }
-        TYPE_TIME => {
-            // Parse time in Rust, construct datetime.time directly (chrono).
-            match parse_time(value) {
-                Ok(CoercedValue::Time(time)) => Ok(time.into_pyobject(py)?.into_any().unbind()),
-                Ok(_) => {
-                    // Shouldn't happen, but fallback to string
-                    Ok(value
-                        .to_string()
-                        .into_pyobject(py)
-                        .unwrap()
-                        .into_any()
-                        .unbind())
-                }
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
-            }
-        }
-        _ => Ok(value
-            .to_string()
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-    }
-}
+/// Pre-coerced values of one request source. The names borrow from the
+/// request map or the route metadata, so no name is copied per request.
+pub type CoercedValues<'a> = Vec<(&'a str, CoercedValue)>;
 
-/// Convert a map of string params to a Python dict with type coercion.
-/// Used by both production handler and test handler.
-/// Returns PyResult to properly handle coercion errors.
+/// Build a Python dict from a map of string values.
 ///
-/// Keys declared in `param_types` (a bounded, registration-time set) are
-/// interned so repeated requests reuse one PyString per name. Arbitrary
-/// client-supplied names are NOT interned — interned strings are effectively
-/// immortal, which would be a memory-growth vector.
-pub fn params_to_py_dict<'py>(
-    py: pyo3::Python<'py>,
-    params: &ahash::AHashMap<String, String>,
-    param_types: &std::collections::HashMap<String, u8>,
-    max_param_length: usize,
-) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
-    let dict = pyo3::types::PyDict::new(py);
-    for (name, value) in params {
-        match param_types.get(name) {
-            Some(&type_hint) => {
-                let py_value = coerce_to_py(py, value, type_hint, max_param_length)?;
-                let _ = dict.set_item(pyo3::types::PyString::intern(py, name), py_value);
-            }
-            None => {
-                let py_value = coerce_to_py(py, value, TYPE_STRING, max_param_length)?;
-                let _ = dict.set_item(name, py_value);
+/// A value in `coerced` replaces the string for its name. The request pipeline
+/// validates and coerces those values before the GIL is taken, so this step
+/// cannot fail on bad input. Used for path, query, header and cookie values.
+///
+/// Names are not interned: interning costs a lookup per call, and interned
+/// client-supplied names would never be freed.
+#[inline]
+pub fn string_map_to_py_dict<'py>(
+    py: Python<'py>,
+    values: &ahash::AHashMap<String, String>,
+    coerced: &[(&str, CoercedValue)],
+) -> PyResult<pyo3::Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    if coerced.is_empty() {
+        for (name, value) in values {
+            dict.set_item(name, value)?;
+        }
+    } else {
+        // `coerced` holds a few entries, so a linear scan beats a hash lookup.
+        for (name, value) in values {
+            match coerced.iter().find(|(typed, _)| *typed == name.as_str()) {
+                Some((_, typed)) => dict.set_item(name, coerced_value_to_py(py, typed))?,
+                None => dict.set_item(name, value)?,
             }
         }
     }
@@ -524,6 +414,24 @@ mod tests {
 
     #[test]
     fn test_coerce_bool() {
+        for (value, expected) in [
+            ("TRUE", true),
+            ("Yes", true),
+            ("ON", true),
+            ("OFF", false),
+            ("No", false),
+        ] {
+            assert!(
+                matches!(coerce_param(value, TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Bool(b)) if b == expected),
+                "{value}"
+            );
+        }
+        for value in ["tru", "yess", "", "on "] {
+            assert!(
+                coerce_param(value, TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH).is_err(),
+                "{value}"
+            );
+        }
         assert!(matches!(
             coerce_param("true", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(true))
@@ -740,12 +648,53 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
 }
 
 /// Build a Python `uuid.UUID` from the parsed 128-bit value.
+///
+/// `uuid.UUID(int=...)` runs the Python `__init__`, which checks its arguments
+/// again. This function builds the object as CPython 3.14 `UUID._from_int` does:
+/// `object.__new__(UUID)`, then it sets the `int` and `is_safe` slots.
+/// `UUID.__setattr__` blocks assignment, so the slots are set with the generic
+/// setter, as `object.__setattr__` does. The 128-bit value is always in range.
 #[inline]
 pub fn uuid_to_py(py: Python<'_>, v: uuid::Uuid) -> PyResult<Py<PyAny>> {
-    let kwargs = PyDict::new(py);
-    kwargs.set_item(pyo3::intern!(py, "int"), v.as_u128())?;
-    Ok(get_uuid_class(py)
-        .bind(py)
-        .call((), Some(&kwargs))?
-        .unbind())
+    let object_new = OBJECT_NEW.get_or_init(py, || {
+        py.import("builtins")
+            .unwrap()
+            .getattr("object")
+            .unwrap()
+            .getattr("__new__")
+            .unwrap()
+            .unbind()
+    });
+    let safe_unknown = SAFE_UUID_UNKNOWN.get_or_init(py, || {
+        py.import("uuid")
+            .unwrap()
+            .getattr("SafeUUID")
+            .unwrap()
+            .getattr("unknown")
+            .unwrap()
+            .unbind()
+    });
+    let value = object_new.bind(py).call1((get_uuid_class(py).bind(py),))?;
+    let int = v.as_u128().into_pyobject(py)?;
+    set_slot(&value, pyo3::intern!(py, "int"), int.as_any())?;
+    set_slot(&value, pyo3::intern!(py, "is_safe"), safe_unknown.bind(py))?;
+    Ok(value.unbind())
+}
+
+/// Set an attribute with the generic setter, as `object.__setattr__` does.
+#[inline]
+fn set_slot(
+    object: &pyo3::Bound<'_, PyAny>,
+    name: &pyo3::Bound<'_, pyo3::types::PyString>,
+    value: &pyo3::Bound<'_, PyAny>,
+) -> PyResult<()> {
+    // SAFETY: the three pointers are valid for the call: the Bound references keep them alive.
+    let status = unsafe {
+        pyo3::ffi::PyObject_GenericSetAttr(object.as_ptr(), name.as_ptr(), value.as_ptr())
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(pyo3::PyErr::fetch(object.py()))
+    }
 }
