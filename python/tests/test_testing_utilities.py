@@ -179,6 +179,14 @@ def test_percent_encoded_path_params():
         assert response.json() == {"value": "a/b"}
 
 
+def test_invalid_utf8_path_param_passes_through():
+    """A path param that does not decode to UTF-8 stays percent-encoded, as in Django."""
+    with TestClient(_percent_encoded_path_api()) as client:
+        response = client.get("/str/a%FFb")
+        assert response.status_code == 200
+        assert response.json() == {"value": "a%FFb"}
+
+
 def test_percent_encoded_path_params_async_client():
     """AsyncTestClient sends the encoded path too."""
 
