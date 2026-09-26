@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
@@ -36,7 +36,9 @@ use bolt_core::responses;
 use bolt_core::router::parse_query_string;
 use bolt_core::state::{find_asgi_mount, AppState, GLOBAL_ROUTER, ROUTE_METADATA};
 use bolt_core::streaming::{create_python_stream, create_sse_stream};
-use bolt_core::type_coercion::{coerced_value_to_py, string_map_to_py_dict, TypeHints};
+use bolt_core::type_coercion::{
+    coerced_value_to_py, string_map_to_py_dict, CoercedValue, TypeHints,
+};
 use bolt_core::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
 
 use std::future::Future;
@@ -566,53 +568,69 @@ pub async fn response_from_wire_result(
     Ok(build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request, req).await)
 }
 
-/// Build prebound Python args/kwargs from Rust binding metadata.
+/// One request source as Rust holds it: the string map and its coerced values.
+pub(crate) struct SourceValues<'a> {
+    pub values: Option<&'a AHashMap<String, String>>,
+    pub coerced: &'a [(&'a str, CoercedValue)],
+}
+
+impl SourceValues<'_> {
+    /// Look up `key`: a coerced value first, then the string map.
+    #[inline]
+    fn get(&self, py: Python<'_>, key: &str) -> PyResult<Option<Py<PyAny>>> {
+        if let Some((_, typed)) = self.coerced.iter().find(|(name, _)| *name == key) {
+            return coerced_value_to_py(py, typed).map(Some);
+        }
+        Ok(self
+            .values
+            .and_then(|values| values.get(key))
+            .map(|value| PyString::new(py, value).into_any().unbind()))
+    }
+}
+
+/// Bind handler arguments straight from the Rust request maps.
 ///
-/// Returns None if any *required* binding value is missing so the Python
-/// injector can execute as a safe fallback and preserve 422 error semantics.
-/// Optional bindings are keyword-only: a missing value is either skipped
-/// (function default applies) or injected as None (Optional[T] with no default).
-pub(crate) fn build_prebound_args_kwargs(
+/// `Ok(None)` means a required value is missing; the Python injector then
+/// raises the 422 from the source dicts. A `prebind_only` route builds no
+/// source dict when this succeeds, because nothing else reads them.
+pub(crate) fn build_prebound_from_values(
     py: Python<'_>,
     bindings: &[RustArgBinding],
-    path_params: &Bound<'_, PyDict>,
-    query_params: &Bound<'_, PyDict>,
-    headers: &Bound<'_, PyDict>,
-    cookies: &Bound<'_, PyDict>,
-) -> Option<(Py<PyList>, Py<PyDict>)> {
+    path: &SourceValues<'_>,
+    query: &SourceValues<'_>,
+    headers: &SourceValues<'_>,
+    cookies: &SourceValues<'_>,
+) -> PyResult<Option<(Py<PyList>, Py<PyDict>)>> {
     let args = PyList::empty(py);
     let kwargs = PyDict::new(py);
 
     for binding in bindings {
-        let source_dict = match binding.source {
-            RustArgSource::Path => path_params,
-            RustArgSource::Query => query_params,
+        let source = match binding.source {
+            RustArgSource::Path => path,
+            RustArgSource::Query => query,
             RustArgSource::Header => headers,
             RustArgSource::Cookie => cookies,
         };
-
-        match source_dict.get_item(binding.lookup_key.bind(py)).ok()? {
+        match source.get(py, &binding.key)? {
             Some(value) => {
                 if binding.positional {
-                    args.append(&value).ok()?;
+                    args.append(value)?;
                 } else {
-                    kwargs.set_item(binding.arg_name.bind(py), &value).ok()?;
+                    kwargs.set_item(binding.arg_name.bind(py), value)?;
                 }
             }
             None => {
                 if binding.required {
-                    // Fall back to the Python injector, which raises the 422.
-                    return None;
+                    return Ok(None);
                 }
                 if binding.inject_none {
-                    kwargs.set_item(binding.arg_name.bind(py), py.None()).ok()?;
+                    kwargs.set_item(binding.arg_name.bind(py), py.None())?;
                 }
-                // else: omit — the handler's own default applies.
             }
         }
     }
 
-    Some((args.unbind(), kwargs.unbind()))
+    Ok(Some((args.unbind(), kwargs.unbind())))
 }
 
 /// Map an HTTP method to a `Cow::Borrowed` static string. Routable methods are
@@ -1176,9 +1194,44 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             None
         };
 
+        // Bind the handler arguments from the Rust maps. A prebind_only route
+        // then needs no Python source dicts.
+        let state_lock = std::sync::OnceLock::new();
+        let mut skip_dicts = false;
+        if let Some(bindings) = route_metadata.and_then(|m| m.rust_arg_bindings.as_deref()) {
+            let prebound = build_prebound_from_values(
+                py,
+                bindings,
+                &SourceValues {
+                    values: path_params.as_ref(),
+                    coerced: &path_coerced,
+                },
+                &SourceValues {
+                    values: query_params.as_ref(),
+                    coerced: &query_coerced,
+                },
+                &SourceValues {
+                    values: headers.as_ref(),
+                    coerced: &headers_coerced,
+                },
+                &SourceValues {
+                    values: cookies.as_ref(),
+                    coerced: &cookies_coerced,
+                },
+            );
+            if let Some((pre_args, pre_kwargs)) = prebound? {
+                let state_dict = PyDict::new(py);
+                state_dict.set_item(pyo3::intern!(py, "_bolt_prebound_args"), pre_args)?;
+                state_dict.set_item(pyo3::intern!(py, "_bolt_prebound_kwargs"), pre_kwargs)?;
+                let _ = state_lock.set(state_dict.unbind());
+                skip_dicts = route_metadata.is_some_and(|m| m.prebind_only);
+            }
+        }
+
         // OPTIMIZATION: Create typed PyDicts only when non-empty.
         // Saves 1 Python heap alloc per empty source (up to 4 for simple API handlers).
         let path_params_py: Option<Py<PyDict>> = match path_params.as_ref() {
+            Some(_) if skip_dicts => None,
             Some(path_params) => {
                 Some(string_map_to_py_dict(py, path_params, &path_coerced)?.unbind())
             }
@@ -1186,13 +1239,14 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         };
 
         let query_params_py: Option<Py<PyDict>> = match query_params.as_ref() {
+            Some(_) if skip_dicts => None,
             Some(query_params) => {
                 Some(string_map_to_py_dict(py, query_params, &query_coerced)?.unbind())
             }
             None => None,
         };
 
-        let headers_py: Option<Py<PyDict>> = if needs_headers {
+        let headers_py: Option<Py<PyDict>> = if needs_headers && !skip_dicts {
             if let Some(headers_map) = headers.as_ref() {
                 Some(string_map_to_py_dict(py, headers_map, &headers_coerced)?.unbind())
             } else {
@@ -1201,7 +1255,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         } else {
             None
         };
-        let cookies_py: Option<Py<PyDict>> = if needs_cookies {
+        let cookies_py: Option<Py<PyDict>> = if needs_cookies && !skip_dicts {
             if let Some(cookies_map) = cookies.as_ref() {
                 Some(string_map_to_py_dict(py, cookies_map, &cookies_coerced)?.unbind())
             } else {
@@ -1215,38 +1269,6 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         // when a value was converted. A move, no copy.
         let keep_raw_headers = !headers_coerced.is_empty();
         let keep_raw_cookies = !cookies_coerced.is_empty();
-
-        // Only create state dict when Rust-side prebound args exist.
-        // For fast-path handlers (no rust_arg_bindings), state is lazily allocated on first access.
-        let state_lock = std::sync::OnceLock::new();
-        if let Some(bindings) = route_metadata.and_then(|m| m.rust_arg_bindings.as_deref()) {
-            // Create temp empty dict for prebound arg extraction (only when bindings exist)
-            let empty_dict = PyDict::new(py);
-            let pp_ref = match &path_params_py {
-                Some(d) => d.bind(py),
-                None => &empty_dict,
-            };
-            let qp_ref = match &query_params_py {
-                Some(d) => d.bind(py),
-                None => &empty_dict,
-            };
-            let hd_ref = match &headers_py {
-                Some(d) => d.bind(py),
-                None => &empty_dict,
-            };
-            let ck_ref = match &cookies_py {
-                Some(d) => d.bind(py),
-                None => &empty_dict,
-            };
-            if let Some((pre_args, pre_kwargs)) =
-                build_prebound_args_kwargs(py, bindings, pp_ref, qp_ref, hd_ref, ck_ref)
-            {
-                let state_dict = PyDict::new(py);
-                state_dict.set_item(pyo3::intern!(py, "_bolt_prebound_args"), pre_args)?;
-                state_dict.set_item(pyo3::intern!(py, "_bolt_prebound_kwargs"), pre_kwargs)?;
-                let _ = state_lock.set(state_dict.unbind());
-            }
-        }
 
         // Only create form/files dicts when form data is present (saves 2 allocs per request).
         let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {

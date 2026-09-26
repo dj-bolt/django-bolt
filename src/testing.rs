@@ -41,7 +41,9 @@ use bolt_websocket::WebSocketRouter;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 
-use crate::handler::{build_prebound_args_kwargs, form_result_to_py, response_from_wire_result};
+use crate::handler::{
+    build_prebound_from_values, form_result_to_py, response_from_wire_result, SourceValues,
+};
 use bolt_core::request_pipeline::{
     set_declared_item, validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
 };
@@ -1137,8 +1139,45 @@ async fn handle_test_request_internal(
             None
         };
 
+        // Bind the handler arguments from the Rust maps (matches production).
+        let state_lock = std::sync::OnceLock::new();
+        let mut skip_dicts = false;
+        if let Some(bindings) = route_meta
+            .as_ref()
+            .and_then(|m| m.rust_arg_bindings.as_deref())
+        {
+            let prebound = build_prebound_from_values(
+                py,
+                bindings,
+                &SourceValues {
+                    values: path_params.as_ref(),
+                    coerced: &path_coerced,
+                },
+                &SourceValues {
+                    values: query_params.as_ref(),
+                    coerced: &query_coerced,
+                },
+                &SourceValues {
+                    values: Some(&headers),
+                    coerced: &headers_coerced,
+                },
+                &SourceValues {
+                    values: Some(&cookies),
+                    coerced: &cookies_coerced,
+                },
+            );
+            if let Some((pre_args, pre_kwargs)) = prebound? {
+                let state_dict = PyDict::new(py);
+                state_dict.set_item("_bolt_prebound_args", pre_args)?;
+                state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
+                let _ = state_lock.set(state_dict.unbind());
+                skip_dicts = route_meta.as_ref().is_some_and(|m| m.prebind_only);
+            }
+        }
+
         // Create typed dicts - reuse pre-coerced values from the validation phase.
         let path_params_dict = match path_params.as_ref() {
+            Some(_) if skip_dicts => None,
             Some(path_params) => {
                 Some(string_map_to_py_dict(py, path_params, &path_coerced)?.unbind())
             }
@@ -1146,18 +1185,19 @@ async fn handle_test_request_internal(
         };
 
         let query_params_dict = match query_params.as_ref() {
+            Some(_) if skip_dicts => None,
             Some(query_params) => {
                 Some(string_map_to_py_dict(py, query_params, &query_coerced)?.unbind())
             }
             None => None,
         };
 
-        let headers_dict = if needs_headers {
+        let headers_dict = if needs_headers && !skip_dicts {
             Some(string_map_to_py_dict(py, &headers, &headers_coerced)?)
         } else {
             None
         };
-        let cookies_dict = if needs_cookies {
+        let cookies_dict = if needs_cookies && !skip_dicts {
             Some(string_map_to_py_dict(py, &cookies, &cookies_coerced)?)
         } else {
             None
@@ -1165,39 +1205,6 @@ async fn handle_test_request_internal(
         // Django middleware reads the original strings (matches production).
         let keep_raw_headers = !headers_coerced.is_empty();
         let keep_raw_cookies = !cookies_coerced.is_empty();
-
-        // Only create state dict when Rust-side prebound args exist (matches production).
-        let state_lock = std::sync::OnceLock::new();
-        if let Some(bindings) = route_meta
-            .as_ref()
-            .and_then(|m| m.rust_arg_bindings.as_deref())
-        {
-            let empty_dict = PyDict::new(py);
-            let pp_ref = match &path_params_dict {
-                Some(d) => d.bind(py),
-                None => &empty_dict,
-            };
-            let qp_ref = match &query_params_dict {
-                Some(d) => d.bind(py),
-                None => &empty_dict,
-            };
-            let hd_ref = match &headers_dict {
-                Some(d) => d,
-                None => &empty_dict,
-            };
-            let ck_ref = match &cookies_dict {
-                Some(d) => d,
-                None => &empty_dict,
-            };
-            if let Some((pre_args, pre_kwargs)) =
-                build_prebound_args_kwargs(py, bindings, pp_ref, qp_ref, hd_ref, ck_ref)
-            {
-                let state_dict = PyDict::new(py);
-                state_dict.set_item("_bolt_prebound_args", pre_args)?;
-                state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
-                let _ = state_lock.set(state_dict.unbind());
-            }
-        }
 
         // Only create form/files dicts when form data is present (matches production).
         let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {

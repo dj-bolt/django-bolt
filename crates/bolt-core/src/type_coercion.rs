@@ -414,6 +414,10 @@ pub type CoercedValues<'a> = Vec<(&'a str, CoercedValue)>;
 /// validates and coerces those values before the GIL is taken, so this step
 /// cannot fail on bad input. Used for path, query, header and cookie values.
 ///
+/// Two passes keep the cost linear: every string goes in first, then each
+/// coerced value overwrites its string. The overwritten strings are short,
+/// so this is cheaper than a lookup per value.
+///
 /// Names are not interned: interning costs a lookup per call, and interned
 /// client-supplied names would never be freed.
 #[inline]
@@ -423,18 +427,11 @@ pub fn string_map_to_py_dict<'py>(
     coerced: &[(&str, CoercedValue)],
 ) -> PyResult<pyo3::Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    if coerced.is_empty() {
-        for (name, value) in values {
-            dict.set_item(name, value)?;
-        }
-    } else {
-        // `coerced` holds a few entries, so a linear scan beats a hash lookup.
-        for (name, value) in values {
-            match coerced.iter().find(|(typed, _)| *typed == name.as_str()) {
-                Some((_, typed)) => dict.set_item(name, coerced_value_to_py(py, typed)?)?,
-                None => dict.set_item(name, value)?,
-            }
-        }
+    for (name, value) in values {
+        dict.set_item(name, value)?;
+    }
+    for (name, typed) in coerced {
+        dict.set_item(name, coerced_value_to_py(py, typed)?)?;
     }
     Ok(dict)
 }
