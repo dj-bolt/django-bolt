@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
+import httpx
 import pytest
 
 from django_bolt.testing import TestClient
@@ -77,6 +78,25 @@ class _EchoHandler(socketserver.StreamRequestHandler):
             return list(cls.received)
 
 
+def _get_concurrently(server, path: str, count: int, workers: int) -> list[httpx.Response]:
+    # One client for each thread: a shared httpx.Client races on a free-threaded build.
+    clients = threading.local()
+    created: list[httpx.Client] = []
+
+    def fetch(_: int) -> httpx.Response:
+        if not hasattr(clients, "client"):
+            clients.client = httpx.Client(timeout=server.timeout)
+            created.append(clients.client)
+        return clients.client.get(server.url(path))
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(fetch, range(count)))
+    finally:
+        for client in created:
+            client.close()
+
+
 @pytest.mark.server_integration
 def test_dispatch_probes_worker_loop_default(make_server_project):
     """The default loop supports normal asyncio compatibility semantics."""
@@ -128,6 +148,9 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             self.request = tls_context.wrap_socket(self.request, server_side=True)
             assert self.read_line(self.request) == b"over-tls\n"
             self.request.sendall(b"tls-ok\n")
+            # Close TLS before TCP. A bare close races the close_notify
+            # of the probe, and the socket then answers with RST.
+            self.request.unwrap()
 
     starttls_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), StartTLSHandler)
     starttls_thread = threading.Thread(target=starttls_server.serve_forever, daemon=True)
@@ -166,15 +189,23 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
         def log_message(self, format, *args):
             pass
 
-    http_server = ThreadingHTTPServer(("127.0.0.1", 0), HTTPHandler)
+    class PooledHTTPServer(ThreadingHTTPServer):
+        # The accept thread does each TLS handshake, one at a time. The
+        # pooled probe below opens 8 connections at once. The default
+        # backlog of 5 then overflows, and macOS resets the extra connects.
+        request_queue_size = 64
+
+    http_server = PooledHTTPServer(("127.0.0.1", 0), HTTPHandler)
     http_server.socket = tls_context.wrap_socket(http_server.socket, server_side=True)
     http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
     http_thread.start()
 
     try:
         with project.start(
-            # The shared-lock probe needs one loop. A free-threaded build
-            # starts one worker thread, and thus one loop, for each CPU.
+            # The shared-lock and cached-client probes keep loop-bound
+            # objects in module globals, so they need one loop. A
+            # free-threaded build starts one worker thread, and thus one
+            # loop, for each CPU.
             extra_args=["--workers", "1"],
             env={
                 "BOLT_PROBE_TCP_PORT": str(echo_server.server_address[1]),
@@ -227,16 +258,13 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
 
             # Contention binds asyncio.Lock to the loop. Both requests must see
             # the same process-lived facade rather than per-request loop objects.
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = [executor.submit(server.get, "/t-shared-lock") for _ in range(2)]
-                responses = [future.result() for future in futures]
+            responses = _get_concurrently(server, "/t-shared-lock", count=2, workers=2)
             assert all(response.status_code == 200 for response in responses)
             assert len({response.json()["loop"] for response in responses}) == 1
 
             # A real connection pool remains usable when cached across requests.
             assert server.get("/t-cached-client").json() == {"pooled": True}
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                pooled = list(executor.map(lambda _: server.get("/t-cached-client"), range(32)))
+            pooled = _get_concurrently(server, "/t-cached-client", count=32, workers=8)
             assert all(response.status_code == 200 for response in pooled)
             assert all(response.json() == {"pooled": True} for response in pooled)
 
