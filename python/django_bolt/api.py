@@ -62,7 +62,6 @@ from .openapi import (
     SwaggerRenderPlugin,
 )
 from .openapi.routes import OpenAPIRouteRegistrar
-from .openapi.schema_generator import SchemaGenerator
 from .pagination import extract_pagination_item_type, paginate
 from .responses import JSON as _JSONResponse
 from .router import Router
@@ -2888,19 +2887,6 @@ class BoltAPI:
                 for upload in upload_files:
                     with suppress(Exception):
                         upload.close_sync()
-
-    def _get_openapi_schema(self) -> dict[str, Any]:
-        """Get or generate OpenAPI schema.
-
-        Returns:
-            OpenAPI schema as dictionary.
-        """
-        if self._openapi_schema is None:
-            generator = SchemaGenerator(self, self._openapi_config)
-            openapi = generator.generate()
-            self._openapi_schema = openapi.to_schema()
-
-        return self._openapi_schema
 
     def _register_openapi_routes(self, *, middleware: list[Any] | None = None) -> None:
         """Register OpenAPI documentation routes.
