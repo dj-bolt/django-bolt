@@ -93,6 +93,8 @@ dev = [
     "django-debug-toolbar>=7.1.1",
     # Pure-Python wheel (no cp314t build of psycopg-binary exists); needs libpq at run time.
     "psycopg>=3.2", # PostgreSQL recovery tests (`just test-pg`)
+    "django-tenants>=3.14", # request lane tests with real schemas (`just test-pg`)
+    "django-allauth>=65.19", # session login through allauth, read by Bolt routes
 ]
 docs = [
     "zensical",

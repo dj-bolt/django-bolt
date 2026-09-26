@@ -4,11 +4,12 @@ import asyncio
 import contextlib
 import dis
 import inspect
+import logging
+import os
 import sys
 import threading
 from collections.abc import Callable
 from contextlib import suppress
-from functools import partial
 from typing import Any, get_origin, get_type_hints
 
 # Django import - may fail if Django not configured
@@ -24,7 +25,6 @@ from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
-from django.utils.functional import SimpleLazyObject
 
 from . import _json
 from ._kwargs import (
@@ -37,8 +37,13 @@ from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler
 from .auth import get_default_authentication_classes, register_auth_backend
-from .auth.user_loader import default_django_user_loader, resolve_user_loader
+from .auth.user_loader import (
+    DEFAULT_USER_LOADERS,
+    LazyUser,
+    resolve_user_loader,
+)
 from .concurrency import (
+    LaneAffinityError,
     _drop_broken_connections,
     run_in_orm_executor,
     run_on_request_lane,
@@ -86,6 +91,9 @@ from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata, HandlerPattern
 from .views import APIView, ViewSet, _layer
 from .websocket import mark_websocket_handler
+
+logger = logging.getLogger(__name__)
+
 
 Response = ResponseWireV1
 
@@ -388,6 +396,8 @@ class BoltAPI:
                 Receives the BoltAPI instance as argument.
         """
         self._routes: list[tuple[str, str, int, Callable]] = []
+        # Handler IDs whose lane affinity error was logged with its fix, one time each.
+        self._lane_affinity_hinted: set[int] = set()
         self._websocket_routes: list[tuple[str, int, Callable]] = []  # (path, handler_id, handler)
         self._handlers: dict[int, Callable] = {}
         # OPTIMIZATION: Use handler_id (int) as key instead of callable
@@ -1467,8 +1477,13 @@ class BoltAPI:
                 field.name for field in meta.get("fields", []) if getattr(field, "source", None) == "request"
             }
 
-            # Static ORM + request-component analysis at registration time
-            handler_analysis = analyze_handler(fn, request_param_names=request_param_names)
+            # Static ORM + request-component analysis at registration time.
+            # A handler with only a request parameter has no fields, but the
+            # analysis still needs the name to find reads of request.user.
+            analyzed_request_names = request_param_names
+            if not analyzed_request_names and meta["mode"] == "request_only":
+                analyzed_request_names = {next(iter(meta["sig"].parameters))}
+            handler_analysis = analyze_handler(fn, request_param_names=analyzed_request_names)
 
             if request_param_names:
                 if handler_analysis.analysis_failed:
@@ -1500,12 +1515,27 @@ class BoltAPI:
                 if getattr(dep_needs, needs_key):
                     meta[needs_key] = True
 
+            # Normalize route-level middleware declared via @middleware / @cors / @rate_limit.
+            # Validation happens at registration time to fail fast and deterministically.
+            route_middleware = normalize_middleware_specs(
+                getattr(fn, "__bolt_middleware__", []),
+                context="route",
+                allow_function_middleware=True,
+            )
+            if route_middleware or hasattr(fn, "__bolt_middleware__"):
+                fn.__bolt_middleware__ = route_middleware
+
+            router_middleware = normalize_middleware_specs(_router_middleware, context="router")
+
             # Django middleware can keep request state in threading.local. A sync
             # handler must then run on the thread of its request, not inline on
-            # the event loop, so treat it as blocking work.
-            meta["is_blocking"] = handler_analysis.is_blocking or (
-                not meta["is_async"] and self._has_django_wrapper_middleware
+            # the event loop, so treat it as blocking work. The middleware can be
+            # on the API, on a router, or on the route.
+            has_django_middleware = self._has_django_wrapper_middleware or any(
+                isinstance(spec, (DjangoMiddleware, DjangoMiddlewareStack))
+                for spec in (*router_middleware, *route_middleware)
             )
+            meta["is_blocking"] = handler_analysis.is_blocking or (not meta["is_async"] and has_django_middleware)
 
             # Determine final response type with proper priority:
             # 1. response_model parameter (explicit, takes precedence)
@@ -1660,18 +1690,6 @@ class BoltAPI:
                 meta["body_struct_param"] = "body"
                 meta["body_struct_type"] = body_struct_type
 
-            # Normalize route-level middleware declared via @middleware / @cors / @rate_limit.
-            # Validation happens at registration time to fail fast and deterministically.
-            route_middleware = normalize_middleware_specs(
-                getattr(fn, "__bolt_middleware__", []),
-                context="route",
-                allow_function_middleware=True,
-            )
-            if route_middleware or hasattr(fn, "__bolt_middleware__"):
-                fn.__bolt_middleware__ = route_middleware
-
-            router_middleware = normalize_middleware_specs(_router_middleware, context="router")
-
             # Preserve normalized middleware layers in handler metadata for runtime execution.
             meta["_router_middleware"] = router_middleware
             meta["_route_middleware"] = route_middleware
@@ -1708,14 +1726,6 @@ class BoltAPI:
                 if backend.scheme_name not in user_loaders:
                     user_loaders[backend.scheme_name] = resolve_user_loader(backend)
             meta["_user_loaders"] = user_loaders
-
-            # Execution context for request.user loads on the async dispatch
-            # path: async handlers run on the event loop, and non-blocking
-            # sync handlers are run inline on it too — both need the loader
-            # to use the executor (sync ORM on the loop thread raises
-            # SynchronousOnlyOperation). Only blocking sync handlers run in
-            # a worker thread, where a direct ORM call is safe and faster.
-            meta["_user_load_is_async_ctx"] = meta["is_async"] or not meta["is_blocking"]
 
             # scheme_name → handler. Lookup at dispatch is O(1) via the
             # matched backend's name. None when no backend has revocation.
@@ -1892,6 +1902,14 @@ class BoltAPI:
                     args, kwargs = prebound_args, prebound_kwargs
                 elif injector_is_async:
                     args, kwargs = await injector(request)
+                elif is_blocking and not is_async:
+                    # The sync injector runs in the thread hop of the handler, so its
+                    # sync dependencies run on that thread (the lane behind Django middleware).
+                    def _run_blocking_multi_injected() -> ResponseWireV1:
+                        injected_args, injected_kwargs = injector(request)
+                        return _dispatch_multi_sync(handler(*injected_args, **injected_kwargs))
+
+                    return await sync_to_thread(_run_blocking_multi_injected)
                 else:
                     args, kwargs = injector(request)
 
@@ -2507,6 +2525,14 @@ class BoltAPI:
                     args, kwargs = prebound_args, prebound_kwargs
                 elif injector_is_async:
                     args, kwargs = await injector(request)
+                elif is_blocking and not is_async:
+                    # The sync injector runs in the thread hop of the handler, so its
+                    # sync dependencies run on that thread (the lane behind Django middleware).
+                    def _run_blocking_injected() -> ResponseWireV1:
+                        injected_args, injected_kwargs = injector(request)
+                        return serialize_response_sync(handler(*injected_args, **injected_kwargs), meta)
+
+                    return await sync_to_thread(_run_blocking_injected)
                 else:
                     args, kwargs = injector(request)
 
@@ -2534,6 +2560,35 @@ class BoltAPI:
     def _handle_http_exception(self, he: HTTPException) -> Response:
         """Handle HTTPException and return response."""
         return _wire_from_error_parts(*http_exception_handler(he))
+
+    def _describe_lane_affinity_error(self, error: LaneAffinityError, handler: Callable, handler_id: int) -> None:
+        """Add the route and the handler to the message. In dev mode, log the fix one time per route.
+
+        The read of ``request.user`` can be indirect, for example in a template,
+        so the message must say where the request ran. This runs on the error path only.
+        """
+        if getattr(error, "_bolt_route_described", False):
+            return
+        error._bolt_route_described = True
+        route = next((f"{method} {path}" for method, path, route_id, _ in self._routes if route_id == handler_id), None)
+        target = inspect.unwrap(handler)
+        code = getattr(target, "__code__", None)
+        where = f"{target.__module__}.{target.__qualname__}"
+        if code is not None:
+            where += f" ({code.co_filename}:{code.co_firstlineno})"
+        description = f"Route: {route or 'unknown'}. Handler: {where}."
+        error.args = (f"{error.args[0]} {description}", *error.args[1:])
+
+        dev_mode = django_settings.DEBUG or os.environ.get("DJANGO_BOLT_DEV_WORKER") == "1"
+        if dev_mode and handler_id not in self._lane_affinity_hinted:
+            self._lane_affinity_hinted.add(handler_id)
+            logger.warning(
+                "%s reads request.user synchronously on a thread that cannot reach the request lane. %s "
+                "Use `await request.auser()` or a `CurrentUser` parameter. "
+                "Bolt logs this one time for each route.",
+                where,
+                description,
+            )
 
     def _handle_generic_exception(self, e: Exception, request: dict[str, Any] = None) -> Response:
         """Handle generic exception using error_handlers module."""
@@ -2772,7 +2827,7 @@ class BoltAPI:
             # Integer hashing is O(1) with minimal overhead vs callable hashing
             meta = self._handler_meta[handler_id]
 
-            # 2. Lazy user loading using SimpleLazyObject (Django pattern)
+            # 2. Lazy user loading (Django pattern)
             # User is only loaded from DB when request.user is actually accessed
             # Skip setting user=None — PyRequest.user getter already returns None.
             auth_context = request.get("auth")
@@ -2783,16 +2838,16 @@ class BoltAPI:
 
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    # Route-local loader for the scheme that authenticated;
+                    # Route-local loaders for the scheme that authenticated;
                     # schemes with no backend instance (Rust session auth)
-                    # fall back to the default pk query. A loader of None
-                    # means the backend has no user resolution — leave
+                    # fall back to the default pk query. Loaders of None
+                    # mean the backend has no user resolution — leave
                     # request.user unset (PyRequest getter returns None).
-                    loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
-                    if loader is not None:
-                        request["user"] = SimpleLazyObject(
-                            partial(loader, user_id, auth_context, meta["_user_load_is_async_ctx"])
-                        )
+                    # The sync loader looks at the thread that forces the
+                    # user. ``await request.auser()`` uses the async loader.
+                    loaders = meta["_user_loaders"].get(auth_context.get("auth_backend"), DEFAULT_USER_LOADERS)
+                    if loaders is not None:
+                        request["user"] = LazyUser(loaders, user_id, auth_context)
 
             # 3. Check if we need to execute middleware
             # Middleware runs for:
@@ -2815,6 +2870,8 @@ class BoltAPI:
         except HTTPException as he:
             return self._handle_http_exception(he)
         except Exception as e:
+            if isinstance(e, LaneAffinityError):
+                self._describe_lane_affinity_error(e, handler, handler_id)
             # BlackSheep pattern: only log unhandled exceptions (rare path)
             if self._logging_middleware:
                 self._logging_middleware.log_exception(request, e, exc_info=True)
@@ -2864,9 +2921,9 @@ class BoltAPI:
             if auth_context:
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
-                    if loader is not None:
-                        request["user"] = SimpleLazyObject(partial(loader, user_id, auth_context, False))
+                    loaders = meta["_user_loaders"].get(auth_context.get("auth_backend"), DEFAULT_USER_LOADERS)
+                    if loaders is not None:
+                        request["user"] = LazyUser(loaders, user_id, auth_context)
 
             # Call pre-compiled sync executor directly (no coroutine, no await)
             return meta["_sync_executor"](handler, request)

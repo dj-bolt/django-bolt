@@ -244,7 +244,8 @@ class TestBoltAuthUserPrecedence:
 
         @api.get("/jwt-peeked", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
         async def jwt_peeked(request):
-            user = request.user
+            # An async handler behind Django middleware loads its user with auser().
+            user = await request.auser()
             return {"username": getattr(user, "username", None)}
 
         user = User.objects.create(username="peeked_user")
@@ -254,6 +255,35 @@ class TestBoltAuthUserPrecedence:
             assert response.status_code == 200, response.text
             assert response.json()["username"] == "peeked_user"
             # Proves the middleware ran and evaluated the session-based user
+            assert peeked == {"is_authenticated": False}
+
+    def test_jwt_user_survives_peeking_middleware_in_a_sync_handler(self):
+        """The sync ``request.user`` of a lane request keeps the Bolt user too."""
+
+        peeked = {}
+
+        class PeekingMiddleware:
+            def __init__(self, get_response):
+                self.get_response = get_response
+
+            def __call__(self, request):
+                peeked["is_authenticated"] = request.user.is_authenticated
+                return self.get_response(request)
+
+        api = BoltAPI(
+            middleware=[DjangoMiddlewareStack([SessionMiddleware, AuthenticationMiddleware, PeekingMiddleware])]
+        )
+
+        @api.get("/jwt-peeked", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
+        def jwt_peeked(request):
+            return {"username": getattr(request.user, "username", None)}
+
+        user = User.objects.create(username="peeked_sync_user")
+
+        with TestClient(api) as client:
+            response = client.get("/jwt-peeked", headers={"Authorization": f"Bearer {_make_jwt(user)}"})
+            assert response.status_code == 200, response.text
+            assert response.json()["username"] == "peeked_sync_user"
             assert peeked == {"is_authenticated": False}
 
     def test_middleware_that_authenticates_user_still_wins(self):

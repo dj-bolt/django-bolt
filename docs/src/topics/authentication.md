@@ -110,7 +110,7 @@ Django-Bolt provides lazy user loading via `request.user`:
 
 ```python
 @api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
-async def get_me(request):
+def get_me(request):
     user = request.user  # Lazily loads from database
 
     return {
@@ -121,6 +121,37 @@ async def get_me(request):
 ```
 
 The user is only loaded from the database when you access `request.user`. If you don't need the full user object, use `request.context` which is available without a database query.
+
+In an async handler or an async middleware, prefer `await request.auser()`:
+
+```python
+@api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+async def get_me(request):
+    user = await request.auser()
+    return {"id": user.id}
+```
+
+`request.auser()` does not block the event loop. It awaits an async `get_user` directly. It runs `get_user_sync` on the request lane or on the ORM pool. `request.user` then returns the same user with no second query.
+
+To get the user as a parameter, use `CurrentUser`. It works in sync and async handlers:
+
+```python
+from django_bolt import CurrentUser, OptionalCurrentUser
+
+@api.get("/me", auth=[JWTAuthentication()])
+async def get_me(user: CurrentUser):
+    return {"id": user.id}
+
+@api.get("/home", auth=[JWTAuthentication()])
+def home(user: OptionalCurrentUser):
+    return {"signed_in": user is not None}
+```
+
+`CurrentUser` answers 401 when the request has no authenticated user. `OptionalCurrentUser` gives `None` then. In an async handler, both load the user with `await request.auser()`. In a sync handler, both read `request.user`, so the handler keeps its sync dispatch. For the type of your user model, make your own alias: `Annotated[User, Depends(require_current_user)]`.
+
+An async handler can also read `request.user`. The read loads the user when it occurs, and the worker thread waits for that query. Use `await request.auser()` when the loop must serve other requests during the query, for example with a networked database. The query runs on that worker thread, or on the lane of a request with Django middleware. On the lane, it sees the thread-local state of the request, for example a tenant schema. With `DEBUG = True` or `runbolt --dev`, Bolt logs each such read that blocks the event loop for more than 50 ms, with its file and line.
+
+A thread with no event loop that is not the lane cannot wait for the lane, for example a thread from `asyncio.to_thread`. A sync read there raises `LaneAffinityError`, a subclass of `RuntimeError`. Its message names the route and the handler. With `DEBUG = True` or `runbolt --dev`, Bolt also logs the fix one time for each route.
 
 ### Custom user query
 
@@ -140,7 +171,7 @@ class MyJWT(JWTAuthentication):
 
 @api.get("/tasks", auth=[MyJWT()], guards=[IsAuthenticated()])
 async def tasks(request):
-    user = request.user  # loaded with your query
+    user = await request.auser()  # loaded with your query
     ...
 ```
 
@@ -148,6 +179,10 @@ Overriding the async `get_user` or the sync `get_user_sync` both work —
 either alone is enough. If you define both, sync handlers use
 `get_user_sync` directly (no event-loop overhead) and it is also preferred
 for async handlers via a worker thread.
+
+A backend that overrides only the async `get_user` serves `await request.auser()`.
+A sync read of `request.user` cannot run a coroutine, so it raises `RuntimeError`.
+Define `get_user_sync` as well when sync handlers or sync middleware read `request.user`.
 
 The override is scoped to the routes that use that backend instance —
 routes authenticated with a plain `JWTAuthentication` keep the default

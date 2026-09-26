@@ -22,7 +22,8 @@ Type-Safe Requests:
 
     @api.get("/profile", guards=[IsAuthenticated()])
     async def profile(request: Request[User, JWTClaims, dict]) -> dict:
-        return {"email": request.user.email}  # IDE knows User has email
+        user = await request.auser()
+        return {"email": user.email}
 
 Middleware:
     from django_bolt import BoltAPI
@@ -54,11 +55,13 @@ from .auth import (
     AllowAny,
     APIKeyAuthentication,
     AuthContext,
+    # JWT Token & Utilities
+    CurrentUser,
     IsAuthenticated,
     # Authentication backends
     JWTAuthentication,
+    OptionalCurrentUser,
     Requires,
-    # JWT Token & Utilities
     Token,
     create_jwt_for_user,
     extract_user_id_from_context,
@@ -247,6 +250,8 @@ __all__ = [
     "Token",
     "create_jwt_for_user",
     "get_current_user",
+    "CurrentUser",
+    "OptionalCurrentUser",
     "extract_user_id_from_context",
     "get_auth_context",
     # OpenAPI

@@ -404,12 +404,14 @@ Available synced attributes:
 | Attribute | Source | Access |
 |-----------|--------|--------|
 | User (async) | AuthenticationMiddleware | `await request.auser()` |
-| User (sync) | AuthenticationMiddleware | `request.user` |
+| User (sync) | AuthenticationMiddleware | `request.user` (in async code, see below) |
 | Session | SessionMiddleware | `request.session` |
 | Messages | MessageMiddleware | `request.state["_messages"]` |
 | META | All middleware | `request.state["META"]` |
 | CSRF token | CsrfViewMiddleware | `request.state["_csrf_token"]` |
 | Custom attributes | Your middleware | `request.state["<name>"]` |
+
+In async code behind Django middleware, `request.user` works. Its query runs on the lane of the request (see [Authentication](authentication.md#accessing-the-authenticated-user)). This includes the session user of `AuthenticationMiddleware`: Bolt runs its query on the lane, where Django alone raises `SynchronousOnlyOperation`. The event loop waits for that query. `await request.auser()` does not block the loop.
 
 Bolt copies each public attribute that a middleware sets on the Django request to `request.state`. For example, django-tenants sets `request.tenant`. Read it from `request.state["tenant"]`. Bolt does not copy names that start with `_`.
 
@@ -479,6 +481,8 @@ Django-Bolt optimizes middleware execution with a three-tier system:
 2. **Third-party middleware with hooks** - Wrapped in `sync_to_async` for safety
 3. **Custom `__call__` middleware** - Executed as a chain via single `sync_to_async` call
 
+A class with hook methods is in tier 1 or 2, also when it defines its own `__call__`. `DjangoMiddlewareStack` runs its hooks and does not call its `__call__`. Use `DjangoMiddleware` for a class whose `__call__` must run.
+
 The `DjangoMiddlewareStack` automatically categorizes your middleware for optimal performance.
 
 If a `DjangoMiddlewareStack` mixes hook middleware (`process_request` / `process_view` / `process_response`) with `__call__`-only middleware, Django-Bolt uses a correctness-first compatibility path to preserve strict declared order and hook semantics. This path is slower than the pure hook fast path.
@@ -493,6 +497,10 @@ Python middleware execution order is explicit and strict:
 4. Handler
 
 For responses, the order is reversed.
+
+`BoltAPI(django_middleware=...)` puts the Django middleware before the entries of `middleware=[...]`. A `DjangoMiddleware` or `DjangoMiddlewareStack` in `middleware=[...]` runs at its position in the list.
+
+A Python middleware before the Django middleware runs before any Django hook, as in Django's `MIDDLEWARE` order. It does not run on the lane of the request. It does not see the thread-local state of the Django middleware, for example the tenant of django-tenants. If it loads `request.user`, it loads the user without that state, and the handler then gets the same user. Put a middleware that reads the user after the Django middleware.
 
 Rust-handled middleware configs (for example `@cors` and `@rate_limit`) are still compiled from metadata and executed in Rust.
 

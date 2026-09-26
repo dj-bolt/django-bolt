@@ -329,11 +329,17 @@ class Request(Protocol):
         Returns a LazyUser proxy that acts as a transparent wrapper for a Django user model
         instance (AbstractBaseUser or custom user model). The user is loaded from the database
         only when first accessed (like Django QuerySets), avoiding wasted queries for handlers
-        that don't use the user. Works seamlessly in both sync and async handlers without any await.
+        that don't use the user.
 
         The LazyUser proxy is transparent - accessing any attribute (username, email, is_staff,
         etc.) will trigger user loading and delegate to the underlying user instance.
         From a type-checking perspective, this behaves exactly like a UserType.
+
+        ``request.user`` is sync. The query runs on the thread that reads it. In async
+        code, the read blocks the event loop for the query. On the lane of a request
+        with Django middleware, the query runs on that lane. ``await request.auser()``
+        loads the user without blocking the loop. A backend with only an async
+        ``get_user`` serves ``await request.auser()`` only.
 
         Returns:
             Django User model instance (wrapped in LazyUser proxy) if authentication context
@@ -347,19 +353,36 @@ class Request(Protocol):
         Examples:
             ```python
             @api.get("/me", guards=[IsAuthenticated()])
-            async def get_me(request):
-                user = request.user  # No await needed!
+            def get_me(request):
+                user = request.user
                 return {"username": user.username}
             ```
 
-            With user check:
+            In an async handler:
             ```python
             @api.get("/profile")
             async def get_profile(request):
-                user = request.user
+                user = await request.auser()
                 if user:
                     return {"username": user.username}
                 return {"anonymous": True}
+            ```
+        """
+        ...
+
+    async def auser(self) -> UserType | None:
+        """
+        Load the user of the request without blocking the event loop (Django-style).
+
+        Use it in async code. ``request.user`` then returns the same user with no
+        second query. With no authentication, it returns ``AnonymousUser``.
+
+        Example:
+            ```python
+            @api.get("/me")
+            async def me(request: Request):
+                user = await request.auser()
+                return {"username": user.username}
             ```
         """
         ...

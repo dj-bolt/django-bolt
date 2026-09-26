@@ -30,7 +30,8 @@ class Request(Protocol):
     Examples:
         @api.get("/profile")
         async def profile(request: Request) -> dict:
-            return {"user": request.user.username}
+            user = await request.auser()
+            return {"user": user.username}
     """
 
     @property

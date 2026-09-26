@@ -16,14 +16,15 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import functools
 import io
+from asyncio.events import _get_running_loop
 from collections.abc import Callable
-from inspect import iscoroutine
+from functools import partial
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from .._core import RequestLane
-from ..concurrency import drive_on_lane, in_lane_mode
+from ..concurrency import drive_on_lane, in_lane_mode, run_orm_blocking
 from ..middleware_response import (
     _BODY_BYTES,
     _BODY_FILE,
@@ -222,6 +223,7 @@ class DjangoMiddleware:
             self.middleware_class = import_string(middleware_class_or_get_response)
         else:
             self.middleware_class = middleware_class_or_get_response
+        _check_capabilities(self.middleware_class)
 
         self.init_kwargs = init_kwargs
         self.get_response = None
@@ -276,7 +278,21 @@ class DjangoMiddleware:
         # detects it as async and enables async_mode
         markcoroutinefunction(get_response_bridge)
 
-        # Create middleware instance with the async bridge
+        if not getattr(self.middleware_class, "async_capable", False):
+            # Django gives a middleware that is not async-capable a sync get_response.
+            # Such a middleware runs on the lane, with no event loop, and must get a
+            # response there. A factory with no flags can still return an async
+            # function, which calls this bridge on the loop and awaits the coroutine.
+            get_response_async = get_response_bridge
+
+            def get_response_bridge(django_request: HttpRequest) -> HttpResponse:
+                if _get_running_loop() is None:
+                    return async_to_sync(get_response_async)(django_request)
+                return get_response_async(django_request)
+
+            markcoroutinefunction(get_response_bridge)
+
+        # Create middleware instance with the bridge
         self._middleware_instance = self.middleware_class(get_response_bridge, **self.init_kwargs)
 
         # Check if the middleware instance is async-capable
@@ -285,14 +301,21 @@ class DjangoMiddleware:
         # because MiddlewareMixin already handles these methods correctly in __acall__
         # by wrapping them in sync_to_async. Doing it ourselves causes double-wrapping
         # and severe performance degradation.
-        self._middleware_is_async = iscoroutinefunction(self._middleware_instance)
-        # MiddlewareMixin marks each instance as async. A subclass with its own
-        # sync ``__call__`` must run on the thread of the request. Its result is
-        # a response, or the coroutine of ``super().__call__``.
-        # ``middleware_class`` can be a factory, so look at the instance that it returns.
+        # ``sync_capable`` is the flag that Django reads for a class or a factory.
+        # ``middleware_class`` can be a factory, so look at the instance that it returns too.
+        sync_capable = getattr(self.middleware_class, "sync_capable", True) and getattr(
+            type(self._middleware_instance), "sync_capable", True
+        )
+        # An async-only middleware needs the event loop. Its ``__call__`` can be a
+        # plain function that returns an awaitable, for example a Future.
+        self._middleware_is_async = iscoroutinefunction(self._middleware_instance) or not sync_capable
+        # MiddlewareMixin marks each instance as async. A sync-capable subclass with
+        # its own sync ``__call__`` must run on the thread of the request. Its result
+        # is a response, or an awaitable such as the coroutine of ``super().__call__``.
         instance_call = type(self._middleware_instance).__call__
         self._sync_call_override = (
-            isinstance(self._middleware_instance, MiddlewareMixin)
+            sync_capable
+            and isinstance(self._middleware_instance, MiddlewareMixin)
             and instance_call is not MiddlewareMixin.__call__
             and not iscoroutinefunction(instance_call)
         )
@@ -369,12 +392,13 @@ class DjangoMiddleware:
                 django_response = await sync_to_async(self._middleware_instance.__call__, thread_sensitive=True)(
                     django_request
                 )
-                if iscoroutine(django_response):
+                if isawaitable(django_response):
                     django_response = await django_response
             elif self._middleware_is_async:
                 # Async-capable middleware (e.g., using MiddlewareMixin with async get_response)
                 # MiddlewareMixin.__acall__ handles process_request/process_response internally
-                # by wrapping them in sync_to_async - we don't need to do it ourselves
+                # by wrapping them in sync_to_async - we don't need to do it ourselves.
+                # An async-only middleware can return any awaitable, a Future included.
                 django_response = await self._middleware_instance(django_request)
             else:
                 # Sync middleware without async support - run in thread pool
@@ -446,6 +470,24 @@ def _is_django_builtin_middleware(middleware_class: type) -> bool:
     return any(module.startswith(prefix) for prefix in _DJANGO_SAFE_MIDDLEWARE_PREFIXES)
 
 
+def _check_capabilities(middleware: Any) -> None:
+    """Reject a middleware that can run in no mode, as Django does at load."""
+    if not getattr(middleware, "sync_capable", True) and not getattr(middleware, "async_capable", False):
+        name = getattr(middleware, "__qualname__", repr(middleware))
+        raise RuntimeError(f"Middleware {name} must have at least one of sync_capable/async_capable set to True.")
+
+
+def _needs_event_loop(middleware: Any) -> bool:
+    """Whether a middleware class or factory must run on the event loop.
+
+    ``sync_capable`` is the flag that Django reads for a class or a factory.
+    A class with an async ``__call__`` can await, so it needs the loop too.
+    """
+    return not getattr(middleware, "sync_capable", True) or (
+        isinstance(middleware, type) and iscoroutinefunction(middleware.__call__)
+    )
+
+
 class DjangoMiddlewareStack:
     """
     Wraps MULTIPLE Django middleware classes into a SINGLE Bolt middleware.
@@ -507,6 +549,8 @@ class DjangoMiddlewareStack:
                 "Django is required to use DjangoMiddlewareStack. Install Django with: pip install django"
             )
 
+        for middleware in middleware_classes:
+            _check_capabilities(middleware)
         self.middleware_classes = middleware_classes
         self.get_response = None
         self._django_hook_middleware = []  # Django built-in: direct calls
@@ -527,20 +571,16 @@ class DjangoMiddlewareStack:
 
     @property
     def supports_lane_dispatch(self) -> bool:
-        """Whether a lane can run this stack with no event loop.
-
-        A middleware with an async ``__call__`` can await, so it needs the event
-        loop. ``sync_capable`` is the flag that Django reads for a class or a factory.
-        """
-        return not any(
-            not getattr(middleware, "sync_capable", True)
-            or (isinstance(middleware, type) and iscoroutinefunction(middleware.__call__))
-            for middleware in self.middleware_classes
-        )
+        """Whether a lane can run this stack with no event loop."""
+        return not any(_needs_event_loop(middleware) for middleware in self.middleware_classes)
 
     @staticmethod
     def _has_hook_methods(middleware_class: type) -> bool:
-        """Return True if middleware defines any Django hook methods."""
+        """Return True if middleware defines any Django hook methods.
+
+        Such a middleware runs through its hooks. The stack does not call its
+        ``__call__``, so ``process_view`` runs as with Django's ``MiddlewareMixin``.
+        """
         return any(
             hasattr(middleware_class, method_name)
             for method_name in ("process_request", "process_view", "process_response")
@@ -577,6 +617,7 @@ class DjangoMiddlewareStack:
         1. Django built-in hook-based -> direct calls (fast, safe)
         2. Third-party hook-based -> sync_to_async (slower, but safe for blocking I/O)
         3. __call__-only -> sync chain with sync_to_async
+        An async-only __call__ middleware goes to the compatibility chain, which awaits it.
         """
         self.get_response = get_response
         self._django_hook_middleware = []
@@ -644,7 +685,9 @@ class DjangoMiddlewareStack:
 
         # Compatibility fallback: mixed hook + __call__ middleware cannot be safely flattened
         # while preserving strict declared order and process_view semantics.
-        if has_hook_middleware and has_call_only_middleware:
+        # An async-only middleware awaits on the event loop, so the sync chain
+        # below cannot run it. The compatibility chain gives it an async get_response.
+        if (has_hook_middleware and has_call_only_middleware) or any(map(_needs_event_loop, call_only_classes)):
             self._compatibility_chain = self._build_compatibility_chain()
             return
 
@@ -780,6 +823,17 @@ class DjangoMiddlewareStack:
 
             next_layer = chain
 
+            if _needs_event_loop(middleware_class):
+                # Django gives an async-only middleware an async get_response.
+                # The layer awaits its result, which can be any awaitable.
+                instance = middleware_class(next_layer)
+
+                async def call_layer(django_request, *, _instance=instance):
+                    return await _instance(django_request)
+
+                chain = call_layer
+                continue
+
             def get_response_sync(django_request, _next=next_layer):
                 if in_lane_mode():
                     return drive_on_lane(_next(django_request))
@@ -817,6 +871,7 @@ class DjangoMiddlewareStack:
            b. Hook middleware only: the request phase, the handler, the response phase.
               A phase with a third-party hook runs on the thread of the request.
            c. ``__call__`` middleware only: one sync chain on the thread of the request.
+              A stack with an async-only middleware uses the compatibility chain (a).
         3. Convert the Django response to a Bolt response one time.
         """
         # 1. Single Bolt→Django conversion
@@ -952,23 +1007,42 @@ def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
 
     Rules:
     - No Bolt user set → adopt Django's user (plain Django behavior).
+    - Django user is already the request user → adopt it again. Each
+      ``DjangoMiddleware`` wrapper copies the attributes, and a later copy
+      must keep Django's ``auser`` for a user that an earlier copy adopted.
     - Django user is AuthenticationMiddleware's still-unevaluated lazy
       default → keep the Bolt user (also avoids forcing a session query).
     - Django user was evaluated or explicitly assigned (login(),
       impersonation middleware) → adopt it only if it is actually
       authenticated; an anonymous result never overrides Bolt auth.
     """
-    if bolt_request.user is None:
+    bolt_user = bolt_request.user
+    if bolt_user is None or bolt_user is django_user:
         return True
     if isinstance(django_user, LazyObject) and django_user._wrapped is empty:
         return False
     return bool(getattr(django_user, "is_authenticated", False))
 
 
-async def _static_auser(user):
-    """Module-level `auser` replacement bound via functools.partial — avoids
-    allocating a fresh coroutine function per request."""
-    return user
+def _route_sync_force(user: Any) -> None:
+    """Make a sync read of Django's lazy session user run through ``run_orm_blocking``.
+
+    ``AuthenticationMiddleware`` sets a ``SimpleLazyObject`` whose setup runs
+    the session query on the thread that reads it. On the event loop, Django's
+    guard raises ``SynchronousOnlyOperation``. ``run_orm_blocking`` runs the
+    query on the lane of the request, or inline with the guard satisfied.
+    Each wrapper copies the user again, so a routed setup stays as it is.
+    """
+    if not isinstance(user, LazyObject):
+        return
+    state = user.__dict__
+    if state["_wrapped"] is not empty:
+        return
+    setupfunc = state["_setupfunc"]
+    if type(setupfunc) is partial and setupfunc.func is run_orm_blocking:
+        return
+    # LazyObject.__setattr__ forwards names other than _wrapped to the user, which forces it.
+    state["_setupfunc"] = partial(run_orm_blocking, setupfunc)
 
 
 def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request) -> None:
@@ -992,14 +1066,16 @@ def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request)
     auser = getattr(django_request, "auser", None)
     if user is not None:
         if _should_adopt_django_user(user, bolt_request):
+            _route_sync_force(user)
             bolt_request.user = user
             # Sync auser (async callable) for async access via `await request.auser()`
             if auser is not None:
                 bolt_request.state["auser"] = auser
         else:
-            # Keep the Bolt-auth user and make auser consistent with it,
-            # instead of Django's session-based (anonymous) auser.
-            bolt_request.state["auser"] = functools.partial(_static_auser, bolt_request.user)
+            # Keep the Bolt-auth user. Without a state entry, request.auser
+            # falls back to the async loader of that user (LazyUser.aload),
+            # not to Django's session-based (anonymous) auser.
+            bolt_request.state.pop("auser", None)
     elif auser is not None:
         bolt_request.state["auser"] = auser
 

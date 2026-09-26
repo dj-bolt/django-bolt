@@ -114,6 +114,44 @@ async def resolve_dependency(
     return value
 
 
+def resolve_dependency_sync(
+    dep_fn: Callable,
+    depends_marker: DependsMarker,
+    request: dict[str, Any],
+    dep_cache: dict[Any, Any],
+    params_map: dict[str, Any],
+    query_map: dict[str, Any],
+    headers_map: dict[str, str],
+    cookies_map: dict[str, str],
+    handler_meta: dict[Callable, dict[str, Any]],
+    compile_binder: Callable,
+    http_method: str,
+    path: str,
+) -> Any:
+    """Sync form of :func:`resolve_dependency`, for a sync dependency of a sync handler.
+
+    Its injector then needs no event loop, so the handler keeps sync dispatch.
+    """
+    if depends_marker.use_cache and dep_fn in dep_cache:
+        return dep_cache[dep_fn]
+
+    dep_meta = handler_meta.get(dep_fn)
+    if dep_meta is None:
+        dep_meta = compile_binder(dep_fn, http_method, path)
+        handler_meta[dep_fn] = dep_meta
+
+    if dep_meta.get("mode") == "request_only":
+        value = dep_fn(request)
+    else:
+        args, kwargs = _extract_dependency_args(dep_meta, request, params_map, query_map, headers_map, cookies_map)
+        value = dep_fn(*args, **kwargs)
+
+    if depends_marker.use_cache:
+        dep_cache[dep_fn] = value
+
+    return value
+
+
 def _extract_dependency_args(
     dep_meta: dict[str, Any],
     request: dict[str, Any],

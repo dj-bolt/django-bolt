@@ -325,7 +325,7 @@ Start with one ORM thread for every one or two worker threads, then measure. Eac
 
 A blocking sync handler does not use the ORM pool. It runs on the shared executor pool, which has `CPU count + 4` threads (maximum 32). Set `DJANGO_BOLT_EXECUTOR_THREADS` to change it.
 
-An async handler that reads the lazy `request.user` blocks its worker thread until the ORM pool loads the user. In an async handler, prefer `await request.auser()`.
+In an async handler, `await request.auser()` loads the user on the ORM pool. The worker then serves other requests while the user loads. A sync read of `request.user`, in the handler, a helper, or a template, blocks the worker thread until the user loads. The query runs on that worker thread, or on the lane of the request. In dev mode, Bolt logs such a read when it blocks for more than 50 ms.
 
 ### Compare equal topologies
 

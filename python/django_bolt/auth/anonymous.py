@@ -8,14 +8,20 @@ from typing import Any
 
 from django.contrib.auth.models import AnonymousUser
 
+from .user_loader import aload_bolt_user
+
 
 async def auser_fallback(user: Any = None) -> Any:
     """
     Return the Bolt user, or an anonymous user if no user is set.
 
-    Keep the same lazy user object as request.user to share its cached result.
+    A user that Bolt authenticated loads with its async loader, on the lane
+    of the request or on the ORM pool, and does not block the event loop.
+    ``request.user`` then shares the loaded result.
     """
-    return user if user is not None else AnonymousUser()
+    if user is None:
+        return AnonymousUser()
+    return await aload_bolt_user(user)
 
 
 __all__ = ["auser_fallback"]

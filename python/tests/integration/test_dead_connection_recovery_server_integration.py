@@ -20,7 +20,6 @@ variable, they skip.
 
 from __future__ import annotations
 
-import os
 import secrets
 import time
 from typing import Any
@@ -28,55 +27,12 @@ from typing import Any
 import jwt
 import psycopg
 import pytest
-from psycopg import sql
-from psycopg.conninfo import conninfo_to_dict
 
 from .apps import app_module
 from .apps.dead_connection_recovery import SECRET, USERNAME
+from .helpers import postgres_settings
 
 pytestmark = [pytest.mark.server_integration, pytest.mark.postgres]
-
-DSN_VARIABLE = "DJANGO_BOLT_TEST_POSTGRES_DSN"
-
-
-@pytest.fixture
-def postgres_database() -> Any:
-    """A fresh database on the configured PostgreSQL server, dropped at exit.
-
-    Each test gets its own database so parallel workers and the ``migrate``
-    of each server do not meet.
-    """
-    dsn = os.environ.get(DSN_VARIABLE)
-    if not dsn:
-        pytest.skip(f"Set {DSN_VARIABLE} to run the PostgreSQL recovery tests.")
-
-    name = f"bolt_recovery_{secrets.token_hex(6)}"
-    with psycopg.connect(dsn, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
-    params = {**conninfo_to_dict(dsn), "dbname": name}
-    try:
-        yield params
-    finally:
-        with psycopg.connect(dsn, autocommit=True) as admin:
-            admin.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
-                (name,),
-            )
-            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
-
-
-def database_settings(params: dict[str, Any], **options: Any) -> str:
-    """Django ``DATABASES["default"]`` for the settings of a server project."""
-    database = {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": params["dbname"],
-        "USER": params.get("user", ""),
-        "PASSWORD": params.get("password", ""),
-        "HOST": params.get("host", ""),
-        "PORT": params.get("port", ""),
-        **options,
-    }
-    return f'DATABASES["default"] = {database!r}'
 
 
 def make_token(user_id: int) -> str:
@@ -119,7 +75,7 @@ def start_server(make_server_project, params: dict[str, Any], **database_options
     application_name = f"bolt-recovery-{secrets.token_hex(4)}"
     project = make_server_project(
         api_module=app_module("dead_connection_recovery"),
-        settings_extra=database_settings(params, **database_options),
+        settings_extra=postgres_settings(params, **database_options),
     )
     server = project.start(env={"PGAPPNAME": application_name, "DJANGO_BOLT_ORM_THREADS": "1"})
     return server, application_name
