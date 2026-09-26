@@ -656,7 +656,12 @@ pub fn test_request(
                 path.clone()
             };
 
-            // Create test request
+            // `TestRequest::with_uri` panics on an invalid URI. Check it first.
+            if let Err(e) = actix_web::http::Uri::try_from(uri.as_str()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid request URI {uri:?}: {e}"
+                )));
+            }
             let mut req = test::TestRequest::with_uri(&uri);
 
             // Set method
@@ -750,7 +755,10 @@ async fn handle_test_request_internal(
         if let Some(route_match) = router.find(method, path) {
             let handler_id = route_match.handler_id();
             let handler = Python::attach(|py| route_match.route().handler.clone_ref(py));
-            let path_params = route_match.path_params();
+            let path_params = route_match.path_params().map(|mut params| {
+                bolt_core::router::decode_path_params(&mut params);
+                params
+            });
             (handler, path_params, handler_id)
         } else {
             // No route found - check for trailing slash redirect FIRST
