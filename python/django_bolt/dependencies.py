@@ -7,7 +7,6 @@ from collections.abc import Callable
 from typing import Any
 
 from .params import Depends as DependsMarker
-from .typing import FieldDefinition
 
 _POSITIONAL_KINDS = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
 
@@ -159,64 +158,3 @@ def _extract_dependency_args(
             dep_kwargs[name] = dval
 
     return dep_args, dep_kwargs
-
-
-async def call_dependency(
-    dep_fn: Callable,
-    dep_meta: dict[str, Any],
-    request: dict[str, Any],
-    params_map: dict[str, Any],
-    query_map: dict[str, Any],
-    headers_map: dict[str, str],
-    cookies_map: dict[str, str],
-) -> Any:
-    """Call an async dependency function with resolved parameters."""
-    args, kwargs = _extract_dependency_args(dep_meta, request, params_map, query_map, headers_map, cookies_map)
-    return await dep_fn(*args, **kwargs)
-
-
-def call_dependency_sync(
-    dep_fn: Callable,
-    dep_meta: dict[str, Any],
-    request: dict[str, Any],
-    params_map: dict[str, Any],
-    query_map: dict[str, Any],
-    headers_map: dict[str, str],
-    cookies_map: dict[str, str],
-) -> Any:
-    """Call a sync dependency function with resolved parameters."""
-    args, kwargs = _extract_dependency_args(dep_meta, request, params_map, query_map, headers_map, cookies_map)
-    return dep_fn(*args, **kwargs)
-
-
-def extract_dependency_value(
-    field: FieldDefinition,
-    params_map: dict[str, Any],
-    query_map: dict[str, Any],
-    headers_map: dict[str, str],
-    cookies_map: dict[str, str],
-) -> Any:
-    """Extract value for a dependency parameter using FieldDefinition.
-
-    Kept for backward compatibility — the request hot path uses the
-    pre-compiled plan in :func:`_extract_dependency_args` instead.
-    """
-    key = field.alias or field.name
-
-    # Rust pre-converts values to typed Python objects (int, float, bool, str)
-    if key in params_map:
-        return params_map[key]
-    elif key in query_map:
-        return query_map[key]
-    elif field.source == "header":
-        raw = headers_map.get(key.lower())
-        if raw is None:
-            raise ValueError(f"Missing required header: {key}")
-        return raw
-    elif field.source == "cookie":
-        raw = cookies_map.get(key)
-        if raw is None:
-            raise ValueError(f"Missing required cookie: {key}")
-        return raw
-    else:
-        return None

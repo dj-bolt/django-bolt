@@ -299,36 +299,3 @@ def get_msgspec_type_for_django_field(field: models.Field) -> Any:
         return Annotated[base_type, Meta(**constraints)]
 
     return base_type
-
-
-def create_msgspec_field_definition(
-    field: models.Field,
-    write_only: bool = False,
-    read_only: bool = False,
-) -> tuple[str, Any, dict[str, Any]]:
-    """
-    Create a msgspec field definition from a Django field.
-
-    Args:
-        field: Django model field
-        write_only: If True, field is input-only
-        read_only: If True, field is output-only
-
-    Returns:
-        Tuple of (field_name, field_type, field_metadata)
-    """
-    field_name = field.name
-    if not field_name:
-        raise ValueError("Django field must have a name to create a serializer definition")
-
-    field_type = get_msgspec_type_for_django_field(field)
-
-    # Build metadata dict
-    metadata: dict[str, Any] = {
-        "write_only": write_only,
-        "read_only": read_only,
-        "help_text": field.help_text or None,
-        "verbose_name": field.verbose_name,
-    }
-
-    return field_name, field_type, metadata

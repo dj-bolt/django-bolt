@@ -637,28 +637,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls.__literal_fields__ = literal_fields
         cls.__has_serializer_fields__ = has_serializer_fields
 
-    @classmethod
-    def _cache_default_values_map(cls) -> None:
-        """
-        Pre-compute the default values mapping for dump(exclude_defaults=True).
-
-        This is called lazily on first dump with exclude_defaults=True.
-        Moving this computation from per-dump to per-class provides significant
-        performance improvement for dump_many and repeated dump calls.
-        """
-        # None = not cached yet, {} = cached (even if empty)
-        if cls.__default_values_map__ is not None:
-            return
-
-        cls._ensure_dump_ready()
-
-        default_values: dict[str, Any] = {}
-        for spec in cls._dump_field_specs:
-            if spec.default_value is not _MISSING:
-                default_values[spec.field_name] = spec.default_value
-
-        cls.__default_values_map__ = default_values
-
     def __post_init__(self) -> None:
         """
         Run all field and model validators after struct initialization.
@@ -2434,31 +2412,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     # -------------------------------------------------------------------------
     # Helper for getting value from source path
     # -------------------------------------------------------------------------
-
-    @staticmethod
-    def _get_value_from_source(obj: Any, source: str) -> Any:
-        """
-        Get a value from an object using a dot-notation source path.
-
-        Args:
-            obj: The object to get the value from
-            source: Dot-notation path (e.g., "author.name")
-
-        Returns:
-            The value at the path, or None if not found
-        """
-        parts = source.split(".")
-        value = obj
-        for part in parts:
-            if value is None:
-                return None
-            if hasattr(value, part):
-                value = getattr(value, part)
-            elif isinstance(value, dict) and part in value:
-                value = value[part]
-            else:
-                return None
-        return value
 
 
 class SerializerView(Iterable[T]):
