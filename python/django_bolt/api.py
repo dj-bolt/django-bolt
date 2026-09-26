@@ -1529,20 +1529,23 @@ class BoltAPI:
 
             # Recursively analyze Depends targets so a dep reading request.query
             # (etc.) causes the handler's route to actually parse query params.
-            # Populate self._handler_meta by callable so runtime dep resolution
-            # (dependencies.resolve_dependency) reuses the compiled meta too.
+            # Populate self._handler_meta by (callable, method, path) so runtime
+            # dep resolution (dependencies.resolve_dependency) reuses the compiled meta too.
             def _compile_dep(dep_fn: Callable) -> dict[str, Any]:
-                cached = self._handler_meta.get(dep_fn)
+                key = (dep_fn, method, full_path)
+                cached = self._handler_meta.get(key)
                 if cached is not None:
                     return cached
                 compiled = self._compile_binder(dep_fn, method, full_path)
-                self._handler_meta[dep_fn] = compiled
+                self._handler_meta[key] = compiled
                 return compiled
 
             dep_needs = analyze_dependency_tree(meta, _compile_dep)
             # The request data of the dependencies sets the parsing flags of the route too.
             dep_fields = dependency_fields(meta, _compile_dep)
             meta["dependency_fields"] = dep_fields
+            if any(f.source == "path" for f in dep_fields):
+                meta["needs_path_params"] = True
             if any(f.source in ("form", "file") for f in dep_fields):
                 meta["needs_form_parsing"] = True
                 meta["needs_headers"] = True

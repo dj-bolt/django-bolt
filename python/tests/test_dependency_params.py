@@ -374,3 +374,31 @@ def test_a_handler_and_a_dependency_decode_other_body_types_separately(shared_bo
     response = shared_body_client.post(f"/{mode}/other-type", json={"name": "bolt", "count": 3})
     assert response.status_code == 200, response.text
     assert response.json() == {"name": "bolt", "count": 3}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_binds_by_the_source_of_each_route(mode):
+    """One dependency on two routes: a path parameter on one, a query parameter on the other."""
+    api = BoltAPI()
+
+    def sync_item_id(item_id: int) -> int:
+        return item_id
+
+    async def async_item_id(item_id: int) -> int:
+        return item_id
+
+    dependency = async_item_id if mode == "async" else sync_item_id
+
+    @api.get("/by-query")
+    async def by_query(resolved=Depends(dependency)):
+        return {"item_id": resolved}
+
+    @api.get("/by-path/{item_id}")
+    async def by_path(resolved=Depends(dependency)):
+        return {"item_id": resolved}
+
+    with TestClient(api) as client:
+        assert client.get("/by-query?item_id=7").json() == {"item_id": 7}
+        response = client.get("/by-path/8")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"item_id": 8}

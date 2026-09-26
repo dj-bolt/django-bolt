@@ -155,3 +155,32 @@ async def test_concurrent_requests_on_the_shared_loop():
             asyncio.gather(*[client.get(f"/tenant/{t}", headers=_headers()) for t in tenants]), timeout=20
         )
     assert [r.json() for r in responses] == [{"tenant": t} for t in tenants]
+
+
+def test_a_sync_read_whose_loader_uses_async_to_sync_on_the_lane():
+    """The loader runs on the lane while the loop waits for it.
+
+    An ``async_to_sync`` inside the loader must not schedule its coroutine on
+    that loop: the loop cannot run it, and the request would deadlock.
+    """
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMiddleware])])
+
+    async def resolve_name():
+        await asyncio.sleep(0)
+        return "bob"
+
+    class _BridgeAuth(JWTAuthentication):
+        def get_user_sync(self, user_id):
+            # The loader itself runs on the lane and sees its thread-local state.
+            tenant = getattr(_local, "tenant", "<unset>")
+            return SimpleNamespace(username=async_to_sync(resolve_name)(), tenant=tenant)
+
+    @api.get("/tenant/{tenant}", auth=[_BridgeAuth(secret=SECRET)])
+    async def endpoint(tenant: str, request: Request):
+        await asyncio.sleep(0)
+        user = request.user
+        return {"tenant": user.tenant, "username": user.username}
+
+    response = _get(api, "/tenant/acme")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenant": "acme", "username": "bob"}

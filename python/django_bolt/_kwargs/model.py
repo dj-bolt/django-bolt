@@ -178,6 +178,7 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         "fields": [],
         "path_params": path_params,
         "http_method": http_method,
+        "path": path,
         "has_file_uploads": False,  # Default; overridden below if file params exist
     }
 
@@ -461,8 +462,8 @@ async def build_handler_arguments(
                 cookies_map,
                 handler_meta_dict,
                 compile_binder_fn,
-                meta.get("http_method", ""),
-                meta.get("path", ""),
+                meta["http_method"],
+                meta["path"],
             )
         else:
             value, body_obj, body_loaded = extract_parameter_value(
@@ -673,8 +674,8 @@ def compile_argument_injector(
 
         _dep_plan: list[tuple[int, Any, bool, str, bool, Any]] = []
         _dep_fallback_fields: list[FieldDefinition] = []
-        http_method = meta.get("http_method", "")
-        path = meta.get("path", "")
+        http_method = meta["http_method"]
+        path = meta["path"]
 
         # A sync handler uses the sync form of a dependency that has one, for
         # example get_current_user. Its injector then needs no event loop.

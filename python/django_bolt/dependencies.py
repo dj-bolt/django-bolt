@@ -159,13 +159,14 @@ def _dep_meta(
     http_method: str,
     path: str,
 ) -> dict[str, Any]:
-    dep_meta = handler_meta.get(dep_fn)
+    # The route sets the source of a field: a name in the path is a path
+    # parameter on one route and a query parameter on another. The method
+    # sets whether a body is allowed. So the binding is cached for each route.
+    key = (dep_fn, http_method, path)
+    dep_meta = handler_meta.get(key)
     if dep_meta is None:
-        # Compile dependency metadata with the actual HTTP method and path
-        # Dependencies MUST be validated against HTTP method constraints
-        # e.g., a dependency with Body() can't be used in GET handlers
         dep_meta = compile_binder(dep_fn, http_method, path)
-        handler_meta[dep_fn] = dep_meta
+        handler_meta[key] = dep_meta
     return dep_meta
 
 

@@ -83,14 +83,23 @@ def test_current_user_loads_with_the_backend_on_the_lane(handler_is_async):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_get_current_user_returns_none_without_a_user():
+@pytest.mark.parametrize("handler_is_async", [True, False], ids=["async", "sync"])
+def test_get_current_user_returns_none_without_a_user(handler_is_async):
     """No authentication, or a user ID with no row, gives ``None``."""
     api = BoltAPI()
     auth = JWTAuthentication(secret=SECRET)
 
-    @api.get("/me", auth=[auth])
-    async def me(user: Annotated[User | None, Depends(get_current_user)]):
-        return {"username": user.username if user is not None else None}
+    if handler_is_async:
+
+        @api.get("/me", auth=[auth])
+        async def me(user: Annotated[User | None, Depends(get_current_user)]):
+            return {"username": user.username if user is not None else None}
+
+    else:
+
+        @api.get("/me", auth=[auth])
+        def me_sync(user: Annotated[User | None, Depends(get_current_user)]):
+            return {"username": user.username if user is not None else None}
 
     real = User.objects.create(username="real_user")
     with TestClient(api) as client:

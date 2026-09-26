@@ -353,7 +353,9 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     ``await request.auser()`` does not block the loop.
 
     Both branches run ``fn`` in a copied context, so ContextVar writes stay
-    scoped the same way.
+    scoped the same way. While the loop waits, asgiref must not see it as the
+    parent loop of the thread that runs ``fn``: an ``async_to_sync`` in ``fn``
+    would schedule its coroutine on the waiting loop and never return.
     """
     loop = _get_running_loop()
     if loop is None:
@@ -368,7 +370,7 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
         _set_running_loop(None)
         started = time.perf_counter()
         try:
-            return contextvars.copy_context().run(_call_guarded, fn, *args)
+            return contextvars.copy_context().run(_call_without_parent_loop, fn, *args)
         finally:
             _set_running_loop(loop)
             waited = time.perf_counter() - started
@@ -380,13 +382,32 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     executor = getattr(AsyncToSync.executors, "current", None) or SyncToAsync.context_to_thread_executor.get(context)
     if executor is None:
         raise LaneAffinityError(_OFF_LANE_ORM_CALL)
-    future = executor.submit(contextvars.copy_context().run, _call_guarded, fn, *args)
+    future = executor.submit(contextvars.copy_context().run, _call_without_parent_loop, fn, *args)
     started = time.perf_counter()
     result = future.result()
     waited = time.perf_counter() - started
     if waited >= _SLOW_LOOP_WAIT_SECONDS:
         _report_slow_loop_wait(waited)
     return result
+
+
+def _call_without_parent_loop[T](fn: Callable[..., T], *args: object) -> T:
+    """Call ``fn`` with no asgiref parent loop on this thread.
+
+    :func:`run_orm_blocking` blocks the loop that asgiref recorded as the parent
+    loop of a lane. An ``async_to_sync`` in ``fn`` then runs its own loop on a
+    new thread, as it does on a thread that no loop started.
+    """
+    threadlocal = SyncToAsync.threadlocal
+    parent_loop = getattr(threadlocal, "main_event_loop", None)
+    parent_pid = getattr(threadlocal, "main_event_loop_pid", None)
+    threadlocal.main_event_loop = None
+    threadlocal.main_event_loop_pid = None
+    try:
+        return _call_guarded(fn, *args)
+    finally:
+        threadlocal.main_event_loop = parent_loop
+        threadlocal.main_event_loop_pid = parent_pid
 
 
 # A sync read of request.user that blocks the event loop this long is reported in dev mode.
