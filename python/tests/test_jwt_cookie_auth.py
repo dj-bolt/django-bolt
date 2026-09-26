@@ -202,8 +202,8 @@ class TestGetUserOverrideResolution:
         The token's sub is a username, which the default pk-based query can
         never resolve — so a 200 with the right username proves the override
         ran, and inheriting the default get_user_sync did not shadow it.
-        An async handler that reads request.user gets the user loaded with the
-        async get_user first. A sync handler cannot run a coroutine, so its read raises.
+        A sync read of request.user cannot run a coroutine, so it raises in
+        an async handler and in a sync handler alike.
         """
         user = User.objects.create(username="asyncoverride")
 
@@ -224,7 +224,10 @@ class TestGetUserOverrideResolution:
 
         @api.get("/direct-read", auth=[UsernameJWT(secret=SECRET)], guards=[IsAuthenticated()])
         async def direct_read(request):
-            return {"username": request.user.username}
+            try:
+                return {"username": request.user.username}
+            except RuntimeError as exc:
+                return {"error": str(exc)}
 
         @api.get("/sync-access", auth=[UsernameJWT(secret=SECRET)], guards=[IsAuthenticated()])
         def sync_access(request):
@@ -240,7 +243,7 @@ class TestGetUserOverrideResolution:
             assert response.json() == {"username": "asyncoverride", "same": True}
             response = client.get("/direct-read", headers={"Authorization": f"Bearer {token}"})
             assert response.status_code == 200
-            assert response.json() == {"username": "asyncoverride"}
+            assert "await request.auser()" in response.json()["error"]
             response = client.get("/sync-access", headers={"Authorization": f"Bearer {token}"})
             assert response.status_code == 200
             assert "await request.auser()" in response.json()["error"]

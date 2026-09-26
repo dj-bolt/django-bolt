@@ -16,9 +16,10 @@ different get_user overrides.
 Each backend resolves to a pair of loaders:
 
 1. request.user is sync. It runs the query on the thread that reads it
-   (run_orm_blocking). A thread with a running event loop sends the query to
-   the ORM pool, and the loop waits. On the loop of a request with Django
-   middleware, the query runs on the lane of the request, and the loop waits.
+   (run_orm_blocking), also on a thread with a running event loop: the loop
+   waits in any case, and a hop would only add two thread wakeups. On the
+   loop of a request with Django middleware, the query runs on the lane of
+   the request, and the loop waits.
 2. await request.auser() is async. It awaits an async get_user as a coroutine.
    It sends a sync query through run_in_orm_executor, the hand-off of each
    framework query. A request with a lane keeps the query on that lane.
@@ -44,7 +45,6 @@ from .pk_loader import load_user_by_pk_sync
 __all__ = [
     "LazyUser",
     "aload_bolt_user",
-    "preload_request_user",
     "load_user_by_pk_sync",
     "register_auth_backend",
     "get_registered_backend",
@@ -119,27 +119,6 @@ async def aload_bolt_user(user: Any) -> Any:
     if type(user) is LazyUser:
         return await user.aload()
     return user
-
-
-async def preload_request_user(request: Any) -> None:
-    """Load ``request.user`` before an async handler that reads it.
-
-    The handler then reads a loaded user, and its sync read does not block
-    the event loop. A user that Bolt authenticated loads with its async
-    loader. The lazy user of Django's ``AuthenticationMiddleware`` loads with
-    Django's ``auser``, which gives the same user without a sync query.
-    """
-    user = request.user
-    if user is None:
-        return
-    # ``type`` does not force a lazy object. ``isinstance`` does.
-    user_type = type(user)
-    if user_type is LazyUser:
-        await user.aload()
-    elif user_type is SimpleLazyObject and user._wrapped is empty:
-        loaded = await request.auser()
-        if loaded is not user:
-            user._wrapped = loaded
 
 
 def _has_custom_get_user_sync(cls: type) -> bool:

@@ -3,9 +3,7 @@
 ``/me-trivial/{item_id}`` is an ``async def`` handler with no await, no
 middleware, and JWT auth. In a real server it takes the ``can_sync_dispatch``
 branch, and Rust installs the WorkerLoop as the running loop around
-``_dispatch_sync``. The user loader must then send its query to the ORM pool.
-It reads ``request.user`` in a helper: a read in the source of the handler
-makes Bolt load the user first, which leaves the fast path.
+``_dispatch_sync``. The user loader runs its query on that thread all the same.
 ``/me-sync/{item_id}`` is the plain ``def`` variant, which runs with no
 running loop. ``TestClient`` never takes the sync-dispatch branch, so only a
 ``runbolt`` subprocess covers this path. ``get_user_sync`` runs a raw query,
@@ -40,13 +38,9 @@ async def health():
     return {"status": "ok"}
 
 
-def _user_of(request: Request):
-    return request.user
-
-
 @api.get("/me-trivial/{item_id}", auth=[DatabaseAuth(secret=SECRET)])
 async def me_trivial(item_id: int, request: Request):
-    user = _user_of(request)
+    user = request.user
     return {"username": user.username, "loaded_on": user.loaded_on, "handler_on": threading.current_thread().name}
 
 

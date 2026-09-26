@@ -243,9 +243,6 @@ class HandlerAnalysis:
     request_needs_cookies: bool = False
     """Whether the handler reads request.cookies"""
 
-    request_reads_user: bool = False
-    """Whether the handler reads request.user, also in a nested function"""
-
     # Analysis metadata
     analysis_failed: bool = False
     """Whether AST analysis failed (e.g., couldn't get source)"""
@@ -341,8 +338,6 @@ class OrmVisitor(ast.NodeVisitor):
 
         if self._is_request_name(node.value):
             self._mark_request_component_attr(attr_name)
-            if attr_name == "user" and isinstance(node.ctx, ast.Load):
-                self.analysis.request_reads_user = True
 
         # Check for .objects manager access
         if attr_name in ORM_MANAGER_ATTRS:

@@ -99,7 +99,7 @@ def _register(target: BoltAPI) -> None:
 
     @target.get("/me/async")
     async def me_async(request: Request):
-        # Bolt loads the session user before the handler, because the route has AuthenticationMiddleware.
+        # A sync read of the session user runs its query on the lane of the request.
         return {**_describe(request.user), "allauth": "allauth" in request.state}
 
     @target.get("/me/auser")

@@ -19,11 +19,12 @@ import contextvars
 import io
 from asyncio.events import _get_running_loop
 from collections.abc import Callable
+from functools import partial
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from .._core import RequestLane
-from ..concurrency import drive_on_lane, in_lane_mode
+from ..concurrency import drive_on_lane, in_lane_mode, run_orm_blocking
 from ..middleware_response import (
     _BODY_BYTES,
     _BODY_FILE,
@@ -1023,6 +1024,27 @@ def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
     return bool(getattr(django_user, "is_authenticated", False))
 
 
+def _route_sync_force(user: Any) -> None:
+    """Make a sync read of Django's lazy session user run through ``run_orm_blocking``.
+
+    ``AuthenticationMiddleware`` sets a ``SimpleLazyObject`` whose setup runs
+    the session query on the thread that reads it. On the event loop, Django's
+    guard raises ``SynchronousOnlyOperation``. ``run_orm_blocking`` runs the
+    query on the lane of the request, or inline with the guard satisfied.
+    Each wrapper copies the user again, so a routed setup stays as it is.
+    """
+    if not isinstance(user, LazyObject):
+        return
+    state = user.__dict__
+    if state["_wrapped"] is not empty:
+        return
+    setupfunc = state["_setupfunc"]
+    if type(setupfunc) is partial and setupfunc.func is run_orm_blocking:
+        return
+    # LazyObject.__setattr__ forwards names other than _wrapped to the user, which forces it.
+    state["_setupfunc"] = partial(run_orm_blocking, setupfunc)
+
+
 def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request) -> None:
     """
     Sync attributes added by Django middleware to Bolt request.
@@ -1044,6 +1066,7 @@ def _sync_request_attributes(django_request: HttpRequest, bolt_request: Request)
     auser = getattr(django_request, "auser", None)
     if user is not None:
         if _should_adopt_django_user(user, bolt_request):
+            _route_sync_force(user)
             bolt_request.user = user
             # Sync auser (async callable) for async access via `await request.auser()`
             if auser is not None:

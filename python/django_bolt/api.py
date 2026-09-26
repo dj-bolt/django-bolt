@@ -43,7 +43,6 @@ from .auth.backends import revocation_takes_claims
 from .auth.user_loader import (
     DEFAULT_USER_LOADERS,
     LazyUser,
-    preload_request_user,
     resolve_user_loader,
 )
 from .concurrency import (
@@ -112,16 +111,6 @@ def _revocation_handlers(backends: list[Any]) -> dict[str, tuple[Callable, bool]
         if getattr(backend, "revoked_token_handler", None) is not None
     }
     return handlers or None
-
-
-def _with_preloaded_user(executor: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap the executor of an async handler that reads request.user. See preload_request_user."""
-
-    async def execute_with_preloaded_user(handler: Callable, request: Any) -> Any:
-        await preload_request_user(request)
-        return await executor(handler, request)
-
-    return execute_with_preloaded_user
 
 
 Response = ResponseWireV1
@@ -1774,14 +1763,6 @@ class BoltAPI:
                 if backend.scheme_name not in user_loaders:
                     user_loaders[backend.scheme_name] = resolve_user_loader(backend)
             meta["_user_loaders"] = user_loaders
-
-            # An async handler that reads request.user gets the user loaded before
-            # it runs, so its sync read does not block the event loop. The rule
-            # does not depend on the database, so tests and production take the
-            # same path. The load awaits, so the route cannot use the sync fast path.
-            if meta["is_async"] and handler_analysis.request_reads_user:
-                meta["_handler_executor"] = _with_preloaded_user(meta["_handler_executor"])
-                meta.pop("_sync_executor", None)
 
             revocation_handlers = _revocation_handlers(effective_auth_backends)
             meta["_revocation_handlers"] = revocation_handlers
