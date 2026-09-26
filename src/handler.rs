@@ -231,7 +231,7 @@ pub fn form_result_to_py(
     for (key, value) in &result.form_map {
         match value {
             FormValue::Single(v) => {
-                let py_val = coerced_value_to_py(py, v);
+                let py_val = coerced_value_to_py(py, v)?;
                 if seq_fields.contains(key) {
                     // Always emit list[T] for fields annotated as list/set/tuple.
                     // The Python form-struct extractor skips its isinstance wrap-check.
@@ -242,7 +242,10 @@ pub fn form_result_to_py(
                 }
             }
             FormValue::Multi(vs) => {
-                let items: Vec<Py<PyAny>> = vs.iter().map(|v| coerced_value_to_py(py, v)).collect();
+                let items = vs
+                    .iter()
+                    .map(|v| coerced_value_to_py(py, v))
+                    .collect::<PyResult<Vec<Py<PyAny>>>>()?;
                 let list = PyList::new(py, items)?;
                 form_dict.set_item(key, list)?;
             }
@@ -870,7 +873,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     let is_async_handler = plan.map_or(false, |p| p.is_async());
 
     // Extract and validate headers
-    let headers = if must_extract_headers {
+    let mut headers = if must_extract_headers {
         match extract_headers(&req, state.max_header_size) {
             Ok(h) => Some(h),
             Err(response) => return response,
@@ -974,7 +977,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
     // Optimization: Only parse cookies if handler needs them
     // Cookie parsing can be expensive for requests with many cookies
-    let cookies = if needs_cookies {
+    let mut cookies = if needs_cookies {
         Some(parse_cookies_inline(
             headers
                 .as_ref()
@@ -1207,6 +1210,11 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         } else {
             None
         };
+        // A typed header or cookie replaces its string in the dicts above.
+        // Django middleware reads the original strings, so keep the Rust maps
+        // when a value was converted. A move, no copy.
+        let keep_raw_headers = !headers_coerced.is_empty();
+        let keep_raw_cookies = !cookies_coerced.is_empty();
 
         // Only create state dict when Rust-side prebound args exist.
         // For fast-path handlers (no rust_arg_bindings), state is lazily allocated on first access.
@@ -1263,6 +1271,16 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             query_params: query_params_py,
             headers: headers_py,
             cookies: cookies_py,
+            raw_headers: if keep_raw_headers {
+                headers.take()
+            } else {
+                None
+            },
+            raw_cookies: if keep_raw_cookies {
+                cookies.take()
+            } else {
+                None
+            },
             context,
             user: None,
             state: state_lock,

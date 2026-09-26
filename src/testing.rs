@@ -1162,6 +1162,9 @@ async fn handle_test_request_internal(
         } else {
             None
         };
+        // Django middleware reads the original strings (matches production).
+        let keep_raw_headers = !headers_coerced.is_empty();
+        let keep_raw_cookies = !cookies_coerced.is_empty();
 
         // Only create state dict when Rust-side prebound args exist (matches production).
         let state_lock = std::sync::OnceLock::new();
@@ -1219,6 +1222,8 @@ async fn handle_test_request_internal(
             query_params: query_params_dict,
             headers: headers_dict.map(|d| d.unbind()),
             cookies: cookies_dict.map(|d| d.unbind()),
+            raw_headers: keep_raw_headers.then_some(headers),
+            raw_cookies: keep_raw_cookies.then_some(cookies),
             context,
             user: None,
             state: state_lock,
@@ -1453,7 +1458,7 @@ pub fn handle_test_websocket(
         let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
         match coerce_param(v, type_hint, max_param_length) {
             Ok(coerced) => {
-                let py_value = coerced_value_to_py(py, &coerced);
+                let py_value = coerced_value_to_py(py, &coerced)?;
                 path_params_dict.set_item(k, py_value)?;
             }
             // Oversized values are a hard error — never fall back to the raw string.
@@ -1488,7 +1493,7 @@ pub fn handle_test_websocket(
 
                     match coerce_param(&decoded_value, type_hint, max_param_length) {
                         Ok(coerced) => {
-                            let py_value = coerced_value_to_py(py, &coerced);
+                            let py_value = coerced_value_to_py(py, &coerced)?;
                             query_dict.set_item(decoded_key.as_ref(), py_value)?;
                         }
                         // Oversized values are a hard error — never fall back to raw string.

@@ -107,7 +107,7 @@ fn build_scope(
 
                 match coerce_param(&decoded_value, type_hint, max_param_length) {
                     Ok(coerced) => {
-                        let py_value = coerced_value_to_py(py, &coerced);
+                        let py_value = coerced_value_to_py(py, &coerced)?;
                         query_dict.set_item(decoded_key.as_ref(), py_value)?;
                     }
                     // Oversized values reject the upgrade — never pass a raw string through.
@@ -152,7 +152,7 @@ fn build_scope(
         let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
         match coerce_param(v, type_hint, max_param_length) {
             Ok(coerced) => {
-                let py_value = coerced_value_to_py(py, &coerced);
+                let py_value = coerced_value_to_py(py, &coerced)?;
                 params_dict.set_item(k.as_str(), py_value)?;
             }
             // Oversized values reject the upgrade — never pass a raw string through.

@@ -178,8 +178,14 @@ async def list_items(x_page_size: Annotated[int, Header()] = 20):
 {"detail": "Header 'x-page-size': Invalid integer 'abc': invalid digit found in string"}
 ```
 
-The converted value also replaces the string in `request.headers`.
-`request.META` keeps a string, the `str()` of the converted value.
+The converted value also replaces the string in `request.headers` and
+`request.cookies`. Django middleware still gets the strings as they
+arrived: `request.META` and `HttpRequest.COOKIES` hold the original text,
+so a value such as `0005` keeps its leading zeros there.
+
+A value that Rust can parse but Python cannot build is also a 422. This
+covers a `date` or `datetime` with a year outside 1 to 9999, and a
+`Decimal` with an exponent that Python's `decimal` module rejects.
 
 ### All headers
 

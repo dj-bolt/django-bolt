@@ -21,12 +21,12 @@ pub static EMPTY_TYPES: std::sync::LazyLock<TypeHints> = std::sync::LazyLock::ne
 ///
 /// Returns the pre-coerced non-string values of each source. String
 /// parameters are validated for length but left as-is.
-pub fn validate_and_cache_typed_params<'a>(
-    path_params: Option<&'a AHashMap<String, String>>,
-    query_params: Option<&'a AHashMap<String, String>>,
-    param_types: &'a TypeHints,
+pub fn validate_and_cache_typed_params<'t>(
+    path_params: Option<&AHashMap<String, String>>,
+    query_params: Option<&AHashMap<String, String>>,
+    param_types: &'t TypeHints,
     max_length: usize,
-) -> Result<(CoercedValues<'a>, CoercedValues<'a>), HttpResponse> {
+) -> Result<(CoercedValues<'t>, CoercedValues<'t>), HttpResponse> {
     let path_coerced = match path_params {
         Some(params) => {
             validate_and_cache_source(params, param_types, max_length, "Path parameter")?
@@ -51,12 +51,15 @@ pub fn validate_and_cache_typed_params<'a>(
 ///
 /// The loop walks the smaller side: a request has many headers but a route
 /// types few of them, while path and query maps are usually small.
-pub fn validate_and_cache_source<'a>(
-    values: &'a AHashMap<String, String>,
-    types: &'a TypeHints,
+///
+/// The names in the result borrow from `types`, the route metadata, not from
+/// `values`. The caller can thus move the request map while it holds the result.
+pub fn validate_and_cache_source<'t>(
+    values: &AHashMap<String, String>,
+    types: &'t TypeHints,
     max_length: usize,
     label: &str,
-) -> Result<CoercedValues<'a>, HttpResponse> {
+) -> Result<CoercedValues<'t>, HttpResponse> {
     let mut coerced_values = CoercedValues::new();
     if types.len() < values.len() {
         for (name, value) in values {
@@ -83,10 +86,10 @@ pub fn validate_and_cache_source<'a>(
             if value.len() > max_length {
                 return Err(too_long(label, name, value.len(), max_length));
             }
-            if let Some(&type_hint) = types.get(name) {
+            if let Some((typed_name, &type_hint)) = types.get_key_value(name) {
                 coerce_into(
                     &mut coerced_values,
-                    name,
+                    typed_name,
                     value,
                     type_hint,
                     max_length,
@@ -107,9 +110,9 @@ fn too_long(label: &str, name: &str, len: usize, max_length: usize) -> HttpRespo
 }
 
 #[inline]
-fn coerce_into<'a>(
-    coerced_values: &mut CoercedValues<'a>,
-    name: &'a str,
+fn coerce_into<'t>(
+    coerced_values: &mut CoercedValues<'t>,
+    name: &'t str,
     value: &str,
     type_hint: u8,
     max_length: usize,
@@ -164,7 +167,7 @@ pub fn set_declared_item(
     label: &str,
 ) -> PyResult<()> {
     match coerce_declared_value(name, value, types, max_length, label) {
-        Ok(Some(coerced)) => dict.set_item(name, coerced_value_to_py(py, &coerced)),
+        Ok(Some(coerced)) => dict.set_item(name, coerced_value_to_py(py, &coerced)?),
         Ok(None) => dict.set_item(name, value),
         Err(detail) => Err(pyo3::exceptions::PyValueError::new_err(detail)),
     }

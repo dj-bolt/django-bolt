@@ -4,7 +4,7 @@
 //! eliminating the need for Python's convert_primitive() function.
 //! Performance improvement: ~100-500µs per parameter.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
 use pyo3::{IntoPyObject, Py, PyAny, PyResult, Python};
@@ -118,6 +118,43 @@ fn is_valid_decimal_literal(s: &str) -> bool {
         }
     }
     i == b.len()
+}
+
+/// Largest adjusted exponent that Python's `decimal` module accepts (`MAX_EMAX`
+/// of libmpdec on a 64-bit build). The mantissa has at most `max_length` digits,
+/// so the bound leaves room for it.
+const PYTHON_DECIMAL_MAX_EMAX: u64 = 999_999_999_999_999_999;
+
+/// Check that Python can build a `Decimal` from a valid literal.
+///
+/// `Decimal("1E999999999999999999999")` raises `InvalidOperation`, because the
+/// exponent does not fit. Such a value must be a 422, not a Python error
+/// under the GIL.
+fn decimal_exponent_fits(s: &str) -> bool {
+    let Some(pos) = s.find(['e', 'E']) else {
+        return true;
+    };
+    let exponent = &s[pos + 1..];
+    let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    match digits.parse::<u64>() {
+        Ok(magnitude) => magnitude.saturating_add(s.len() as u64) <= PYTHON_DECIMAL_MAX_EMAX,
+        Err(_) => false,
+    }
+}
+
+/// Check that Python can build a `date` or `datetime` for this year.
+///
+/// chrono parses year 0 and year 10000. Python `datetime` accepts 1 to 9999
+/// only, and a value outside that range must be a 422.
+fn check_python_year(year: i32, kind: &str, value: &str) -> Result<(), String> {
+    if (1..=9999).contains(&year) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid {} '{}': year {} is out of range (1 to 9999)",
+            kind, value, year
+        ))
+    }
 }
 
 /// Type hint constants (must match Python's get_type_hint_id() in compiler.py)
@@ -265,19 +302,36 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
             .map(CoercedValue::Uuid)
             .map_err(|e| format!("Invalid UUID '{}': {}", value, e)),
 
-        TYPE_DATETIME => parse_datetime(value),
+        TYPE_DATETIME => {
+            let parsed = parse_datetime(value)?;
+            let year = match &parsed {
+                CoercedValue::DateTime(dt) => dt.year(),
+                CoercedValue::NaiveDateTime(ndt) => ndt.year(),
+                _ => unreachable!("parse_datetime returns a datetime"),
+            };
+            check_python_year(year, "datetime", value)?;
+            Ok(parsed)
+        }
 
         TYPE_DECIMAL => {
-            if is_valid_decimal_literal(value) {
-                Ok(CoercedValue::Decimal(value.to_string()))
-            } else {
+            if !is_valid_decimal_literal(value) {
                 Err(format!("Invalid decimal '{}'", value))
+            } else if !decimal_exponent_fits(value) {
+                Err(format!(
+                    "Invalid decimal '{}': exponent is out of range",
+                    value
+                ))
+            } else {
+                Ok(CoercedValue::Decimal(value.to_string()))
             }
         }
 
-        TYPE_DATE => NaiveDate::parse_from_str(value, "%Y-%m-%d")
-            .map(CoercedValue::Date)
-            .map_err(|e| format!("Invalid date '{}': {}", value, e)),
+        TYPE_DATE => {
+            let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map_err(|e| format!("Invalid date '{}': {}", value, e))?;
+            check_python_year(date.year(), "date", value)?;
+            Ok(CoercedValue::Date(date))
+        }
 
         TYPE_TIME => parse_time(value),
 
@@ -350,7 +404,8 @@ fn parse_time(value: &str) -> Result<CoercedValue, String> {
 pub type TypeHints = ahash::AHashMap<String, u8>;
 
 /// Pre-coerced values of one request source. The names borrow from the
-/// request map or the route metadata, so no name is copied per request.
+/// route metadata, so no name is copied per request and the request map
+/// stays free to move.
 pub type CoercedValues<'a> = Vec<(&'a str, CoercedValue)>;
 
 /// Build a Python dict from a map of string values.
@@ -376,7 +431,7 @@ pub fn string_map_to_py_dict<'py>(
         // `coerced` holds a few entries, so a linear scan beats a hash lookup.
         for (name, value) in values {
             match coerced.iter().find(|(typed, _)| *typed == name.as_str()) {
-                Some((_, typed)) => dict.set_item(name, coerced_value_to_py(py, typed))?,
+                Some((_, typed)) => dict.set_item(name, coerced_value_to_py(py, typed)?)?,
                 None => dict.set_item(name, value)?,
             }
         }
@@ -410,6 +465,38 @@ mod tests {
             matches!(coerce_param("-2.5", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Float(f)) if (f + 2.5).abs() < 0.001)
         );
         assert!(coerce_param("not_a_float", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH).is_err());
+    }
+
+    #[test]
+    fn python_year_range_is_enforced() {
+        for value in ["0000-01-01", "-0001-01-01", "+10000-01-01"] {
+            let error = coerce_param(value, TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
+            assert!(error.to_string().contains("year"), "{value}: {error}");
+        }
+        for value in [
+            "0000-01-01T00:00:00",
+            "0000-01-01T00:00:00Z",
+            "+10000-01-01T00:00:00",
+        ] {
+            let error = coerce_param(value, TYPE_DATETIME, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
+            assert!(error.to_string().contains("year"), "{value}: {error}");
+        }
+        assert!(coerce_param("0001-01-01", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
+        assert!(coerce_param("9999-12-31", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
+    }
+
+    #[test]
+    fn python_decimal_exponent_range_is_enforced() {
+        for value in ["1E999999999999999999999", "1e-99999999999999999999"] {
+            let error = coerce_param(value, TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
+            assert!(error.to_string().contains("exponent"), "{value}: {error}");
+        }
+        for value in ["1E+2147483648", "1E999999999999999", "-0.5e-7", "12.5"] {
+            assert!(
+                coerce_param(value, TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH).is_ok(),
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -620,31 +707,34 @@ mod tests {
 /// directly — datetime/date/time go through PyO3's chrono integration (C-API
 /// construction, no ISO-string round trip) and UUID is built from its 128-bit
 /// value instead of re-parsing a hex string in Python.
-pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
-    match value {
+///
+/// `coerce_param` rejects the values that Python cannot build, so this fails
+/// only on a Python error such as memory exhaustion. The error is returned,
+/// never unwrapped: a panic under the GIL would abort the worker.
+pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> PyResult<Py<PyAny>> {
+    Ok(match value {
         // Primitives - direct conversion
-        CoercedValue::Int(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Float(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Bool(v) => v.into_pyobject(py).unwrap().to_owned().unbind().into_any(),
-        CoercedValue::String(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::Int(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Float(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Bool(v) => v.into_pyobject(py)?.to_owned().unbind().into_any(),
+        CoercedValue::String(v) => v.into_pyobject(py)?.into_any().unbind(),
 
-        // UUID: construct from the 128-bit integer (uuid.UUID(int=...)) —
-        // avoids a 36-char string alloc in Rust + hex parsing in Python.
-        CoercedValue::Uuid(v) => uuid_to_py(py, *v).unwrap(),
+        // UUID: built from the 128-bit integer, no hex string round trip.
+        CoercedValue::Uuid(v) => uuid_to_py(py, *v)?,
 
         // Decimal: construct Python decimal.Decimal from the validated input
         // string (kept as-is so large exponents are never expanded into their
         // full digit string in Rust).
-        CoercedValue::Decimal(v) => get_decimal_class(py).call1(py, (v.as_str(),)).unwrap(),
+        CoercedValue::Decimal(v) => get_decimal_class(py).call1(py, (v.as_str(),))?,
 
         // Temporal types: direct C-API construction via pyo3's chrono feature.
-        CoercedValue::DateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::NaiveDateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Date(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Time(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::DateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::NaiveDateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Date(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Time(v) => v.into_pyobject(py)?.into_any().unbind(),
 
         CoercedValue::Null => py.None(),
-    }
+    })
 }
 
 /// Build a Python `uuid.UUID` from the parsed 128-bit value.
