@@ -149,20 +149,7 @@ def home(user: OptionalCurrentUser):
 
 `CurrentUser` answers 401 when the request has no authenticated user. `OptionalCurrentUser` gives `None` then. In an async handler, both load the user with `await request.auser()`. In a sync handler, both read `request.user`, so the handler keeps its sync dispatch. For the type of your user model, make your own alias: `Annotated[User, Depends(require_current_user)]`.
 
-An async handler can also read `request.user`. When the source of the handler reads it, Bolt loads the user with `await request.auser()` before the handler runs. The read then does not block the event loop. The rule does not depend on the database. The load also makes the read work for a backend with only an async `get_user`, and for the session user of `AuthenticationMiddleware`. A read that is not in the source of the handler, for example in a helper or a template, loads the user when it occurs. The worker thread waits for that query. The query runs on the ORM pool, or on the lane of a request with Django middleware. On the lane, it sees the thread-local state of the request, for example a tenant schema. With `DEBUG = True` or `runbolt --dev`, Bolt logs each such read that blocks the event loop for more than 50 ms, with its file and line.
-
-A handler that does not read `request.user` loads nothing. Rust auth, guards and `request.context` need no query. When the source reads `request.user` in a branch, Bolt loads the user for each request, also when the branch does not run. For a read that runs only on some requests, use `await request.auser()` in the branch. Bolt does not load the user first for `auser()`, so the query runs only when the branch runs:
-
-```python
-@api.get("/items", auth=[JWTAuthentication()])
-async def items(request, mine: bool = False):
-    if not mine:
-        return await list_public_items()
-    user = await request.auser()  # a query only when mine=true
-    return await list_items_of(user)
-```
-
-In async code, prefer `await request.auser()` or `CurrentUser`. Use `request.user` in sync handlers, templates and sync helpers.
+An async handler can also read `request.user`. The read loads the user when it occurs, and the worker thread waits for that query. Use `await request.auser()` when the loop must serve other requests during the query, for example with a networked database. The query runs on that worker thread, or on the lane of a request with Django middleware. On the lane, it sees the thread-local state of the request, for example a tenant schema. With `DEBUG = True` or `runbolt --dev`, Bolt logs each such read that blocks the event loop for more than 50 ms, with its file and line.
 
 A thread with no event loop that is not the lane cannot wait for the lane, for example a thread from `asyncio.to_thread`. A sync read there raises `LaneAffinityError`, a subclass of `RuntimeError`. Its message names the route and the handler. With `DEBUG = True` or `runbolt --dev`, Bolt also logs the fix one time for each route.
 
@@ -194,8 +181,7 @@ either alone is enough. If you define both, sync handlers use
 for async handlers via a worker thread.
 
 A backend that overrides only the async `get_user` serves `await request.auser()`.
-When an async handler reads `request.user` in its own source, Bolt loads the user first, so the read works.
-Any other sync read of `request.user` cannot run a coroutine, so it raises `RuntimeError`.
+A sync read of `request.user` cannot run a coroutine, so it raises `RuntimeError`.
 Define `get_user_sync` as well when sync handlers or sync middleware read `request.user`.
 
 The override is scoped to the routes that use that backend instance —

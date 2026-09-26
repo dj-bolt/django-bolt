@@ -17,7 +17,7 @@ import os
 import sys
 import threading
 import time
-from asyncio.events import _get_running_loop
+from asyncio.events import _get_running_loop, _set_running_loop
 from collections.abc import Callable, Coroutine
 from functools import partial
 
@@ -338,8 +338,9 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
 
     A thread with no running event loop runs ``fn`` inline. This keeps a
     request lane on its own connection and thread-local state. A thread with
-    a running loop cannot run the ORM inline, so ``fn`` runs on the ORM pool,
-    and the loop waits for it.
+    a running loop also runs ``fn`` inline: the read blocks the loop in any
+    case, and a hop to the ORM pool only adds two thread wakeups. Django's
+    ``async_unsafe`` guard sees no running loop during the call.
 
     A request with Django middleware keeps its thread-local state on its
     lane, for example a tenant schema. A query on another thread does not
@@ -354,24 +355,32 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     Both branches run ``fn`` in a copied context, so ContextVar writes stay
     scoped the same way.
     """
-    if _get_running_loop() is None:
+    loop = _get_running_loop()
+    if loop is None:
         if _thread_sensitive_context.get(None) is None or getattr(_lane_state, "is_lane", False):
             return contextvars.copy_context().run(fn, *args)
         raise LaneAffinityError(_OFF_LANE_ORM_CALL)
     context = _thread_sensitive_context.get(None)
-    if context is not None:
-        # The loop waits for the lane of the request. Pick the executor that
-        # asgiref picks for thread-sensitive work: a lane that waits for the
-        # loop in async_to_sync runs work only through its CurrentThreadExecutor.
-        executor = getattr(AsyncToSync.executors, "current", None) or SyncToAsync.context_to_thread_executor.get(
-            context
-        )
-        if executor is None:
-            raise LaneAffinityError(_OFF_LANE_ORM_CALL)
-        future = executor.submit(contextvars.copy_context().run, _call_guarded, fn, *args)
-    else:
-        executor, call = _orm_handoff()
-        future = executor.submit(contextvars.copy_context().run, call, fn, *args)
+    if context is None:
+        # The loop blocks on this read. Run it here: no hop, no second thread.
+        # Nothing on this thread observes the running-loop flag during a
+        # blocking call, so Django's async_unsafe guard lets the query through.
+        _set_running_loop(None)
+        started = time.perf_counter()
+        try:
+            return contextvars.copy_context().run(_call_guarded, fn, *args)
+        finally:
+            _set_running_loop(loop)
+            waited = time.perf_counter() - started
+            if waited >= _SLOW_LOOP_WAIT_SECONDS:
+                _report_slow_loop_wait(waited)
+    # The loop waits for the lane of the request. Pick the executor that
+    # asgiref picks for thread-sensitive work: a lane that waits for the
+    # loop in async_to_sync runs work only through its CurrentThreadExecutor.
+    executor = getattr(AsyncToSync.executors, "current", None) or SyncToAsync.context_to_thread_executor.get(context)
+    if executor is None:
+        raise LaneAffinityError(_OFF_LANE_ORM_CALL)
+    future = executor.submit(contextvars.copy_context().run, _call_guarded, fn, *args)
     started = time.perf_counter()
     result = future.result()
     waited = time.perf_counter() - started

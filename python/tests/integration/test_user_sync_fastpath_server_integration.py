@@ -1,9 +1,9 @@
 """``request.user`` on the sync-dispatch fast path of a real ``runbolt`` server.
 
-The user loader reads the running loop of the calling thread. Rust installs
-the WorkerLoop around the trivially-async fast path, so the loader must send
-the query to the ORM pool there. The plain sync fast path has no running
-loop, so the query runs inline on the worker thread.
+A sync read of ``request.user`` runs its query on the thread that reads it.
+Rust installs the WorkerLoop around the trivially-async fast path, so Django's
+``async_unsafe`` guard sees a running loop there. The loader hides the loop
+during the query. The plain sync fast path has no running loop.
 
 This needs a real server: ``TestClient`` never takes the sync-dispatch branch
 (``can_sync_dispatch``), so it cannot reach either fast path.
@@ -38,8 +38,8 @@ def test_request_user_loads_on_both_sync_fast_paths(make_server_project, allow_u
 
     assert trivial.status_code == 200, trivial.text
     assert trivial.json()["username"] == "bob"
-    # The worker thread has a running loop here, so the query goes to the ORM pool.
-    assert trivial.json()["loaded_on"].startswith("bolt_orm")
+    # The worker thread has a running loop here. The query still runs on it, with no hop.
+    assert trivial.json()["loaded_on"] == trivial.json()["handler_on"]
 
     assert plain.status_code == 200, plain.text
     assert plain.json()["username"] == "bob"

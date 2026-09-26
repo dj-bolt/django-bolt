@@ -12,7 +12,10 @@ from typing import Annotated
 import jwt
 import pytest
 from asgiref.sync import async_to_sync, markcoroutinefunction, sync_to_async
+from django.contrib.auth import alogin
+from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.auth.models import User
+from django.contrib.sessions.middleware import SessionMiddleware
 from django.db import connection
 from django.db.backends.signals import connection_created
 from django.http import HttpResponse
@@ -871,8 +874,9 @@ def test_sync_user_loader_with_an_async_bridge_completes_when_forced_on_the_even
     """A lazy user forced on the event loop blocks that loop until the query returns.
 
     A request with no Django middleware has no lane, so the query runs on the
-    ORM pool. A loader that calls ``async_to_sync`` there must get a loop of
-    its own and complete.
+    thread of the loop. A loader that calls ``async_to_sync`` there must get a
+    loop of its own and complete. Its thread-sensitive work comes back to the
+    thread that forced the user.
     """
 
     def load_user():
@@ -892,13 +896,14 @@ def test_sync_user_loader_with_an_async_bridge_completes_when_forced_on_the_even
 
     @api.get("/tenant/{tenant}", auth=[SyncBridgeAuth(secret=_TEST_JWT_SECRET)])
     async def endpoint(tenant: str, request: Request):
-        return {"loaded_on": request.user.loaded_on}
+        return {"loaded_on": request.user.loaded_on, "forced_on": threading.current_thread().name}
 
     with TestClient(api, share_db_connection=False) as client:
         response = client.get("/tenant/acme", headers={"Authorization": f"Bearer {_database_auth_token()}"})
 
     assert response.status_code == 200, response.text
-    assert response.json()["loaded_on"].startswith("bolt_orm")
+    body = response.json()
+    assert body["loaded_on"] == body["forced_on"]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -1113,3 +1118,42 @@ def test_a_template_reads_the_user_in_an_async_handler():
     with TestClient(api, share_db_connection=False) as client:
         assert client.get("/loaded/acme", headers=headers).json() == {"page": "acme"}
         assert client.get("/lazy/acme", headers=headers).json() == {"page": "acme"}
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("wrapper", ["stack", "single"])
+def test_a_sync_read_of_the_session_user_in_an_async_handler_runs_on_the_lane(wrapper):
+    """The lazy user of ``AuthenticationMiddleware`` loads with a sync read on the event loop.
+
+    Django's lazy object would run the session query on the loop thread and
+    raise ``SynchronousOnlyOperation``. Bolt routes the read through
+    ``run_orm_blocking``, so it runs on the lane of the request.
+    """
+    if wrapper == "stack":
+        middleware = [DjangoMiddlewareStack([SessionMiddleware, AuthenticationMiddleware])]
+    else:
+        middleware = [DjangoMiddleware(SessionMiddleware), DjangoMiddleware(AuthenticationMiddleware)]
+    api = BoltAPI(middleware=middleware)
+
+    @api.post("/login")
+    async def login(request: Request):
+        await alogin(request, await User.objects.aget(username="session_reader"))
+        return {"ok": True}
+
+    @api.get("/me")
+    async def me(request: Request):
+        await asyncio.sleep(0)
+        return {
+            "username": request.user.username,
+            "authenticated": request.user.is_authenticated,
+            # Django caches the sync and the async user apart. They are one user.
+            "same": (await request.auser()) == request.user,
+        }
+
+    User.objects.create_user(username="session_reader", password="pw-for-tests")
+    with TestClient(api) as client:
+        assert client.post("/login").status_code == 200
+        response = client.get("/me")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"username": "session_reader", "authenticated": True, "same": True}

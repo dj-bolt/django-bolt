@@ -1,17 +1,11 @@
 """
-Tests that request.user loading runs on the framework's bounded ORM pool.
+Tests for the thread of a request.user load.
 
-Loading `request.user` issues a Django query, so it is ORM work and belongs
-on the same bounded, vendor-aware executor as every other framework-initiated
-query (`concurrency.run_in_orm_executor`). That pool exists because SQLite
-throughput scales inversely with connection count — a wide pool contends on
-the database file lock — and because each pool thread holds its own long-lived
-connection, so the connection budget must be tunable in one place via
-`DJANGO_BOLT_ORM_THREADS`.
-
-A private user-loading pool silently escapes that budget: it opens its own
-connections, ignores the env override, and reintroduces exactly the
-file-lock contention the ORM pool is sized to avoid.
+A sync read of `request.user` blocks the thread that reads it, so the query
+runs on that thread (`concurrency.run_orm_blocking`). A hop to a pool would
+add two thread wakeups and block the reader all the same. An async load
+(`await request.auser()`) is ORM work and uses the bounded, vendor-aware
+executor of every framework-initiated query (`concurrency.run_in_orm_executor`).
 """
 
 from __future__ import annotations
@@ -128,8 +122,7 @@ def _make_user(username: str = "orm-pool"):
 def _force_on_event_loop(loader, *args):
     """Force a lazy user on a thread with a running loop, as an async handler or middleware does.
 
-    The loader reads the calling thread: with a running loop, the sync ORM
-    cannot run inline, so the query must cross to the ORM pool.
+    The loop blocks on the read, so the query runs on this thread.
     """
 
     async def force():
@@ -138,8 +131,8 @@ def _force_on_event_loop(loader, *args):
     return asyncio.run(force())
 
 
-def test_default_user_loader_runs_on_orm_executor(fresh_orm_executor, monkeypatch):
-    """The no-backend default loader (Rust session auth) uses the ORM pool."""
+def test_default_user_loader_runs_on_the_reading_thread(fresh_orm_executor, monkeypatch):
+    """The no-backend default loader (Rust session auth) runs on the thread that reads the user."""
     fresh_orm_executor()
     user = _make_user("default-loader")
 
@@ -156,12 +149,11 @@ def test_default_user_loader_runs_on_orm_executor(fresh_orm_executor, monkeypatc
     assert loaded is not None
     assert loaded.pk == user.pk
 
-    assert seen, "the pk query never ran"
-    assert seen[0].startswith(ORM_THREAD_PREFIX), f"default user load ran on {seen[0]!r}; expected the shared ORM pool."
+    assert seen == [threading.current_thread().name], f"default user load ran on {seen!r}; expected the reading thread."
 
 
-def test_backend_user_loader_runs_on_orm_executor(fresh_orm_executor):
-    """A backend's get_user_sync is dispatched to the ORM pool, not a private one."""
+def test_backend_user_loader_runs_on_the_reading_thread(fresh_orm_executor):
+    """A backend's get_user_sync runs on the thread that reads the user, not on a pool."""
     fresh_orm_executor()
     user = _make_user("backend-loader")
 
@@ -174,43 +166,9 @@ def test_backend_user_loader_runs_on_orm_executor(fresh_orm_executor):
     assert loaded is not None
     assert loaded.pk == user.pk
 
-    assert backend.threads, "get_user_sync never ran"
-    assert backend.threads[0].startswith(ORM_THREAD_PREFIX), (
-        f"user load ran on {backend.threads[0]!r}; expected the shared ORM pool. "
-        "A private user-loading pool escapes DJANGO_BOLT_ORM_THREADS and the "
-        "per-thread database connection budget."
+    assert backend.threads == [threading.current_thread().name], (
+        f"user load ran on {backend.threads!r}; expected the reading thread."
     )
-
-
-def test_user_loading_respects_orm_thread_budget(fresh_orm_executor):
-    """DJANGO_BOLT_ORM_THREADS caps user loads too, not just QuerySet evaluation."""
-    fresh_orm_executor(workers=1)
-    user = _make_user("budget")
-
-    backend = RecordingJWTAuth(secret="user-loader-orm-pool-test-secret", algorithms=["HS256"])
-    loader, _ = resolve_user_loader(backend)
-
-    # Two loads requested at once against a one-thread budget must serialize:
-    # the second cannot enter get_user_sync while the first is parked there.
-    callers = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-    try:
-        pending = [callers.submit(_force_on_event_loop, loader, str(user.pk), None) for _ in range(2)]
-        assert backend.entered.acquire(timeout=5), "no user load started"
-        # A wide pool would admit the second load here; a one-thread budget
-        # cannot until the first returns.
-        second_entered = backend.entered.acquire(timeout=0.5)
-        backend.release.set()
-        assert [f.result(timeout=5) is not None for f in pending] == [True, True]
-    finally:
-        backend.release.set()
-        callers.shutdown(wait=False)
-
-    assert not second_entered, (
-        f"{backend.max_in_flight} user loads ran concurrently under "
-        "DJANGO_BOLT_ORM_THREADS=1; the user loader is not using the ORM pool."
-    )
-    assert backend.max_in_flight == 1
-    assert len(set(backend.threads)) == 1
 
 
 def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
@@ -289,11 +247,11 @@ def test_run_in_orm_executor_reentry_leaves_the_callers_pool(fresh_orm_executor)
     )
 
 
-def test_user_forced_under_a_loop_on_an_orm_worker_leaves_the_callers_pool(fresh_orm_executor):
-    """The blocking hand-off has the same reentry case as ``run_in_orm_executor``.
+def test_user_forced_under_a_loop_on_an_orm_worker_runs_on_the_worker(fresh_orm_executor):
+    """A blocking read under a loop on an ORM worker runs on that worker.
 
-    The worker runs a loop, so the query cannot run inline. The one ORM slot
-    is the worker itself, so the query must cross to the default pool.
+    The worker holds the one ORM slot. A hop into its own pool would wait
+    on that slot forever. The read runs inline, so there is no hop.
     """
     fresh_orm_executor(workers=1)
     user = _make_user("nested-sync")
@@ -313,7 +271,7 @@ def test_user_forced_under_a_loop_on_an_orm_worker_leaves_the_callers_pool(fresh
     loaded = concurrency._get_orm_executor().submit(drive_nested_loop).result(timeout=10)
     assert loaded is not None
     assert loaded.pk == user.pk
-    assert seen and seen[0].startswith(DEFAULT_THREAD_PREFIX), f"query ran on {seen!r}; expected the default pool"
+    assert seen and seen[0].startswith(ORM_THREAD_PREFIX), f"query ran on {seen!r}; expected the worker itself"
 
 
 @pytest.mark.parametrize("handoff", ["async", "blocking"])
@@ -322,17 +280,20 @@ def test_async_to_sync_on_an_orm_worker_leaves_the_callers_pool(fresh_orm_execut
 
     A ``get_user_sync`` that wraps an async ``get_user`` does this. The new
     thread is not a pool thread, but the worker still holds the one ORM slot.
-    The hand-offs of that loop must use the default pool.
+    An async hand-off from that loop must use the default pool. A blocking
+    read runs on the thread of that loop.
     """
     fresh_orm_executor(workers=1)
     user = _make_user(f"a2s-{handoff}")
     seen: list[str] = []
+    loop_thread: list[str] = []
 
     def recording_pk_load(model, user_id):
         seen.append(threading.current_thread().name)
         return load_user_by_pk_sync(model, user_id)
 
     async def nested():
+        loop_thread.append(threading.current_thread().name)
         if handoff == "async":
             return await concurrency.run_in_orm_executor(recording_pk_load, User, str(user.pk))
         return concurrency.run_orm_blocking(recording_pk_load, User, str(user.pk))
@@ -347,7 +308,10 @@ def test_async_to_sync_on_an_orm_worker_leaves_the_callers_pool(fresh_orm_execut
     loaded = asyncio.run(drive())
     assert loaded is not None
     assert loaded.pk == user.pk
-    assert seen and seen[0].startswith(DEFAULT_THREAD_PREFIX), f"query ran on {seen!r}; expected the default pool"
+    if handoff == "async":
+        assert seen and seen[0].startswith(DEFAULT_THREAD_PREFIX), f"query ran on {seen!r}; expected the default pool"
+    else:
+        assert seen == loop_thread, f"query ran on {seen!r}; expected the thread of the loop {loop_thread!r}"
 
 
 def test_orm_executor_is_built_once_under_concurrent_first_use(fresh_orm_executor, monkeypatch):

@@ -504,8 +504,11 @@ class TestSyncHandlerWithCustomBackend:
             guards=[IsAuthenticated()],
         )
         async def async_custom_sync_read(request):
-            """Bolt loads the user with the async get_user before the handler, so the read works."""
-            return {"username": request.user.username}
+            """A sync read cannot run the async get_user, so it raises and names the fix."""
+            try:
+                return {"username": request.user.username}
+            except RuntimeError as exc:
+                return {"error": str(exc)}
 
         # Create test user
         User.objects.create(username="asyncuser")
@@ -520,7 +523,7 @@ class TestSyncHandlerWithCustomBackend:
 
             response = client.get("/async-custom-sync-read", headers={"X-API-Key": "async-key"})
             assert response.status_code == 200, f"Response: {response.text}"
-            assert response.json() == {"username": "asyncuser"}
+            assert "await request.auser()" in response.json()["error"]
 
 
 class TestRequestUserGuardBehavior:
