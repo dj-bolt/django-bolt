@@ -1769,6 +1769,10 @@ class BoltAPI:
             ):
                 middleware_meta["needs_cookies"] = True
                 middleware_meta["needs_headers"] = True
+            elif "rust_arg_bindings" in middleware_meta:
+                # Rust binds every argument from its own request maps, so the
+                # Python source dicts have no reader. Rust then does not build them.
+                middleware_meta["prebind_only"] = True
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
