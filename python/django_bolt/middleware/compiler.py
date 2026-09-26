@@ -365,8 +365,15 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     form_seq_fields: set[str] = set()
     file_constraints: dict[str, dict[str, Any]] = {}
 
+    # The fields of the dependencies count too. A handler field keeps its own
+    # type when a dependency field has the same name.
     fields = handler_meta.get("fields", [])
-    for field in fields:
+    handler_names = {field.name for field in fields}
+    route_fields = [
+        *fields,
+        *(field for field in handler_meta.get("dependency_fields", ()) if field.name not in handler_names),
+    ]
+    for field in route_fields:
         # Include type hints for path, query, header, cookie
         if field.source in ("path", "query", "header", "cookie"):
             _extract_type_hints_from_field(field, param_types, skip_string=True)

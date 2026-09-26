@@ -16,7 +16,13 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 import msgspec
 
 from ..analysis import resolve_introspection_target
-from ..dependencies import resolve_dependency, resolve_dependency_sync
+from ..dependencies import (
+    decode_body_once,
+    dependency_needs_event_loop,
+    resolve_dependency,
+    resolve_dependency_sync,
+    sync_form,
+)
 from ..params import Depends as DependsMarker
 from ..params import Param
 from ..typing import (
@@ -172,6 +178,7 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         "fields": [],
         "path_params": path_params,
         "http_method": http_method,
+        "path": path,
         "has_file_uploads": False,  # Default; overridden below if file params exist
     }
 
@@ -455,8 +462,8 @@ async def build_handler_arguments(
                 cookies_map,
                 handler_meta_dict,
                 compile_binder_fn,
-                meta.get("http_method", ""),
-                meta.get("path", ""),
+                meta["http_method"],
+                meta["path"],
             )
         else:
             value, body_obj, body_loaded = extract_parameter_value(
@@ -667,8 +674,8 @@ def compile_argument_injector(
 
         _dep_plan: list[tuple[int, Any, bool, str, bool, Any]] = []
         _dep_fallback_fields: list[FieldDefinition] = []
-        http_method = meta.get("http_method", "")
-        path = meta.get("path", "")
+        http_method = meta["http_method"]
+        path = meta["path"]
 
         # A sync handler uses the sync form of a dependency that has one, for
         # example get_current_user. Its injector then needs no event loop.
@@ -679,9 +686,7 @@ def compile_argument_injector(
             if src_id == _SRC_DEP:
                 dependency = f.dependency
                 if handler_is_sync and dependency is not None:
-                    sync_variant = getattr(dependency.dependency, "_bolt_sync_variant", None)
-                    if sync_variant is not None:
-                        dependency = DependsMarker(dependency=sync_variant, use_cache=dependency.use_cache)
+                    dependency = sync_form(dependency)
                 _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, dependency))
             elif src_id == _SRC_REQUEST_D:
                 _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, None))
@@ -702,7 +707,10 @@ def compile_argument_injector(
         _async_dep_fns = []
         for idx in _dep_indices:
             dep = _dep_plan[idx][5]  # dependency marker
-            if dep is not None and inspect.iscoroutinefunction(dep.dependency):
+            # A sync dependency of an async dependency also needs the async injector.
+            if dep is not None and dependency_needs_event_loop(
+                dep.dependency, handler_meta_dict, compile_binder_fn, http_method, path, sync_handler=handler_is_sync
+            ):
                 _async_dep_fns.append(idx)
         _can_parallel = len(_async_dep_fns) >= 2
 
@@ -761,10 +769,8 @@ def compile_argument_injector(
                     elif src_id == _SRC_FILE_D:
                         value = extractor(files_map)
                     elif src_id == _SRC_BODY_D:
-                        if not body_loaded:
-                            body_obj = extractor(request["body"])
-                            body_loaded = True
-                        value = body_obj
+                        # A dependency with the same body type shares this decode.
+                        value = decode_body_once(dep_cache, extractor, request["body"])
                     else:
                         field = _dep_fallback_by_name[name]
                         value, body_obj, body_loaded = extract_parameter_value(
@@ -886,10 +892,8 @@ def compile_argument_injector(
                 elif src_id == _SRC_FILE_D:
                     value = extractor(files_map)
                 elif src_id == _SRC_BODY_D:
-                    if not body_loaded:
-                        body_obj = extractor(request["body"])
-                        body_loaded = True
-                    value = body_obj
+                    # A dependency with the same body type shares this decode.
+                    value = decode_body_once(dep_cache, extractor, request["body"])
                 else:
                     field = _dep_fallback_by_name[name]
                     value, body_obj, body_loaded = extract_parameter_value(

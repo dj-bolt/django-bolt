@@ -539,6 +539,46 @@ class TestRefreshEndpointTypEnforcement:
         r = client.get("/api", headers={"Authorization": f"Bearer {pair.refresh_token}"})
         assert r.status_code == 401
 
+    @staticmethod
+    def _typed(claim: str, value: str) -> str:
+        """A token of another issuer, which names its type in ``claim``."""
+        now = int(time.time())
+        return jwt.encode(
+            {"sub": "u", "jti": "jti-1", claim: value, "iat": now, "exp": now + 60}, SECRET, algorithm="HS256"
+        )
+
+    # typ: django-bolt; token_type: djangorestframework-simplejwt; token_use: django-allauth, AWS Cognito.
+    @pytest.mark.parametrize("claim", ["typ", "token_type", "token_use"])
+    def test_refresh_type_in_any_type_claim_rejected_on_api_route(self, client, claim):
+        r = client.get("/api", headers={"Authorization": f"Bearer {self._typed(claim, 'refresh')}"})
+        assert r.status_code == 401
+
+    # Keycloak: typ Refresh, Offline and ID; AWS Cognito: token_use id. Case does not matter.
+    @pytest.mark.parametrize(
+        ("claim", "value"),
+        [("typ", "Refresh"), ("typ", "Offline"), ("typ", "ID"), ("token_use", "id"), ("token_type", "REFRESH")],
+    )
+    def test_a_non_access_token_type_is_rejected_on_api_route(self, client, claim, value):
+        r = client.get("/api", headers={"Authorization": f"Bearer {self._typed(claim, value)}"})
+        assert r.status_code == 401
+
+    def test_a_keycloak_access_token_type_works_on_api_route(self, client):
+        r = client.get("/api", headers={"Authorization": f"Bearer {self._typed('typ', 'Bearer')}"})
+        assert r.status_code == 200
+
+    @pytest.mark.parametrize("claim", ["typ", "token_type", "token_use"])
+    def test_access_type_in_any_type_claim_works_on_api_route(self, client, claim):
+        r = client.get("/api", headers={"Authorization": f"Bearer {self._typed(claim, 'access')}"})
+        assert r.status_code == 200
+        assert r.json() == {"user_id": "u"}
+
+    def test_conflicting_type_claim_rejected_on_refresh_route(self, client):
+        now = int(time.time())
+        payload = {"sub": "u", "jti": "j", "typ": "refresh", "token_type": "access", "iat": now, "exp": now + 60}
+        token = jwt.encode(payload, SECRET, algorithm="HS256")
+        r = client.request("POST", "/refresh", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 401
+
     def test_refresh_token_works_on_refresh_route(self, client):
         pair = create_token_pair("u", secret=SECRET)
         r = client.request("POST", "/refresh", headers={"Authorization": f"Bearer {pair.refresh_token}"})

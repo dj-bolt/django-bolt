@@ -1398,12 +1398,23 @@ pub fn handle_test_websocket(
     }
 
     // Auth and guards for WebSocket
+    // The auth context for the revocation check, which the Python test client
+    // awaits before it starts the handler (the server awaits it in the handshake).
+    let mut revocation_auth: Option<Py<PyDict>> = None;
     if let Some(route_meta) = app.route_metadata.get(handler_id) {
         let auth_ctx = if !route_meta.auth_backends.is_empty() {
             authenticate(&header_map, &route_meta.auth_backends)
         } else {
             None
         };
+        if let (Some(_), Some(ctx)) = (
+            route_meta.websocket_revocation_check.as_ref(),
+            auth_ctx.as_ref(),
+        ) {
+            let context = PyDict::new(py).unbind();
+            bolt_core::middleware::auth::populate_auth_context(&context, ctx, py);
+            revocation_auth = Some(context);
+        }
 
         if !route_meta.guards.is_empty() {
             match evaluate_guards(&route_meta.guards, auth_ctx.as_ref()) {
@@ -1478,6 +1489,9 @@ pub fn handle_test_websocket(
     let scope_dict = pyo3::types::PyDict::new(py);
     scope_dict.set_item("type", "websocket")?;
     scope_dict.set_item("path", &path)?;
+    if let Some(context) = revocation_auth {
+        scope_dict.set_item("_bolt_revocation_auth", context)?;
+    }
 
     // Parse and coerce query parameters
     let query_dict = pyo3::types::PyDict::new(py);

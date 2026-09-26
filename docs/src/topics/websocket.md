@@ -200,6 +200,15 @@ async with websockets.connect(
     print(await ws.recv())
 ```
 
+### Revoked tokens
+
+A `revoked_token_handler` or a `revocation_store` of the backend applies to
+the handshake too. When the handler reports the token as revoked, the
+handshake gets `401 Unauthorized` and the connection does not open. Bolt
+checks the token one time, at the handshake. An open connection stays open
+after its token is revoked. To end it, close it from the handler. See
+[Token revocation](authentication.md#token-revocation).
+
 ### Authentication from a browser
 
 The browser `WebSocket` API cannot set request headers. Use a cookie instead.

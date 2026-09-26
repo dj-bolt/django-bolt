@@ -146,7 +146,9 @@ def get_current_user_sync(request: Request) -> Any:
     keeps its sync dispatch, and a request with Django middleware stays on its lane.
     """
     user = request.user
-    if user is None or not user.is_authenticated:
+    # A lazy request.user is never None itself. Its truth value is the truth
+    # value of the loaded user, and a user ID with no row loads as None.
+    if not user or not user.is_authenticated:
         return None
     return user
 

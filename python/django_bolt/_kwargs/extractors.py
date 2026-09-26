@@ -595,13 +595,30 @@ def create_file_extractor(
         return extract_required
 
 
+_BODY_EXTRACTORS: dict[Any, Callable] = {}
+
+
 def create_body_extractor(name: str, annotation: Any) -> Callable:
     """
     Create a pre-compiled extractor for request body.
 
     Uses cached msgspec decoder for maximum performance.
     Converts msgspec.DecodeError (JSON parsing errors) to RequestValidationError for proper 422 responses.
+
+    Each body type has one extractor. So a handler and a dependency with the
+    same body type decode the body one time (see ``decode_body_once``).
     """
+    try:
+        return _BODY_EXTRACTORS[annotation]
+    except KeyError:
+        extractor = _BODY_EXTRACTORS[annotation] = _build_body_extractor(annotation)
+        return extractor
+    except TypeError:
+        # An unhashable annotation gets its own extractor.
+        return _build_body_extractor(annotation)
+
+
+def _build_body_extractor(annotation: Any) -> Callable:
     if is_msgspec_struct(annotation):
         decoder = get_msgspec_decoder(annotation)
 

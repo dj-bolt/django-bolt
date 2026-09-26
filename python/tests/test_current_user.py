@@ -83,14 +83,23 @@ def test_current_user_loads_with_the_backend_on_the_lane(handler_is_async):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_get_current_user_returns_none_without_a_user():
+@pytest.mark.parametrize("handler_is_async", [True, False], ids=["async", "sync"])
+def test_get_current_user_returns_none_without_a_user(handler_is_async):
     """No authentication, or a user ID with no row, gives ``None``."""
     api = BoltAPI()
     auth = JWTAuthentication(secret=SECRET)
 
-    @api.get("/me", auth=[auth])
-    async def me(user: Annotated[User | None, Depends(get_current_user)]):
-        return {"username": user.username if user is not None else None}
+    if handler_is_async:
+
+        @api.get("/me", auth=[auth])
+        async def me(user: Annotated[User | None, Depends(get_current_user)]):
+            return {"username": user.username if user is not None else None}
+
+    else:
+
+        @api.get("/me", auth=[auth])
+        def me_sync(user: Annotated[User | None, Depends(get_current_user)]):
+            return {"username": user.username if user is not None else None}
 
     real = User.objects.create(username="real_user")
     with TestClient(api) as client:
@@ -108,6 +117,29 @@ def test_current_user_in_a_sync_handler_keeps_lane_dispatch():
     @api.get("/tenant/{tenant}", auth=[auth])
     def endpoint(tenant: str, user: CurrentUser):
         return {"tenant": user.tenant, "lane_mode": in_lane_mode()}
+
+    with TestClient(api, share_db_connection=False) as client:
+        response = client.get("/tenant/acme", headers=_headers())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenant": "acme", "lane_mode": True}
+    assert auth.queries == 1
+
+
+def _tenant_of_user(user=Depends(get_current_user)) -> str:
+    """A sync dependency that depends on get_current_user."""
+    return user.tenant
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_nested_get_current_user_in_a_sync_handler_keeps_lane_dispatch():
+    """A sync handler gets the sync form of get_current_user also when another dependency depends on it."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMiddleware])])
+    auth = _TenantAuth(secret=SECRET)
+
+    @api.get("/tenant/{tenant}", auth=[auth])
+    def endpoint(tenant: str, user_tenant: Annotated[str, Depends(_tenant_of_user)]):
+        return {"tenant": user_tenant, "lane_mode": in_lane_mode()}
 
     with TestClient(api, share_db_connection=False) as client:
         response = client.get("/tenant/acme", headers=_headers())

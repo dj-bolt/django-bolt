@@ -230,9 +230,12 @@ pub enum AuthBackend {
         /// Clock-skew tolerance (seconds) for `exp`/`nbf`.
         leeway: i64,
         /// Expected `typ` claim. `Some(t)` requires the token to carry
-        /// exactly `typ == t` (e.g. a rotation endpoint sets "refresh").
-        /// `None` (normal access routes) rejects `typ == "refresh"` so a
-        /// refresh token can never authenticate a regular endpoint.
+        /// exactly `typ == t` (e.g. a rotation endpoint sets "refresh"),
+        /// and no other token type claim that disagrees. `None` (normal
+        /// access routes) rejects a token whose `typ`, `token_type` or
+        /// `token_use` names a refresh or ID token (see
+        /// `NON_ACCESS_TOKEN_TYPES`), so such a token can never
+        /// authenticate a regular endpoint.
         token_type: Option<String>,
         /// Require a non-empty JWT ID claim, even without a Python
         /// revocation handler.
@@ -410,6 +413,31 @@ struct TokenHeader {
     kid: Option<String>,
 }
 
+/// Claims other than `typ` that name the token type: `token_type`
+/// (djangorestframework-simplejwt) and `token_use` (django-allauth, AWS Cognito).
+const OTHER_TOKEN_TYPE_CLAIMS: [&str; 2] = ["token_type", "token_use"];
+
+/// Token types that never authenticate a route with no expected token type,
+/// compared without case: refresh tokens (`refresh`; Keycloak `Refresh` and
+/// `Offline`) and ID tokens (AWS Cognito `id`; Keycloak `ID`).
+const NON_ACCESS_TOKEN_TYPES: [&str; 3] = ["refresh", "offline", "id"];
+
+fn is_non_access_token_type(token_type: &str) -> bool {
+    NON_ACCESS_TOKEN_TYPES
+        .iter()
+        .any(|name| token_type.eq_ignore_ascii_case(name))
+}
+
+/// The token types that the claims declare: `typ`, then each string value of
+/// [`OTHER_TOKEN_TYPE_CLAIMS`].
+fn declared_token_types(claims: &Claims) -> impl Iterator<Item = &str> {
+    claims.typ.as_deref().into_iter().chain(
+        OTHER_TOKEN_TYPE_CLAIMS
+            .iter()
+            .filter_map(|name| claims.extra.get(*name).and_then(serde_json::Value::as_str)),
+    )
+}
+
 /// Decode and validate a JWT against a prebuilt key and algorithm allowlist.
 ///
 /// Owns the full validation loop instead of `jsonwebtoken::decode()` so the
@@ -475,17 +503,21 @@ fn decode_and_validate(
     };
 
     // Token-type separation (symmetric enforcement): an expected type must
-    // match exactly; routes with no expectation never accept refresh tokens.
+    // match `typ` exactly; routes with no expectation never accept refresh
+    // or ID tokens. Other issuers name the type in other claims, so each of
+    // those counts too: such a token never passes as an access token.
     match token_type {
         Some(expected) => {
-            if claims.typ.as_deref() != Some(expected) {
-                log::debug!("JWT rejected: typ claim does not match expected token type");
+            if claims.typ.as_deref() != Some(expected)
+                || declared_token_types(&claims).any(|t| t != expected)
+            {
+                log::debug!("JWT rejected: token type claims do not match expected token type");
                 return None;
             }
         }
         None => {
-            if claims.typ.as_deref() == Some("refresh") {
-                log::debug!("JWT rejected: refresh token used on an access route");
+            if declared_token_types(&claims).any(is_non_access_token_type) {
+                log::debug!("JWT rejected: refresh or ID token used on an access route");
                 return None;
             }
         }
@@ -983,6 +1015,132 @@ mod tests {
             .is_none(),
             "typ:\"refresh\" must never authenticate a route with no expected token type"
         );
+    }
+
+    #[test]
+    fn non_access_token_types_rejected_on_access_route_without_case() {
+        // Keycloak: typ Refresh, Offline, ID. AWS Cognito: token_use id.
+        for (claim, value) in [
+            ("typ", "Refresh"),
+            ("typ", "Offline"),
+            ("typ", "ID"),
+            ("token_use", "id"),
+            ("token_type", "REFRESH"),
+        ] {
+            let json = format!(
+                r#"{{"sub":"42","exp":{},"{}":"{}"}}"#,
+                future_exp(),
+                claim,
+                value
+            );
+            let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
+            assert!(
+                decode_and_validate(
+                    &token,
+                    &hs256_key(),
+                    &[Algorithm::HS256],
+                    None,
+                    None,
+                    60,
+                    None
+                )
+                .is_none(),
+                "{claim}:{value} must never authenticate a route with no expected token type"
+            );
+        }
+        // Keycloak access tokens carry typ Bearer.
+        let json = format!(r#"{{"sub":"42","exp":{},"typ":"Bearer"}}"#, future_exp());
+        let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn refresh_type_in_any_type_claim_rejected_on_access_route() {
+        for claim in ["typ", "token_type", "token_use"] {
+            let refresh_json = format!(
+                r#"{{"sub":"42","exp":{},"{}":"refresh"}}"#,
+                future_exp(),
+                claim
+            );
+            let refresh = sign_token(r#"{"alg":"HS256"}"#, &refresh_json, Algorithm::HS256);
+            let access_json = format!(
+                r#"{{"sub":"42","exp":{},"{}":"access"}}"#,
+                future_exp(),
+                claim
+            );
+            let access = sign_token(r#"{"alg":"HS256"}"#, &access_json, Algorithm::HS256);
+
+            assert!(
+                decode_and_validate(
+                    &refresh,
+                    &hs256_key(),
+                    &[Algorithm::HS256],
+                    None,
+                    None,
+                    60,
+                    None
+                )
+                .is_none(),
+                "{claim}:\"refresh\" must never authenticate a route with no expected token type"
+            );
+            assert!(
+                decode_and_validate(
+                    &access,
+                    &hs256_key(),
+                    &[Algorithm::HS256],
+                    None,
+                    None,
+                    60,
+                    None
+                )
+                .is_some(),
+                "{claim}:\"access\" authenticates a route with no expected token type"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_token_type_rejects_a_conflicting_type_claim() {
+        let json = format!(
+            r#"{{"sub":"42","exp":{},"typ":"refresh","token_use":"access"}}"#,
+            future_exp()
+        );
+        let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            Some("refresh")
+        )
+        .is_none());
+        // An expected type still needs `typ`: another type claim alone is not enough.
+        let json = format!(
+            r#"{{"sub":"42","exp":{},"token_type":"refresh"}}"#,
+            future_exp()
+        );
+        let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            Some("refresh")
+        )
+        .is_none());
     }
 
     #[test]

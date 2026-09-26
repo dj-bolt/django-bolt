@@ -252,6 +252,39 @@ def test_custom_revoked_token_handler_without_store():
 
 
 @pytest.mark.django_db
+def test_a_revoked_token_handler_with_two_parameters_gets_the_claims():
+    """A handler can decide from any claim, for example the session that the token names."""
+    ended_sessions: set[str] = set()
+    seen: list[tuple[str, dict]] = []
+
+    async def session_ended(jti: str, claims: dict) -> bool:
+        seen.append((jti, claims))
+        return claims.get("sid") in ended_sessions
+
+    api = BoltAPI()
+    auth = JWTAuthentication(secret=SECRET, revoked_token_handler=session_ended)
+
+    @api.get("/p", auth=[auth], guards=[IsAuthenticated()])
+    async def p(request):
+        return {"ok": True}
+
+    user = _create_user()
+    token = jwt.encode(
+        {"sub": str(user.pk), "jti": "jti-sid", "sid": "session-1", "exp": int(time.time()) + 60},
+        SECRET,
+        algorithm="HS256",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with TestClient(api) as client:
+        assert client.get("/p", headers=headers).status_code == 200
+        assert seen[0][0] == "jti-sid"
+        assert seen[0][1]["sid"] == "session-1"
+        ended_sessions.add("session-1")
+        assert client.get("/p", headers=headers).status_code == 401
+
+
+@pytest.mark.django_db
 def test_re_issued_token_after_revocation_works():
     """Revocation is per-JTI, not per-user — a fresh token with a new JTI
     works even after the previous one was revoked."""

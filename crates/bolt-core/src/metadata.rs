@@ -548,6 +548,10 @@ pub struct RouteMetadata {
     /// fast path: sync executors may return just the encoded JSON body and
     /// Rust rebuilds the (status, JSON meta) envelope from this value.
     pub default_status_code: u16,
+    /// WebSocket routes with a `revoked_token_handler`: an async Python
+    /// callable that takes the auth context and returns True for a revoked
+    /// token. The handshake awaits it before the upgrade.
+    pub websocket_revocation_check: Option<Arc<Py<PyAny>>>,
 }
 
 impl RouteMetadata {
@@ -774,6 +778,11 @@ impl RouteMetadata {
 
         // Default success status (guaranteed by Python registration; 200 fallback
         // for defensive parsing of hand-built metadata in tests).
+        let websocket_revocation_check = py_meta
+            .get_item("websocket_revocation_check")?
+            .filter(|value| !value.is_none())
+            .map(|value| Arc::new(value.unbind()));
+
         let default_status_code = py_meta
             .get_item("default_status_code")
             .ok()
@@ -798,6 +807,7 @@ impl RouteMetadata {
             rust_arg_bindings,
             plan,
             default_status_code,
+            websocket_revocation_check,
         })
     }
 }
