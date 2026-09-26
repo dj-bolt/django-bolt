@@ -53,6 +53,10 @@ All notable changes to this project will be documented in this file.
 - **Sync dependencies of a blocking sync handler run on the thread of the handler** - Bolt resolved them on the event loop, and then ran the handler in a worker thread. A sync dependency that used the ORM raised `SynchronousOnlyOperation`. Behind Django middleware, it also missed the thread-local state of the lane, for example the tenant schema. The dependencies now run in the same thread hop as the handler. This also applies to `CurrentUser` in a sync handler, which read the session user of Django on the event loop.
 - **Bolt rejects a middleware with no capability** - `DjangoMiddleware` and `DjangoMiddlewareStack` now raise `RuntimeError` for a middleware with `sync_capable = False` and `async_capable = False`, as Django does at load.
 
+### Documentation
+
+- **PostgreSQL on macOS with forked workers** - In local development on macOS, a forked `runbolt` worker can hang when libpq opens a PostgreSQL connection. When libpq is built with GSSAPI support, its GSSAPI negotiation calls the macOS Kerberos framework, which is not safe after `fork()`. The FAQ and `CONTRIBUTING.md` now show the fix: set `PGGSSENCMODE=disable`, or `"gssencmode": "disable"` in `DATABASES[...]["OPTIONS"]`. Linux does not need it. See [the FAQ](docs/src/faq.md#why-does-runbolt-hang-on-macos-when-it-connects-to-postgresql).
+
 ## [0.11.0]
 
 ### Removed
