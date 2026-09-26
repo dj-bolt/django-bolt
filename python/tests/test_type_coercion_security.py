@@ -1137,3 +1137,36 @@ class TestTypeVerification:
         data = response.json()
         assert data["type"] == "str", f"Expected str, got {data['type']}"
         assert data["value"] == "hello"
+
+
+# =============================================================================
+# Validation Error Body Encoding
+# =============================================================================
+
+
+class TestValidationErrorBodyIsJson:
+    """The 422 body echoes the client value, so it must stay valid JSON."""
+
+    @pytest.mark.parametrize(
+        ("raw", "decoded"),
+        [
+            ("%0A", "\n"),
+            ("%09", "\t"),
+            ("%0D", "\r"),
+            ("%00", "\x00"),
+            ("%1F", "\x1f"),
+            ("%22%5C", '"\\'),
+        ],
+    )
+    def test_query_int_error_with_special_char(self, client, raw, decoded):
+        response = client.get(f"/query/int?value={raw}")
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert f"'{decoded}'" in detail
+
+    @pytest.mark.parametrize(("raw", "decoded"), [("%0A", "\n"), ("%09", "\t")])
+    def test_path_int_error_with_control_char(self, client, raw, decoded):
+        response = client.get(f"/int/{raw}")
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert f"'{decoded}'" in detail

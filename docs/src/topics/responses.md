@@ -113,6 +113,15 @@ async def show_page(request: Request):
     })
 ```
 
+The `auth` context processor gives the template the `user` of the request. In an async handler, a template that reads `{{ user }}` loads the user, and the event loop waits for the query. To not block the loop, load the user first:
+
+```python
+@api.get("/account")
+async def account(request: Request):
+    await request.auser()  # the template then reads the loaded user
+    return render(request, "myapp/account.html")
+```
+
 Use standard Django templates - nothing special required:
 
 ```html

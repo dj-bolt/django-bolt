@@ -142,7 +142,12 @@ class _DeadDbapiConnection:
 
 
 def _kill_silently() -> None:
-    """Replace the connection of this thread without using it: Django records no error."""
+    """Replace the connection of this thread without using it: Django records no error.
+
+    The thread keeps its connection across tests. A new connection takes
+    the settings of this test (``health_check_enabled`` is read at connect time).
+    """
+    connection.close()
     connection.ensure_connection()
     connection.connection.close()
     connection.connection = _DeadDbapiConnection()
@@ -158,12 +163,13 @@ def _user_api() -> BoltAPI:
 
     @api.get("/kill")
     async def kill():
-        await concurrency.run_in_orm_executor(_kill_silently)
+        # No await: the sync fast path runs this on the thread that also serves /me.
+        concurrency.run_orm_blocking(_kill_silently)
         return {"killed": True}
 
     @api.get("/me", auth=[JWTAuthentication(secret=SECRET)], guards=[IsAuthenticated()])
     async def me(request):
-        # The lazy load runs get_user_sync on the ORM pool through run_orm_blocking.
+        # The lazy load runs get_user_sync on this thread through run_orm_blocking.
         return {"username": request.user.username}
 
     return api
@@ -203,7 +209,7 @@ def database_settings(request, monkeypatch):
 def test_user_load_on_the_orm_pool_after_dead_connection(
     single_thread_pool, database_settings, pooled_user_headers, first_status_after_kill
 ):
-    """The lazy ``request.user`` load runs on the ORM pool through ``run_orm_blocking``.
+    """The lazy ``request.user`` load runs on the reading thread through ``run_orm_blocking``.
 
     ``/kill`` replaces the connection of that thread without using it. The
     settings decide whether the check before the call can find it. On every

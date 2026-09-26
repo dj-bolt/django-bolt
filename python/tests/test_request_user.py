@@ -7,6 +7,7 @@ for different authentication backends via actual HTTP requests.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import jwt
@@ -121,7 +122,10 @@ class TestJWTUserLoading:
 
     @pytest.mark.django_db(transaction=True)
     def test_auser_returns_jwt_user_without_django_middleware(self):
-        """Both getters return the JWT user when Django middleware is absent."""
+        """Both getters return the JWT user when Django middleware is absent.
+
+        ``auser()`` loads the user one time. ``request.user`` shares that result.
+        """
         api = BoltAPI(django_middleware=[])
 
         @api.get("/async-me", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
@@ -131,7 +135,7 @@ class TestJWTUserLoading:
             return {
                 "username": user.username,
                 "user_id": user.pk,
-                "same_user": user is request.user and again is user,
+                "same_user": user == request.user and again is user,
             }
 
         user = User.objects.create(username="async_jwt_user")
@@ -141,6 +145,87 @@ class TestJWTUserLoading:
 
         assert response.status_code == 200, response.text
         assert response.json() == {"username": user.username, "user_id": user.pk, "same_user": True}
+
+    @pytest.mark.django_db(transaction=True)
+    def test_concurrent_auser_calls_share_one_query(self):
+        """Two ``auser()`` calls of one request that run at the same time load the user one time."""
+        queries = []
+
+        class CountingJWT(JWTAuthentication):
+            def get_user_sync(self, user_id):
+                queries.append(user_id)
+                return User.objects.get(pk=user_id)
+
+        api = BoltAPI(django_middleware=[])
+
+        @api.get("/me", auth=[CountingJWT(secret="test-secret")])
+        async def me(request):
+            first, second = await asyncio.gather(request.auser(), request.auser())
+            return {"same": first is second, "shared": first is object.__getattribute__(request.user, "_wrapped")}
+
+        user = User.objects.create(username="gather_user")
+        token = create_jwt_token(user_id=str(user.pk))
+        with TestClient(api) as client:
+            response = client.get("/me", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"same": True, "shared": True}
+        assert len(queries) == 1
+
+    @pytest.mark.django_db(transaction=True)
+    def test_sync_read_during_auser_keeps_one_user(self):
+        """A sync read while ``auser()`` waits loads the user first. ``auser()`` must keep that user.
+
+        Otherwise ``request.user`` changes to a second object in the middle of
+        the request, and a write to the first object is lost.
+        """
+        api = BoltAPI(django_middleware=[])
+
+        @api.get("/me", auth=[JWTAuthentication(secret="test-secret")])
+        async def me(request):
+            pending = asyncio.ensure_future(request.auser())
+            await asyncio.sleep(0)
+            request.user.marker = "kept"
+            first = object.__getattribute__(request.user, "_wrapped")
+            loaded = await pending
+            return {
+                "auser_is_first": loaded is first,
+                "user_is_first": object.__getattribute__(request.user, "_wrapped") is first,
+                "marker": getattr(request.user, "marker", None),
+            }
+
+        user = User.objects.create(username="race_user")
+        token = create_jwt_token(user_id=str(user.pk))
+        with TestClient(api) as client:
+            response = client.get("/me", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"auser_is_first": True, "user_is_first": True, "marker": "kept"}
+
+    @pytest.mark.django_db(transaction=True)
+    def test_repr_of_the_lazy_user_hides_the_claims(self):
+        """``repr(request.user)`` can reach a debug page or a log. It must not show the token claims.
+
+        It must not load the user either.
+        """
+        api = BoltAPI(django_middleware=[])
+
+        @api.get("/me", auth=[JWTAuthentication(secret="test-secret")])
+        def me(request):
+            before = repr(request.user)
+            return {"before": before, "after": repr(request.user) if request.user.username else ""}
+
+        user = User.objects.create(username="repr_user")
+        token = create_jwt_token(user_id=str(user.pk), email="private@example.com", role="owner")
+        with TestClient(api) as client:
+            response = client.get("/me", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert "private@example.com" not in body["before"]
+        assert "owner" not in body["before"]
+        assert body["before"] == f"<LazyUser: user_id={str(user.pk)!r}, not loaded>"
+        assert "repr_user" in body["after"]
 
     def test_auser_returns_anonymous_without_authentication(self):
         """The async getter still returns an anonymous user without authentication."""
@@ -338,20 +423,20 @@ class TestRequestUserSyncHandlers:
 
 
 class TestSyncHandlerWithCustomBackend:
-    """Test request.user in sync handlers with custom backends (currently fails)."""
+    """Test request.user in sync handlers with custom backends."""
 
     @pytest.mark.django_db(transaction=True)
     def test_sync_handler_with_custom_backend_should_load_user(self):
-        """Test that sync handler with custom backend loads user."""
+        """A sync handler reads request.user through the backend's get_user_sync."""
 
         class CustomSyncKeyAuth(APIKeyAuthentication):
-            """Custom API key that maps keys to users (async get_user)."""
+            """Custom API key that maps keys to users (sync get_user_sync)."""
 
-            async def get_user(self, user_id: str, auth_context: dict):
+            def get_user_sync(self, user_id: str):
                 """Map API key identifier to actual user."""
                 if user_id == "apikey:test-key":
                     try:
-                        return await User.objects.aget(username="testuser")
+                        return User.objects.get(username="testuser")
                     except User.DoesNotExist:
                         return None
                 return None
@@ -407,11 +492,23 @@ class TestSyncHandlerWithCustomBackend:
         )
         async def async_custom_handler(request):
             """Async handler with custom backend."""
-            user = request.user
+            user = await request.auser()
             return {
                 "user_loaded": user is not None,
                 "username": user.username if user else None,
             }
+
+        @api.get(
+            "/async-custom-sync-read",
+            auth=[CustomAsyncKeyAuth(api_keys={"async-key"})],
+            guards=[IsAuthenticated()],
+        )
+        async def async_custom_sync_read(request):
+            """A sync read cannot run the async get_user, so it raises and names the fix."""
+            try:
+                return {"username": request.user.username}
+            except RuntimeError as exc:
+                return {"error": str(exc)}
 
         # Create test user
         User.objects.create(username="asyncuser")
@@ -419,11 +516,14 @@ class TestSyncHandlerWithCustomBackend:
         with TestClient(api) as client:
             response = client.get("/async-custom", headers={"X-API-Key": "async-key"})
 
-            # This should work because async handlers use ThreadPoolExecutor
             assert response.status_code == 200, f"Response: {response.text}"
             data = response.json()
             assert data["user_loaded"] is True
             assert data["username"] == "asyncuser"
+
+            response = client.get("/async-custom-sync-read", headers={"X-API-Key": "async-key"})
+            assert response.status_code == 200, f"Response: {response.text}"
+            assert "await request.auser()" in response.json()["error"]
 
 
 class TestRequestUserGuardBehavior:

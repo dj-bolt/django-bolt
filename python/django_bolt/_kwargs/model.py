@@ -16,7 +16,7 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 import msgspec
 
 from ..analysis import resolve_introspection_target
-from ..dependencies import resolve_dependency
+from ..dependencies import resolve_dependency, resolve_dependency_sync
 from ..params import Depends as DependsMarker
 from ..params import Param
 from ..typing import (
@@ -670,10 +670,19 @@ def compile_argument_injector(
         http_method = meta.get("http_method", "")
         path = meta.get("path", "")
 
+        # A sync handler uses the sync form of a dependency that has one, for
+        # example get_current_user. Its injector then needs no event loop.
+        handler_is_sync = not meta.get("is_async", True)
+
         for f in fields:
             src_id = _dep_source_map.get(f.source, _SRC_FALLBACK_D)
             if src_id == _SRC_DEP:
-                _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, f.dependency))
+                dependency = f.dependency
+                if handler_is_sync and dependency is not None:
+                    sync_variant = getattr(dependency.dependency, "_bolt_sync_variant", None)
+                    if sync_variant is not None:
+                        dependency = DependsMarker(dependency=sync_variant, use_cache=dependency.use_cache)
+                _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, dependency))
             elif src_id == _SRC_REQUEST_D:
                 _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, None))
             elif src_id == _SRC_FALLBACK_D or f.extractor is None:
@@ -696,6 +705,94 @@ def compile_argument_injector(
             if dep is not None and inspect.iscoroutinefunction(dep.dependency):
                 _async_dep_fns.append(idx)
         _can_parallel = len(_async_dep_fns) >= 2
+
+        if not _async_dep_fns:
+            # Every dependency is sync, so the injector needs no event loop. A sync
+            # handler then keeps sync dispatch and lane dispatch, and an async handler
+            # keeps its fast path.
+            def injector_with_sync_deps(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+                params_map = request["params"] if needs_path_params else _EMPTY_DICT
+                query_map = request["query"] if needs_query else _EMPTY_DICT
+                headers_map = request.get("headers", _EMPTY_DICT) if needs_headers else _EMPTY_DICT
+                cookies_map = request.get("cookies", _EMPTY_DICT) if needs_cookies else _EMPTY_DICT
+
+                if needs_form:
+                    form_map = request.form
+                    files_map = request.files
+                else:
+                    form_map, files_map = _EMPTY_FORM_FILES
+
+                body_obj: Any = None
+                body_loaded: bool = False
+                dep_cache: dict[Any, Any] = {}
+                args: list[Any] = []
+                kwargs: dict[str, Any] = {}
+
+                for src_id, extractor, positional, name, needs_files, dependency in _dep_plan:
+                    if src_id == _SRC_DEP:
+                        if dependency is None:
+                            raise ValueError(f"Depends for parameter {name} requires a callable")
+                        value = resolve_dependency_sync(
+                            dependency.dependency,
+                            dependency,
+                            request,
+                            dep_cache,
+                            params_map,
+                            query_map,
+                            headers_map,
+                            cookies_map,
+                            handler_meta_dict,
+                            compile_binder_fn,
+                            http_method,
+                            path,
+                        )
+                    elif src_id == _SRC_REQUEST_D:
+                        value = request
+                    elif src_id == _SRC_PATH_D:
+                        value = extractor(params_map)
+                    elif src_id == _SRC_QUERY_D:
+                        value = extractor(query_map)
+                    elif src_id == _SRC_HEADER_D:
+                        value = extractor(headers_map)
+                    elif src_id == _SRC_COOKIE_D:
+                        value = extractor(cookies_map)
+                    elif src_id == _SRC_FORM_D:
+                        value = extractor(form_map, files_map) if needs_files else extractor(form_map)
+                    elif src_id == _SRC_FILE_D:
+                        value = extractor(files_map)
+                    elif src_id == _SRC_BODY_D:
+                        if not body_loaded:
+                            body_obj = extractor(request["body"])
+                            body_loaded = True
+                        value = body_obj
+                    else:
+                        field = _dep_fallback_by_name[name]
+                        value, body_obj, body_loaded = extract_parameter_value(
+                            field,
+                            request,
+                            params_map,
+                            query_map,
+                            headers_map,
+                            cookies_map,
+                            form_map,
+                            files_map,
+                            meta,
+                            body_obj,
+                            body_loaded,
+                        )
+
+                    if positional:
+                        args.append(value)
+                    else:
+                        kwargs[name] = value
+
+                # Track UploadFiles for auto-cleanup (only when handler has file params)
+                if has_file_uploads and "_upload_files" in files_map:
+                    request.state["_upload_files"] = files_map["_upload_files"]
+
+                return args, kwargs
+
+            return injector_with_sync_deps
 
         async def injector_with_deps(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
             """Optimized argument injector with dependency support."""

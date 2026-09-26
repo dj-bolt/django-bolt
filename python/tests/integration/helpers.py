@@ -290,6 +290,45 @@ def _terminate_process(process: subprocess.Popen[str], timeout: float = 5.0) -> 
     return stdout, stderr
 
 
+class _DrainedPopen(subprocess.Popen):
+    """A ``Popen`` that reads its stdout and stderr pipes while the process runs.
+
+    Without this, a server that writes more than the pipe buffer of the OS
+    (about 64 KB) blocks in its next write, and stops answering requests.
+    One daemon thread reads each pipe into a buffer. ``communicate()`` waits
+    for the process and the readers, then returns all of the output, as for
+    a plain ``Popen``.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._output: dict[str, list[str]] = {"stdout": [], "stderr": []}
+        self._readers = [
+            threading.Thread(target=self._drain, args=(pipe, self._output[name]), daemon=True)
+            for name, pipe in (("stdout", self.stdout), ("stderr", self.stderr))
+        ]
+        for reader in self._readers:
+            reader.start()
+
+    @staticmethod
+    def _drain(pipe: Any, chunks: list[str]) -> None:
+        for chunk in iter(lambda: pipe.read(8192), ""):
+            chunks.append(chunk)
+        pipe.close()
+
+    def communicate(self, input: Any = None, timeout: float | None = None) -> tuple[str, str]:
+        if input is not None:
+            raise ValueError("_DrainedPopen has no stdin")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        self.wait(timeout=timeout)
+        for reader in self._readers:
+            reader.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+            if reader.is_alive():
+                # A child process still holds the pipe open, as for a plain Popen.
+                raise subprocess.TimeoutExpired(self.args, timeout)
+        return "".join(self._output["stdout"]), "".join(self._output["stderr"])
+
+
 def _spawn_process(command: list[str], cwd: Path, env: dict[str, str]) -> subprocess.Popen[str]:
     kwargs: dict[str, Any] = {
         "cwd": str(cwd),
@@ -302,7 +341,7 @@ def _spawn_process(command: list[str], cwd: Path, env: dict[str, str]) -> subpro
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["preexec_fn"] = os.setsid
-    return subprocess.Popen(command, **kwargs)
+    return _DrainedPopen(command, **kwargs)
 
 
 def _raise_process_failure(process: subprocess.Popen[str], message: str) -> None:
@@ -574,6 +613,10 @@ class ServerProject:
         if extra_args:
             command.extend(extra_args)
 
+        return _spawn_process(command, cwd=self.root, env=self._process_env(env)), port
+
+    def _process_env(self, env: dict[str, str] | None = None) -> dict[str, str]:
+        """The environment of a subprocess of this project, with its PYTHONPATH."""
         process_env = os.environ.copy()
         process_env.update(env or {})
         existing_pythonpath = process_env.get("PYTHONPATH", "")
@@ -581,8 +624,21 @@ class ServerProject:
         if self.preserve_pythonpath and existing_pythonpath:
             pythonpath_parts.append(existing_pythonpath)
         process_env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+        return process_env
 
-        return _spawn_process(command, cwd=self.root, env=process_env), port
+    def manage(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        """Run ``manage.py <args>`` for this project, for example ``migrate``, before the server starts.
+
+        Raises ``subprocess.CalledProcessError`` with the output when the command fails.
+        """
+        return subprocess.run(
+            [self.python_executable, str(self.path("manage.py")), *args],
+            cwd=self.root,
+            env=self._process_env(env),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     def start(
         self,
@@ -612,6 +668,23 @@ class ServerProject:
             startup_path=startup_path,
             timeout=timeout,
         )
+
+
+def postgres_settings(params: dict[str, Any], *, engine: str = "django.db.backends.postgresql", **options: Any) -> str:
+    """Django ``DATABASES["default"]`` for the settings of a server project.
+
+    ``params`` comes from the ``postgres_database`` fixture.
+    """
+    database = {
+        "ENGINE": engine,
+        "NAME": params["dbname"],
+        "USER": params.get("user", ""),
+        "PASSWORD": params.get("password", ""),
+        "HOST": params.get("host", ""),
+        "PORT": params.get("port", ""),
+        **options,
+    }
+    return f'DATABASES["default"] = {database!r}'
 
 
 def create_server_project(

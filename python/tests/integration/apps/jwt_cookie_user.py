@@ -3,7 +3,7 @@
 Defines routes protected by ``JWTAuthentication(cookie=...)`` so a real
 ``runbolt`` server proves the cookie config flows from backend metadata into
 Rust extraction, plus a route whose backend overrides ``get_user`` to resolve
-``request.user`` by username instead of the default pk lookup. ``/seed``
+``await request.auser()`` by username instead of the default pk lookup. ``/seed``
 migrates the subprocess's sqlite database and creates the test user, since
 server projects start with an unmigrated DB. ``SECRET`` and ``USERNAME`` are
 exported so tests can mint matching tokens.
@@ -80,5 +80,6 @@ async def dual(request):
     guards=[IsAuthenticated()],
 )
 async def me(request):
-    user = request.user
+    # An async-only get_user serves ``await request.auser()`` only.
+    user = await request.auser()
     return {"username": user.username if user else None}

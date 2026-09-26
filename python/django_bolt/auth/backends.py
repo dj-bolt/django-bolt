@@ -83,8 +83,10 @@ class BaseAuthentication(ABC):
         """
         Resolve a User instance from the authentication context.
 
-        This method is called when request.user is awaited. Override this method
-        to provide custom user resolution logic for your authentication backend.
+        ``await request.auser()`` calls this method. Override it to provide custom
+        user resolution logic for your authentication backend. Sync access to
+        ``request.user`` cannot run an async method. Define ``get_user_sync`` too
+        when sync code reads ``request.user``.
 
         Args:
             user_id: The user identifier from the auth context
@@ -389,10 +391,10 @@ class JWTAuthentication(BaseAuthentication):
         Synchronously load user from database using the user_id from JWT token.
 
         This method does the actual DB query — a pk SELECT compiled once per
-        (user model, database alias), not recompiled per request. Thread pool
-        wrapping is handled by the loader resolved in
-        user_loader.resolve_user_loader() based on the handler's execution
-        context.
+        (user model, database alias), not recompiled per request. The loaders
+        from user_loader.resolve_user_loader() choose the thread: the thread
+        that reads ``request.user``, or the ORM pool when that thread runs an
+        event loop.
         """
         if not user_id:
             return None

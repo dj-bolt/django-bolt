@@ -7,17 +7,18 @@ extract user information from request context.
 
 from __future__ import annotations
 
-import asyncio
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import jwt
 from django.conf import settings
-from django.contrib.auth import get_user_model
 
+from django_bolt.exceptions import Unauthorized
+from django_bolt.params import Depends
 from django_bolt.types import Request
 
-from .pk_loader import load_user_by_pk_sync
+if TYPE_CHECKING:
+    from django.contrib.auth.base_user import AbstractBaseUser
 
 
 def create_jwt_for_user(
@@ -104,55 +105,80 @@ def create_jwt_for_user(
     return jwt.encode(payload, secret, algorithm=algorithm)
 
 
-async def get_current_user(request: Request):
+async def get_current_user(request: Request) -> Any:
     """
-    Dependency function to extract and fetch Django User from request context.
+    Dependency that gives the authenticated user of the request.
 
-    This is a reusable dependency that can be used with Depends() to inject
-    the current authenticated Django User into your handlers.
-
-    Args:
-        request: Request dictionary with context
+    It loads the user with ``await request.auser()``. Thus it uses the user
+    loader of the auth backend, runs the query on the request lane when the
+    route has Django middleware, and fills the cache of ``request.user``. It
+    works in sync and async handlers.
 
     Returns:
-        Django User instance or None if not authenticated or not found
+        The user, or None if the request is not authenticated or the user
+        does not exist.
 
     Example:
         ```python
-        from django_bolt import BoltAPI
-        from django_bolt.auth import JWTAuthentication
-        from django_bolt.permissions import IsAuthenticated
-        from django_bolt.params import Depends
-        from django_bolt.jwt_utils import get_current_user
+        from django_bolt import BoltAPI, CurrentUser
+        from django_bolt.auth import IsAuthenticated, JWTAuthentication
 
         api = BoltAPI()
 
-        @api.get(
-            "/me",
-            auth=[JWTAuthentication()],
-            guards=[IsAuthenticated()]
-        )
-        async def get_my_profile(user=Depends(get_current_user)):
-            return {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "is_staff": user.is_staff,
-            }
+        @api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+        async def me(user: CurrentUser):
+            return {"id": user.id, "username": user.username}
         ```
+
+        For the type of your user model, make your own alias:
+        ``Annotated[User, Depends(get_current_user)]``.
     """
-    User = get_user_model()
-    context = request.get("context", {})
-    user_id = context.get("user_id")
-
-    if not user_id:
+    user = await request.auser()
+    if user is None or not user.is_authenticated:
         return None
+    return user
 
-    # Pre-compiled pk query on the default executor. Deliberately NOT
-    # `User.objects.aget`: asgiref's thread_sensitive executor is one shared
-    # thread per process, which serializes every user load in the worker.
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, load_user_by_pk_sync, User, user_id)
+
+def get_current_user_sync(request: Request) -> Any:
+    """Sync form of :func:`get_current_user`. A sync handler uses it in place of the async form.
+
+    It reads ``request.user`` on the thread of the handler, so a sync handler
+    keeps its sync dispatch, and a request with Django middleware stays on its lane.
+    """
+    user = request.user
+    if user is None or not user.is_authenticated:
+        return None
+    return user
+
+
+async def require_current_user(request: Request) -> Any:
+    """Dependency that gives the authenticated user, or answers 401 when there is none."""
+    user = await get_current_user(request)
+    if user is None:
+        raise Unauthorized(detail="Authentication required")
+    return user
+
+
+def require_current_user_sync(request: Request) -> Any:
+    """Sync form of :func:`require_current_user`."""
+    user = get_current_user_sync(request)
+    if user is None:
+        raise Unauthorized(detail="Authentication required")
+    return user
+
+
+# The injector of a sync handler uses the sync form of these dependencies.
+get_current_user._bolt_sync_variant = get_current_user_sync
+require_current_user._bolt_sync_variant = require_current_user_sync
+
+if TYPE_CHECKING:
+    CurrentUser = Annotated[AbstractBaseUser, Depends(require_current_user)]
+    OptionalCurrentUser = Annotated[AbstractBaseUser | None, Depends(get_current_user)]
+else:
+    # The current user as a parameter: ``def me(user: CurrentUser)``. It answers 401 with no user.
+    CurrentUser = Annotated[Any, Depends(require_current_user)]
+    # The current user, or None with no user: ``def home(user: OptionalCurrentUser)``.
+    OptionalCurrentUser = Annotated[Any, Depends(get_current_user)]
 
 
 def extract_user_id_from_context(request: Request) -> str | None:

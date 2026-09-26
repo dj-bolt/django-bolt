@@ -121,7 +121,8 @@ class BoltTestTransport(httpx.BaseTransport):
         """Handle a request by routing it through Rust's Actix test infrastructure."""
         # Parse URL
         url = request.url
-        path = url.path
+        # Send the encoded path, as a real server receives it. Rust decodes path params.
+        path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
         # Extract headers
@@ -190,7 +191,8 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
         """Handle a request asynchronously through Rust's test infrastructure."""
         # Parse URL
         url = request.url
-        path = url.path
+        # Send the encoded path, as a real server receives it. Rust decodes path params.
+        path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
         # Extract headers
