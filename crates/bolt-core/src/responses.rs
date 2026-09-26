@@ -127,18 +127,12 @@ pub fn error_400_header_too_large(max_size: usize) -> HttpResponse {
 pub fn error_422_validation(detail: &str) -> HttpResponse {
     // Pre-allocate based on expected size (avoid reallocation)
     let mut body = Vec::with_capacity(32 + detail.len());
-    body.extend_from_slice(br#"{"detail":""#);
-    // Escape any quotes in the detail message
-    for byte in detail.bytes() {
-        if byte == b'"' {
-            body.extend_from_slice(br#"\""#);
-        } else if byte == b'\\' {
-            body.extend_from_slice(br#"\\"#);
-        } else {
-            body.push(byte);
-        }
-    }
-    body.extend_from_slice(br#""}"#);
+    body.extend_from_slice(br#"{"detail":"#);
+    // The detail echoes client input. serde_json escapes quotes, backslashes,
+    // and all control characters, so the body is always valid JSON.
+    // It copies the unescaped runs as blocks, which is faster than a byte loop.
+    serde_json::to_writer(&mut body, detail).expect("a write to a Vec cannot fail");
+    body.push(b'}');
 
     HttpResponse::UnprocessableEntity()
         .content_type("application/json")
@@ -166,6 +160,32 @@ mod tests {
             response.status(),
             actix_web::http::StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[test]
+    fn test_error_422_validation_escapes_to_valid_json() {
+        use actix_web::body::MessageBody;
+
+        // Every control character, quotes, backslash, and non-ASCII text.
+        let mut detail: String = (0u8..0x20).map(char::from).collect();
+        detail.push_str("\"\\ caf\u{e9} \u{1f600}");
+
+        let response = error_422_validation(&detail);
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body = response
+            .into_body()
+            .try_into_bytes()
+            .ok()
+            .expect("body is bytes");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("422 body is valid JSON");
+        assert_eq!(json["detail"], detail.as_str());
+        assert!(body.starts_with(br#"{"detail":"\u0000\u0001"#));
+        let short_forms = br#"\t\n\u000b\f\r"#;
+        assert!(body.windows(short_forms.len()).any(|w| w == short_forms));
     }
 
     #[test]

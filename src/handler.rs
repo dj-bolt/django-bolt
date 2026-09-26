@@ -702,21 +702,9 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             let handler_id = route_match.handler_id();
             let (route, raw_params) = route_match.into_parts();
 
-            // URL-decode path parameters in place for consistency with query
-            // string parsing (/items/hello%20world yields id="hello world").
-            // Values are mutated in the existing map — no map rebuild.
+            // Values are decoded in the existing map — no map rebuild.
             let path_params = raw_params.map(|mut params| {
-                for v in params.values_mut() {
-                    if v.as_bytes().iter().any(|&b| b == b'%' || b == b'+') {
-                        let decoded = match urlencoding::decode(v) {
-                            Ok(std::borrow::Cow::Owned(s)) => Some(s),
-                            _ => None,
-                        };
-                        if let Some(s) = decoded {
-                            *v = s;
-                        }
-                    }
-                }
+                bolt_core::router::decode_path_params(&mut params);
                 params
             });
             (route, path_params, handler_id)

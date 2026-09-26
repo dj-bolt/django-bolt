@@ -493,6 +493,7 @@ dependencies = [
  "jsonwebtoken",
  "log",
  "matchit",
+ "memchr",
  "once_cell",
  "parking_lot",
  "pyo3",

@@ -326,6 +326,20 @@ impl Router {
     }
 }
 
+/// URL-decode path parameters in place (`/items/hello%20world` yields `hello world`).
+/// A value that does not decode to UTF-8 stays as it is.
+/// The decoder does not change `+`, so only a `%` starts a decode.
+#[inline]
+pub fn decode_path_params(params: &mut AHashMap<String, String>) {
+    for v in params.values_mut() {
+        if memchr::memchr(b'%', v.as_bytes()).is_some() {
+            if let Ok(Cow::Owned(s)) = urlencoding::decode(v) {
+                *v = s;
+            }
+        }
+    }
+}
+
 /// Parse query string into key-value pairs
 /// OPTIMIZATION: #[inline] on hot path - called on requests with query strings
 #[inline]
@@ -360,4 +374,30 @@ pub fn parse_query_string(query: &str) -> AHashMap<String, String> {
     }
 
     params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_path_params() {
+        let mut params = AHashMap::new();
+        params.insert("space".to_string(), "hello%20world".to_string());
+        params.insert("slash".to_string(), "a%2Fb".to_string());
+        params.insert("newline".to_string(), "%0A".to_string());
+        params.insert("plain".to_string(), "abc".to_string());
+        params.insert("plus".to_string(), "a+b".to_string());
+        // Not valid UTF-8 after decoding: the value stays as it is.
+        params.insert("bad".to_string(), "%FF".to_string());
+
+        decode_path_params(&mut params);
+
+        assert_eq!(params["space"], "hello world");
+        assert_eq!(params["slash"], "a/b");
+        assert_eq!(params["newline"], "\n");
+        assert_eq!(params["plain"], "abc");
+        assert_eq!(params["plus"], "a+b");
+        assert_eq!(params["bad"], "%FF");
+    }
 }
