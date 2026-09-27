@@ -155,3 +155,63 @@ async def test_concurrent_requests_on_the_shared_loop():
             asyncio.gather(*[client.get(f"/tenant/{t}", headers=_headers()) for t in tenants]), timeout=20
         )
     assert [r.json() for r in responses] == [{"tenant": t} for t in tenants]
+
+
+def test_a_sync_read_whose_loader_uses_async_to_sync_on_the_lane():
+    """The loader runs on the lane while the loop waits for it.
+
+    An ``async_to_sync`` inside the loader must not schedule its coroutine on
+    that loop: the loop cannot run it, and the request would deadlock.
+    """
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMiddleware])])
+
+    async def resolve_name():
+        await asyncio.sleep(0)
+        return "bob"
+
+    class _BridgeAuth(JWTAuthentication):
+        def get_user_sync(self, user_id):
+            # The loader itself runs on the lane and sees its thread-local state.
+            tenant = getattr(_local, "tenant", "<unset>")
+            return SimpleNamespace(username=async_to_sync(resolve_name)(), tenant=tenant)
+
+    @api.get("/tenant/{tenant}", auth=[_BridgeAuth(secret=SECRET)])
+    async def endpoint(tenant: str, request: Request):
+        await asyncio.sleep(0)
+        user = request.user
+        return {"tenant": user.tenant, "username": user.username}
+
+    response = _get(api, "/tenant/acme")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenant": "acme", "username": "bob"}
+
+
+def test_a_loader_async_to_sync_wrapper_made_on_the_loop_does_not_deadlock():
+    """An ``async_to_sync`` wrapper made before the read must not keep the loop that waits.
+
+    asgiref before 3.12 stores the parent loop on the wrapper, when it is made
+    on a running loop or at its first call. The loader then scheduled its
+    coroutine on the loop that waits for the lane, and the request never answered.
+    """
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMiddleware])])
+    bridges = []
+
+    async def resolve_name():
+        await asyncio.sleep(0)
+        return "bob"
+
+    class _BridgeAuth(JWTAuthentication):
+        def get_user_sync(self, user_id):
+            return SimpleNamespace(username=bridges[-1](), tenant=getattr(_local, "tenant", "<unset>"))
+
+    @api.get("/tenant/{tenant}", auth=[_BridgeAuth(secret=SECRET)])
+    async def endpoint(tenant: str, request: Request):
+        bridges.append(async_to_sync(resolve_name))
+        user = request.user
+        return {"tenant": user.tenant, "username": user.username}
+
+    with TestClient(api, timeout=5) as client:
+        response = client.get("/tenant/acme", headers=_headers())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenant": "acme", "username": "bob"}

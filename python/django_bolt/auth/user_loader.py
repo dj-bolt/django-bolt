@@ -8,10 +8,11 @@ Eager loading (optional): Loads user immediately at dispatch time
 Backends customize user loading by overriding get_user (async) and/or
 get_user_sync (sync) — overriding either one alone is honored. The effective
 strategy is resolved once per route at registration time (resolve_user_loader,
-stored in the handler meta keyed by scheme name), so the per-request path is a
-single dict lookup plus a call. Resolution must be per-route, not per scheme
-name: two JWTAuthentication subclasses share scheme_name "jwt" but can carry
-different get_user overrides.
+stored in the handler meta by backend position), so the per-request path is a
+single tuple index plus a call. Rust reports that position as
+auth_backend_index. Resolution must be per backend, not per scheme name: two
+JWTAuthentication subclasses share scheme_name "jwt" but can carry different
+get_user overrides.
 
 Each backend resolves to a pair of loaders:
 

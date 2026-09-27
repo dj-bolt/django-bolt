@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dis
+import functools
 import inspect
 import logging
 import os
@@ -32,13 +33,14 @@ from ._kwargs import (
     compile_binder,
     compile_websocket_binder,
     extract_response_metadata,
+    field_has_upload_file,
 )
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler
-from .auth import get_default_authentication_classes, register_auth_backend
+from .auth import register_auth_backend
+from .auth.backends import revocation_takes_claims
 from .auth.user_loader import (
-    DEFAULT_USER_LOADERS,
     LazyUser,
     resolve_user_loader,
 )
@@ -50,11 +52,17 @@ from .concurrency import (
     sync_to_thread,
 )
 from .decorators import _RESPONSE_MODEL_UNSET, ActionHandler
+from .dependencies import dependency_fields
 from .error_handlers import handle_exception, http_exception_handler
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
 from .middleware import CompressionConfig, DjangoMiddleware, DjangoMiddlewareStack
-from .middleware.compiler import _compile_rust_arg_bindings, add_optimization_flags_to_metadata, compile_middleware_meta
+from .middleware.compiler import (
+    _compile_rust_arg_bindings,
+    add_optimization_flags_to_metadata,
+    compile_middleware_meta,
+    route_auth_backends,
+)
 from .middleware.django_loader import load_django_middleware
 from .middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
 from .middleware_response import MiddlewareResponse
@@ -93,6 +101,23 @@ from .views import APIView, ViewSet, _layer
 from .websocket import mark_websocket_handler
 
 logger = logging.getLogger(__name__)
+
+
+def _revocation_handlers(backends: list[Any]) -> tuple[tuple[Callable, bool] | None, ...] | None:
+    """(revoked_token_handler, takes_claims) or None for each backend of a route.
+
+    The position in the tuple is the position of the backend in
+    ``route_auth_backends()``, which Rust reports as ``auth_backend_index``.
+    Two JWT backends have the same scheme name, so the scheme name cannot
+    identify the backend. None when no backend has revocation.
+    """
+    handlers = tuple(
+        (backend.revoked_token_handler, revocation_takes_claims(backend.revoked_token_handler))
+        if getattr(backend, "revoked_token_handler", None) is not None
+        else None
+        for backend in backends
+    )
+    return handlers if any(handlers) else None
 
 
 Response = ResponseWireV1
@@ -878,6 +903,7 @@ class BoltAPI:
             meta = self._compile_websocket_binder(fn, full_path)
             meta["is_async"] = True
             meta["is_websocket"] = True
+            self._apply_dependency_tree(meta, "WEBSOCKET", full_path)
 
             # URL-reverse identity, same scheme as HTTP routes (see _route_decorator).
             meta["name"] = name if name is not None else fn.__name__
@@ -908,6 +934,15 @@ class BoltAPI:
             # Add optimization flags and param_types to middleware metadata
             # These enable Rust-side type coercion for path/query params
             middleware_meta = add_optimization_flags_to_metadata(middleware_meta, meta)
+
+            # The handshake awaits this check before the upgrade: a revoked
+            # token gets 401, as on an HTTP route.
+            revocation_handlers = _revocation_handlers(route_auth_backends(auth))
+            if revocation_handlers is not None:
+                middleware_meta = middleware_meta or {}
+                middleware_meta["websocket_revocation_check"] = functools.partial(
+                    self._websocket_token_revoked, revocation_handlers
+                )
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
@@ -1498,22 +1533,7 @@ class BoltAPI:
                     meta["needs_headers"] = meta.get("needs_headers", False) or handler_analysis.request_needs_headers
                     meta["needs_cookies"] = meta.get("needs_cookies", False) or handler_analysis.request_needs_cookies
 
-            # Recursively analyze Depends targets so a dep reading request.query
-            # (etc.) causes the handler's route to actually parse query params.
-            # Populate self._handler_meta by callable so runtime dep resolution
-            # (dependencies.resolve_dependency) reuses the compiled meta too.
-            def _compile_dep(dep_fn: Callable) -> dict[str, Any]:
-                cached = self._handler_meta.get(dep_fn)
-                if cached is not None:
-                    return cached
-                compiled = self._compile_binder(dep_fn, method, full_path)
-                self._handler_meta[dep_fn] = compiled
-                return compiled
-
-            dep_needs = analyze_dependency_tree(meta, _compile_dep)
-            for needs_key in ("needs_body", "needs_query", "needs_headers", "needs_cookies"):
-                if getattr(dep_needs, needs_key):
-                    meta[needs_key] = True
+            self._apply_dependency_tree(meta, method, full_path)
 
             # Normalize route-level middleware declared via @middleware / @cors / @rate_limit.
             # Validation happens at registration time to fail fast and deterministically.
@@ -1713,28 +1733,19 @@ class BoltAPI:
             # These are parsed by Rust's RouteMetadata::from_python() to skip unused parsing
             middleware_meta = add_optimization_flags_to_metadata(middleware_meta, meta)
 
-            # Resolve effective auth backends once (explicit > defaults) — reused
-            # below for revocation precomputation and _auth_backend_instances.
-            effective_auth_backends = auth if auth is not None else (get_default_authentication_classes() or [])
+            # Resolve effective auth backends once (explicit > defaults), in
+            # the order Rust gets them. Reused below for revocation
+            # precomputation and _auth_backend_instances.
+            effective_auth_backends = route_auth_backends(auth)
 
-            # scheme_name → user loader for THIS route's backends. Must be
-            # per-route: JWTAuthentication subclasses all share scheme "jwt"
-            # but can carry different get_user overrides. First backend of a
-            # scheme wins (Rust reports only the scheme that authenticated).
-            user_loaders: dict[str, Any] = {}
-            for backend in effective_auth_backends:
-                if backend.scheme_name not in user_loaders:
-                    user_loaders[backend.scheme_name] = resolve_user_loader(backend)
-            meta["_user_loaders"] = user_loaders
+            # The user loaders of THIS route's backends, by the position that
+            # Rust reports as auth_backend_index. Two JWTAuthentication
+            # subclasses share scheme "jwt" but can carry different get_user
+            # overrides, so the scheme name cannot pick the loader.
+            meta["_user_loaders"] = tuple(resolve_user_loader(backend) for backend in effective_auth_backends)
 
-            # scheme_name → handler. Lookup at dispatch is O(1) via the
-            # matched backend's name. None when no backend has revocation.
-            revocation_handlers: dict[str, Callable] = {
-                b.scheme_name: b.revoked_token_handler
-                for b in effective_auth_backends
-                if getattr(b, "revoked_token_handler", None) is not None
-            }
-            meta["_revocation_handlers"] = revocation_handlers or None
+            revocation_handlers = _revocation_handlers(effective_auth_backends)
+            meta["_revocation_handlers"] = revocation_handlers
 
             # Sync dispatch bypass requires no awaits in the request flow.
             # Revocation handlers are awaited, so opt out when configured.
@@ -1798,6 +1809,39 @@ class BoltAPI:
     def _compile_binder(self, fn: Callable, http_method: str = "", path: str = "") -> HandlerMetadata:
         """Delegate to compile_binder in api_compilation module."""
         return compile_binder(fn, http_method, path)
+
+    def _apply_dependency_tree(self, meta: HandlerMetadata, method: str, full_path: str) -> None:
+        """Set the request data flags of a route from its whole dependency tree.
+
+        A dependency that reads the query, a header or the body makes the route
+        parse it too. The request data fields of the dependencies go into
+        ``meta["dependency_fields"]``, so Rust also gets their types.
+        Each dependency binder is cached by (callable, method, path), and
+        ``dependencies.resolve_dependency`` reuses it at run time.
+        """
+
+        def _compile_dep(dep_fn: Callable) -> dict[str, Any]:
+            key = (dep_fn, method, full_path)
+            cached = self._handler_meta.get(key)
+            if cached is not None:
+                return cached
+            compiled = self._compile_binder(dep_fn, method, full_path)
+            self._handler_meta[key] = compiled
+            return compiled
+
+        dep_needs = analyze_dependency_tree(meta, _compile_dep)
+        dep_fields = dependency_fields(meta, _compile_dep)
+        meta["dependency_fields"] = dep_fields
+        if any(f.source == "path" for f in dep_fields):
+            meta["needs_path_params"] = True
+        if any(f.source in ("form", "file") for f in dep_fields):
+            meta["needs_form_parsing"] = True
+            meta["needs_headers"] = True
+        if any(f.source == "file" or field_has_upload_file(f) for f in dep_fields):
+            meta["has_file_uploads"] = True
+        for needs_key in ("needs_body", "needs_query", "needs_headers", "needs_cookies"):
+            if getattr(dep_needs, needs_key):
+                meta[needs_key] = True
 
     def _compile_websocket_binder(self, fn: Callable, path: str) -> HandlerMetadata:
         """Delegate to compile_websocket_binder in api_compilation module."""
@@ -2782,17 +2826,19 @@ class BoltAPI:
     async def _check_revocation(
         self,
         auth_context: dict[str, Any],
-        revocation_handlers: dict[str, Callable],
+        revocation_handlers: tuple[tuple[Callable, bool] | None, ...],
     ) -> None:
-        """Reject the request if the authenticated token's JTI is revoked."""
-        handler = revocation_handlers.get(auth_context["auth_backend"])
-        if handler is None:
+        """Reject the request if the authenticated token is revoked."""
+        entry = revocation_handlers[auth_context["auth_backend_index"]]
+        if entry is None:
             # Matched backend has no revocation (e.g., API-key auth on a
             # route where only JWT configured one).
             return
+        handler, takes_claims = entry
 
         # When auth_context is set, Rust guarantees auth_claims is too.
-        jti = auth_context["auth_claims"].get("jti")
+        claims = auth_context["auth_claims"]
+        jti = claims.get("jti")
         if not jti:
             # Without a JTI we cannot identify which token to check.
             # Rejecting is safer than silently honoring.
@@ -2800,8 +2846,25 @@ class BoltAPI:
                 status_code=401,
                 detail="Token missing 'jti' claim required for revocation",
             )
-        if await handler(jti):
+        revoked = await handler(jti, claims) if takes_claims else await handler(jti)
+        if revoked:
             raise HTTPException(status_code=401, detail="Token has been revoked")
+
+    async def _websocket_token_revoked(
+        self,
+        revocation_handlers: tuple[tuple[Callable, bool] | None, ...],
+        auth_context: dict[str, Any],
+    ) -> bool:
+        """Whether the token of a WebSocket handshake is revoked.
+
+        Rust awaits this before the upgrade, with the auth context of the
+        handshake. A token with no ``jti`` counts as revoked, as on HTTP routes.
+        """
+        try:
+            await self._check_revocation(auth_context, revocation_handlers)
+        except HTTPException:
+            return True
+        return False
 
     async def _dispatch(self, handler: Callable, request: dict[str, Any], handler_id: int = None) -> Response:
         """
@@ -2842,14 +2905,13 @@ class BoltAPI:
 
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    # Route-local loaders for the scheme that authenticated;
-                    # schemes with no backend instance (Rust session auth)
-                    # fall back to the default pk query. Loaders of None
-                    # mean the backend has no user resolution — leave
-                    # request.user unset (PyRequest getter returns None).
-                    # The sync loader looks at the thread that forces the
-                    # user. ``await request.auser()`` uses the async loader.
-                    loaders = meta["_user_loaders"].get(auth_context.get("auth_backend"), DEFAULT_USER_LOADERS)
+                    # Route-local loaders of the backend that authenticated.
+                    # Loaders of None mean the backend has no user
+                    # resolution — leave request.user unset (PyRequest
+                    # getter returns None). The sync loader looks at the
+                    # thread that forces the user. ``await request.auser()``
+                    # uses the async loader.
+                    loaders = meta["_user_loaders"][auth_context["auth_backend_index"]]
                     if loaders is not None:
                         request["user"] = LazyUser(loaders, user_id, auth_context)
 
@@ -2925,7 +2987,7 @@ class BoltAPI:
             if auth_context:
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    loaders = meta["_user_loaders"].get(auth_context.get("auth_backend"), DEFAULT_USER_LOADERS)
+                    loaders = meta["_user_loaders"][auth_context["auth_backend_index"]]
                     if loaders is not None:
                         request["user"] = LazyUser(loaders, user_id, auth_context)
 

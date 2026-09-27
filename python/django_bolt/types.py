@@ -227,6 +227,7 @@ class Request(Protocol):
             "is_staff": False,               # Staff status (bool)
             "is_superuser": False,           # Superuser status (bool)
             "auth_backend": "jwt",           # Backend used: jwt, api_key, etc.
+            "auth_backend_index": 0,         # Position of that backend in the route's auth list
             "permissions": ["read", "write"], # User permissions (List[str], optional)
             "auth_claims": {                 # Full JWT claims (optional, JWT only)
                 "sub": "123",

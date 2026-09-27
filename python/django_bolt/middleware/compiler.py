@@ -114,6 +114,17 @@ def _compile_guard(guard: Any, method: str, path: str) -> dict[str, Any]:
     return instance.to_metadata()
 
 
+def route_auth_backends(auth: list[Any] | None) -> list[Any]:
+    """Return the auth backends that Rust gets for a route, in Rust order.
+
+    The position of a backend in this list is its identity at dispatch. Rust
+    reports it as ``auth_backend_index``. Two backends can have the same
+    scheme name, so Python must not find a backend by its scheme name.
+    """
+    backends = auth if auth is not None else get_default_authentication_classes()
+    return [backend for backend in backends if hasattr(backend, "to_metadata")]
+
+
 def compile_middleware_meta(
     handler: Callable,
     method: str,
@@ -149,17 +160,7 @@ def compile_middleware_meta(
             all_middleware.append(mw_dict)
 
     # Compile authentication backends
-    auth_backends = []
-    if auth is not None:
-        # Per-route auth override
-        for auth_backend in auth:
-            if hasattr(auth_backend, "to_metadata"):
-                auth_backends.append(auth_backend.to_metadata())
-    else:
-        # Use global default authentication classes
-        for auth_backend in get_default_authentication_classes():
-            if hasattr(auth_backend, "to_metadata"):
-                auth_backends.append(auth_backend.to_metadata())
+    auth_backends = [auth_backend.to_metadata() for auth_backend in route_auth_backends(auth)]
 
     # Compile guards/permissions
     guard_list = []
@@ -383,8 +384,10 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     form_seq_fields: set[str] = set()
     file_constraints: dict[str, dict[str, Any]] = {}
 
-    fields = handler_meta.get("fields", [])
-    for field in fields:
+    # The fields of the dependencies count too. Each field goes into the claim
+    # map of its source, so two fields that read one wire key with different
+    # types fail here, whatever their Python names.
+    for field in (*handler_meta.get("fields", []), *handler_meta.get("dependency_fields", ())):
         if field.source in ("path", "query"):
             _extract_type_hints_from_field(field, param_claims)
 
