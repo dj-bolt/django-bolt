@@ -19,6 +19,7 @@ from unittest.mock import Mock
 
 import pytest
 from django.conf import settings
+from django.test import override_settings
 
 import django_bolt.logging.config as config_module
 from django_bolt.logging import LoggingConfig, LoggingMiddleware, create_logging_middleware
@@ -728,6 +729,39 @@ class TestLoggingHelpers:
 class TestQueueBasedLogging:
     """Test queue-based non-blocking logging setup documented in LOGGING.md."""
 
+    @pytest.fixture(autouse=True)
+    def _restore_logging_state(self):
+        """Restore logger handlers and module globals that these tests change.
+
+        The tests clear handlers, reset module flags, and stop or start the
+        queue listener. Without this fixture, the state leaks to the next test
+        in the same worker process.
+        """
+        saved_loggers = [
+            (logger, logger.handlers[:], logger.level, logger.propagate)
+            for logger in map(logging.getLogger, ("", "django", "django.server", "django_bolt"))
+        ]
+        configured = config_module._LOGGING_CONFIGURED
+        listener = config_module._QUEUE_LISTENER
+        queue = config_module._QUEUE
+        listener_running = listener is not None and listener._thread is not None
+
+        yield
+
+        current = config_module._QUEUE_LISTENER
+        if current is not None and current is not listener and current._thread is not None:
+            current.stop()
+        # setup_django_logging(force=True) stops the listener that was running before the test.
+        if listener_running and listener._thread is None:
+            listener.start()
+        config_module._LOGGING_CONFIGURED = configured
+        config_module._QUEUE_LISTENER = listener
+        config_module._QUEUE = queue
+        for logger, handlers, level, propagate in saved_loggers:
+            logger.handlers[:] = handlers
+            logger.setLevel(level)
+            logger.propagate = propagate
+
     def test_ensure_queue_logging_returns_queue_handler(self):
         """_ensure_queue_logging should return a QueueHandler."""
         handler = _ensure_queue_logging("INFO")
@@ -948,28 +982,21 @@ class TestQueueBasedLogging:
 
     def test_setup_django_logging_respects_explicit_logging_config(self):
         """setup_django_logging should skip setup when LOGGING is explicitly configured."""
-        # Configure Django settings with explicit LOGGING
-        if not settings.configured:
-            settings.configure(
-                DEBUG=True,
-                SECRET_KEY="test-secret-key",
-                LOGGING={"version": 1, "disable_existing_loggers": False},
-            )
-
         # Reset global state
         config_module._LOGGING_CONFIGURED = False
 
-        # Count handlers before
         django_logger = logging.getLogger("django")
-        handlers_before = len(django_logger.handlers)
 
-        setup_django_logging(force=True)
+        # conftest configures settings without LOGGING, so set explicit LOGGING here.
+        # Count handlers inside the block: Django reconfigures logging when the override exits.
+        with override_settings(LOGGING={"version": 1, "disable_existing_loggers": False}):
+            handlers_before = len(django_logger.handlers)
+            setup_django_logging(force=True)
+            handlers_after = len(django_logger.handlers)
 
         # Should mark as configured
         assert config_module._LOGGING_CONFIGURED is True
 
-        # Should not have added handlers (respects explicit LOGGING)
-        handlers_after = len(django_logger.handlers)
         # With explicit LOGGING, we don't modify handlers
         assert handlers_after == handlers_before, "Should not modify handlers with explicit LOGGING"
 
