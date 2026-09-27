@@ -75,10 +75,6 @@ def sync_outer_of_async(values: dict = Depends(async_values)) -> dict:
     return {"nested": values["version"]}
 
 
-def page_number(page: Annotated[int, Query()] = 1) -> int:
-    return page
-
-
 @pytest.fixture(scope="module")
 def client():
     api = BoltAPI()
@@ -86,10 +82,6 @@ def client():
     @api.get("/sync/nested-async")
     def sync_nested_async_route(outer=Depends(sync_outer_of_async)):
         return outer
-
-    @api.get("/page-as-text")
-    def page_as_text_route(page: str, number=Depends(page_number)):
-        return {"page": page, "number": number}
 
     @api.get("/async/values")
     async def async_values_route(values=Depends(async_values)):
@@ -164,12 +156,6 @@ def test_a_sync_handler_gets_a_sync_dependency_of_an_async_dependency(client):
 @pytest.mark.parametrize("mode", MODES)
 def test_a_query_value_of_the_wrong_type_is_a_client_error(client, mode):
     assert client.get(f"/{mode}/values?page=abc").status_code == 422
-
-
-def test_a_handler_field_keeps_its_type_when_a_dependency_has_the_same_name(client):
-    response = client.get("/page-as-text?page=7")
-    assert response.status_code == 200, response.text
-    assert response.json() == {"page": "7", "number": "7"}
 
 
 class Item(msgspec.Struct):
@@ -434,3 +420,41 @@ def test_a_dependency_with_the_same_type_for_a_handler_wire_key_is_allowed():
         response = client.get("/shared", headers={"X-Count": "4"})
         assert response.status_code == 200, response.text
         assert response.json() == {"raw": 4, "count": 4}
+
+
+def test_a_dependency_with_another_type_for_a_handler_name_fails_at_registration():
+    """The same Python name in the handler and the dependency is one wire key too."""
+    api = BoltAPI()
+
+    def paging(page: Annotated[int, Query()]) -> int:
+        return page
+
+    with pytest.raises(TypeError) as exc_info:
+
+        @api.get("/clash")
+        async def clash(page: Annotated[str, Query()], paged=Depends(paging)):
+            return {"page": page, "paged": paged}
+
+    assert "page" in str(exc_info.value)
+
+
+def test_a_dependency_with_a_handler_name_in_another_source_gets_its_type():
+    """A handler query ``token`` and a dependency header ``token`` are two wire keys."""
+    api = BoltAPI()
+
+    def header_token(token: Annotated[int, Header()]) -> int:
+        return token
+
+    @api.get("/two-sources")
+    async def two_sources(token: Annotated[str, Query()], header=Depends(header_token)):
+        return {"query": token, "header": header}
+
+    with TestClient(api) as client:
+        response = client.get("/two-sources?token=abc", headers={"token": "7"})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"query": "abc", "header": 7}
+
+    parameters = (
+        SchemaGenerator(api, OpenAPIConfig(title="Test", version="1")).generate().paths["/two-sources"].get.parameters
+    )
+    assert {(p.param_in, p.name) for p in parameters} == {("query", "token"), ("header", "token")}

@@ -809,14 +809,9 @@ class SchemaGenerator:
     def _route_fields(meta: dict[str, Any]) -> list[Any]:
         """The fields of the handler, then the request data fields of its dependencies.
 
-        A dependency field with the name of a handler field is left out, as at run time.
+        The parameter extraction documents each location and name one time.
         """
-        fields = meta.get("fields", [])
-        handler_names = {field.name for field in fields}
-        return [
-            *fields,
-            *(field for field in meta.get("dependency_fields", ()) if field.name not in handler_names),
-        ]
+        return [*meta.get("fields", []), *meta.get("dependency_fields", ())]
 
     def _extract_parameters(self, meta: dict[str, Any], path: str) -> list[Parameter]:
         """Extract OpenAPI parameters from handler metadata.
