@@ -225,6 +225,56 @@ def test_multi_backend_revocation_only_applies_to_matched_backend():
 
 
 @pytest.mark.django_db
+def test_two_jwt_backends_check_each_token_with_its_own_revocation_handler():
+    """Both backends have the scheme name "jwt". The backend that accepts a token checks it."""
+    secret_a = "revocation-backend-a-secret-longer-than-32-characters"
+    secret_b = "revocation-backend-b-secret-longer-than-32-characters"
+    checked: list[tuple[str, str]] = []
+
+    async def handler_a(jti: str) -> bool:
+        checked.append(("a", jti))
+        return jti == "revoked-a"
+
+    async def handler_b(jti: str) -> bool:
+        checked.append(("b", jti))
+        return jti == "revoked-b"
+
+    api = BoltAPI()
+    backends = [
+        JWTAuthentication(secret=secret_a, revoked_token_handler=handler_a),
+        JWTAuthentication(secret=secret_b, revoked_token_handler=handler_b),
+    ]
+
+    @api.get("/p", auth=backends, guards=[IsAuthenticated()])
+    async def p(request):
+        return {"backend": request["context"]["auth_backend"]}
+
+    def bearer(secret: str, jti: str) -> dict[str, str]:
+        token = jwt.encode({"sub": "1", "jti": jti, "exp": int(time.time()) + 60}, secret, algorithm="HS256")
+        return {"Authorization": f"Bearer {token}"}
+
+    with TestClient(api) as client:
+        assert client.get("/p", headers=bearer(secret_a, "ok-a")).status_code == 200
+        assert client.get("/p", headers=bearer(secret_b, "ok-b")).status_code == 200
+        assert client.get("/p", headers=bearer(secret_a, "revoked-a")).status_code == 401
+        assert client.get("/p", headers=bearer(secret_b, "revoked-b")).status_code == 401
+        # A jti that the other backend revokes does not revoke this token.
+        response = client.get("/p", headers=bearer(secret_a, "revoked-b"))
+        assert response.status_code == 200, response.text
+        assert response.json() == {"backend": "jwt"}
+        assert client.get("/p", headers=bearer(secret_b, "revoked-a")).status_code == 200
+
+    assert checked == [
+        ("a", "ok-a"),
+        ("b", "ok-b"),
+        ("a", "revoked-a"),
+        ("b", "revoked-b"),
+        ("a", "revoked-b"),
+        ("b", "revoked-a"),
+    ]
+
+
+@pytest.mark.django_db
 def test_custom_revoked_token_handler_without_store():
     """The `revoked_token_handler=` config path should work the same as
     `revocation_store=`."""

@@ -64,6 +64,7 @@ fn auth_context_from_principal(dict: &Bound<'_, PyDict>) -> PyResult<AuthContext
         is_staff: item(dict, "is_staff")?.extract()?,
         is_superuser: item(dict, "is_superuser")?.extract()?,
         backend: item(dict, "backend")?.extract()?,
+        backend_index: None,
         claims,
         permissions: permissions.into_iter().collect(),
         cookie_csrf: false,

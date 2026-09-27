@@ -61,6 +61,11 @@ pub struct AuthContext {
     pub is_staff: bool,
     pub is_superuser: bool,
     pub backend: String,
+    /// Position of the authenticating backend in the route's backend list.
+    /// Two backends can have the same scheme name (two JWT secrets), so
+    /// Python finds the per-backend revocation handler and user loader by
+    /// this position. `None` when no route backend list made the context.
+    pub backend_index: Option<usize>,
     pub claims: Option<Claims>,
     pub permissions: HashSet<String>,
     /// The credential that actually authenticated this request came from a
@@ -86,6 +91,7 @@ impl AuthContext {
             is_staff,
             is_superuser,
             backend: backend.to_string(),
+            backend_index: None,
             claims: Some(claims),
             permissions,
             cookie_csrf,
@@ -105,6 +111,7 @@ impl AuthContext {
             is_staff: false,
             is_superuser: false,
             backend: "api_key".to_string(),
+            backend_index: None,
             claims: None,
             permissions,
             cookie_csrf: false,
@@ -333,54 +340,55 @@ pub fn build_jwks_key_source(jwks_json: &str) -> Result<JwtKeySource, String> {
     Ok(JwtKeySource::Jwks(keys))
 }
 
-/// Authenticate using configured backends and return AuthContext
-/// Returns None if no authentication was successful
+/// Authenticate using configured backends and return AuthContext.
+/// Returns None if no authentication was successful. The context records
+/// the position of the backend that accepted the credential.
 pub fn authenticate(
     headers: &AHashMap<String, String>,
     backends: &[AuthBackend],
 ) -> Option<AuthContext> {
-    for backend in backends {
-        match backend {
-            AuthBackend::JWT {
-                keys,
-                algorithms,
-                header,
-                cookie,
-                audience,
-                issuer,
-                leeway,
-                token_type,
-                require_jti,
-                cookie_csrf,
-            } => {
-                if let Some(ctx) = try_jwt_auth(
-                    headers,
-                    keys,
-                    algorithms,
-                    header,
-                    cookie.as_deref(),
-                    audience.as_deref(),
-                    issuer.as_deref(),
-                    *leeway,
-                    token_type.as_deref(),
-                    *require_jti,
-                    cookie.is_some() && *cookie_csrf,
-                ) {
-                    return Some(ctx);
-                }
-            }
-            AuthBackend::APIKey {
-                api_keys,
-                header,
-                key_permissions,
-            } => {
-                if let Some(ctx) = try_api_key_auth(headers, api_keys, header, key_permissions) {
-                    return Some(ctx);
-                }
-            }
-        }
+    backends.iter().enumerate().find_map(|(index, backend)| {
+        let mut ctx = authenticate_with(headers, backend)?;
+        ctx.backend_index = Some(index);
+        Some(ctx)
+    })
+}
+
+fn authenticate_with(
+    headers: &AHashMap<String, String>,
+    backend: &AuthBackend,
+) -> Option<AuthContext> {
+    match backend {
+        AuthBackend::JWT {
+            keys,
+            algorithms,
+            header,
+            cookie,
+            audience,
+            issuer,
+            leeway,
+            token_type,
+            require_jti,
+            cookie_csrf,
+        } => try_jwt_auth(
+            headers,
+            keys,
+            algorithms,
+            header,
+            cookie.as_deref(),
+            audience.as_deref(),
+            issuer.as_deref(),
+            *leeway,
+            token_type.as_deref(),
+            *require_jti,
+            cookie.is_some() && *cookie_csrf,
+        ),
+        AuthBackend::APIKey {
+            api_keys,
+            header,
+            key_permissions,
+        } => try_api_key_auth(headers, api_keys, header, key_permissions),
     }
-    None
 }
 
 /// Find a cookie value by name in a raw Cookie header string.
@@ -661,6 +669,7 @@ pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: P
     let _ = dict.set_item(intern!(py, "is_staff"), auth_ctx.is_staff);
     let _ = dict.set_item(intern!(py, "is_superuser"), auth_ctx.is_superuser);
     let _ = dict.set_item(intern!(py, "auth_backend"), &auth_ctx.backend);
+    set_if_some!(dict, py, "auth_backend_index", auth_ctx.backend_index);
 
     if !auth_ctx.permissions.is_empty() {
         let perms: Vec<&String> = auth_ctx.permissions.iter().collect();
@@ -1252,5 +1261,90 @@ mod tests {
             None
         )
         .is_none());
+    }
+
+    fn hs256_backend(secret: &str) -> AuthBackend {
+        AuthBackend::JWT {
+            keys: JwtKeySource::Static(DecodingKey::from_secret(secret.as_bytes())),
+            algorithms: vec![Algorithm::HS256],
+            header: "authorization".to_string(),
+            cookie: None,
+            audience: None,
+            issuer: None,
+            leeway: 0,
+            token_type: None,
+            require_jti: false,
+            cookie_csrf: false,
+        }
+    }
+
+    fn bearer_headers(secret: &str) -> AHashMap<String, String> {
+        let claims = format!(r#"{{"sub":"42","exp":{}}}"#, future_exp());
+        let message = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256"}"#),
+            URL_SAFE_NO_PAD.encode(claims)
+        );
+        let signature = crypto::sign(
+            message.as_bytes(),
+            &EncodingKey::from_secret(secret.as_bytes()),
+            Algorithm::HS256,
+        )
+        .unwrap();
+        let mut headers = AHashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            format!("Bearer {message}.{signature}"),
+        );
+        headers
+    }
+
+    #[test]
+    fn authenticate_records_the_position_of_the_accepting_backend() {
+        // Both backends have the scheme name "jwt". Only the position tells
+        // Python which backend accepted the token.
+        let backends = [hs256_backend("secret-a"), hs256_backend("secret-b")];
+
+        let first = authenticate(&bearer_headers("secret-a"), &backends).unwrap();
+        assert_eq!(
+            (first.backend.as_str(), first.backend_index),
+            ("jwt", Some(0))
+        );
+
+        let second = authenticate(&bearer_headers("secret-b"), &backends).unwrap();
+        assert_eq!(
+            (second.backend.as_str(), second.backend_index),
+            ("jwt", Some(1))
+        );
+
+        assert!(authenticate(&bearer_headers("secret-c"), &backends).is_none());
+    }
+
+    #[test]
+    fn authenticate_records_the_position_of_an_api_key_backend() {
+        let backends = [
+            hs256_backend("secret-a"),
+            AuthBackend::APIKey {
+                api_keys: HashSet::from(["key-1".to_string()]),
+                header: "x-api-key".to_string(),
+                key_permissions: HashMap::new(),
+            },
+        ];
+        let mut headers = AHashMap::new();
+        headers.insert("x-api-key".to_string(), "key-1".to_string());
+
+        let ctx = authenticate(&headers, &backends).unwrap();
+        assert_eq!(
+            (ctx.backend.as_str(), ctx.backend_index),
+            ("api_key", Some(1))
+        );
+    }
+
+    #[test]
+    fn contexts_made_outside_a_backend_list_have_no_position() {
+        assert_eq!(
+            AuthContext::from_api_key("k", &HashMap::new()).backend_index,
+            None
+        );
     }
 }

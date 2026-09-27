@@ -880,6 +880,10 @@ async def is_revoked(jti: str) -> bool: ...
 async def is_revoked_by_claims(jti: str, claims: dict) -> bool: ...
 ```
 
+A route can have more than one JWT backend, for example one for each
+issuer. Bolt checks a token only with the handler of the backend that
+accepted the token.
+
 ### Session-bound tokens (django-allauth)
 
 Some issuers bind an access token to a server-side session. For example,

@@ -66,6 +66,66 @@ async def test_a_revoked_token_fails_the_websocket_handshake(takes_claims):
 
 
 @pytest.mark.asyncio
+async def test_two_jwt_backends_check_each_handshake_token_with_its_own_revocation_handler():
+    """Both backends have the scheme name "jwt". The backend that accepts the token checks it."""
+    secret_a = "websocket-backend-a-secret-longer-than-32-characters"
+    secret_b = "websocket-backend-b-secret-longer-than-32-characters"
+    checked: list[tuple[str, str]] = []
+
+    async def handler_a(jti: str) -> bool:
+        checked.append(("a", jti))
+        return jti == "revoked-a"
+
+    async def handler_b(jti: str) -> bool:
+        checked.append(("b", jti))
+        return jti == "revoked-b"
+
+    api = BoltAPI()
+
+    @api.websocket(
+        "/ws",
+        auth=[
+            JWTAuthentication(secret=secret_a, revoked_token_handler=handler_a),
+            JWTAuthentication(secret=secret_b, revoked_token_handler=handler_b),
+        ],
+        guards=[IsAuthenticated()],
+    )
+    async def endpoint(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    async def connect(secret: str, jti: str) -> str:
+        token = jwt.encode({"sub": "1", "jti": jti, "exp": int(time.time()) + 60}, secret, algorithm="HS256")
+        async with WebSocketTestClient(
+            api,
+            "/ws",
+            headers={"Authorization": f"Bearer {token}"},
+            cors_allowed_origins=["*"],
+            read_django_settings=False,
+        ) as websocket:
+            return await websocket.receive_text()
+
+    assert await connect(secret_a, "ok-a") == "connected"
+    assert await connect(secret_b, "ok-b") == "connected"
+    with pytest.raises(PermissionError, match="revoked"):
+        await connect(secret_a, "revoked-a")
+    with pytest.raises(PermissionError, match="revoked"):
+        await connect(secret_b, "revoked-b")
+    # A jti that the other backend revokes does not revoke this token.
+    assert await connect(secret_a, "revoked-b") == "connected"
+    assert await connect(secret_b, "revoked-a") == "connected"
+
+    assert checked == [
+        ("a", "ok-a"),
+        ("b", "ok-b"),
+        ("a", "revoked-a"),
+        ("b", "revoked-b"),
+        ("a", "revoked-b"),
+        ("b", "revoked-a"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_denied_handshake_destroys_the_test_app():
     """Python does not call __aexit__ when the entry fails, so the entry cleans up."""
     api = BoltAPI()

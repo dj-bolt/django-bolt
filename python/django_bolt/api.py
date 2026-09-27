@@ -38,10 +38,9 @@ from ._kwargs import (
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler
-from .auth import get_default_authentication_classes, register_auth_backend
+from .auth import register_auth_backend
 from .auth.backends import revocation_takes_claims
 from .auth.user_loader import (
-    DEFAULT_USER_LOADERS,
     LazyUser,
     resolve_user_loader,
 )
@@ -58,7 +57,12 @@ from .error_handlers import handle_exception, http_exception_handler
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
 from .middleware import CompressionConfig, DjangoMiddleware, DjangoMiddlewareStack
-from .middleware.compiler import _compile_rust_arg_bindings, add_optimization_flags_to_metadata, compile_middleware_meta
+from .middleware.compiler import (
+    _compile_rust_arg_bindings,
+    add_optimization_flags_to_metadata,
+    compile_middleware_meta,
+    route_auth_backends,
+)
 from .middleware.django_loader import load_django_middleware
 from .middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
 from .middleware_response import MiddlewareResponse
@@ -99,18 +103,21 @@ from .websocket import mark_websocket_handler
 logger = logging.getLogger(__name__)
 
 
-def _revocation_handlers(backends: list[Any]) -> dict[str, tuple[Callable, bool]] | None:
-    """scheme_name → (revoked_token_handler, takes_claims) for the backends of a route.
+def _revocation_handlers(backends: list[Any]) -> tuple[tuple[Callable, bool] | None, ...] | None:
+    """(revoked_token_handler, takes_claims) or None for each backend of a route.
 
-    The lookup at dispatch is O(1) by the name of the matched backend. None
-    when no backend has revocation.
+    The position in the tuple is the position of the backend in
+    ``route_auth_backends()``, which Rust reports as ``auth_backend_index``.
+    Two JWT backends have the same scheme name, so the scheme name cannot
+    identify the backend. None when no backend has revocation.
     """
-    handlers = {
-        backend.scheme_name: (backend.revoked_token_handler, revocation_takes_claims(backend.revoked_token_handler))
-        for backend in backends
+    handlers = tuple(
+        (backend.revoked_token_handler, revocation_takes_claims(backend.revoked_token_handler))
         if getattr(backend, "revoked_token_handler", None) is not None
-    }
-    return handlers or None
+        else None
+        for backend in backends
+    )
+    return handlers if any(handlers) else None
 
 
 Response = ResponseWireV1
@@ -930,9 +937,7 @@ class BoltAPI:
 
             # The handshake awaits this check before the upgrade: a revoked
             # token gets 401, as on an HTTP route.
-            revocation_handlers = _revocation_handlers(
-                auth if auth is not None else (get_default_authentication_classes() or [])
-            )
+            revocation_handlers = _revocation_handlers(route_auth_backends(auth))
             if revocation_handlers is not None:
                 middleware_meta = middleware_meta or {}
                 middleware_meta["websocket_revocation_check"] = functools.partial(
@@ -1728,19 +1733,16 @@ class BoltAPI:
             # These are parsed by Rust's RouteMetadata::from_python() to skip unused parsing
             middleware_meta = add_optimization_flags_to_metadata(middleware_meta, meta)
 
-            # Resolve effective auth backends once (explicit > defaults) — reused
-            # below for revocation precomputation and _auth_backend_instances.
-            effective_auth_backends = auth if auth is not None else (get_default_authentication_classes() or [])
+            # Resolve effective auth backends once (explicit > defaults), in
+            # the order Rust gets them. Reused below for revocation
+            # precomputation and _auth_backend_instances.
+            effective_auth_backends = route_auth_backends(auth)
 
-            # scheme_name → user loader for THIS route's backends. Must be
-            # per-route: JWTAuthentication subclasses all share scheme "jwt"
-            # but can carry different get_user overrides. First backend of a
-            # scheme wins (Rust reports only the scheme that authenticated).
-            user_loaders: dict[str, Any] = {}
-            for backend in effective_auth_backends:
-                if backend.scheme_name not in user_loaders:
-                    user_loaders[backend.scheme_name] = resolve_user_loader(backend)
-            meta["_user_loaders"] = user_loaders
+            # The user loaders of THIS route's backends, by the position that
+            # Rust reports as auth_backend_index. Two JWTAuthentication
+            # subclasses share scheme "jwt" but can carry different get_user
+            # overrides, so the scheme name cannot pick the loader.
+            meta["_user_loaders"] = tuple(resolve_user_loader(backend) for backend in effective_auth_backends)
 
             revocation_handlers = _revocation_handlers(effective_auth_backends)
             meta["_revocation_handlers"] = revocation_handlers
@@ -2824,10 +2826,10 @@ class BoltAPI:
     async def _check_revocation(
         self,
         auth_context: dict[str, Any],
-        revocation_handlers: dict[str, tuple[Callable, bool]],
+        revocation_handlers: tuple[tuple[Callable, bool] | None, ...],
     ) -> None:
         """Reject the request if the authenticated token is revoked."""
-        entry = revocation_handlers.get(auth_context["auth_backend"])
+        entry = revocation_handlers[auth_context["auth_backend_index"]]
         if entry is None:
             # Matched backend has no revocation (e.g., API-key auth on a
             # route where only JWT configured one).
@@ -2850,7 +2852,7 @@ class BoltAPI:
 
     async def _websocket_token_revoked(
         self,
-        revocation_handlers: dict[str, tuple[Callable, bool]],
+        revocation_handlers: tuple[tuple[Callable, bool] | None, ...],
         auth_context: dict[str, Any],
     ) -> bool:
         """Whether the token of a WebSocket handshake is revoked.
@@ -2903,14 +2905,13 @@ class BoltAPI:
 
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    # Route-local loaders for the scheme that authenticated;
-                    # schemes with no backend instance (Rust session auth)
-                    # fall back to the default pk query. Loaders of None
-                    # mean the backend has no user resolution — leave
-                    # request.user unset (PyRequest getter returns None).
-                    # The sync loader looks at the thread that forces the
-                    # user. ``await request.auser()`` uses the async loader.
-                    loaders = meta["_user_loaders"].get(auth_context.get("auth_backend"), DEFAULT_USER_LOADERS)
+                    # Route-local loaders of the backend that authenticated.
+                    # Loaders of None mean the backend has no user
+                    # resolution — leave request.user unset (PyRequest
+                    # getter returns None). The sync loader looks at the
+                    # thread that forces the user. ``await request.auser()``
+                    # uses the async loader.
+                    loaders = meta["_user_loaders"][auth_context["auth_backend_index"]]
                     if loaders is not None:
                         request["user"] = LazyUser(loaders, user_id, auth_context)
 
@@ -2986,7 +2987,7 @@ class BoltAPI:
             if auth_context:
                 user_id = auth_context.get("user_id")
                 if user_id:
-                    loaders = meta["_user_loaders"].get(auth_context.get("auth_backend"), DEFAULT_USER_LOADERS)
+                    loaders = meta["_user_loaders"][auth_context["auth_backend_index"]]
                     if loaders is not None:
                         request["user"] = LazyUser(loaders, user_id, auth_context)
 
