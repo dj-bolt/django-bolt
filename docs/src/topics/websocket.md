@@ -123,6 +123,23 @@ async def connect(websocket: WebSocket, token: str | None = None):
     # ...
 ```
 
+## Typed parameters
+
+Declare a path, query, header or cookie parameter with a type, for example
+`int`. Rust converts the value before the handler runs. A value that does not
+convert rejects the upgrade with a 400. The body names the parameter:
+
+```python
+@api.websocket("/ws/feed")
+async def feed(websocket: WebSocket, limit: Annotated[int, Query()] = 10):
+    await websocket.accept()
+    await websocket.send_json({"limit": limit})
+```
+
+`?limit=50` gives the integer `50`. `?limit=abc` gives a 400 with
+`Query parameter 'limit': Invalid integer 'abc'`. `WebSocketTestClient`
+raises `ValueError` with the same text.
+
 ## Closing connections
 
 ### From the server

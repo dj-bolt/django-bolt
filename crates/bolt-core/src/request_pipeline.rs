@@ -103,10 +103,15 @@ pub fn validate_and_cache_source<'t>(
 
 #[cold]
 fn too_long(label: &str, name: &str, len: usize, max_length: usize) -> HttpResponse {
-    responses::error_422_validation(&format!(
+    responses::error_422_validation(&too_long_detail(label, name, len, max_length))
+}
+
+#[cold]
+fn too_long_detail(label: &str, name: &str, len: usize, max_length: usize) -> String {
+    format!(
         "{} '{}': Parameter too long: {} bytes (max {} bytes)",
         label, name, len, max_length
-    ))
+    )
 }
 
 #[inline]
@@ -153,6 +158,24 @@ pub fn coerce_declared_value(
     }
 }
 
+/// Check the length of one path or query value, then coerce it as `types` declares.
+///
+/// Unlike [`coerce_declared_value`], the length limit applies to all values,
+/// including strings. The error is the detail text, as there.
+#[inline]
+pub fn coerce_param_value(
+    name: &str,
+    value: &str,
+    types: &TypeHints,
+    max_length: usize,
+    label: &str,
+) -> Result<Option<CoercedValue>, String> {
+    if value.len() > max_length {
+        return Err(too_long_detail(label, name, value.len(), max_length));
+    }
+    coerce_declared_value(name, value, types, max_length, label)
+}
+
 /// Set `name` in a WebSocket scope dict, coerced when `types` declares it.
 ///
 /// A bad typed value is a `ValueError`, which rejects the upgrade. Values with
@@ -166,7 +189,36 @@ pub fn set_declared_item(
     max_length: usize,
     label: &str,
 ) -> PyResult<()> {
-    match coerce_declared_value(name, value, types, max_length, label) {
+    let coerced = coerce_declared_value(name, value, types, max_length, label);
+    set_coerced_item(py, dict, name, value, coerced)
+}
+
+/// Set a path or query `name` in a WebSocket scope dict, coerced when `types` declares it.
+///
+/// A value that is too long or a bad typed value is a `ValueError`.
+/// The error rejects the upgrade, as a header or cookie error does.
+pub fn set_param_item(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    name: &str,
+    value: &str,
+    types: &TypeHints,
+    max_length: usize,
+    label: &str,
+) -> PyResult<()> {
+    let coerced = coerce_param_value(name, value, types, max_length, label);
+    set_coerced_item(py, dict, name, value, coerced)
+}
+
+#[inline]
+fn set_coerced_item(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    name: &str,
+    value: &str,
+    coerced: Result<Option<CoercedValue>, String>,
+) -> PyResult<()> {
+    match coerced {
         Ok(Some(coerced)) => dict.set_item(name, coerced_value_to_py(py, &coerced)?),
         Ok(None) => dict.set_item(name, value),
         Err(detail) => Err(pyo3::exceptions::PyValueError::new_err(detail)),
@@ -306,6 +358,36 @@ mod tests {
         assert!(coerce_declared_value("other", "1", &hints, 64, "Header")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn param_value_rejects_bad_typed_value_with_label_and_name() {
+        let hints = types(&[("limit", TYPE_INT)]);
+        let detail = coerce_param_value("limit", "abc", &hints, 64, "Query parameter").unwrap_err();
+        assert!(
+            detail.starts_with("Query parameter 'limit': Invalid integer 'abc'"),
+            "{detail}"
+        );
+        assert!(matches!(
+            coerce_param_value("limit", "7", &hints, 64, "Query parameter"),
+            Ok(Some(CoercedValue::Int(7)))
+        ));
+    }
+
+    #[test]
+    fn param_value_checks_length_of_untyped_value() {
+        let hints = types(&[]);
+        assert!(
+            coerce_param_value("q", "short", &hints, 64, "Path parameter")
+                .unwrap()
+                .is_none()
+        );
+        let detail =
+            coerce_param_value("q", &"a".repeat(65), &hints, 64, "Path parameter").unwrap_err();
+        assert!(
+            detail.starts_with("Path parameter 'q': Parameter too long"),
+            "{detail}"
+        );
     }
 
     #[test]

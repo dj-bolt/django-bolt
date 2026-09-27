@@ -14,10 +14,9 @@ use tokio::sync::mpsc;
 
 use bolt_core::metadata::CorsConfig;
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
-use bolt_core::request_pipeline::{set_declared_item, EMPTY_TYPES};
+use bolt_core::request_pipeline::{set_declared_item, set_param_item, EMPTY_TYPES};
 use bolt_core::state::{AppState, ROUTE_METADATA};
-use bolt_core::type_coercion::coerced_value_to_py;
-use bolt_core::type_coercion::{coerce_param, CoerceError, TypeHints, TYPE_STRING};
+use bolt_core::type_coercion::TypeHints;
 use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 
 use super::actor::WebSocketActor;
@@ -90,7 +89,8 @@ fn build_scope(
     scope_dict.set_item("type", "websocket")?;
     scope_dict.set_item("path", req.path())?;
 
-    // Parse and coerce query parameters
+    // Parse and coerce query parameters.
+    // A value that is too long or a bad typed value rejects the upgrade, as in HTTP.
     let query_dict = PyDict::new(py);
     let query_string = req.query_string();
     if !query_string.is_empty() {
@@ -98,27 +98,15 @@ fn build_scope(
             if let Some((key, value)) = pair.split_once('=') {
                 let decoded_key = urlencoding::decode(key).unwrap_or_default();
                 let decoded_value = urlencoding::decode(value).unwrap_or_default();
-
-                // Get type hint and coerce
-                let type_hint = param_types
-                    .get(decoded_key.as_ref())
-                    .copied()
-                    .unwrap_or(TYPE_STRING);
-
-                match coerce_param(&decoded_value, type_hint, max_param_length) {
-                    Ok(coerced) => {
-                        let py_value = coerced_value_to_py(py, &coerced)?;
-                        query_dict.set_item(decoded_key.as_ref(), py_value)?;
-                    }
-                    // Oversized values reject the upgrade — never pass a raw string through.
-                    Err(e @ CoerceError::TooLong { .. }) => {
-                        return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-                    }
-                    // Genuine type-coercion failure: fall back to the raw string.
-                    Err(CoerceError::Invalid(_)) => {
-                        query_dict.set_item(decoded_key.as_ref(), decoded_value.as_ref())?;
-                    }
-                }
+                set_param_item(
+                    py,
+                    &query_dict,
+                    &decoded_key,
+                    &decoded_value,
+                    param_types,
+                    max_param_length,
+                    "Query parameter",
+                )?;
             }
         }
     }
@@ -149,21 +137,15 @@ fn build_scope(
     // Coerce path params using type hints
     let params_dict = PyDict::new(py);
     for (k, v) in path_params.iter() {
-        let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
-        match coerce_param(v, type_hint, max_param_length) {
-            Ok(coerced) => {
-                let py_value = coerced_value_to_py(py, &coerced)?;
-                params_dict.set_item(k.as_str(), py_value)?;
-            }
-            // Oversized values reject the upgrade — never pass a raw string through.
-            Err(e @ CoerceError::TooLong { .. }) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-            }
-            // Genuine type-coercion failure: fall back to the raw string.
-            Err(CoerceError::Invalid(_)) => {
-                params_dict.set_item(k.as_str(), v.as_str())?;
-            }
-        }
+        set_param_item(
+            py,
+            &params_dict,
+            k,
+            v,
+            param_types,
+            max_param_length,
+            "Path parameter",
+        )?;
     }
     scope_dict.set_item("path_params", params_dict)?;
 

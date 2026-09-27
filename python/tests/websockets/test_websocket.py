@@ -722,6 +722,23 @@ async def test_websocket_invalid_typed_cookie_rejects_upgrade(injection_api):
 
 
 @pytest.mark.asyncio
+async def test_websocket_invalid_typed_query_rejects_upgrade(injection_api):
+    """Test a bad typed query value rejects the upgrade and names the parameter."""
+    with pytest.raises(ValueError, match="Query parameter 'limit': Invalid integer 'abc'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=t&limit=abc"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_typed_path_rejects_upgrade(injection_api):
+    """Test a bad typed path value rejects the upgrade and names the parameter."""
+    headers = {"Authorization": "Bearer t", "Cookie": "session=s"}
+    with pytest.raises(ValueError, match="Path parameter 'room_id': Invalid integer 'abc'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/mixed/abc", query_string="token=t", headers=headers):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_websocket_mixed_injection(injection_api):
     """Test combined path, query, header, and cookie parameter injection."""
     headers = {
