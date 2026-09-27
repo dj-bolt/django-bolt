@@ -16,6 +16,7 @@ use bolt_core::metadata::CorsConfig;
 use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::request_pipeline::{set_declared_item, set_param_item, EMPTY_TYPES};
+use bolt_core::router::parse_query_string;
 use bolt_core::state::{AppState, ROUTE_METADATA};
 use bolt_core::type_coercion::TypeHints;
 use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
@@ -90,26 +91,19 @@ fn build_scope(
     scope_dict.set_item("type", "websocket")?;
     scope_dict.set_item("path", req.path())?;
 
-    // Parse and coerce query parameters.
+    // Parse the query string with the HTTP parser: the last value of a repeated key wins.
     // A value that is too long or a bad typed value rejects the upgrade, as in HTTP.
     let query_dict = PyDict::new(py);
-    let query_string = req.query_string();
-    if !query_string.is_empty() {
-        for pair in query_string.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                let decoded_key = urlencoding::decode(key).unwrap_or_default();
-                let decoded_value = urlencoding::decode(value).unwrap_or_default();
-                set_param_item(
-                    py,
-                    &query_dict,
-                    &decoded_key,
-                    &decoded_value,
-                    param_types,
-                    max_param_length,
-                    "Query parameter",
-                )?;
-            }
-        }
+    for (key, value) in &parse_query_string(req.query_string()) {
+        set_param_item(
+            py,
+            &query_dict,
+            key,
+            value,
+            param_types,
+            max_param_length,
+            "Query parameter",
+        )?;
     }
     scope_dict.set_item("query_params", query_dict)?;
 

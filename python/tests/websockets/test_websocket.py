@@ -312,6 +312,14 @@ async def test_websocket_multiple_path_params(api):
         }
 
 
+@pytest.mark.asyncio
+async def test_websocket_path_param_is_url_decoded(api):
+    """Test a path value is URL-decoded, as for an HTTP route."""
+    async with WebSocketTestClient(api, "/ws/chat/hello%20world") as ws:
+        welcome = await ws.receive_text()
+        assert welcome == "Joined room: hello world"
+
+
 # --- Query Parameter Tests ---
 
 
@@ -736,6 +744,39 @@ async def test_websocket_invalid_typed_path_rejects_upgrade(injection_api):
     with pytest.raises(ValueError, match="Path parameter 'room_id': Invalid integer 'abc'"):
         async with WebSocketTestClient(injection_api, "/ws/inject/mixed/abc", query_string="token=t", headers=headers):
             pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_typed_path_value_is_url_decoded(injection_api):
+    """Test an encoded typed path value is decoded before it converts, as for an HTTP route."""
+    headers = {"Authorization": "Bearer t", "Cookie": "session=s"}
+    async with WebSocketTestClient(
+        injection_api, "/ws/inject/mixed/%34%32", query_string="token=t", headers=headers
+    ) as ws:
+        response = await ws.receive_json()
+        assert response["room_id"] == 42
+        assert response["room_id_type"] == "int"
+
+
+@pytest.mark.asyncio
+async def test_websocket_repeated_query_key_keeps_last_value(injection_api):
+    """Test the last value of a repeated query key wins, and only it is checked, as for an HTTP route."""
+    async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=t&limit=abc&limit=5") as ws:
+        response = await ws.receive_json()
+        assert response["limit"] == 5
+        assert response["limit_type"] == "int"
+
+    with pytest.raises(ValueError, match="Query parameter 'limit': Invalid integer 'abc'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=t&limit=5&limit=abc"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_query_key_without_value_is_empty_string(injection_api):
+    """Test a query key with no '=' gives an empty string, as for an HTTP route."""
+    async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token") as ws:
+        response = await ws.receive_json()
+        assert response["token"] == ""
 
 
 @pytest.mark.asyncio

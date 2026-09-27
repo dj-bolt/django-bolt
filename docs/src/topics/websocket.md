@@ -108,6 +108,9 @@ async def room(websocket: WebSocket, room_id: str):
         await websocket.send_text(f"[{room_id}] {message}")
 ```
 
+Bolt decodes path values as for HTTP routes. Thus `/ws/room/hello%20world`
+gives `hello world`.
+
 ## Query parameters
 
 Access query parameters from the connection:
@@ -122,6 +125,9 @@ async def connect(websocket: WebSocket, token: str | None = None):
     await websocket.accept()
     # ...
 ```
+
+When a query key repeats, the parameter gets the last value, as for HTTP
+routes.
 
 ## Typed parameters
 

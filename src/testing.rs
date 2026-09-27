@@ -1319,6 +1319,7 @@ pub fn handle_test_websocket(
 ) -> PyResult<(bool, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
     use bolt_core::middleware::auth::authenticate;
     use bolt_core::permissions::{evaluate_guards, GuardResult};
+    use bolt_core::router::parse_query_string;
 
     let entry = registry()
         .get(&app_id)
@@ -1499,25 +1500,19 @@ pub fn handle_test_websocket(
         scope_dict.set_item("_bolt_revocation_auth", context)?;
     }
 
-    // Parse and coerce query parameters
+    // Parse the query string with the HTTP parser, as production does.
     let query_dict = pyo3::types::PyDict::new(py);
     if let Some(ref qs) = query_string {
-        if !qs.is_empty() {
-            for pair in qs.split('&') {
-                if let Some((key, value)) = pair.split_once('=') {
-                    let decoded_key = urlencoding::decode(key).unwrap_or_default();
-                    let decoded_value = urlencoding::decode(value).unwrap_or_default();
-                    set_param_item(
-                        py,
-                        &query_dict,
-                        &decoded_key,
-                        &decoded_value,
-                        param_types,
-                        max_param_length,
-                        "Query parameter",
-                    )?;
-                }
-            }
+        for (key, value) in &parse_query_string(qs) {
+            set_param_item(
+                py,
+                &query_dict,
+                key,
+                value,
+                param_types,
+                max_param_length,
+                "Query parameter",
+            )?;
         }
     }
     scope_dict.set_item("query_params", query_dict)?;
