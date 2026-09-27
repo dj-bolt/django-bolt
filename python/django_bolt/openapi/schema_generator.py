@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import datetime
+import decimal
 import enum
 import http.client
 import inspect
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from types import UnionType
@@ -1566,6 +1569,8 @@ _MSGSPEC_NODE_HANDLERS: dict[str, Callable[[SchemaGenerator, Any, bool], Schema 
     "DateType": lambda _g, _n, _r: Schema(type="string", format="date"),
     "TimeType": lambda _g, _n, _r: Schema(type="string", format="time"),
     "UUIDType": lambda _g, _n, _r: Schema(type="string", format="uuid"),
+    "TimeDeltaType": lambda _g, _n, _r: Schema(type="string", format="duration"),
+    "DecimalType": lambda _g, _n, _r: Schema(type="string", format="decimal"),
     "StructType": _node_struct,
     "UnionType": _node_union,
     "ListType": _node_list,
@@ -1604,10 +1609,18 @@ _TYPING_ORIGIN_HANDLERS: dict[Any, Callable[[SchemaGenerator, tuple[Any, ...], b
 }
 
 # Kwargs, not Schema instances: callers may mutate the returned Schema.
+# Parameters and form fields keep their raw Python type. Each entry matches the
+# schema of the msgspec.inspect node above, so a type documents the same everywhere.
 _PRIMITIVE_SCHEMAS: dict[Any, dict[str, str]] = {
     str: {"type": "string"},
     int: {"type": "integer"},
     float: {"type": "number"},
     bool: {"type": "boolean"},
     bytes: {"type": "string", "format": "binary"},
+    datetime.datetime: {"type": "string", "format": "date-time"},
+    datetime.date: {"type": "string", "format": "date"},
+    datetime.time: {"type": "string", "format": "time"},
+    datetime.timedelta: {"type": "string", "format": "duration"},
+    uuid.UUID: {"type": "string", "format": "uuid"},
+    decimal.Decimal: {"type": "string", "format": "decimal"},
 }
