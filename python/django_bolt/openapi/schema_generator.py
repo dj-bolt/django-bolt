@@ -1533,10 +1533,32 @@ def _node_union(gen: SchemaGenerator, node: Any, register: bool) -> Schema | Ref
 
 
 def _node_list(gen: SchemaGenerator, node: Any, register: bool) -> Schema:
+    """A list, a set, a frozenset or a ``tuple[T, ...]``: an array with one item type."""
     item_type = getattr(node, "item_type", None)
-    if item_type:
-        return Schema(type="array", items=gen._type_to_schema(item_type, register_component=register))
-    return Schema(type="array", items=Schema(type="object"))
+    items = gen._type_to_schema(item_type, register_component=register) if item_type else Schema(type="object")
+    return Schema(
+        **gen._schema_kwargs(
+            type="array",
+            items=items,
+            min_items=node.min_length,
+            max_items=node.max_length,
+            # msgspec rejects a repeated item of a set, as JSON Schema does for uniqueItems.
+            unique_items=True if type(node).__name__ in ("SetType", "FrozenSetType") else None,
+        )
+    )
+
+
+def _node_tuple(gen: SchemaGenerator, node: Any, register: bool) -> Schema:
+    """A fixed ``tuple[A, B]``: one schema for each position, and exactly that many items."""
+    count = len(node.item_types)
+    return Schema(
+        **gen._schema_kwargs(
+            type="array",
+            prefix_items=[gen._type_to_schema(item, register_component=register) for item in node.item_types] or None,
+            min_items=count,
+            max_items=count,
+        )
+    )
 
 
 def _node_dict(gen: SchemaGenerator, node: Any, register: bool) -> Schema:
@@ -1574,6 +1596,10 @@ _MSGSPEC_NODE_HANDLERS: dict[str, Callable[[SchemaGenerator, Any, bool], Schema 
     "StructType": _node_struct,
     "UnionType": _node_union,
     "ListType": _node_list,
+    "SetType": _node_list,
+    "FrozenSetType": _node_list,
+    "VarTupleType": _node_list,
+    "TupleType": _node_tuple,
     "DictType": _node_dict,
     "EnumType": _node_enum,
     "CustomType": _node_enum,
