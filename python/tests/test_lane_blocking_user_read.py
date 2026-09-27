@@ -184,3 +184,34 @@ def test_a_sync_read_whose_loader_uses_async_to_sync_on_the_lane():
     response = _get(api, "/tenant/acme")
     assert response.status_code == 200, response.text
     assert response.json() == {"tenant": "acme", "username": "bob"}
+
+
+def test_a_loader_async_to_sync_wrapper_made_on_the_loop_does_not_deadlock():
+    """An ``async_to_sync`` wrapper made before the read must not keep the loop that waits.
+
+    asgiref before 3.12 stores the parent loop on the wrapper, when it is made
+    on a running loop or at its first call. The loader then scheduled its
+    coroutine on the loop that waits for the lane, and the request never answered.
+    """
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMiddleware])])
+    bridges = []
+
+    async def resolve_name():
+        await asyncio.sleep(0)
+        return "bob"
+
+    class _BridgeAuth(JWTAuthentication):
+        def get_user_sync(self, user_id):
+            return SimpleNamespace(username=bridges[-1](), tenant=getattr(_local, "tenant", "<unset>"))
+
+    @api.get("/tenant/{tenant}", auth=[_BridgeAuth(secret=SECRET)])
+    async def endpoint(tenant: str, request: Request):
+        bridges.append(async_to_sync(resolve_name))
+        user = request.user
+        return {"tenant": user.tenant, "username": user.username}
+
+    with TestClient(api, timeout=5) as client:
+        response = client.get("/tenant/acme", headers=_headers())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenant": "acme", "username": "bob"}

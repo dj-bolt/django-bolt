@@ -62,3 +62,22 @@ async def test_a_revoked_token_fails_the_websocket_handshake(takes_claims):
     with pytest.raises(PermissionError, match="revoked"):
         await connect(headers)
     assert await connect(_bearer("jti-2", "sid-2")) == "connected"
+
+
+@pytest.mark.asyncio
+async def test_a_denied_handshake_destroys_the_test_app():
+    """Python does not call __aexit__ when the entry fails, so the entry cleans up."""
+    api = BoltAPI()
+
+    async def every_token_revoked(jti: str) -> bool:
+        return True
+
+    @api.websocket("/ws", auth=[JWTAuthentication(secret=SECRET, revoked_token_handler=every_token_revoked)])
+    async def ws(websocket: WebSocket):
+        await websocket.accept()
+
+    client = WebSocketTestClient(api, "/ws", headers=_bearer("jti-1", "sid-1"))
+    with pytest.raises(PermissionError):
+        await client.__aenter__()
+
+    assert client._app_id is None

@@ -278,7 +278,16 @@ class WebSocketTestClient:
 
         Routes through Rust for path matching, authentication, and guard evaluation.
         Uses the same production code path as Rust for parameter injection.
+        Python does not call ``__aexit__`` when the entry fails, so a failed
+        entry destroys the test app here.
         """
+        try:
+            return await self._enter()
+        except BaseException:
+            self._cleanup_app()
+            raise
+
+    async def _enter(self) -> WebSocketTestClient:
         # Use Rust for path matching, auth, and guard evaluation
         _found, handler_id, handler, path_params, scope = self._find_handler_via_rust()
 

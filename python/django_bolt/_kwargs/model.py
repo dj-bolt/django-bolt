@@ -314,6 +314,7 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
         "fields": [],
         "path_params": path_params,
         "http_method": "WEBSOCKET",
+        "path": path,
         "has_file_uploads": False,  # WebSocket never has file uploads
     }
 

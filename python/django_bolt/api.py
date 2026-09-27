@@ -896,6 +896,7 @@ class BoltAPI:
             meta = self._compile_websocket_binder(fn, full_path)
             meta["is_async"] = True
             meta["is_websocket"] = True
+            self._apply_dependency_tree(meta, "WEBSOCKET", full_path)
 
             # URL-reverse identity, same scheme as HTTP routes (see _route_decorator).
             meta["name"] = name if name is not None else fn.__name__
@@ -1527,33 +1528,7 @@ class BoltAPI:
                     meta["needs_headers"] = meta.get("needs_headers", False) or handler_analysis.request_needs_headers
                     meta["needs_cookies"] = meta.get("needs_cookies", False) or handler_analysis.request_needs_cookies
 
-            # Recursively analyze Depends targets so a dep reading request.query
-            # (etc.) causes the handler's route to actually parse query params.
-            # Populate self._handler_meta by (callable, method, path) so runtime
-            # dep resolution (dependencies.resolve_dependency) reuses the compiled meta too.
-            def _compile_dep(dep_fn: Callable) -> dict[str, Any]:
-                key = (dep_fn, method, full_path)
-                cached = self._handler_meta.get(key)
-                if cached is not None:
-                    return cached
-                compiled = self._compile_binder(dep_fn, method, full_path)
-                self._handler_meta[key] = compiled
-                return compiled
-
-            dep_needs = analyze_dependency_tree(meta, _compile_dep)
-            # The request data of the dependencies sets the parsing flags of the route too.
-            dep_fields = dependency_fields(meta, _compile_dep)
-            meta["dependency_fields"] = dep_fields
-            if any(f.source == "path" for f in dep_fields):
-                meta["needs_path_params"] = True
-            if any(f.source in ("form", "file") for f in dep_fields):
-                meta["needs_form_parsing"] = True
-                meta["needs_headers"] = True
-            if any(f.source == "file" or field_has_upload_file(f) for f in dep_fields):
-                meta["has_file_uploads"] = True
-            for needs_key in ("needs_body", "needs_query", "needs_headers", "needs_cookies"):
-                if getattr(dep_needs, needs_key):
-                    meta[needs_key] = True
+            self._apply_dependency_tree(meta, method, full_path)
 
             # Normalize route-level middleware declared via @middleware / @cors / @rate_limit.
             # Validation happens at registration time to fail fast and deterministically.
@@ -1832,6 +1807,39 @@ class BoltAPI:
     def _compile_binder(self, fn: Callable, http_method: str = "", path: str = "") -> HandlerMetadata:
         """Delegate to compile_binder in api_compilation module."""
         return compile_binder(fn, http_method, path)
+
+    def _apply_dependency_tree(self, meta: HandlerMetadata, method: str, full_path: str) -> None:
+        """Set the request data flags of a route from its whole dependency tree.
+
+        A dependency that reads the query, a header or the body makes the route
+        parse it too. The request data fields of the dependencies go into
+        ``meta["dependency_fields"]``, so Rust also gets their types.
+        Each dependency binder is cached by (callable, method, path), and
+        ``dependencies.resolve_dependency`` reuses it at run time.
+        """
+
+        def _compile_dep(dep_fn: Callable) -> dict[str, Any]:
+            key = (dep_fn, method, full_path)
+            cached = self._handler_meta.get(key)
+            if cached is not None:
+                return cached
+            compiled = self._compile_binder(dep_fn, method, full_path)
+            self._handler_meta[key] = compiled
+            return compiled
+
+        dep_needs = analyze_dependency_tree(meta, _compile_dep)
+        dep_fields = dependency_fields(meta, _compile_dep)
+        meta["dependency_fields"] = dep_fields
+        if any(f.source == "path" for f in dep_fields):
+            meta["needs_path_params"] = True
+        if any(f.source in ("form", "file") for f in dep_fields):
+            meta["needs_form_parsing"] = True
+            meta["needs_headers"] = True
+        if any(f.source == "file" or field_has_upload_file(f) for f in dep_fields):
+            meta["has_file_uploads"] = True
+        for needs_key in ("needs_body", "needs_query", "needs_headers", "needs_cookies"):
+            if getattr(dep_needs, needs_key):
+                meta[needs_key] = True
 
     def _compile_websocket_binder(self, fn: Callable, path: str) -> HandlerMetadata:
         """Delegate to compile_websocket_binder in api_compilation module."""
