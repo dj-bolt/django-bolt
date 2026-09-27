@@ -5,6 +5,7 @@ The real-server counterpart is ``integration/test_websocket_revocation_server_in
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import jwt
@@ -80,4 +81,27 @@ async def test_a_denied_handshake_destroys_the_test_app():
     with pytest.raises(PermissionError):
         await client.__aenter__()
 
+    assert client._app_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_entry_stops_the_handler_task():
+    """A cancel that reaches the entry after the handler starts also stops the handler."""
+    api = BoltAPI()
+
+    @api.websocket("/ws")
+    async def ws(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.receive_text()
+
+    client = WebSocketTestClient(api, "/ws")
+    entry = asyncio.create_task(client.__aenter__())
+    # The entry runs up to its last await, after it starts the handler task.
+    await asyncio.sleep(0)
+    entry.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await entry
+
+    assert client._handler_task is not None
+    assert client._handler_task.done()
     assert client._app_id is None

@@ -203,6 +203,13 @@ class WebSocketTestClient:
 
         return self._app_id
 
+    async def _cancel_handler_task(self) -> None:
+        """Cancel the handler task if it still runs, and wait for it to stop."""
+        if self._handler_task and not self._handler_task.done():
+            self._handler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._handler_task
+
     def _cleanup_app(self) -> None:
         """Cleanup test app instance."""
         if self._app_id is not None:
@@ -279,11 +286,12 @@ class WebSocketTestClient:
         Routes through Rust for path matching, authentication, and guard evaluation.
         Uses the same production code path as Rust for parameter injection.
         Python does not call ``__aexit__`` when the entry fails, so a failed
-        entry destroys the test app here.
+        entry stops the handler task and destroys the test app here.
         """
         try:
             return await self._enter()
         except BaseException:
+            await self._cancel_handler_task()
             self._cleanup_app()
             raise
 
@@ -362,11 +370,7 @@ class WebSocketTestClient:
             )
             self._closed = True
 
-        # Cancel handler task if still running
-        if self._handler_task and not self._handler_task.done():
-            self._handler_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._handler_task
+        await self._cancel_handler_task()
 
         # Cleanup test app instance
         self._cleanup_app()
