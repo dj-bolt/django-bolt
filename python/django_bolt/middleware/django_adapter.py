@@ -968,7 +968,11 @@ def _to_django_request(request: Request) -> HttpRequest:
     if request.query:
         django_request.GET = QueryDict(mutable=True)
         for key, value in request.query.items():
-            django_request.GET[key] = value
+            # A sequence parameter holds the list of the values of its repeated key.
+            if isinstance(value, list):
+                django_request.GET.setlist(key, value)
+            else:
+                django_request.GET[key] = value
     else:
         django_request.GET = _get_empty_querydict()  # Reuse singleton (no allocation)
 

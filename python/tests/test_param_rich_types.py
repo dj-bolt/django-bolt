@@ -11,6 +11,7 @@ Each value arrives with its declared type, and a bad value gives a 422:
 
 # No ``from __future__ import annotations``: the tests declare the handlers
 # with local types, and the handlers must resolve them.
+from decimal import Decimal
 from typing import Annotated, NewType
 from urllib.parse import parse_qsl
 
@@ -18,7 +19,8 @@ import msgspec
 import pytest
 
 from django_bolt import BoltAPI
-from django_bolt.param_functions import Cookie, Form, Header, Path, Query
+from django_bolt.middleware import DjangoMiddlewareStack
+from django_bolt.param_functions import Cookie, File, Form, Header, Path, Query
 from django_bolt.serializers.types import PositiveInt
 from django_bolt.testing import TestClient
 
@@ -343,6 +345,101 @@ def test_path_alias_with_constraint():
         assert client.get("/items/0").status_code == 422
 
 
+# --- msgspec.Meta on an optional type, on a bad type, and on a file ---------------------
+
+
+@pytest.fixture(scope="module")
+def optional_constraint_client():
+    api = BoltAPI()
+
+    @api.get("/marker")
+    async def marker(page: Annotated[int | None, msgspec.Meta(ge=1), Query()]):
+        return _show(page)
+
+    @api.get("/default")
+    async def default(page: Annotated[int | None, msgspec.Meta(ge=1)] = None):
+        return _show(page)
+
+    @api.get("/header")
+    async def header(x_limit: Annotated[int | None, msgspec.Meta(le=10), Header()] = None):
+        return _show(x_limit)
+
+    @api.get("/tags")
+    async def tags(tag: Annotated[list[int] | None, msgspec.Meta(max_length=2), Query()] = None):
+        return _show(tag)
+
+    with TestClient(api) as client:
+        yield client
+
+
+@pytest.mark.parametrize(
+    ("url", "headers", "expected"),
+    [
+        ("/marker", {}, {"value": None, "type": "NoneType"}),
+        ("/marker?page=2", {}, {"value": 2, "type": "int"}),
+        ("/default", {}, {"value": None, "type": "NoneType"}),
+        ("/default?page=3", {}, {"value": 3, "type": "int"}),
+        ("/header", {"X-Limit": "10"}, {"value": 10, "type": "int"}),
+        ("/tags", {}, {"value": None, "type": "NoneType"}),
+        ("/tags?tag=1&tag=2", {}, {"value": [1, 2], "type": "list", "item_types": ["int"]}),
+    ],
+)
+def test_a_constraint_on_an_optional_type_applies_to_its_value(optional_constraint_client, url, headers, expected):
+    """``Annotated[int | None, Meta(ge=1)]`` is optional, and a value must meet the constraint."""
+    response = optional_constraint_client.get(url, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "headers"),
+    [
+        ("/marker?page=0", {}),
+        ("/default?page=0", {}),
+        ("/header", {"X-Limit": "11"}),
+        ("/tags?tag=1&tag=2&tag=3", {}),
+    ],
+)
+def test_a_value_outside_the_constraint_of_an_optional_type_is_a_422(optional_constraint_client, url, headers):
+    response = optional_constraint_client.get(url, headers=headers)
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [Annotated[Decimal, msgspec.Meta(ge=0)], Annotated[int | str, msgspec.Meta(ge=1)]],
+    ids=["decimal", "union"],
+)
+def test_a_constraint_that_msgspec_cannot_apply_fails_at_registration(annotation):
+    """msgspec takes ``ge`` on an ``int`` or a ``float`` only. The route fails when it registers, not at each request."""
+    api = BoltAPI()
+
+    async def handler(value: annotation):
+        return {"value": str(value)}
+
+    with pytest.raises(TypeError, match="Can only set `ge`"):
+        api.get("/value")(handler)
+
+
+def test_msgspec_meta_does_not_change_how_a_file_parameter_binds():
+    """``File()`` takes its constraints (``max_files``) itself. A single file still gives a list."""
+    api = BoltAPI()
+
+    @api.post("/marker")
+    async def marker(files: Annotated[list[dict], msgspec.Meta(max_length=3), File()]):
+        return {"type": type(files).__name__, "count": len(files)}
+
+    @api.post("/default")
+    async def default(files: Annotated[list[dict], msgspec.Meta(max_length=3)] = File()):
+        return {"type": type(files).__name__, "count": len(files)}
+
+    with TestClient(api) as client:
+        for url in ("/marker", "/default"):
+            response = client.post(url, files={"files": ("a.txt", b"a", "text/plain")})
+            assert response.status_code == 200, response.text
+            assert response.json() == {"type": "list", "count": 1}
+
+
 def test_the_query_string_of_the_request_keeps_each_value_of_a_sequence_key():
     api = BoltAPI()
 
@@ -357,6 +454,31 @@ def test_the_query_string_of_the_request_keeps_each_value_of_a_sequence_key():
     body = response.json()
     assert sorted(body["query_string"].split("&")) == ["page=2", "tag=1", "tag=3"]
     assert sorted(body["full_path"].removeprefix("/items?").split("&")) == ["page=2", "tag=1", "tag=3"]
+
+
+class _TagRecordingMiddleware:
+    """A Django middleware that copies the ``tag`` values of ``request.GET`` to the request."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        request.tags = request.GET.getlist("tag")
+        return self.get_response(request)
+
+
+def test_django_middleware_reads_each_value_of_a_sequence_key_from_request_get():
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TagRecordingMiddleware])])
+
+    @api.get("/items")
+    async def items(request, tag: Annotated[list[int], Query()]):
+        return {"middleware": request.state.get("tags"), "handler": tag}
+
+    with TestClient(api) as client:
+        response = client.get("/items?tag=1&tag=2")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"middleware": ["1", "2"], "handler": [1, 2]}
 
 
 def test_a_sequence_query_value_over_the_length_limit_is_a_422():

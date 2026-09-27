@@ -138,7 +138,9 @@ async def articles(
 ```
 
 The constraints apply to path, query, header, cookie and form parameters.
+On `int | None`, they apply to the `int` value, and the parameter stays optional.
 The OpenAPI schema shows them, for example `minimum: 1`.
+A constraint that msgspec cannot apply, for example `ge` on a `Decimal`, raises `TypeError` when the route registers.
 The types in `django_bolt.serializers.types`, such as `PositiveInt`, work the same way.
 
 ### NewType and type aliases

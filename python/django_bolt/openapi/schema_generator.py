@@ -1307,10 +1307,12 @@ class SchemaGenerator:
 
         # Optional[T] -> T (single non-None arg only; multi-arm unions like
         # ``A | B | None`` go to _union_schema so every arm is preserved).
+        # T goes through this method again, so ``Annotated[int, Meta(ge=1)] | None``
+        # shows the constraints of its value.
         if is_optional(type_annotation):
             non_none_args = [arg for arg in get_args(type_annotation) if arg is not type(None)]
             if len(non_none_args) == 1:
-                type_annotation = non_none_args[0]
+                return self._typing_to_schema(non_none_args[0], register_component)
 
         origin_handler = _TYPING_ORIGIN_HANDLERS.get(get_origin(type_annotation))
         if origin_handler is not None:

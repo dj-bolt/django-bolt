@@ -18,7 +18,6 @@ import msgspec
 from ..analysis import resolve_introspection_target
 from ..dependencies import resolve_dependency, resolve_dependency_sync
 from ..params import Depends as DependsMarker
-from ..params import Param
 from ..typing import (
     FieldDefinition,
     HandlerMetadata,
@@ -189,12 +188,8 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         name = param.name
         annotation = type_hints.get(name, param.annotation)
 
-        # Take the Param or Depends marker out of Annotated[T, ...]. msgspec.Meta stays.
-        annotation, explicit_marker = split_param_annotation(annotation)
-
-        # Check default value for marker
-        if explicit_marker is None and isinstance(param.default, (Param, DependsMarker)):
-            explicit_marker = param.default
+        # Take the Param or Depends marker out of Annotated[T, ...] or the default. msgspec.Meta stays.
+        annotation, explicit_marker = split_param_annotation(annotation, param.default)
 
         # Create FieldDefinition with inference
         field = FieldDefinition.from_parameter(
@@ -339,11 +334,8 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
         if name in ("websocket", "ws") and annotation is inspect.Parameter.empty:
             continue
 
-        # Take the Param or Depends marker out of Annotated[T, ...]. msgspec.Meta stays.
-        annotation, explicit_marker = split_param_annotation(annotation)
-
-        if explicit_marker is None and isinstance(param.default, (Param, DependsMarker)):
-            explicit_marker = param.default
+        # Take the Param or Depends marker out of Annotated[T, ...] or the default. msgspec.Meta stays.
+        annotation, explicit_marker = split_param_annotation(annotation, param.default)
 
         # Create FieldDefinition with inference
         # WebSocket doesn't have body, so primitives should default to query

@@ -112,6 +112,24 @@ def test_the_constraints_of_a_parameter_show_in_its_schema():
     }
 
 
+def test_the_constraint_of_an_optional_parameter_shows_on_its_value_type():
+    """Both spellings of an optional constrained parameter show ``minimum: 1``, and neither is required."""
+    api = BoltAPI()
+
+    @api.get("/items")
+    async def items(
+        page: Annotated[int | None, msgspec.Meta(ge=1), Query()],
+        size: Annotated[int, msgspec.Meta(ge=1)] | None = None,
+    ):
+        return {}
+
+    parameters = _spec(api)["paths"]["/items"]["get"]["parameters"]
+    assert {parameter["name"]: (parameter["required"], parameter["schema"]) for parameter in parameters} == {
+        "page": (False, {"type": "integer", "minimum": 1}),
+        "size": (False, {"type": "integer", "minimum": 1}),
+    }
+
+
 @dataclasses.dataclass
 class Address:
     """A postal address."""

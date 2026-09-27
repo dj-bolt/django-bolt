@@ -323,26 +323,44 @@ def resolve_type_alias(annotation: Any) -> Any:
     return annotation
 
 
-def split_param_annotation(annotation: Any) -> tuple[Any, Any]:
+def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, Any]:
     """Split a parameter annotation into its value type and its ``Param`` or ``Depends`` marker.
 
     ``Annotated[int, msgspec.Meta(ge=1), Query()]`` gives ``(Annotated[int, msgspec.Meta(ge=1)], Query())``.
+    The marker comes from ``Annotated``, or else from ``default``. It is None when there is none.
     The ``msgspec.Meta`` items stay on a scalar or a sequence type, so the value
-    is validated against them and the schema shows them. A struct, a dataclass
-    or an upload keeps only its base type, as before. A ``NewType`` or a ``type``
-    alias resolves to the type it names. The marker is None when there is none.
+    is validated against them and the schema shows them. They go on the type
+    inside ``Optional``, because msgspec takes ``Annotated[int, Meta(ge=1)] | None``
+    and rejects ``Annotated[int | None, Meta(ge=1)]``. A struct, a dataclass, an
+    upload or a ``File()`` parameter keeps only its base type, as before. A
+    ``NewType`` or a ``type`` alias resolves to the type it names.
+
+    Raises:
+        TypeError: msgspec cannot apply a constraint to the type, for example ``ge`` to a ``Decimal``.
     """
+    default_marker = default if isinstance(default, (Param, DependsMarker)) else None
     annotation = resolve_type_alias(annotation)
     if get_origin(annotation) is not Annotated:
-        return annotation, None
+        return annotation, default_marker
     base, *extras = get_args(annotation)
     base = resolve_type_alias(base)
-    marker = next((extra for extra in extras if isinstance(extra, (Param, DependsMarker))), None)
+    marker = next((extra for extra in extras if isinstance(extra, (Param, DependsMarker))), default_marker)
     constraints = [extra for extra in extras if isinstance(extra, msgspec.Meta)]
     inner = unwrap_optional(base)
-    if not constraints or is_msgspec_struct(inner) or is_dataclass_type(inner) or is_upload_file_type(inner):
+    if (
+        not constraints
+        or is_msgspec_struct(inner)
+        or is_dataclass_type(inner)
+        or is_upload_file_type(inner)
+        or (isinstance(marker, Param) and marker.source == "file")
+    ):
         return base, marker
-    return Annotated[(base, *constraints)], marker
+    constrained = Annotated[(inner, *constraints)]
+    if is_optional(base):
+        constrained = constrained | None
+    # Check the constraints at registration. Else each request fails with a TypeError.
+    msgspec.inspect.type_info(constrained)
+    return constrained, marker
 
 
 def is_dataclass_type(annotation: Any) -> bool:
