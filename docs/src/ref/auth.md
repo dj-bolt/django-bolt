@@ -414,14 +414,15 @@ Requires a model with `jti` (unique, indexed) and `expires_at`
 
 After authentication, `request.context` contains:
 
-| Key            | Type        | Description                     |
-| -------------- | ----------- | ------------------------------- |
-| `user_id`      | `str`       | User identifier                 |
-| `is_staff`     | `bool`      | Staff status                    |
-| `is_superuser` | `bool`      | Superuser status                |
-| `auth_backend` | `str`       | Backend name (`jwt`, `api_key`) |
-| `permissions`  | `list[str]` | User permissions                |
-| `auth_claims`  | `dict`      | JWT claims (JWT only)           |
+| Key                  | Type        | Description                                                   |
+| -------------------- | ----------- | ------------------------------------------------------------- |
+| `user_id`            | `str`       | User identifier                                               |
+| `is_staff`           | `bool`      | Staff status                                                  |
+| `is_superuser`       | `bool`      | Superuser status                                              |
+| `auth_backend`       | `str`       | Backend name (`jwt`, `api_key`)                               |
+| `auth_backend_index` | `int`       | Position of the backend that authenticated, in the `auth` list |
+| `permissions`        | `list[str]` | User permissions                                              |
+| `auth_claims`        | `dict`      | JWT claims (JWT only)                                         |
 
 ```python
 @api.get("/info")

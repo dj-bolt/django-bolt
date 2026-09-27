@@ -17,6 +17,7 @@ Performance: ~60k+ RPS with JWT validation happening entirely in Rust.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sys
 import threading
@@ -37,7 +38,21 @@ from .pk_loader import load_user_by_pk_sync
 from .revocation import create_revocation_handler
 
 # (jti) -> True if the token is revoked, False otherwise.
-RevokedTokenHandler = Callable[[str], Awaitable[bool]]
+RevokedTokenHandler = Callable[[str], Awaitable[bool]] | Callable[[str, dict[str, Any]], Awaitable[bool]]
+
+_POSITIONAL = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+
+
+def revocation_takes_claims(handler: RevokedTokenHandler) -> bool:
+    """Whether a ``revoked_token_handler`` takes the claims as its second argument.
+
+    Bolt reads this one time, at registration.
+    """
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return sum(1 for parameter in parameters if parameter.kind in _POSITIONAL) >= 2
 
 
 @dataclass
@@ -126,6 +141,12 @@ class JWTAuthentication(BaseAuthentication):
         audience: Optional JWT audience claim to validate. Required with
             ``jwks_url`` to prevent cross-application token substitution.
         issuer: Optional JWT issuer claim to validate
+        revoked_token_handler: Async callable that returns True when a token is
+            revoked. Bolt calls it for each authenticated request, with the
+            ``jti`` of the token: ``handler(jti)``. A handler with two
+            parameters also gets the verified claims: ``handler(jti, claims)``.
+            Use the claims to reject a token whose session ended, for example
+            the ``sid`` of a django-allauth access token.
         public_key: PEM-encoded public key for asymmetric algorithms
             (RS*/PS*/ES*/EdDSA). Preferred over passing a PEM via ``secret``
             (which also works, for compatibility). Mutually exclusive with
@@ -134,9 +155,14 @@ class JWTAuthentication(BaseAuthentication):
             validation (default: 60).
         token_type: Expected ``typ`` claim. When set (e.g. ``"refresh"`` for
             a token-rotation endpoint), tokens must carry exactly that
-            ``typ``. When left as None (normal access routes), tokens
-            carrying ``typ: "refresh"`` are rejected so refresh tokens can
-            never authenticate a regular endpoint.
+            ``typ``, and no other type claim that disagrees. When left as
+            None (normal access routes), a token is rejected when its
+            ``typ``, ``token_type`` (djangorestframework-simplejwt) or
+            ``token_use`` (django-allauth, AWS Cognito) names a refresh or
+            ID token: ``refresh``, ``offline`` or ``id``, in any case
+            (Keycloak writes ``Refresh``, ``Offline`` and ``ID``). So such a
+            token never authenticates a regular endpoint. An OIDC ID token
+            with no type claim still passes: set ``audience`` to reject it.
         csrf: When the token is read from a ``cookie``, enforce a cross-site
             origin check on unsafe (state-changing) HTTP methods, since bolt
             bypasses Django's ``CsrfViewMiddleware`` and cookies are attached
@@ -361,10 +387,6 @@ class JWTAuthentication(BaseAuthentication):
             if self.jwks_url is not None:
                 metadata["jwks_refresh"] = self._refresh_jwks
                 metadata["jwks_refresh_interval"] = self.jwks_refresh_interval
-
-        # Add revocation handler reference (will be called from Rust if present)
-        if self.revoked_token_handler:
-            metadata["has_revocation_handler"] = True
 
         return metadata
 

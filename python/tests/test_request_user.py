@@ -227,6 +227,47 @@ class TestJWTUserLoading:
         assert body["before"] == f"<LazyUser: user_id={str(user.pk)!r}, not loaded>"
         assert "repr_user" in body["after"]
 
+    @pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync", "async"])
+    def test_two_jwt_backends_load_each_user_with_their_own_get_user(self, handler_is_async):
+        """Both backends have the scheme name "jwt". The backend that accepts the token loads the user."""
+        secret_a = "user-loader-a-secret-longer-than-32-characters"
+        secret_b = "user-loader-b-secret-longer-than-32-characters"
+
+        class TenantA(JWTAuthentication):
+            def get_user_sync(self, user_id):
+                return User(username=f"a:{user_id}")
+
+        class TenantB(JWTAuthentication):
+            def get_user_sync(self, user_id):
+                return User(username=f"b:{user_id}")
+
+        api = BoltAPI(django_middleware=[])
+        backends = [TenantA(secret=secret_a), TenantB(secret=secret_b)]
+
+        if handler_is_async:
+
+            @api.get("/me", auth=backends)
+            async def me(request):
+                return {"user": request.user.username, "auser": (await request.auser()).username}
+        else:
+
+            @api.get("/me", auth=backends)
+            def me(request):
+                return {"user": request.user.username, "auser": request.user.username}
+
+        def bearer(secret: str) -> dict[str, str]:
+            token = jwt.encode({"sub": "7", "exp": int(time.time()) + 60}, secret, algorithm="HS256")
+            return {"Authorization": f"Bearer {token}"}
+
+        with TestClient(api) as client:
+            response_a = client.get("/me", headers=bearer(secret_a))
+            response_b = client.get("/me", headers=bearer(secret_b))
+
+        assert response_a.status_code == 200, response_a.text
+        assert response_a.json() == {"user": "a:7", "auser": "a:7"}
+        assert response_b.status_code == 200, response_b.text
+        assert response_b.json() == {"user": "b:7", "auser": "b:7"}
+
     def test_auser_returns_anonymous_without_authentication(self):
         """The async getter still returns an anonymous user without authentication."""
         api = BoltAPI(django_middleware=[])
