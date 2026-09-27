@@ -1,0 +1,167 @@
+"""A revoked token fails the WebSocket handshake of ``WebSocketTestClient``.
+
+The real-server counterpart is ``integration/test_websocket_revocation_server_integration.py``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+
+import jwt
+import pytest
+
+from django_bolt import BoltAPI, WebSocket
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
+from django_bolt.testing import WebSocketTestClient
+
+SECRET = "websocket-revocation-secret-longer-than-32-characters"
+
+
+def _bearer(jti: str, sid: str) -> dict[str, str]:
+    token = jwt.encode({"sub": "1", "jti": jti, "sid": sid, "exp": int(time.time()) + 60}, SECRET, algorithm="HS256")
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("takes_claims", [False, True], ids=["jti", "claims"])
+async def test_a_revoked_token_fails_the_websocket_handshake(takes_claims):
+    revoked: set[str] = set()
+    seen: list[dict] = []
+
+    if takes_claims:
+
+        async def handler(jti: str, claims: dict) -> bool:
+            seen.append(claims)
+            return claims["sid"] in revoked
+    else:
+
+        async def handler(jti: str) -> bool:
+            return jti in revoked
+
+    api = BoltAPI()
+
+    @api.websocket(
+        "/ws", auth=[JWTAuthentication(secret=SECRET, revoked_token_handler=handler)], guards=[IsAuthenticated()]
+    )
+    async def endpoint(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    async def connect(headers):
+        async with WebSocketTestClient(
+            api, "/ws", headers=headers, cors_allowed_origins=["*"], read_django_settings=False
+        ) as websocket:
+            return await websocket.receive_text()
+
+    headers = _bearer("jti-1", "sid-1")
+    assert await connect(headers) == "connected"
+    if takes_claims:
+        assert seen[0]["sid"] == "sid-1"
+
+    revoked.add("sid-1" if takes_claims else "jti-1")
+    with pytest.raises(PermissionError, match="revoked"):
+        await connect(headers)
+    assert await connect(_bearer("jti-2", "sid-2")) == "connected"
+
+
+@pytest.mark.asyncio
+async def test_two_jwt_backends_check_each_handshake_token_with_its_own_revocation_handler():
+    """Both backends have the scheme name "jwt". The backend that accepts the token checks it."""
+    secret_a = "websocket-backend-a-secret-longer-than-32-characters"
+    secret_b = "websocket-backend-b-secret-longer-than-32-characters"
+    checked: list[tuple[str, str]] = []
+
+    async def handler_a(jti: str) -> bool:
+        checked.append(("a", jti))
+        return jti == "revoked-a"
+
+    async def handler_b(jti: str) -> bool:
+        checked.append(("b", jti))
+        return jti == "revoked-b"
+
+    api = BoltAPI()
+
+    @api.websocket(
+        "/ws",
+        auth=[
+            JWTAuthentication(secret=secret_a, revoked_token_handler=handler_a),
+            JWTAuthentication(secret=secret_b, revoked_token_handler=handler_b),
+        ],
+        guards=[IsAuthenticated()],
+    )
+    async def endpoint(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    async def connect(secret: str, jti: str) -> str:
+        token = jwt.encode({"sub": "1", "jti": jti, "exp": int(time.time()) + 60}, secret, algorithm="HS256")
+        async with WebSocketTestClient(
+            api,
+            "/ws",
+            headers={"Authorization": f"Bearer {token}"},
+            cors_allowed_origins=["*"],
+            read_django_settings=False,
+        ) as websocket:
+            return await websocket.receive_text()
+
+    assert await connect(secret_a, "ok-a") == "connected"
+    assert await connect(secret_b, "ok-b") == "connected"
+    with pytest.raises(PermissionError, match="revoked"):
+        await connect(secret_a, "revoked-a")
+    with pytest.raises(PermissionError, match="revoked"):
+        await connect(secret_b, "revoked-b")
+    # A jti that the other backend revokes does not revoke this token.
+    assert await connect(secret_a, "revoked-b") == "connected"
+    assert await connect(secret_b, "revoked-a") == "connected"
+
+    assert checked == [
+        ("a", "ok-a"),
+        ("b", "ok-b"),
+        ("a", "revoked-a"),
+        ("b", "revoked-b"),
+        ("a", "revoked-b"),
+        ("b", "revoked-a"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_denied_handshake_destroys_the_test_app():
+    """Python does not call __aexit__ when the entry fails, so the entry cleans up."""
+    api = BoltAPI()
+
+    async def every_token_revoked(jti: str) -> bool:
+        return True
+
+    @api.websocket("/ws", auth=[JWTAuthentication(secret=SECRET, revoked_token_handler=every_token_revoked)])
+    async def ws(websocket: WebSocket):
+        await websocket.accept()
+
+    client = WebSocketTestClient(api, "/ws", headers=_bearer("jti-1", "sid-1"))
+    with pytest.raises(PermissionError):
+        await client.__aenter__()
+
+    assert client._app_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_entry_stops_the_handler_task():
+    """A cancel that reaches the entry after the handler starts also stops the handler."""
+    api = BoltAPI()
+
+    @api.websocket("/ws")
+    async def ws(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.receive_text()
+
+    client = WebSocketTestClient(api, "/ws")
+    entry = asyncio.create_task(client.__aenter__())
+    # The entry runs up to its last await, after it starts the handler task.
+    await asyncio.sleep(0)
+    entry.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await entry
+
+    assert client._handler_task is not None
+    assert client._handler_task.done()
+    assert client._app_id is None
