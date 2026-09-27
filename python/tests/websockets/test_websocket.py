@@ -638,6 +638,14 @@ async def test_websocket_query_injection(injection_api):
 
 
 @pytest.mark.asyncio
+async def test_websocket_query_plus_decodes_to_space(injection_api):
+    """A `+` in the query is a space and `%2B` is a literal `+`, as in Django."""
+    async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=hello+world%2B1") as ws:
+        response = await ws.receive_json()
+        assert response["token"] == "hello world+1"
+
+
+@pytest.mark.asyncio
 async def test_websocket_query_injection_default(injection_api):
     """Test Query() parameter uses default value when not provided."""
     async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=xyz") as ws:

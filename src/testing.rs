@@ -35,7 +35,7 @@ use bolt_core::metadata::{CorsConfig, RateLimitKey, RouteMetadata, RouteMetadata
 use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
-use bolt_core::router::Router;
+use bolt_core::router::{decode_query_component, Router};
 use bolt_core::state::{find_asgi_mount, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS};
 use bolt_websocket::WebSocketRouter;
 use futures_util::StreamExt;
@@ -1498,8 +1498,8 @@ pub fn handle_test_websocket(
         if !qs.is_empty() {
             for pair in qs.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
-                    let decoded_key = urlencoding::decode(key).unwrap_or_default();
-                    let decoded_value = urlencoding::decode(value).unwrap_or_default();
+                    let decoded_key = decode_query_component(key);
+                    let decoded_value = decode_query_component(value);
 
                     let type_hint = param_types
                         .get(decoded_key.as_ref())

@@ -278,8 +278,8 @@ class TestIntegerBoundaries:
 
         Security: Only plain integers accepted, no prefix modifiers.
         """
-        # Plus sign in integer (tests strict parsing)
-        response = client.get("/query/int?value=+123")
+        # Plus sign in integer (tests strict parsing). A bare `+` in a query is a space.
+        response = client.get("/query/int?value=%2B123")
         # Note: Rust's i64::parse may accept +123, so we document behavior
         if response.status_code == 200:
             # If accepted, verify the value is correct

@@ -60,6 +60,34 @@ def test_query_parameters():
         assert data["limit"] == 20
 
 
+def test_query_plus_decodes_to_space():
+    """A `+` in the query is a space and `%2B` is a literal `+`, as in Django."""
+    api = BoltAPI()
+
+    @api.get("/search")
+    async def search(q: str, tag: str = ""):
+        return {"q": q, "tag": tag}
+
+    @api.get("/items/{name}")
+    async def item(name: str):
+        return {"name": name}
+
+    with TestClient(api) as client:
+        response = client.get("/search?q=hello+world&tag=a%2Bb")
+        assert response.status_code == 200
+        assert response.json() == {"q": "hello world", "tag": "a+b"}
+
+        # httpx encodes a space in params as `+` and a `+` as `%2B`.
+        response = client.get("/search", params={"q": "x y", "tag": "c+d"})
+        assert response.status_code == 200
+        assert response.json() == {"q": "x y", "tag": "c+d"}
+
+        # A `+` in the path is a literal `+`.
+        response = client.get("/items/a+b")
+        assert response.status_code == 200
+        assert response.json() == {"name": "a+b"}
+
+
 def test_post_with_body():
     """Test POST with JSON body."""
 

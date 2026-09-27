@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use bolt_core::metadata::CorsConfig;
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::request_pipeline::{set_declared_item, EMPTY_TYPES};
+use bolt_core::router::decode_query_component;
 use bolt_core::state::{AppState, ROUTE_METADATA};
 use bolt_core::type_coercion::coerced_value_to_py;
 use bolt_core::type_coercion::{coerce_param, CoerceError, TypeHints, TYPE_STRING};
@@ -96,8 +97,8 @@ fn build_scope(
     if !query_string.is_empty() {
         for pair in query_string.split('&') {
             if let Some((key, value)) = pair.split_once('=') {
-                let decoded_key = urlencoding::decode(key).unwrap_or_default();
-                let decoded_value = urlencoding::decode(value).unwrap_or_default();
+                let decoded_key = decode_query_component(key);
+                let decoded_value = decode_query_component(value);
 
                 // Get type hint and coerce
                 let type_hint = param_types

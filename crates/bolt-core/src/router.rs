@@ -328,7 +328,7 @@ impl Router {
 
 /// URL-decode path parameters in place (`/items/hello%20world` yields `hello world`).
 /// A value that does not decode to UTF-8 stays as it is.
-/// The decoder does not change `+`, so only a `%` starts a decode.
+/// A `+` in a path is a literal `+`, so only a `%` starts a decode.
 #[inline]
 pub fn decode_path_params(params: &mut AHashMap<String, String>) {
     for v in params.values_mut() {
@@ -337,6 +337,26 @@ pub fn decode_path_params(params: &mut AHashMap<String, String>) {
                 *v = s;
             }
         }
+    }
+}
+
+/// Decode one query key or value, as Django `QueryDict` does (`application/x-www-form-urlencoded`).
+/// A `+` becomes a space before the percent-decode, so `%2B` gives a literal `+`.
+/// A value that does not decode to UTF-8 stays as it is.
+/// Do not use this for path params: a `+` in a path is a literal `+`.
+#[inline]
+pub fn decode_query_component(value: &str) -> Cow<'_, str> {
+    let bytes = value.as_bytes();
+    let has_percent = memchr::memchr(b'%', bytes).is_some();
+    let has_plus = memchr::memchr(b'+', bytes).is_some();
+    match (has_percent, has_plus) {
+        (false, false) => Cow::Borrowed(value),
+        (false, true) => Cow::Owned(value.replace('+', " ")),
+        (true, false) => urlencoding::decode(value).unwrap_or(Cow::Borrowed(value)),
+        (true, true) => match urlencoding::decode(&value.replace('+', " ")) {
+            Ok(decoded) => Cow::Owned(decoded.into_owned()),
+            Err(_) => Cow::Borrowed(value),
+        },
     }
 }
 
@@ -349,27 +369,18 @@ pub fn parse_query_string(query: &str) -> AHashMap<String, String> {
         return params;
     }
 
-    #[inline(always)]
-    fn decode_component(value: &str) -> Cow<'_, str> {
-        if value.as_bytes().iter().any(|&b| b == b'%' || b == b'+') {
-            urlencoding::decode(value).unwrap_or_else(|_| Cow::Borrowed(value))
-        } else {
-            Cow::Borrowed(value)
-        }
-    }
-
     for pair in query.split('&') {
         if let Some(eq_pos) = pair.find('=') {
             let key = &pair[..eq_pos];
             let value = &pair[eq_pos + 1..];
             if !key.is_empty() {
                 params.insert(
-                    decode_component(key).into_owned(),
-                    decode_component(value).into_owned(),
+                    decode_query_component(key).into_owned(),
+                    decode_query_component(value).into_owned(),
                 );
             }
         } else if !pair.is_empty() {
-            params.insert(decode_component(pair).into_owned(), String::new());
+            params.insert(decode_query_component(pair).into_owned(), String::new());
         }
     }
 
@@ -399,5 +410,25 @@ mod tests {
         assert_eq!(params["plain"], "abc");
         assert_eq!(params["plus"], "a+b");
         assert_eq!(params["bad"], "%FF");
+    }
+
+    #[test]
+    fn test_parse_query_string_decodes_plus_as_space() {
+        let params =
+            parse_query_string("q=hello+world&tag=a%2Bb&mixed=a+b%20c&my+key=1&flag+on&plain=x");
+
+        assert_eq!(params["q"], "hello world");
+        assert_eq!(params["tag"], "a+b");
+        assert_eq!(params["mixed"], "a b c");
+        assert_eq!(params["my key"], "1");
+        assert_eq!(params["flag on"], "");
+        assert_eq!(params["plain"], "x");
+    }
+
+    #[test]
+    fn test_parse_query_string_keeps_value_that_is_not_utf8() {
+        let params = parse_query_string("bad=a+%FF");
+
+        assert_eq!(params["bad"], "a+%FF");
     }
 }
