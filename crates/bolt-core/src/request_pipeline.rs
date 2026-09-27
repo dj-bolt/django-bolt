@@ -384,9 +384,9 @@ mod tests {
         );
         let detail =
             coerce_param_value("q", &"a".repeat(65), &hints, 64, "Path parameter").unwrap_err();
-        assert!(
-            detail.starts_with("Path parameter 'q': Parameter too long"),
-            "{detail}"
+        assert_eq!(
+            detail,
+            "Path parameter 'q': Parameter too long: 65 bytes (max 64 bytes)"
         );
     }
 
