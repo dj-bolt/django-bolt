@@ -25,6 +25,7 @@ from ..typing import (
     HandlerPattern,
     is_msgspec_struct,
     is_upload_file_type,
+    split_param_annotation,
     unwrap_optional,
 )
 from ..websocket import WebSocket as WebSocketType
@@ -188,18 +189,8 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         name = param.name
         annotation = type_hints.get(name, param.annotation)
 
-        # Extract explicit markers from Annotated or default
-        explicit_marker = None
-
-        # Check Annotated[T, ...]
-        origin = get_origin(annotation)
-        if origin is Annotated:
-            args = get_args(annotation)
-            annotation = args[0] if args else annotation  # Unwrap to get actual type
-            for meta_val in args[1:]:
-                if isinstance(meta_val, (Param, DependsMarker)):
-                    explicit_marker = meta_val
-                    break
+        # Take the Param or Depends marker out of Annotated[T, ...]. msgspec.Meta stays.
+        annotation, explicit_marker = split_param_annotation(annotation)
 
         # Check default value for marker
         if explicit_marker is None and isinstance(param.default, (Param, DependsMarker)):
@@ -348,16 +339,8 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
         if name in ("websocket", "ws") and annotation is inspect.Parameter.empty:
             continue
 
-        # Extract explicit markers from Annotated or default
-        explicit_marker = None
-
-        if origin is Annotated:
-            args = get_args(annotation)
-            annotation = args[0] if args else annotation
-            for meta_val in args[1:]:
-                if isinstance(meta_val, (Param, DependsMarker)):
-                    explicit_marker = meta_val
-                    break
+        # Take the Param or Depends marker out of Annotated[T, ...]. msgspec.Meta stays.
+        annotation, explicit_marker = split_param_annotation(annotation)
 
         if explicit_marker is None and isinstance(param.default, (Param, DependsMarker)):
             explicit_marker = param.default

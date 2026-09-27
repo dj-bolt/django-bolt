@@ -8,9 +8,9 @@ import inspect
 import re
 import uuid
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import is_dataclass, replace
 from types import UnionType
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_origin, is_typeddict
 
 import msgspec
 
@@ -25,7 +25,7 @@ from ..responses import (
     StreamingResponse,
 )
 from ..serializers.fields import _FieldMarker
-from ..typing import is_msgspec_struct, is_optional, unwrap_optional
+from ..typing import is_msgspec_struct, is_optional, resolve_type_alias, unwrap_optional
 from ..views import _layer
 from .spec import (
     Example,
@@ -330,7 +330,13 @@ class SchemaGenerator:
         ``msgspec.json.schema_components`` carries through.
         """
         own_doc = cls.__dict__.get("__doc__")
-        return inspect.cleandoc(own_doc) if own_doc else None
+        if not own_doc:
+            return None
+        # A dataclass or a NamedTuple with no docstring gets its signature as
+        # ``__doc__``, for example ``Point(x, y)``. msgspec skips it too.
+        if (is_dataclass(cls) or issubclass(cls, tuple)) and own_doc.startswith(f"{cls.__name__}("):
+            return None
+        return inspect.cleandoc(own_doc)
 
     def _enum_schema(self, enum_cls: type, *, register_component: bool) -> Schema | Reference:
         """Promote a named enum to a component (``$ref``) or inline its values.
@@ -1283,6 +1289,8 @@ class SchemaGenerator:
 
     def _typing_to_schema(self, type_annotation: Any, register_component: bool) -> Schema | Reference:
         """Convert a raw ``typing`` annotation (not a msgspec.inspect node)."""
+        # A NewType or a ``type`` alias documents the type it names, as msgspec decodes it.
+        type_annotation = resolve_type_alias(type_annotation)
         # A documented custom type (e.g. ``Email = Annotated[str, Meta(...)]``)
         # used directly as a response model — bare or nested (``list[Email]``) —
         # still carries its msgspec Meta. Normalize it through msgspec.inspect so
@@ -1319,6 +1327,13 @@ class SchemaGenerator:
         # as the msgspec EnumType path. (#246)
         if isinstance(type_annotation, type) and issubclass(type_annotation, enum.Enum):
             return self._enum_schema(type_annotation, register_component=register_component)
+        # A dataclass, a TypedDict or a NamedTuple: the same component as a struct field of that type.
+        if isinstance(type_annotation, type) and (
+            is_dataclass(type_annotation)
+            or is_typeddict(type_annotation)
+            or (issubclass(type_annotation, tuple) and hasattr(type_annotation, "_fields"))
+        ):
+            return self._type_to_schema(msgspec.inspect.type_info(type_annotation), register_component)
         primitive = _PRIMITIVE_SCHEMAS.get(type_annotation)
         return Schema(**primitive) if primitive is not None else Schema(type="object")
 
@@ -1515,6 +1530,31 @@ def _node_str(gen: SchemaGenerator, node: Any, register: bool) -> Schema:
     )
 
 
+def _node_named_tuple(gen: SchemaGenerator, node: Any, register: bool) -> Reference:
+    """A NamedTuple: msgspec encodes it as an array, with one schema for each position."""
+    cls = node.cls
+
+    def build() -> Schema:
+        items: list[Schema | Reference] = []
+        required = 0
+        for field in node.fields:
+            _name, field_schema, field_required = gen._msgspec_field_schema(field, register_component=True)
+            items.append(field_schema)
+            required += field_required
+        return Schema(
+            **gen._schema_kwargs(
+                title=_type_display_name(cls),
+                description=gen._own_docstring(cls),
+                type="array",
+                prefix_items=items or None,
+                min_items=required,
+                max_items=len(items),
+            )
+        )
+
+    return gen._register_component(cls, build)
+
+
 def _node_struct(gen: SchemaGenerator, node: Any, register: bool) -> Schema | Reference:
     # Always a component so self-referential types emit a $ref instead of
     # recursing forever; _struct_to_component_schema guards re-entry.
@@ -1587,6 +1627,12 @@ _MSGSPEC_NODE_HANDLERS: dict[str, Callable[[SchemaGenerator, Any, bool], Schema 
     "StrType": _node_str,
     "BoolType": lambda _g, _n, _r: Schema(type="boolean"),
     "BytesType": lambda _g, _n, _r: Schema(type="string", format="binary"),
+    "ByteArrayType": lambda _g, _n, _r: Schema(type="string", format="binary"),
+    "MemoryViewType": lambda _g, _n, _r: Schema(type="string", format="binary"),
+    # Any value: an empty schema. msgspec.Raw holds JSON of any type.
+    "AnyType": lambda _g, _n, _r: Schema(),
+    "RawType": lambda _g, _n, _r: Schema(),
+    "NoneType": lambda _g, _n, _r: Schema(type="null"),
     "DateTimeType": lambda _g, _n, _r: Schema(type="string", format="date-time"),
     "DateType": lambda _g, _n, _r: Schema(type="string", format="date"),
     "TimeType": lambda _g, _n, _r: Schema(type="string", format="time"),
@@ -1594,6 +1640,10 @@ _MSGSPEC_NODE_HANDLERS: dict[str, Callable[[SchemaGenerator, Any, bool], Schema 
     "TimeDeltaType": lambda _g, _n, _r: Schema(type="string", format="duration"),
     "DecimalType": lambda _g, _n, _r: Schema(type="string", format="decimal"),
     "StructType": _node_struct,
+    # A dataclass and a TypedDict are JSON objects, as a struct is.
+    "DataclassType": _node_struct,
+    "TypedDictType": _node_struct,
+    "NamedTupleType": _node_named_tuple,
     "UnionType": _node_union,
     "ListType": _node_list,
     "SetType": _node_list,
@@ -1618,6 +1668,23 @@ def _origin_list(gen: SchemaGenerator, args: tuple[Any, ...], register: bool) ->
     return Schema(type="array", items=gen._type_to_schema(item_type, register_component=register))
 
 
+def _origin_set(gen: SchemaGenerator, args: tuple[Any, ...], register: bool) -> Schema:
+    item_type = args[0] if args else Any
+    return Schema(type="array", items=gen._type_to_schema(item_type, register_component=register), unique_items=True)
+
+
+def _origin_tuple(gen: SchemaGenerator, args: tuple[Any, ...], register: bool) -> Schema:
+    # tuple[int, ...] has one item type. tuple[int, str] has one type for each position.
+    if len(args) == 2 and args[1] is Ellipsis:
+        return Schema(type="array", items=gen._type_to_schema(args[0], register_component=register))
+    return Schema(
+        type="array",
+        prefix_items=[gen._type_to_schema(arg, register_component=register) for arg in args] or None,
+        min_items=len(args),
+        max_items=len(args),
+    )
+
+
 def _origin_dict(gen: SchemaGenerator, args: tuple[Any, ...], register: bool) -> Schema:
     # dict[K] without a value type or dict[str, Any] stays additionalProperties: true.
     value_type = args[1] if len(args) == 2 else None
@@ -1629,6 +1696,9 @@ _TYPING_ORIGIN_HANDLERS: dict[Any, Callable[[SchemaGenerator, tuple[Any, ...], b
     Union: _origin_union,
     UnionType: _origin_union,
     list: _origin_list,
+    set: _origin_set,
+    frozenset: _origin_set,
+    tuple: _origin_tuple,
     dict: _origin_dict,
     # Bare typing.Literal does not go through msgspec.inspect.type_info.
     Literal: lambda gen, args, _r: gen._enum_values_schema(args),
@@ -1643,6 +1713,7 @@ _PRIMITIVE_SCHEMAS: dict[Any, dict[str, str]] = {
     float: {"type": "number"},
     bool: {"type": "boolean"},
     bytes: {"type": "string", "format": "binary"},
+    Any: {},
     datetime.datetime: {"type": "string", "format": "date-time"},
     datetime.date: {"type": "string", "format": "date"},
     datetime.time: {"type": "string", "format": "time"},

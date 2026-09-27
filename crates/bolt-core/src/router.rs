@@ -340,6 +340,16 @@ pub fn decode_path_params(params: &mut AHashMap<String, String>) {
     }
 }
 
+/// Decode one key or value of a query string. A value that does not decode stays as it is.
+#[inline(always)]
+fn decode_component(value: &str) -> Cow<'_, str> {
+    if value.as_bytes().iter().any(|&b| b == b'%' || b == b'+') {
+        urlencoding::decode(value).unwrap_or_else(|_| Cow::Borrowed(value))
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
 /// Parse query string into key-value pairs
 /// OPTIMIZATION: #[inline] on hot path - called on requests with query strings
 #[inline]
@@ -347,15 +357,6 @@ pub fn parse_query_string(query: &str) -> AHashMap<String, String> {
     let mut params = AHashMap::new();
     if query.is_empty() {
         return params;
-    }
-
-    #[inline(always)]
-    fn decode_component(value: &str) -> Cow<'_, str> {
-        if value.as_bytes().iter().any(|&b| b == b'%' || b == b'+') {
-            urlencoding::decode(value).unwrap_or_else(|_| Cow::Borrowed(value))
-        } else {
-            Cow::Borrowed(value)
-        }
     }
 
     for pair in query.split('&') {
@@ -376,9 +377,65 @@ pub fn parse_query_string(query: &str) -> AHashMap<String, String> {
     params
 }
 
+/// Collect each value of the query keys in `keys`, in the order of the query.
+///
+/// `parse_query_string` keeps the last value of a repeated key. A sequence
+/// parameter (`list[int]`, `set[str]`) takes all of them, so the route lists
+/// its sequence keys and this second pass reads only those. A key that is not
+/// in the query is not in the result.
+pub fn collect_query_sequences(
+    query: &str,
+    keys: &std::collections::HashSet<String>,
+) -> Vec<(String, Vec<String>)> {
+    let mut sequences: Vec<(String, Vec<String>)> = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_component(key);
+        if !keys.contains(key.as_ref()) {
+            continue;
+        }
+        let value = decode_component(value).into_owned();
+        match sequences.iter_mut().find(|(name, _)| name == key.as_ref()) {
+            Some((_, values)) => values.push(value),
+            None => sequences.push((key.into_owned(), vec![value])),
+        }
+    }
+    sequences
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_query_sequences_keeps_each_value_of_a_listed_key_in_order() {
+        let keys: std::collections::HashSet<String> =
+            ["tag".to_string(), "id".to_string()].into_iter().collect();
+        let sequences = collect_query_sequences("tag=b&page=2&tag=a%20c&id=1&tag=b&empty", &keys);
+        assert_eq!(
+            sequences,
+            vec![
+                (
+                    "tag".to_string(),
+                    vec!["b".to_string(), "a c".to_string(), "b".to_string()]
+                ),
+                ("id".to_string(), vec!["1".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_query_sequences_reads_a_key_with_no_value_as_empty() {
+        let keys: std::collections::HashSet<String> = ["tag".to_string()].into_iter().collect();
+        assert_eq!(
+            collect_query_sequences("tag&tag=", &keys),
+            vec![("tag".to_string(), vec![String::new(), String::new()])]
+        );
+        assert!(collect_query_sequences("other=1", &keys).is_empty());
+    }
 
     #[test]
     fn test_decode_path_params() {

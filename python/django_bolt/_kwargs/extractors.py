@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Sequence
-from typing import Any, get_args, get_origin
+from typing import Annotated, Any, get_args, get_origin
 
 import msgspec
 
@@ -52,6 +52,73 @@ def get_msgspec_decoder(type_: Any) -> msgspec.json.Decoder:
     return _DECODER_CACHE[type_]
 
 
+_SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
+# The msgspec.Meta fields that constrain a value. The other fields only document it.
+_META_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "pattern", "min_length", "max_length", "tz")
+
+
+def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = False) -> Callable | None:
+    """Build the conversion of one parameter value that Rust cannot do, or None.
+
+    Rust converts a scalar value by its type. It does not build a sequence and
+    it does not check ``msgspec.Meta`` constraints. For such a parameter, one
+    ``msgspec.convert`` builds the ``list``, ``set``, ``frozenset`` or ``tuple``
+    from the values and checks the constraints. A bad value gives a 422 that
+    names ``loc`` and ``key``. With ``one_item``, a source that gives one value
+    (a path, a header or a cookie) gives a sequence of that one item.
+    """
+    target = unwrap_optional(annotation)
+    base = get_args(target)[0] if get_origin(target) is Annotated else target
+    is_sequence = get_origin(unwrap_optional(base)) in _SEQUENCE_ORIGINS
+    constrained = get_origin(target) is Annotated and any(
+        getattr(extra, name, None) is not None
+        for extra in get_args(target)[1:]
+        if isinstance(extra, msgspec.Meta)
+        for name in _META_CONSTRAINTS
+    )
+    if not is_sequence and not constrained:
+        return None
+    wrap = is_sequence and one_item
+
+    def convert(value: Any) -> Any:
+        if wrap and not isinstance(value, list):
+            value = [value]
+        try:
+            return msgspec.convert(value, target, strict=False)
+        except msgspec.ValidationError as error:
+            raise RequestValidationError(
+                errors=[{"type": "validation_error", "loc": (loc, key), "msg": str(error), "input": value}]
+            ) from None
+
+    return convert
+
+
+def _converted_extractor(key: str, annotation: Any, default: Any, convert: Callable, missing: str) -> Callable:
+    """Build an extractor that reads ``key`` and converts a present value with ``convert``.
+
+    A missing value gives the default of the parameter, which is not converted,
+    or a 422 with the ``missing`` detail when the parameter is required.
+    """
+    if default is not inspect.Parameter.empty or is_optional(annotation):
+        default_value = None if default is inspect.Parameter.empty else default
+
+        def extract_optional(source_map: dict[str, Any]) -> Any:
+            if key in source_map:
+                return convert(source_map[key])
+            return default_value
+
+        return extract_optional
+
+    def extract_required(source_map: dict[str, Any]) -> Any:
+        try:
+            value = source_map[key]
+        except KeyError:
+            raise HTTPException(status_code=422, detail=missing) from None
+        return convert(value)
+
+    return extract_required
+
+
 def create_path_extractor(name: str, annotation: Any, alias: str | None = None) -> Callable:
     """Create a pre-compiled extractor for path parameters.
 
@@ -59,6 +126,16 @@ def create_path_extractor(name: str, annotation: Any, alias: str | None = None) 
     str, uuid.UUID, decimal.Decimal, datetime, date, time) for both HTTP and WebSocket.
     """
     key = alias or name
+    convert = _param_converter(annotation, "path", key, one_item=True)
+
+    if convert is not None:
+
+        def extract_converted(params_map: dict[str, Any]) -> Any:
+            if key not in params_map:
+                raise HTTPException(status_code=422, detail=f"Missing required path parameter: {key}")
+            return convert(params_map[key])
+
+        return extract_converted
 
     def extract(params_map: dict[str, Any]) -> Any:
         if key not in params_map:
@@ -85,6 +162,11 @@ def create_query_extractor(name: str, annotation: Any, default: Any, alias: str 
 
     # Individual field extraction
     key = alias or name
+    # HTTP routes get each value of a sequence key as a list from Rust. A
+    # WebSocket scope gives the last value of a key, so it gives one item.
+    convert = _param_converter(annotation, "query", key, one_item=True)
+    if convert is not None:
+        return _converted_extractor(key, annotation, default, convert, f"Missing required query parameter: {key}")
     optional = default is not inspect.Parameter.empty or is_optional(annotation)
 
     if optional:
@@ -126,6 +208,9 @@ def create_header_extractor(name: str, annotation: Any, default: Any, alias: str
     # Convert underscores to hyphens for HTTP header lookup
     # e.g., x_custom -> x-custom, content_type -> content-type
     key = (alias or name).lower().replace("_", "-")
+    convert = _param_converter(annotation, "header", key, one_item=True)
+    if convert is not None:
+        return _converted_extractor(key, annotation, default, convert, f"Missing required header: {key}")
     optional = default is not inspect.Parameter.empty or is_optional(annotation)
 
     if optional:
@@ -167,6 +252,9 @@ def create_cookie_extractor(name: str, annotation: Any, default: Any, alias: str
 
     # Individual field extraction
     key = alias or name
+    convert = _param_converter(annotation, "cookie", key, one_item=True)
+    if convert is not None:
+        return _converted_extractor(key, annotation, default, convert, f"Missing required cookie: {key}")
     optional = default is not inspect.Parameter.empty or is_optional(annotation)
 
     if optional:
@@ -204,6 +292,9 @@ def create_form_extractor(name: str, annotation: Any, default: Any, alias: str |
 
     # Individual field extraction
     key = alias or name
+    convert = _param_converter(annotation, "body", key)
+    if convert is not None:
+        return _converted_extractor(key, annotation, default, convert, f"Missing required form field: {key}")
     optional = default is not inspect.Parameter.empty or is_optional(annotation)
 
     if optional:
@@ -289,9 +380,6 @@ def _collect_struct_errors(
                 }
             )
     return errors
-
-
-_SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
 
 
 def _is_sequence_field(field_type: Any) -> bool:

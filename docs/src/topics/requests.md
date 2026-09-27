@@ -103,6 +103,61 @@ async def search(
 
 If no type annotation is provided, the parameter is treated as a string.
 
+### Repeated query keys
+
+Declare a `list`, `set`, `frozenset` or `tuple` to take each value of a repeated key:
+
+```python
+from typing import Annotated
+from django_bolt.param_functions import Query
+
+@api.get("/items")
+async def items(tag: Annotated[set[int], Query()]):
+    # /items?tag=1&tag=2&tag=1 gives {1, 2}
+    return {"tags": sorted(tag)}
+```
+
+Bolt converts each value to the item type. A bad item gives a 422.
+A `tuple[int, str]` needs exactly one value for each position.
+A form field takes each value of its name in the same way.
+A header or a cookie gives a sequence of one item.
+
+### Constraints
+
+Add `msgspec.Meta` to limit a value. A value outside the limits gives a 422:
+
+```python
+import msgspec
+
+@api.get("/articles")
+async def articles(
+    page: Annotated[int, msgspec.Meta(ge=1)] = 1,
+    code: Annotated[str, msgspec.Meta(pattern=r"^[A-Z]{3}$"), Query()] = "ABC",
+):
+    return {"page": page, "code": code}
+```
+
+The constraints apply to path, query, header, cookie and form parameters.
+The OpenAPI schema shows them, for example `minimum: 1`.
+The types in `django_bolt.serializers.types`, such as `PositiveInt`, work the same way.
+
+### NewType and type aliases
+
+A `NewType` or a `type` alias converts as the type that it names:
+
+```python
+from typing import NewType
+
+UserId = NewType("UserId", int)
+type Page = int
+
+@api.get("/users/{user_id}")
+async def user(user_id: UserId, page: Page = 1):
+    return {"user_id": user_id, "page": page}
+```
+
+The handler gets an `int`, and `/users/abc` gives a 422.
+
 ## Request body
 
 ### JSON body

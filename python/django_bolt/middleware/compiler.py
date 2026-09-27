@@ -16,7 +16,7 @@ from django.core.exceptions import ImproperlyConfigured
 
 from ..auth.backends import get_default_authentication_classes
 from ..auth.guards import BasePermission, get_default_permission_classes
-from ..typing import is_msgspec_struct, unwrap_optional
+from ..typing import is_msgspec_struct, resolve_type_alias, unwrap_optional
 
 # Type hint constants - MUST match src/type_coercion.rs
 TYPE_INT = 1
@@ -43,8 +43,8 @@ def get_type_hint_id(annotation: Any) -> int:
     Returns:
         Type hint ID constant (TYPE_INT, TYPE_STRING, etc.)
     """
-    # Unwrap Optional[T] or T | None
-    unwrapped = unwrap_optional(annotation)
+    # Unwrap Optional[T] or T | None, and a NewType or a type alias
+    unwrapped = unwrap_optional(resolve_type_alias(annotation))
 
     # Get base type if it's a generic
     origin = get_origin(unwrapped)
@@ -54,7 +54,7 @@ def get_type_hint_id(annotation: Any) -> int:
         args = get_args(unwrapped)
         if args:
             # First arg is the actual type, rest are metadata
-            unwrapped = args[0]
+            unwrapped = unwrap_optional(resolve_type_alias(args[0]))
             origin = get_origin(unwrapped)
 
     if origin is not None:
@@ -233,29 +233,34 @@ def _extract_type_hints_from_field(field: Any, claims: dict[str, tuple[str, int]
             )
 
 
-_SEQUENCE_ORIGINS_FOR_FORM = (list, set, frozenset, tuple)
+_SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
 
 
-def _collect_form_seq_field_names(field: Any, target: set[str]) -> None:
+def _is_sequence_annotation(annotation: Any) -> bool:
+    """True for a list, set, frozenset or tuple type, also behind Optional, msgspec.Meta or an alias."""
+    inner = unwrap_optional(resolve_type_alias(annotation))
+    if get_origin(inner) is Annotated:
+        inner = unwrap_optional(resolve_type_alias(get_args(inner)[0]))
+    return get_origin(inner) in _SEQUENCE_ORIGINS
+
+
+def _collect_seq_field_names(field: Any, target: set[str]) -> None:
     """Collect wire-side field names whose declared type is a sequence (list/set/tuple/frozenset).
 
     Rust uses this set to always emit a Python list for those keys, even when the
-    form contained only a single occurrence — eliminating a scalar→list wrap step
-    on the Python hot path.
+    form or the query contained only a single occurrence. A repeated query key
+    then gives each of its values, not only the last one.
     """
     unwrapped = unwrap_optional(field.annotation)
     if is_msgspec_struct(unwrapped):
         for struct_field in msgspec.structs.fields(unwrapped):
-            inner = unwrap_optional(struct_field.type)
-            if get_origin(inner) in _SEQUENCE_ORIGINS_FOR_FORM:
+            if _is_sequence_annotation(struct_field.type):
                 target.add(struct_field.name)
                 encoded_name = getattr(struct_field, "encode_name", struct_field.name)
                 if encoded_name != struct_field.name:
                     target.add(encoded_name)
-    else:
-        inner = unwrap_optional(field.annotation)
-        if get_origin(inner) in _SEQUENCE_ORIGINS_FOR_FORM:
-            target.add(field.alias or field.name)
+    elif _is_sequence_annotation(field.annotation):
+        target.add(field.alias or field.name)
 
 
 def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -381,12 +386,15 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     cookie_claims: dict[str, tuple[str, int]] = {}
     form_claims: dict[str, tuple[str, int]] = {}
     form_seq_fields: set[str] = set()
+    query_seq_fields: set[str] = set()
     file_constraints: dict[str, dict[str, Any]] = {}
 
     fields = handler_meta.get("fields", [])
     for field in fields:
         if field.source in ("path", "query"):
             _extract_type_hints_from_field(field, param_claims)
+            if field.source == "query":
+                _collect_seq_field_names(field, query_seq_fields)
 
         elif field.source == "header":
             _extract_type_hints_from_field(field, header_claims)
@@ -397,7 +405,7 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
         # Form fields - extract type hints for Rust-side form parsing
         elif field.source == "form":
             _extract_type_hints_from_field(field, form_claims)
-            _collect_form_seq_field_names(field, form_seq_fields)
+            _collect_seq_field_names(field, form_seq_fields)
 
         # File fields - extract constraints for Rust-side validation
         elif field.source == "file":
@@ -432,6 +440,9 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
 
     if form_seq_fields:
         metadata["form_seq_fields"] = sorted(form_seq_fields)
+
+    if query_seq_fields:
+        metadata["query_seq_fields"] = sorted(query_seq_fields)
 
     if file_constraints:
         metadata["file_constraints"] = file_constraints

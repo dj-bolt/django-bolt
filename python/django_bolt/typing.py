@@ -14,7 +14,7 @@ from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from functools import reduce
 from operator import or_
-from typing import TYPE_CHECKING, Annotated, Any, TypedDict, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, NewType, TypeAliasType, TypedDict, Union, get_args, get_origin
 
 import msgspec
 
@@ -37,6 +37,8 @@ __all__ = [
     "is_optional",
     "is_upload_file_type",
     "unwrap_optional",
+    "resolve_type_alias",
+    "split_param_annotation",
     "infer_param_source",
 ]
 
@@ -301,6 +303,48 @@ def unwrap_optional(annotation: Any) -> Any:
     return annotation
 
 
+def resolve_type_alias(annotation: Any) -> Any:
+    """Return the type that a ``NewType`` or a ``type`` alias names, through each level.
+
+    msgspec converts and validates such a value as the type it names. Bolt
+    does the same, so Rust converts a ``NewType("UserId", int)`` value as an ``int``.
+    The arms of a union resolve too, so ``UserId | None`` gives ``int | None``.
+    """
+    while True:
+        if isinstance(annotation, TypeAliasType):
+            annotation = annotation.__value__
+        elif isinstance(annotation, NewType):
+            annotation = annotation.__supertype__
+        else:
+            break
+    origin = get_origin(annotation)
+    if origin is Union or origin is types.UnionType:
+        return reduce(or_, (resolve_type_alias(arg) for arg in get_args(annotation)))
+    return annotation
+
+
+def split_param_annotation(annotation: Any) -> tuple[Any, Any]:
+    """Split a parameter annotation into its value type and its ``Param`` or ``Depends`` marker.
+
+    ``Annotated[int, msgspec.Meta(ge=1), Query()]`` gives ``(Annotated[int, msgspec.Meta(ge=1)], Query())``.
+    The ``msgspec.Meta`` items stay on a scalar or a sequence type, so the value
+    is validated against them and the schema shows them. A struct, a dataclass
+    or an upload keeps only its base type, as before. A ``NewType`` or a ``type``
+    alias resolves to the type it names. The marker is None when there is none.
+    """
+    annotation = resolve_type_alias(annotation)
+    if get_origin(annotation) is not Annotated:
+        return annotation, None
+    base, *extras = get_args(annotation)
+    base = resolve_type_alias(base)
+    marker = next((extra for extra in extras if isinstance(extra, (Param, DependsMarker))), None)
+    constraints = [extra for extra in extras if isinstance(extra, msgspec.Meta)]
+    inner = unwrap_optional(base)
+    if not constraints or is_msgspec_struct(inner) or is_dataclass_type(inner) or is_upload_file_type(inner):
+        return base, marker
+    return Annotated[(base, *constraints)], marker
+
+
 def is_dataclass_type(annotation: Any) -> bool:
     """Check if annotation is a dataclass."""
     try:
@@ -337,8 +381,10 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     if name in {"request", "req"}:
         return "request"
 
-    # Unwrap Optional if present
+    # Unwrap Optional and msgspec.Meta if present
     unwrapped = unwrap_optional(annotation)
+    if get_origin(unwrapped) is Annotated:
+        unwrapped = unwrap_optional(get_args(unwrapped)[0])
 
     # 3. Simple types -> query params
     if is_simple_type(unwrapped):

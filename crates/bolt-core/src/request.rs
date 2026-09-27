@@ -79,6 +79,29 @@ pub struct PyRequest {
     pub conn_remote_addr: Option<IpAddr>,
 }
 
+/// Rebuild a query string from the Python query dict of a request.
+///
+/// A sequence query parameter holds a list of the values of its repeated key.
+/// Each item then gives its own `key=value` pair, as in the original query.
+fn encode_query_dict(query_dict: &Bound<'_, PyDict>) -> String {
+    let mut pairs: Vec<String> = Vec::with_capacity(query_dict.len());
+    for (k, v) in query_dict.iter() {
+        let Ok(key) = k.extract::<String>() else {
+            continue;
+        };
+        if let Ok(items) = v.cast::<pyo3::types::PyList>() {
+            for item in items.iter() {
+                if let Ok(value) = item.str() {
+                    pairs.push(format!("{}={}", key, value));
+                }
+            }
+        } else if let Ok(value) = v.str() {
+            pairs.push(format!("{}={}", key, value));
+        }
+    }
+    pairs.join("&")
+}
+
 impl PyRequest {
     #[inline]
     fn dict_or_empty<'py>(value: &Option<Py<PyDict>>, py: Python<'py>) -> Py<PyDict> {
@@ -311,15 +334,7 @@ impl PyRequest {
                 if query_dict.is_empty() {
                     String::new()
                 } else {
-                    query_dict
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            let key = k.extract::<String>().ok()?;
-                            let val = v.str().ok()?.to_string();
-                            Some(format!("{}={}", key, val))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("&")
+                    encode_query_dict(query_dict)
                 }
             }
             None => String::new(),
@@ -433,15 +448,7 @@ impl PyRequest {
                 if query_dict.is_empty() {
                     self.path.clone()
                 } else {
-                    let query_string: String = query_dict
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            let key = k.extract::<String>().ok()?;
-                            let val = v.str().ok()?.to_string();
-                            Some(format!("{}={}", key, val))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("&");
+                    let query_string: String = encode_query_dict(query_dict);
                     format!("{}?{}", self.path, query_string)
                 }
             }
@@ -489,15 +496,7 @@ impl PyRequest {
             format!("{}://{}{}", scheme, host, path)
         } else {
             let query_dict = self.query_params.as_ref().unwrap().bind(py);
-            let query_string: String = query_dict
-                .iter()
-                .filter_map(|(k, v)| {
-                    let key = k.extract::<String>().ok()?;
-                    let val = v.str().ok()?.to_string();
-                    Some(format!("{}={}", key, val))
-                })
-                .collect::<Vec<_>>()
-                .join("&");
+            let query_string: String = encode_query_dict(query_dict);
             format!("{}://{}{}?{}", scheme, host, path, query_string)
         }
     }
