@@ -907,8 +907,6 @@ class TestQueueBasedLogging:
             else:
                 with suppress(AttributeError):
                     delattr(settings, "BOLT_LOG_QUEUE_SIZE")
-            config_module._QUEUE_LISTENER = None
-            config_module._QUEUE = None
 
     @pytest.mark.parametrize("bad_value", [0, -1, "10k"], ids=["zero", "negative", "non-int"])
     def test_invalid_queue_size_falls_back_to_bounded_default_with_notice(self, bad_value):
@@ -941,8 +939,6 @@ class TestQueueBasedLogging:
             else:
                 with suppress(AttributeError):
                     delattr(settings, "BOLT_LOG_QUEUE_SIZE")
-            config_module._QUEUE_LISTENER = None
-            config_module._QUEUE = None
 
     def test_setup_django_logging_configures_queue_handlers(self):
         """setup_django_logging should configure queue handlers for django loggers."""
@@ -990,15 +986,18 @@ class TestQueueBasedLogging:
         # conftest configures settings without LOGGING, so set explicit LOGGING here.
         # Count handlers inside the block: Django reconfigures logging when the override exits.
         with override_settings(LOGGING={"version": 1, "disable_existing_loggers": False}):
-            handlers_before = len(django_logger.handlers)
+            handlers_before = django_logger.handlers[:]
             setup_django_logging(force=True)
-            handlers_after = len(django_logger.handlers)
+            handlers_after = django_logger.handlers[:]
 
         # Should mark as configured
         assert config_module._LOGGING_CONFIGURED is True
 
         # With explicit LOGGING, we don't modify handlers
-        assert handlers_after == handlers_before, "Should not modify handlers with explicit LOGGING"
+        assert len(handlers_after) == len(handlers_before), "Should not modify handlers with explicit LOGGING"
+        assert all(after is before for after, before in zip(handlers_after, handlers_before, strict=True)), (
+            "Should not replace handlers with explicit LOGGING"
+        )
 
     def test_setup_django_logging_is_idempotent(self):
         """setup_django_logging should not reconfigure when called multiple times."""
