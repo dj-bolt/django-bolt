@@ -83,7 +83,19 @@ pub struct PyRequest {
 ///
 /// A sequence query parameter holds a list of the values of its repeated key.
 /// Each item then gives its own `key=value` pair, as in the original query.
+/// The dict holds decoded text, so each key and value is percent-encoded again.
+/// A value such as `a&b` then stays one value.
 fn encode_query_dict(query_dict: &Bound<'_, PyDict>) -> String {
+    fn push_pair(pairs: &mut Vec<String>, key: &str, value: &Bound<'_, PyAny>) {
+        if let Ok(value) = value.str() {
+            pairs.push(format!(
+                "{}={}",
+                urlencoding::encode(key),
+                urlencoding::encode(&value.to_string_lossy())
+            ));
+        }
+    }
+
     let mut pairs: Vec<String> = Vec::with_capacity(query_dict.len());
     for (k, v) in query_dict.iter() {
         let Ok(key) = k.extract::<String>() else {
@@ -91,12 +103,10 @@ fn encode_query_dict(query_dict: &Bound<'_, PyDict>) -> String {
         };
         if let Ok(items) = v.cast::<pyo3::types::PyList>() {
             for item in items.iter() {
-                if let Ok(value) = item.str() {
-                    pairs.push(format!("{}={}", key, value));
-                }
+                push_pair(&mut pairs, &key, &item);
             }
-        } else if let Ok(value) = v.str() {
-            pairs.push(format!("{}={}", key, value));
+        } else {
+            push_pair(&mut pairs, &key, &v);
         }
     }
     pairs.join("&")

@@ -12,6 +12,7 @@ Each value arrives with its declared type, and a bad value gives a 422:
 # No ``from __future__ import annotations``: the tests declare the handlers
 # with local types, and the handlers must resolve them.
 from typing import Annotated, NewType
+from urllib.parse import parse_qsl
 
 import msgspec
 import pytest
@@ -373,3 +374,21 @@ def test_a_sequence_query_value_over_the_length_limit_is_a_422():
 
     assert response.status_code == 422, response.text
     assert "Parameter too long" in response.text
+
+
+def test_the_query_string_of_the_request_encodes_each_key_and_value():
+    """A decoded value with ``&``, ``=`` or a space must not split into other pairs."""
+    api = BoltAPI()
+
+    @api.get("/items")
+    async def items(request, tag: Annotated[list[str], Query()], q: str = ""):
+        return {"query_string": request.META["QUERY_STRING"], "full_path": request.get_full_path()}
+
+    with TestClient(api) as client:
+        response = client.get("/items?tag=a%26b&tag=c%3Dd&q=x%20y%25")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    expected = [("q", "x y%"), ("tag", "a&b"), ("tag", "c=d")]
+    assert sorted(parse_qsl(body["query_string"])) == expected
+    assert sorted(parse_qsl(body["full_path"].removeprefix("/items?"))) == expected
