@@ -885,7 +885,7 @@ class TestKnownSecurityGaps:
         Previously, query params with datetime type annotation received strings.
         Now, the Rust layer properly coerces them to Python datetime objects.
 
-        FIX APPLIED: coerce_to_py() in type_coercion.rs now handles TYPE_DATETIME,
+        FIX APPLIED: coerce_param() in type_coercion.rs now handles TYPE_DATETIME,
         TYPE_UUID, TYPE_DECIMAL, TYPE_DATE, and TYPE_TIME for query params.
         """
         # Send a valid datetime - handler now receives datetime object

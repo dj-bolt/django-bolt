@@ -958,10 +958,11 @@ def _to_django_request(request: Request) -> HttpRequest:
     # so middleware writes (CSRF_COOKIE) are visible to the handler's request.META.
     django_request.META = request.META
 
-    # Copy cookies - use empty dict directly if no cookies
+    # Django reads cookies as strings. A typed Cookie() parameter holds its
+    # converted value in request.cookies, so use the strings as they arrived.
     # Note: When django_middleware is enabled, needs_cookies=True is set at registration
     # time, ensuring Rust always parses and passes cookies to Python
-    django_request.COOKIES = dict(request.cookies) if request.cookies else {}
+    django_request.COOKIES = request.raw_cookies
 
     # Query params - only create mutable QueryDict if we have params
     if request.query:

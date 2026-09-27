@@ -8,6 +8,7 @@ actually runs and modifies requests/responses through the complete pipeline.
 from __future__ import annotations
 
 import re
+from typing import Annotated
 
 import msgspec
 import pytest
@@ -29,6 +30,7 @@ from django_bolt import BoltAPI, Request
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, TimingMiddleware
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
+from django_bolt.param_functions import Cookie, Header
 from django_bolt.responses import HTML, JSON
 from django_bolt.testing import TestClient
 
@@ -1932,3 +1934,33 @@ def test_full_pass_runs_hooks_in_declared_and_reverse_order(handler_kind):
         assert client.get("/x").status_code == 200
 
     assert calls == ["a.request", "b.request", "handler", "b.response", "a.response"]
+
+
+class RawValuesRecorder(MiddlewareMixin):
+    """Record the cookie and header strings that Django middleware sees."""
+
+    seen: dict = {}
+
+    def process_request(self, request):
+        RawValuesRecorder.seen = {
+            "cookie": request.COOKIES.get("n"),
+            "header": request.META.get("HTTP_X_COUNT"),
+        }
+
+
+class TestTypedParamsKeepRawStringsForDjango:
+    """A typed cookie or header reaches Django middleware as its original string."""
+
+    def test_django_middleware_sees_raw_cookie_and_header(self):
+        api = BoltAPI(middleware=[DjangoMiddlewareStack([RawValuesRecorder])])
+
+        @api.get("/typed")
+        async def typed(count: Annotated[int, Cookie(alias="n")], x_count: Annotated[int, Header()]) -> dict:
+            return {"count": count, "x_count": x_count}
+
+        with TestClient(api) as client:
+            response = client.get("/typed", cookies={"n": "0005"}, headers={"X-Count": "0007"})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"count": 5, "x_count": 7}
+        assert RawValuesRecorder.seen == {"cookie": "0005", "header": "0007"}

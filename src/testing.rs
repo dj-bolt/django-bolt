@@ -41,11 +41,17 @@ use bolt_websocket::WebSocketRouter;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 
-use crate::handler::{build_prebound_args_kwargs, form_result_to_py, response_from_wire_result};
-use bolt_core::request_pipeline::validate_and_cache_typed_params;
+use crate::handler::{
+    build_prebound_from_values, form_result_to_py, response_from_wire_result, SourceValues,
+};
+use bolt_core::request_pipeline::{
+    set_declared_item, validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
+};
 use bolt_core::static_files::handle_file;
 use bolt_core::type_coercion::coerced_value_to_py;
-use bolt_core::type_coercion::{coerce_param, params_to_py_dict, CoerceError, TYPE_STRING};
+use bolt_core::type_coercion::{
+    coerce_param, string_map_to_py_dict, CoerceError, TypeHints, TYPE_STRING,
+};
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
@@ -867,7 +873,7 @@ async fn handle_test_request_internal(
             Err(response) => return response,
         }
     } else {
-        (None, None)
+        (Vec::new(), Vec::new())
     };
 
     // Extract headers
@@ -966,6 +972,27 @@ async fn handle_test_request_internal(
         parse_cookies_inline(headers.get("cookie").map(|s| s.as_str()))
     } else {
         AHashMap::new()
+    };
+
+    // Validate and pre-coerce the header and cookie values that Python receives.
+    let empty_types: &TypeHints = &EMPTY_TYPES;
+    let header_types = route_meta.as_ref().map_or(empty_types, |m| &m.header_types);
+    let cookie_types = route_meta.as_ref().map_or(empty_types, |m| &m.cookie_types);
+    let headers_coerced = if needs_headers {
+        match validate_and_cache_source(&headers, header_types, max_param_length, "Header") {
+            Ok(cached) => cached,
+            Err(response) => return response,
+        }
+    } else {
+        Vec::new()
+    };
+    let cookies_coerced = if needs_cookies {
+        match validate_and_cache_source(&cookies, cookie_types, max_param_length, "Cookie") {
+            Ok(cached) => cached,
+            Err(response) => return response,
+        }
+    } else {
+        Vec::new()
     };
 
     // Form parsing (URL-encoded and multipart)
@@ -1120,95 +1147,72 @@ async fn handle_test_request_internal(
             None
         };
 
-        let headers_for_python = if needs_headers {
-            Some(headers.clone())
-        } else {
-            None
-        };
-
-        // Get param_types from route metadata for typed conversion
-        let param_types = route_meta
-            .as_ref()
-            .map(|m| &m.param_types)
-            .cloned()
-            .unwrap_or_default();
-
-        // Create typed dicts - reuse pre-coerced path/query values from validation phase.
-        let path_params_dict = if let Some(path_params) = path_params.as_ref() {
-            let dict = PyDict::new(py);
-            for (name, value) in path_params {
-                if let Some(coerced) = path_coerced.as_ref().and_then(|m| m.get(name)) {
-                    dict.set_item(name, coerced_value_to_py(py, coerced))?;
-                } else {
-                    dict.set_item(name, value)?;
-                }
-            }
-            Some(dict.unbind())
-        } else {
-            None
-        };
-
-        let query_params_dict = if let Some(query_params) = query_params.as_ref() {
-            let dict = PyDict::new(py);
-            for (name, value) in query_params {
-                if let Some(coerced) = query_coerced.as_ref().and_then(|m| m.get(name)) {
-                    dict.set_item(name, coerced_value_to_py(py, coerced))?;
-                } else {
-                    dict.set_item(name, value)?;
-                }
-            }
-            Some(dict.unbind())
-        } else {
-            None
-        };
-
-        let headers_dict = match &headers_for_python {
-            Some(h) => Some(params_to_py_dict(py, h, &param_types, max_param_length)?),
-            None => None,
-        };
-        let cookies_dict = if needs_cookies {
-            Some(params_to_py_dict(
-                py,
-                &cookies,
-                &param_types,
-                max_param_length,
-            )?)
-        } else {
-            None
-        };
-
-        // Only create state dict when Rust-side prebound args exist (matches production).
+        // Bind the handler arguments from the Rust maps (matches production).
         let state_lock = std::sync::OnceLock::new();
+        let mut skip_dicts = false;
         if let Some(bindings) = route_meta
             .as_ref()
             .and_then(|m| m.rust_arg_bindings.as_deref())
         {
-            let empty_dict = PyDict::new(py);
-            let pp_ref = match &path_params_dict {
-                Some(d) => d.bind(py),
-                None => &empty_dict,
-            };
-            let qp_ref = match &query_params_dict {
-                Some(d) => d.bind(py),
-                None => &empty_dict,
-            };
-            let hd_ref = match &headers_dict {
-                Some(d) => d,
-                None => &empty_dict,
-            };
-            let ck_ref = match &cookies_dict {
-                Some(d) => d,
-                None => &empty_dict,
-            };
-            if let Some((pre_args, pre_kwargs)) =
-                build_prebound_args_kwargs(py, bindings, pp_ref, qp_ref, hd_ref, ck_ref)
-            {
+            let prebound = build_prebound_from_values(
+                py,
+                bindings,
+                &SourceValues {
+                    values: path_params.as_ref(),
+                    coerced: &path_coerced,
+                },
+                &SourceValues {
+                    values: query_params.as_ref(),
+                    coerced: &query_coerced,
+                },
+                &SourceValues {
+                    values: Some(&headers),
+                    coerced: &headers_coerced,
+                },
+                &SourceValues {
+                    values: Some(&cookies),
+                    coerced: &cookies_coerced,
+                },
+            );
+            if let Some((pre_args, pre_kwargs)) = prebound? {
                 let state_dict = PyDict::new(py);
                 state_dict.set_item("_bolt_prebound_args", pre_args)?;
                 state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
                 let _ = state_lock.set(state_dict.unbind());
+                skip_dicts = route_meta.as_ref().is_some_and(|m| m.prebind_only);
             }
         }
+
+        // Create typed dicts - reuse pre-coerced values from the validation phase.
+        let path_params_dict = match path_params.as_ref() {
+            Some(_) if skip_dicts => None,
+            Some(path_params) => {
+                Some(string_map_to_py_dict(py, path_params, &path_coerced)?.unbind())
+            }
+            None => None,
+        };
+
+        let query_params_dict = match query_params.as_ref() {
+            Some(_) if skip_dicts => None,
+            Some(query_params) => {
+                Some(string_map_to_py_dict(py, query_params, &query_coerced)?.unbind())
+            }
+            None => None,
+        };
+
+        let headers_dict = if needs_headers && !skip_dicts {
+            Some(string_map_to_py_dict(py, &headers, &headers_coerced)?)
+        } else {
+            None
+        };
+        let cookies_dict = if needs_cookies && !skip_dicts {
+            Some(string_map_to_py_dict(py, &cookies, &cookies_coerced)?)
+        } else {
+            None
+        };
+        // Django middleware reads the original strings (matches production).
+        let keep_raw_headers = !headers_coerced.is_empty();
+        let keep_raw_cookies = !cookies_coerced.is_empty();
 
         // Only create form/files dicts when form data is present (matches production).
         let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {
@@ -1233,6 +1237,8 @@ async fn handle_test_request_internal(
             query_params: query_params_dict,
             headers: headers_dict.map(|d| d.unbind()),
             cookies: cookies_dict.map(|d| d.unbind()),
+            raw_headers: keep_raw_headers.then_some(headers),
+            raw_cookies: keep_raw_cookies.then_some(cookies),
             context,
             user: None,
             state: state_lock,
@@ -1453,13 +1459,12 @@ pub fn handle_test_websocket(
         }
     }
 
-    // Get param_types from route metadata for type coercion
-    let param_types = app
-        .route_metadata
-        .get(handler_id)
-        .map(|m| &m.param_types)
-        .cloned()
-        .unwrap_or_default();
+    // Get type hints from route metadata for type coercion
+    let ws_route_meta = app.route_metadata.get(handler_id);
+    let empty_types: &TypeHints = &EMPTY_TYPES;
+    let param_types = ws_route_meta.map_or(empty_types, |m| &m.param_types);
+    let header_types = ws_route_meta.map_or(empty_types, |m| &m.header_types);
+    let cookie_types = ws_route_meta.map_or(empty_types, |m| &m.cookie_types);
 
     // Build path_params dict with type coercion
     let max_param_length = app.max_param_length;
@@ -1468,7 +1473,7 @@ pub fn handle_test_websocket(
         let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
         match coerce_param(v, type_hint, max_param_length) {
             Ok(coerced) => {
-                let py_value = coerced_value_to_py(py, &coerced);
+                let py_value = coerced_value_to_py(py, &coerced)?;
                 path_params_dict.set_item(k, py_value)?;
             }
             // Oversized values are a hard error — never fall back to the raw string.
@@ -1503,7 +1508,7 @@ pub fn handle_test_websocket(
 
                     match coerce_param(&decoded_value, type_hint, max_param_length) {
                         Ok(coerced) => {
-                            let py_value = coerced_value_to_py(py, &coerced);
+                            let py_value = coerced_value_to_py(py, &coerced)?;
                             query_dict.set_item(decoded_key.as_ref(), py_value)?;
                         }
                         // Oversized values are a hard error — never fall back to raw string.
@@ -1524,9 +1529,18 @@ pub fn handle_test_websocket(
     let qs_bytes = query_string.as_ref().map(|s| s.as_bytes()).unwrap_or(b"");
     scope_dict.set_item("query_string", pyo3::types::PyBytes::new(py, qs_bytes))?;
 
+    // A typed header with a bad value rejects the upgrade, as in production.
     let headers_dict = pyo3::types::PyDict::new(py);
     for (k, v) in headers.iter() {
-        headers_dict.set_item(k.to_lowercase(), v)?;
+        set_declared_item(
+            py,
+            &headers_dict,
+            &k.to_lowercase(),
+            v,
+            header_types,
+            max_param_length,
+            "Header",
+        )?;
     }
     scope_dict.set_item("headers", headers_dict)?;
     scope_dict.set_item("path_params", &path_params_dict)?;
@@ -1540,7 +1554,15 @@ pub fn handle_test_websocket(
                 if let Some(eq_pos) = pair.find('=') {
                     let key = &pair[..eq_pos];
                     let value = &pair[eq_pos + 1..];
-                    cookies_dict.set_item(key, value)?;
+                    set_declared_item(
+                        py,
+                        &cookies_dict,
+                        key,
+                        value,
+                        cookie_types,
+                        max_param_length,
+                        "Cookie",
+                    )?;
                 }
             }
         }

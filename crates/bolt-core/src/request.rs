@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 
+use ahash::AHashMap;
 use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::OnceLock;
@@ -50,6 +51,12 @@ pub struct PyRequest {
     pub headers: Option<Py<PyDict>>,
     /// Cookies - None when handler doesn't need cookies (saves 1 PyDict alloc per request)
     pub cookies: Option<Py<PyDict>>,
+    /// The header strings as they arrived. Set only when a typed header
+    /// replaced its string in `headers`. `META` is built from them.
+    pub raw_headers: Option<AHashMap<String, String>>,
+    /// The cookie strings as they arrived. Set only when a typed cookie
+    /// replaced its string in `cookies`. `raw_cookies` is built from them.
+    pub raw_cookies: Option<AHashMap<String, String>>,
     pub context: Option<Py<PyDict>>, // Middleware context data
     // None if no auth context or user not found
     pub user: Option<Py<PyAny>>,
@@ -153,6 +160,28 @@ impl PyRequest {
     #[inline]
     fn cookies<'py>(&self, py: Python<'py>) -> Py<PyDict> {
         Self::dict_or_empty(&self.cookies, py)
+    }
+
+    /// Get the cookie strings as they arrived, in a new dict.
+    ///
+    /// A typed cookie parameter holds its converted value in `cookies`. Django
+    /// middleware reads `HttpRequest.COOKIES` as strings, so the adapter uses
+    /// this dict. The dict is new on each call, so middleware can change it.
+    #[getter]
+    fn raw_cookies<'py>(&self, py: Python<'py>) -> PyResult<Py<PyDict>> {
+        match &self.raw_cookies {
+            Some(raw) => {
+                let dict = PyDict::new(py);
+                for (name, value) in raw {
+                    dict.set_item(name, value)?;
+                }
+                Ok(dict.unbind())
+            }
+            None => match &self.cookies {
+                Some(cookies) => Ok(cookies.bind(py).copy()?.unbind()),
+                None => Ok(PyDict::new(py).unbind()),
+            },
+        }
     }
 
     /// Get query params as a dict for middleware access.
@@ -317,17 +346,26 @@ impl PyRequest {
 
         // Convert headers to HTTP_* format
         // Header keys are already lowercase (normalized by http crate)
-        if let Some(headers_py) = &self.headers {
+        // A typed header holds its converted value in `headers`, so META
+        // reads the original strings when Rust kept them.
+        let set_header = |name: &str, value: &str| -> PyResult<()> {
+            let meta_key = if name == "content-type" {
+                "CONTENT_TYPE".to_string()
+            } else if name == "content-length" {
+                "CONTENT_LENGTH".to_string()
+            } else {
+                format!("HTTP_{}", name.to_uppercase().replace('-', "_"))
+            };
+            meta.set_item(meta_key, value)
+        };
+        if let Some(raw) = &self.raw_headers {
+            for (name, value) in raw {
+                set_header(name, value)?;
+            }
+        } else if let Some(headers_py) = &self.headers {
             for (key, value) in headers_py.bind(py).iter() {
                 if let (Ok(k), Ok(v)) = (key.extract::<String>(), value.extract::<String>()) {
-                    let meta_key = if k == "content-type" {
-                        "CONTENT_TYPE".to_string()
-                    } else if k == "content-length" {
-                        "CONTENT_LENGTH".to_string()
-                    } else {
-                        format!("HTTP_{}", k.to_uppercase().replace('-', "_"))
-                    };
-                    meta.set_item(meta_key, v)?;
+                    set_header(&k, &v)?;
                 }
             }
         }
