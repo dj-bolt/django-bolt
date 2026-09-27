@@ -130,6 +130,10 @@ Declare a path, query, header or cookie parameter with a type, for example
 convert rejects the upgrade with a 400. The body names the parameter:
 
 ```python
+from typing import Annotated
+
+from django_bolt.param_functions import Query
+
 @api.websocket("/ws/feed")
 async def feed(websocket: WebSocket, limit: Annotated[int, Query()] = 10):
     await websocket.accept()
