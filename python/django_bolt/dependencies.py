@@ -83,14 +83,8 @@ def _compile_dep_arg_plan(
         elif src == _SRC_FORM and getattr(field.extractor, "needs_files_map", False):
             src = _SRC_FORM_WITH_FILES
         plan.append((src, field.extractor, field.kind in _POSITIONAL_KINDS, field.name))
-    dep_meta["_is_async_dep"] = inspect.iscoroutinefunction(dep_fn)
-    dep_meta["_is_request_only_dep"] = dep_meta.get("mode") == "request_only"
-    dep_meta["_dep_arg_plan"] = plan
-    # Set before the nested dependencies compile, so a cycle stops here.
     nested: list[tuple[str, DependsMarker, dict[str, Any]]] = []
     nested_sync: list[tuple[str, DependsMarker, dict[str, Any]]] = []
-    dep_meta["_dep_nested"] = nested
-    dep_meta["_dep_nested_sync"] = nested_sync
     http_method = dep_meta["http_method"]
     path = dep_meta["path"]
     for name, marker, sync_marker in nested_markers:
@@ -104,6 +98,14 @@ def _compile_dep_arg_plan(
                 compile_dependency(sync_marker.dependency, handler_meta, compile_binder, http_method, path),
             )
         )
+    dep_meta["_is_async_dep"] = inspect.iscoroutinefunction(dep_fn)
+    dep_meta["_is_request_only_dep"] = dep_meta.get("mode") == "request_only"
+    dep_meta["_dep_nested"] = nested
+    dep_meta["_dep_nested_sync"] = nested_sync
+    # Set the plan last, because a binding with a plan is complete. An error in
+    # a nested dependency then leaves no part of this binding in the cache. A
+    # cycle of dependencies raises RecursionError at registration.
+    dep_meta["_dep_arg_plan"] = plan
 
 
 def sync_form(marker: DependsMarker) -> DependsMarker:
