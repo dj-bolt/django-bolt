@@ -164,6 +164,7 @@ mod tests {
             is_staff: false,
             is_superuser: false,
             backend: "test".to_string(),
+            backend_index: None,
             claims: None,
             permissions: HashSet::new(),
             cookie_csrf: false,

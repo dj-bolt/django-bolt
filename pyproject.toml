@@ -35,6 +35,7 @@ classifiers = [
 ]
 dependencies = [
     "Django>=5.2",
+    "asgiref>=3.12",  # an async_to_sync wrapper picks its parent loop at each call
     "click>=8.1",
     "httpx>=0.28.1",
     "msgspec>=0.20",
