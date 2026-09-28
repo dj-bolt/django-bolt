@@ -9,7 +9,9 @@ use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
+use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::fs::File;
@@ -33,7 +35,7 @@ use bolt_core::request_pipeline::{
 use bolt_core::response_builder;
 use bolt_core::response_meta::ResponseMeta;
 use bolt_core::responses;
-use bolt_core::router::parse_query_string;
+use bolt_core::router::{parse_query_string, QueryParams};
 use bolt_core::state::{find_asgi_mount, AppState, GLOBAL_ROUTER, ROUTE_METADATA};
 use bolt_core::streaming::{create_python_stream, create_sse_stream};
 use bolt_core::type_coercion::{
@@ -569,12 +571,13 @@ pub async fn response_from_wire_result(
 }
 
 /// One request source as Rust holds it: the string map and its coerced values.
-pub(crate) struct SourceValues<'a> {
-    pub values: Option<&'a AHashMap<String, String>>,
+/// The query map borrows its strings from the request; the other maps own them.
+pub(crate) struct SourceValues<'a, K = String, V = String> {
+    pub values: Option<&'a AHashMap<K, V>>,
     pub coerced: &'a [(&'a str, CoercedValue)],
 }
 
-impl SourceValues<'_> {
+impl<K: Borrow<str> + Eq + Hash, V: AsRef<str>> SourceValues<'_, K, V> {
     /// Look up `key`: a coerced value first, then the string map.
     #[inline]
     fn get(&self, py: Python<'_>, key: &str) -> PyResult<Option<Py<PyAny>>> {
@@ -584,7 +587,7 @@ impl SourceValues<'_> {
         Ok(self
             .values
             .and_then(|values| values.get(key))
-            .map(|value| PyString::new(py, value).into_any().unbind()))
+            .map(|value| PyString::new(py, value.as_ref()).into_any().unbind()))
     }
 }
 
@@ -597,7 +600,7 @@ pub(crate) fn build_prebound_from_values(
     py: Python<'_>,
     bindings: &[RustArgBinding],
     path: &SourceValues<'_>,
-    query: &SourceValues<'_>,
+    query: &SourceValues<'_, Cow<'_, str>, Cow<'_, str>>,
     headers: &SourceValues<'_>,
     cookies: &SourceValues<'_>,
 ) -> PyResult<Option<(Py<PyList>, Py<PyDict>)>> {
@@ -605,13 +608,13 @@ pub(crate) fn build_prebound_from_values(
     let kwargs = PyDict::new(py);
 
     for binding in bindings {
-        let source = match binding.source {
-            RustArgSource::Path => path,
-            RustArgSource::Query => query,
-            RustArgSource::Header => headers,
-            RustArgSource::Cookie => cookies,
+        let value = match binding.source {
+            RustArgSource::Path => path.get(py, &binding.key)?,
+            RustArgSource::Query => query.get(py, &binding.key)?,
+            RustArgSource::Header => headers.get(py, &binding.key)?,
+            RustArgSource::Cookie => cookies.get(py, &binding.key)?,
         };
-        match source.get(py, &binding.key)? {
+        match value {
             Some(value) => {
                 if binding.positional {
                     args.append(value)?;
@@ -829,18 +832,11 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     let plan = route_metadata.map(|m| m.plan);
 
     let needs_query = plan.map_or(true, |p| p.needs_query());
-    let query_params = if needs_query {
-        req.uri().query().and_then(|q| {
-            let parsed = parse_query_string(q);
-            if parsed.is_empty() {
-                None
-            } else {
-                Some(parsed)
-            }
-        })
-    } else {
-        None
-    };
+    // The map borrows its keys and values from the URI when they need no decode.
+    let query_string = if needs_query { req.uri().query() } else { None };
+    let query_params: Option<QueryParams<'_>> = query_string
+        .map(parse_query_string)
+        .filter(|parsed| !parsed.is_empty());
 
     let needs_body = plan.map_or(true, |p| p.needs_body());
 
@@ -1279,6 +1275,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             body,
             path_params: path_params_py,
             query_params: query_params_py,
+            query_string: query_string.map(str::to_owned).unwrap_or_default(),
             headers: headers_py,
             cookies: cookies_py,
             raw_headers: if keep_raw_headers {

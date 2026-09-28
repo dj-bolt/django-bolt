@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from django.http import QueryDict
 
 from django_bolt import BoltAPI
 from django_bolt.testing import TestClient
@@ -33,6 +34,15 @@ def api():
     async def get_meta_query(request):
         """Return QUERY_STRING from META."""
         return {"query": request.META.get("QUERY_STRING")}
+
+    @api.get("/meta/urls")
+    async def get_meta_urls(request):
+        """Return the URLs built from the query, and the query as Django parses QUERY_STRING."""
+        return {
+            "full_path": request.get_full_path(),
+            "absolute_uri": request.build_absolute_uri(),
+            "reparsed": QueryDict(request.META["QUERY_STRING"]).dict(),
+        }
 
     @api.get("/meta/headers")
     async def get_meta_headers(request):
@@ -237,13 +247,18 @@ class TestRequestMETA:
         assert meta["SCRIPT_NAME"] == ""
 
     def test_meta_query_string_preserves_encoding(self, client):
-        """META QUERY_STRING preserves URL encoding from original request."""
-        # URL-encoded query string: foo=hello%20world -> foo=hello world when decoded
-        # But QUERY_STRING should preserve the original encoding
-        response = client.get("/meta/query?foo=hello%20world&bar=a%2Bb")
+        """META QUERY_STRING is the query string as the client sent it, as in Django."""
+        response = client.get("/meta/query?foo=hello%20world&bar=a%2Bb&q=a+b")
         assert response.status_code == 200
-        query = response.json()["query"]
+        assert response.json()["query"] == "foo=hello%20world&bar=a%2Bb&q=a+b"
 
-        # The raw query string should be preserved
-        assert "foo=hello%20world" in query or "foo=hello world" in query
-        assert "bar=a%2Bb" in query or "bar=a+b" in query
+    def test_urls_keep_the_query_as_sent(self, client):
+        """get_full_path() and build_absolute_uri() keep the encoded query, as in Django."""
+        query = "q=hello+world&tag=a%2Bb&text=a%26b%3Dc"
+        response = client.get(f"/meta/urls?{query}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["full_path"] == f"/meta/urls?{query}"
+        assert data["absolute_uri"].endswith(f"/meta/urls?{query}")
+        # Django middleware parses QUERY_STRING again. It must get the values that the handler gets.
+        assert data["reparsed"] == {"q": "hello world", "tag": "a+b", "text": "a&b=c"}

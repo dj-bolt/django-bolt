@@ -1,7 +1,8 @@
-"""App under test for the decode of `+` in a query over a real server.
+"""App under test for query-string decoding over a real server.
 
-The routes echo a query value and a path value.
-A test can then see that `+` is a space in a query and a `+` in a path.
+The routes echo query values, a path value, and the URLs that the request builds.
+A test can then see that a query decodes as Django `QueryDict` does, that a
+`+` in a path stays a `+`, and that the URLs keep the query as it was sent.
 """
 
 from __future__ import annotations
@@ -28,7 +29,16 @@ def item(name: str):
     return {"name": name}
 
 
+@api.get("/echo")
+async def echo(request):
+    return {
+        "query": dict(request.query),
+        "full_path": request.get_full_path(),
+        "query_string": request.META["QUERY_STRING"],
+    }
+
+
 @api.websocket("/ws/search")
-async def search_ws(websocket: WebSocket, q: str):
+async def search_ws(websocket: WebSocket, q: str, flag: str | None = None):
     await websocket.accept()
-    await websocket.send_text(json.dumps({"q": q}))
+    await websocket.send_text(json.dumps({"q": q, "flag": flag}))

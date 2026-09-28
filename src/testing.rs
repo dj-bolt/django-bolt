@@ -35,7 +35,7 @@ use bolt_core::metadata::{CorsConfig, RateLimitKey, RouteMetadata, RouteMetadata
 use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
-use bolt_core::router::{decode_query_component, Router};
+use bolt_core::router::{query_pairs, Router};
 use bolt_core::state::{find_asgi_mount, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS};
 use bolt_websocket::WebSocketRouter;
 use futures_util::StreamExt;
@@ -742,7 +742,7 @@ async fn handle_test_request_internal(
     use bolt_core::request::PyRequest;
     use bolt_core::request_pipeline::{build_validation_error_response, extract_headers};
     use bolt_core::responses;
-    use bolt_core::router::parse_query_string;
+    use bolt_core::router::{parse_query_string, QueryParams};
     use bolt_core::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
 
     let method = req.method().as_str();
@@ -845,18 +845,11 @@ async fn handle_test_request_internal(
         .as_ref()
         .map(|m| m.plan.needs_query())
         .unwrap_or(true);
-    let query_params = if needs_query {
-        req.uri().query().and_then(|q| {
-            let parsed = parse_query_string(q);
-            if parsed.is_empty() {
-                None
-            } else {
-                Some(parsed)
-            }
-        })
-    } else {
-        None
-    };
+    // The map borrows its keys and values from the URI when they need no decode.
+    let query_string = if needs_query { req.uri().query() } else { None };
+    let query_params: Option<QueryParams<'_>> = query_string
+        .map(parse_query_string)
+        .filter(|parsed| !parsed.is_empty());
 
     // Max parameter length resolved once at startup; read the plain field here.
     let max_param_length = state.max_param_length;
@@ -1235,6 +1228,7 @@ async fn handle_test_request_internal(
             body: body.to_vec(),
             path_params: path_params_dict,
             query_params: query_params_dict,
+            query_string: query_string.map(str::to_owned).unwrap_or_default(),
             headers: headers_dict.map(|d| d.unbind()),
             cookies: cookies_dict.map(|d| d.unbind()),
             raw_headers: keep_raw_headers.then_some(headers),
@@ -1508,33 +1502,24 @@ pub fn handle_test_websocket(
 
     // Parse and coerce query parameters
     let query_dict = pyo3::types::PyDict::new(py);
-    if let Some(ref qs) = query_string {
-        if !qs.is_empty() {
-            for pair in qs.split('&') {
-                if let Some((key, value)) = pair.split_once('=') {
-                    let decoded_key = decode_query_component(key);
-                    let decoded_value = decode_query_component(value);
+    for (key, value) in query_pairs(query_string.as_deref().unwrap_or_default()) {
+        let type_hint = param_types
+            .get(key.as_ref())
+            .copied()
+            .unwrap_or(TYPE_STRING);
 
-                    let type_hint = param_types
-                        .get(decoded_key.as_ref())
-                        .copied()
-                        .unwrap_or(TYPE_STRING);
-
-                    match coerce_param(&decoded_value, type_hint, max_param_length) {
-                        Ok(coerced) => {
-                            let py_value = coerced_value_to_py(py, &coerced)?;
-                            query_dict.set_item(decoded_key.as_ref(), py_value)?;
-                        }
-                        // Oversized values are a hard error — never fall back to raw string.
-                        Err(e @ CoerceError::TooLong { .. }) => {
-                            return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-                        }
-                        // Genuine type-coercion failure: fall back to the raw string.
-                        Err(CoerceError::Invalid(_)) => {
-                            query_dict.set_item(decoded_key.as_ref(), decoded_value.as_ref())?;
-                        }
-                    }
-                }
+        match coerce_param(&value, type_hint, max_param_length) {
+            Ok(coerced) => {
+                let py_value = coerced_value_to_py(py, &coerced)?;
+                query_dict.set_item(key.as_ref(), py_value)?;
+            }
+            // Oversized values are a hard error — never fall back to raw string.
+            Err(e @ CoerceError::TooLong { .. }) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
+            }
+            // Genuine type-coercion failure: fall back to the raw string.
+            Err(CoerceError::Invalid(_)) => {
+                query_dict.set_item(key.as_ref(), value.as_ref())?;
             }
         }
     }

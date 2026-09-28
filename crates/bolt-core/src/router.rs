@@ -340,50 +340,98 @@ pub fn decode_path_params(params: &mut AHashMap<String, String>) {
     }
 }
 
+/// Query keys and values, decoded as Django `QueryDict` decodes them.
+/// A key or a value borrows from the query string when it needs no decode.
+pub type QueryParams<'a> = AHashMap<Cow<'a, str>, Cow<'a, str>>;
+
 /// Decode one query key or value, as Django `QueryDict` does (`application/x-www-form-urlencoded`).
-/// A `+` becomes a space before the percent-decode, so `%2B` gives a literal `+`.
-/// A value that does not decode to UTF-8 stays as it is.
+/// A `+` becomes a space and `%XX` becomes a byte, so `%2B` gives a literal `+`.
+/// Bytes that are not UTF-8 become U+FFFD, as in Python `unquote`.
 /// Do not use this for path params: a `+` in a path is a literal `+`.
 #[inline]
 pub fn decode_query_component(value: &str) -> Cow<'_, str> {
-    let bytes = value.as_bytes();
-    let has_percent = memchr::memchr(b'%', bytes).is_some();
-    let has_plus = memchr::memchr(b'+', bytes).is_some();
-    match (has_percent, has_plus) {
-        (false, false) => Cow::Borrowed(value),
-        (false, true) => Cow::Owned(value.replace('+', " ")),
-        (true, false) => urlencoding::decode(value).unwrap_or(Cow::Borrowed(value)),
-        (true, true) => match urlencoding::decode(&value.replace('+', " ")) {
-            Ok(decoded) => Cow::Owned(decoded.into_owned()),
-            Err(_) => Cow::Borrowed(value),
-        },
+    // Keys and values are short. An inline scan costs less than a `memchr` call.
+    if value.bytes().any(|byte| byte == b'%' || byte == b'+') {
+        decode_escaped_query_component(value)
+    } else {
+        Cow::Borrowed(value)
     }
 }
 
-/// Parse query string into key-value pairs
-/// OPTIMIZATION: #[inline] on hot path - called on requests with query strings
-#[inline]
-pub fn parse_query_string(query: &str) -> AHashMap<String, String> {
-    let mut params = AHashMap::new();
-    if query.is_empty() {
-        return params;
+/// Decode a component that has a `%` or a `+`, in one pass.
+/// It is out of line, so that the check in `decode_query_component` inlines.
+#[inline(never)]
+fn decode_escaped_query_component(value: &str) -> Cow<'_, str> {
+    let bytes = value.as_bytes();
+    if !bytes.contains(&b'%') {
+        return Cow::Owned(value.replace('+', " "));
     }
-
-    for pair in query.split('&') {
-        if let Some(eq_pos) = pair.find('=') {
-            let key = &pair[..eq_pos];
-            let value = &pair[eq_pos + 1..];
-            if !key.is_empty() {
-                params.insert(
-                    decode_query_component(key).into_owned(),
-                    decode_query_component(value).into_owned(),
-                );
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                decoded.push(b' ');
+                i += 1;
             }
-        } else if !pair.is_empty() {
-            params.insert(decode_query_component(pair).into_owned(), String::new());
+            b'%' => match (hex_digit(bytes.get(i + 1)), hex_digit(bytes.get(i + 2))) {
+                (Some(high), Some(low)) => {
+                    decoded.push((high << 4) | low);
+                    i += 3;
+                }
+                // Not an escape: the `%` stays, as in Python `unquote`.
+                _ => {
+                    decoded.push(b'%');
+                    i += 1;
+                }
+            },
+            byte => {
+                decoded.push(byte);
+                i += 1;
+            }
         }
     }
+    match String::from_utf8(decoded) {
+        Ok(text) => Cow::Owned(text),
+        Err(error) => Cow::Owned(String::from_utf8_lossy(error.as_bytes()).into_owned()),
+    }
+}
 
+#[inline]
+fn hex_digit(byte: Option<&u8>) -> Option<u8> {
+    match *byte? {
+        digit @ b'0'..=b'9' => Some(digit - b'0'),
+        letter @ b'a'..=b'f' => Some(letter - b'a' + 10),
+        letter @ b'A'..=b'F' => Some(letter - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Split a query string into decoded (key, value) pairs, in their order.
+/// The rules are those of Python `parse_qsl` for Django `QueryDict`, and of the
+/// WHATWG `application/x-www-form-urlencoded` parser. An empty pair is skipped.
+/// A pair with no `=` has an empty value. An empty key stays.
+#[inline]
+pub fn query_pairs(query: &str) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (decode_query_component(key), decode_query_component(value))
+        })
+}
+
+/// Parse a query string into a map. A repeated key keeps its last value, as `QueryDict[key]` does.
+#[inline]
+pub fn parse_query_string(query: &str) -> QueryParams<'_> {
+    if query.is_empty() {
+        return QueryParams::new();
+    }
+    // One pair for each `&`, but at most 16. Thus a query of many `&` cannot make a large map.
+    let pairs = query.bytes().filter(|&byte| byte == b'&').count() + 1;
+    let mut params = QueryParams::with_capacity(pairs.min(16));
+    params.extend(query_pairs(query));
     params
 }
 
@@ -426,9 +474,78 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_query_string_keeps_value_that_is_not_utf8() {
-        let params = parse_query_string("bad=a+%FF");
+    fn test_parse_query_string_replaces_bytes_that_are_not_utf8() {
+        // Django `QueryDict` decodes with errors="replace".
+        let params = parse_query_string("bad=a+%FF&cut=%E2%82&ok=%C3%A9&%FF=key");
 
-        assert_eq!(params["bad"], "a+%FF");
+        assert_eq!(params["bad"], "a \u{FFFD}");
+        assert_eq!(params["cut"], "\u{FFFD}");
+        assert_eq!(params["ok"], "é");
+        assert_eq!(params["\u{FFFD}"], "key");
+    }
+
+    #[test]
+    fn test_parse_query_string_keeps_empty_keys_and_skips_empty_pairs() {
+        let params = parse_query_string("=v&&flag&a=1&a=2&%zz=%&");
+
+        assert_eq!(params[""], "v");
+        assert_eq!(params["flag"], "");
+        assert_eq!(params["a"], "2");
+        assert_eq!(params["%zz"], "%");
+        assert_eq!(params.len(), 4);
+    }
+
+    #[test]
+    fn test_parse_query_string_borrows_what_needs_no_decode() {
+        let params = parse_query_string("page=2&q=a+b");
+
+        let (key, value) = params.get_key_value("page").unwrap();
+        assert!(matches!(key, Cow::Borrowed(_)));
+        assert!(matches!(value, Cow::Borrowed(_)));
+        assert!(matches!(params["q"], Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_query_pairs_keep_their_order() {
+        let pairs: Vec<(String, String)> = query_pairs("b=2&a=1&flag&b=3")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+
+        let expected = [("b", "2"), ("a", "1"), ("flag", ""), ("b", "3")];
+        assert_eq!(pairs, expected.map(|(k, v)| (k.to_string(), v.to_string())));
+    }
+
+    /// The parser gives the pairs of the WHATWG `application/x-www-form-urlencoded`
+    /// parser (in `serde_urlencoded`), which gives what Django `QueryDict` gives.
+    #[test]
+    fn test_parse_query_string_matches_the_whatwg_parser() {
+        let parts: Vec<&str> =
+            "a Z 0 é + % %2 %2B %20 %3D %26 %C3%A9 %FF %E2%82 %ED%A0%80 %zz = & &&"
+                .split(' ')
+                .collect();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let count = next() % 12;
+            let query: String = (0..count)
+                .map(|_| parts[(next() % parts.len() as u64) as usize])
+                .collect();
+
+            let expected: AHashMap<String, String> =
+                serde_urlencoded::from_str::<Vec<(String, String)>>(&query)
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+            let actual: AHashMap<String, String> = parse_query_string(&query)
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(actual, expected, "query {query:?}");
+        }
     }
 }

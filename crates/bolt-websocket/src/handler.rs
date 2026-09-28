@@ -16,7 +16,7 @@ use bolt_core::metadata::CorsConfig;
 use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::request_pipeline::{set_declared_item, EMPTY_TYPES};
-use bolt_core::router::decode_query_component;
+use bolt_core::router::query_pairs;
 use bolt_core::state::{AppState, ROUTE_METADATA};
 use bolt_core::type_coercion::coerced_value_to_py;
 use bolt_core::type_coercion::{coerce_param, CoerceError, TypeHints, TYPE_STRING};
@@ -94,33 +94,25 @@ fn build_scope(
 
     // Parse and coerce query parameters
     let query_dict = PyDict::new(py);
-    let query_string = req.query_string();
-    if !query_string.is_empty() {
-        for pair in query_string.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                let decoded_key = decode_query_component(key);
-                let decoded_value = decode_query_component(value);
+    for (key, value) in query_pairs(req.query_string()) {
+        // Get type hint and coerce
+        let type_hint = param_types
+            .get(key.as_ref())
+            .copied()
+            .unwrap_or(TYPE_STRING);
 
-                // Get type hint and coerce
-                let type_hint = param_types
-                    .get(decoded_key.as_ref())
-                    .copied()
-                    .unwrap_or(TYPE_STRING);
-
-                match coerce_param(&decoded_value, type_hint, max_param_length) {
-                    Ok(coerced) => {
-                        let py_value = coerced_value_to_py(py, &coerced)?;
-                        query_dict.set_item(decoded_key.as_ref(), py_value)?;
-                    }
-                    // Oversized values reject the upgrade — never pass a raw string through.
-                    Err(e @ CoerceError::TooLong { .. }) => {
-                        return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-                    }
-                    // Genuine type-coercion failure: fall back to the raw string.
-                    Err(CoerceError::Invalid(_)) => {
-                        query_dict.set_item(decoded_key.as_ref(), decoded_value.as_ref())?;
-                    }
-                }
+        match coerce_param(&value, type_hint, max_param_length) {
+            Ok(coerced) => {
+                let py_value = coerced_value_to_py(py, &coerced)?;
+                query_dict.set_item(key.as_ref(), py_value)?;
+            }
+            // Oversized values reject the upgrade — never pass a raw string through.
+            Err(e @ CoerceError::TooLong { .. }) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
+            }
+            // Genuine type-coercion failure: fall back to the raw string.
+            Err(CoerceError::Invalid(_)) => {
+                query_dict.set_item(key.as_ref(), value.as_ref())?;
             }
         }
     }

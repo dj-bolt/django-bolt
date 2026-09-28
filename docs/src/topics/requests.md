@@ -103,6 +103,14 @@ async def search(
 
 If no type annotation is provided, the parameter is treated as a string.
 
+Bolt decodes query keys and values as Django `QueryDict` does:
+
+- A `+` is a space, and `%2B` is a literal `+`. Thus a client must send a literal `+` as `%2B`.
+- Bytes that are not UTF-8 become U+FFFD (`�`).
+- A key with no `=` has an empty value. A repeated key keeps its last value.
+
+A `+` in a path parameter stays a `+`. `request.META["QUERY_STRING"]`, `request.get_full_path()` and `request.build_absolute_uri()` keep the query as the client sent it.
+
 ## Request body
 
 ### JSON body
