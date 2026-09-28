@@ -23,7 +23,6 @@ from ..dependencies import (
     resolve_dependency_sync,
     sync_form,
 )
-from ..params import Depends as DependsMarker
 from ..typing import (
     FieldDefinition,
     HandlerMetadata,
