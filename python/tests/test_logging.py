@@ -984,7 +984,8 @@ class TestQueueBasedLogging:
         django_logger = logging.getLogger("django")
 
         # conftest configures settings without LOGGING, so set explicit LOGGING here.
-        # Count handlers inside the block: Django reconfigures logging when the override exits.
+        # Django 6.1+ reconfigures logging when a LOGGING override starts and when it ends.
+        # Copy the handlers inside the block, so only setup_django_logging runs between the copies.
         with override_settings(LOGGING={"version": 1, "disable_existing_loggers": False}):
             handlers_before = django_logger.handlers[:]
             setup_django_logging(force=True)
