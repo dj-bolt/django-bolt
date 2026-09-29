@@ -126,6 +126,7 @@ async def items(tag: Annotated[set[int], Query()]):
 ```
 
 Bolt converts each value to the item type. A bad item gives a 422.
+A bare `list`, `set`, `frozenset` or `tuple` keeps each item as a string.
 A `tuple[int, str]` needs exactly one value for each position.
 A form field takes each value of its name in the same way.
 A header or a cookie gives a sequence of one item.

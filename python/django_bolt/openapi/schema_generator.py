@@ -1341,6 +1341,11 @@ class SchemaGenerator:
         origin_handler = _TYPING_ORIGIN_HANDLERS.get(get_origin(type_annotation))
         if origin_handler is not None:
             return origin_handler(self, get_args(type_annotation), register_component)
+        # A bare list, set, frozenset or tuple has no origin. msgspec reads it as items of any type.
+        if isinstance(type_annotation, type) and type_annotation in _BARE_COLLECTION_ARGS:
+            return _TYPING_ORIGIN_HANDLERS[type_annotation](
+                self, _BARE_COLLECTION_ARGS[type_annotation], register_component
+            )
 
         if type_annotation is UploadFile:
             return Schema(type="string", format="binary")
@@ -1728,6 +1733,14 @@ _TYPING_ORIGIN_HANDLERS: dict[Any, Callable[[SchemaGenerator, tuple[Any, ...], b
     dict: _origin_dict,
     # Bare typing.Literal does not go through msgspec.inspect.type_info.
     Literal: lambda gen, args, _r: gen._enum_values_schema(args),
+}
+
+# The type arguments that msgspec gives a bare collection: `set` is `set[Any]`, `tuple` is `tuple[Any, ...]`.
+_BARE_COLLECTION_ARGS: dict[type, tuple[Any, ...]] = {
+    list: (Any,),
+    set: (Any,),
+    frozenset: (Any,),
+    tuple: (Any, ...),
 }
 
 # Kwargs, not Schema instances: callers may mutate the returned Schema.

@@ -67,6 +67,30 @@ def test_a_sequence_parameter_is_an_array():
     }
 
 
+def test_a_bare_collection_is_an_array_of_any_items():
+    """msgspec reads a bare ``list``, ``set``, ``frozenset`` or ``tuple`` as a collection of any items."""
+    api = BoltAPI()
+
+    @api.get("/bare")
+    async def bare(
+        tags: Annotated[list, Query()],
+        unique: Annotated[set, Query()],
+        names: Annotated[frozenset, Query()],
+        steps: Annotated[tuple, Query()],
+    ) -> set:
+        return set()
+
+    spec = _spec(api)
+    assert _parameters(spec, "/bare") == {
+        "tags": {"type": "array", "items": {}},
+        "unique": {"type": "array", "items": {}, "uniqueItems": True},
+        "names": {"type": "array", "items": {}, "uniqueItems": True},
+        "steps": {"type": "array", "items": {}},
+    }
+    response = spec["paths"]["/bare"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert response == {"type": "array", "items": {}, "uniqueItems": True}
+
+
 def test_a_sequence_form_field_is_an_array():
     api = BoltAPI()
 

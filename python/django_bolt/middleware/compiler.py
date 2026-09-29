@@ -238,11 +238,11 @@ _SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
 
 
 def _is_sequence_annotation(annotation: Any) -> bool:
-    """True for a list, set, frozenset or tuple type, also behind Optional, msgspec.Meta or an alias."""
+    """True for a list, set, frozenset or tuple type, also bare or behind Optional, msgspec.Meta or an alias."""
     inner = unwrap_optional(resolve_type_alias(annotation))
     if get_origin(inner) is Annotated:
         inner = unwrap_optional(resolve_type_alias(get_args(inner)[0]))
-    return get_origin(inner) in _SEQUENCE_ORIGINS
+    return (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
 
 
 def _collect_seq_field_names(field: Any, target: set[str]) -> None:

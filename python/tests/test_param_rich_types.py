@@ -204,6 +204,42 @@ def test_a_single_value_source_rejects_a_type_that_cannot_hold_one_item(route, a
         api.get(route)(handler)
 
 
+def test_a_bare_collection_parameter_takes_each_value_of_its_key():
+    """msgspec reads a bare ``set`` as ``set[Any]``. It takes each value, and each item stays a string."""
+    api = BoltAPI()
+
+    @api.get("/bare")
+    async def bare(tag: Annotated[set, Query()], ids: Annotated[tuple, Query()], x_names: Annotated[list, Header()]):
+        return {"tag": _show(tag), "ids": _show(ids), "x_names": _show(x_names)}
+
+    @api.post("/bare-form")
+    async def bare_form(tag: Annotated[frozenset, Form()]):
+        return _show(tag)
+
+    class Prefs(msgspec.Struct):
+        themes: list = []
+
+    @api.get("/bare-cookie-struct")
+    async def bare_cookie_struct(prefs: Annotated[Prefs, Cookie()]):
+        return _show(prefs.themes)
+
+    with TestClient(api) as client:
+        response = client.get("/bare?tag=b&tag=a&tag=b&ids=1&ids=2", headers={"X-Names": "n"})
+        form_response = client.post("/bare-form", data={"tag": ["b", "a", "b"]})
+        cookie_response = client.get("/bare-cookie-struct", cookies={"themes": "dark"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "tag": {"value": ["a", "b"], "type": "set"},
+        "ids": {"value": ["1", "2"], "type": "tuple"},
+        "x_names": {"value": ["n"], "type": "list", "item_types": ["str"]},
+    }
+    assert form_response.status_code == 200, form_response.text
+    assert form_response.json() == {"value": ["a", "b"], "type": "frozenset"}
+    assert cookie_response.status_code == 200, cookie_response.text
+    assert cookie_response.json() == {"value": ["dark"], "type": "list", "item_types": ["str"]}
+
+
 def test_a_one_item_or_variadic_tuple_header_takes_the_value():
     api = BoltAPI()
 

@@ -81,7 +81,9 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     """
     target = unwrap_optional(annotation)
     base = get_args(target)[0] if get_origin(target) is Annotated else target
-    is_sequence = get_origin(unwrap_optional(base)) in _SEQUENCE_ORIGINS
+    inner = unwrap_optional(base)
+    # A bare `set` has no origin. msgspec reads it as set[Any].
+    is_sequence = (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
     constrained = get_origin(target) is Annotated and any(
         getattr(extra, name, None) is not None
         for extra in get_args(target)[1:]
@@ -403,7 +405,7 @@ def _is_sequence_field(field_type: Any) -> bool:
     """
     Determine whether a type annotation represents a sequence container (list, set, frozenset, or tuple).
 
-    Unwraps Optional[...] before checking the underlying origin.
+    Unwraps Optional[...] before checking the underlying origin. A bare ``set`` has no origin, so the class itself counts.
 
     Parameters:
         field_type (Any): The type annotation to inspect.
@@ -412,7 +414,7 @@ def _is_sequence_field(field_type: Any) -> bool:
         bool: `True` if the (unwrapped) annotation's origin is one of list, set, frozenset, or tuple; `False` otherwise.
     """
     inner = unwrap_optional(field_type)
-    return get_origin(inner) in _SEQUENCE_ORIGINS
+    return (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
 
 
 def _collect_sequence_field_names(struct_type: type) -> tuple[str, ...]:
