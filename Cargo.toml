@@ -119,7 +119,6 @@ pyo3-async-runtimes = { workspace = true }
 regex = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true }
-urlencoding = { workspace = true }
 bolt-loop = { workspace = true }
 bolt-core = { workspace = true }
 bolt-asgi = { workspace = true }
