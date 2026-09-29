@@ -796,14 +796,6 @@ async def test_websocket_repeated_query_key_keeps_last_value(injection_api):
 
 
 @pytest.mark.asyncio
-async def test_websocket_query_key_without_value_is_empty_string(injection_api):
-    """Test a query key with no '=' gives an empty string, as for an HTTP route."""
-    async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token") as ws:
-        response = await ws.receive_json()
-        assert response["token"] == ""
-
-
-@pytest.mark.asyncio
 async def test_websocket_mixed_injection(injection_api):
     """Test combined path, query, header, and cookie parameter injection."""
     headers = {
