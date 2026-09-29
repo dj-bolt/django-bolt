@@ -1780,8 +1780,9 @@ class BoltAPI:
             # get_running_loop() valid even when the coroutine never awaits.
             middleware_meta["is_async"] = meta["is_async"]
 
-            # Python middleware requires cookies and headers regardless of handler params
+            # Python middleware requires cookies, headers and the query regardless of handler params
             # Django middleware needs cookies/headers (CSRF, session, auth, etc.)
+            # and the query (request.GET, QUERY_STRING and get_full_path() for redirects).
             # Custom middleware may also inspect headers for routing, auth, etc.
             if (
                 self._has_django_middleware
@@ -1790,6 +1791,7 @@ class BoltAPI:
             ):
                 middleware_meta["needs_cookies"] = True
                 middleware_meta["needs_headers"] = True
+                middleware_meta["needs_query"] = True
             elif "rust_arg_bindings" in middleware_meta:
                 # Rust binds every argument from its own request maps, so the
                 # Python source dicts have no reader. Rust then does not build them.
@@ -1816,8 +1818,8 @@ class BoltAPI:
         A dependency that reads the query, a header or the body makes the route
         parse it too. The request data fields of the dependencies go into
         ``meta["dependency_fields"]``, so Rust also gets their types.
-        Each dependency binder is cached by (callable, method, path), and
-        ``dependencies.resolve_dependency`` reuses it at run time.
+        Each dependency binder is cached by (callable, method, path). The
+        argument injector of the route gets it one time, at registration.
         """
 
         def _compile_dep(dep_fn: Callable) -> dict[str, Any]:

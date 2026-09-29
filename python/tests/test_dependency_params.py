@@ -16,6 +16,7 @@ from django_bolt import BoltAPI, Depends, UploadFile
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.param_functions import Body, Cookie, File, Form, Header, Query
+from django_bolt.params import Param
 from django_bolt.testing import TestClient
 
 
@@ -458,3 +459,46 @@ def test_a_dependency_with_a_handler_name_in_another_source_gets_its_type():
         SchemaGenerator(api, OpenAPIConfig(title="Test", version="1")).generate().paths["/two-sources"].get.parameters
     )
     assert {(p.param_in, p.name) for p in parameters} == {("query", "token"), ("header", "token")}
+
+
+def _unsupported_source(value: Annotated[str, Param(source="nowhere")] = "") -> str:
+    return value
+
+
+def _outer_of_unsupported(value: str = Depends(_unsupported_source)) -> str:
+    return value
+
+
+def test_a_nested_dependency_that_fails_to_compile_fails_each_registration():
+    """The error leaves no part of the outer binding in the cache of the API.
+
+    Before, the second registration used the plan of the outer dependency
+    without its nested binding, and each request answered 500.
+    """
+    api = BoltAPI()
+
+    for _ in range(2):
+        with pytest.raises(TypeError, match="unsupported source"):
+
+            @api.get("/items")
+            def items(value: str = Depends(_outer_of_unsupported)):
+                return {"value": value}
+
+
+async def cycle_first(value: Annotated[int, Depends(cycle_second)]) -> int:
+    return value
+
+
+async def cycle_second(value: Annotated[int, Depends(cycle_first)]) -> int:
+    return value
+
+
+def test_a_cycle_of_async_dependencies_fails_at_registration():
+    """Before, the route registered, and each request recursed until it failed with a 500."""
+    api = BoltAPI()
+
+    with pytest.raises(RecursionError):
+
+        @api.get("/cycle")
+        async def cycle(value=Depends(cycle_first)):
+            return {"value": value}

@@ -47,6 +47,10 @@ pub struct PyRequest {
     pub path_params: Option<Py<PyDict>>,
     /// Query parameters - None when no query params (saves 1 PyDict alloc per request)
     pub query_params: Option<Py<PyDict>>,
+    /// The query string as the client sent it, still encoded. It is empty when
+    /// the request has no query, or when the route does not read the query.
+    /// `META["QUERY_STRING"]`, `get_full_path()` and `build_absolute_uri()` use it.
+    pub query_string: String,
     /// Headers - None when handler doesn't need headers (saves 1 PyDict alloc per request)
     pub headers: Option<Py<PyDict>>,
     /// Cookies - None when handler doesn't need cookies (saves 1 PyDict alloc per request)
@@ -304,27 +308,9 @@ impl PyRequest {
         meta.set_item("REQUEST_METHOD", self.method.as_ref())?;
         meta.set_item("PATH_INFO", &self.path)?;
 
-        // QUERY_STRING - reconstructed from parsed query_params.
-        let query_string = match &self.query_params {
-            Some(qp) => {
-                let query_dict = qp.bind(py);
-                if query_dict.is_empty() {
-                    String::new()
-                } else {
-                    query_dict
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            let key = k.extract::<String>().ok()?;
-                            let val = v.str().ok()?.to_string();
-                            Some(format!("{}={}", key, val))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("&")
-                }
-            }
-            None => String::new(),
-        };
-        meta.set_item("QUERY_STRING", query_string)?;
+        // QUERY_STRING is still encoded, as in Django. A decoded `&` or `=`
+        // would change the parameters that Django middleware parses from it.
+        meta.set_item("QUERY_STRING", &self.query_string)?;
 
         // Server info from Actix's connection_info() - handles IPv6 and proxies correctly
         // conn_host may include port: "example.com:8080" or "[::1]:8080"
@@ -426,26 +412,12 @@ impl PyRequest {
     ///     /users?page=2&limit=10
     ///
     /// This matches Django's HttpRequest.get_full_path() method.
-    fn get_full_path(&self, py: Python<'_>) -> String {
-        match &self.query_params {
-            Some(qp) => {
-                let query_dict = qp.bind(py);
-                if query_dict.is_empty() {
-                    self.path.clone()
-                } else {
-                    let query_string: String = query_dict
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            let key = k.extract::<String>().ok()?;
-                            let val = v.str().ok()?.to_string();
-                            Some(format!("{}={}", key, val))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("&");
-                    format!("{}?{}", self.path, query_string)
-                }
-            }
-            None => self.path.clone(),
+    /// The query stays encoded, as the client sent it.
+    fn get_full_path(&self) -> String {
+        if self.query_string.is_empty() {
+            self.path.clone()
+        } else {
+            format!("{}?{}", self.path, self.query_string)
         }
     }
 
@@ -478,27 +450,9 @@ impl PyRequest {
             None => ("localhost".to_string(), "http".to_string()),
         };
 
-        let path = location.unwrap_or(&self.path);
-
-        // Build query string from query_params if using current path
-        let has_query = match &self.query_params {
-            Some(qp) if location.is_none() => !qp.bind(py).is_empty(),
-            _ => false,
-        };
-        if !has_query {
-            format!("{}://{}{}", scheme, host, path)
-        } else {
-            let query_dict = self.query_params.as_ref().unwrap().bind(py);
-            let query_string: String = query_dict
-                .iter()
-                .filter_map(|(k, v)| {
-                    let key = k.extract::<String>().ok()?;
-                    let val = v.str().ok()?.to_string();
-                    Some(format!("{}={}", key, val))
-                })
-                .collect::<Vec<_>>()
-                .join("&");
-            format!("{}://{}{}?{}", scheme, host, path, query_string)
+        match location {
+            Some(location) => format!("{}://{}{}", scheme, host, location),
+            None => format!("{}://{}{}", scheme, host, self.get_full_path()),
         }
     }
 

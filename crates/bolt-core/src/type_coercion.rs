@@ -420,15 +420,22 @@ pub type CoercedValues<'a> = Vec<(&'a str, CoercedValue)>;
 ///
 /// Names are not interned: interning costs a lookup per call, and interned
 /// client-supplied names would never be freed.
+///
+/// `values` can own its strings (headers, cookies) or borrow them (query).
 #[inline]
-pub fn string_map_to_py_dict<'py>(
+pub fn string_map_to_py_dict<'py, K, V>(
     py: Python<'py>,
-    values: &ahash::AHashMap<String, String>,
+    values: &ahash::AHashMap<K, V>,
     coerced: &[(&str, CoercedValue)],
-) -> PyResult<pyo3::Bound<'py, PyDict>> {
+) -> PyResult<pyo3::Bound<'py, PyDict>>
+where
+    K: std::borrow::Borrow<str>,
+    V: AsRef<str>,
+{
     let dict = PyDict::new(py);
     for (name, value) in values {
-        dict.set_item(name, value)?;
+        let name: &str = name.borrow();
+        dict.set_item(name, value.as_ref())?;
     }
     for (name, typed) in coerced {
         dict.set_item(name, coerced_value_to_py(py, typed)?)?;

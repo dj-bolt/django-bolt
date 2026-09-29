@@ -740,7 +740,7 @@ async fn handle_test_request_internal(
     use bolt_core::request::PyRequest;
     use bolt_core::request_pipeline::{build_validation_error_response, extract_headers};
     use bolt_core::responses;
-    use bolt_core::router::parse_query_string;
+    use bolt_core::router::{parse_query_string, QueryParams};
     use bolt_core::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
 
     let method = req.method().as_str();
@@ -843,18 +843,11 @@ async fn handle_test_request_internal(
         .as_ref()
         .map(|m| m.plan.needs_query())
         .unwrap_or(true);
-    let query_params = if needs_query {
-        req.uri().query().and_then(|q| {
-            let parsed = parse_query_string(q);
-            if parsed.is_empty() {
-                None
-            } else {
-                Some(parsed)
-            }
-        })
-    } else {
-        None
-    };
+    // The map borrows its keys and values from the URI when they need no decode.
+    let query_string = if needs_query { req.uri().query() } else { None };
+    let query_params: Option<QueryParams<'_>> = query_string
+        .map(parse_query_string)
+        .filter(|parsed| !parsed.is_empty());
 
     // Max parameter length resolved once at startup; read the plain field here.
     let max_param_length = state.max_param_length;
@@ -1233,6 +1226,7 @@ async fn handle_test_request_internal(
             body: body.to_vec(),
             path_params: path_params_dict,
             query_params: query_params_dict,
+            query_string: query_string.map(str::to_owned).unwrap_or_default(),
             headers: headers_dict.map(|d| d.unbind()),
             cookies: cookies_dict.map(|d| d.unbind()),
             raw_headers: keep_raw_headers.then_some(headers),
