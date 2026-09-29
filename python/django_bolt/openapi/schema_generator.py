@@ -887,6 +887,9 @@ class SchemaGenerator:
 
             # Get schema for parameter type
             schema = self._type_to_schema(annotation)
+            # A path, a header or a cookie gives one value, so its array holds exactly one item.
+            if param_in != "query" and isinstance(schema, Schema) and schema.type == "array":
+                schema = replace(schema, min_items=1, max_items=1)
             if default not in (inspect.Parameter.empty, None):
                 schema = replace(schema, default=default)
 
@@ -1737,6 +1740,8 @@ _PRIMITIVE_SCHEMAS: dict[Any, dict[str, str]] = {
     bool: {"type": "boolean"},
     bytes: {"type": "string", "format": "binary"},
     Any: {},
+    msgspec.Raw: {},
+    type(None): {"type": "null"},
     datetime.datetime: {"type": "string", "format": "date-time"},
     datetime.date: {"type": "string", "format": "date"},
     datetime.time: {"type": "string", "format": "time"},

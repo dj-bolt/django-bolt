@@ -183,6 +183,41 @@ def test_a_sequence_header_or_cookie_gives_one_item(form_client):
     assert form_client.get("/cookie", cookies={"tags": "a"}).json() == {"value": ["a"], "type": "set"}
 
 
+@pytest.mark.parametrize(
+    ("route", "annotation"),
+    [
+        ("/value", Annotated[tuple[int, str], Header()]),
+        ("/value", Annotated[tuple[int, str], Cookie()]),
+        ("/value", Annotated[list[int], msgspec.Meta(min_length=2), Header()]),
+        ("/value/{value}", Annotated[tuple[int, int], Path()]),
+    ],
+    ids=["header_pair", "cookie_pair", "header_min_two", "path_pair"],
+)
+def test_a_single_value_source_rejects_a_type_that_cannot_hold_one_item(route, annotation):
+    """A path, a header or a cookie gives one value. A type that needs more fails when the route registers."""
+    api = BoltAPI()
+
+    async def handler(value: annotation):
+        return {"value": list(value)}
+
+    with pytest.raises(TypeError, match="one item"):
+        api.get(route)(handler)
+
+
+def test_a_one_item_or_variadic_tuple_header_takes_the_value():
+    api = BoltAPI()
+
+    @api.get("/ids")
+    async def ids(x_id: Annotated[tuple[int], Header()], x_ids: Annotated[tuple[int, ...], Header()]):
+        return {"one": _show(x_id), "many": _show(x_ids)}
+
+    with TestClient(api) as client:
+        response = client.get("/ids", headers={"X-Id": "4", "X-Ids": "5"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"one": {"value": [4], "type": "tuple"}, "many": {"value": [5], "type": "tuple"}}
+
+
 # --- NewType and type aliases ----------------------------------------------------------
 
 

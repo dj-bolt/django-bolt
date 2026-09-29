@@ -55,6 +55,16 @@ def get_msgspec_decoder(type_: Any) -> msgspec.json.Decoder:
 _SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
 # The msgspec.Meta fields that constrain a value. The other fields only document it.
 _META_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "pattern", "min_length", "max_length", "tz")
+# These sources give one value. A query key can give more than one.
+_SINGLE_VALUE_SOURCES = ("path", "header", "cookie")
+
+
+def _holds_one_item(annotation: Any) -> bool:
+    """Return True when msgspec accepts a sequence of exactly one item for this type."""
+    node = msgspec.inspect.type_info(annotation)
+    if isinstance(node, msgspec.inspect.TupleType):
+        return len(node.item_types) == 1
+    return (node.min_length or 0) <= 1 and (node.max_length is None or node.max_length >= 1)
 
 
 def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = False) -> Callable | None:
@@ -65,7 +75,9 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     ``msgspec.convert`` builds the ``list``, ``set``, ``frozenset`` or ``tuple``
     from the values and checks the constraints. A bad value gives a 422 that
     names ``loc`` and ``key``. With ``one_item``, a source that gives one value
-    (a path, a header or a cookie) gives a sequence of that one item.
+    (a path, a header or a cookie) gives a sequence of that one item. A type
+    that cannot hold one item, such as ``tuple[int, str]``, then raises
+    ``TypeError`` here, when the route registers.
     """
     target = unwrap_optional(annotation)
     base = get_args(target)[0] if get_origin(target) is Annotated else target
@@ -79,6 +91,11 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     if not is_sequence and not constrained:
         return None
     wrap = is_sequence and one_item
+    if wrap and loc in _SINGLE_VALUE_SOURCES and not _holds_one_item(target):
+        raise TypeError(
+            f"The {loc} parameter {key!r} gets one value, but its type {target!r} cannot hold one item. "
+            "Use list[T], set[T], tuple[T] or tuple[T, ...]."
+        )
 
     def convert(value: Any) -> Any:
         if wrap and not isinstance(value, list):

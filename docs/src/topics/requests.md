@@ -121,6 +121,7 @@ Bolt converts each value to the item type. A bad item gives a 422.
 A `tuple[int, str]` needs exactly one value for each position.
 A form field takes each value of its name in the same way.
 A header or a cookie gives a sequence of one item.
+A path, header or cookie type that cannot hold one item, such as `tuple[int, str]`, raises `TypeError` when the route registers.
 
 ### Constraints
 

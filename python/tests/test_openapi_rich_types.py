@@ -18,7 +18,7 @@ from openapi_spec_validator import validate
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
-from django_bolt.param_functions import Cookie, Form, Header, Query
+from django_bolt.param_functions import Cookie, Form, Header, Path, Query
 
 UserId = NewType("UserId", int)
 type Page = int
@@ -39,10 +39,12 @@ def _parameters(spec: dict, path: str) -> dict[str, dict]:
 
 
 def test_a_sequence_parameter_is_an_array():
+    """A query array takes each value of its key. A path, header or cookie array holds one item."""
     api = BoltAPI()
 
-    @api.get("/items")
+    @api.get("/items/{ids}")
     async def items(
+        ids: Annotated[list[int], Path()],
         tags: Annotated[list[int], Query()],
         unique: Annotated[set[int], Query()],
         names: Annotated[frozenset[str], Query()],
@@ -53,14 +55,15 @@ def test_a_sequence_parameter_is_an_array():
     ):
         return {}
 
-    assert _parameters(_spec(api), "/items") == {
+    assert _parameters(_spec(api), "/items/{ids}") == {
+        "ids": {"type": "array", "items": INTEGER, "minItems": 1, "maxItems": 1},
         "tags": {"type": "array", "items": INTEGER},
         "unique": {"type": "array", "items": INTEGER, "uniqueItems": True},
         "names": {"type": "array", "items": STRING, "uniqueItems": True},
         "steps": {"type": "array", "items": INTEGER},
         "point": {"type": "array", "prefixItems": [INTEGER, STRING], "minItems": 2, "maxItems": 2},
-        "x-ids": {"type": "array", "items": INTEGER},
-        "flags": {"type": "array", "items": STRING, "uniqueItems": True},
+        "x-ids": {"type": "array", "items": INTEGER, "minItems": 1, "maxItems": 1},
+        "flags": {"type": "array", "items": STRING, "uniqueItems": True, "minItems": 1, "maxItems": 1},
     }
 
 
@@ -199,6 +202,32 @@ def test_the_remaining_msgspec_types_of_a_json_body():
         "minItems": 1,
         "maxItems": 2,
     }
+
+
+def test_a_raw_or_none_return_type_documents_as_its_field_does():
+    """``msgspec.Raw`` holds any JSON value (``{}``), and ``None`` is ``null``, also outside a struct."""
+    api = BoltAPI()
+
+    @api.get("/raw")
+    async def raw() -> msgspec.Raw:
+        return msgspec.Raw(b"{}")
+
+    @api.get("/raws")
+    async def raws() -> list[msgspec.Raw]:
+        return []
+
+    @api.get("/nothing")
+    async def nothing() -> None:
+        return None
+
+    paths = _spec(api)["paths"]
+
+    def response_schema(path: str) -> dict:
+        return paths[path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+
+    assert response_schema("/raw") == {}
+    assert response_schema("/raws") == {"type": "array", "items": {}}
+    assert response_schema("/nothing") == {"type": "null"}
 
 
 def test_a_dataclass_with_no_docstring_has_no_generated_description():
