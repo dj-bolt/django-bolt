@@ -17,6 +17,7 @@ import msgspec
 
 from ..analysis import resolve_introspection_target
 from ..dependencies import (
+    compile_dependency,
     decode_body_once,
     dependency_needs_event_loop,
     resolve_dependency,
@@ -426,19 +427,17 @@ async def build_handler_arguments(
         elif field.source == "dependency":
             if field.dependency is None:
                 raise ValueError(f"Depends for parameter {field.name} requires a callable")
+            dep_fn = field.dependency.dependency
             value = await resolve_dependency(
-                field.dependency.dependency,
+                dep_fn,
                 field.dependency,
+                compile_dependency(dep_fn, handler_meta_dict, compile_binder_fn, meta["http_method"], meta["path"]),
                 request,
                 dep_cache,
                 params_map,
                 query_map,
                 headers_map,
                 cookies_map,
-                handler_meta_dict,
-                compile_binder_fn,
-                meta["http_method"],
-                meta["path"],
             )
         else:
             value, body_obj, body_loaded = extract_parameter_value(
@@ -660,9 +659,16 @@ def compile_argument_injector(
             src_id = _dep_source_map.get(f.source, _SRC_FALLBACK_D)
             if src_id == _SRC_DEP:
                 dependency = f.dependency
-                if handler_is_sync and dependency is not None:
-                    dependency = sync_form(dependency)
-                _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, dependency))
+                # The extractor slot of a dependency holds its binding for this
+                # route, compiled here. A request then does not look it up.
+                dep_meta = None
+                if dependency is not None:
+                    if handler_is_sync:
+                        dependency = sync_form(dependency)
+                    dep_meta = compile_dependency(
+                        dependency.dependency, handler_meta_dict, compile_binder_fn, http_method, path
+                    )
+                _dep_plan.append((src_id, dep_meta, f.kind in _POSITIONAL_KINDS, f.name, False, dependency))
             elif src_id == _SRC_REQUEST_D:
                 _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, None))
             elif src_id == _SRC_FALLBACK_D or f.extractor is None:
@@ -718,16 +724,13 @@ def compile_argument_injector(
                         value = resolve_dependency_sync(
                             dependency.dependency,
                             dependency,
+                            extractor,
                             request,
                             dep_cache,
                             params_map,
                             query_map,
                             headers_map,
                             cookies_map,
-                            handler_meta_dict,
-                            compile_binder_fn,
-                            http_method,
-                            path,
                         )
                     elif src_id == _SRC_REQUEST_D:
                         value = request
@@ -795,26 +798,23 @@ def compile_argument_injector(
             # For 2+ async deps, resolve them in parallel via asyncio.gather
             if _can_parallel:
                 # Pre-resolve all async deps in parallel
-                async def _resolve_one(dependency):
+                async def _resolve_one(dependency, dep_meta):
                     return await resolve_dependency(
                         dependency.dependency,
                         dependency,
+                        dep_meta,
                         request,
                         dep_cache,
                         params_map,
                         query_map,
                         headers_map,
                         cookies_map,
-                        handler_meta_dict,
-                        compile_binder_fn,
-                        http_method,
-                        path,
                     )
 
                 dep_coros = []
                 for idx in _async_dep_fns:
-                    dep = _dep_plan[idx][5]
-                    dep_coros.append(_resolve_one(dep))
+                    plan_entry = _dep_plan[idx]
+                    dep_coros.append(_resolve_one(plan_entry[5], plan_entry[1]))
 
                 dep_results = await asyncio.gather(*dep_coros)
                 # Map results back to plan indices — use a pre-sized list indexed
@@ -841,16 +841,13 @@ def compile_argument_injector(
                         value = await resolve_dependency(
                             dependency.dependency,
                             dependency,
+                            extractor,
                             request,
                             dep_cache,
                             params_map,
                             query_map,
                             headers_map,
                             cookies_map,
-                            handler_meta_dict,
-                            compile_binder_fn,
-                            http_method,
-                            path,
                         )
                 elif src_id == _SRC_REQUEST_D:
                     value = request

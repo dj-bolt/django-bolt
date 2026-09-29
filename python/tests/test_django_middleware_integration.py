@@ -1964,3 +1964,37 @@ class TestTypedParamsKeepRawStringsForDjango:
         assert response.status_code == 200, response.text
         assert response.json() == {"count": 5, "x_count": 7}
         assert RawValuesRecorder.seen == {"cookie": "0005", "header": "0007"}
+
+
+class QueryRecorder(MiddlewareMixin):
+    """Record the query that Django middleware sees."""
+
+    seen: dict = {}
+
+    def process_request(self, request):
+        QueryRecorder.seen = {
+            "get": request.GET.dict(),
+            "query_string": request.META.get("QUERY_STRING"),
+            "full_path": request.get_full_path(),
+        }
+
+
+class TestDjangoMiddlewareSeesTheQuery:
+    """Django middleware gets the query, also when the handler does not read it."""
+
+    def test_middleware_sees_the_query_that_the_handler_ignores(self):
+        api = BoltAPI(middleware=[DjangoMiddlewareStack([QueryRecorder])])
+
+        @api.get("/page")
+        async def page() -> dict:
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            response = client.get("/page?next=%2Fa%3Fb%3D1&q=x+y")
+
+        assert response.status_code == 200, response.text
+        assert QueryRecorder.seen == {
+            "get": {"next": "/a?b=1", "q": "x y"},
+            "query_string": "next=%2Fa%3Fb%3D1&q=x+y",
+            "full_path": "/page?next=%2Fa%3Fb%3D1&q=x+y",
+        }

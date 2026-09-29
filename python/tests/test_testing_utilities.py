@@ -8,6 +8,7 @@ from typing import Annotated
 
 import msgspec
 import pytest
+from django.http import QueryDict
 
 from django_bolt import BoltAPI, _core
 from django_bolt.param_functions import Header
@@ -58,6 +59,58 @@ def test_query_parameters():
         data = response.json()
         assert data["query"] == "test"
         assert data["limit"] == 20
+
+
+def test_query_plus_decodes_to_space():
+    """A `+` in the query is a space and `%2B` is a literal `+`, as in Django."""
+    api = BoltAPI()
+
+    @api.get("/search")
+    async def search(q: str, tag: str = ""):
+        return {"q": q, "tag": tag}
+
+    @api.get("/items/{name}")
+    async def item(name: str):
+        return {"name": name}
+
+    with TestClient(api) as client:
+        response = client.get("/search?q=hello+world&tag=a%2Bb")
+        assert response.status_code == 200
+        assert response.json() == {"q": "hello world", "tag": "a+b"}
+
+        # httpx encodes a space in params as `+` and a `+` as `%2B`.
+        response = client.get("/search", params={"q": "x y", "tag": "c+d"})
+        assert response.status_code == 200
+        assert response.json() == {"q": "x y", "tag": "c+d"}
+
+        # A `+` in the path is a literal `+`.
+        response = client.get("/items/a+b")
+        assert response.status_code == 200
+        assert response.json() == {"name": "a+b"}
+
+
+@pytest.mark.parametrize(
+    "query_string",
+    [
+        "q=hello+world&tag=a%2Bb&text=a%26b%3Dc",
+        "bad=%FF&cut=%E2%82&surrogate=%ED%A0%80&mixed=a+%FF",
+        "=v&flag&&a=1&a=2&",
+        "n=+5&k%20ey=v%20al&%zz=1&%=2&caf%C3%A9=%C3%A9",
+    ],
+)
+def test_query_matches_django_querydict(query_string):
+    """`request.query` holds what Django `QueryDict` gives, with the last value of a repeated key."""
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(request):
+        return dict(request.query)
+
+    with TestClient(api) as client:
+        response = client.get(f"/query?{query_string}")
+
+    assert response.status_code == 200
+    assert response.json() == {key: values[-1] for key, values in QueryDict(query_string).lists()}
 
 
 def test_post_with_body():

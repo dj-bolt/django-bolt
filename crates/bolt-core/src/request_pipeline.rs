@@ -5,9 +5,12 @@
 
 use actix_web::{HttpRequest, HttpResponse};
 use ahash::AHashMap;
+use std::borrow::Borrow;
+use std::hash::Hash;
 
 use crate::form_parsing::ValidationError;
 use crate::responses;
+use crate::router::QueryParams;
 use crate::type_coercion::{
     coerce_param, coerced_value_to_py, CoercedValue, CoercedValues, TypeHints, TYPE_STRING,
 };
@@ -23,7 +26,7 @@ pub static EMPTY_TYPES: std::sync::LazyLock<TypeHints> = std::sync::LazyLock::ne
 /// parameters are validated for length but left as-is.
 pub fn validate_and_cache_typed_params<'t>(
     path_params: Option<&AHashMap<String, String>>,
-    query_params: Option<&AHashMap<String, String>>,
+    query_params: Option<&QueryParams<'_>>,
     param_types: &'t TypeHints,
     max_length: usize,
 ) -> Result<(CoercedValues<'t>, CoercedValues<'t>), HttpResponse> {
@@ -54,26 +57,33 @@ pub fn validate_and_cache_typed_params<'t>(
 ///
 /// The names in the result borrow from `types`, the route metadata, not from
 /// `values`. The caller can thus move the request map while it holds the result.
-pub fn validate_and_cache_source<'t>(
-    values: &AHashMap<String, String>,
+///
+/// `values` can own its strings (headers, cookies) or borrow them (query).
+pub fn validate_and_cache_source<'t, K, V>(
+    values: &AHashMap<K, V>,
     types: &'t TypeHints,
     max_length: usize,
     label: &str,
-) -> Result<CoercedValues<'t>, HttpResponse> {
+) -> Result<CoercedValues<'t>, HttpResponse>
+where
+    K: Borrow<str> + Eq + Hash,
+    V: AsRef<str>,
+{
     let mut coerced_values = CoercedValues::new();
     if types.len() < values.len() {
         for (name, value) in values {
+            let value = value.as_ref();
             // Security: Always validate length for ALL parameters (including strings)
             if value.len() > max_length {
-                return Err(too_long(label, name, value.len(), max_length));
+                return Err(too_long(label, name.borrow(), value.len(), max_length));
             }
         }
         for (name, &type_hint) in types {
-            if let Some(value) = values.get(name) {
+            if let Some(value) = values.get(name.as_str()) {
                 coerce_into(
                     &mut coerced_values,
                     name,
-                    value,
+                    value.as_ref(),
                     type_hint,
                     max_length,
                     label,
@@ -82,6 +92,7 @@ pub fn validate_and_cache_source<'t>(
         }
     } else {
         for (name, value) in values {
+            let (name, value): (&str, &str) = (name.borrow(), value.as_ref());
             // Security: Always validate length for ALL parameters (including strings)
             if value.len() > max_length {
                 return Err(too_long(label, name, value.len(), max_length));
@@ -367,7 +378,9 @@ mod tests {
         let bad = values(&[("id", "x")]);
         let response = validate_and_cache_typed_params(Some(&bad), None, &hints, 64).unwrap_err();
         assert!(detail(response).contains("Path parameter 'id'"));
-        let response = validate_and_cache_typed_params(None, Some(&bad), &hints, 64).unwrap_err();
+        let bad_query = crate::router::parse_query_string("id=x");
+        let response =
+            validate_and_cache_typed_params(None, Some(&bad_query), &hints, 64).unwrap_err();
         assert!(detail(response).contains("Query parameter 'id'"));
     }
 }

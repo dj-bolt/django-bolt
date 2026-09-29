@@ -561,7 +561,6 @@ dependencies = [
  "pyo3-async-runtimes",
  "regex",
  "tokio",
- "urlencoding",
 ]
 
 [[package]]
@@ -961,7 +960,6 @@ dependencies = [
  "socket2 0.6.2",
  "tikv-jemallocator",
  "tokio",
- "urlencoding",
 ]
 
 [[package]]
