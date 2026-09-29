@@ -1816,8 +1816,8 @@ class BoltAPI:
         A dependency that reads the query, a header or the body makes the route
         parse it too. The request data fields of the dependencies go into
         ``meta["dependency_fields"]``, so Rust also gets their types.
-        Each dependency binder is cached by (callable, method, path), and
-        ``dependencies.resolve_dependency`` reuses it at run time.
+        Each dependency binder is cached by (callable, method, path). The
+        argument injector of the route gets it one time, at registration.
         """
 
         def _compile_dep(dep_fn: Callable) -> dict[str, Any]:
