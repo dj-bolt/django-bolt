@@ -154,6 +154,26 @@ The OpenAPI schema shows them, for example `minimum: 1`.
 A constraint that msgspec cannot apply, for example `ge` on a `Decimal`, raises `TypeError` when the route registers.
 The types in `django_bolt.serializers.types`, such as `PositiveInt`, work the same way.
 
+`Query()` and `Path()` also take the constraint arguments `gt`, `ge`, `lt`, `le`, `min_length`, `max_length` and `pattern`.
+Bolt applies them as `msgspec.Meta`:
+
+```python
+@api.get("/search")
+async def search(
+    name: str = Query(min_length=3, description="The name to find"),
+    category: str = Query(default="all"),
+    page: Annotated[int, Query(ge=1)] = 1,
+):
+    return {"name": name, "category": category, "page": page}
+```
+
+The marker can be the default of the parameter, or an item of `Annotated`.
+In both forms, `default` gives the value of a missing parameter.
+Without `default`, the parameter is required.
+Do not give a default both in the marker and after `=`. Registration then raises `TypeError`.
+`Header()`, `Cookie()` and `Form()` take `default` in the same way.
+The OpenAPI schema shows the `description`, `example` and `deprecated` arguments of the marker.
+
 ### NewType and type aliases
 
 A `NewType` or a `type` alias converts as the type that it names:

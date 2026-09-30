@@ -893,12 +893,15 @@ class SchemaGenerator:
             if default not in (inspect.Parameter.empty, None):
                 schema = replace(schema, default=default)
 
+            marker = field.param
             parameter = Parameter(
                 name=alias,
                 param_in=param_in,
                 required=required,
                 schema=schema,
-                description=f"Parameter {alias}",
+                description=marker.description if marker and marker.description else f"Parameter {alias}",
+                deprecated=bool(marker and marker.deprecated),
+                example=marker.example if marker else None,
             )
             parameters.append(parameter)
 
@@ -976,7 +979,13 @@ class SchemaGenerator:
                                 required.append(sub_name)
                         continue
 
-                    properties[name] = self._type_to_schema(annotation)
+                    property_schema = self._type_to_schema(annotation)
+                    marker = field.param
+                    if isinstance(property_schema, Schema) and marker and marker.description:
+                        property_schema = replace(property_schema, description=marker.description)
+                    if default not in (inspect.Parameter.empty, None):
+                        property_schema = self._with_default(property_schema, default)
+                    properties[name] = property_schema
                     if default == inspect.Parameter.empty and not is_optional(annotation):
                         required.append(name)
 

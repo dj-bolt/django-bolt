@@ -323,11 +323,16 @@ def resolve_type_alias(annotation: Any) -> Any:
     return annotation
 
 
+# The constraint arguments of Query() and Path(), with the msgspec.Meta names.
+_MARKER_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "min_length", "max_length", "pattern")
+
+
 def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, Any]:
     """Split a parameter annotation into its value type and its ``Param`` or ``Depends`` marker.
 
     ``Annotated[int, msgspec.Meta(ge=1), Query()]`` gives ``(Annotated[int, msgspec.Meta(ge=1)], Query())``.
     The marker comes from ``Annotated``, or else from ``default``. It is None when there is none.
+    The constraint arguments of the marker (``Query(ge=1)``) become one more ``msgspec.Meta``.
     The ``msgspec.Meta`` items stay on a scalar or a sequence type, so the value
     is validated against them and the schema shows them. They go on the type
     inside ``Optional``, because msgspec takes ``Annotated[int, Meta(ge=1)] | None``
@@ -340,12 +345,19 @@ def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, A
     """
     default_marker = default if isinstance(default, (Param, DependsMarker)) else None
     annotation = resolve_type_alias(annotation)
-    if get_origin(annotation) is not Annotated:
-        return annotation, default_marker
-    base, *extras = get_args(annotation)
-    base = resolve_type_alias(base)
-    marker = next((extra for extra in extras if isinstance(extra, (Param, DependsMarker))), default_marker)
-    constraints = [extra for extra in extras if isinstance(extra, msgspec.Meta)]
+    if get_origin(annotation) is Annotated:
+        base, *extras = get_args(annotation)
+        base = resolve_type_alias(base)
+        marker = next((extra for extra in extras if isinstance(extra, (Param, DependsMarker))), default_marker)
+        constraints = [extra for extra in extras if isinstance(extra, msgspec.Meta)]
+    else:
+        base, marker, constraints = annotation, default_marker, []
+    if isinstance(marker, Param):
+        marker_constraints = {
+            name: value for name in _MARKER_CONSTRAINTS if (value := getattr(marker, name)) is not None
+        }
+        if marker_constraints:
+            constraints.append(msgspec.Meta(**marker_constraints))
     inner = unwrap_optional(base)
     if (
         not constraints
@@ -549,7 +561,12 @@ class FieldDefinition:
             FieldDefinition instance
         """
         name = parameter.name
-        default = parameter.default
+        # A marker after "=" is not a value. Its own default is the default of the parameter.
+        default = inspect.Parameter.empty if isinstance(parameter.default, Param) else parameter.default
+        if isinstance(explicit_marker, Param) and explicit_marker.default is not ...:
+            if default is not inspect.Parameter.empty:
+                raise TypeError(f"Parameter '{name}' has a default in its marker and after '='. Remove one of them.")
+            default = explicit_marker.default
 
         # Handle explicit markers
         source: str

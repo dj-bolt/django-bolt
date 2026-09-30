@@ -284,9 +284,15 @@ def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, A
     if mode == "request_only":
         return None
 
+    signature_params = handler_meta["sig"].parameters
+
     # Validate every field first; bail out entirely on anything unsupported so
     # the Python injector keeps full ownership of the route's semantics.
     for field in fields:
+        # Rust omits a missing optional keyword, so the handler's own default applies.
+        # A marker default (Query(default=1)) is not in the signature. The injector gives it.
+        if field.is_optional and signature_params[field.name].default is not field.default:
+            return None
         if field.source not in ("path", "query", "header", "cookie"):
             return None
         if not field.is_simple_type:

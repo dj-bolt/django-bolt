@@ -34,6 +34,9 @@ class Param:
     source: str
     """Parameter source: 'query', 'path', 'body', 'header', 'cookie', 'form', 'file'"""
 
+    default: Any = ...
+    """Value of a missing parameter. ``...`` makes the parameter required."""
+
     alias: str | None = None
     """Alternative name for the parameter in the request"""
 
@@ -127,6 +130,7 @@ def Query(
     """
     return Param(
         source="query",
+        default=default,
         alias=alias,
         gt=gt,
         ge=ge,
@@ -181,6 +185,7 @@ def Path(
 
     return Param(
         source="path",
+        default=default,
         alias=alias,
         gt=gt,
         ge=ge,
@@ -218,6 +223,7 @@ def Body(
     """
     return Param(
         source="body",
+        default=default,
         alias=alias,
         embed=embed,
         description=description,
@@ -248,6 +254,7 @@ def Header(
     """
     return Param(
         source="header",
+        default=default,
         alias=alias,
         description=description,
         example=example,
@@ -278,6 +285,7 @@ def Cookie(
     """
     return Param(
         source="cookie",
+        default=default,
         alias=alias,
         description=description,
         example=example,
@@ -306,6 +314,7 @@ def Form(
     """
     return Param(
         source="form",
+        default=default,
         alias=alias,
         description=description,
         example=example,
@@ -346,6 +355,7 @@ def File(
     """
     return Param(
         source="file",
+        default=default,
         alias=alias,
         description=description,
         max_size=max_size,
