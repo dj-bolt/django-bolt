@@ -3,7 +3,7 @@
 Each value arrives with its declared type, and a bad value gives a 422:
 
 - A ``list``, ``set``, ``frozenset`` or ``tuple`` query parameter takes each value of
-  its repeated key (``?tag=a&tag=b``). A form field takes each value of its name. A
+  its repeated key (``?tag=a&tag=b``), also on a WebSocket route. A form field takes each value of its name. A
   header or a cookie gives one item.
 - A ``NewType`` or a ``type`` alias converts as the type it names.
 - ``msgspec.Meta`` constraints (``ge``, ``max_length``, ``pattern``) apply to the value.
@@ -18,11 +18,11 @@ from urllib.parse import parse_qsl
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, WebSocket
 from django_bolt.middleware import DjangoMiddlewareStack
 from django_bolt.param_functions import Cookie, File, Form, Header, Path, Query
 from django_bolt.serializers.types import PositiveInt
-from django_bolt.testing import TestClient
+from django_bolt.testing import TestClient, WebSocketTestClient
 
 UserId = NewType("UserId", int)
 type Page = int
@@ -585,3 +585,37 @@ def test_the_query_string_of_the_request_encodes_each_key_and_value():
     expected = [("q", "x y%"), ("tag", "a&b"), ("tag", "c=d")]
     assert sorted(parse_qsl(body["query_string"])) == expected
     assert sorted(parse_qsl(body["full_path"].removeprefix("/items?"))) == expected
+
+
+# --- Sequences in the query of a WebSocket route -------------------------------------
+
+
+@pytest.fixture(scope="module")
+def ws_api():
+    api = BoltAPI()
+
+    @api.websocket("/ws/tags")
+    async def tags(websocket: WebSocket, tag: Annotated[list[int], Query()], page: int = 1):
+        await websocket.accept()
+        await websocket.send_json({"tag": _show(tag), "page": page})
+
+    @api.websocket("/ws/names")
+    async def names(websocket: WebSocket, name: Annotated[set[str], Query()]):
+        await websocket.accept()
+        await websocket.send_json(_show(name))
+
+    return api
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_sequence_query_parameter_takes_each_value_of_its_key(ws_api):
+    async with WebSocketTestClient(ws_api, "/ws/tags", query_string="tag=3&page=2&tag=1&tag=3") as ws:
+        response = await ws.receive_json()
+    assert response == {"tag": {"value": [3, 1, 3], "type": "list", "item_types": ["int"]}, "page": 2}
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_sequence_query_parameter_decodes_each_value(ws_api):
+    async with WebSocketTestClient(ws_api, "/ws/names", query_string="name=a+b&name=c%26d&name=a%20b") as ws:
+        response = await ws.receive_json()
+    assert response == {"value": ["a b", "c&d"], "type": "set"}

@@ -35,7 +35,7 @@ use bolt_core::metadata::{CorsConfig, RateLimitKey, RouteMetadata, RouteMetadata
 use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
-use bolt_core::router::{query_pairs, Router};
+use bolt_core::router::{collect_query_sequences, query_pairs, Router};
 use bolt_core::state::{find_asgi_mount, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS};
 use bolt_websocket::WebSocketRouter;
 use futures_util::StreamExt;
@@ -1536,6 +1536,15 @@ pub fn handle_test_websocket(
                 query_dict.set_item(key.as_ref(), value.as_ref())?;
             }
         }
+    }
+    // A sequence parameter takes each value of its repeated key, as in production.
+    // The loop above checked the length of each value.
+    if let Some(ws_route_meta) = ws_route_meta.filter(|m| !m.query_seq_fields.is_empty()) {
+        let sequences = collect_query_sequences(
+            query_string.as_deref().unwrap_or_default(),
+            &ws_route_meta.query_seq_fields,
+        );
+        set_query_sequences(py, &query_dict, &sequences)?;
     }
     scope_dict.set_item("query_params", query_dict)?;
 

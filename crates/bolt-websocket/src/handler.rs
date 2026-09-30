@@ -12,11 +12,11 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use bolt_core::metadata::CorsConfig;
+use bolt_core::metadata::{CorsConfig, RouteMetadata};
 use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
-use bolt_core::request_pipeline::{set_declared_item, EMPTY_TYPES};
-use bolt_core::router::query_pairs;
+use bolt_core::request_pipeline::{set_declared_item, set_query_sequences, EMPTY_TYPES};
+use bolt_core::router::{collect_query_sequences, query_pairs};
 use bolt_core::state::{AppState, ROUTE_METADATA};
 use bolt_core::type_coercion::coerced_value_to_py;
 use bolt_core::type_coercion::{coerce_param, CoerceError, TypeHints, TYPE_STRING};
@@ -83,11 +83,14 @@ fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
     path_params: &AHashMap<String, String>,
-    param_types: &TypeHints,
-    header_types: &TypeHints,
-    cookie_types: &TypeHints,
+    route_meta: Option<&RouteMetadata>,
     max_param_length: usize,
 ) -> PyResult<Py<PyAny>> {
+    let empty_types: &TypeHints = &EMPTY_TYPES;
+    let param_types = route_meta.map_or(empty_types, |m| &m.param_types);
+    let header_types = route_meta.map_or(empty_types, |m| &m.header_types);
+    let cookie_types = route_meta.map_or(empty_types, |m| &m.cookie_types);
+
     let scope_dict = PyDict::new(py);
     scope_dict.set_item("type", "websocket")?;
     scope_dict.set_item("path", req.path())?;
@@ -115,6 +118,12 @@ fn build_scope(
                 query_dict.set_item(key.as_ref(), value.as_ref())?;
             }
         }
+    }
+    // A sequence parameter takes each value of its repeated key, as in HTTP.
+    // The loop above checked the length of each value.
+    if let Some(route_meta) = route_meta.filter(|m| !m.query_seq_fields.is_empty()) {
+        let sequences = collect_query_sequences(req.query_string(), &route_meta.query_seq_fields);
+        set_query_sequences(py, &query_dict, &sequences)?;
     }
     scope_dict.set_item("query_params", query_dict)?;
 
@@ -617,24 +626,12 @@ pub async fn handle_websocket_upgrade_with_handler(
     // Create channels for bidirectional communication (configurable size)
     let (to_python_tx, to_python_rx) = mpsc::channel::<WsMessage>(config.channel_buffer_size);
 
-    // Get type hints from route metadata for type coercion
+    // Route metadata holds the type hints and the sequence query keys
     let route_meta = ROUTE_METADATA.get().and_then(|m| m.get(handler_id));
-    let empty_types: &TypeHints = &EMPTY_TYPES;
-    let param_types = route_meta.map_or(empty_types, |m| &m.param_types);
-    let header_types = route_meta.map_or(empty_types, |m| &m.header_types);
-    let cookie_types = route_meta.map_or(empty_types, |m| &m.cookie_types);
 
     // Build scope for Python - if this fails, decrement counter
     let scope = match Python::attach(|py| {
-        build_scope(
-            py,
-            &req,
-            &path_params,
-            param_types,
-            header_types,
-            cookie_types,
-            state.max_param_length,
-        )
+        build_scope(py, &req, &path_params, route_meta, state.max_param_length)
     }) {
         Ok(s) => s,
         Err(e) => {
