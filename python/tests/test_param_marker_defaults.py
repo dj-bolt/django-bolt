@@ -20,6 +20,7 @@ from django_bolt import BoltAPI, WebSocket
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.param_functions import Cookie, Form, Header, Path, Query
+from django_bolt.params import Param
 from django_bolt.testing import TestClient, WebSocketTestClient
 
 
@@ -218,3 +219,10 @@ def test_the_openapi_form_schema_shows_the_marker_default_and_description():
     assert schema["required"] == ["title"]
     assert schema["properties"]["title"] == {"type": "string", "description": "The title"}
     assert schema["properties"]["tag"] == {"type": "string", "default": "none"}
+
+
+def test_param_keeps_its_positional_field_order():
+    """``default`` is the last field, so ``Param(source, alias)`` still sets the alias."""
+    param = Param("query", "x")
+    assert param.alias == "x"
+    assert param.default is ...

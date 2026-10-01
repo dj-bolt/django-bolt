@@ -34,9 +34,6 @@ class Param:
     source: str
     """Parameter source: 'query', 'path', 'body', 'header', 'cookie', 'form', 'file'"""
 
-    default: Any = ...
-    """Value of a missing parameter. ``...`` makes the parameter required."""
-
     alias: str | None = None
     """Alternative name for the parameter in the request"""
 
@@ -91,6 +88,10 @@ class Param:
 
     max_files: int | None = None
     """Maximum number of files for list[UploadFile] parameters"""
+
+    # Last, so that a Param made with positional arguments keeps its field order.
+    default: Any = ...
+    """Value of a missing parameter. ``...`` makes the parameter required."""
 
 
 def Query(
