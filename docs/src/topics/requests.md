@@ -190,6 +190,7 @@ async def user(user_id: UserId, page: Page = 1):
 ```
 
 The handler gets an `int`, and `/users/abc` gives a 422.
+A parameterized alias gets its arguments. With `type Pair[T] = list[T]`, a `Pair[int]` parameter converts as `list[int]`.
 
 ## Request body
 

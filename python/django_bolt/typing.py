@@ -14,7 +14,18 @@ from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from functools import reduce
 from operator import or_
-from typing import TYPE_CHECKING, Annotated, Any, NewType, TypeAliasType, TypedDict, Union, get_args, get_origin
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    NewType,
+    TypeAliasType,
+    TypedDict,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+)
 
 import msgspec
 
@@ -303,16 +314,30 @@ def unwrap_optional(annotation: Any) -> Any:
     return annotation
 
 
+def _substitute_alias_args(alias: TypeAliasType, args: tuple[Any, ...]) -> Any:
+    """Return the value of a generic ``type`` alias with ``args`` in place of its type parameters."""
+    value = alias.__value__
+    arg_by_param = dict(zip(alias.__type_params__, args, strict=True))
+    if isinstance(value, TypeVar):
+        return arg_by_param[value]
+    params = getattr(value, "__parameters__", ())
+    return value[tuple(arg_by_param[param] for param in params)] if params else value
+
+
 def resolve_type_alias(annotation: Any) -> Any:
     """Return the type that a ``NewType`` or a ``type`` alias names, through each level.
 
     msgspec converts and validates such a value as the type it names. Bolt
     does the same, so Rust converts a ``NewType("UserId", int)`` value as an ``int``.
     The arms of a union resolve too, so ``UserId | None`` gives ``int | None``.
+    A parameterized alias gets its arguments, so ``Pair[int]`` with
+    ``type Pair[T] = list[T]`` gives ``list[int]``.
     """
     while True:
         if isinstance(annotation, TypeAliasType):
             annotation = annotation.__value__
+        elif isinstance(alias := get_origin(annotation), TypeAliasType):
+            annotation = _substitute_alias_args(alias, get_args(annotation))
         elif isinstance(annotation, NewType):
             annotation = annotation.__supertype__
         else:

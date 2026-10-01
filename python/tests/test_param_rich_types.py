@@ -27,6 +27,9 @@ from django_bolt.testing import TestClient, WebSocketTestClient
 UserId = NewType("UserId", int)
 type Page = int
 type MaybeUserId = UserId | None
+type Pair[T] = list[T]
+type Maybe[T] = T | None
+type Positive[T] = Annotated[T, msgspec.Meta(ge=1)]
 
 
 def _show(value):
@@ -316,6 +319,51 @@ def test_a_newtype_or_type_alias_parameter_converts_as_its_base_type(alias_clien
 )
 def test_a_bad_newtype_or_type_alias_value_is_a_422(alias_client, method, url, kwargs):
     response = getattr(alias_client, method)(url, **kwargs)
+    assert response.status_code == 422, response.text
+
+
+@pytest.fixture(scope="module")
+def generic_alias_client():
+    api = BoltAPI()
+
+    @api.get("/generic")
+    async def generic(tag: Annotated[Pair[int], Query()], page: Maybe[int] = None, size: Positive[int] = 10):
+        return {"tag": _show(tag), "page": _show(page), "size": _show(size)}
+
+    with TestClient(api) as client:
+        yield client
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "/generic?tag=1&tag=2&page=3&size=4",
+            {
+                "tag": {"value": [1, 2], "type": "list", "item_types": ["int"]},
+                "page": {"value": 3, "type": "int"},
+                "size": {"value": 4, "type": "int"},
+            },
+        ),
+        (
+            "/generic?tag=5",
+            {
+                "tag": {"value": [5], "type": "list", "item_types": ["int"]},
+                "page": {"value": None, "type": "NoneType"},
+                "size": {"value": 10, "type": "int"},
+            },
+        ),
+    ],
+)
+def test_a_parameterized_type_alias_converts_as_the_type_it_names(generic_alias_client, url, expected):
+    response = generic_alias_client.get(url)
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+@pytest.mark.parametrize("url", ["/generic?tag=x", "/generic?tag=1&page=x", "/generic?tag=1&size=0"])
+def test_a_bad_parameterized_type_alias_value_is_a_422(generic_alias_client, url):
+    response = generic_alias_client.get(url)
     assert response.status_code == 422, response.text
 
 

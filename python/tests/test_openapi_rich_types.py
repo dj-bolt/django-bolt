@@ -23,6 +23,9 @@ from django_bolt.param_functions import Cookie, Form, Header, Path, Query
 UserId = NewType("UserId", int)
 type Page = int
 type MaybePage = Page | None
+type Pair[T] = list[T]
+type Maybe[T] = T | None
+type Positive[T] = Annotated[T, msgspec.Meta(ge=1)]
 
 INTEGER = {"type": "integer"}
 STRING = {"type": "string"}
@@ -116,6 +119,20 @@ def test_a_newtype_or_type_alias_parameter_documents_its_base_type():
         "user_id": INTEGER,
         "page": {"type": "integer", "default": 1},
         "next_page": INTEGER,
+    }
+
+
+def test_a_parameterized_type_alias_parameter_documents_the_type_it_names():
+    api = BoltAPI()
+
+    @api.get("/items")
+    async def items(tag: Annotated[Pair[int], Query()], page: Maybe[int] = None, size: Positive[int] = 10):
+        return {}
+
+    assert _parameters(_spec(api), "/items") == {
+        "tag": {"type": "array", "items": INTEGER},
+        "page": INTEGER,
+        "size": {"type": "integer", "minimum": 1, "default": 10},
     }
 
 
