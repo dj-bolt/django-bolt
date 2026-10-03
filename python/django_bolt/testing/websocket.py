@@ -31,6 +31,9 @@ from django_bolt import BoltAPI, _core
 from django_bolt.websocket import CloseCode, WebSocket
 from django_bolt.websocket.handlers import build_websocket_request, get_websocket_param_name
 
+# Seconds the client waits for the handler to accept or refuse the handshake.
+HANDSHAKE_TIMEOUT = 5.0
+
 try:
     from django.conf import settings
 except ImportError:
@@ -165,6 +168,9 @@ class WebSocketTestClient:
         self._close_code: int | None = None
         self._accepted_subprotocol: str | None = None
         self._requested_subprotocols: list[str] = []
+        # The handshake decision: None on accept, an HTTP status or an error on refusal.
+        self._handshake: asyncio.Future[int | BaseException | None] | None = None
+        self._connect_sent = False
         self._handler_task: asyncio.Task | None = None
         self._handler_exception: Exception | None = None
 
@@ -263,8 +269,17 @@ class WebSocketTestClient:
 
         return found, handler_id, handler, path_params_dict, scope_dict
 
+    def _decide(self, outcome: int | BaseException | None) -> None:
+        """Record the handshake decision. The first decision wins."""
+        if self._handshake is not None and not self._handshake.done():
+            self._handshake.set_result(outcome)
+
     async def _receive(self) -> dict[str, Any]:
         """ASGI receive callable - gets messages from client queue."""
+        # ASGI: the first receive before accept gives `websocket.connect`, as on the server.
+        if not self._accepted and not self._connect_sent:
+            self._connect_sent = True
+            return {"type": "websocket.connect"}
         return await self._client_to_server.get()
 
     async def _send(self, message: dict[str, Any]) -> None:
@@ -281,8 +296,12 @@ class WebSocketTestClient:
                 )
             self._accepted = True
             self._accepted_subprotocol = subprotocol
+            self._decide(None)
 
         elif msg_type == "websocket.close":
+            # Close before accept refuses the handshake with 403, as on the server.
+            if not self._accepted:
+                self._decide(403)
             self._closed = True
             self._close_code = message.get("code", CloseCode.NORMAL)
 
@@ -350,6 +369,10 @@ class WebSocketTestClient:
             try:
                 await handler(*args, **kwargs)
             except Exception as e:
+                if not self._accepted:
+                    # An error before accept fails the handshake, as the server answers 500.
+                    self._decide(e)
+                    return
                 self._handler_exception = e
                 # Send disconnect on error
                 if not self._closed:
@@ -361,11 +384,22 @@ class WebSocketTestClient:
                     )
                     self._closed = True
                     self._close_code = CloseCode.INTERNAL_ERROR
+            else:
+                # A return before accept refuses the handshake with 403.
+                self._decide(403)
 
+        self._handshake = asyncio.get_running_loop().create_future()
         self._handler_task = asyncio.create_task(run_handler())
 
-        # Give handler a chance to start
-        await asyncio.sleep(0)
+        # Wait for the handshake decision, as the server sends the 101 only on accept.
+        try:
+            outcome = await asyncio.wait_for(asyncio.shield(self._handshake), HANDSHAKE_TIMEOUT)
+        except TimeoutError as e:
+            raise TimeoutError(f"The WebSocket handler did not accept or close within {HANDSHAKE_TIMEOUT}s") from e
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome is not None:
+            raise HandshakeRejected(outcome)
 
         return self
 
@@ -536,6 +570,17 @@ class WebSocketTestClient:
                 yield await self.receive_json(timeout=timeout)
             except (ConnectionClosed, TimeoutError):
                 break
+
+
+class HandshakeRejected(Exception):
+    """Raised when the handler refuses the WebSocket handshake.
+
+    The server answers the upgrade with ``status_code`` and opens no connection.
+    """
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        super().__init__(f"WebSocket handshake rejected with HTTP {status_code}")
 
 
 class ConnectionClosed(Exception):

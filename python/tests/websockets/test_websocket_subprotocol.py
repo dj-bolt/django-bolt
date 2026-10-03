@@ -5,8 +5,7 @@ from __future__ import annotations
 import pytest
 
 from django_bolt import BoltAPI, WebSocket
-from django_bolt.testing import ConnectionClosed, WebSocketTestClient
-from django_bolt.websocket import CloseCode
+from django_bolt.testing import HandshakeRejected, WebSocketTestClient
 
 
 def _chat_api() -> BoltAPI:
@@ -57,8 +56,61 @@ async def test_accepting_unrequested_subprotocol_fails():
         await websocket.accept(subprotocol="not-requested")
 
     with pytest.raises(ValueError, match="not-requested"):
-        async with WebSocketTestClient(api, "/ws/bad", subprotocols=["chat.v1"]) as ws:
-            with pytest.raises(ConnectionClosed):
-                await ws.receive_text()
-            assert not ws.accepted
-            assert ws.close_code == CloseCode.INTERNAL_ERROR
+        async with WebSocketTestClient(api, "/ws/bad", subprotocols=["chat.v1"]):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_close_before_accept_rejects_handshake_with_403():
+    api = BoltAPI()
+
+    @api.websocket("/ws/refuse")
+    async def refuse(websocket: WebSocket):
+        await websocket.close()
+
+    with pytest.raises(HandshakeRejected) as rejected:
+        async with WebSocketTestClient(api, "/ws/refuse"):
+            pass
+    assert rejected.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_return_before_accept_rejects_handshake_with_403():
+    api = BoltAPI()
+
+    @api.websocket("/ws/no-accept")
+    async def no_accept(websocket: WebSocket):
+        return
+
+    with pytest.raises(HandshakeRejected) as rejected:
+        async with WebSocketTestClient(api, "/ws/no-accept"):
+            pass
+    assert rejected.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_error_before_accept_raises_the_handler_error():
+    api = BoltAPI()
+
+    @api.websocket("/ws/fail")
+    async def fail(websocket: WebSocket):
+        raise RuntimeError("boom before accept")
+
+    with pytest.raises(RuntimeError, match="boom before accept"):
+        async with WebSocketTestClient(api, "/ws/fail"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_receive_before_accept_gives_connect_event():
+    api = BoltAPI()
+
+    @api.websocket("/ws/connect-first")
+    async def connect_first(websocket: WebSocket):
+        message = await websocket.receive()
+        await websocket.accept()
+        await websocket.send_text(message["type"])
+        await websocket.receive_text()
+
+    async with WebSocketTestClient(api, "/ws/connect-first") as ws:
+        assert await ws.receive_text() == "websocket.connect"

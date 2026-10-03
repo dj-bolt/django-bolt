@@ -6,6 +6,8 @@ with extra headers, close before accept, or fail before accept.
 
 from __future__ import annotations
 
+import asyncio
+
 from django_bolt import BoltAPI, WebSocket
 
 api = BoltAPI()
@@ -49,3 +51,32 @@ async def fail(websocket: WebSocket):
 @api.websocket("/ws/no-accept")
 async def no_accept(websocket: WebSocket):
     return
+
+
+@api.websocket("/ws/connect-first")
+async def connect_first(websocket: WebSocket):
+    message = await websocket.receive()
+    await websocket.accept()
+    await websocket.send_text(message["type"])
+    await websocket.receive_text()
+
+
+# Each entry names what a send raised after the client left during the handshake.
+SEND_AFTER_LEAVE: list[str] = []
+
+
+@api.websocket("/ws/slow-accept")
+async def slow_accept(websocket: WebSocket):
+    await asyncio.sleep(0.5)
+    await websocket.accept()
+    try:
+        await websocket.send_text("late")
+    except Exception as exc:
+        SEND_AFTER_LEAVE.append(type(exc).__name__)
+    else:
+        SEND_AFTER_LEAVE.append("no error")
+
+
+@api.get("/send-after-leave")
+async def send_after_leave():
+    return {"errors": SEND_AFTER_LEAVE}

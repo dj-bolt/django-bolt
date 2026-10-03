@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
@@ -170,7 +171,12 @@ class WebSocket:
         """Send a raw WebSocket message."""
         if self._state != WebSocketState.CONNECTED:
             raise RuntimeError("WebSocket is not connected")
-        await self._send(message)
+        try:
+            await self._send(message)
+        except OSError as exc:
+            # The server raises OSError when the client left (ASGI).
+            self._state = WebSocketState.DISCONNECTED
+            raise WebSocketDisconnect(CloseCode.ABNORMAL_CLOSURE) from exc
 
     async def send_text(self, data: str) -> None:
         """Send a text message."""
@@ -209,14 +215,16 @@ class WebSocket:
         if self._state == WebSocketState.DISCONNECTED:
             return
 
-        await self._send(
-            {
-                "type": "websocket.close",
-                "code": code,
-                "reason": reason,
-            }
-        )
         self._state = WebSocketState.DISCONNECTED
+        # A client that left needs no close frame.
+        with contextlib.suppress(OSError):
+            await self._send(
+                {
+                    "type": "websocket.close",
+                    "code": code,
+                    "reason": reason,
+                }
+            )
 
     async def iter_text(self):
         """Async iterator for text messages."""

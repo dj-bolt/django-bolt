@@ -10,7 +10,7 @@ use futures_util::FutureExt;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 
@@ -33,6 +33,7 @@ use super::{ConnectionSlot, ACTIVE_WS_CONNECTIONS};
 /// Cached Python imports - loaded once at first WebSocket connection
 static WS_CLASS: OnceCell<Py<PyAny>> = OnceCell::new();
 static BUILD_REQUEST_FN: OnceCell<Py<PyAny>> = OnceCell::new();
+static DISCONNECT_CLASS: OnceCell<Py<PyAny>> = OnceCell::new();
 
 /// Get cached WebSocket class (imports once, reuses)
 fn get_ws_class(py: Python<'_>) -> PyResult<&Py<PyAny>> {
@@ -41,6 +42,27 @@ fn get_ws_class(py: Python<'_>) -> PyResult<&Py<PyAny>> {
         let ws_class = ws_module.getattr("WebSocket")?;
         Ok(ws_class.unbind())
     })
+}
+
+/// Get cached WebSocketDisconnect class (imports once, reuses)
+fn get_disconnect_class(py: Python<'_>) -> PyResult<&Py<PyAny>> {
+    DISCONNECT_CLASS.get_or_try_init(|| {
+        let ws_module = py.import("django_bolt.websocket")?;
+        Ok(ws_module.getattr("WebSocketDisconnect")?.unbind())
+    })
+}
+
+/// Whether a handler error only reports that the client left.
+fn is_client_gone(error: &PyErr) -> bool {
+    Python::attach(|py| {
+        error.is_instance_of::<pyo3::exceptions::PyConnectionResetError>(py)
+            || get_disconnect_class(py).is_ok_and(|class| error.is_instance(py, class.bind(py)))
+    })
+}
+
+/// The error of a send to a client that left. ASGI requires an `OSError`.
+fn client_gone() -> PyErr {
+    pyo3::exceptions::PyConnectionResetError::new_err("WebSocket client disconnected")
 }
 
 /// Get cached build_websocket_request function (imports once, reuses)
@@ -211,7 +233,7 @@ fn build_scope(
 
 /// The handshake decision of the handler.
 enum Handshake {
-    /// Send the 101 response. `ready` gets the result when the actor runs.
+    /// Send the 101 response. Bolt signals `ready` when the actor runs.
     Accept {
         subprotocol: Option<String>,
         headers: Vec<(HeaderName, HeaderValue)>,
@@ -231,6 +253,8 @@ struct WsConnectionState {
     handshake: Mutex<Option<oneshot::Sender<Handshake>>>,
     /// Subprotocols that the client requested
     subprotocols: Vec<String>,
+    /// Whether a receive before accept got the `websocket.connect` event
+    connect_sent: AtomicBool,
 }
 
 impl WsConnectionState {
@@ -248,12 +272,27 @@ impl WsConnectionState {
         }
     }
 
+    fn handshake_pending(&self) -> bool {
+        self.handshake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// The actor of an accepted connection.
+    ///
+    /// Before accept, a send is an error of the handler. After accept, no
+    /// actor means that the client left during the handshake.
     fn actor(&self) -> PyResult<Addr<WebSocketActor>> {
-        self.actor_addr.get().cloned().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WebSocket is not open: call accept() before send, or the client left",
-            )
-        })
+        if let Some(addr) = self.actor_addr.get() {
+            return Ok(addr.clone());
+        }
+        if self.handshake_pending() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "WebSocket is not accepted: call accept() before send",
+            ));
+        }
+        Err(client_gone())
     }
 }
 
@@ -289,7 +328,18 @@ fn create_receive_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<
     impl ReceiveFn {
         fn __call__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
             let state = self.state.clone();
+            // ASGI: the first receive before accept gives `websocket.connect`.
+            let connect = state.actor_addr.get().is_none()
+                && state.handshake_pending()
+                && !state.connect_sent.swap(true, Ordering::Relaxed);
             let future = pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                if connect {
+                    return Python::attach(|py| {
+                        let dict = PyDict::new(py);
+                        dict.set_item("type", "websocket.connect")?;
+                        Ok(dict.unbind())
+                    });
+                }
                 let mut rx = state.from_actor_rx.lock().await;
                 match rx.recv().await {
                     Some(WsMessage::Text(text)) => Python::attach(|py| {
@@ -397,12 +447,7 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                             actor
                                 .send(SendToClient(WsMessage::SendText(text)))
                                 .await
-                                .map_err(|e| {
-                                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                        "Failed to send text: {}",
-                                        e
-                                    ))
-                                })?;
+                                .map_err(|_| client_gone())?;
                             Ok(Python::attach(|py| {
                                 py.None().into_pyobject(py).unwrap().unbind()
                             }))
@@ -415,12 +460,7 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                             actor
                                 .send(SendToClient(WsMessage::SendBinary(data)))
                                 .await
-                                .map_err(|e| {
-                                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                        "Failed to send binary: {}",
-                                        e
-                                    ))
-                                })?;
+                                .map_err(|_| client_gone())?;
                             Ok(Python::attach(|py| {
                                 py.None().into_pyobject(py).unwrap().unbind()
                             }))
@@ -453,12 +493,7 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                             actor
                                 .send(SendToClient(WsMessage::Close { code, reason }))
                                 .await
-                                .map_err(|e| {
-                                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                        "Failed to send close: {}",
-                                        e
-                                    ))
-                                })?;
+                                .map_err(|_| client_gone())?;
                         }
                         Ok(Python::attach(|py| {
                             py.None().into_pyobject(py).unwrap().unbind()
@@ -752,6 +787,7 @@ pub async fn handle_websocket_upgrade_with_handler(
         actor_addr: OnceLock::new(),
         handshake: Mutex::new(Some(handshake_tx)),
         subprotocols,
+        connect_sent: AtomicBool::new(false),
     });
 
     spawn_handler(ws_state.clone(), scope, handler, injector);
@@ -763,14 +799,26 @@ pub async fn handle_websocket_upgrade_with_handler(
             ready,
         }) => {
             let actor = WebSocketActor::new(to_python_tx, slot);
-            let protocols: Vec<&str> = subprotocol.as_deref().into_iter().collect();
+            // Set the header here: actix reads only the first header line of the client.
+            let protocol = subprotocol
+                .map(|selected| {
+                    HeaderValue::from_str(&selected).map_err(|e| {
+                        actix_web::error::ErrorInternalServerError(format!(
+                            "WebSocket subprotocol: {}",
+                            e
+                        ))
+                    })
+                })
+                .transpose()?;
             let (addr, mut resp) = ws::WsResponseBuilder::new(actor, &req, stream)
                 .frame_size(config.max_message_size)
-                .protocols(&protocols)
                 .start_with_addr()
                 .map_err(|e| {
                     actix_web::error::ErrorInternalServerError(format!("WebSocket error: {}", e))
                 })?;
+            if let Some(protocol) = protocol {
+                resp.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocol);
+            }
             append_headers(resp.headers_mut(), headers);
             let _ = ws_state.actor_addr.set(addr);
             let _ = ready.send(());
@@ -875,7 +923,10 @@ fn spawn_handler(
             match error {
                 None => ws_state.refuse(StatusCode::FORBIDDEN),
                 Some(e) => {
-                    eprintln!("[django-bolt] WebSocket handler error: {}", e);
+                    // A client that left is not an error of the handler.
+                    if !is_client_gone(&e) {
+                        eprintln!("[django-bolt] WebSocket handler error: {}", e);
+                    }
                     ws_state.refuse(StatusCode::INTERNAL_SERVER_ERROR);
                     close_with_error(&ws_state, "Internal error").await;
                 }

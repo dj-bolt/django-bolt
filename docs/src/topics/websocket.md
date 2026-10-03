@@ -181,6 +181,10 @@ async def room(websocket: WebSocket, room: str):
     await websocket.accept()
 ```
 
+A call to `receive()` before `accept()` gives `{"type": "websocket.connect"}`
+one time, as the ASGI specification requires. A second call waits until the
+handler accepts or refuses the handshake.
+
 ### Handling client disconnect
 
 ```python
@@ -195,6 +199,9 @@ async def handler(websocket: WebSocket):
     except WebSocketDisconnect:
         print("Client disconnected")
 ```
+
+A send to a client that left raises `WebSocketDisconnect` with code 1006.
+Bolt does not log it as a handler error.
 
 ## Close codes
 
@@ -347,6 +354,20 @@ with TestClient(api) as client:
         response = ws.receive_text()
         assert response == "Echo: Hello"
 ```
+
+`WebSocketTestClient` waits for the handshake decision of the handler, as the
+server does. A refused handshake fails the `async with`:
+
+```python
+from django_bolt.testing import HandshakeRejected, WebSocketTestClient
+
+with pytest.raises(HandshakeRejected) as rejected:
+    async with WebSocketTestClient(api, "/ws/rooms/closed"):
+        pass
+assert rejected.value.status_code == 403
+```
+
+An error in the handler before `accept()` fails the `async with` with that error.
 
 ## Real-time patterns
 

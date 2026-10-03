@@ -27,7 +27,7 @@ Usage:
 
 from django_bolt.testing.client import AsyncTestClient, BoltTestClientWarning, TestClient
 from django_bolt.testing.dbshare import SharedTestConnectionError
-from django_bolt.testing.websocket import ConnectionClosed, WebSocketTestClient
+from django_bolt.testing.websocket import ConnectionClosed, HandshakeRejected, WebSocketTestClient
 
 __all__ = [
     "TestClient",
@@ -36,4 +36,5 @@ __all__ = [
     "SharedTestConnectionError",
     "WebSocketTestClient",
     "ConnectionClosed",
+    "HandshakeRejected",
 ]
