@@ -299,10 +299,21 @@ def _orm_handoff() -> tuple[concurrent.futures.ThreadPoolExecutor, Callable[...,
     that loop cannot use the ORM pool: it waits on the slot that the worker
     holds, and a one-thread pool never frees it. That rare case uses the
     default pool and one connection outside the ORM budget.
+
+    A call through ``_ThreadSensitiveExecutor`` holds a slot too. asgiref runs
+    the sync function in a context that it copied before the hand-off, so the
+    slot marker of this module is not visible there. asgiref sets its own
+    marker, ``deadlock_context``, in that context before the copy, and an
+    ``async_to_sync`` inside the function carries it to the nested coroutine.
     """
-    if in_orm_executor_thread() or _holds_orm_slot.get():
+    if _holds_slot() or SyncToAsync.deadlock_context.get(False):
         return _get_default_executor(), _call_guarded
     return _get_orm_executor(), _call_in_orm_slot
+
+
+def _holds_slot() -> bool:
+    """Whether the calling context already holds an ORM pool slot."""
+    return in_orm_executor_thread() or _holds_orm_slot.get()
 
 
 class _ThreadSensitiveExecutor:
@@ -324,8 +335,11 @@ class _ThreadSensitiveExecutor:
     __slots__ = ()
 
     def submit(self, fn: Callable[..., object], *args: object) -> concurrent.futures.Future:
-        executor, call = _orm_handoff()
-        return executor.submit(contextvars.copy_context().run, call, fn, *args)
+        # This is the outer call, so the asgiref marker of ``_orm_handoff`` is
+        # always set here. Only a slot that this context already holds counts.
+        if _holds_slot():
+            return _get_default_executor().submit(contextvars.copy_context().run, _call_guarded, fn, *args)
+        return _get_orm_executor().submit(contextvars.copy_context().run, _call_in_orm_slot, fn, *args)
 
 
 # Installed once at import. asgiref reads the attribute on each call.

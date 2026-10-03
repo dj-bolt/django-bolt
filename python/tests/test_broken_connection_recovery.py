@@ -28,7 +28,7 @@ import time
 
 import jwt
 import pytest
-from asgiref.sync import sync_to_async
+from asgiref.sync import async_to_sync, sync_to_async
 from django.contrib.auth.models import User
 from django.db import connection, connections
 from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteWrapper
@@ -300,3 +300,35 @@ def test_check_before_call_gate_follows_the_database_settings(monkeypatch, datab
     concurrency.configure_connection_checks()
 
     assert concurrency._check_before_call is expected
+
+
+@pytest.mark.django_db(transaction=True)
+def test_nested_orm_handoff_inside_a_thread_sensitive_call_with_one_orm_thread(single_thread_pool):
+    """A thread-sensitive call holds the one ORM thread. A nested hand-off must not wait for it.
+
+    ``sync_to_async`` runs ``f`` on the ORM pool. ``f`` calls ``async_to_sync``,
+    so ``g`` runs on the loop of the request while the pool thread waits.
+    ``g`` hands a query off. With one ORM thread, that hand-off must take
+    another executor, or the request never answers.
+    """
+
+    async def g() -> int:
+        return await concurrency.run_in_orm_executor(_select_one)
+
+    def f() -> int:
+        return async_to_sync(g)()
+
+    api = BoltAPI()
+
+    @api.get("/nested")
+    async def nested():
+        return {"value": await sync_to_async(f)()}
+
+    with TestClient(api) as client:
+        result: list = []
+        worker = threading.Thread(target=lambda: result.append(client.get("/nested")), daemon=True)
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive(), "the request did not answer in 5 s: the nested hand-off waits for its own thread"
+        assert result[0].status_code == 200
+        assert result[0].json() == {"value": 1}

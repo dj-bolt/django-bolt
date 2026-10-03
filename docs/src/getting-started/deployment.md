@@ -297,7 +297,7 @@ Each worker thread holds its own Django database connection, as in any threaded 
 
 ### Size the database thread pools
 
-An async handler that returns a QuerySet does not run the query on its worker thread. Django-Bolt evaluates the QuerySet on the ORM thread pool. Django's async ORM API, such as `await Model.objects.aget()`, `acount()` and `async for`, runs on the same pool. One process has one ORM pool, and all worker threads in that process share it. The pool size is the number of queries in flight per process. A query that waits 20 ms on the database server needs 50 threads for 2,500 requests per second.
+An async handler that returns a QuerySet does not run the query on its worker thread. Django-Bolt evaluates the QuerySet on the ORM thread pool. Django's async ORM API, such as `await Model.objects.aget()`, `acount()` and `async for`, runs on the same pool when the route has no Django middleware. A route with Django middleware runs these calls on its request lane. One process has one ORM pool, and all worker threads in that process share it. The pool size is the number of queries in flight per process. A query that waits 20 ms on the database server needs 50 threads for 2,500 requests per second.
 
 The pool has 1 thread when every database is SQLite, and 4 threads for other databases. These defaults fit a build with the GIL, where more threads in one process add no parallelism. With the GIL disabled, a small pool becomes the limit: the worker threads wait for it and the CPUs stay idle.
 
