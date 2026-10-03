@@ -98,15 +98,20 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
             f"The {loc} parameter {key!r} gets one value, but its type {target!r} cannot hold one item. "
             "Use list[T], set[T], tuple[T] or tuple[T, ...]."
         )
+    # msgspec caches the type info of a Struct, but not of a type such as list[int].
+    # A one-field Struct made here keeps that lookup out of each request.
+    holder = msgspec.defstruct("ParamValue", [("value", target)], array_like=True)
 
     def convert(value: Any) -> Any:
         if wrap and not isinstance(value, list):
             value = [value]
         try:
-            return msgspec.convert(value, target, strict=False)
+            return msgspec.convert((value,), holder, strict=False).value
         except msgspec.ValidationError as error:
+            # Remove the position of the value in the holder from the error path.
+            msg = str(error).replace(" - at `$[0]`", "").replace("`$[0]", "`$")
             raise RequestValidationError(
-                errors=[{"type": "validation_error", "loc": (loc, key), "msg": str(error), "input": value}]
+                errors=[{"type": "validation_error", "loc": (loc, key), "msg": msg, "input": value}]
             ) from None
 
     return convert
