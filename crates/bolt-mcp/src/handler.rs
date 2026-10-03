@@ -346,6 +346,58 @@ fn set_task_status(task_ctx: &TaskContext, event: CtxEvent) {
     task_ctx.set_status_message(message);
 }
 
+/// One in-task input request, waiting for its `tasks/update` answer. Yields
+/// the Python reply future with the outcome.
+type PendingInput = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Py<PyAny>, Result<Value, TaskExit>)> + Send>,
+>;
+
+fn reply_error(reply: &Py<PyAny>, message: &str) {
+    crate::context::resolve_reply_future(
+        reply,
+        &serde_json::json!({ "error": { "message": message } }).to_string(),
+    );
+}
+
+/// Turn a Context server request into a pending task input request. An
+/// invalid request fails the Python reply future at once.
+fn queue_input(
+    task_ctx: &TaskContext,
+    pending: &FuturesUnordered<PendingInput>,
+    method: &'static str,
+    key: String,
+    params_json: &str,
+    reply: Py<PyAny>,
+) {
+    let request = serde_json::from_str::<Value>(params_json)
+        .map_err(|e| McpError::internal_error(format!("invalid input params: {e}"), None))
+        .and_then(|params| input_request(method, params));
+    match request {
+        Ok(request) => {
+            let task_ctx = task_ctx.clone();
+            pending.push(Box::pin(async move {
+                let outcome = task_ctx.request_input(key, request).await;
+                (reply, outcome)
+            }));
+        }
+        Err(err) => reply_error(&reply, &err.message),
+    }
+}
+
+/// Deliver an input answer to the Python reply future. Returns `true` when
+/// `tasks/cancel` dropped the request instead: the caller then cancels.
+fn deliver_input(reply: &Py<PyAny>, outcome: Result<Value, TaskExit>) -> bool {
+    match outcome {
+        Ok(value) => crate::context::resolve_reply_future(
+            reply,
+            &serde_json::json!({ "result": value }).to_string(),
+        ),
+        Err(TaskExit::Cancelled) => return true,
+        Err(TaskExit::Error(err)) => reply_error(reply, &err.message),
+    }
+    false
+}
+
 /// The body of a SEP-2663 task: run the tool on the WorkerLoop. Context
 /// events update the status message or become `inputRequests`, which
 /// `tasks/update` answers. `tasks/cancel` cancels the Python coroutine.
@@ -361,58 +413,27 @@ async fn run_task(
         payload,
         ct.clone()
     ));
-    let mut pending_inputs = FuturesUnordered::new();
+    let mut pending_inputs: FuturesUnordered<PendingInput> = FuturesUnordered::new();
     let mut cancel_requested = false;
     let result = loop {
         tokio::select! {
             biased;
-            _ = task_ctx.cancelled(), if !cancel_requested => {
-                cancel_requested = true;
-                ct.cancel();
-            }
+            _ = task_ctx.cancelled(), if !cancel_requested => cancel_requested = true,
             result = &mut dispatch => break result,
             event = recv_event(&mut rx) => match event {
                 Some(CtxEvent::ServerRequest { method, key, params_json, reply }) => {
-                    let request = serde_json::from_str::<Value>(&params_json)
-                        .map_err(|e| {
-                            McpError::internal_error(format!("invalid input params: {e}"), None)
-                        })
-                        .and_then(|params| input_request(method, params));
-                    match request {
-                        Ok(request) => {
-                            let task_ctx = task_ctx.clone();
-                            pending_inputs.push(async move {
-                                let outcome = task_ctx.request_input(key, request).await;
-                                (reply, outcome)
-                            });
-                        }
-                        Err(err) => crate::context::resolve_reply_future(
-                            &reply,
-                            &serde_json::json!({ "error": { "message": err.message } }).to_string(),
-                        ),
-                    }
+                    queue_input(&task_ctx, &pending_inputs, method, key, &params_json, reply);
                 }
                 Some(event) => set_task_status(&task_ctx, event),
                 // The Python Context is gone; the tool is about to finish.
                 None => rx = None,
             },
             Some((reply, outcome)) = pending_inputs.next(), if !pending_inputs.is_empty() => {
-                match outcome {
-                    Ok(value) => crate::context::resolve_reply_future(
-                        &reply,
-                        &serde_json::json!({ "result": value }).to_string(),
-                    ),
-                    // `tasks/cancel` dropped the pending input.
-                    Err(TaskExit::Cancelled) => {
-                        cancel_requested = true;
-                        ct.cancel();
-                    }
-                    Err(TaskExit::Error(err)) => crate::context::resolve_reply_future(
-                        &reply,
-                        &serde_json::json!({ "error": { "message": err.message } }).to_string(),
-                    ),
-                }
+                cancel_requested |= deliver_input(&reply, outcome);
             }
+        }
+        if cancel_requested {
+            ct.cancel();
         }
     };
     if cancel_requested {

@@ -169,6 +169,8 @@ class MCP:
         handle at once. The client polls ``tasks/get`` for the result.
         ``ttl`` and ``poll_interval`` are in milliseconds. Tasks live in
         process memory, so serve them with ``runbolt --processes 1``.
+        Cancel and TTL expiry stop an async tool. A sync tool runs in a
+        thread, which continues to the end.
         """
         if isinstance(output_schema, str) and output_schema != "auto":
             raise ValueError(f"output_schema must be a JSON Schema dict, 'auto', or None, got {output_schema!r}")

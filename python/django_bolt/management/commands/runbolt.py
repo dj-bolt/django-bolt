@@ -734,7 +734,12 @@ class Command(BaseCommand):
 
         # Run autodiscovery + banner once in the parent before forking so the
         # user sees a single clean banner instead of N copies.
-        self._print_multiprocess_banner(options)
+        discovered = self._discover_multiprocess_apis()
+        if discovered is not None:
+            apis, merged_api = discovered
+            if processes > 1:
+                _reject_multiprocess_mcp_tasks(merged_api._mcp_mounts)
+            self._print_multiprocess_banner(options, apis, merged_api)
 
         # Give Actix the same graceful-shutdown window the supervisor allows
         # before escalating to SIGKILL (user-set env takes precedence).
@@ -781,15 +786,16 @@ class Command(BaseCommand):
 
         supervisor.run()
 
-    def _print_multiprocess_banner(self, options):
-        """Perform a dry-run of autodiscovery to collect route/feature info,
-        then print the startup banner once from the parent process."""
+    def _discover_multiprocess_apis(self):
+        """Perform a dry-run of autodiscovery in the parent process.
+
+        Returns ``(apis, merged_api)``, or ``None`` when no BoltAPI is found.
+        """
         # Setup logging/file-response just like start_single_process
         if setup_django_logging is not None:
             setup_django_logging()
         if initialize_file_response_settings is not None:
             initialize_file_response_settings()
-        banner_base_url = _build_display_url(options["host"], options["port"], dev_mode=False)
 
         apis = self.autodiscover_apis()
         if not apis:
@@ -798,11 +804,12 @@ class Command(BaseCommand):
                     "No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment, e.g., api = BoltAPI()"
                 )
             )
-            return
+            return None
+        return apis, self.merge_apis(apis)
 
-        merged_api = self.merge_apis(apis)
-        if options["processes"] > 1:
-            _reject_multiprocess_mcp_tasks(merged_api._mcp_mounts)
+    def _print_multiprocess_banner(self, options, apis, merged_api):
+        """Print the startup banner once from the parent process, from the dry-run discovery."""
+        banner_base_url = _build_display_url(options["host"], options["port"], dev_mode=False)
         _user_route_count = len(merged_api._routes)
 
         features: list[tuple[str, str]] = []

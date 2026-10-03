@@ -251,12 +251,12 @@ The client must declare the `io.modelcontextprotocol/tasks` extension in its cap
 
 - `ttl` is the task lifetime in milliseconds. The default is 300 000 (5 minutes). When the TTL elapses, the task fails and Bolt cancels the tool coroutine.
 - `poll_interval` is the polling interval that the server suggests, in milliseconds. The default is 1 000.
-- `tasks/cancel` cancels the tool coroutine. The task then reports `cancelled`.
+- `tasks/cancel` cancels the tool coroutine. The task then reports `cancelled`. A sync (`def`) tool runs in a thread, and a thread cannot be stopped. Its work thus continues to the end, but Bolt discards the result. This also applies when the TTL elapses. Make long tasks `async def` if they must stop on cancel.
 - `ctx.report_progress()` and the log methods set the `statusMessage` of the task. A log line updates it at `info` level and above, unless the request sets a log level.
 - `ctx.elicit()` and `ctx.sample()` suspend the tool. The task reports `input_required` with the request in `inputRequests`. The client answers with `tasks/update`, and the tool continues from the same point. Unlike MRTR, the tool does not run again from the top.
 - `ctx.task_id` gives the task id. It is `None` when the call does not run as a task.
 
-The server advertises the extension only when at least one tool has `task=True`. Only the principal that created a task can get, update or cancel it.
+The server advertises the extension only when at least one tool has `task=True`. Only the principal that created a task can get, update or cancel it. All unauthenticated callers are one principal. On a mount without `auth=` and `guards=`, the task id is thus the only protection. Task ids are random UUIDs, so do not log them or show them to other users.
 
 !!! warning "Tasks need one process"
 

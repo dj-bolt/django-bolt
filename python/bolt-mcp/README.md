@@ -91,8 +91,10 @@ work in stateless mode too.
 `@mcp.tool(task=True)` opts a tool in to the MCP Tasks extension (SEP-2663). A client that
 declares `io.modelcontextprotocol/tasks` gets `resultType: "task"` at once and polls
 `tasks/get`. `ctx.elicit` suspends the task until the client answers with `tasks/update`.
-`tasks/cancel` cancels the tool coroutine. Tasks live in process memory, so `runbolt` refuses
-to start with `--processes` above 1 when a mount has a task tool.
+`tasks/cancel` cancels the tool coroutine; a sync `def` tool runs in a thread, which continues
+to the end. Only the principal that created a task can reach it, and all unauthenticated callers
+are one principal. Tasks live in process memory, so `runbolt` refuses to start with
+`--processes` above 1 when a mount has a task tool.
 
 ```python
 @mcp.tool(task=True, ttl=600_000, poll_interval=2_000)  # milliseconds
