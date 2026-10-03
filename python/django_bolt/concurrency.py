@@ -291,58 +291,66 @@ def _call_in_orm_slot[T](fn: Callable[..., T], *args: object) -> T:
     return _call_guarded(fn, *args)
 
 
-def _orm_handoff() -> tuple[concurrent.futures.ThreadPoolExecutor, Callable[..., object]]:
-    """The pool and the call wrapper for an ORM hand-off from the calling context.
+def _slot_is_held() -> bool:
+    """Whether the calling context holds an ORM pool slot: an ORM pool thread, or a context from one."""
+    return in_orm_executor_thread() or _holds_orm_slot.get()
 
-    An ORM pool worker can run an event loop, on its own thread in
-    ``asyncio.run``, or on a new thread in ``async_to_sync``. A hand-off from
-    that loop cannot use the ORM pool: it waits on the slot that the worker
-    holds, and a one-thread pool never frees it. That rare case uses the
-    default pool and one connection outside the ORM budget.
 
-    A call through ``_ThreadSensitiveExecutor`` holds a slot too. asgiref runs
-    the sync function in a context that it copied before the hand-off, so the
-    slot marker of this module is not visible there. asgiref sets its own
-    marker, ``deadlock_context``, in that context before the copy, and an
-    ``async_to_sync`` inside the function carries it to the nested coroutine.
+def _pool_for(slot_is_held: bool) -> tuple[concurrent.futures.ThreadPoolExecutor, Callable[..., object]]:
+    """The pool and the call wrapper for a hand-off.
+
+    A hand-off from a context that holds a slot cannot use the ORM pool: it
+    waits on the slot that its own thread holds, and a one-thread pool never
+    frees it. That rare case uses the default pool and one connection outside
+    the ORM budget.
     """
-    if _holds_slot() or SyncToAsync.deadlock_context.get(False):
+    if slot_is_held:
         return _get_default_executor(), _call_guarded
     return _get_orm_executor(), _call_in_orm_slot
 
 
-def _holds_slot() -> bool:
-    """Whether the calling context already holds an ORM pool slot."""
-    return in_orm_executor_thread() or _holds_orm_slot.get()
+def _orm_handoff() -> tuple[concurrent.futures.ThreadPoolExecutor, Callable[..., object]]:
+    """The pool and the call wrapper for a framework hand-off from a coroutine.
+
+    The coroutine can run inside a slot. An ORM pool worker runs a loop on
+    its own thread in ``asyncio.run``, or on a new thread in
+    ``async_to_sync``; the slot marker of this module reaches that loop. A
+    thread-sensitive call through :class:`_ThreadSensitiveExecutor` holds a
+    slot too, but asgiref runs the sync function in a context that it copied
+    before the hand-off, so the marker of this module is not set there.
+    asgiref sets its own marker, ``deadlock_context``, before the copy, and
+    an ``async_to_sync`` inside the function carries it to the coroutine.
+    """
+    return _pool_for(_slot_is_held() or SyncToAsync.deadlock_context.get(False))
 
 
 class _ThreadSensitiveExecutor:
     """The asgiref executor for thread-sensitive calls of a request with no thread-sensitive context.
 
     Django's async ORM API (``aget``, ``acount``, ``async for``, ``auser``) is
-    ``sync_to_async(thread_sensitive=True)``. For a plain async route, asgiref
-    sends these calls to its class-level executor. That default is one thread
-    per process: one query in flight, whatever the worker count. No bolt code
-    runs on that thread, so a dead connection on it never gets dropped.
+    ``sync_to_async(thread_sensitive=True)``. For a route without Django
+    middleware, asgiref sends these calls to its class-level executor. That
+    default is one thread per process: one query in flight, whatever the
+    worker count. No Bolt code runs on that thread, so a dead connection on
+    it is never dropped.
 
-    This executor sends the call to the ORM pool through ``_orm_handoff``: the
-    pool is bounded by ``DJANGO_BOLT_ORM_THREADS`` and the call runs through
-    ``_call_guarded``, which drops a broken connection on the error path.
-    A request with Django middleware has a thread-sensitive context, and
-    asgiref never reaches this executor for it.
+    This executor sends the call to the ORM pool. The pool is bounded by
+    ``DJANGO_BOLT_ORM_THREADS``, and the call runs through ``_call_guarded``,
+    which drops a broken connection on the error path. A route with Django
+    middleware has a thread-sensitive context, and asgiref never reaches this
+    executor for it.
     """
 
     __slots__ = ()
 
     def submit(self, fn: Callable[..., object], *args: object) -> concurrent.futures.Future:
-        # This is the outer call, so the asgiref marker of ``_orm_handoff`` is
-        # always set here. Only a slot that this context already holds counts.
-        if _holds_slot():
-            return _get_default_executor().submit(contextvars.copy_context().run, _call_guarded, fn, *args)
-        return _get_orm_executor().submit(contextvars.copy_context().run, _call_in_orm_slot, fn, *args)
+        # asgiref sets ``deadlock_context`` before each call that reaches this
+        # executor, so only the slot markers of this module decide here.
+        executor, call = _pool_for(_slot_is_held())
+        return executor.submit(contextvars.copy_context().run, call, fn, *args)
 
 
-# Installed once at import. asgiref reads the attribute on each call.
+# Installed once at import. asgiref reads the attribute on each thread-sensitive call.
 SyncToAsync.single_thread_executor = _ThreadSensitiveExecutor()
 
 
