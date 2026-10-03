@@ -312,6 +312,14 @@ async def test_websocket_multiple_path_params(api):
         }
 
 
+@pytest.mark.asyncio
+async def test_websocket_path_param_is_url_decoded(api):
+    """Test a path value is URL-decoded, as for an HTTP route."""
+    async with WebSocketTestClient(api, "/ws/chat/hello%20world") as ws:
+        welcome = await ws.receive_text()
+        assert welcome == "Joined room: hello world"
+
+
 # --- Query Parameter Tests ---
 
 
@@ -586,6 +594,23 @@ def injection_api():
             }
         )
 
+    # Typed header and cookie values are converted in Rust, as in HTTP.
+    @api.websocket("/ws/inject/typed")
+    async def typed_header_cookie_handler(
+        websocket: WebSocket,
+        x_count: Annotated[int, Header()],
+        page: Annotated[int, Cookie()] = 1,
+    ):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "x_count": x_count,
+                "x_count_type": type(x_count).__name__,
+                "page": page,
+                "page_type": type(page).__name__,
+            }
+        )
+
     # Mixed injection (path + query + header + cookie)
     @api.websocket("/ws/inject/mixed/{room_id}")
     async def mixed_inject_handler(
@@ -618,6 +643,30 @@ async def test_websocket_query_injection(injection_api):
         assert response["token_type"] == "str"
         assert response["limit"] == 50
         assert response["limit_type"] == "int"
+
+
+@pytest.mark.asyncio
+async def test_websocket_query_plus_decodes_to_space(injection_api):
+    """A `+` in the query is a space and `%2B` is a literal `+`, as in Django."""
+    async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=hello+world%2B1") as ws:
+        response = await ws.receive_json()
+        assert response["token"] == "hello world+1"
+
+
+@pytest.mark.asyncio
+async def test_websocket_query_key_without_value_is_empty(injection_api):
+    """A query key with no `=` has an empty value, as in HTTP routes and Django."""
+    async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token") as ws:
+        response = await ws.receive_json()
+        assert response["token"] == ""
+
+
+@pytest.mark.asyncio
+async def test_websocket_query_replaces_bytes_that_are_not_utf8(injection_api):
+    """Bytes that are not UTF-8 become U+FFFD, as in HTTP routes and Django."""
+    async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=a+%FF") as ws:
+        response = await ws.receive_json()
+        assert response["token"] == "a \ufffd"
 
 
 @pytest.mark.asyncio
@@ -676,6 +725,74 @@ async def test_websocket_cookie_injection_default(injection_api):
         response = await ws.receive_json()
         assert response["session_id"] == "my-session"
         assert response["theme"] == "light"  # Default value
+
+
+@pytest.mark.asyncio
+async def test_websocket_typed_header_and_cookie(injection_api):
+    """Test typed Header() and Cookie() values arrive as their declared types."""
+    headers = {"X-Count": "5", "Cookie": "page=3"}
+    async with WebSocketTestClient(injection_api, "/ws/inject/typed", headers=headers) as ws:
+        response = await ws.receive_json()
+        assert response == {"x_count": 5, "x_count_type": "int", "page": 3, "page_type": "int"}
+
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_typed_header_rejects_upgrade(injection_api):
+    """Test a bad typed header value rejects the upgrade and names the header."""
+    with pytest.raises(ValueError, match="Header 'x-count'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/typed", headers={"X-Count": "abc"}):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_typed_cookie_rejects_upgrade(injection_api):
+    """Test a bad typed cookie value rejects the upgrade and names the cookie."""
+    headers = {"X-Count": "1", "Cookie": "page=last"}
+    with pytest.raises(ValueError, match="Cookie 'page'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/typed", headers=headers):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_typed_query_rejects_upgrade(injection_api):
+    """Test a bad typed query value rejects the upgrade and names the parameter."""
+    with pytest.raises(ValueError, match="Query parameter 'limit': Invalid integer 'abc'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=t&limit=abc"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_typed_path_rejects_upgrade(injection_api):
+    """Test a bad typed path value rejects the upgrade and names the parameter."""
+    headers = {"Authorization": "Bearer t", "Cookie": "session=s"}
+    with pytest.raises(ValueError, match="Path parameter 'room_id': Invalid integer 'abc'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/mixed/abc", query_string="token=t", headers=headers):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_typed_path_value_is_url_decoded(injection_api):
+    """Test an encoded typed path value is decoded before it converts, as for an HTTP route."""
+    headers = {"Authorization": "Bearer t", "Cookie": "session=s"}
+    async with WebSocketTestClient(
+        injection_api, "/ws/inject/mixed/%34%32", query_string="token=t", headers=headers
+    ) as ws:
+        response = await ws.receive_json()
+        assert response["room_id"] == 42
+        assert response["room_id_type"] == "int"
+
+
+@pytest.mark.asyncio
+async def test_websocket_repeated_query_key_keeps_last_value(injection_api):
+    """Test the last value of a repeated query key wins, and only it is checked, as for an HTTP route."""
+    async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=t&limit=abc&limit=5") as ws:
+        response = await ws.receive_json()
+        assert response["limit"] == 5
+        assert response["limit_type"] == "int"
+
+    with pytest.raises(ValueError, match="Query parameter 'limit': Invalid integer 'abc'"):
+        async with WebSocketTestClient(injection_api, "/ws/inject/query", query_string="token=t&limit=5&limit=abc"):
+            pass
 
 
 @pytest.mark.asyncio

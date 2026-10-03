@@ -278,8 +278,8 @@ class TestIntegerBoundaries:
 
         Security: Only plain integers accepted, no prefix modifiers.
         """
-        # Plus sign in integer (tests strict parsing)
-        response = client.get("/query/int?value=+123")
+        # Plus sign in integer (tests strict parsing). A bare `+` in a query is a space.
+        response = client.get("/query/int?value=%2B123")
         # Note: Rust's i64::parse may accept +123, so we document behavior
         if response.status_code == 200:
             # If accepted, verify the value is correct
@@ -885,7 +885,7 @@ class TestKnownSecurityGaps:
         Previously, query params with datetime type annotation received strings.
         Now, the Rust layer properly coerces them to Python datetime objects.
 
-        FIX APPLIED: coerce_to_py() in type_coercion.rs now handles TYPE_DATETIME,
+        FIX APPLIED: coerce_param() in type_coercion.rs now handles TYPE_DATETIME,
         TYPE_UUID, TYPE_DECIMAL, TYPE_DATE, and TYPE_TIME for query params.
         """
         # Send a valid datetime - handler now receives datetime object
@@ -1137,3 +1137,36 @@ class TestTypeVerification:
         data = response.json()
         assert data["type"] == "str", f"Expected str, got {data['type']}"
         assert data["value"] == "hello"
+
+
+# =============================================================================
+# Validation Error Body Encoding
+# =============================================================================
+
+
+class TestValidationErrorBodyIsJson:
+    """The 422 body echoes the client value, so it must stay valid JSON."""
+
+    @pytest.mark.parametrize(
+        ("raw", "decoded"),
+        [
+            ("%0A", "\n"),
+            ("%09", "\t"),
+            ("%0D", "\r"),
+            ("%00", "\x00"),
+            ("%1F", "\x1f"),
+            ("%22%5C", '"\\'),
+        ],
+    )
+    def test_query_int_error_with_special_char(self, client, raw, decoded):
+        response = client.get(f"/query/int?value={raw}")
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert f"'{decoded}'" in detail
+
+    @pytest.mark.parametrize(("raw", "decoded"), [("%0A", "\n"), ("%09", "\t")])
+    def test_path_int_error_with_control_char(self, client, raw, decoded):
+        response = client.get(f"/int/{raw}")
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert f"'{decoded}'" in detail

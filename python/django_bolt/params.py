@@ -89,6 +89,10 @@ class Param:
     max_files: int | None = None
     """Maximum number of files for list[UploadFile] parameters"""
 
+    # Last, so that a Param made with positional arguments keeps its field order.
+    default: Any = ...
+    """Value of a missing parameter. ``...`` makes the parameter required."""
+
 
 def Query(
     default: Any = ...,
@@ -127,6 +131,7 @@ def Query(
     """
     return Param(
         source="query",
+        default=default,
         alias=alias,
         gt=gt,
         ge=ge,
@@ -181,6 +186,7 @@ def Path(
 
     return Param(
         source="path",
+        default=default,
         alias=alias,
         gt=gt,
         ge=ge,
@@ -218,6 +224,7 @@ def Body(
     """
     return Param(
         source="body",
+        default=default,
         alias=alias,
         embed=embed,
         description=description,
@@ -248,6 +255,7 @@ def Header(
     """
     return Param(
         source="header",
+        default=default,
         alias=alias,
         description=description,
         example=example,
@@ -278,6 +286,7 @@ def Cookie(
     """
     return Param(
         source="cookie",
+        default=default,
         alias=alias,
         description=description,
         example=example,
@@ -306,6 +315,7 @@ def Form(
     """
     return Param(
         source="form",
+        default=default,
         alias=alias,
         description=description,
         example=example,
@@ -346,6 +356,7 @@ def File(
     """
     return Param(
         source="file",
+        default=default,
         alias=alias,
         description=description,
         max_size=max_size,

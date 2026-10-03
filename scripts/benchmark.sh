@@ -129,6 +129,10 @@ echo ""
 
 echo "## Root Endpoint Performance"
 cd python/example
+# Migrate before the first server start. The auth benchmarks create a user and
+# a JWT for it, so a new checkout needs the auth tables before that section.
+uv run python manage.py makemigrations users --noinput >/dev/null 2>&1 || true
+uv run python manage.py migrate --noinput >/dev/null 2>&1 || true
 # Collect static into STATIC_ROOT so the native Rust static scope serves admin
 # AND the benchmark fixtures (static/bench/*) from one canonical directory —
 # the production flow. Without this, STATIC_ROOT is empty and the static
@@ -289,8 +293,6 @@ sleep 1
 
 echo ""
 echo "## ORM Performance"
-uv run python manage.py makemigrations users --noinput >/dev/null 2>&1 || true
-uv run python manage.py migrate --noinput >/dev/null 2>&1 || true
 
 start_server
 

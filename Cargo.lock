@@ -493,6 +493,7 @@ dependencies = [
  "jsonwebtoken",
  "log",
  "matchit",
+ "memchr",
  "once_cell",
  "parking_lot",
  "pyo3",
@@ -560,7 +561,6 @@ dependencies = [
  "pyo3-async-runtimes",
  "regex",
  "tokio",
- "urlencoding",
 ]
 
 [[package]]
@@ -960,7 +960,6 @@ dependencies = [
  "socket2 0.6.2",
  "tikv-jemallocator",
  "tokio",
- "urlencoding",
 ]
 
 [[package]]

@@ -103,6 +103,98 @@ async def search(
 
 If no type annotation is provided, the parameter is treated as a string.
 
+Bolt decodes query keys and values as Django `QueryDict` does:
+
+- A `+` is a space, and `%2B` is a literal `+`. Thus a client must send a literal `+` as `%2B`.
+- Bytes that are not UTF-8 become U+FFFD (`�`).
+- A key with no `=` has an empty value. A repeated key keeps its last value, but a sequence parameter takes each value.
+
+A `+` in a path parameter stays a `+`. `request.META["QUERY_STRING"]`, `request.get_full_path()` and `request.build_absolute_uri()` keep the query as the client sent it.
+
+### Repeated query keys
+
+Declare a `list`, `set`, `frozenset` or `tuple` to take each value of a repeated key:
+
+```python
+from typing import Annotated
+from django_bolt.param_functions import Query
+
+@api.get("/items")
+async def items(tag: Annotated[set[int], Query()]):
+    # /items?tag=1&tag=2&tag=1 gives {1, 2}
+    return {"tags": sorted(tag)}
+```
+
+Bolt converts each value to the item type. A bad item gives a 422.
+A bare `list`, `set`, `frozenset` or `tuple` keeps each item as a string.
+A `tuple[int, str]` needs exactly one value for each position.
+A form field takes each value of its name in the same way.
+A WebSocket route takes each value of a repeated query key in the same way.
+A header or a cookie gives a sequence of one item.
+A path, header or cookie type that cannot hold one item, such as `tuple[int, str]`, raises `TypeError` when the route registers.
+
+### Constraints
+
+Add `msgspec.Meta` to limit a value. A value outside the limits gives a 422:
+
+```python
+import msgspec
+
+@api.get("/articles")
+async def articles(
+    page: Annotated[int, msgspec.Meta(ge=1)] = 1,
+    code: Annotated[str, msgspec.Meta(pattern=r"^[A-Z]{3}$"), Query()] = "ABC",
+):
+    return {"page": page, "code": code}
+```
+
+The constraints apply to path, query, header, cookie and form parameters.
+On `int | None`, they apply to the `int` value, and the parameter stays optional.
+The OpenAPI schema shows them, for example `minimum: 1`.
+A constraint that msgspec cannot apply, for example `ge` on a `Decimal`, raises `TypeError` when the route registers.
+The types in `django_bolt.serializers.types`, such as `PositiveInt`, work the same way.
+
+`Query()` and `Path()` also take the constraint arguments `gt`, `ge`, `lt`, `le`, `min_length`, `max_length` and `pattern`.
+Bolt applies them as `msgspec.Meta`:
+
+```python
+@api.get("/search")
+async def search(
+    name: str = Query(min_length=3, description="The name to find"),
+    category: str = Query(default="all"),
+    page: Annotated[int, Query(ge=1)] = 1,
+):
+    return {"name": name, "category": category, "page": page}
+```
+
+The marker can be the default of the parameter, or an item of `Annotated`.
+After `=`, the `default` of the marker gives the value of a missing parameter.
+Without `default`, the parameter is required.
+In `Annotated`, write the default after `=`, as in FastAPI.
+A default in an `Annotated` marker raises `TypeError` when the route registers.
+The first argument of a marker is its default, not its alias.
+Use `Query(alias="q")` to read another key.
+`Header()`, `Cookie()` and `Form()` take `default` in the same way.
+The OpenAPI schema shows the `description`, `example` and `deprecated` arguments of the marker.
+
+### NewType and type aliases
+
+A `NewType` or a `type` alias converts as the type that it names:
+
+```python
+from typing import NewType
+
+UserId = NewType("UserId", int)
+type Page = int
+
+@api.get("/users/{user_id}")
+async def user(user_id: UserId, page: Page = 1):
+    return {"user_id": user_id, "page": page}
+```
+
+The handler gets an `int`, and `/users/abc` gives a 422.
+A parameterized alias gets its arguments. With `type Pair[T] = list[T]`, a `Pair[int]` parameter converts as `list[int]`.
+
 ## Request body
 
 ### JSON body
@@ -160,6 +252,33 @@ async def optional_header(
     return {"custom": custom}
 ```
 
+### Typed headers
+
+Declare a header as `int`, `float`, `bool`, `uuid.UUID`, `decimal.Decimal`,
+`datetime`, `date` or `time`. Rust converts the value before the handler runs.
+A value that does not convert gives a 422 that names the header:
+
+```python
+@api.get("/items")
+async def list_items(x_page_size: Annotated[int, Header()] = 20):
+    return {"page_size": x_page_size}
+```
+
+`X-Page-Size: 50` gives the integer `50`. `X-Page-Size: abc` gives this 422:
+
+```json
+{"detail": "Header 'x-page-size': Invalid integer 'abc': invalid digit found in string"}
+```
+
+The converted value also replaces the string in `request.headers` and
+`request.cookies`. Django middleware still gets the strings as they
+arrived: `request.META` and `HttpRequest.COOKIES` hold the original text,
+so a value such as `0005` keeps its leading zeros there.
+
+A value that Rust can parse but Python cannot build is also a 422. This
+covers a `date` or `datetime` with a year outside 1 to 9999, and a
+`Decimal` with an exponent that Python's `decimal` module rejects.
+
 ### All headers
 
 Access all headers from the request:
@@ -184,6 +303,15 @@ async def get_session(
     session_id: Annotated[str, Cookie(alias="sessionid")]
 ):
     return {"session_id": session_id}
+```
+
+Typed cookies work as typed headers do. Rust converts the value, and a value
+that does not convert gives a 422 that names the cookie:
+
+```python
+@api.get("/feed")
+async def feed(page: Annotated[int, Cookie()] = 1):
+    return {"page": page}
 ```
 
 ## Sessions
@@ -694,4 +822,6 @@ Common validation scenarios that return 422:
 | Missing required form field | `Missing required form field: username` |
 | Missing required file | `Missing required file: document` |
 | Type conversion failure | `Invalid integer value: 'abc'` |
+| Header type conversion failure | `Header 'x-count': Invalid integer 'abc': ...` |
+| Cookie type conversion failure | `Cookie 'page': Invalid integer 'abc': ...` |
 | Struct field validation | `name: Name must be at least 3 characters` |

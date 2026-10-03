@@ -16,15 +16,21 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 import msgspec
 
 from ..analysis import resolve_introspection_target
-from ..dependencies import resolve_dependency
-from ..params import Depends as DependsMarker
-from ..params import Param
+from ..dependencies import (
+    compile_dependency,
+    decode_body_once,
+    dependency_needs_event_loop,
+    resolve_dependency,
+    resolve_dependency_sync,
+    sync_form,
+)
 from ..typing import (
     FieldDefinition,
     HandlerMetadata,
     HandlerPattern,
     is_msgspec_struct,
     is_upload_file_type,
+    split_param_annotation,
     unwrap_optional,
 )
 from ..websocket import WebSocket as WebSocketType
@@ -172,6 +178,7 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         "fields": [],
         "path_params": path_params,
         "http_method": http_method,
+        "path": path,
         "has_file_uploads": False,  # Default; overridden below if file params exist
     }
 
@@ -188,22 +195,8 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         name = param.name
         annotation = type_hints.get(name, param.annotation)
 
-        # Extract explicit markers from Annotated or default
-        explicit_marker = None
-
-        # Check Annotated[T, ...]
-        origin = get_origin(annotation)
-        if origin is Annotated:
-            args = get_args(annotation)
-            annotation = args[0] if args else annotation  # Unwrap to get actual type
-            for meta_val in args[1:]:
-                if isinstance(meta_val, (Param, DependsMarker)):
-                    explicit_marker = meta_val
-                    break
-
-        # Check default value for marker
-        if explicit_marker is None and isinstance(param.default, (Param, DependsMarker)):
-            explicit_marker = param.default
+        # Take the Param or Depends marker out of Annotated[T, ...] or the default. msgspec.Meta stays.
+        annotation, explicit_marker = split_param_annotation(annotation, param.default)
 
         # Create FieldDefinition with inference
         field = FieldDefinition.from_parameter(
@@ -307,6 +300,7 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
         "fields": [],
         "path_params": path_params,
         "http_method": "WEBSOCKET",
+        "path": path,
         "has_file_uploads": False,  # WebSocket never has file uploads
     }
 
@@ -348,19 +342,8 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
         if name in ("websocket", "ws") and annotation is inspect.Parameter.empty:
             continue
 
-        # Extract explicit markers from Annotated or default
-        explicit_marker = None
-
-        if origin is Annotated:
-            args = get_args(annotation)
-            annotation = args[0] if args else annotation
-            for meta_val in args[1:]:
-                if isinstance(meta_val, (Param, DependsMarker)):
-                    explicit_marker = meta_val
-                    break
-
-        if explicit_marker is None and isinstance(param.default, (Param, DependsMarker)):
-            explicit_marker = param.default
+        # Take the Param or Depends marker out of Annotated[T, ...] or the default. msgspec.Meta stays.
+        annotation, explicit_marker = split_param_annotation(annotation, param.default)
 
         # Create FieldDefinition with inference
         # WebSocket doesn't have body, so primitives should default to query
@@ -444,19 +427,17 @@ async def build_handler_arguments(
         elif field.source == "dependency":
             if field.dependency is None:
                 raise ValueError(f"Depends for parameter {field.name} requires a callable")
+            dep_fn = field.dependency.dependency
             value = await resolve_dependency(
-                field.dependency.dependency,
+                dep_fn,
                 field.dependency,
+                compile_dependency(dep_fn, handler_meta_dict, compile_binder_fn, meta["http_method"], meta["path"]),
                 request,
                 dep_cache,
                 params_map,
                 query_map,
                 headers_map,
                 cookies_map,
-                handler_meta_dict,
-                compile_binder_fn,
-                meta.get("http_method", ""),
-                meta.get("path", ""),
             )
         else:
             value, body_obj, body_loaded = extract_parameter_value(
@@ -667,13 +648,27 @@ def compile_argument_injector(
 
         _dep_plan: list[tuple[int, Any, bool, str, bool, Any]] = []
         _dep_fallback_fields: list[FieldDefinition] = []
-        http_method = meta.get("http_method", "")
-        path = meta.get("path", "")
+        http_method = meta["http_method"]
+        path = meta["path"]
+
+        # A sync handler uses the sync form of a dependency that has one, for
+        # example get_current_user. Its injector then needs no event loop.
+        handler_is_sync = not meta.get("is_async", True)
 
         for f in fields:
             src_id = _dep_source_map.get(f.source, _SRC_FALLBACK_D)
             if src_id == _SRC_DEP:
-                _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, f.dependency))
+                dependency = f.dependency
+                # The extractor slot of a dependency holds its binding for this
+                # route, compiled here. A request then does not look it up.
+                dep_meta = None
+                if dependency is not None:
+                    if handler_is_sync:
+                        dependency = sync_form(dependency)
+                    dep_meta = compile_dependency(
+                        dependency.dependency, handler_meta_dict, compile_binder_fn, http_method, path
+                    )
+                _dep_plan.append((src_id, dep_meta, f.kind in _POSITIONAL_KINDS, f.name, False, dependency))
             elif src_id == _SRC_REQUEST_D:
                 _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, None))
             elif src_id == _SRC_FALLBACK_D or f.extractor is None:
@@ -693,9 +688,95 @@ def compile_argument_injector(
         _async_dep_fns = []
         for idx in _dep_indices:
             dep = _dep_plan[idx][5]  # dependency marker
-            if dep is not None and inspect.iscoroutinefunction(dep.dependency):
+            # A sync dependency of an async dependency also needs the async injector.
+            if dep is not None and dependency_needs_event_loop(
+                dep.dependency, handler_meta_dict, compile_binder_fn, http_method, path, sync_handler=handler_is_sync
+            ):
                 _async_dep_fns.append(idx)
         _can_parallel = len(_async_dep_fns) >= 2
+
+        if not _async_dep_fns:
+            # Every dependency is sync, so the injector needs no event loop. A sync
+            # handler then keeps sync dispatch and lane dispatch, and an async handler
+            # keeps its fast path.
+            def injector_with_sync_deps(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+                params_map = request["params"] if needs_path_params else _EMPTY_DICT
+                query_map = request["query"] if needs_query else _EMPTY_DICT
+                headers_map = request.get("headers", _EMPTY_DICT) if needs_headers else _EMPTY_DICT
+                cookies_map = request.get("cookies", _EMPTY_DICT) if needs_cookies else _EMPTY_DICT
+
+                if needs_form:
+                    form_map = request.form
+                    files_map = request.files
+                else:
+                    form_map, files_map = _EMPTY_FORM_FILES
+
+                body_obj: Any = None
+                body_loaded: bool = False
+                dep_cache: dict[Any, Any] = {}
+                args: list[Any] = []
+                kwargs: dict[str, Any] = {}
+
+                for src_id, extractor, positional, name, needs_files, dependency in _dep_plan:
+                    if src_id == _SRC_DEP:
+                        if dependency is None:
+                            raise ValueError(f"Depends for parameter {name} requires a callable")
+                        value = resolve_dependency_sync(
+                            dependency.dependency,
+                            dependency,
+                            extractor,
+                            request,
+                            dep_cache,
+                            params_map,
+                            query_map,
+                            headers_map,
+                            cookies_map,
+                        )
+                    elif src_id == _SRC_REQUEST_D:
+                        value = request
+                    elif src_id == _SRC_PATH_D:
+                        value = extractor(params_map)
+                    elif src_id == _SRC_QUERY_D:
+                        value = extractor(query_map)
+                    elif src_id == _SRC_HEADER_D:
+                        value = extractor(headers_map)
+                    elif src_id == _SRC_COOKIE_D:
+                        value = extractor(cookies_map)
+                    elif src_id == _SRC_FORM_D:
+                        value = extractor(form_map, files_map) if needs_files else extractor(form_map)
+                    elif src_id == _SRC_FILE_D:
+                        value = extractor(files_map)
+                    elif src_id == _SRC_BODY_D:
+                        # A dependency with the same body type shares this decode.
+                        value = decode_body_once(dep_cache, extractor, request["body"])
+                    else:
+                        field = _dep_fallback_by_name[name]
+                        value, body_obj, body_loaded = extract_parameter_value(
+                            field,
+                            request,
+                            params_map,
+                            query_map,
+                            headers_map,
+                            cookies_map,
+                            form_map,
+                            files_map,
+                            meta,
+                            body_obj,
+                            body_loaded,
+                        )
+
+                    if positional:
+                        args.append(value)
+                    else:
+                        kwargs[name] = value
+
+                # Track UploadFiles for auto-cleanup (only when handler has file params)
+                if has_file_uploads and "_upload_files" in files_map:
+                    request.state["_upload_files"] = files_map["_upload_files"]
+
+                return args, kwargs
+
+            return injector_with_sync_deps
 
         async def injector_with_deps(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
             """Optimized argument injector with dependency support."""
@@ -717,26 +798,23 @@ def compile_argument_injector(
             # For 2+ async deps, resolve them in parallel via asyncio.gather
             if _can_parallel:
                 # Pre-resolve all async deps in parallel
-                async def _resolve_one(dependency):
+                async def _resolve_one(dependency, dep_meta):
                     return await resolve_dependency(
                         dependency.dependency,
                         dependency,
+                        dep_meta,
                         request,
                         dep_cache,
                         params_map,
                         query_map,
                         headers_map,
                         cookies_map,
-                        handler_meta_dict,
-                        compile_binder_fn,
-                        http_method,
-                        path,
                     )
 
                 dep_coros = []
                 for idx in _async_dep_fns:
-                    dep = _dep_plan[idx][5]
-                    dep_coros.append(_resolve_one(dep))
+                    plan_entry = _dep_plan[idx]
+                    dep_coros.append(_resolve_one(plan_entry[5], plan_entry[1]))
 
                 dep_results = await asyncio.gather(*dep_coros)
                 # Map results back to plan indices — use a pre-sized list indexed
@@ -763,16 +841,13 @@ def compile_argument_injector(
                         value = await resolve_dependency(
                             dependency.dependency,
                             dependency,
+                            extractor,
                             request,
                             dep_cache,
                             params_map,
                             query_map,
                             headers_map,
                             cookies_map,
-                            handler_meta_dict,
-                            compile_binder_fn,
-                            http_method,
-                            path,
                         )
                 elif src_id == _SRC_REQUEST_D:
                     value = request
@@ -789,10 +864,8 @@ def compile_argument_injector(
                 elif src_id == _SRC_FILE_D:
                     value = extractor(files_map)
                 elif src_id == _SRC_BODY_D:
-                    if not body_loaded:
-                        body_obj = extractor(request["body"])
-                        body_loaded = True
-                    value = body_obj
+                    # A dependency with the same body type shares this decode.
+                    value = decode_body_once(dep_cache, extractor, request["body"])
                 else:
                     field = _dep_fallback_by_name[name]
                     value, body_obj, body_loaded = extract_parameter_value(

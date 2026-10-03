@@ -4,7 +4,7 @@
 //! eliminating the need for Python's convert_primitive() function.
 //! Performance improvement: ~100-500µs per parameter.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
 use pyo3::{IntoPyObject, Py, PyAny, PyResult, Python};
@@ -14,6 +14,8 @@ use uuid::Uuid;
 // Each import costs ~50-100ns, caching eliminates this overhead for repeated coercions
 static UUID_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static DECIMAL_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static OBJECT_NEW: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SAFE_UUID_UNKNOWN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 #[inline]
 pub fn get_uuid_class(py: Python<'_>) -> &Py<PyAny> {
@@ -118,6 +120,43 @@ fn is_valid_decimal_literal(s: &str) -> bool {
     i == b.len()
 }
 
+/// Largest adjusted exponent that Python's `decimal` module accepts (`MAX_EMAX`
+/// of libmpdec on a 64-bit build). The mantissa has at most `max_length` digits,
+/// so the bound leaves room for it.
+const PYTHON_DECIMAL_MAX_EMAX: u64 = 999_999_999_999_999_999;
+
+/// Check that Python can build a `Decimal` from a valid literal.
+///
+/// `Decimal("1E999999999999999999999")` raises `InvalidOperation`, because the
+/// exponent does not fit. Such a value must be a 422, not a Python error
+/// under the GIL.
+fn decimal_exponent_fits(s: &str) -> bool {
+    let Some(pos) = s.find(['e', 'E']) else {
+        return true;
+    };
+    let exponent = &s[pos + 1..];
+    let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    match digits.parse::<u64>() {
+        Ok(magnitude) => magnitude.saturating_add(s.len() as u64) <= PYTHON_DECIMAL_MAX_EMAX,
+        Err(_) => false,
+    }
+}
+
+/// Check that Python can build a `date` or `datetime` for this year.
+///
+/// chrono parses year 0 and year 10000. Python `datetime` accepts 1 to 9999
+/// only, and a value outside that range must be a 422.
+fn check_python_year(year: i32, kind: &str, value: &str) -> Result<(), String> {
+    if (1..=9999).contains(&year) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid {} '{}': year {} is out of range (1 to 9999)",
+            kind, value, year
+        ))
+    }
+}
+
 /// Type hint constants (must match Python's get_type_hint_id() in compiler.py)
 pub const TYPE_INT: u8 = 1;
 pub const TYPE_FLOAT: u8 = 2;
@@ -172,12 +211,12 @@ impl CoercedValue {
 
 /// Error returned by [`coerce_param`].
 ///
-/// Callers distinguish the two variants structurally:
-/// * [`CoerceError::TooLong`] is a hard security limit — it MUST always be
-///   rejected (422 for HTTP, upgrade rejection for WebSockets). Never fall back
-///   to passing the oversized value through.
-/// * [`CoerceError::Invalid`] is a normal type-coercion failure. Some callers
-///   (WebSocket scope building) intentionally fall back to the raw string here.
+/// * [`CoerceError::TooLong`] is a hard security limit. Never pass the
+///   oversized value through.
+/// * [`CoerceError::Invalid`] is a normal type-coercion failure.
+///
+/// Callers reject both variants: a 422 for HTTP, a rejected upgrade for
+/// WebSockets. No caller gives the raw string to the handler.
 ///
 /// `Display` reproduces the exact same messages the old `String` errors used,
 /// so existing `format!("{e}")` / `.to_string()` consumers are unchanged.
@@ -236,9 +275,14 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
             .map_err(|e| format!("Invalid float '{}': {}", value, e)),
 
         TYPE_BOOL => {
-            let lower = value.to_lowercase();
-            let is_true = matches!(lower.as_str(), "true" | "1" | "yes" | "on");
-            let is_false = matches!(lower.as_str(), "false" | "0" | "no" | "off");
+            // Compare without case. This does not allocate a lowercase copy of the value.
+            let is_true = ["true", "1", "yes", "on"]
+                .iter()
+                .any(|token| value.eq_ignore_ascii_case(token));
+            let is_false = !is_true
+                && ["false", "0", "no", "off"]
+                    .iter()
+                    .any(|token| value.eq_ignore_ascii_case(token));
             if is_true {
                 Ok(CoercedValue::Bool(true))
             } else if is_false {
@@ -258,19 +302,36 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
             .map(CoercedValue::Uuid)
             .map_err(|e| format!("Invalid UUID '{}': {}", value, e)),
 
-        TYPE_DATETIME => parse_datetime(value),
+        TYPE_DATETIME => {
+            let parsed = parse_datetime(value)?;
+            let year = match &parsed {
+                CoercedValue::DateTime(dt) => dt.year(),
+                CoercedValue::NaiveDateTime(ndt) => ndt.year(),
+                _ => unreachable!("parse_datetime returns a datetime"),
+            };
+            check_python_year(year, "datetime", value)?;
+            Ok(parsed)
+        }
 
         TYPE_DECIMAL => {
-            if is_valid_decimal_literal(value) {
-                Ok(CoercedValue::Decimal(value.to_string()))
-            } else {
+            if !is_valid_decimal_literal(value) {
                 Err(format!("Invalid decimal '{}'", value))
+            } else if !decimal_exponent_fits(value) {
+                Err(format!(
+                    "Invalid decimal '{}': exponent is out of range",
+                    value
+                ))
+            } else {
+                Ok(CoercedValue::Decimal(value.to_string()))
             }
         }
 
-        TYPE_DATE => NaiveDate::parse_from_str(value, "%Y-%m-%d")
-            .map(CoercedValue::Date)
-            .map_err(|e| format!("Invalid date '{}': {}", value, e)),
+        TYPE_DATE => {
+            let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map_err(|e| format!("Invalid date '{}': {}", value, e))?;
+            check_python_year(date.year(), "date", value)?;
+            Ok(CoercedValue::Date(date))
+        }
 
         TYPE_TIME => parse_time(value),
 
@@ -339,157 +400,45 @@ fn parse_time(value: &str) -> Result<CoercedValue, String> {
     ))
 }
 
-/// Convert a string value to Python object based on type hint.
-/// Handles all supported types including datetime, uuid, and decimal.
-/// Returns PyResult to properly handle validation errors.
-/// `max_length` is the startup-resolved limit (`AppState.max_param_length`),
-/// passed in so the `params_to_py_dict` hot loop never re-resolves config.
-#[inline]
-pub fn coerce_to_py(
-    py: pyo3::Python<'_>,
-    value: &str,
-    type_hint: u8,
-    max_length: usize,
-) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-    // Security: Validate length for ALL types (defense in depth)
-    if value.len() > max_length {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Parameter too long: {} bytes (max {} bytes)",
-            value.len(),
-            max_length
-        )));
-    }
+/// Non-string type hints of one request source, keyed by wire name.
+pub type TypeHints = ahash::AHashMap<String, u8>;
 
-    match type_hint {
-        TYPE_INT => Ok(value
-            .parse::<i64>()
-            .unwrap_or(0)
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-        TYPE_FLOAT => Ok(value
-            .parse::<f64>()
-            .unwrap_or(0.0)
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-        TYPE_BOOL => {
-            let is_true = matches!(value.to_lowercase().as_str(), "true" | "1" | "yes" | "on");
-            Ok(is_true
-                .into_pyobject(py)
-                .unwrap()
-                .to_owned()
-                .unbind()
-                .into_any())
-        }
-        TYPE_UUID => {
-            // Parse UUID in Rust, construct uuid.UUID from the 128-bit value —
-            // no 36-char string alloc, no hex re-parse on the Python side.
-            match Uuid::parse_str(value) {
-                Ok(uuid) => uuid_to_py(py, uuid),
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid UUID '{}': {}",
-                    value, e
-                ))),
-            }
-        }
-        TYPE_DATETIME => {
-            // Parse datetime in Rust, construct datetime.datetime directly via
-            // pyo3's chrono integration (C-API construction, no ISO round trip).
-            match parse_datetime(value) {
-                Ok(CoercedValue::DateTime(dt)) => Ok(dt.into_pyobject(py)?.into_any().unbind()),
-                Ok(CoercedValue::NaiveDateTime(ndt)) => {
-                    Ok(ndt.into_pyobject(py)?.into_any().unbind())
-                }
-                Ok(_) => {
-                    // Shouldn't happen, but fallback to string
-                    Ok(value
-                        .to_string()
-                        .into_pyobject(py)
-                        .unwrap()
-                        .into_any()
-                        .unbind())
-                }
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
-            }
-        }
-        TYPE_DECIMAL => {
-            // Validate decimal in Rust, convert to Python Decimal
-            // OPTIMIZATION: Use cached Decimal class (avoids py.import per call)
-            if is_valid_decimal_literal(value) {
-                // Pass the original validated string: Python's Decimal
-                // normalizes it, and this avoids expanding large exponents.
-                Ok(get_decimal_class(py).call1(py, (value,))?)
-            } else {
-                Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid decimal '{}'",
-                    value
-                )))
-            }
-        }
-        TYPE_DATE => {
-            // Parse date in Rust, construct datetime.date directly (chrono).
-            match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-                Ok(date) => Ok(date.into_pyobject(py)?.into_any().unbind()),
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid date '{}': {}",
-                    value, e
-                ))),
-            }
-        }
-        TYPE_TIME => {
-            // Parse time in Rust, construct datetime.time directly (chrono).
-            match parse_time(value) {
-                Ok(CoercedValue::Time(time)) => Ok(time.into_pyobject(py)?.into_any().unbind()),
-                Ok(_) => {
-                    // Shouldn't happen, but fallback to string
-                    Ok(value
-                        .to_string()
-                        .into_pyobject(py)
-                        .unwrap()
-                        .into_any()
-                        .unbind())
-                }
-                Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
-            }
-        }
-        _ => Ok(value
-            .to_string()
-            .into_pyobject(py)
-            .unwrap()
-            .into_any()
-            .unbind()),
-    }
-}
+/// Pre-coerced values of one request source. The names borrow from the
+/// route metadata, so no name is copied per request and the request map
+/// stays free to move.
+pub type CoercedValues<'a> = Vec<(&'a str, CoercedValue)>;
 
-/// Convert a map of string params to a Python dict with type coercion.
-/// Used by both production handler and test handler.
-/// Returns PyResult to properly handle coercion errors.
+/// Build a Python dict from a map of string values.
 ///
-/// Keys declared in `param_types` (a bounded, registration-time set) are
-/// interned so repeated requests reuse one PyString per name. Arbitrary
-/// client-supplied names are NOT interned — interned strings are effectively
-/// immortal, which would be a memory-growth vector.
-pub fn params_to_py_dict<'py>(
-    py: pyo3::Python<'py>,
-    params: &ahash::AHashMap<String, String>,
-    param_types: &std::collections::HashMap<String, u8>,
-    max_param_length: usize,
-) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
-    let dict = pyo3::types::PyDict::new(py);
-    for (name, value) in params {
-        match param_types.get(name) {
-            Some(&type_hint) => {
-                let py_value = coerce_to_py(py, value, type_hint, max_param_length)?;
-                let _ = dict.set_item(pyo3::types::PyString::intern(py, name), py_value);
-            }
-            None => {
-                let py_value = coerce_to_py(py, value, TYPE_STRING, max_param_length)?;
-                let _ = dict.set_item(name, py_value);
-            }
-        }
+/// A value in `coerced` replaces the string for its name. The request pipeline
+/// validates and coerces those values before the GIL is taken, so this step
+/// cannot fail on bad input. Used for path, query, header and cookie values.
+///
+/// Two passes keep the cost linear: every string goes in first, then each
+/// coerced value overwrites its string. The overwritten strings are short,
+/// so this is cheaper than a lookup per value.
+///
+/// Names are not interned: interning costs a lookup per call, and interned
+/// client-supplied names would never be freed.
+///
+/// `values` can own its strings (headers, cookies) or borrow them (query).
+#[inline]
+pub fn string_map_to_py_dict<'py, K, V>(
+    py: Python<'py>,
+    values: &ahash::AHashMap<K, V>,
+    coerced: &[(&str, CoercedValue)],
+) -> PyResult<pyo3::Bound<'py, PyDict>>
+where
+    K: std::borrow::Borrow<str>,
+    V: AsRef<str>,
+{
+    let dict = PyDict::new(py);
+    for (name, value) in values {
+        let name: &str = name.borrow();
+        dict.set_item(name, value.as_ref())?;
+    }
+    for (name, typed) in coerced {
+        dict.set_item(name, coerced_value_to_py(py, typed)?)?;
     }
     Ok(dict)
 }
@@ -514,7 +463,7 @@ mod tests {
     #[test]
     fn test_coerce_float() {
         assert!(
-            matches!(coerce_param("3.14", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Float(f)) if (f - 3.14).abs() < 0.001)
+            matches!(coerce_param("1.25", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Float(f)) if (f - 1.25).abs() < 0.001)
         );
         assert!(
             matches!(coerce_param("-2.5", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Float(f)) if (f + 2.5).abs() < 0.001)
@@ -523,7 +472,57 @@ mod tests {
     }
 
     #[test]
+    fn python_year_range_is_enforced() {
+        for value in ["0000-01-01", "-0001-01-01", "+10000-01-01"] {
+            let error = coerce_param(value, TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
+            assert!(error.to_string().contains("year"), "{value}: {error}");
+        }
+        for value in [
+            "0000-01-01T00:00:00",
+            "0000-01-01T00:00:00Z",
+            "+10000-01-01T00:00:00",
+        ] {
+            let error = coerce_param(value, TYPE_DATETIME, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
+            assert!(error.to_string().contains("year"), "{value}: {error}");
+        }
+        assert!(coerce_param("0001-01-01", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
+        assert!(coerce_param("9999-12-31", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
+    }
+
+    #[test]
+    fn python_decimal_exponent_range_is_enforced() {
+        for value in ["1E999999999999999999999", "1e-99999999999999999999"] {
+            let error = coerce_param(value, TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
+            assert!(error.to_string().contains("exponent"), "{value}: {error}");
+        }
+        for value in ["1E+2147483648", "1E999999999999999", "-0.5e-7", "12.5"] {
+            assert!(
+                coerce_param(value, TYPE_DECIMAL, DEFAULT_MAX_PARAM_LENGTH).is_ok(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn test_coerce_bool() {
+        for (value, expected) in [
+            ("TRUE", true),
+            ("Yes", true),
+            ("ON", true),
+            ("OFF", false),
+            ("No", false),
+        ] {
+            assert!(
+                matches!(coerce_param(value, TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Bool(b)) if b == expected),
+                "{value}"
+            );
+        }
+        for value in ["tru", "yess", "", "on "] {
+            assert!(
+                coerce_param(value, TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH).is_err(),
+                "{value}"
+            );
+        }
         assert!(matches!(
             coerce_param("true", TYPE_BOOL, DEFAULT_MAX_PARAM_LENGTH),
             Ok(CoercedValue::Bool(true))
@@ -712,40 +711,84 @@ mod tests {
 /// directly — datetime/date/time go through PyO3's chrono integration (C-API
 /// construction, no ISO-string round trip) and UUID is built from its 128-bit
 /// value instead of re-parsing a hex string in Python.
-pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> Py<PyAny> {
-    match value {
+///
+/// `coerce_param` rejects the values that Python cannot build, so this fails
+/// only on a Python error such as memory exhaustion. The error is returned,
+/// never unwrapped: a panic under the GIL would abort the worker.
+pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> PyResult<Py<PyAny>> {
+    Ok(match value {
         // Primitives - direct conversion
-        CoercedValue::Int(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Float(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Bool(v) => v.into_pyobject(py).unwrap().to_owned().unbind().into_any(),
-        CoercedValue::String(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::Int(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Float(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Bool(v) => v.into_pyobject(py)?.to_owned().unbind().into_any(),
+        CoercedValue::String(v) => v.into_pyobject(py)?.into_any().unbind(),
 
-        // UUID: construct from the 128-bit integer (uuid.UUID(int=...)) —
-        // avoids a 36-char string alloc in Rust + hex parsing in Python.
-        CoercedValue::Uuid(v) => uuid_to_py(py, *v).unwrap(),
+        // UUID: built from the 128-bit integer, no hex string round trip.
+        CoercedValue::Uuid(v) => uuid_to_py(py, *v)?,
 
         // Decimal: construct Python decimal.Decimal from the validated input
         // string (kept as-is so large exponents are never expanded into their
         // full digit string in Rust).
-        CoercedValue::Decimal(v) => get_decimal_class(py).call1(py, (v.as_str(),)).unwrap(),
+        CoercedValue::Decimal(v) => get_decimal_class(py).call1(py, (v.as_str(),))?,
 
         // Temporal types: direct C-API construction via pyo3's chrono feature.
-        CoercedValue::DateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::NaiveDateTime(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Date(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
-        CoercedValue::Time(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
+        CoercedValue::DateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::NaiveDateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Date(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Time(v) => v.into_pyobject(py)?.into_any().unbind(),
 
         CoercedValue::Null => py.None(),
-    }
+    })
 }
 
 /// Build a Python `uuid.UUID` from the parsed 128-bit value.
+///
+/// `uuid.UUID(int=...)` runs the Python `__init__`, which checks its arguments
+/// again. This function builds the object as CPython 3.14 `UUID._from_int` does:
+/// `object.__new__(UUID)`, then it sets the `int` and `is_safe` slots.
+/// `UUID.__setattr__` blocks assignment, so the slots are set with the generic
+/// setter, as `object.__setattr__` does. The 128-bit value is always in range.
 #[inline]
 pub fn uuid_to_py(py: Python<'_>, v: uuid::Uuid) -> PyResult<Py<PyAny>> {
-    let kwargs = PyDict::new(py);
-    kwargs.set_item(pyo3::intern!(py, "int"), v.as_u128())?;
-    Ok(get_uuid_class(py)
-        .bind(py)
-        .call((), Some(&kwargs))?
-        .unbind())
+    let object_new = OBJECT_NEW.get_or_init(py, || {
+        py.import("builtins")
+            .unwrap()
+            .getattr("object")
+            .unwrap()
+            .getattr("__new__")
+            .unwrap()
+            .unbind()
+    });
+    let safe_unknown = SAFE_UUID_UNKNOWN.get_or_init(py, || {
+        py.import("uuid")
+            .unwrap()
+            .getattr("SafeUUID")
+            .unwrap()
+            .getattr("unknown")
+            .unwrap()
+            .unbind()
+    });
+    let value = object_new.bind(py).call1((get_uuid_class(py).bind(py),))?;
+    let int = v.as_u128().into_pyobject(py)?;
+    set_slot(&value, pyo3::intern!(py, "int"), int.as_any())?;
+    set_slot(&value, pyo3::intern!(py, "is_safe"), safe_unknown.bind(py))?;
+    Ok(value.unbind())
+}
+
+/// Set an attribute with the generic setter, as `object.__setattr__` does.
+#[inline]
+fn set_slot(
+    object: &pyo3::Bound<'_, PyAny>,
+    name: &pyo3::Bound<'_, pyo3::types::PyString>,
+    value: &pyo3::Bound<'_, PyAny>,
+) -> PyResult<()> {
+    // SAFETY: the three pointers are valid for the call: the Bound references keep them alive.
+    let status = unsafe {
+        pyo3::ffi::PyObject_GenericSetAttr(object.as_ptr(), name.as_ptr(), value.as_ptr())
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(pyo3::PyErr::fetch(object.py()))
+    }
 }

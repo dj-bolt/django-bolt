@@ -17,6 +17,7 @@ use crate::middleware::auth::{
     RefreshingJwks,
 };
 use crate::permissions::{ClaimKey, Guard, GuardDenial, GuardSet, Quantifier};
+use crate::type_coercion::TypeHints;
 
 /// Request value source for Rust-side argument prebinding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,13 +30,14 @@ pub enum RustArgSource {
 
 /// One argument binding entry used by Rust-side prebinding.
 ///
-/// `lookup_key` / `arg_name` are interned Python strings created once at
-/// registration so the per-request dict lookups reuse the same object
-/// (no per-request PyString allocation or re-hashing of a fresh object).
+/// `key` is the wire name that Rust looks up in its request maps. `arg_name`
+/// is an interned Python string created once at registration, so the
+/// per-request kwargs insert reuses one object.
 #[derive(Debug)]
 pub struct RustArgBinding {
     pub source: RustArgSource,
-    pub lookup_key: Py<PyString>,
+    /// Wire key, for lookups in the request maps.
+    pub key: String,
     pub arg_name: Py<PyString>,
     pub positional: bool,
     // (Clone is implemented manually below — Py<T> needs the GIL to clone_ref.)
@@ -54,7 +56,7 @@ impl Clone for RustArgBinding {
         // test-app path — never on the production request hot path.
         Python::attach(|py| Self {
             source: self.source,
-            lookup_key: self.lookup_key.clone_ref(py),
+            key: self.key.clone(),
             arg_name: self.arg_name.clone_ref(py),
             positional: self.positional,
             required: self.required,
@@ -531,7 +533,12 @@ pub struct RouteMetadata {
 
     // Type hints for path/query parameters (enables Rust-side type coercion)
     // Maps parameter name to type hint constant (see type_coercion.rs)
-    pub param_types: HashMap<String, u8>,
+    pub param_types: TypeHints,
+    // Type hints for header and cookie parameters, keyed by wire name.
+    // A header key is lowercase with hyphens. A cookie key is the cookie name.
+    // Only non-string types are present.
+    pub header_types: TypeHints,
+    pub cookie_types: TypeHints,
 
     // Form-related metadata for Rust-side form parsing
     pub form_type_hints: HashMap<String, u8>,
@@ -539,15 +546,26 @@ pub struct RouteMetadata {
     // Rust always emits a Python list for these keys so the Python extractor never
     // has to wrap a single occurrence — eliminates a per-request loop.
     pub form_seq_fields: HashSet<String>,
+    // Query keys whose annotated type is a sequence. A repeated key gives each of
+    // its values as a Python list; the plain query map keeps the last value only.
+    pub query_seq_fields: AHashSet<String>,
     pub file_constraints: HashMap<String, FileFieldConstraints>,
     pub max_upload_size: usize,
     pub memory_spool_threshold: usize,
     pub rust_arg_bindings: Option<Vec<RustArgBinding>>,
+    /// True when the bindings are the only reader of the request maps: no
+    /// request parameter, dependency or middleware. Rust then binds the
+    /// arguments from its own maps and builds no Python source dicts.
+    pub prebind_only: bool,
     pub plan: RouteExecutionPlan,
     /// Route's default success status code. Used by the bare-bytes response
     /// fast path: sync executors may return just the encoded JSON body and
     /// Rust rebuilds the (status, JSON meta) envelope from this value.
     pub default_status_code: u16,
+    /// WebSocket routes with a `revoked_token_handler`: an async Python
+    /// callable that takes the auth context and returns True for a revoked
+    /// token. The handshake awaits it before the upgrade.
+    pub websocket_revocation_check: Option<Arc<Py<PyAny>>>,
 }
 
 impl RouteMetadata {
@@ -667,12 +685,11 @@ impl RouteMetadata {
         // Parse param_types for Rust-side type coercion
         // Format: {"param_name": type_hint_id, ...}
         // Type hint IDs match type_coercion.rs constants (TYPE_INT=1, TYPE_FLOAT=2, etc.)
-        let param_types: HashMap<String, u8> = py_meta
-            .get_item("param_types")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
-            .unwrap_or_default();
+        let param_types = extract_type_hints(py_meta, "param_types");
+
+        // Header and cookie type hints use the same format, keyed by wire name.
+        let header_types = extract_type_hints(py_meta, "header_types");
+        let cookie_types = extract_type_hints(py_meta, "cookie_types");
 
         // Parse form-related metadata for Rust-side form parsing
         let needs_form_parsing = py_meta
@@ -750,6 +767,14 @@ impl RouteMetadata {
             .map(|v| v.into_iter().collect())
             .unwrap_or_default();
 
+        let query_seq_fields: AHashSet<String> = py_meta
+            .get_item("query_seq_fields")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<Vec<String>>().ok())
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+
         // File field constraints
         let file_constraints = parse_file_constraints(py_meta, py);
 
@@ -771,6 +796,18 @@ impl RouteMetadata {
 
         // Optional Rust-side argument binding plan.
         let rust_arg_bindings = parse_rust_arg_bindings(py_meta);
+        let prebind_only = rust_arg_bindings.is_some()
+            && py_meta
+                .get_item("prebind_only")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false);
+
+        let websocket_revocation_check = py_meta
+            .get_item("websocket_revocation_check")?
+            .filter(|value| !value.is_none())
+            .map(|value| Arc::new(value.unbind()));
 
         // Default success status (guaranteed by Python registration; 200 fallback
         // for defensive parsing of hand-built metadata in tests).
@@ -790,14 +827,19 @@ impl RouteMetadata {
             needs_path_params,
             is_static_route,
             param_types,
+            header_types,
+            cookie_types,
             form_type_hints,
             form_seq_fields,
+            query_seq_fields,
             file_constraints,
             max_upload_size,
             memory_spool_threshold,
             rust_arg_bindings,
+            prebind_only,
             plan,
             default_status_code,
+            websocket_revocation_check,
         })
     }
 }
@@ -1217,6 +1259,18 @@ fn parse_file_constraints(
 ///
 /// `required` defaults to true and `inject_none` to false so older metadata
 /// shapes keep the strict all-or-nothing behavior.
+/// Parse a `{"name": type_hint_id}` dict into `TypeHints`.
+/// Type hint IDs match type_coercion.rs constants (TYPE_INT=1, TYPE_FLOAT=2, etc.)
+fn extract_type_hints(py_meta: &Bound<'_, PyDict>, key: &str) -> TypeHints {
+    py_meta
+        .get_item(key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.extract::<HashMap<String, u8>>().ok())
+        .map(|hints| hints.into_iter().collect())
+        .unwrap_or_default()
+}
+
 fn parse_rust_arg_bindings(py_meta: &Bound<'_, PyDict>) -> Option<Vec<RustArgBinding>> {
     let py = py_meta.py();
     let bindings_obj = py_meta.get_item("rust_arg_bindings").ok().flatten()?;
@@ -1294,7 +1348,7 @@ fn parse_rust_arg_bindings(py_meta: &Bound<'_, PyDict>) -> Option<Vec<RustArgBin
         // Intern once at registration — per-request lookups reuse the object.
         bindings.push(RustArgBinding {
             source,
-            lookup_key: PyString::intern(py, &lookup_key).unbind(),
+            key: lookup_key,
             arg_name: PyString::intern(py, &arg_name).unbind(),
             positional,
             required,

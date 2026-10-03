@@ -35,6 +35,7 @@ classifiers = [
 ]
 dependencies = [
     "Django>=5.2",
+    "asgiref>=3.12",  # an async_to_sync wrapper picks its parent loop at each call
     "click>=8.1",
     "httpx>=0.28.1",
     "msgspec>=0.20",
@@ -82,7 +83,7 @@ dev = [
     "pydantic>=2",
     "pyyaml>=5.2",
     "maturin>=1.9.6",
-    "django==6.1",
+    "django==6.1.1",
     "ruff>=0.8",
     "vulture>=2.11", #for dead code detection
     "nanodjango>=0.16",
@@ -93,6 +94,8 @@ dev = [
     "django-debug-toolbar>=7.1.1",
     # Pure-Python wheel (no cp314t build of psycopg-binary exists); needs libpq at run time.
     "psycopg>=3.2", # PostgreSQL recovery tests (`just test-pg`)
+    "django-tenants>=3.14", # request lane tests with real schemas (`just test-pg`)
+    "django-allauth>=65.19", # session login through allauth, read by Bolt routes
 ]
 docs = [
     "zensical",

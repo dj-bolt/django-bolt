@@ -175,7 +175,7 @@ This value is read once at startup (first access) and then cached. Missing, empt
 
 ### DJANGO_BOLT_ORM_THREADS
 
-Number of threads in the ORM pool of each process. Django-Bolt evaluates the QuerySets that async handlers return on this pool. It also loads `request.user` on this pool.
+Number of threads in the ORM pool of each process. Django-Bolt evaluates the QuerySets that async handlers return on this pool. `await request.auser()` also loads the user on this pool.
 
 ```bash
 export DJANGO_BOLT_ORM_THREADS=8

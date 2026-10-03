@@ -8,6 +8,7 @@ actually runs and modifies requests/responses through the complete pipeline.
 from __future__ import annotations
 
 import re
+from typing import Annotated
 
 import msgspec
 import pytest
@@ -29,6 +30,7 @@ from django_bolt import BoltAPI, Request
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, TimingMiddleware
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
+from django_bolt.param_functions import Cookie, Header
 from django_bolt.responses import HTML, JSON
 from django_bolt.testing import TestClient
 
@@ -244,7 +246,8 @@ class TestBoltAuthUserPrecedence:
 
         @api.get("/jwt-peeked", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
         async def jwt_peeked(request):
-            user = request.user
+            # An async handler behind Django middleware loads its user with auser().
+            user = await request.auser()
             return {"username": getattr(user, "username", None)}
 
         user = User.objects.create(username="peeked_user")
@@ -254,6 +257,35 @@ class TestBoltAuthUserPrecedence:
             assert response.status_code == 200, response.text
             assert response.json()["username"] == "peeked_user"
             # Proves the middleware ran and evaluated the session-based user
+            assert peeked == {"is_authenticated": False}
+
+    def test_jwt_user_survives_peeking_middleware_in_a_sync_handler(self):
+        """The sync ``request.user`` of a lane request keeps the Bolt user too."""
+
+        peeked = {}
+
+        class PeekingMiddleware:
+            def __init__(self, get_response):
+                self.get_response = get_response
+
+            def __call__(self, request):
+                peeked["is_authenticated"] = request.user.is_authenticated
+                return self.get_response(request)
+
+        api = BoltAPI(
+            middleware=[DjangoMiddlewareStack([SessionMiddleware, AuthenticationMiddleware, PeekingMiddleware])]
+        )
+
+        @api.get("/jwt-peeked", auth=[JWTAuthentication(secret="test-secret")], guards=[IsAuthenticated()])
+        def jwt_peeked(request):
+            return {"username": getattr(request.user, "username", None)}
+
+        user = User.objects.create(username="peeked_sync_user")
+
+        with TestClient(api) as client:
+            response = client.get("/jwt-peeked", headers={"Authorization": f"Bearer {_make_jwt(user)}"})
+            assert response.status_code == 200, response.text
+            assert response.json()["username"] == "peeked_sync_user"
             assert peeked == {"is_authenticated": False}
 
     def test_middleware_that_authenticates_user_still_wins(self):
@@ -1902,3 +1934,67 @@ def test_full_pass_runs_hooks_in_declared_and_reverse_order(handler_kind):
         assert client.get("/x").status_code == 200
 
     assert calls == ["a.request", "b.request", "handler", "b.response", "a.response"]
+
+
+class RawValuesRecorder(MiddlewareMixin):
+    """Record the cookie and header strings that Django middleware sees."""
+
+    seen: dict = {}
+
+    def process_request(self, request):
+        RawValuesRecorder.seen = {
+            "cookie": request.COOKIES.get("n"),
+            "header": request.META.get("HTTP_X_COUNT"),
+        }
+
+
+class TestTypedParamsKeepRawStringsForDjango:
+    """A typed cookie or header reaches Django middleware as its original string."""
+
+    def test_django_middleware_sees_raw_cookie_and_header(self):
+        api = BoltAPI(middleware=[DjangoMiddlewareStack([RawValuesRecorder])])
+
+        @api.get("/typed")
+        async def typed(count: Annotated[int, Cookie(alias="n")], x_count: Annotated[int, Header()]) -> dict:
+            return {"count": count, "x_count": x_count}
+
+        with TestClient(api) as client:
+            response = client.get("/typed", cookies={"n": "0005"}, headers={"X-Count": "0007"})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"count": 5, "x_count": 7}
+        assert RawValuesRecorder.seen == {"cookie": "0005", "header": "0007"}
+
+
+class QueryRecorder(MiddlewareMixin):
+    """Record the query that Django middleware sees."""
+
+    seen: dict = {}
+
+    def process_request(self, request):
+        QueryRecorder.seen = {
+            "get": request.GET.dict(),
+            "query_string": request.META.get("QUERY_STRING"),
+            "full_path": request.get_full_path(),
+        }
+
+
+class TestDjangoMiddlewareSeesTheQuery:
+    """Django middleware gets the query, also when the handler does not read it."""
+
+    def test_middleware_sees_the_query_that_the_handler_ignores(self):
+        api = BoltAPI(middleware=[DjangoMiddlewareStack([QueryRecorder])])
+
+        @api.get("/page")
+        async def page() -> dict:
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            response = client.get("/page?next=%2Fa%3Fb%3D1&q=x+y")
+
+        assert response.status_code == 200, response.text
+        assert QueryRecorder.seen == {
+            "get": {"next": "/a?b=1", "q": "x y"},
+            "query_string": "next=%2Fa%3Fb%3D1&q=x+y",
+            "full_path": "/page?next=%2Fa%3Fb%3D1&q=x+y",
+        }

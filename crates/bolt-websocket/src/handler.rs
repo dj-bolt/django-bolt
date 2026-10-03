@@ -12,13 +12,15 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use std::collections::HashMap;
-
-use bolt_core::metadata::CorsConfig;
+use bolt_core::metadata::{CorsConfig, RouteMetadata};
+use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
+use bolt_core::request_pipeline::{
+    query_sequences, set_declared_item, set_param_item, set_query_sequences, EMPTY_TYPES,
+};
+use bolt_core::router::parse_query_string;
 use bolt_core::state::{AppState, ROUTE_METADATA};
-use bolt_core::type_coercion::coerced_value_to_py;
-use bolt_core::type_coercion::{coerce_param, CoerceError, TYPE_STRING};
+use bolt_core::type_coercion::TypeHints;
 use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 
 use super::actor::WebSocketActor;
@@ -76,50 +78,48 @@ pub fn is_websocket_upgrade(req: &HttpRequest) -> bool {
 
 /// Build scope dict for Python WebSocket handler
 ///
-/// Parses and coerces query and path parameters to typed Python objects
-/// using the same type coercion as HTTP handlers.
+/// Parses and coerces query, path, header and cookie values to typed Python
+/// objects using the same type coercion as HTTP handlers.
 fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
     path_params: &AHashMap<String, String>,
-    param_types: &HashMap<String, u8>,
+    route_meta: Option<&RouteMetadata>,
     max_param_length: usize,
 ) -> PyResult<Py<PyAny>> {
+    let empty_types: &TypeHints = &EMPTY_TYPES;
+    let param_types = route_meta.map_or(empty_types, |m| &m.param_types);
+    let header_types = route_meta.map_or(empty_types, |m| &m.header_types);
+    let cookie_types = route_meta.map_or(empty_types, |m| &m.cookie_types);
+
     let scope_dict = PyDict::new(py);
     scope_dict.set_item("type", "websocket")?;
     scope_dict.set_item("path", req.path())?;
 
-    // Parse and coerce query parameters
+    // Parse the query string with the HTTP parser: the last value of a repeated key wins.
+    // A value that is too long or a bad typed value rejects the upgrade, as in HTTP.
     let query_dict = PyDict::new(py);
-    let query_string = req.query_string();
-    if !query_string.is_empty() {
-        for pair in query_string.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                let decoded_key = urlencoding::decode(key).unwrap_or_default();
-                let decoded_value = urlencoding::decode(value).unwrap_or_default();
-
-                // Get type hint and coerce
-                let type_hint = param_types
-                    .get(decoded_key.as_ref())
-                    .copied()
-                    .unwrap_or(TYPE_STRING);
-
-                match coerce_param(&decoded_value, type_hint, max_param_length) {
-                    Ok(coerced) => {
-                        let py_value = coerced_value_to_py(py, &coerced);
-                        query_dict.set_item(decoded_key.as_ref(), py_value)?;
-                    }
-                    // Oversized values reject the upgrade — never pass a raw string through.
-                    Err(e @ CoerceError::TooLong { .. }) => {
-                        return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-                    }
-                    // Genuine type-coercion failure: fall back to the raw string.
-                    Err(CoerceError::Invalid(_)) => {
-                        query_dict.set_item(decoded_key.as_ref(), decoded_value.as_ref())?;
-                    }
-                }
-            }
-        }
+    for (key, value) in &parse_query_string(req.query_string()) {
+        set_param_item(
+            py,
+            &query_dict,
+            key,
+            value,
+            param_types,
+            max_param_length,
+            "Query parameter",
+        )?;
+    }
+    // A sequence parameter takes each value of its repeated key, as in HTTP.
+    // Each value gets the length check, as the loop above checks only the last one.
+    if let Some(route_meta) = route_meta {
+        let sequences = query_sequences(
+            Some(req.query_string()),
+            &route_meta.query_seq_fields,
+            max_param_length,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        set_query_sequences(py, &query_dict, &sequences)?;
     }
     scope_dict.set_item("query_params", query_dict)?;
 
@@ -128,10 +128,19 @@ fn build_scope(
 
     // Add headers as dict (FastAPI style)
     // OPTIMIZATION: HeaderName::as_str() already returns lowercase (http crate canonical form)
+    // A typed header with a bad value rejects the upgrade, as in HTTP.
     let headers_dict = PyDict::new(py);
     for (key, value) in req.headers().iter() {
         if let Ok(v) = value.to_str() {
-            headers_dict.set_item(key.as_str(), v)?;
+            set_declared_item(
+                py,
+                &headers_dict,
+                key.as_str(),
+                v,
+                header_types,
+                max_param_length,
+                "Header",
+            )?;
         }
     }
     scope_dict.set_item("headers", headers_dict)?;
@@ -139,21 +148,15 @@ fn build_scope(
     // Coerce path params using type hints
     let params_dict = PyDict::new(py);
     for (k, v) in path_params.iter() {
-        let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
-        match coerce_param(v, type_hint, max_param_length) {
-            Ok(coerced) => {
-                let py_value = coerced_value_to_py(py, &coerced);
-                params_dict.set_item(k.as_str(), py_value)?;
-            }
-            // Oversized values reject the upgrade — never pass a raw string through.
-            Err(e @ CoerceError::TooLong { .. }) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-            }
-            // Genuine type-coercion failure: fall back to the raw string.
-            Err(CoerceError::Invalid(_)) => {
-                params_dict.set_item(k.as_str(), v.as_str())?;
-            }
-        }
+        set_param_item(
+            py,
+            &params_dict,
+            k,
+            v,
+            param_types,
+            max_param_length,
+            "Path parameter",
+        )?;
     }
     scope_dict.set_item("path_params", params_dict)?;
 
@@ -166,7 +169,15 @@ fn build_scope(
                 if let Some(eq_pos) = pair.find('=') {
                     let key = &pair[..eq_pos];
                     let value = &pair[eq_pos + 1..];
-                    cookies_dict.set_item(key, value)?;
+                    set_declared_item(
+                        py,
+                        &cookies_dict,
+                        key,
+                        value,
+                        cookie_types,
+                        max_param_length,
+                        "Cookie",
+                    )?;
                 }
             }
         }
@@ -444,6 +455,19 @@ fn is_origin_allowed(
     false
 }
 
+/// Await the revocation check of a WebSocket route on this thread's WorkerLoop.
+async fn token_revoked(check: &Py<PyAny>, auth_ctx: &AuthContext) -> PyResult<bool> {
+    let future = Python::attach(|py| -> PyResult<_> {
+        let context = PyDict::new(py).unbind();
+        populate_auth_context(&context, auth_ctx, py);
+        let coro = check.call1(py, (context,))?;
+        let locals = bolt_loop::worker_task_locals(py)?;
+        pyo3_async_runtimes::into_future_with_locals(&locals, coro.bind(py).clone())
+    })?;
+    let revoked = future.await?;
+    Python::attach(|py| revoked.extract::<bool>(py))
+}
+
 /// HTTP handler for WebSocket upgrade with full Python integration
 ///
 /// Handles:
@@ -559,6 +583,21 @@ pub async fn handle_websocket_upgrade_with_handler(
                             return Ok(response);
                         }
                     }
+                    // A revoked token fails the handshake, as on an HTTP route.
+                    if let (Some(check), Some(auth_ctx)) =
+                        (route_meta.websocket_revocation_check.as_ref(), ctx.as_ref())
+                    {
+                        match token_revoked(check, auth_ctx).await {
+                            Ok(false) => {}
+                            Ok(true) => return Ok(bolt_core::responses::error_401()),
+                            Err(e) => {
+                                eprintln!("[django-bolt] WebSocket revocation check error: {}", e);
+                                return Ok(HttpResponse::InternalServerError()
+                                    .content_type("application/json")
+                                    .body(r#"{"detail":"Revocation check failed"}"#));
+                            }
+                        }
+                    }
                 }
                 AuthGuardResult::Unauthorized => {
                     return Ok(bolt_core::responses::error_401());
@@ -577,16 +616,12 @@ pub async fn handle_websocket_upgrade_with_handler(
     // Create channels for bidirectional communication (configurable size)
     let (to_python_tx, to_python_rx) = mpsc::channel::<WsMessage>(config.channel_buffer_size);
 
-    // Get param_types from route metadata for type coercion
-    let param_types = ROUTE_METADATA
-        .get()
-        .and_then(|m| m.get(handler_id))
-        .map(|m| m.param_types.clone())
-        .unwrap_or_default();
+    // Route metadata holds the type hints and the sequence query keys
+    let route_meta = ROUTE_METADATA.get().and_then(|m| m.get(handler_id));
 
     // Build scope for Python - if this fails, decrement counter
     let scope = match Python::attach(|py| {
-        build_scope(py, &req, &path_params, &param_types, state.max_param_length)
+        build_scope(py, &req, &path_params, route_meta, state.max_param_length)
     }) {
         Ok(s) => s,
         Err(e) => {
