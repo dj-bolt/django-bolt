@@ -4,13 +4,13 @@
 //! between the production handler (handler.rs) and test handler (testing.rs).
 
 use actix_web::{HttpRequest, HttpResponse};
-use ahash::AHashMap;
-use std::borrow::Borrow;
+use ahash::{AHashMap, AHashSet};
+use std::borrow::{Borrow, Cow};
 use std::hash::Hash;
 
 use crate::form_parsing::ValidationError;
 use crate::responses;
-use crate::router::QueryParams;
+use crate::router::{QueryParams, QuerySequences};
 use crate::type_coercion::{
     coerce_param, coerced_value_to_py, CoercedValue, CoercedValues, TypeHints, TYPE_STRING,
 };
@@ -110,6 +110,47 @@ where
         }
     }
     Ok(coerced_values)
+}
+
+/// The values of each sequence query key of a route, in the order of the query.
+///
+/// A route with no sequence keys, or a request with no query, gives an empty
+/// result that does not allocate. The length limit applies to each value: the
+/// scalar parser keeps the last value of a key, so it does not check the others.
+/// The error is the detail of the rejection, for HTTP and WebSocket.
+pub fn query_sequences<'a>(
+    query: Option<&'a str>,
+    keys: &AHashSet<String>,
+    max_length: usize,
+) -> Result<QuerySequences<'a>, String> {
+    let query = match query {
+        Some(query) if !keys.is_empty() && !query.is_empty() => query,
+        _ => return Ok(Vec::new()),
+    };
+    let sequences = crate::router::collect_query_sequences(query, keys);
+    for (name, values) in &sequences {
+        if let Some(value) = values.iter().find(|value| value.len() > max_length) {
+            return Err(too_long_detail(
+                "Query parameter",
+                name,
+                value.len(),
+                max_length,
+            ));
+        }
+    }
+    Ok(sequences)
+}
+
+/// Put each sequence query key in the Python query dict as a list of its values.
+pub fn set_query_sequences(
+    py: Python<'_>,
+    query_dict: &Bound<'_, PyDict>,
+    sequences: &[(Cow<'_, str>, Vec<Cow<'_, str>>)],
+) -> PyResult<()> {
+    for (name, values) in sequences {
+        query_dict.set_item(name, pyo3::types::PyList::new(py, values)?)?;
+    }
+    Ok(())
 }
 
 #[cold]
@@ -282,6 +323,25 @@ mod tests {
     use super::*;
     use crate::type_coercion::{TYPE_BOOL, TYPE_INT};
     use actix_web::body::MessageBody;
+
+    #[test]
+    fn query_sequences_checks_the_length_of_each_value() {
+        let keys: AHashSet<String> = ["tag".to_string()].into_iter().collect();
+        let sequences = query_sequences(Some("tag=abc&tag=de"), &keys, 3).unwrap();
+        assert_eq!(
+            sequences,
+            vec![(Cow::from("tag"), vec![Cow::from("abc"), Cow::from("de")])]
+        );
+        let detail = query_sequences(Some("tag=abcd&tag=a"), &keys, 3).unwrap_err();
+        assert_eq!(
+            detail,
+            "Query parameter 'tag': Parameter too long: 4 bytes (max 3 bytes)"
+        );
+        assert!(query_sequences(None, &keys, 3).unwrap().is_empty());
+        assert!(query_sequences(Some("tag=abcd"), &Default::default(), 3)
+            .unwrap()
+            .is_empty());
+    }
 
     fn values(pairs: &[(&str, &str)]) -> AHashMap<String, String> {
         pairs

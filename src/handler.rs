@@ -29,8 +29,8 @@ use bolt_core::middleware;
 use bolt_core::middleware::auth::populate_auth_context;
 use bolt_core::request::PyRequest;
 use bolt_core::request_pipeline::{
-    build_validation_error_response, extract_headers, validate_and_cache_source,
-    validate_and_cache_typed_params, EMPTY_TYPES,
+    build_validation_error_response, extract_headers, query_sequences, set_query_sequences,
+    validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
 };
 use bolt_core::response_builder;
 use bolt_core::response_meta::ResponseMeta;
@@ -843,6 +843,19 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     // Max parameter length resolved once at startup; read the plain field here.
     let max_param_length = state.max_param_length;
 
+    // A sequence query parameter takes each value of its repeated key.
+    let query_sequences = match route_metadata {
+        Some(route_meta) if needs_query => match query_sequences(
+            req.uri().query(),
+            &route_meta.query_seq_fields,
+            max_param_length,
+        ) {
+            Ok(sequences) => sequences,
+            Err(detail) => return responses::error_422_validation(&detail),
+        },
+        _ => Vec::new(),
+    };
+
     // Type validation for path and query parameters (Rust-native, no GIL)
     let (path_coerced, query_coerced) = if let Some(route_meta) = route_metadata {
         match validate_and_cache_typed_params(
@@ -1225,7 +1238,9 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         let query_params_py: Option<Py<PyDict>> = match query_params.as_ref() {
             Some(_) if skip_dicts => None,
             Some(query_params) => {
-                Some(string_map_to_py_dict(py, query_params, &query_coerced)?.unbind())
+                let query_dict = string_map_to_py_dict(py, query_params, &query_coerced)?;
+                set_query_sequences(py, &query_dict, &query_sequences)?;
+                Some(query_dict.unbind())
             }
             None => None,
         };

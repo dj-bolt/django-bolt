@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn test_coerce_float() {
         assert!(
-            matches!(coerce_param("3.14", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Float(f)) if (f - 3.14).abs() < 0.001)
+            matches!(coerce_param("1.25", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Float(f)) if (f - 1.25).abs() < 0.001)
         );
         assert!(
             matches!(coerce_param("-2.5", TYPE_FLOAT, DEFAULT_MAX_PARAM_LENGTH), Ok(CoercedValue::Float(f)) if (f + 2.5).abs() < 0.001)

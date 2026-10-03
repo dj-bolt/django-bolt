@@ -14,7 +14,18 @@ from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from functools import reduce
 from operator import or_
-from typing import TYPE_CHECKING, Annotated, Any, TypedDict, Union, get_args, get_origin
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    NewType,
+    TypeAliasType,
+    TypedDict,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+)
 
 import msgspec
 
@@ -37,6 +48,8 @@ __all__ = [
     "is_optional",
     "is_upload_file_type",
     "unwrap_optional",
+    "resolve_type_alias",
+    "split_param_annotation",
     "infer_param_source",
 ]
 
@@ -301,6 +314,92 @@ def unwrap_optional(annotation: Any) -> Any:
     return annotation
 
 
+def _substitute_alias_args(alias: TypeAliasType, args: tuple[Any, ...]) -> Any:
+    """Return the value of a generic ``type`` alias with ``args`` in place of its type parameters."""
+    value = alias.__value__
+    arg_by_param = dict(zip(alias.__type_params__, args, strict=True))
+    if isinstance(value, TypeVar):
+        return arg_by_param[value]
+    params = getattr(value, "__parameters__", ())
+    return value[tuple(arg_by_param[param] for param in params)] if params else value
+
+
+def resolve_type_alias(annotation: Any) -> Any:
+    """Return the type that a ``NewType`` or a ``type`` alias names, through each level.
+
+    msgspec converts and validates such a value as the type it names. Bolt
+    does the same, so Rust converts a ``NewType("UserId", int)`` value as an ``int``.
+    The arms of a union resolve too, so ``UserId | None`` gives ``int | None``.
+    A parameterized alias gets its arguments, so ``Pair[int]`` with
+    ``type Pair[T] = list[T]`` gives ``list[int]``.
+    """
+    while True:
+        if isinstance(annotation, TypeAliasType):
+            annotation = annotation.__value__
+        elif isinstance(alias := get_origin(annotation), TypeAliasType):
+            annotation = _substitute_alias_args(alias, get_args(annotation))
+        elif isinstance(annotation, NewType):
+            annotation = annotation.__supertype__
+        else:
+            break
+    origin = get_origin(annotation)
+    if origin is Union or origin is types.UnionType:
+        return reduce(or_, (resolve_type_alias(arg) for arg in get_args(annotation)))
+    return annotation
+
+
+# The constraint arguments of Query() and Path(), with the msgspec.Meta names.
+_MARKER_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "min_length", "max_length", "pattern")
+
+
+def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, Any]:
+    """Split a parameter annotation into its value type and its ``Param`` or ``Depends`` marker.
+
+    ``Annotated[int, msgspec.Meta(ge=1), Query()]`` gives ``(Annotated[int, msgspec.Meta(ge=1)], Query())``.
+    The marker comes from ``Annotated``, or else from ``default``. It is None when there is none.
+    The constraint arguments of the marker (``Query(ge=1)``) become one more ``msgspec.Meta``.
+    The ``msgspec.Meta`` items stay on a scalar or a sequence type, so the value
+    is validated against them and the schema shows them. They go on the type
+    inside ``Optional``, because msgspec takes ``Annotated[int, Meta(ge=1)] | None``
+    and rejects ``Annotated[int | None, Meta(ge=1)]``. A struct, a dataclass, an
+    upload or a ``File()`` parameter keeps only its base type, as before. A
+    ``NewType`` or a ``type`` alias resolves to the type it names.
+
+    Raises:
+        TypeError: msgspec cannot apply a constraint to the type, for example ``ge`` to a ``Decimal``.
+    """
+    default_marker = default if isinstance(default, (Param, DependsMarker)) else None
+    annotation = resolve_type_alias(annotation)
+    if get_origin(annotation) is Annotated:
+        base, *extras = get_args(annotation)
+        base = resolve_type_alias(base)
+        marker = next((extra for extra in extras if isinstance(extra, (Param, DependsMarker))), default_marker)
+        constraints = [extra for extra in extras if isinstance(extra, msgspec.Meta)]
+    else:
+        base, marker, constraints = annotation, default_marker, []
+    if isinstance(marker, Param):
+        marker_constraints = {
+            name: value for name in _MARKER_CONSTRAINTS if (value := getattr(marker, name)) is not None
+        }
+        if marker_constraints:
+            constraints.append(msgspec.Meta(**marker_constraints))
+    inner = unwrap_optional(base)
+    if (
+        not constraints
+        or is_msgspec_struct(inner)
+        or is_dataclass_type(inner)
+        or is_upload_file_type(inner)
+        or (isinstance(marker, Param) and marker.source == "file")
+    ):
+        return base, marker
+    constrained = Annotated[(inner, *constraints)]
+    if is_optional(base):
+        constrained = constrained | None
+    # Check the constraints at registration. Else each request fails with a TypeError.
+    msgspec.inspect.type_info(constrained)
+    return constrained, marker
+
+
 def is_dataclass_type(annotation: Any) -> bool:
     """Check if annotation is a dataclass."""
     try:
@@ -337,8 +436,10 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     if name in {"request", "req"}:
         return "request"
 
-    # Unwrap Optional if present
+    # Unwrap Optional and msgspec.Meta if present
     unwrapped = unwrap_optional(annotation)
+    if get_origin(unwrapped) is Annotated:
+        unwrapped = unwrap_optional(get_args(unwrapped)[0])
 
     # 3. Simple types -> query params
     if is_simple_type(unwrapped):
@@ -486,6 +587,15 @@ class FieldDefinition:
         """
         name = parameter.name
         default = parameter.default
+        if isinstance(default, Param):
+            # A marker after "=" is not a value. Its own default is the default of the parameter.
+            default = inspect.Parameter.empty if default.default is ... else default.default
+        elif isinstance(explicit_marker, Param) and explicit_marker.default is not ...:
+            # As in FastAPI. Else Form("tag") in Annotated silently makes "tag" the default.
+            raise TypeError(
+                f"`{explicit_marker.source.capitalize()}` default value cannot be set in `Annotated` "
+                f"for '{name}'. Set the default value with `=` instead."
+            )
 
         # Handle explicit markers
         source: str

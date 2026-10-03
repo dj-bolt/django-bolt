@@ -207,7 +207,7 @@ async def middleware_demo(request: Request):
 
 @middleware_api.post("/demo")
 # @csrf_exempt
-async def middleware_demo_post(request: Request, test: Annotated[str, Form("test")]):
+async def middleware_demo_post(request: Request, test: Annotated[str, Form()]):
     """
     Demonstrates Django middleware + messages framework with Django-Bolt.
 
@@ -439,9 +439,9 @@ async def session_demo_get(request: Request):
 async def session_demo_post(
     request: Request,
     action: str = "",
-    username: Annotated[str, Form("username")] = "",
-    key: Annotated[str, Form("key")] = "",
-    value: Annotated[str, Form("value")] = "",
+    username: Annotated[str, Form()] = "",
+    key: Annotated[str, Form()] = "",
+    value: Annotated[str, Form()] = "",
 ):
     """
     Save data to session, login, or logout.

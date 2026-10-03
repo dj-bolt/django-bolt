@@ -45,8 +45,8 @@ use crate::handler::{
     build_prebound_from_values, form_result_to_py, response_from_wire_result, SourceValues,
 };
 use bolt_core::request_pipeline::{
-    set_declared_item, set_param_item, validate_and_cache_source, validate_and_cache_typed_params,
-    EMPTY_TYPES,
+    query_sequences, set_declared_item, set_param_item, set_query_sequences,
+    validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
 };
 use bolt_core::static_files::handle_file;
 use bolt_core::type_coercion::{string_map_to_py_dict, TypeHints};
@@ -852,6 +852,17 @@ async fn handle_test_request_internal(
     // Max parameter length resolved once at startup; read the plain field here.
     let max_param_length = state.max_param_length;
 
+    // A sequence query parameter takes each value of its repeated key.
+    let query_sequences = match route_meta.as_ref() {
+        Some(meta) if needs_query => {
+            match query_sequences(req.uri().query(), &meta.query_seq_fields, max_param_length) {
+                Ok(sequences) => sequences,
+                Err(detail) => return bolt_core::responses::error_422_validation(&detail),
+            }
+        }
+        _ => Vec::new(),
+    };
+
     // Validate typed parameters before GIL acquisition and cache non-string coerced values.
     let (path_coerced, query_coerced) = if let Some(ref meta) = route_meta {
         match validate_and_cache_typed_params(
@@ -1186,7 +1197,9 @@ async fn handle_test_request_internal(
         let query_params_dict = match query_params.as_ref() {
             Some(_) if skip_dicts => None,
             Some(query_params) => {
-                Some(string_map_to_py_dict(py, query_params, &query_coerced)?.unbind())
+                let query_dict = string_map_to_py_dict(py, query_params, &query_coerced)?;
+                set_query_sequences(py, &query_dict, &query_sequences)?;
+                Some(query_dict.unbind())
             }
             None => None,
         };
@@ -1508,6 +1521,17 @@ pub fn handle_test_websocket(
                 "Query parameter",
             )?;
         }
+    }
+    // A sequence parameter takes each value of its repeated key, as in production.
+    // Each value gets the length check, as the loop above checks only the last one.
+    if let Some(ws_route_meta) = ws_route_meta {
+        let sequences = query_sequences(
+            query_string.as_deref(),
+            &ws_route_meta.query_seq_fields,
+            max_param_length,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        set_query_sequences(py, &query_dict, &sequences)?;
     }
     scope_dict.set_item("query_params", query_dict)?;
 

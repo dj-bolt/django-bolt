@@ -546,6 +546,9 @@ pub struct RouteMetadata {
     // Rust always emits a Python list for these keys so the Python extractor never
     // has to wrap a single occurrence — eliminates a per-request loop.
     pub form_seq_fields: HashSet<String>,
+    // Query keys whose annotated type is a sequence. A repeated key gives each of
+    // its values as a Python list; the plain query map keeps the last value only.
+    pub query_seq_fields: AHashSet<String>,
     pub file_constraints: HashMap<String, FileFieldConstraints>,
     pub max_upload_size: usize,
     pub memory_spool_threshold: usize,
@@ -764,6 +767,14 @@ impl RouteMetadata {
             .map(|v| v.into_iter().collect())
             .unwrap_or_default();
 
+        let query_seq_fields: AHashSet<String> = py_meta
+            .get_item("query_seq_fields")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<Vec<String>>().ok())
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+
         // File field constraints
         let file_constraints = parse_file_constraints(py_meta, py);
 
@@ -820,6 +831,7 @@ impl RouteMetadata {
             cookie_types,
             form_type_hints,
             form_seq_fields,
+            query_seq_fields,
             file_constraints,
             max_upload_size,
             memory_spool_threshold,
