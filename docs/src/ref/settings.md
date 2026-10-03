@@ -45,7 +45,7 @@ CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
 
 ### CORS_ALLOW_HEADERS
 
-Allowed headers in CORS requests.
+Allowed headers in CORS requests. The default is `["Content-Type", "Authorization"]`.
 
 ```python
 CORS_ALLOW_HEADERS = ["Content-Type", "Authorization", "X-Requested-With"]
@@ -59,12 +59,12 @@ Headers exposed to the browser.
 CORS_EXPOSE_HEADERS = ["X-Total-Count", "X-Page-Count"]
 ```
 
-### CORS_MAX_AGE
+### CORS_PREFLIGHT_MAX_AGE
 
-Preflight cache duration in seconds.
+Preflight cache duration in seconds. The default is 3600.
 
 ```python
-CORS_MAX_AGE = 86400  # 24 hours
+CORS_PREFLIGHT_MAX_AGE = 86400  # 24 hours
 ```
 
 ## Rate limiting settings
@@ -468,10 +468,10 @@ api = BoltAPI(
 | `CORS_ALLOWED_ORIGINS` | `list[str]` | `[]` | Allowed CORS origins |
 | `CORS_ALLOW_ALL_ORIGINS` | `bool` | `False` | Allow all origins |
 | `CORS_ALLOW_CREDENTIALS` | `bool` | `False` | Allow credentials |
-| `CORS_ALLOW_METHODS` | `list[str]` | All methods | Allowed methods |
-| `CORS_ALLOW_HEADERS` | `list[str]` | `[]` | Allowed headers |
+| `CORS_ALLOW_METHODS` | `list[str]` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `QUERY` | Allowed methods |
+| `CORS_ALLOW_HEADERS` | `list[str]` | `Content-Type`, `Authorization` | Allowed headers |
 | `CORS_EXPOSE_HEADERS` | `list[str]` | `[]` | Exposed headers |
-| `CORS_MAX_AGE` | `int` | `600` | Preflight cache (seconds) |
+| `CORS_PREFLIGHT_MAX_AGE` | `int` | `3600` | Preflight cache (seconds) |
 | `BOLT_MAX_UPLOAD_SIZE` | `int` | `1048576` | Max upload size (bytes) |
 | `BOLT_MEMORY_SPOOL_THRESHOLD` | `int` | `1048576` | Memory threshold before disk spooling (bytes) |
 | `BOLT_ALLOWED_FILE_PATHS` | `list[str]` | `None` | File serving whitelist |

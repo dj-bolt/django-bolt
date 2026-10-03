@@ -374,6 +374,33 @@ def test_article_viewset(api):
         assert response.json()["title"] == "Test Article"
 ```
 
+## Settings in tests
+
+`TestClient` reads the Django settings with the same code as `runbolt`. Thus a test gets the limits, CORS, static files, media files and proxy trust of the server. Some examples:
+
+- A request body over `BOLT_MAX_UPLOAD_SIZE` gets 413. The default limit is 1 MB.
+- `CORS_ALLOWED_ORIGINS`, `CORS_ALLOWED_ORIGIN_REGEXES` and the other CORS settings apply.
+- `STATIC_URL` and `MEDIA_URL` are served, with `BOLT_STATIC_MAX_AGE` and `BOLT_MEDIA_MAX_AGE`.
+- Each request comes from `127.0.0.1`. Thus `BOLT_TRUSTED_PROXIES` and `X-Forwarded-For` work as on a server.
+
+Change a setting with `override_settings` before you create the client:
+
+```python
+from django.test import override_settings
+
+
+def test_large_upload():
+    with override_settings(BOLT_MAX_UPLOAD_SIZE=10 * 1024 * 1024), TestClient(api) as client:
+        response = client.post("/upload", content=b"x" * (2 * 1024 * 1024))
+        assert response.status_code == 200
+```
+
+Three `TestClient` arguments replace settings for one test:
+
+- `cors_allowed_origins=[...]` replaces the CORS settings. A `"*"` entry allows each origin.
+- `static_files_config={...}` replaces the static settings.
+- `read_django_settings=False` turns off the CORS, static and media settings.
+
 ## Using Django's test runner
 
 The sections above use pytest. `manage.py test` works too, with one change:

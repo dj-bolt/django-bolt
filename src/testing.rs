@@ -23,7 +23,6 @@ use pyo3::types::PyDict;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use actix_multipart::Multipart;
 use bolt_asgi::asgi_http;
@@ -31,8 +30,7 @@ use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
 use bolt_core::form_parsing::{
     parse_multipart, parse_urlencoded, FormParseResult, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
 };
-use bolt_core::metadata::{CorsConfig, RateLimitKey, RouteMetadata, RouteMetadataStore};
-use bolt_core::middleware::client_ip::TrustedProxies;
+use bolt_core::metadata::{RateLimitKey, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
@@ -48,11 +46,11 @@ use std::collections::HashMap;
 use crate::handler::{
     build_prebound_from_values, form_result_to_py, response_from_wire_result, SourceValues,
 };
+use crate::server::{configure_file_scopes, inject_global_cors, ServerConfig};
 use bolt_core::request_pipeline::{
     query_sequences, set_declared_item, set_param_item, set_query_sequences,
     validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
 };
-use bolt_core::static_files::handle_file;
 use bolt_core::type_coercion::{string_map_to_py_dict, TypeHints};
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
@@ -118,6 +116,10 @@ fn ensure_task_locals_initialized() {
     });
 }
 
+/// The peer address of each test request: a client on the loopback interface.
+const TEST_PEER_ADDR: std::net::SocketAddr =
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50000);
+
 /// Test application state stored per instance
 pub struct TestAppState {
     pub router: Arc<Router>,
@@ -126,21 +128,11 @@ pub struct TestAppState {
     pub mcp_mounts: Arc<Vec<bolt_mcp::McpMount>>,
     pub route_metadata: Arc<RouteMetadataStore>,
     pub dispatch: Py<PyAny>,
-    pub global_cors_config: Option<CorsConfig>,
+    /// The Django settings, read by the same function as `runbolt`.
+    pub config: ServerConfig,
     /// Global compression config (mirrors production server). Drives the
     /// streaming-compression codec selection in `handler.rs`.
     pub global_compression_config: Option<Arc<bolt_core::metadata::CompressionConfig>>,
-    pub trusted_proxies: Arc<TrustedProxies>,
-    pub debug: bool,
-    pub max_payload_size: usize,
-    /// Max byte length for parameter values (resolved once from
-    /// DJANGO_BOLT_MAX_PARAM_LENGTH), mirroring production `AppState`.
-    pub max_param_length: usize,
-    pub asgi_mount_timeout: Duration,
-    /// Trailing slash handling mode: "strip", "append", or "keep"
-    pub trailing_slash: String,
-    /// Static files configuration for testing static file serving
-    pub static_files_config: Option<Arc<ScopeConfig>>,
 }
 
 /// Registry for test app instances
@@ -151,121 +143,35 @@ fn registry() -> &'static DashMap<u64, Arc<RwLock<TestAppState>>> {
     TEST_REGISTRY.get_or_init(DashMap::new)
 }
 
-/// Parse CORS config from a Python dict (matches production server parsing)
-fn parse_cors_config_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<CorsConfig> {
-    use ahash::AHashSet;
-
-    let origins: Vec<String> = dict
-        .get_item("origins")?
-        .map(|v| v.extract().unwrap_or_default())
-        .unwrap_or_default();
-
-    let origin_set: AHashSet<String> = origins.iter().cloned().collect();
-    let allow_all_origins = origins.iter().any(|o| o == "*");
-
-    let credentials: bool = dict
-        .get_item("credentials")?
-        .map(|v| v.extract().unwrap_or(false))
-        .unwrap_or(false);
-
-    let methods: Vec<String> = dict
-        .get_item("methods")?
-        .map(|v| v.extract().unwrap_or_default())
-        .unwrap_or_else(|| {
-            vec![
-                "GET".to_string(),
-                "POST".to_string(),
-                "PUT".to_string(),
-                "PATCH".to_string(),
-                "DELETE".to_string(),
-                "OPTIONS".to_string(),
-                "QUERY".to_string(),
-            ]
-        });
-
-    let headers: Vec<String> = dict
-        .get_item("headers")?
-        .map(|v| v.extract().unwrap_or_default())
-        .unwrap_or_else(|| {
-            vec![
-                "accept".to_string(),
-                "accept-encoding".to_string(),
-                "authorization".to_string(),
-                "content-type".to_string(),
-                "dnt".to_string(),
-                "origin".to_string(),
-                "user-agent".to_string(),
-                "x-csrftoken".to_string(),
-                "x-requested-with".to_string(),
-            ]
-        });
-
-    let expose_headers: Vec<String> = dict
-        .get_item("expose_headers")?
-        .map(|v| v.extract().unwrap_or_default())
-        .unwrap_or_default();
-
-    let max_age: u32 = dict
-        .get_item("max_age")?
-        .map(|v| v.extract().unwrap_or(86400))
-        .unwrap_or(86400);
-
-    // Build pre-computed strings and cached HeaderValues
-    let methods_str = methods.join(", ");
-    let headers_str = headers.join(", ");
-    let expose_headers_str = expose_headers.join(", ");
-    let max_age_str = max_age.to_string();
-
-    let methods_header = HeaderValue::from_str(&methods_str).ok();
-    let headers_header = HeaderValue::from_str(&headers_str).ok();
-    let expose_headers_header = if !expose_headers_str.is_empty() {
-        HeaderValue::from_str(&expose_headers_str).ok()
-    } else {
-        None
-    };
-    let max_age_header = HeaderValue::from_str(&max_age_str).ok();
-
-    Ok(CorsConfig {
-        origins,
-        origin_regexes: vec![],
-        compiled_origin_regexes: vec![],
-        origin_set,
-        allow_all_origins,
-        credentials,
-        methods,
-        headers,
-        expose_headers,
-        max_age,
-        methods_str,
-        headers_str,
-        expose_headers_str,
-        max_age_str,
-        methods_header,
-        headers_header,
-        expose_headers_header,
-        max_age_header,
-    })
-}
-
-/// Create a test app instance and return its ID
+/// Create a test app instance and return its ID.
+///
+/// The app reads the Django settings with the function that `runbolt` uses.
+/// With `read_django_settings=False`, it uses no global CORS, static or media
+/// settings. `cors_allowed_origins` and `static_files_config` replace the
+/// settings for one test.
 #[pyfunction]
-#[pyo3(signature = (dispatch, debug, cors_config=None, trailing_slash=None, static_files_config=None, compression_config=None))]
+#[pyo3(signature = (dispatch, read_django_settings=true, cors_allowed_origins=None, static_files_config=None, compression_config=None))]
 pub fn create_test_app(
     py: Python<'_>,
     dispatch: Py<PyAny>,
-    debug: bool,
-    cors_config: Option<&Bound<'_, PyDict>>,
-    trailing_slash: Option<String>,
+    read_django_settings: bool,
+    cors_allowed_origins: Option<Vec<String>>,
     static_files_config: Option<&Bound<'_, PyDict>>,
     compression_config: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<u64> {
-    let trusted_proxies = Arc::new(TrustedProxies::from_django_settings(py)?);
-
-    let global_cors_config = if let Some(cors_dict) = cors_config {
-        Some(parse_cors_config_from_dict(cors_dict)?)
-    } else {
-        None
-    };
+    let mut config = ServerConfig::from_django_settings(py)?;
+    if !read_django_settings {
+        config.global_cors_config = None;
+        config.cors_origin_regexes = vec![];
+        config.static_files_config = None;
+        config.media_files_config = None;
+    }
+    if let Some(origins) = cors_allowed_origins {
+        config.set_cors_origins(origins);
+    }
+    if let Some(static_dict) = static_files_config {
+        config.static_files_config = static_scope_from_dict(static_dict, config.debug)?;
+    }
 
     let global_compression_config = match compression_config {
         Some(d) => Some(Arc::new(
@@ -274,75 +180,6 @@ pub fn create_test_app(
         None => None,
     };
 
-    // Parse static files config from Python dict
-    let static_config = if let Some(static_dict) = static_files_config {
-        let url_prefix: String = static_dict
-            .get_item("url_prefix")?
-            .map(|v| v.extract().unwrap_or_default())
-            .unwrap_or_else(|| "/static".to_string());
-
-        let directories: Vec<String> = static_dict
-            .get_item("directories")?
-            .map(|v| v.extract().unwrap_or_default())
-            .unwrap_or_default();
-
-        // Mirror the production hot-path contract: store pre-canonicalized
-        // absolute roots so `find_in_directories` never canonicalizes the dir.
-        let directories: Vec<PathBuf> = directories
-            .iter()
-            .filter_map(|dir| Path::new(dir).canonicalize().ok())
-            .filter(|p| p.is_dir())
-            .collect();
-
-        let csp_header: Option<HeaderValue> = static_dict
-            .get_item("csp_header")?
-            .and_then(|v| v.extract::<String>().ok())
-            .and_then(|s| HeaderValue::from_str(&s).ok());
-
-        let cache_control: Option<HeaderValue> = static_dict
-            .get_item("cache_control")?
-            .and_then(|v| v.extract::<String>().ok())
-            .and_then(|s| HeaderValue::from_str(&s).ok());
-
-        // Mirror production: register when we have real dirs OR in DEBUG (where
-        // the staticfiles-finders fallback serves admin/app static).
-        if !directories.is_empty() || debug {
-            Some(Arc::new(ScopeConfig {
-                url_prefix,
-                directories,
-                csp_header,
-                cache_control,
-                mode: ServeMode::Static,
-                allow_django_finders: debug,
-            }))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // Read max payload size from Django settings (same as production server)
-    // Default to 10MB for tests to handle large file uploads
-    let max_payload_size: usize = (|| -> PyResult<usize> {
-        let django_conf = py.import("django.conf")?;
-        let settings = django_conf.getattr("settings")?;
-        settings.getattr("BOLT_MAX_UPLOAD_SIZE")?.extract::<usize>()
-    })()
-    .unwrap_or(10 * 1024 * 1024); // Default to 10MB for tests
-
-    let asgi_mount_timeout = (|| -> PyResult<f64> {
-        let django_conf = py.import("django.conf")?;
-        let settings = django_conf.getattr("settings")?;
-        settings
-            .getattr("BOLT_ASGI_MOUNT_TIMEOUT")?
-            .extract::<f64>()
-    })()
-    .ok()
-    .filter(|value| value.is_finite() && *value > 0.0)
-    .map(Duration::from_secs_f64)
-    .unwrap_or_else(|| Duration::from_secs(30)); // Default 30s
-
     let app = TestAppState {
         router: Arc::new(Router::new()),
         websocket_router: Arc::new(WebSocketRouter::new()),
@@ -350,20 +187,62 @@ pub fn create_test_app(
         mcp_mounts: Arc::new(Vec::new()),
         route_metadata: Arc::new(RouteMetadataStore::default()),
         dispatch: dispatch.clone_ref(py),
-        global_cors_config,
+        config,
         global_compression_config,
-        trusted_proxies,
-        debug,
-        max_payload_size,
-        max_param_length: bolt_core::type_coercion::resolve_max_param_length(),
-        asgi_mount_timeout,
-        trailing_slash: trailing_slash.unwrap_or_else(|| "strip".to_string()),
-        static_files_config: static_config,
     };
 
     let id = TEST_ID_GEN.fetch_add(1, Ordering::Relaxed);
     registry().insert(id, Arc::new(RwLock::new(app)));
     Ok(id)
+}
+
+/// Build a static scope from an explicit `static_files_config` dict with the
+/// keys `url_prefix`, `directories`, `csp_header` and `cache_control`.
+fn static_scope_from_dict(
+    static_dict: &Bound<'_, PyDict>,
+    debug: bool,
+) -> PyResult<Option<Arc<ScopeConfig>>> {
+    let url_prefix: String = static_dict
+        .get_item("url_prefix")?
+        .map(|v| v.extract().unwrap_or_default())
+        .unwrap_or_else(|| "/static".to_string());
+
+    let directories: Vec<String> = static_dict
+        .get_item("directories")?
+        .map(|v| v.extract().unwrap_or_default())
+        .unwrap_or_default();
+
+    // Mirror the production hot-path contract: store pre-canonicalized
+    // absolute roots so `find_in_directories` never canonicalizes the dir.
+    let directories: Vec<PathBuf> = directories
+        .iter()
+        .filter_map(|dir| Path::new(dir).canonicalize().ok())
+        .filter(|p| p.is_dir())
+        .collect();
+
+    let csp_header: Option<HeaderValue> = static_dict
+        .get_item("csp_header")?
+        .and_then(|v| v.extract::<String>().ok())
+        .and_then(|s| HeaderValue::from_str(&s).ok());
+
+    let cache_control: Option<HeaderValue> = static_dict
+        .get_item("cache_control")?
+        .and_then(|v| v.extract::<String>().ok())
+        .and_then(|s| HeaderValue::from_str(&s).ok());
+
+    // Mirror production: register when we have real dirs OR in DEBUG (where
+    // the staticfiles-finders fallback serves admin/app static).
+    if directories.is_empty() && !debug {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(ScopeConfig {
+        url_prefix: url_prefix.trim_end_matches('/').to_string(),
+        directories,
+        csp_header,
+        cache_control,
+        mode: ServeMode::Static,
+        allow_django_finders: debug,
+    })))
 }
 
 /// Destroy a test app instance
@@ -482,18 +361,15 @@ pub fn register_test_middleware_metadata(
         })?;
         // Propagate parse failures so tests fail loudly instead of the route
         // silently losing its auth/middleware config.
-        let mut route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
+        let route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "Failed to parse route metadata for handler {}: {}",
                 handler_id, e
             ))
         })?;
-        // Inject global CORS config if route doesn't have explicit config
-        if route_meta.cors_config.is_none() && !route_meta.plan.skip_cors() {
-            route_meta.cors_config = app.global_cors_config.clone();
-        }
         parsed_metadata.insert(handler_id, route_meta);
     }
+    inject_global_cors(&mut parsed_metadata, app.config.global_cors_config.as_ref());
 
     app.route_metadata = Arc::new(RouteMetadataStore::from_map(parsed_metadata));
     Ok(())
@@ -543,22 +419,7 @@ pub fn test_request(
 
         runtime_handle.block_on(async {
             // Read test app state
-            let (
-                router,
-                route_metadata,
-                asgi_mounts,
-                mcp_mounts,
-                dispatch,
-                global_cors_config,
-                global_compression_config,
-                trusted_proxies,
-                debug,
-                max_payload_size,
-                max_param_length,
-                asgi_mount_timeout,
-                _trailing_slash,
-                static_files_config,
-            ) = {
+            let (router, route_metadata, asgi_mounts, mcp_mounts, dispatch, config, compression) = {
                 let state = app_state.read();
                 (
                     state.router.clone(),
@@ -566,31 +427,25 @@ pub fn test_request(
                     state.asgi_mounts.clone(),
                     state.mcp_mounts.clone(),
                     Python::attach(|py| state.dispatch.clone_ref(py)),
-                    state.global_cors_config.clone(),
+                    state.config.clone(),
                     state.global_compression_config.clone(),
-                    state.trusted_proxies.clone(),
-                    state.debug,
-                    state.max_payload_size,
-                    state.max_param_length,
-                    state.asgi_mount_timeout,
-                    state.trailing_slash.clone(),
-                    state.static_files_config.clone(),
                 )
             };
+            let max_payload_size = config.max_payload_size;
 
             // Build AppState matching production
             // Include router and route_metadata so CorsMiddleware can find route-level CORS config
             let app_state_arc = Arc::new(AppState {
                 dispatch,
-                debug,
-                max_header_size: 8192,
+                debug: config.debug,
+                max_header_size: config.max_header_size,
                 max_payload_size,
-                max_param_length,
-                asgi_mount_timeout,
-                global_cors_config: global_cors_config.clone(),
-                cors_origin_regexes: vec![],
-                global_compression_config,
-                trusted_proxies,
+                max_param_length: config.max_param_length,
+                asgi_mount_timeout: config.asgi_mount_timeout,
+                global_cors_config: config.global_cors_config,
+                cors_origin_regexes: config.cors_origin_regexes,
+                global_compression_config: compression,
+                trusted_proxies: config.trusted_proxies,
                 router: Some(router.clone()),
                 route_metadata: Some(route_metadata.clone()),
                 asgi_mounts: Some(asgi_mounts.clone()),
@@ -599,8 +454,8 @@ pub fn test_request(
                     ext.insert(mcp_mounts.clone());
                     ext
                 },
-                static_files_config: static_files_config.clone(),
-                media_files_config: None,
+                static_files_config: config.static_files_config,
+                media_files_config: config.media_files_config,
                 access_logger: None,
             });
 
@@ -620,42 +475,17 @@ pub fn test_request(
             // Create Actix test service with production middleware stack
             // Use MergeOnly for NormalizePath (only normalizes // -> /)
             // Trailing slash handling is done via Starlette-style redirect in handler
-            let app = if let Some(ref config) = static_files_config {
-                // With static files: register static file handler before default service.
-                // One `web::Data<Arc<ScopeConfig>>` carries all per-scope state,
-                // matching the production handler signature.
-                let scope_data = web::Data::new(config.clone());
-                let static_route = format!("{}{{path:.*}}", config.url_prefix);
-
-                test::init_service(
-                    App::new()
-                        .app_data(web::Data::new(app_state_arc.clone()))
-                        .app_data(web::PayloadConfig::new(max_payload_size))
-                        .app_data(scope_data)
-                        .wrap(NormalizePath::new(TrailingSlash::MergeOnly))
-                        .wrap(CorsMiddleware::new())
-                        .wrap(CompressionMiddleware::new())
-                        .service(
-                            web::resource(&static_route)
-                                .route(web::get().to(handle_file))
-                                .route(web::head().to(handle_file)),
-                        )
-                        .default_service(web::to(handler)),
-                )
-                .await
-            } else {
-                // Without static files: just the default handler
-                test::init_service(
-                    App::new()
-                        .app_data(web::Data::new(app_state_arc.clone()))
-                        .app_data(web::PayloadConfig::new(max_payload_size))
-                        .wrap(NormalizePath::new(TrailingSlash::MergeOnly))
-                        .wrap(CorsMiddleware::new())
-                        .wrap(CompressionMiddleware::new())
-                        .default_service(web::to(handler)),
-                )
-                .await
-            };
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(app_state_arc.clone()))
+                    .app_data(web::PayloadConfig::new(max_payload_size))
+                    .wrap(NormalizePath::new(TrailingSlash::MergeOnly))
+                    .wrap(CorsMiddleware::new())
+                    .wrap(CompressionMiddleware::new())
+                    .configure(|cfg| configure_file_scopes(cfg, &app_state_arc))
+                    .default_service(web::to(handler)),
+            )
+            .await;
 
             // Build full URI
             let uri = if let Some(qs) = query_string {
@@ -670,7 +500,9 @@ pub fn test_request(
                     "Invalid request URI {uri:?}: {e}"
                 )));
             }
-            let mut req = test::TestRequest::with_uri(&uri);
+            // A real client has a peer address. Without one, client-IP rate
+            // limits and BOLT_TRUSTED_PROXIES cannot work as in production.
+            let mut req = test::TestRequest::with_uri(&uri).peer_addr(TEST_PEER_ADDR);
 
             // Set method
             let method_upper = method.to_uppercase();
@@ -696,9 +528,9 @@ pub fn test_request(
                 }
             };
 
-            // Set headers
+            // Append, so a repeated header keeps each value as on the wire.
             for (name, value) in headers {
-                req = req.insert_header((name, value));
+                req = req.append_header((name, value));
             }
 
             // Set body
@@ -1353,7 +1185,7 @@ pub fn handle_test_websocket(
     // Origin validation for WebSocket
     let origin = header_map.get("origin");
     if let Some(origin_value) = origin {
-        let origin_allowed = if let Some(ref cors_config) = app.global_cors_config {
+        let origin_allowed = if let Some(ref cors_config) = app.config.global_cors_config {
             if cors_config.allow_all_origins {
                 true
             } else {
@@ -1433,7 +1265,7 @@ pub fn handle_test_websocket(
                             .get("x-real-ip")
                             .map(|value| Some(value.as_str())),
                         Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-                        &app.trusted_proxies,
+                        &app.config.trusted_proxies,
                     )
                 })
                 .flatten();
@@ -1521,7 +1353,7 @@ pub fn handle_test_websocket(
     let cookie_types = ws_route_meta.map_or(empty_types, |m| &m.cookie_types);
 
     // Build path_params dict with type coercion
-    let max_param_length = app.max_param_length;
+    let max_param_length = app.config.max_param_length;
     let path_params_dict = pyo3::types::PyDict::new(py);
     // A value that is too long or a bad typed value rejects the upgrade, as in production.
     for (k, v) in path_params.iter() {

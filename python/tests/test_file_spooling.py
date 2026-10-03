@@ -4,12 +4,23 @@ from __future__ import annotations
 
 from typing import Annotated
 
+import pytest
 from django.test import override_settings
 
 from django_bolt import BoltAPI
 from django_bolt.datastructures import UploadFile
 from django_bolt.params import File
 from django_bolt.testing import TestClient
+
+
+@pytest.fixture(autouse=True)
+def _upload_limit_for_large_files():
+    """The tests upload files up to 6 MB. Allow them, as an app must.
+
+    A request body over BOLT_MAX_UPLOAD_SIZE (default 1 MB) gets 413.
+    """
+    with override_settings(BOLT_MAX_UPLOAD_SIZE=10 * 1024 * 1024):
+        yield
 
 
 class TestFileAutoCleanup:

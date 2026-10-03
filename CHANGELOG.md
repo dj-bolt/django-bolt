@@ -6,10 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **`TestClient` reads the Django settings as `runbolt` does** - The test client had its own settings reader, and it disagreed with the server. Now one reader serves both. A test can see these changes:
+  - A request body over `BOLT_MAX_UPLOAD_SIZE` gets 413. The default limit is 1 MB, not 10 MB. Set `BOLT_MAX_UPLOAD_SIZE` in a test that uploads more.
+  - `BOLT_MAX_HEADER_SIZE` applies.
+  - CORS uses the server defaults: the headers `Content-Type, Authorization`, and a preflight max-age of 3600 seconds. `CORS_ALLOWED_ORIGIN_REGEXES` applies. A `"*"` entry in `CORS_ALLOWED_ORIGINS` is not a wildcard; use `CORS_ALLOW_ALL_ORIGINS`.
+  - `MEDIA_URL` is served, and `BOLT_STATIC_MAX_AGE` and `BOLT_MEDIA_MAX_AGE` add `Cache-Control`.
+  - Each request comes from `127.0.0.1`, so `BOLT_TRUSTED_PROXIES` and `X-Forwarded-For` work as on a server.
+
+  The `cors_allowed_origins`, `static_files_config` and `read_django_settings` arguments still work.
 - **macOS wheels are for Apple silicon only** - PyPI gets a macOS arm64 wheel, not a universal2 wheel. On an Intel Mac, pip installs from the source distribution, which needs a Rust toolchain.
 
 ### Fixed
 
+- **The CORS settings reference names the setting that Bolt reads** - The docs named `CORS_MAX_AGE`, but Bolt reads `CORS_PREFLIGHT_MAX_AGE`. The docs also gave wrong defaults for `CORS_ALLOW_HEADERS`, `CORS_ALLOW_METHODS` and the max-age.
 - **Nested serializers work on Django 5.2** - On Django 5.2, a serializer with a relation field (a foreign key, a many-to-many field or a reverse relation) raised `NotImplementedError`. A route that returned such a serializer answered 500. Bolt called the deprecated `get_cache_name()`, and Django 5.2 relations raise in it. Bolt now reads `cache_name`, which each supported Django version has. The CI jobs for Django 5.2 and 6.0 did not find this: a build step reinstalled Django 6.1 before the tests ran.
 - **`runbolt --dev` reloads for a file in a new directory** - The watcher starts to watch a new directory after it gets the event for that directory. A file written before then, for example by `git checkout` or a code generator, sent no event, so no reload occurred. Now, when a directory is created, the watcher looks in it for a `.py` or `.html` file.
 

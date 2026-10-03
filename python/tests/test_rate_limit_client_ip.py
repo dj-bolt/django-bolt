@@ -2,11 +2,10 @@
 Tests for `settings.BOLT_TRUSTED_PROXIES`, the list that decides whether a
 `key="ip"` rate limit may believe `X-Forwarded-For`.
 
-Only the configuration half lives here. Everything that needs a real client
-address runs against a real server, in
-``python/tests/integration/test_rate_limit_client_ip_server_integration.py``:
-``TestRequest`` leaves ``peer_addr`` unset, so in process every caller resolves
-to the same constant and no proxy can be trusted.
+Only the configuration half lives here. The test client sends each request
+from 127.0.0.1, so in process every caller has the same address. Tests that
+need several client addresses run against a real server, in
+``python/tests/integration/test_rate_limit_client_ip_server_integration.py``.
 """
 
 import pytest

@@ -38,9 +38,9 @@ If RPS drops, the change needs optimization or rejection.
 
 ---
 
-## test_state.rs - Maximize Production Code Reuse
+## testing.rs - Maximize Production Code Reuse
 
-`test_state.rs` provides the TestClient infrastructure for testing. It should **always reuse production code** instead of duplicating functionality.
+`testing.rs` provides the TestClient infrastructure for testing. It should **always reuse production code** instead of duplicating functionality.
 
 ### Why This Matters
 
@@ -76,8 +76,12 @@ for (name, value) in &headers {
 - `authenticate()` - for running auth backends
 - `evaluate_guards()` - for checking permissions
 
+**Settings**: Read each Django setting in `ServerConfig::from_django_settings` (`server.rs`). `runbolt` and the test client both use it. Never read a setting a second time in `testing.rs` or in the Python test client.
+
+**File scopes and CORS injection**: Use `configure_file_scopes()` and `inject_global_cors()` (`server.rs`).
+
 ### When Adding New Functionality
 
 1. First implement in production modules (`handler.rs`, `response_builder.rs`, etc.)
-2. Then call those functions from `test_state.rs`
-3. Never copy-paste production code into test_state.rs
+2. Then call those functions from `testing.rs`
+3. Never copy-paste production code into testing.rs

@@ -45,67 +45,6 @@ except ImportError:
     settings = None  # type: ignore
 
 
-def _read_cors_settings_from_django() -> dict | None:
-    """Read all CORS settings from Django settings (same as production server).
-
-    Returns:
-        Dict with CORS config from Django settings, or None if not configured.
-        Keys: origins, credentials, methods, headers, expose_headers, max_age
-    """
-    try:
-        # Check if any CORS setting is defined
-        has_origins = hasattr(settings, "CORS_ALLOWED_ORIGINS")
-        has_all_origins = hasattr(settings, "CORS_ALLOW_ALL_ORIGINS") and settings.CORS_ALLOW_ALL_ORIGINS
-
-        if not has_origins and not has_all_origins:
-            return None
-
-        # Build CORS config dict matching production server format
-        cors_config = {}
-
-        # Origins
-        if has_all_origins:
-            cors_config["origins"] = ["*"]
-        elif has_origins:
-            origins = settings.CORS_ALLOWED_ORIGINS
-            if isinstance(origins, (list, tuple)):
-                cors_config["origins"] = list(origins)
-            else:
-                cors_config["origins"] = []
-        else:
-            cors_config["origins"] = []
-
-        # Credentials
-        cors_config["credentials"] = getattr(settings, "CORS_ALLOW_CREDENTIALS", False)
-
-        # Methods
-        if hasattr(settings, "CORS_ALLOW_METHODS"):
-            methods = settings.CORS_ALLOW_METHODS
-            if isinstance(methods, (list, tuple)):
-                cors_config["methods"] = list(methods)
-
-        # Headers
-        if hasattr(settings, "CORS_ALLOW_HEADERS"):
-            headers = settings.CORS_ALLOW_HEADERS
-            if isinstance(headers, (list, tuple)):
-                cors_config["headers"] = list(headers)
-
-        # Expose headers
-        if hasattr(settings, "CORS_EXPOSE_HEADERS"):
-            expose = settings.CORS_EXPOSE_HEADERS
-            if isinstance(expose, (list, tuple)):
-                cors_config["expose_headers"] = list(expose)
-
-        # Max age
-        if hasattr(settings, "CORS_PREFLIGHT_MAX_AGE"):
-            cors_config["max_age"] = settings.CORS_PREFLIGHT_MAX_AGE
-
-        return cors_config
-    except (ImportError, AttributeError):
-        # Django not configured or settings not available
-        return None
-
-
 class WebSocketTestClient:
     """Async WebSocket test client for django-bolt.
 
@@ -155,13 +94,8 @@ class WebSocketTestClient:
         self.auth_context = auth_context
 
         # Build CORS config dict for Rust (same as HTTP TestClient)
-        self._cors_config: dict | None = None
-        if cors_allowed_origins is not None:
-            # Explicit origins provided - create minimal config
-            self._cors_config = {"origins": cors_allowed_origins}
-        elif read_django_settings:
-            # Read full CORS config from Django settings (same as production server)
-            self._cors_config = _read_cors_settings_from_django()
+        self._cors_allowed_origins = cors_allowed_origins
+        self._read_django_settings = read_django_settings
 
         # Message queues for bidirectional communication
         self._client_to_server: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -191,9 +125,8 @@ class WebSocketTestClient:
         # This ensures WebSocket origin validation uses same config as HTTP
         self._app_id = _core.create_test_app(
             self.api._dispatch,
-            False,
-            self._cors_config,
-            None,
+            self._read_django_settings,
+            self._cors_allowed_origins,
             None,
             self.api._rust_compression_config(),
         )
