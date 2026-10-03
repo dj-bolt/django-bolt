@@ -24,6 +24,7 @@ except ImportError:
 import msgspec
 from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
+from django.core.handlers.asgi import ASGIHandler
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
 
@@ -3261,6 +3262,10 @@ class BoltAPI:
                 await send(rewritten)
 
             await asgi_app(django_scope, receive, django_send)
+
+        # Django's ASGIHandler serves HTTP only. Keep WebSocket connections off it.
+        if isinstance(asgi_app, ASGIHandler):
+            django_mount_wrapper._bolt_http_only = True
 
         self.mount_asgi(path, django_mount_wrapper)
 

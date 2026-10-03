@@ -865,8 +865,7 @@ class SimpleWebSocketClient:
         self.headers = headers or {}
         self.timeout = timeout
         self.socket: socket.socket | None = None
-        # Frame bytes that arrived in the same read as the handshake.
-        self._buffer = bytearray()
+        self._pending = b""
 
     def connect(self) -> None:
         key = base64.b64encode(secrets.token_bytes(16)).decode()
@@ -894,7 +893,8 @@ class SimpleWebSocketClient:
                 raise AssertionError("WebSocket handshake failed before headers completed")
             response += chunk
 
-        header_bytes, rest = response.split(b"\r\n\r\n", 1)
+        # Keep frame bytes that arrive with the headers, such as an early close.
+        header_bytes, self._pending = response.split(b"\r\n\r\n", 1)
         header_text = header_bytes.decode("utf-8", errors="replace")
         status_line = header_text.splitlines()[0]
         assert "101" in status_line, f"Unexpected WebSocket handshake response: {header_text}"
@@ -909,7 +909,6 @@ class SimpleWebSocketClient:
             hashlib.sha1(f"{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11".encode()).digest()
         ).decode()
         assert accept == expected_accept, f"Unexpected Sec-WebSocket-Accept: {accept}"
-        self._buffer = bytearray(rest)
         self.socket = sock
 
     def _require_socket(self) -> socket.socket:
@@ -919,8 +918,8 @@ class SimpleWebSocketClient:
 
     def _recv_exact(self, length: int) -> bytes:
         sock = self._require_socket()
-        chunks = self._buffer[:length]
-        del self._buffer[:length]
+        chunks = bytearray(self._pending[:length])
+        self._pending = self._pending[length:]
         while len(chunks) < length:
             chunk = sock.recv(length - len(chunks))
             if not chunk:
