@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **bolt-mcp: MCP Tasks extension (SEP-2663)** - `@mcp.tool(task=True, ttl=, poll_interval=)` runs a tool as a task. A client that declares `io.modelcontextprotocol/tasks` gets `resultType: "task"` from `tools/call`, then polls `tasks/get`. The server also serves `tasks/update` and `tasks/cancel`. `tasks/cancel` and an elapsed TTL cancel the Python coroutine. In a task, `ctx.elicit()` and `ctx.sample()` suspend the tool until `tasks/update` answers, with no MRTR replay. `ctx.report_progress()` and log lines set the task `statusMessage`. `ctx.task_id` gives the task id. Only the principal that created a task can reach it. Tasks live in process memory, so `runbolt` stops at startup when a mount has a task tool and `--processes` is more than 1. It also stops when such a mount runs with `--max-rss` or `--workers-lifetime`. (#299)
+
 ## [0.12.0]
 
 ### Added

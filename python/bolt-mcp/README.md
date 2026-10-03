@@ -86,6 +86,23 @@ client replies on a separate POST (correlated by id). They therefore require **s
 capabilities — otherwise they raise (surfaced as an in-band tool error). `report_progress`/logging
 work in stateless mode too.
 
+## Long-running tools: tasks
+
+`@mcp.tool(task=True)` opts a tool in to the MCP Tasks extension (SEP-2663). A client that
+declares `io.modelcontextprotocol/tasks` gets `resultType: "task"` at once and polls
+`tasks/get`. `ctx.elicit` suspends the task until the client answers with `tasks/update`.
+`tasks/cancel` cancels the tool coroutine; a sync `def` tool runs in a thread, which continues
+to the end. Only the principal that created a task can reach it, and all unauthenticated callers
+are one principal. Tasks live in process memory, so `runbolt` refuses to start with
+`--processes` above 1, `--max-rss` or `--workers-lifetime` when a mount has a task tool.
+
+```python
+@mcp.tool(task=True, ttl=600_000, poll_interval=2_000)  # milliseconds
+async def build_report(month: str, ctx: Context) -> dict:
+    await ctx.report_progress(1, 2, "Collecting data")  # becomes the task statusMessage
+    return {"month": month}
+```
+
 ## Expose existing endpoints as tools
 
 Existing REST routes are **never exposed implicitly** — `api.mount_mcp(mcp)` serves only
@@ -159,6 +176,5 @@ SEP-2243 routing-header validation, Rust-evaluated per-tool guards, all three au
 validation by default, and configurable Host/Origin DNS-rebinding protection
 (`mount_mcp(allowed_hosts=..., allowed_origins=...)`).
 
-Not yet: `completion/complete`, the tasks extension (`io.modelcontextprotocol/tasks`),
-list-changed notifications (catalogs are static), and CIMD client registration in the
-built-in Authorization Server.
+Not yet: `completion/complete`, list-changed notifications (catalogs are static), and CIMD
+client registration in the built-in Authorization Server.

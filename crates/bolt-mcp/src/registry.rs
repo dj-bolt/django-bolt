@@ -16,7 +16,10 @@ use rmcp::model::{
     CacheScope, Implementation, Prompt, ProtocolVersion, RequestStateCodec, Resource,
     ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
 };
+use rmcp::task_manager::TaskOptions;
 use serde::Deserialize;
+
+use crate::tasks::McpTasks;
 
 use bolt_core::metadata::parse_guard;
 use bolt_core::permissions::{Guard, GuardSet};
@@ -30,6 +33,8 @@ pub struct McpToolEntry {
     pub dispatch: Py<PyAny>,
     /// Whether the tool declared a `Context` parameter (progress/log/elicit).
     pub needs_context: bool,
+    /// SEP-2663 task options when the tool opted in with `task=True`.
+    pub task: Option<TaskOptions>,
 }
 
 pub struct McpRegistry {
@@ -50,6 +55,8 @@ pub struct McpRegistry {
     /// Freshness hint applied to all list results (SEP-2549).
     pub list_ttl_ms: u64,
     pub list_cache_scope: CacheScope,
+    /// Task store, present when at least one tool opted in to tasks.
+    pub tasks: Option<McpTasks>,
 }
 
 /// Serde model of the wire-format catalog JSON produced by
@@ -87,6 +94,30 @@ fn parse_guard_list(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<GuardSet> {
         guards.push(parse_guard(dict, py)?);
     }
     Ok(GuardSet::from_guards(guards))
+}
+
+/// Parse a tool's `task` config: `None`, or {"ttl_ms": int, "poll_interval_ms": int}.
+fn parse_task_options(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<Option<TaskOptions>> {
+    if obj.is_none() {
+        return Ok(None);
+    }
+    let cfg = obj.cast::<PyDict>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "MCP tool '{name}' config 'task' must be a dict or None"
+        ))
+    })?;
+    let field = |key: &str| -> PyResult<u64> {
+        cfg.get_item(key)?
+            .ok_or_else(|| {
+                PyValueError::new_err(format!("MCP tool '{name}' task config missing '{key}'"))
+            })?
+            .extract()
+    };
+    Ok(Some(
+        TaskOptions::new()
+            .with_ttl_ms(field("ttl_ms")?)
+            .with_poll_interval_ms(field("poll_interval_ms")?),
+    ))
 }
 
 impl McpRegistry {
@@ -142,6 +173,10 @@ impl McpRegistry {
                 PyValueError::new_err(format!("MCP tool '{name}' config missing 'guards'"))
             })?;
             let guards = parse_guard_list(py, &guards_obj)?;
+            let task_obj = cfg.get_item("task")?.ok_or_else(|| {
+                PyValueError::new_err(format!("MCP tool '{name}' config missing 'task'"))
+            })?;
+            let task = parse_task_options(&name, &task_obj)?;
             tool_order.push(name.clone());
             tools.insert(
                 name,
@@ -150,6 +185,7 @@ impl McpRegistry {
                     guards,
                     dispatch,
                     needs_context,
+                    task,
                 },
             );
         }
@@ -189,13 +225,22 @@ impl McpRegistry {
 
         // Logging capability is deprecated in 2026-07-28 but stays advertised
         // for legacy session clients that use `ctx.log()` streams.
+        // The Tasks extension is advertised only when a tool opted in.
+        let tasks = tools
+            .values()
+            .any(|entry| entry.task.is_some())
+            .then(McpTasks::default);
         #[allow(deprecated)]
-        let capabilities = ServerCapabilities::builder()
+        let builder = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
             .enable_prompts()
-            .enable_logging()
-            .build();
+            .enable_logging();
+        let capabilities = if tasks.is_some() {
+            builder.enable_tasks().build()
+        } else {
+            builder.build()
+        };
         let mut server_info = ServerInfo::new(capabilities);
         // Advertise the modern revision explicitly: rmcp's LATEST is the
         // previous revision and `initialize` negotiation caps at this value.
@@ -215,6 +260,7 @@ impl McpRegistry {
             codec: RequestStateCodec::new(state_key),
             list_ttl_ms: catalog.list_ttl_ms.unwrap_or(0),
             list_cache_scope,
+            tasks,
         })
     }
 

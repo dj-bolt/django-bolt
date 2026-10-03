@@ -45,6 +45,35 @@ _ENV_DEV_SPAWN_MS = "DJANGO_BOLT_DEV_SPAWN_UNIX_MS"
 DEV_RELOAD_DEBOUNCE_MS = 50
 
 
+def _mcp_task_unsafe_option(options) -> str | None:
+    """Return the runbolt option that lets another process answer tasks/get, if one is set.
+
+    MCP Tasks (SEP-2663) live in the memory of the process that created them.
+    With SO_REUSEPORT, a second process can get the request. Worker recycling
+    starts the new worker before the old one stops, so it has the same effect.
+    """
+    if options["processes"] > 1:
+        return "--processes above 1"
+    if options["max_rss"]:
+        return "--max-rss"
+    if options["workers_lifetime"]:
+        return "--workers-lifetime"
+    return None
+
+
+def _reject_mcp_tasks(mcp_mounts: list[dict], option: str) -> None:
+    """Stop startup when an MCP mount has task tools and ``option`` splits tasks across processes."""
+    for mount in mcp_mounts:
+        task_tools = sorted(name for name, tool in mount["tools"].items() if tool["task"] is not None)
+        if task_tools:
+            raise CommandError(
+                f"The MCP mount at {mount['path']!r} has task tools ({', '.join(task_tools)}). "
+                "MCP Tasks live in the memory of one process, so tasks/get must reach that process. "
+                f"With {option}, a different process can get the request. "
+                "Run one process without --max-rss and --workers-lifetime, or remove task=True from these tools."
+            )
+
+
 class _Ansi:
     """Minimal ANSI palette; every attribute is '' when colors are disabled."""
 
@@ -718,7 +747,13 @@ class Command(BaseCommand):
 
         # Run autodiscovery + banner once in the parent before forking so the
         # user sees a single clean banner instead of N copies.
-        self._print_multiprocess_banner(options)
+        discovered = self._discover_multiprocess_apis()
+        if discovered is not None:
+            apis, merged_api = discovered
+            unsafe_option = _mcp_task_unsafe_option(options)
+            if unsafe_option is not None:
+                _reject_mcp_tasks(merged_api._mcp_mounts, unsafe_option)
+            self._print_multiprocess_banner(options, apis, merged_api)
 
         # Give Actix the same graceful-shutdown window the supervisor allows
         # before escalating to SIGKILL (user-set env takes precedence).
@@ -765,15 +800,16 @@ class Command(BaseCommand):
 
         supervisor.run()
 
-    def _print_multiprocess_banner(self, options):
-        """Perform a dry-run of autodiscovery to collect route/feature info,
-        then print the startup banner once from the parent process."""
+    def _discover_multiprocess_apis(self):
+        """Perform a dry-run of autodiscovery in the parent process.
+
+        Returns ``(apis, merged_api)``, or ``None`` when no BoltAPI is found.
+        """
         # Setup logging/file-response just like start_single_process
         if setup_django_logging is not None:
             setup_django_logging()
         if initialize_file_response_settings is not None:
             initialize_file_response_settings()
-        banner_base_url = _build_display_url(options["host"], options["port"], dev_mode=False)
 
         apis = self.autodiscover_apis()
         if not apis:
@@ -782,9 +818,12 @@ class Command(BaseCommand):
                     "No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment, e.g., api = BoltAPI()"
                 )
             )
-            return
+            return None
+        return apis, self.merge_apis(apis)
 
-        merged_api = self.merge_apis(apis)
+    def _print_multiprocess_banner(self, options, apis, merged_api):
+        """Print the startup banner once from the parent process, from the dry-run discovery."""
+        banner_base_url = _build_display_url(options["host"], options["port"], dev_mode=False)
         _user_route_count = len(merged_api._routes)
 
         features: list[tuple[str, str]] = []
