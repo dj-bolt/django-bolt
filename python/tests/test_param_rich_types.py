@@ -667,3 +667,11 @@ async def test_a_websocket_sequence_query_parameter_decodes_each_value(ws_api):
     async with WebSocketTestClient(ws_api, "/ws/names", query_string="name=a+b&name=c%26d&name=a%20b") as ws:
         response = await ws.receive_json()
     assert response == {"value": ["a b", "c&d"], "type": "set"}
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_earlier_value_of_a_websocket_sequence_key_rejects_the_upgrade(ws_api):
+    """The scalar parser keeps the last value of a key, so each sequence value needs its own length check."""
+    with pytest.raises(ValueError, match="Parameter too long"):
+        async with WebSocketTestClient(ws_api, "/ws/names", query_string="name=" + "a" * 9000 + "&name=b"):
+            pass

@@ -851,7 +851,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             max_param_length,
         ) {
             Ok(sequences) => sequences,
-            Err(response) => return response,
+            Err(detail) => return responses::error_422_validation(&detail),
         },
         _ => Vec::new(),
     };

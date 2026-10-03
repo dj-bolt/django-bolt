@@ -115,12 +115,14 @@ where
 /// The values of each sequence query key of a route, in the order of the query.
 ///
 /// A route with no sequence keys, or a request with no query, gives an empty
-/// result that does not allocate. The length limit applies to each value.
+/// result that does not allocate. The length limit applies to each value: the
+/// scalar parser keeps the last value of a key, so it does not check the others.
+/// The error is the detail of the rejection, for HTTP and WebSocket.
 pub fn query_sequences<'a>(
     query: Option<&'a str>,
     keys: &AHashSet<String>,
     max_length: usize,
-) -> Result<QuerySequences<'a>, HttpResponse> {
+) -> Result<QuerySequences<'a>, String> {
     let query = match query {
         Some(query) if !keys.is_empty() && !query.is_empty() => query,
         _ => return Ok(Vec::new()),
@@ -128,7 +130,12 @@ pub fn query_sequences<'a>(
     let sequences = crate::router::collect_query_sequences(query, keys);
     for (name, values) in &sequences {
         if let Some(value) = values.iter().find(|value| value.len() > max_length) {
-            return Err(too_long("Query parameter", name, value.len(), max_length));
+            return Err(too_long_detail(
+                "Query parameter",
+                name,
+                value.len(),
+                max_length,
+            ));
         }
     }
     Ok(sequences)
@@ -148,10 +155,15 @@ pub fn set_query_sequences(
 
 #[cold]
 fn too_long(label: &str, name: &str, len: usize, max_length: usize) -> HttpResponse {
-    responses::error_422_validation(&format!(
+    responses::error_422_validation(&too_long_detail(label, name, len, max_length))
+}
+
+#[cold]
+fn too_long_detail(label: &str, name: &str, len: usize, max_length: usize) -> String {
+    format!(
         "{} '{}': Parameter too long: {} bytes (max {} bytes)",
         label, name, len, max_length
-    ))
+    )
 }
 
 #[inline]
@@ -198,6 +210,26 @@ pub fn coerce_declared_value(
     }
 }
 
+/// Coerce one path or query value as `types` declares, and check its length.
+///
+/// Unlike [`coerce_declared_value`], the length limit applies to all values,
+/// including strings. `coerce_param` checks a typed value, so this function
+/// checks only a value that it does not coerce. The error is the detail text.
+#[inline]
+pub fn coerce_param_value(
+    name: &str,
+    value: &str,
+    types: &TypeHints,
+    max_length: usize,
+    label: &str,
+) -> Result<Option<CoercedValue>, String> {
+    let coerced = coerce_declared_value(name, value, types, max_length, label)?;
+    if coerced.is_none() && value.len() > max_length {
+        return Err(too_long_detail(label, name, value.len(), max_length));
+    }
+    Ok(coerced)
+}
+
 /// Set `name` in a WebSocket scope dict, coerced when `types` declares it.
 ///
 /// A bad typed value is a `ValueError`, which rejects the upgrade. Values with
@@ -211,7 +243,36 @@ pub fn set_declared_item(
     max_length: usize,
     label: &str,
 ) -> PyResult<()> {
-    match coerce_declared_value(name, value, types, max_length, label) {
+    let coerced = coerce_declared_value(name, value, types, max_length, label);
+    set_coerced_item(py, dict, name, value, coerced)
+}
+
+/// Set a path or query `name` in a WebSocket scope dict, coerced when `types` declares it.
+///
+/// A value that is too long or a bad typed value is a `ValueError`.
+/// The error rejects the upgrade, as a header or cookie error does.
+pub fn set_param_item(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    name: &str,
+    value: &str,
+    types: &TypeHints,
+    max_length: usize,
+    label: &str,
+) -> PyResult<()> {
+    let coerced = coerce_param_value(name, value, types, max_length, label);
+    set_coerced_item(py, dict, name, value, coerced)
+}
+
+#[inline]
+fn set_coerced_item(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    name: &str,
+    value: &str,
+    coerced: Result<Option<CoercedValue>, String>,
+) -> PyResult<()> {
+    match coerced {
         Ok(Some(coerced)) => dict.set_item(name, coerced_value_to_py(py, &coerced)?),
         Ok(None) => dict.set_item(name, value),
         Err(detail) => Err(pyo3::exceptions::PyValueError::new_err(detail)),
@@ -271,10 +332,10 @@ mod tests {
             sequences,
             vec![(Cow::from("tag"), vec![Cow::from("abc"), Cow::from("de")])]
         );
-        let response = query_sequences(Some("tag=abcd&tag=a"), &keys, 3).unwrap_err();
+        let detail = query_sequences(Some("tag=abcd&tag=a"), &keys, 3).unwrap_err();
         assert_eq!(
-            response.status(),
-            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY
+            detail,
+            "Query parameter 'tag': Parameter too long: 4 bytes (max 3 bytes)"
         );
         assert!(query_sequences(None, &keys, 3).unwrap().is_empty());
         assert!(query_sequences(Some("tag=abcd"), &Default::default(), 3)
@@ -370,6 +431,42 @@ mod tests {
         assert!(coerce_declared_value("other", "1", &hints, 64, "Header")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn param_value_rejects_bad_typed_value_with_label_and_name() {
+        let hints = types(&[("limit", TYPE_INT)]);
+        let detail = coerce_param_value("limit", "abc", &hints, 64, "Query parameter").unwrap_err();
+        assert!(
+            detail.starts_with("Query parameter 'limit': Invalid integer 'abc'"),
+            "{detail}"
+        );
+        assert!(matches!(
+            coerce_param_value("limit", "7", &hints, 64, "Query parameter"),
+            Ok(Some(CoercedValue::Int(7)))
+        ));
+        let detail = coerce_param_value("limit", &"1".repeat(65), &hints, 64, "Query parameter")
+            .unwrap_err();
+        assert_eq!(
+            detail,
+            "Query parameter 'limit': Parameter too long: 65 bytes (max 64 bytes)"
+        );
+    }
+
+    #[test]
+    fn param_value_checks_length_of_untyped_value() {
+        let hints = types(&[]);
+        assert!(
+            coerce_param_value("q", "short", &hints, 64, "Path parameter")
+                .unwrap()
+                .is_none()
+        );
+        let detail =
+            coerce_param_value("q", &"a".repeat(65), &hints, 64, "Path parameter").unwrap_err();
+        assert_eq!(
+            detail,
+            "Path parameter 'q': Parameter too long: 65 bytes (max 64 bytes)"
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ import json
 import pytest
 
 from .apps import app_module
-from .helpers import SimpleWebSocketClient
+from .helpers import SimpleWebSocketClient, attempt_ws_upgrade
 
 pytestmark = pytest.mark.server_integration
 
@@ -46,3 +46,14 @@ def test_runbolt_gives_a_websocket_sequence_parameter_each_value(make_server_pro
         response = json.loads(websocket.receive_text())
 
     assert response == {"tag": [3, 1, 3]}
+
+
+def test_runbolt_rejects_an_oversized_earlier_value_of_a_websocket_sequence_key(make_server_project):
+    project = make_server_project(api_module=app_module("param_rich_types"))
+    oversized = "1" * 9000  # over the default 8192-byte limit
+
+    with project.start() as server:
+        status_line, body = attempt_ws_upgrade(server.host, server.port, f"/ws/tags?tag={oversized}&tag=1")
+
+    assert "400" in status_line, f"status={status_line!r} body={body!r}"
+    assert "Parameter too long" in body, f"body={body!r}"

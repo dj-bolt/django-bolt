@@ -15,11 +15,12 @@ use tokio::sync::mpsc;
 use bolt_core::metadata::{CorsConfig, RouteMetadata};
 use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
-use bolt_core::request_pipeline::{set_declared_item, set_query_sequences, EMPTY_TYPES};
-use bolt_core::router::{collect_query_sequences, query_pairs};
+use bolt_core::request_pipeline::{
+    query_sequences, set_declared_item, set_param_item, set_query_sequences, EMPTY_TYPES,
+};
+use bolt_core::router::parse_query_string;
 use bolt_core::state::{AppState, ROUTE_METADATA};
-use bolt_core::type_coercion::coerced_value_to_py;
-use bolt_core::type_coercion::{coerce_param, CoerceError, TypeHints, TYPE_STRING};
+use bolt_core::type_coercion::TypeHints;
 use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 
 use super::actor::WebSocketActor;
@@ -95,34 +96,29 @@ fn build_scope(
     scope_dict.set_item("type", "websocket")?;
     scope_dict.set_item("path", req.path())?;
 
-    // Parse and coerce query parameters
+    // Parse the query string with the HTTP parser: the last value of a repeated key wins.
+    // A value that is too long or a bad typed value rejects the upgrade, as in HTTP.
     let query_dict = PyDict::new(py);
-    for (key, value) in query_pairs(req.query_string()) {
-        // Get type hint and coerce
-        let type_hint = param_types
-            .get(key.as_ref())
-            .copied()
-            .unwrap_or(TYPE_STRING);
-
-        match coerce_param(&value, type_hint, max_param_length) {
-            Ok(coerced) => {
-                let py_value = coerced_value_to_py(py, &coerced)?;
-                query_dict.set_item(key.as_ref(), py_value)?;
-            }
-            // Oversized values reject the upgrade — never pass a raw string through.
-            Err(e @ CoerceError::TooLong { .. }) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-            }
-            // Genuine type-coercion failure: fall back to the raw string.
-            Err(CoerceError::Invalid(_)) => {
-                query_dict.set_item(key.as_ref(), value.as_ref())?;
-            }
-        }
+    for (key, value) in &parse_query_string(req.query_string()) {
+        set_param_item(
+            py,
+            &query_dict,
+            key,
+            value,
+            param_types,
+            max_param_length,
+            "Query parameter",
+        )?;
     }
     // A sequence parameter takes each value of its repeated key, as in HTTP.
-    // The loop above checked the length of each value.
-    if let Some(route_meta) = route_meta.filter(|m| !m.query_seq_fields.is_empty()) {
-        let sequences = collect_query_sequences(req.query_string(), &route_meta.query_seq_fields);
+    // Each value gets the length check, as the loop above checks only the last one.
+    if let Some(route_meta) = route_meta {
+        let sequences = query_sequences(
+            Some(req.query_string()),
+            &route_meta.query_seq_fields,
+            max_param_length,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
         set_query_sequences(py, &query_dict, &sequences)?;
     }
     scope_dict.set_item("query_params", query_dict)?;
@@ -152,21 +148,15 @@ fn build_scope(
     // Coerce path params using type hints
     let params_dict = PyDict::new(py);
     for (k, v) in path_params.iter() {
-        let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
-        match coerce_param(v, type_hint, max_param_length) {
-            Ok(coerced) => {
-                let py_value = coerced_value_to_py(py, &coerced)?;
-                params_dict.set_item(k.as_str(), py_value)?;
-            }
-            // Oversized values reject the upgrade — never pass a raw string through.
-            Err(e @ CoerceError::TooLong { .. }) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-            }
-            // Genuine type-coercion failure: fall back to the raw string.
-            Err(CoerceError::Invalid(_)) => {
-                params_dict.set_item(k.as_str(), v.as_str())?;
-            }
-        }
+        set_param_item(
+            py,
+            &params_dict,
+            k,
+            v,
+            param_types,
+            max_param_length,
+            "Path parameter",
+        )?;
     }
     scope_dict.set_item("path_params", params_dict)?;
 
