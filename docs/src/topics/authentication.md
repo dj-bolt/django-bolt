@@ -110,7 +110,7 @@ Django-Bolt provides lazy user loading via `request.user`:
 
 ```python
 @api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
-async def get_me(request):
+def get_me(request):
     user = request.user  # Lazily loads from database
 
     return {
@@ -121,6 +121,37 @@ async def get_me(request):
 ```
 
 The user is only loaded from the database when you access `request.user`. If you don't need the full user object, use `request.context` which is available without a database query.
+
+In an async handler or an async middleware, prefer `await request.auser()`:
+
+```python
+@api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+async def get_me(request):
+    user = await request.auser()
+    return {"id": user.id}
+```
+
+`request.auser()` does not block the event loop. It awaits an async `get_user` directly. It runs `get_user_sync` on the request lane or on the ORM pool. `request.user` then returns the same user with no second query.
+
+To get the user as a parameter, use `CurrentUser`. It works in sync and async handlers:
+
+```python
+from django_bolt import CurrentUser, OptionalCurrentUser
+
+@api.get("/me", auth=[JWTAuthentication()])
+async def get_me(user: CurrentUser):
+    return {"id": user.id}
+
+@api.get("/home", auth=[JWTAuthentication()])
+def home(user: OptionalCurrentUser):
+    return {"signed_in": user is not None}
+```
+
+`CurrentUser` answers 401 when the request has no authenticated user. `OptionalCurrentUser` gives `None` then. In an async handler, both load the user with `await request.auser()`. In a sync handler, both read `request.user`, so the handler keeps its sync dispatch. For the type of your user model, make your own alias: `Annotated[User, Depends(require_current_user)]`.
+
+An async handler can also read `request.user`. The read loads the user when it occurs, and the worker thread waits for that query. Use `await request.auser()` when the loop must serve other requests during the query, for example with a networked database. The query runs on that worker thread, or on the lane of a request with Django middleware. On the lane, it sees the thread-local state of the request, for example a tenant schema. With `DEBUG = True` or `runbolt --dev`, Bolt logs each such read that blocks the event loop for more than 50 ms, with its file and line.
+
+A thread with no event loop that is not the lane cannot wait for the lane, for example a thread from `asyncio.to_thread`. A sync read there raises `LaneAffinityError`, a subclass of `RuntimeError`. Its message names the route and the handler. With `DEBUG = True` or `runbolt --dev`, Bolt also logs the fix one time for each route.
 
 ### Custom user query
 
@@ -140,7 +171,7 @@ class MyJWT(JWTAuthentication):
 
 @api.get("/tasks", auth=[MyJWT()], guards=[IsAuthenticated()])
 async def tasks(request):
-    user = request.user  # loaded with your query
+    user = await request.auser()  # loaded with your query
     ...
 ```
 
@@ -148,6 +179,10 @@ Overriding the async `get_user` or the sync `get_user_sync` both work —
 either alone is enough. If you define both, sync handlers use
 `get_user_sync` directly (no event-loop overhead) and it is also preferred
 for async handlers via a worker thread.
+
+A backend that overrides only the async `get_user` serves `await request.auser()`.
+A sync read of `request.user` cannot run a coroutine, so it raises `RuntimeError`.
+Define `get_user_sync` as well when sync handlers or sync middleware read `request.user`.
 
 The override is scoped to the routes that use that backend instance —
 routes authenticated with a plain `JWTAuthentication` keep the default
@@ -828,6 +863,66 @@ Requires a model with `jti` (unique, indexed) and `expires_at`
 (indexed) fields. A periodic cleanup task should delete rows where
 `expires_at < now()`. Slower than cache-based stores; only use when you
 don't have a cache layer.
+
+### Custom revocation handler
+
+Pass `revoked_token_handler=` to decide revocation with your own code.
+Bolt calls it for each authenticated request, before the handler runs.
+When it returns `True`, the request gets `401 Unauthorized`.
+
+A handler with one parameter gets the `jti` of the token. A handler with
+two parameters also gets the verified claims. Bolt reads the number of
+parameters one time, at registration.
+
+```python
+async def is_revoked(jti: str) -> bool: ...
+
+async def is_revoked_by_claims(jti: str, claims: dict) -> bool: ...
+```
+
+A route can have more than one JWT backend, for example one for each
+issuer. Bolt checks a token only with the handler of the backend that
+accepted the token.
+
+### Session-bound tokens (django-allauth)
+
+Some issuers bind an access token to a server-side session. For example,
+the JWT token strategy of django-allauth headless puts the session in the
+`sid` claim. When the user logs out, allauth ends that session. Bolt still
+accepts the access token until it expires, because the signature stays
+valid.
+
+To reject the token at logout, check its session in a revocation handler:
+
+```python
+from allauth.headless.tokens.strategies.jwt.internal import get_token_session, validate_token_user
+
+from django_bolt.auth import JWTAuthentication
+from django_bolt.concurrency import sync_to_thread
+
+
+def _session_is_valid(claims: dict) -> bool:
+    session = get_token_session(claims)
+    return session is not None and validate_token_user(claims, session) is not None
+
+
+async def allauth_session_ended(jti: str, claims: dict) -> bool:
+    return not await sync_to_thread(_session_is_valid, claims)
+
+
+auth = JWTAuthentication(revoked_token_handler=allauth_session_ended)
+```
+
+This is the same check as `HEADLESS_JWT_STATEFUL_VALIDATION_ENABLED` in
+allauth. It reads the session for each request. The two functions are in
+an internal module of allauth, so check them when you upgrade allauth.
+
+!!! note "Use HS256 with the same key"
+
+    With `HEADLESS_JWT_ALGORITHM = "HS256"`, allauth signs with `SECRET_KEY`.
+    `JWTAuthentication()` verifies with `SECRET_KEY` by default. For `RS256`,
+    pass `algorithms=["RS256"]` and the public key of `HEADLESS_JWT_PRIVATE_KEY`
+    as `public_key=`.
 
 ### Per-call vs per-instance TTL
 

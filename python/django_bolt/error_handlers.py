@@ -102,23 +102,6 @@ def serialize_django_response(response: Any) -> tuple[int, list[tuple[str, str]]
     return status_code, headers, body
 
 
-def is_django_response(obj: Any) -> bool:
-    """Check if object is a Django HttpResponse.
-
-    This avoids importing Django in hot paths - only checks when we suspect
-    we have a Django response.
-
-    Args:
-        obj: Object to check
-
-    Returns:
-        True if obj is a Django HttpResponse
-    """
-    if DjangoHttpResponse is None:
-        return False
-    return isinstance(obj, DjangoHttpResponse)
-
-
 def http_exception_handler(exc: HTTPException) -> tuple[int, list[tuple[str, str]], bytes]:
     """Convert an HTTPException to a response tuple.
 

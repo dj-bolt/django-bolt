@@ -407,6 +407,24 @@ def _display_host(host: str, *, dev_mode: bool) -> str:
     return host
 
 
+def _gil_enabled() -> bool:
+    """False on a free-threaded CPython that runs with the GIL disabled."""
+    is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
+    return True if is_gil_enabled is None else bool(is_gil_enabled())
+
+
+def default_worker_threads() -> int:
+    """Actix worker threads per process when ``--workers`` is not given.
+
+    With the GIL, one thread runs Python at a time, so more threads only
+    wait. A free-threaded interpreter runs one handler per thread in
+    parallel, so the default is the CPU count.
+    """
+    if _gil_enabled():
+        return 1
+    return os.cpu_count() or 1
+
+
 def _build_display_url(host: str, port: int, *, dev_mode: bool, path: str = "") -> str:
     """Build a user-facing URL for startup banner output."""
     return f"http://{_display_host(host, dev_mode=dev_mode)}:{port}{path}"
@@ -541,6 +559,15 @@ class Command(BaseCommand):
         parser.add_argument("--port", type=int, default=8000, help="Port to bind to (default: 8000)")
         parser.add_argument("--processes", type=int, default=1, help="Number of processes (default: 1)")
         parser.add_argument(
+            "--workers",
+            type=int,
+            default=None,
+            help=(
+                "Actix worker threads per process. Each thread runs Python handlers. "
+                "Default: 1 with the GIL, the CPU count on a free-threaded Python."
+            ),
+        )
+        parser.add_argument(
             "--no-admin",
             action="store_true",
             help="Disable Django admin integration (admin enabled by default)",
@@ -603,6 +630,10 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         self._handle_started = time.monotonic()
         processes = options["processes"]
+        if options["workers"] is None:
+            options["workers"] = default_worker_threads()
+        elif options["workers"] < 1:
+            raise CommandError("--workers must be at least 1")
         dev_mode = options.get("dev", False)
         dev_worker_mode = os.environ.get(_ENV_DEV_WORKER) == "1"
         effective_dev_mode = dev_mode or dev_worker_mode
@@ -948,7 +979,7 @@ class Command(BaseCommand):
             middleware_count = len(middleware_data)
 
         # Set environment variables for Rust
-        os.environ["DJANGO_BOLT_WORKERS"] = "1"
+        os.environ["DJANGO_BOLT_WORKERS"] = str(options["workers"])
         os.environ["DJANGO_BOLT_BACKLOG"] = str(options["backlog"])
         if options.get("keep_alive") is not None:
             os.environ["DJANGO_BOLT_KEEP_ALIVE"] = str(options["keep_alive"])
@@ -1110,10 +1141,17 @@ class Command(BaseCommand):
             route_bits.append(f"+{framework_routes} framework")
         route_bits.append(f"{api_count} app{'s' if api_count != 1 else ''}")
 
+        workers = options["workers"]
+        worker_bits = [f"{processes} process{'es' if processes != 1 else ''}"]
+        if workers != 1:
+            worker_bits.append(f"{workers} threads each")
+        if not _gil_enabled():
+            worker_bits.append("free-threaded")
+
         meta_rows = [
             ("Mode", mode),
             ("Routes", sep.join(route_bits)),
-            ("Workers", f"{processes} process{'es' if processes != 1 else ''}"),
+            ("Workers", sep.join(worker_bits)),
             *meta_rows,
         ]
 

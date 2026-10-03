@@ -207,6 +207,13 @@ class WebSocketTestClient:
 
         return self._app_id
 
+    async def _cancel_handler_task(self) -> None:
+        """Cancel the handler task if it still runs, and wait for it to stop."""
+        if self._handler_task and not self._handler_task.done():
+            self._handler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._handler_task
+
     def _cleanup_app(self) -> None:
         """Cleanup test app instance."""
         if self._app_id is not None:
@@ -285,7 +292,17 @@ class WebSocketTestClient:
 
         Routes through Rust for path matching, authentication, and guard evaluation.
         Uses the same production code path as Rust for parameter injection.
+        Python does not call ``__aexit__`` when the entry fails, so a failed
+        entry stops the handler task and destroys the test app here.
         """
+        try:
+            return await self._enter()
+        except BaseException:
+            await self._cancel_handler_task()
+            self._cleanup_app()
+            raise
+
+    async def _enter(self) -> WebSocketTestClient:
         # Use Rust for path matching, auth, and guard evaluation
         (
             _found,
@@ -305,6 +322,13 @@ class WebSocketTestClient:
             self._handler_task = asyncio.create_task(self._run_handler(handler, args, kwargs))
             await asyncio.sleep(0)
             return self
+
+        # A revoked token fails the handshake, as the server checks before the upgrade.
+        revocation_auth = scope.pop("_bolt_revocation_auth", None)
+        if revocation_auth is not None:
+            check = self.api._handler_middleware[handler_id]["websocket_revocation_check"]
+            if await check(revocation_auth):
+                raise PermissionError("WebSocket connection denied: Token has been revoked")
 
         # Create WebSocket instance
         ws = WebSocket(scope, self._receive, self._send)
@@ -371,11 +395,7 @@ class WebSocketTestClient:
             )
             self._closed = True
 
-        # Cancel handler task if still running
-        if self._handler_task and not self._handler_task.done():
-            self._handler_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._handler_task
+        await self._cancel_handler_task()
 
         # Cleanup test app instance
         self._cleanup_app()

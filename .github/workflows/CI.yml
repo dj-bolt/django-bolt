@@ -14,16 +14,124 @@ permissions:
   contents: read
 
 jobs:
-  # Supported Python versions, parsed from the pyproject.toml classifiers
+  # Find if a pull request changes documentation only. Such a pull request
+  # skips the build and test jobs. The ci-ok job reports one result for all.
+  # Other events (push, tag, workflow_dispatch) always run the full pipeline.
+  changes:
+    name: Detect doc-only changes
+    runs-on: ubuntu-latest
+    outputs:
+      # "true" when every changed file is documentation.
+      docs-only: ${{ steps.classify.outputs.docs-only }}
+      # "true" when docs/ or the docs toolchain changed. This starts the
+      # docs build.
+      docs: ${{ steps.classify.outputs.docs }}
+    steps:
+      # The pull_request checkout is the test merge commit. Depth 2 also
+      # fetches its first parent, the tip of the base branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Classify the changed files
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "Event $EVENT_NAME always runs the full pipeline."
+            echo "docs-only=false" >> "$GITHUB_OUTPUT"
+            echo "docs=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Documentation is docs/** and each *.md file, with two exceptions.
+          # The package readmes are build inputs: `twine check` in the
+          # validate job renders README.md, and the bolt-mcp build reads
+          # python/bolt-mcp/README.md. No other build step or test reads a
+          # Markdown file.
+          is_doc() {
+            case "$1" in
+              README.md | python/bolt-mcp/README.md) return 1 ;;
+              docs/* | *.md) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # --no-renames lists the old and the new path of a moved file.
+          total=0
+          code=0
+          docs=false
+          {
+            echo "### Changed files"
+            echo
+            echo "| File | Class |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r -d '' file; do
+            total=$((total + 1))
+            if is_doc "$file"; then
+              class=doc
+            else
+              class=code
+              code=$((code + 1))
+            fi
+            # uv.lock and pyproject.toml pin the docs toolchain.
+            case "$file" in docs/* | uv.lock | pyproject.toml) docs=true ;; esac
+            echo "$class  $file"
+            echo "| \`$file\` | $class |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(git diff --name-only --no-renames -z HEAD^1 HEAD)
+
+          # An empty diff is not doc-only, so it runs the full pipeline.
+          if [ "$total" -gt 0 ] && [ "$code" -eq 0 ]; then
+            docs_only=true
+          else
+            docs_only=false
+          fi
+          echo "files=$total code=$code docs-only=$docs_only docs=$docs"
+          printf '\ndocs-only=%s, docs=%s\n' "$docs_only" "$docs" >> "$GITHUB_STEP_SUMMARY"
+          echo "docs-only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "docs=$docs" >> "$GITHUB_OUTPUT"
+
+  # Supported Python versions, parsed from the pyproject.toml classifiers.
+  # A doc-only pull request skips this job. Each job that needs it then skips
+  # too: test, server_smoke_linux, server_integration_linux, and the wheels.
   python-versions:
     name: Read Python versions from pyproject.toml
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs-only != 'true'
     outputs:
+      # GIL builds only (one abi3 wheel covers them all).
       versions-json: ${{ steps.extract.outputs.versions-json }}
-      versions: ${{ steps.extract.outputs.versions }}
-      min-max-json: ${{ steps.extract.outputs.min-max-json }}
+      # GIL builds plus the free-threaded builds (3.14t, ...): the test matrix
+      # and the wheel `--interpreter` list. Free-threaded builds are emitted
+      # only while the "Free Threading" classifier is present.
+      test-versions-json: ${{ steps.extract.outputs.test-versions-json }}
+      interpreters: ${{ steps.extract.outputs.interpreters }}
+      # Oldest, newest, and newest free-threaded: the server-integration matrix.
+      integration-versions-json: ${{ steps.extract.outputs.integration-versions-json }}
+      # Oldest and newest supported Python, for the jobs that need exactly one
+      # interpreter rather than a matrix. Derived so no job hardcodes a version
+      # that could fall out of the supported set unnoticed.
+      oldest-version: ${{ steps.extract.outputs.oldest-version }}
+      newest-version: ${{ steps.extract.outputs.newest-version }}
+      # The free-threaded interpreters (e.g. 3.14t), newline-separated for
+      # setup-python's multi-version input. Empty when free threading is off.
+      free-threaded-versions: ${{ steps.extract.outputs.free-threaded-versions }}
+      # The whole artifact-smoke include list. Generated here so each entry's
+      # wheel pattern is derived from its interpreter and the two cannot drift.
+      artifact-include-json: ${{ steps.extract.outputs.artifact-include-json }}
+      # Newest supported Django series: the base django-version axis.
+      django-newest-json: ${{ steps.extract.outputs.django-newest-json }}
+      # Older supported Django series, each pinned to the oldest supported
+      # Python: extra `include` entries for the test matrix.
+      django-include-json: ${{ steps.extract.outputs.django-include-json }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -42,9 +150,69 @@ jobs:
               key=lambda v: tuple(map(int, v.split("."))),
           )
           assert versions, "no 'Programming Language :: Python :: 3.X' classifiers in pyproject.toml"
+          # CPython supports free threading from 3.14; PyO3 0.29 dropped 3.13t.
+          free_threaded = (
+              [f"{v}t" for v in versions if tuple(map(int, v.split("."))) >= (3, 14)]
+              if any(c.startswith("Programming Language :: Python :: Free Threading") for c in classifiers)
+              else []
+          )
           print(f"versions-json={json.dumps(versions)}")
-          print(f"versions={' '.join(versions)}")
-          print(f"min-max-json={json.dumps([versions[0], versions[-1]])}")
+          print(f"test-versions-json={json.dumps(versions + free_threaded)}")
+          print(f"interpreters={' '.join(versions + free_threaded)}")
+          print(f"integration-versions-json={json.dumps([versions[0], versions[-1], *free_threaded[-1:]])}")
+          print(f"oldest-version={versions[0]}")
+          print(f"newest-version={versions[-1]}")
+
+          # Multiline output: setup-python takes one version per line.
+          print("free-threaded-versions<<__FT__")
+          for v in free_threaded:
+              print(v)
+          print("__FT__")
+
+          # Artifact smoke: the abi3 wheel and the sdist install on the oldest
+          # supported Python, since that is what the abi3 tag and
+          # requires-python claim. Each free-threaded build gets its own
+          # cp3XX-cp3XXt wheel, whose pattern is derived from the interpreter.
+          artifacts = [
+              {
+                  "artifact-kind": "wheel",
+                  "python-version": versions[0],
+                  "artifact-pattern": "django_bolt-*-abi3-*.whl",
+              }
+          ]
+          for v in free_threaded:
+              tag = "cp" + v.removesuffix("t").replace(".", "")
+              artifacts.append(
+                  {
+                      "artifact-kind": "wheel",
+                      "python-version": v,
+                      "artifact-pattern": f"django_bolt-*-{tag}-{tag}t-*.whl",
+                  }
+              )
+          artifacts.append(
+              {
+                  "artifact-kind": "sdist",
+                  "python-version": versions[0],
+                  "artifact-pattern": "django_bolt-*.tar.gz",
+              }
+          )
+          print(f"artifact-include-json={json.dumps(artifacts)}")
+
+          # Django series, same source of truth. Only upstream-supported series
+          # are listed (see scripts/check_support_matrix.py), and every one of
+          # them supports every Python above -- so the newest Django runs on all
+          # Pythons and each older series runs on the oldest Python.
+          django_prefix = "Framework :: Django :: "
+          django = sorted(
+              (c.removeprefix(django_prefix) for c in classifiers if c.startswith(django_prefix) and c != "Framework :: Django"),
+              key=lambda v: tuple(map(int, v.split("."))),
+          )
+          assert django, "no 'Framework :: Django :: X.Y' classifiers in pyproject.toml"
+          print(f"django-newest-json={json.dumps(django[-1:])}")
+          print(
+              "django-include-json="
+              + json.dumps([{"python-version": versions[0], "django-version": d} for d in django[:-1]])
+          )
           EOF
 
   # Run tests across Python versions
@@ -55,24 +223,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ fromJSON(needs.python-versions.outputs.versions-json) }}
-        # Newest supported Django on every Python; older Django series on the
-        # newest Python each of them supports (see pyproject classifiers).
-        django-version: ["6.1"]
-        include:
-          - { python-version: "3.12", django-version: "4.2" }
-          - { python-version: "3.12", django-version: "5.0" }
-          - { python-version: "3.13", django-version: "5.1" }
-          - { python-version: "3.13", django-version: "5.2" }
-          - { python-version: "3.14", django-version: "6.0" }
+        # Includes the free-threaded builds (e.g. 3.14t): `uv python install`
+        # resolves the "t" suffix, and maturin builds a cp314t module for it.
+        python-version: ${{ fromJSON(needs.python-versions.outputs.test-versions-json) }}
+        # Newest supported Django on every Python; each older series once on the
+        # oldest Python. Both derived from the pyproject classifiers, so dropping
+        # or adding a Django series needs no change here.
+        django-version: ${{ fromJSON(needs.python-versions.outputs.django-newest-json) }}
+        include: ${{ fromJSON(needs.python-versions.outputs.django-include-json) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "latest"
 
@@ -85,10 +251,17 @@ jobs:
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
+          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
+          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
+          # defaulting it to "deny". Empty means "leave the variable unset", so
+          # warnings stay warnings and don't block tests.
+          build-warnings: ""
 
       - name: Install dependencies
         # One explicit sync (dev group pins the newest Django), then swap in the
@@ -114,21 +287,22 @@ jobs:
     name: Server Smoke Linux
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
+    needs: python-versions
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "latest"
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ needs.python-versions.outputs.newest-version }}
 
       - name: Create virtual environment
         run: uv venv
@@ -137,10 +311,17 @@ jobs:
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
+          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
+          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
+          # defaulting it to "deny". Empty means "leave the variable unset", so
+          # warnings stay warnings and don't block tests.
+          build-warnings: ""
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -158,20 +339,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ fromJSON(needs.python-versions.outputs.min-max-json) }}
+        python-version: ${{ fromJSON(needs.python-versions.outputs.integration-versions-json) }}
+    # The PostgreSQL tests (`-m postgres`: dead-connection recovery and the
+    # django-tenants request lanes) skip without a DSN, so the service is what
+    # keeps those fixes from regressing in silence.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DJANGO_BOLT_TEST_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "latest"
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -182,10 +380,17 @@ jobs:
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
+          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
+          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
+          # defaulting it to "deny". Empty means "leave the variable unset", so
+          # warnings stay warnings and don't block tests.
+          build-warnings: ""
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]" -e python/bolt-mcp
@@ -203,25 +408,26 @@ jobs:
     name: Platform Smoke ${{ matrix.os }}
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
+    needs: python-versions
     strategy:
       fail-fast: false
       matrix:
         os: ["macos-latest", "windows-latest"]
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "latest"
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ needs.python-versions.outputs.newest-version }}
 
       - name: Create virtual environment
         run: uv venv
@@ -230,10 +436,17 @@ jobs:
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
+          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
+          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
+          # defaulting it to "deny". Empty means "leave the variable unset", so
+          # warnings stay warnings and don't block tests.
+          build-warnings: ""
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -251,7 +464,7 @@ jobs:
     needs: python-versions
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -264,13 +477,13 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x86_64
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
           sccache: "true"
           manylinux: auto
           docker-options: --pull always
 
       - name: Upload wheels
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-linux-x86_64
           path: dist
@@ -282,7 +495,7 @@ jobs:
     needs: python-versions
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -295,13 +508,13 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: aarch64
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
           sccache: "true"
           manylinux: auto
           docker-options: --pull always
 
       - name: Upload wheels
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-linux-aarch64
           path: dist
@@ -313,19 +526,27 @@ jobs:
     needs: python-versions
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Set up free-threaded Python
+        # The GIL interpreters come from the runner tool cache; the
+        # free-threaded ones must be installed for maturin to find them.
+        if: needs.python-versions.outputs.free-threaded-versions != ''
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ needs.python-versions.outputs.free-threaded-versions }}
 
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: universal2-apple-darwin
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
           sccache: "true"
 
       - name: Upload wheels
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-macos-universal2
           path: dist
@@ -337,19 +558,25 @@ jobs:
     needs: python-versions
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Set up free-threaded Python
+        if: needs.python-versions.outputs.free-threaded-versions != ''
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ needs.python-versions.outputs.free-threaded-versions }}
 
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x64
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.versions }}
+          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
           sccache: "true"
 
       - name: Upload wheels
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-windows-x64
           path: dist
@@ -358,9 +585,11 @@ jobs:
   sdist:
     name: Build source distribution
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs-only != 'true'
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -376,7 +605,7 @@ jobs:
           args: --out dist
 
       - name: Upload sdist
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-sdist
           path: dist
@@ -388,12 +617,12 @@ jobs:
     needs: [linux-amd64,linux-arm64, macos, windows, sdist]
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: wheels-*
           path: dist
@@ -414,15 +643,21 @@ jobs:
   audit:
     name: Security audit
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs-only != 'true'
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          rustflags: ""
+          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
+          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
+          # defaulting it to "deny". Empty means "leave the variable unset", so
+          # warnings stay warnings and don't block tests.
+          build-warnings: ""
 
       - name: cargo audit (Rust deps in Cargo.lock)
         run: |
@@ -435,7 +670,7 @@ jobs:
           cargo audit --ignore RUSTSEC-2026-0258
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "latest"
 
@@ -445,41 +680,50 @@ jobs:
           uvx pip-audit --requirement audit-reqs.txt --no-deps
 
   artifact_smoke:
-    name: Artifact Smoke ${{ matrix.artifact-kind }}
+    name: Artifact Smoke ${{ matrix.artifact-kind }} Python ${{ matrix.python-version }}
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: [linux-amd64, sdist]
+    needs: [linux-amd64, sdist, python-versions]
     strategy:
       fail-fast: false
       matrix:
-        artifact-kind: ["wheel", "sdist"]
+        # Interpreter + matching wheel pattern for each artifact, generated
+        # together by the python-versions job (see artifact-include-json).
+        include: ${{ fromJSON(needs.python-versions.outputs.artifact-include-json) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "latest"
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
       - name: Create virtual environment
-        run: uv venv
+        run: uv venv --python "${{ matrix.python-version }}"
 
       - name: Install Rust
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
         # `toolchain` so the action reads the file. Default rust-cache is safe to
         # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical.
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
+        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
+        # config on the interpreter, so a shared cache only costs a rebuild of
+        # the PyO3 crates.
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          rustflags: "" # action defaults to -D warnings; don't block tests on warnings
+          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
+          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
+          # defaulting it to "deny". Empty means "leave the variable unset", so
+          # warnings stay warnings and don't block tests.
+          build-warnings: ""
 
       - name: Install dependencies
         run: uv pip install -e ".[dev]"
@@ -489,14 +733,14 @@ jobs:
 
       - name: Download Linux wheel artifact
         if: matrix.artifact-kind == 'wheel'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: wheels-linux-x86_64
           path: dist
 
       - name: Download source artifact
         if: matrix.artifact-kind == 'sdist'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: wheels-sdist
           path: dist
@@ -504,19 +748,87 @@ jobs:
       - name: Resolve artifact path
         id: artifact
         shell: bash
+        env:
+          ARTIFACT_PATTERN: ${{ matrix.artifact-pattern }}
         run: |
-          if [ "${{ matrix.artifact-kind }}" = "wheel" ]; then
-            artifact_path=$(find dist -name 'django_bolt-*.whl' | head -n 1)
-          else
-            artifact_path=$(find dist -name 'django_bolt-*.tar.gz' | head -n 1)
+          mapfile -t artifacts < <(find dist -maxdepth 1 -name "$ARTIFACT_PATTERN" -type f)
+          if [ "${#artifacts[@]}" -ne 1 ]; then
+            echo "Expected one artifact matching $ARTIFACT_PATTERN; found ${#artifacts[@]}" >&2
+            exit 1
           fi
-          test -n "$artifact_path"
-          echo "path=$artifact_path" >> "$GITHUB_OUTPUT"
+          echo "path=${artifacts[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Run artifact smoke tests
         env:
           DJANGO_BOLT_ARTIFACT_PATH: ${{ steps.artifact.outputs.path }}
         run: uv run pytest python/tests/integration/test_artifact_smoke.py -m artifact_smoke -s -vv
+
+  # Build the documentation site when a pull request changes docs/, uv.lock,
+  # or pyproject.toml. This job only builds. The Documentation workflow
+  # deploys on push to master.
+  docs:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "latest"
+
+      # --only-group installs the locked docs group and not the project, so
+      # the Rust extension does not build. This matches `just docs-build`.
+      - name: Build llms-full.txt
+        run: uv run --locked --only-group docs python build_llms_full.py
+        working-directory: docs
+
+      - name: Build the site
+        run: uv run --locked --only-group docs zensical build --clean
+        working-directory: docs
+
+  # One check for branch protection. A skipped job reports one check under its
+  # matrix template name, so a required matrix check never passes. This job
+  # passes when each needed job succeeds or skips. It fails on each other
+  # result, for example failure or cancelled.
+  ci-ok:
+    name: CI OK
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - changes
+      - python-versions
+      - test
+      - server_smoke_linux
+      - server_integration_linux
+      - platform_smoke
+      - linux-amd64
+      - linux-arm64
+      - macos
+      - windows
+      - sdist
+      - validate
+      - audit
+      - artifact_smoke
+      - docs
+
+    steps:
+      - name: Check the results of the needed jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.value.result)  \(.key)"' <<< "$NEEDS"
+          bad=$(jq '[.[] | select(.result != "success" and .result != "skipped")] | length' <<< "$NEEDS")
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$bad needed job(s) did not succeed or skip."
+            exit 1
+          fi
 
   # Release to PyPI
   release:
@@ -532,12 +844,12 @@ jobs:
       contents: write # Required for GitHub release
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: wheels-*
           path: dist
@@ -553,7 +865,7 @@ jobs:
         run: uv publish --trusted-publishing always
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
           generate_release_notes: true

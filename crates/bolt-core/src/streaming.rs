@@ -160,8 +160,8 @@ fn schedule_async_stream_forwarder(
     content: &Py<PyAny>,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> PyResult<()> {
-    // The forwarder MUST run on the WorkerLoop — the same loop that runs
-    // async HTTP dispatch — not on the selector/compat loop. A streaming
+    // The forwarder MUST run on this thread's WorkerLoop — the loop that
+    // runs async HTTP dispatch — not on the selector/compat loop. A streaming
     // generator awaiting an asyncio primitive (future, queue, lock) that a
     // normally-dispatched handler resolves would otherwise wait on a
     // cross-loop wakeup that never fires: `Future.set_result` wakes waiters
@@ -169,7 +169,7 @@ fn schedule_async_stream_forwarder(
     // loop's selector. (Regression seen as bolt-mcp sampling hanging: the
     // SSE tool's future lived on uvloop, the client's reply POST ran on the
     // WorkerLoop.)
-    let locals = bolt_loop::worker_task_locals(py)?.clone();
+    let locals = bolt_loop::worker_task_locals(py)?;
     let sender = Py::new(
         py,
         AsyncStreamSender {

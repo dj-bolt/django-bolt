@@ -8,12 +8,17 @@ Tests the AST-based analysis of handler functions for:
 
 from __future__ import annotations
 
+import pytest
+from django.db import connection, connections
+
+from django_bolt import BoltAPI
 from django_bolt.analysis import (
     DependencyNeeds,
     HandlerAnalysis,
     analyze_dependency_tree,
     analyze_handler,
 )
+from django_bolt.testing import TestClient
 
 
 # Test handler functions for analysis
@@ -598,3 +603,31 @@ class TestAnalyzeDependencyTree:
 
         needs = analyze_dependency_tree(handler_meta, self._compile_fn({dep_fn: dep_meta}))
         assert needs.needs_query is True
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("use_handler", ["connection", "connections"])
+def test_sync_handler_with_a_raw_cursor_runs_off_the_event_loop(use_handler):
+    """A raw cursor is blocking database work, as a manager call is."""
+    api = BoltAPI()
+
+    if use_handler == "connection":
+
+        @api.get("/one")
+        def one():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                return {"value": cursor.fetchone()[0]}
+    else:
+
+        @api.get("/one")
+        def one():
+            with connections["default"].cursor() as cursor:
+                cursor.execute("SELECT 1")
+                return {"value": cursor.fetchone()[0]}
+
+    with TestClient(api) as client:
+        response = client.get("/one")
+
+    assert response.status_code == 200
+    assert response.json() == {"value": 1}

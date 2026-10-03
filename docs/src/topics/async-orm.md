@@ -8,7 +8,7 @@ Django-Bolt handlers are async, which means you use Django's async ORM methods. 
 
 ## Why async handlers?
 
-Django-Bolt uses async handlers for maximum performance. The Rust runtime manages concurrent requests while your Python code handles business logic. Django 5.0+ provides excellent async ORM support.
+Django-Bolt uses async handlers for maximum performance. The Rust runtime manages concurrent requests while your Python code handles business logic. Every supported Django version provides excellent async ORM support.
 
 ## Basic async ORM methods
 

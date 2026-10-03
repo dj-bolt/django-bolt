@@ -121,7 +121,8 @@ class BoltTestTransport(httpx.BaseTransport):
         """Handle a request by routing it through Rust's Actix test infrastructure."""
         # Parse URL
         url = request.url
-        path = url.path
+        # Send the encoded path, as a real server receives it. Rust decodes path params.
+        path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
         # Extract headers
@@ -190,7 +191,8 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
         """Handle a request asynchronously through Rust's test infrastructure."""
         # Parse URL
         url = request.url
-        path = url.path
+        # Send the encoded path, as a real server receives it. Rust decodes path params.
+        path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
         # Extract headers
@@ -565,6 +567,9 @@ class TestClient(httpx.Client):
             finally:
                 with contextlib.suppress(builtins.BaseException):
                     _core.destroy_test_app(self.app_id)
+                # A lane keeps its database connections open. An open connection
+                # blocks the drop of the test database at teardown.
+                _core.stop_idle_lanes()
         return super().__exit__(exc_type, exc_val, exc_tb)
 
     # Override HTTP methods to support stream=True
@@ -865,4 +870,6 @@ class AsyncTestClient(httpx.AsyncClient):
         finally:
             with contextlib.suppress(builtins.BaseException):
                 _core.destroy_test_app(self.app_id)
+            # As in TestClient.__exit__: close the database connections of the lanes.
+            _core.stop_idle_lanes()
         return await super().__aexit__(exc_type, exc_val, exc_tb)

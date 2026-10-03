@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Sequence
-from typing import Any, get_args, get_origin
+from typing import Annotated, Any, get_args, get_origin
 
 import msgspec
 
@@ -52,6 +52,97 @@ def get_msgspec_decoder(type_: Any) -> msgspec.json.Decoder:
     return _DECODER_CACHE[type_]
 
 
+_SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
+# The msgspec.Meta fields that constrain a value. The other fields only document it.
+_META_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "pattern", "min_length", "max_length", "tz")
+# These sources give one value. A query key can give more than one.
+_SINGLE_VALUE_SOURCES = ("path", "header", "cookie")
+
+
+def _holds_one_item(annotation: Any) -> bool:
+    """Return True when msgspec accepts a sequence of exactly one item for this type."""
+    node = msgspec.inspect.type_info(annotation)
+    if isinstance(node, msgspec.inspect.TupleType):
+        return len(node.item_types) == 1
+    return (node.min_length or 0) <= 1 and (node.max_length is None or node.max_length >= 1)
+
+
+def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = False) -> Callable | None:
+    """Build the conversion of one parameter value that Rust cannot do, or None.
+
+    Rust converts a scalar value by its type. It does not build a sequence and
+    it does not check ``msgspec.Meta`` constraints. For such a parameter, one
+    ``msgspec.convert`` builds the ``list``, ``set``, ``frozenset`` or ``tuple``
+    from the values and checks the constraints. A bad value gives a 422 that
+    names ``loc`` and ``key``. With ``one_item``, a source that gives one value
+    (a path, a header or a cookie) gives a sequence of that one item. A type
+    that cannot hold one item, such as ``tuple[int, str]``, then raises
+    ``TypeError`` here, when the route registers.
+    """
+    target = unwrap_optional(annotation)
+    base = get_args(target)[0] if get_origin(target) is Annotated else target
+    inner = unwrap_optional(base)
+    # A bare `set` has no origin. msgspec reads it as set[Any].
+    is_sequence = (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
+    constrained = get_origin(target) is Annotated and any(
+        getattr(extra, name, None) is not None
+        for extra in get_args(target)[1:]
+        if isinstance(extra, msgspec.Meta)
+        for name in _META_CONSTRAINTS
+    )
+    if not is_sequence and not constrained:
+        return None
+    wrap = is_sequence and one_item
+    if wrap and loc in _SINGLE_VALUE_SOURCES and not _holds_one_item(target):
+        raise TypeError(
+            f"The {loc} parameter {key!r} gets one value, but its type {target!r} cannot hold one item. "
+            "Use list[T], set[T], tuple[T] or tuple[T, ...]."
+        )
+    # msgspec caches the type info of a Struct, but not of a type such as list[int].
+    # A one-field Struct made here keeps that lookup out of each request.
+    holder = msgspec.defstruct("ParamValue", [("value", target)], array_like=True)
+
+    def convert(value: Any) -> Any:
+        if wrap and not isinstance(value, list):
+            value = [value]
+        try:
+            return msgspec.convert((value,), holder, strict=False).value
+        except msgspec.ValidationError as error:
+            # Remove the position of the value in the holder from the error path.
+            msg = str(error).replace(" - at `$[0]`", "").replace("`$[0]", "`$")
+            raise RequestValidationError(
+                errors=[{"type": "validation_error", "loc": (loc, key), "msg": msg, "input": value}]
+            ) from None
+
+    return convert
+
+
+def _converted_extractor(key: str, annotation: Any, default: Any, convert: Callable, missing: str) -> Callable:
+    """Build an extractor that reads ``key`` and converts a present value with ``convert``.
+
+    A missing value gives the default of the parameter, which is not converted,
+    or a 422 with the ``missing`` detail when the parameter is required.
+    """
+    if default is not inspect.Parameter.empty or is_optional(annotation):
+        default_value = None if default is inspect.Parameter.empty else default
+
+        def extract_optional(source_map: dict[str, Any]) -> Any:
+            if key in source_map:
+                return convert(source_map[key])
+            return default_value
+
+        return extract_optional
+
+    def extract_required(source_map: dict[str, Any]) -> Any:
+        try:
+            value = source_map[key]
+        except KeyError:
+            raise HTTPException(status_code=422, detail=missing) from None
+        return convert(value)
+
+    return extract_required
+
+
 def create_path_extractor(name: str, annotation: Any, alias: str | None = None) -> Callable:
     """Create a pre-compiled extractor for path parameters.
 
@@ -59,6 +150,16 @@ def create_path_extractor(name: str, annotation: Any, alias: str | None = None) 
     str, uuid.UUID, decimal.Decimal, datetime, date, time) for both HTTP and WebSocket.
     """
     key = alias or name
+    convert = _param_converter(annotation, "path", key, one_item=True)
+
+    if convert is not None:
+
+        def extract_converted(params_map: dict[str, Any]) -> Any:
+            if key not in params_map:
+                raise HTTPException(status_code=422, detail=f"Missing required path parameter: {key}")
+            return convert(params_map[key])
+
+        return extract_converted
 
     def extract(params_map: dict[str, Any]) -> Any:
         if key not in params_map:
@@ -85,6 +186,11 @@ def create_query_extractor(name: str, annotation: Any, default: Any, alias: str 
 
     # Individual field extraction
     key = alias or name
+    # HTTP routes get each value of a sequence key as a list from Rust. A
+    # WebSocket scope gives the last value of a key, so it gives one item.
+    convert = _param_converter(annotation, "query", key, one_item=True)
+    if convert is not None:
+        return _converted_extractor(key, annotation, default, convert, f"Missing required query parameter: {key}")
     optional = default is not inspect.Parameter.empty or is_optional(annotation)
 
     if optional:
@@ -111,8 +217,11 @@ def create_header_extractor(name: str, annotation: Any, default: Any, alias: str
     When annotation is a msgspec.Struct or Serializer, extracts all struct
     fields from the headers and constructs the struct instance.
 
-    Note: Rust pre-converts values to typed Python objects (int, float, bool,
-    str, uuid.UUID, decimal.Decimal, datetime, date, time) for both HTTP and WebSocket.
+    Note: The compiler puts the non-string header types into ``header_types``,
+    keyed by header name. Rust converts and validates those values for HTTP
+    and WebSocket, and a bad value gives a 422 (HTTP) or a rejected upgrade.
+    The extractor thus reads typed objects (int, float, bool, uuid.UUID,
+    decimal.Decimal, datetime, date, time) and does no conversion.
     """
     # Check if annotation is a Struct/Serializer type
     unwrapped = unwrap_optional(annotation)
@@ -123,21 +232,26 @@ def create_header_extractor(name: str, annotation: Any, default: Any, alias: str
     # Convert underscores to hyphens for HTTP header lookup
     # e.g., x_custom -> x-custom, content_type -> content-type
     key = (alias or name).lower().replace("_", "-")
+    convert = _param_converter(annotation, "header", key, one_item=True)
+    if convert is not None:
+        return _converted_extractor(key, annotation, default, convert, f"Missing required header: {key}")
     optional = default is not inspect.Parameter.empty or is_optional(annotation)
 
     if optional:
         default_value = None if default is inspect.Parameter.empty else default
 
-        def extract(headers_map: dict[str, str]) -> Any:
+        def extract(headers_map: dict[str, Any]) -> Any:
             if key in headers_map:
                 return headers_map[key]
             return default_value
     else:
 
-        def extract(headers_map: dict[str, str]) -> Any:
-            if key not in headers_map:
-                raise HTTPException(status_code=422, detail=f"Missing required header: {key}")
-            return headers_map[key]
+        def extract(headers_map: dict[str, Any]) -> Any:
+            # One dict lookup on the hit path; the try block costs nothing there.
+            try:
+                return headers_map[key]
+            except KeyError:
+                raise HTTPException(status_code=422, detail=f"Missing required header: {key}") from None
 
     return extract
 
@@ -149,8 +263,11 @@ def create_cookie_extractor(name: str, annotation: Any, default: Any, alias: str
     When annotation is a msgspec.Struct or Serializer, extracts all struct
     fields from the cookies and constructs the struct instance.
 
-    Note: Rust pre-converts values to typed Python objects (int, float, bool,
-    str, uuid.UUID, decimal.Decimal, datetime, date, time) for both HTTP and WebSocket.
+    Note: The compiler puts the non-string cookie types into ``cookie_types``,
+    keyed by cookie name. Rust converts and validates those values for HTTP
+    and WebSocket, and a bad value gives a 422 (HTTP) or a rejected upgrade.
+    The extractor thus reads typed objects (int, float, bool, uuid.UUID,
+    decimal.Decimal, datetime, date, time) and does no conversion.
     """
     # Check if annotation is a Struct/Serializer type
     unwrapped = unwrap_optional(annotation)
@@ -159,21 +276,26 @@ def create_cookie_extractor(name: str, annotation: Any, default: Any, alias: str
 
     # Individual field extraction
     key = alias or name
+    convert = _param_converter(annotation, "cookie", key, one_item=True)
+    if convert is not None:
+        return _converted_extractor(key, annotation, default, convert, f"Missing required cookie: {key}")
     optional = default is not inspect.Parameter.empty or is_optional(annotation)
 
     if optional:
         default_value = None if default is inspect.Parameter.empty else default
 
-        def extract(cookies_map: dict[str, str]) -> Any:
+        def extract(cookies_map: dict[str, Any]) -> Any:
             if key in cookies_map:
                 return cookies_map[key]
             return default_value
     else:
 
-        def extract(cookies_map: dict[str, str]) -> Any:
-            if key not in cookies_map:
-                raise HTTPException(status_code=422, detail=f"Missing required cookie: {key}")
-            return cookies_map[key]
+        def extract(cookies_map: dict[str, Any]) -> Any:
+            # One dict lookup on the hit path; the try block costs nothing there.
+            try:
+                return cookies_map[key]
+            except KeyError:
+                raise HTTPException(status_code=422, detail=f"Missing required cookie: {key}") from None
 
     return extract
 
@@ -194,6 +316,9 @@ def create_form_extractor(name: str, annotation: Any, default: Any, alias: str |
 
     # Individual field extraction
     key = alias or name
+    convert = _param_converter(annotation, "body", key)
+    if convert is not None:
+        return _converted_extractor(key, annotation, default, convert, f"Missing required form field: {key}")
     optional = default is not inspect.Parameter.empty or is_optional(annotation)
 
     if optional:
@@ -281,14 +406,11 @@ def _collect_struct_errors(
     return errors
 
 
-_SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
-
-
 def _is_sequence_field(field_type: Any) -> bool:
     """
     Determine whether a type annotation represents a sequence container (list, set, frozenset, or tuple).
 
-    Unwraps Optional[...] before checking the underlying origin.
+    Unwraps Optional[...] before checking the underlying origin. A bare ``set`` has no origin, so the class itself counts.
 
     Parameters:
         field_type (Any): The type annotation to inspect.
@@ -297,7 +419,7 @@ def _is_sequence_field(field_type: Any) -> bool:
         bool: `True` if the (unwrapped) annotation's origin is one of list, set, frozenset, or tuple; `False` otherwise.
     """
     inner = unwrap_optional(field_type)
-    return get_origin(inner) in _SEQUENCE_ORIGINS
+    return (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
 
 
 def _collect_sequence_field_names(struct_type: type) -> tuple[str, ...]:
@@ -440,7 +562,8 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     snake_case to kebab-case for HTTP header lookup. Supports msgspec field
     aliases (field(name=...)) and rename strategies.
 
-    Note: Rust pre-converts values to typed Python objects (int, float, bool, str).
+    Note: Rust converts the typed struct fields before this runs (see
+    ``create_header_extractor``), so msgspec gets typed values.
 
     Args:
         struct_type: The msgspec.Struct or Serializer class
@@ -595,13 +718,30 @@ def create_file_extractor(
         return extract_required
 
 
+_BODY_EXTRACTORS: dict[Any, Callable] = {}
+
+
 def create_body_extractor(name: str, annotation: Any) -> Callable:
     """
     Create a pre-compiled extractor for request body.
 
     Uses cached msgspec decoder for maximum performance.
     Converts msgspec.DecodeError (JSON parsing errors) to RequestValidationError for proper 422 responses.
+
+    Each body type has one extractor. So a handler and a dependency with the
+    same body type decode the body one time (see ``decode_body_once``).
     """
+    try:
+        return _BODY_EXTRACTORS[annotation]
+    except KeyError:
+        extractor = _BODY_EXTRACTORS[annotation] = _build_body_extractor(annotation)
+        return extractor
+    except TypeError:
+        # An unhashable annotation gets its own extractor.
+        return _build_body_extractor(annotation)
+
+
+def _build_body_extractor(annotation: Any) -> Callable:
     if is_msgspec_struct(annotation):
         decoder = get_msgspec_decoder(annotation)
 

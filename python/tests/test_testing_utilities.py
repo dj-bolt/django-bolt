@@ -3,13 +3,16 @@
 This file tests the TestClient (V2) that routes through Rust with per-instance state.
 """
 
+import asyncio
 from typing import Annotated
 
 import msgspec
+import pytest
+from django.http import QueryDict
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, _core
 from django_bolt.param_functions import Header
-from django_bolt.testing import TestClient
+from django_bolt.testing import AsyncTestClient, TestClient
 
 
 def test_simple_get_request():
@@ -56,6 +59,58 @@ def test_query_parameters():
         data = response.json()
         assert data["query"] == "test"
         assert data["limit"] == 20
+
+
+def test_query_plus_decodes_to_space():
+    """A `+` in the query is a space and `%2B` is a literal `+`, as in Django."""
+    api = BoltAPI()
+
+    @api.get("/search")
+    async def search(q: str, tag: str = ""):
+        return {"q": q, "tag": tag}
+
+    @api.get("/items/{name}")
+    async def item(name: str):
+        return {"name": name}
+
+    with TestClient(api) as client:
+        response = client.get("/search?q=hello+world&tag=a%2Bb")
+        assert response.status_code == 200
+        assert response.json() == {"q": "hello world", "tag": "a+b"}
+
+        # httpx encodes a space in params as `+` and a `+` as `%2B`.
+        response = client.get("/search", params={"q": "x y", "tag": "c+d"})
+        assert response.status_code == 200
+        assert response.json() == {"q": "x y", "tag": "c+d"}
+
+        # A `+` in the path is a literal `+`.
+        response = client.get("/items/a+b")
+        assert response.status_code == 200
+        assert response.json() == {"name": "a+b"}
+
+
+@pytest.mark.parametrize(
+    "query_string",
+    [
+        "q=hello+world&tag=a%2Bb&text=a%26b%3Dc",
+        "bad=%FF&cut=%E2%82&surrogate=%ED%A0%80&mixed=a+%FF",
+        "=v&flag&&a=1&a=2&",
+        "n=+5&k%20ey=v%20al&%zz=1&%=2&caf%C3%A9=%C3%A9",
+    ],
+)
+def test_query_matches_django_querydict(query_string):
+    """`request.query` holds what Django `QueryDict` gives, with the last value of a repeated key."""
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(request):
+        return dict(request.query)
+
+    with TestClient(api) as client:
+        response = client.get(f"/query?{query_string}")
+
+    assert response.status_code == 200
+    assert response.json() == {key: values[-1] for key, values in QueryDict(query_string).lists()}
 
 
 def test_post_with_body():
@@ -146,3 +201,65 @@ def test_status_code():
         response = client.post("/created")
         assert response.status_code == 201
         assert response.json() == {"created": True}
+
+
+def _percent_encoded_path_api():
+    api = BoltAPI()
+
+    @api.get("/int/{value}")
+    async def get_int(value: int):
+        return {"value": value}
+
+    @api.get("/str/{value}")
+    async def get_str(value: str):
+        return {"value": value}
+
+    return api
+
+
+def test_percent_encoded_path_params():
+    """The client sends the encoded path, and Bolt decodes path params as in production."""
+    with TestClient(_percent_encoded_path_api()) as client:
+        response = client.get("/int/%0A")
+        assert response.status_code == 422
+
+        response = client.get("/str/hello%20world")
+        assert response.status_code == 200
+        assert response.json() == {"value": "hello world"}
+
+        response = client.get("/str/a%2Fb")
+        assert response.status_code == 200
+        assert response.json() == {"value": "a/b"}
+
+
+def test_invalid_utf8_path_param_passes_through():
+    """A path param that does not decode to UTF-8 stays percent-encoded, as in Django."""
+    with TestClient(_percent_encoded_path_api()) as client:
+        response = client.get("/str/a%FFb")
+        assert response.status_code == 200
+        assert response.json() == {"value": "a%FFb"}
+
+
+def test_percent_encoded_path_params_async_client():
+    """AsyncTestClient sends the encoded path too."""
+
+    async def run():
+        async with AsyncTestClient(_percent_encoded_path_api()) as client:
+            bad = await client.get("/int/%09")
+            spaced = await client.get("/str/hello%20world")
+            return bad.status_code, spaced.status_code, spaced.json()
+
+    assert asyncio.run(run()) == (422, 200, {"value": "hello world"})
+
+
+def test_invalid_uri_raises_value_error():
+    """The Rust test backend rejects a URI that is not valid, and does not panic."""
+    with TestClient(_percent_encoded_path_api()) as client, pytest.raises(ValueError, match="Invalid request URI"):
+        _core.test_request(
+            app_id=client.app_id,
+            method="GET",
+            path="/int/\n",
+            headers=[],
+            body=b"",
+            query_string=None,
+        )

@@ -61,6 +61,11 @@ pub struct AuthContext {
     pub is_staff: bool,
     pub is_superuser: bool,
     pub backend: String,
+    /// Position of the authenticating backend in the route's backend list.
+    /// Two backends can have the same scheme name (two JWT secrets), so
+    /// Python finds the per-backend revocation handler and user loader by
+    /// this position. `None` when no route backend list made the context.
+    pub backend_index: Option<usize>,
     pub claims: Option<Claims>,
     pub permissions: HashSet<String>,
     /// The credential that actually authenticated this request came from a
@@ -86,6 +91,7 @@ impl AuthContext {
             is_staff,
             is_superuser,
             backend: backend.to_string(),
+            backend_index: None,
             claims: Some(claims),
             permissions,
             cookie_csrf,
@@ -105,6 +111,7 @@ impl AuthContext {
             is_staff: false,
             is_superuser: false,
             backend: "api_key".to_string(),
+            backend_index: None,
             claims: None,
             permissions,
             cookie_csrf: false,
@@ -230,9 +237,12 @@ pub enum AuthBackend {
         /// Clock-skew tolerance (seconds) for `exp`/`nbf`.
         leeway: i64,
         /// Expected `typ` claim. `Some(t)` requires the token to carry
-        /// exactly `typ == t` (e.g. a rotation endpoint sets "refresh").
-        /// `None` (normal access routes) rejects `typ == "refresh"` so a
-        /// refresh token can never authenticate a regular endpoint.
+        /// exactly `typ == t` (e.g. a rotation endpoint sets "refresh"),
+        /// and no other token type claim that disagrees. `None` (normal
+        /// access routes) rejects a token whose `typ`, `token_type` or
+        /// `token_use` names a refresh or ID token (see
+        /// `NON_ACCESS_TOKEN_TYPES`), so such a token can never
+        /// authenticate a regular endpoint.
         token_type: Option<String>,
         /// Require a non-empty JWT ID claim, even without a Python
         /// revocation handler.
@@ -330,54 +340,55 @@ pub fn build_jwks_key_source(jwks_json: &str) -> Result<JwtKeySource, String> {
     Ok(JwtKeySource::Jwks(keys))
 }
 
-/// Authenticate using configured backends and return AuthContext
-/// Returns None if no authentication was successful
+/// Authenticate using configured backends and return AuthContext.
+/// Returns None if no authentication was successful. The context records
+/// the position of the backend that accepted the credential.
 pub fn authenticate(
     headers: &AHashMap<String, String>,
     backends: &[AuthBackend],
 ) -> Option<AuthContext> {
-    for backend in backends {
-        match backend {
-            AuthBackend::JWT {
-                keys,
-                algorithms,
-                header,
-                cookie,
-                audience,
-                issuer,
-                leeway,
-                token_type,
-                require_jti,
-                cookie_csrf,
-            } => {
-                if let Some(ctx) = try_jwt_auth(
-                    headers,
-                    keys,
-                    algorithms,
-                    header,
-                    cookie.as_deref(),
-                    audience.as_deref(),
-                    issuer.as_deref(),
-                    *leeway,
-                    token_type.as_deref(),
-                    *require_jti,
-                    cookie.is_some() && *cookie_csrf,
-                ) {
-                    return Some(ctx);
-                }
-            }
-            AuthBackend::APIKey {
-                api_keys,
-                header,
-                key_permissions,
-            } => {
-                if let Some(ctx) = try_api_key_auth(headers, api_keys, header, key_permissions) {
-                    return Some(ctx);
-                }
-            }
-        }
+    backends.iter().enumerate().find_map(|(index, backend)| {
+        let mut ctx = authenticate_with(headers, backend)?;
+        ctx.backend_index = Some(index);
+        Some(ctx)
+    })
+}
+
+fn authenticate_with(
+    headers: &AHashMap<String, String>,
+    backend: &AuthBackend,
+) -> Option<AuthContext> {
+    match backend {
+        AuthBackend::JWT {
+            keys,
+            algorithms,
+            header,
+            cookie,
+            audience,
+            issuer,
+            leeway,
+            token_type,
+            require_jti,
+            cookie_csrf,
+        } => try_jwt_auth(
+            headers,
+            keys,
+            algorithms,
+            header,
+            cookie.as_deref(),
+            audience.as_deref(),
+            issuer.as_deref(),
+            *leeway,
+            token_type.as_deref(),
+            *require_jti,
+            cookie.is_some() && *cookie_csrf,
+        ),
+        AuthBackend::APIKey {
+            api_keys,
+            header,
+            key_permissions,
+        } => try_api_key_auth(headers, api_keys, header, key_permissions),
     }
-    None
 }
 
 /// Find a cookie value by name in a raw Cookie header string.
@@ -408,6 +419,31 @@ struct TokenHeader {
     alg: String,
     #[serde(default)]
     kid: Option<String>,
+}
+
+/// Claims other than `typ` that name the token type: `token_type`
+/// (djangorestframework-simplejwt) and `token_use` (django-allauth, AWS Cognito).
+const OTHER_TOKEN_TYPE_CLAIMS: [&str; 2] = ["token_type", "token_use"];
+
+/// Token types that never authenticate a route with no expected token type,
+/// compared without case: refresh tokens (`refresh`; Keycloak `Refresh` and
+/// `Offline`) and ID tokens (AWS Cognito `id`; Keycloak `ID`).
+const NON_ACCESS_TOKEN_TYPES: [&str; 3] = ["refresh", "offline", "id"];
+
+fn is_non_access_token_type(token_type: &str) -> bool {
+    NON_ACCESS_TOKEN_TYPES
+        .iter()
+        .any(|name| token_type.eq_ignore_ascii_case(name))
+}
+
+/// The token types that the claims declare: `typ`, then each string value of
+/// [`OTHER_TOKEN_TYPE_CLAIMS`].
+fn declared_token_types(claims: &Claims) -> impl Iterator<Item = &str> {
+    claims.typ.as_deref().into_iter().chain(
+        OTHER_TOKEN_TYPE_CLAIMS
+            .iter()
+            .filter_map(|name| claims.extra.get(*name).and_then(serde_json::Value::as_str)),
+    )
 }
 
 /// Decode and validate a JWT against a prebuilt key and algorithm allowlist.
@@ -475,17 +511,21 @@ fn decode_and_validate(
     };
 
     // Token-type separation (symmetric enforcement): an expected type must
-    // match exactly; routes with no expectation never accept refresh tokens.
+    // match `typ` exactly; routes with no expectation never accept refresh
+    // or ID tokens. Other issuers name the type in other claims, so each of
+    // those counts too: such a token never passes as an access token.
     match token_type {
         Some(expected) => {
-            if claims.typ.as_deref() != Some(expected) {
-                log::debug!("JWT rejected: typ claim does not match expected token type");
+            if claims.typ.as_deref() != Some(expected)
+                || declared_token_types(&claims).any(|t| t != expected)
+            {
+                log::debug!("JWT rejected: token type claims do not match expected token type");
                 return None;
             }
         }
         None => {
-            if claims.typ.as_deref() == Some("refresh") {
-                log::debug!("JWT rejected: refresh token used on an access route");
+            if declared_token_types(&claims).any(is_non_access_token_type) {
+                log::debug!("JWT rejected: refresh or ID token used on an access route");
                 return None;
             }
         }
@@ -629,6 +669,7 @@ pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: P
     let _ = dict.set_item(intern!(py, "is_staff"), auth_ctx.is_staff);
     let _ = dict.set_item(intern!(py, "is_superuser"), auth_ctx.is_superuser);
     let _ = dict.set_item(intern!(py, "auth_backend"), &auth_ctx.backend);
+    set_if_some!(dict, py, "auth_backend_index", auth_ctx.backend_index);
 
     if !auth_ctx.permissions.is_empty() {
         let perms: Vec<&String> = auth_ctx.permissions.iter().collect();
@@ -986,6 +1027,132 @@ mod tests {
     }
 
     #[test]
+    fn non_access_token_types_rejected_on_access_route_without_case() {
+        // Keycloak: typ Refresh, Offline, ID. AWS Cognito: token_use id.
+        for (claim, value) in [
+            ("typ", "Refresh"),
+            ("typ", "Offline"),
+            ("typ", "ID"),
+            ("token_use", "id"),
+            ("token_type", "REFRESH"),
+        ] {
+            let json = format!(
+                r#"{{"sub":"42","exp":{},"{}":"{}"}}"#,
+                future_exp(),
+                claim,
+                value
+            );
+            let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
+            assert!(
+                decode_and_validate(
+                    &token,
+                    &hs256_key(),
+                    &[Algorithm::HS256],
+                    None,
+                    None,
+                    60,
+                    None
+                )
+                .is_none(),
+                "{claim}:{value} must never authenticate a route with no expected token type"
+            );
+        }
+        // Keycloak access tokens carry typ Bearer.
+        let json = format!(r#"{{"sub":"42","exp":{},"typ":"Bearer"}}"#, future_exp());
+        let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            None
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn refresh_type_in_any_type_claim_rejected_on_access_route() {
+        for claim in ["typ", "token_type", "token_use"] {
+            let refresh_json = format!(
+                r#"{{"sub":"42","exp":{},"{}":"refresh"}}"#,
+                future_exp(),
+                claim
+            );
+            let refresh = sign_token(r#"{"alg":"HS256"}"#, &refresh_json, Algorithm::HS256);
+            let access_json = format!(
+                r#"{{"sub":"42","exp":{},"{}":"access"}}"#,
+                future_exp(),
+                claim
+            );
+            let access = sign_token(r#"{"alg":"HS256"}"#, &access_json, Algorithm::HS256);
+
+            assert!(
+                decode_and_validate(
+                    &refresh,
+                    &hs256_key(),
+                    &[Algorithm::HS256],
+                    None,
+                    None,
+                    60,
+                    None
+                )
+                .is_none(),
+                "{claim}:\"refresh\" must never authenticate a route with no expected token type"
+            );
+            assert!(
+                decode_and_validate(
+                    &access,
+                    &hs256_key(),
+                    &[Algorithm::HS256],
+                    None,
+                    None,
+                    60,
+                    None
+                )
+                .is_some(),
+                "{claim}:\"access\" authenticates a route with no expected token type"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_token_type_rejects_a_conflicting_type_claim() {
+        let json = format!(
+            r#"{{"sub":"42","exp":{},"typ":"refresh","token_use":"access"}}"#,
+            future_exp()
+        );
+        let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            Some("refresh")
+        )
+        .is_none());
+        // An expected type still needs `typ`: another type claim alone is not enough.
+        let json = format!(
+            r#"{{"sub":"42","exp":{},"token_type":"refresh"}}"#,
+            future_exp()
+        );
+        let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
+        assert!(decode_and_validate(
+            &token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            None,
+            None,
+            60,
+            Some("refresh")
+        )
+        .is_none());
+    }
+
+    #[test]
     fn token_type_expectation_enforced_both_ways() {
         let refresh_json = format!(r#"{{"sub":"42","exp":{},"typ":"refresh"}}"#, future_exp());
         let refresh = sign_token(r#"{"alg":"HS256"}"#, &refresh_json, Algorithm::HS256);
@@ -1094,5 +1261,90 @@ mod tests {
             None
         )
         .is_none());
+    }
+
+    fn hs256_backend(secret: &str) -> AuthBackend {
+        AuthBackend::JWT {
+            keys: JwtKeySource::Static(DecodingKey::from_secret(secret.as_bytes())),
+            algorithms: vec![Algorithm::HS256],
+            header: "authorization".to_string(),
+            cookie: None,
+            audience: None,
+            issuer: None,
+            leeway: 0,
+            token_type: None,
+            require_jti: false,
+            cookie_csrf: false,
+        }
+    }
+
+    fn bearer_headers(secret: &str) -> AHashMap<String, String> {
+        let claims = format!(r#"{{"sub":"42","exp":{}}}"#, future_exp());
+        let message = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256"}"#),
+            URL_SAFE_NO_PAD.encode(claims)
+        );
+        let signature = crypto::sign(
+            message.as_bytes(),
+            &EncodingKey::from_secret(secret.as_bytes()),
+            Algorithm::HS256,
+        )
+        .unwrap();
+        let mut headers = AHashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            format!("Bearer {message}.{signature}"),
+        );
+        headers
+    }
+
+    #[test]
+    fn authenticate_records_the_position_of_the_accepting_backend() {
+        // Both backends have the scheme name "jwt". Only the position tells
+        // Python which backend accepted the token.
+        let backends = [hs256_backend("secret-a"), hs256_backend("secret-b")];
+
+        let first = authenticate(&bearer_headers("secret-a"), &backends).unwrap();
+        assert_eq!(
+            (first.backend.as_str(), first.backend_index),
+            ("jwt", Some(0))
+        );
+
+        let second = authenticate(&bearer_headers("secret-b"), &backends).unwrap();
+        assert_eq!(
+            (second.backend.as_str(), second.backend_index),
+            ("jwt", Some(1))
+        );
+
+        assert!(authenticate(&bearer_headers("secret-c"), &backends).is_none());
+    }
+
+    #[test]
+    fn authenticate_records_the_position_of_an_api_key_backend() {
+        let backends = [
+            hs256_backend("secret-a"),
+            AuthBackend::APIKey {
+                api_keys: HashSet::from(["key-1".to_string()]),
+                header: "x-api-key".to_string(),
+                key_permissions: HashMap::new(),
+            },
+        ];
+        let mut headers = AHashMap::new();
+        headers.insert("x-api-key".to_string(), "key-1".to_string());
+
+        let ctx = authenticate(&headers, &backends).unwrap();
+        assert_eq!(
+            (ctx.backend.as_str(), ctx.backend_index),
+            ("api_key", Some(1))
+        );
+    }
+
+    #[test]
+    fn contexts_made_outside_a_backend_list_have_no_position() {
+        assert_eq!(
+            AuthContext::from_api_key("k", &HashMap::new()).backend_index,
+            None
+        );
     }
 }

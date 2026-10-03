@@ -173,6 +173,40 @@ export DJANGO_BOLT_MAX_PARAM_LENGTH=65536
 
 This value is read once at startup (first access) and then cached. Missing, empty, non-integer, or `0` values are ignored and the default is used.
 
+### DJANGO_BOLT_ORM_THREADS
+
+Number of threads in the ORM pool of each process. Django-Bolt evaluates the QuerySets that async handlers return on this pool. `await request.auser()` also loads the user on this pool.
+
+```bash
+export DJANGO_BOLT_ORM_THREADS=8
+```
+
+**Default:** `1` when every database is SQLite, otherwise `4`.
+
+Each thread holds one database connection. Increase the value when one free-threaded process runs many worker threads. See [Size the database thread pools](../getting-started/deployment.md#size-the-database-thread-pools). An invalid value logs a warning, and the default applies. A value below `1` gives a pool of one thread.
+
+### DJANGO_BOLT_LANE_IDLE_SECONDS
+
+Idle time, in seconds, after which a request lane closes its database connections and stops. Routes with Django middleware use request lanes. See [Request lanes](../topics/middleware.md#request-lanes).
+
+```bash
+export DJANGO_BOLT_LANE_IDLE_SECONDS=30
+```
+
+**Default:** `10`. A fraction such as `0.5` is valid. An invalid value or a value that is not positive gives the default.
+
+### DJANGO_BOLT_EXECUTOR_THREADS
+
+Number of threads in the shared executor pool of each process. Blocking sync handlers and `sync_to_thread` calls run on this pool.
+
+```bash
+export DJANGO_BOLT_EXECUTOR_THREADS=16
+```
+
+**Default:** CPU count + 4, maximum `32`.
+
+An invalid value logs a warning, and the default applies. A value below `1` gives a pool of one thread.
+
 ## File serving settings
 
 ### BOLT_ALLOWED_FILE_PATHS
@@ -294,16 +328,10 @@ BOLT_EMIT_SIGNALS = True
 
 Django-Bolt disables signals by default for maximum performance. Enable this setting when:
 
-- Using `CONN_MAX_AGE` with a value other than `None` (required for connection recycling)
-- Using third-party packages that depend on request signals (e.g., django-debug-toolbar)
+- Using third-party packages that depend on request signals (e.g. django-debug-toolbar)
 - Implementing custom signal receivers for request lifecycle events
 
-!!! warning "Required for CONN_MAX_AGE"
-    If you set `CONN_MAX_AGE=600` (or any non-None value), you **must** enable signals for Django to properly close old connections:
-    ```python
-    CONN_MAX_AGE = 600
-    BOLT_EMIT_SIGNALS = True  # Required!
-    ```
+`CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` do not need signals. Bolt runs Django's connection check on the executor thread before each call when a database sets a positive `CONN_MAX_AGE` or `CONN_HEALTH_CHECKS`. With neither set, Bolt runs the check only after a call raises. A connection that the database closed then fails one request, and the next one reconnects. See [Database Connection Management](../topics/signals.md#database-connection-management).
 
 See [Django Signals](../topics/signals.md) for detailed documentation.
 
@@ -352,7 +380,7 @@ The `runbolt` management command accepts these options:
 |--------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8000` | Bind port |
-| `--workers` | `1` | Workers per process |
+| `--workers` | `1`, or the CPU count on free-threaded Python | Actix worker threads per process. Each thread runs Python handlers. |
 | `--processes` | `1` | Number of processes |
 | `--dev` | off | Enable auto-reload |
 | `--no-admin` | off | Disable admin integration |
@@ -456,3 +484,6 @@ api = BoltAPI(
 | `BOLT_AUTHENTICATION_CLASSES` | `list` | `[]` | Default authentication backends |
 | `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |
 | `DJANGO_BOLT_MAX_PARAM_LENGTH` | `int` (env var) | `8192` | Max path/query/form parameter size in bytes, clamped to `1048576` (1 MB); requests over the limit return `422` |
+| `DJANGO_BOLT_ORM_THREADS` | `int` (env var) | `1` (SQLite) or `4` | Threads in the ORM pool of each process |
+| `DJANGO_BOLT_LANE_IDLE_SECONDS` | `float` (env var) | `10` | Idle time after which a request lane stops |
+| `DJANGO_BOLT_EXECUTOR_THREADS` | `int` (env var) | CPU count + 4 (max `32`) | Threads in the shared executor pool of each process |

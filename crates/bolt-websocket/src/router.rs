@@ -66,6 +66,11 @@ impl WebSocketRouter {
         Ok(())
     }
 
+    /// Find the route for `path` and its path parameters.
+    ///
+    /// The values are URL-decoded with the same code as for HTTP routes, so
+    /// `/ws/rooms/hello%20world` gives `hello world`. The server and the test
+    /// backend both use this lookup.
     pub fn find(&self, path: &str) -> Option<(&WebSocketRoute, AHashMap<String, String>)> {
         // O(1) static route lookup first
         if let Some(route) = self.static_routes.get(path) {
@@ -79,6 +84,7 @@ impl WebSocketRouter {
                 for (key, value) in matched.params.iter() {
                     params.insert(key.to_string(), value.to_string());
                 }
+                bolt_core::router::decode_path_params(&mut params);
                 return Some((matched.value, params));
             }
         }

@@ -1,21 +1,28 @@
-//! Process-lived asyncio facade for worker-local HTTP dispatch.
+//! Per-worker-thread asyncio facade for Bolt's HTTP dispatch.
 //!
-//! Python Tasks and Futures use one stable loop identity.  A Tokio pump owns
-//! the ready queue independently of request futures, so detached tasks keep
-//! running after their originating response has completed.
+//! Every Actix worker thread binds its own `WorkerLoop` at startup
+//! (`bind_thread_loop`). A Tokio pump task on that same thread owns the
+//! loop's ready queue, so the callbacks of one loop never run on two OS
+//! threads at once, and N worker threads drive N loops in parallel on a
+//! free-threaded interpreter. Entry points that are not Actix workers
+//! (TestClient, MCP transports on the shared Tokio runtime) use one shared
+//! loop whose pump task migrates between runtime threads. A pump runs
+//! independently of request futures, so detached tasks keep running after
+//! their originating response has completed.
 
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 #[cfg(unix)]
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[cfg(unix)]
 mod worker_fd;
 
 use once_cell::sync::OnceCell;
 
-/// The startup/selector loop. Bolt route coroutines run on the WorkerLoop
+/// The startup/selector loop. Bolt route coroutines run on a WorkerLoop
 /// instead (see `worker_task_locals`); this loop backs the WorkerLoop's
 /// delegated selector work and mounted ASGI apps.
 pub static TASK_LOCALS: OnceCell<pyo3_async_runtimes::TaskLocals> = OnceCell::new();
@@ -25,8 +32,19 @@ static WORKER_DISPATCH_START: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_DISPATCH_START_CANCELLABLE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_SYNC_DISPATCH: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static WORKER_HANDLE_FAILED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static WORKER_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-static WORKER_SERVICE: std::sync::OnceLock<WorkerLoopService> = std::sync::OnceLock::new();
+
+/// The loop for every thread without a bound loop of its own. Its pump task
+/// lives in whichever Tokio runtime first calls `current_loop`, but the
+/// static is process-level, so every such entry point (TestClient, MCP)
+/// must share one process-lived runtime — if that runtime were torn down,
+/// every later `call_soon` would fail with "worker asyncio loop is
+/// unavailable" with no recovery path.
+static SHARED_LOOP: PyOnceLock<Arc<WorkerLoop>> = PyOnceLock::new();
+
+thread_local! {
+    /// The loop bound to this Actix worker thread by `bind_thread_loop`.
+    static THREAD_LOOP: std::cell::OnceCell<Arc<WorkerLoop>> = const { std::cell::OnceCell::new() };
+}
 
 #[cfg(unix)]
 static SIGNAL_WATCHERS: std::sync::LazyLock<
@@ -42,33 +60,112 @@ pub enum WorkerLoopCommand {
     Ready(crate::worker_fd::Ready),
 }
 
-struct WorkerLoopService {
+/// One asyncio loop and the Tokio pump that services it.
+///
+/// Every Python coroutine belonging to a Bolt route — HTTP dispatch,
+/// streaming response generators, WebSocket handlers — runs on the
+/// WorkerLoop of the thread that accepted it, so a coroutine resumes on that
+/// same thread and loop-bound objects created by one request stay valid for
+/// later requests on that thread. Rust-pumped loops accept `call_soon` from
+/// any thread, so a future resolved cross-thread still wakes its own loop.
+///
+/// Rust outside this module reaches a loop through `current_loop` and
+/// `worker_task_locals`. The one deliberate exception is
+/// `asgi_http::submit_to_event_loop`: mounted ASGI apps stay on the
+/// startup/selector loop (`TASK_LOCALS`), so they cannot share asyncio
+/// primitives with Bolt handlers.
+pub struct WorkerLoop {
+    loop_obj: Py<PyAny>,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
     #[cfg(unix)]
-    runtime: tokio::runtime::Handle,
-    #[cfg(unix)]
-    fd_watchers: crate::worker_fd::FdWatchers,
+    fd_watchers: Arc<crate::worker_fd::FdWatchers>,
+    task_locals: PyOnceLock<pyo3_async_runtimes::TaskLocals>,
 }
 
-impl WorkerLoopService {
-    /// Invariant: the pump task lives in whichever Tokio runtime first calls
-    /// this, but the statics are process-level. Every entry point (server and
-    /// TestClient) must therefore share one process-lived runtime — if that
-    /// runtime were torn down, every later `call_soon` would fail with
-    /// "worker asyncio loop is unavailable" with no recovery path.
-    fn get() -> &'static Self {
-        WORKER_SERVICE.get_or_init(|| {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            tokio::spawn(run_ready_queue(tx.clone(), rx));
-            Self {
-                tx,
+impl WorkerLoop {
+    /// Create a loop whose pump task runs on the current Tokio runtime: an
+    /// Actix worker's own current-thread runtime, or the shared multi-thread
+    /// runtime for every other entry point.
+    fn new(py: Python<'_>) -> PyResult<Arc<Self>> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "a WorkerLoop can only be created from a Tokio runtime thread",
+            )
+        })?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        #[cfg(unix)]
+        let fd_watchers = Arc::new(crate::worker_fd::FdWatchers::default());
+        let scheduler = Py::new(
+            py,
+            WorkerLoopScheduler {
+                tx: tx.clone(),
                 #[cfg(unix)]
-                runtime: tokio::runtime::Handle::current(),
+                runtime: runtime.clone(),
                 #[cfg(unix)]
-                fd_watchers: crate::worker_fd::FdWatchers::default(),
-            }
+                fd_watchers: Arc::clone(&fd_watchers),
+            },
+        )?;
+        let factory = get_worker_fn(py, &WORKER_LOOP_FACTORY, "make_worker_loop")?;
+        let loop_obj = factory.call1(py, (scheduler,))?;
+        let worker_loop = Arc::new(Self {
+            loop_obj,
+            tx,
+            #[cfg(unix)]
+            fd_watchers,
+            task_locals: PyOnceLock::new(),
+        });
+        runtime.spawn(run_ready_queue(Arc::clone(&worker_loop), rx));
+        Ok(worker_loop)
+    }
+
+    /// The Python `WorkerLoop` instance.
+    pub fn loop_obj(&self) -> &Py<PyAny> {
+        &self.loop_obj
+    }
+
+    /// TaskLocals bound to this loop, for Rust code that schedules Python
+    /// coroutines or resolves Python futures on it (e.g. the streaming
+    /// forwarder and its backpressure futures).
+    ///
+    /// The context is a copy of the startup one. Python does not let two
+    /// threads enter one `Context` at the same time, so each loop needs its
+    /// own. A `copy_context()` here would copy the context of the request
+    /// that streams first, and keep its contextvars for the process lifetime.
+    pub fn task_locals(&self, py: Python<'_>) -> PyResult<&pyo3_async_runtimes::TaskLocals> {
+        self.task_locals.get_or_try_init(py, || {
+            let startup = TASK_LOCALS.get().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
+            })?;
+            let context = startup.context(py).call_method0("copy")?;
+            Ok(
+                pyo3_async_runtimes::TaskLocals::new(self.loop_obj.bind(py).clone())
+                    .with_context(context),
+            )
         })
     }
+}
+
+/// Bind a WorkerLoop to the calling thread. Idempotent. The server calls
+/// this from the Actix app factory, which runs once on every worker thread
+/// at startup, inside that worker's runtime.
+pub fn bind_thread_loop(py: Python<'_>) -> PyResult<()> {
+    THREAD_LOOP.with(|slot| {
+        if slot.get().is_none() {
+            let worker_loop = WorkerLoop::new(py)?;
+            let _ = slot.set(worker_loop);
+        }
+        Ok(())
+    })
+}
+
+/// The calling thread's bound loop, or the shared loop for every other thread.
+pub fn current_loop(py: Python<'_>) -> PyResult<Arc<WorkerLoop>> {
+    if let Some(worker_loop) = THREAD_LOOP.with(|slot| slot.get().cloned()) {
+        return Ok(worker_loop);
+    }
+    SHARED_LOOP
+        .get_or_try_init(py, || WorkerLoop::new(py))
+        .map(Arc::clone)
 }
 
 fn get_worker_fn<'py>(
@@ -84,48 +181,9 @@ fn get_worker_fn<'py>(
     })
 }
 
-/// The process-lived WorkerLoop. Every Python coroutine belonging to a Bolt
-/// route — HTTP dispatch, streaming response generators, WebSocket handlers —
-/// must run here, so that futures, queues, and locks shared between handlers
-/// always live on one loop. A coroutine driven on the selector loop instead
-/// would deadlock the moment a WorkerLoop-dispatched handler resolves one of
-/// its futures (asyncio wakes waiters via a same-loop `call_soon`).
-///
-/// Rust outside this module reaches the loop through `worker_task_locals`.
-/// The one deliberate exception is `asgi_http::submit_to_event_loop`: mounted
-/// ASGI apps stay on the startup/selector loop (`TASK_LOCALS`), so they
-/// cannot share asyncio primitives with Bolt handlers.
-fn get_loop(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
-    WORKER_LOOP.get_or_try_init(py, || {
-        let scheduler = Py::new(
-            py,
-            WorkerLoopScheduler {
-                tx: WorkerLoopService::get().tx.clone(),
-            },
-        )?;
-        let factory = get_worker_fn(py, &WORKER_LOOP_FACTORY, "make_worker_loop")?;
-        factory.call1(py, (scheduler,)).map(Into::into)
-    })
-}
-
-/// TaskLocals bound to the WorkerLoop, for Rust code that schedules Python
-/// coroutines or resolves Python futures on the HTTP dispatch loop
-/// (e.g. the streaming forwarder and its backpressure futures).
-///
-/// The context is the startup one, not a fresh `copy_context()`: this snapshot
-/// is initialized lazily from whichever request first streams or upgrades, and
-/// is then inherited by every stream/WebSocket task for the process lifetime —
-/// so copying here would pin that request's contextvars forever.
-pub fn worker_task_locals(py: Python<'_>) -> PyResult<&'static pyo3_async_runtimes::TaskLocals> {
-    static WORKER_TASK_LOCALS: PyOnceLock<pyo3_async_runtimes::TaskLocals> = PyOnceLock::new();
-    WORKER_TASK_LOCALS.get_or_try_init(py, || {
-        let event_loop = get_loop(py)?.bind(py).clone();
-        // `get_loop` already errored if TASK_LOCALS was unset.
-        let startup = TASK_LOCALS.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
-        })?;
-        Ok(pyo3_async_runtimes::TaskLocals::new(event_loop).with_context(startup.context(py)))
-    })
+/// TaskLocals of the calling thread's WorkerLoop (see `WorkerLoop::task_locals`).
+pub fn worker_task_locals(py: Python<'_>) -> PyResult<pyo3_async_runtimes::TaskLocals> {
+    Ok(current_loop(py)?.task_locals(py)?.clone())
 }
 
 /// Ready handles run per drain batch before the pump yields back to Tokio.
@@ -177,9 +235,9 @@ fn run_command(
 }
 
 /// `asyncio.events._get_running_loop` / `_set_running_loop`: the running
-/// loop is thread-local and the pump task can run on any Tokio worker
-/// thread, so it is installed once per drain batch and restored afterwards
-/// (other Python work on that thread must not observe a running loop).
+/// loop is thread-local and the pump thread also runs other Python work
+/// (HTTP dispatch, or for the shared loop any Tokio worker thread), so it
+/// is installed once per drain batch and restored afterwards.
 static GET_RUNNING_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static SET_RUNNING_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
@@ -194,15 +252,13 @@ fn running_loop_fn(
 }
 
 async fn run_ready_queue(
-    tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
+    worker_loop: Arc<WorkerLoop>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkerLoopCommand>,
 ) {
-    let tx = &tx;
+    let loop_obj = &worker_loop.loop_obj;
+    let tx = &worker_loop.tx;
     while let Some(first) = rx.recv().await {
         Python::attach(|py| {
-            let Ok(loop_obj) = get_loop(py) else {
-                return;
-            };
             let (Ok(get_running), Ok(set_running)) = (
                 running_loop_fn(py, &GET_RUNNING_LOOP, "_get_running_loop"),
                 running_loop_fn(py, &SET_RUNNING_LOOP, "_set_running_loop"),
@@ -302,22 +358,19 @@ pub fn worker_timer_count() -> usize {
     WORKER_TIMER_LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(unix)]
-pub fn fd_watchers() -> &'static crate::worker_fd::FdWatchers {
-    &WorkerLoopService::get().fd_watchers
-}
-
-/// Test/introspection hook: descriptor watchers whose Tokio task is still
-/// running. A watcher for a cancelled handle must exit rather than spin.
+/// Test/introspection hook: descriptor watchers of the calling thread's loop
+/// whose Tokio task is still running. A watcher for a cancelled handle must
+/// exit rather than spin.
 #[pyfunction]
-pub fn worker_fd_watcher_count() -> usize {
+pub fn worker_fd_watcher_count(py: Python<'_>) -> PyResult<usize> {
     #[cfg(unix)]
     {
-        WorkerLoopService::get().fd_watchers.live_count()
+        Ok(current_loop(py)?.fd_watchers.live_count())
     }
     #[cfg(not(unix))]
     {
-        0
+        let _ = py;
+        Ok(0)
     }
 }
 
@@ -399,6 +452,11 @@ fn run_worker_timers(rx: std::sync::mpsc::Receiver<TimerCommand>) {
 #[pyclass(frozen)]
 pub struct WorkerLoopScheduler {
     tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
+    /// Runtime that hosts this loop's descriptor watcher tasks.
+    #[cfg(unix)]
+    runtime: tokio::runtime::Handle,
+    #[cfg(unix)]
+    fd_watchers: Arc<crate::worker_fd::FdWatchers>,
 }
 
 #[pymethods]
@@ -438,9 +496,8 @@ impl WorkerLoopScheduler {
 
     #[cfg(unix)]
     fn add_reader(&self, fd: i32, handle: Py<PyAny>) -> PyResult<()> {
-        let service = WorkerLoopService::get();
-        service.fd_watchers.add(
-            &service.runtime,
+        self.fd_watchers.add(
+            &self.runtime,
             &self.tx,
             fd,
             crate::worker_fd::Direction::Read,
@@ -450,9 +507,8 @@ impl WorkerLoopScheduler {
 
     #[cfg(unix)]
     fn add_writer(&self, fd: i32, handle: Py<PyAny>) -> PyResult<()> {
-        let service = WorkerLoopService::get();
-        service.fd_watchers.add(
-            &service.runtime,
+        self.fd_watchers.add(
+            &self.runtime,
             &self.tx,
             fd,
             crate::worker_fd::Direction::Write,
@@ -462,15 +518,13 @@ impl WorkerLoopScheduler {
 
     #[cfg(unix)]
     fn remove_reader(&self, fd: i32) -> bool {
-        WorkerLoopService::get()
-            .fd_watchers
+        self.fd_watchers
             .remove(fd, crate::worker_fd::Direction::Read)
     }
 
     #[cfg(unix)]
     fn remove_writer(&self, fd: i32) -> bool {
-        WorkerLoopService::get()
-            .fd_watchers
+        self.fd_watchers
             .remove(fd, crate::worker_fd::Direction::Write)
     }
 
@@ -600,7 +654,8 @@ pub async fn dispatch(dispatch: Py<PyAny>, request: Py<PyAny>) -> PyResult<Py<Py
             },
         )?;
         let start = get_worker_fn(py, &WORKER_DISPATCH_START, "worker_dispatch_start")?;
-        start.call1(py, (dispatch, request, get_loop(py)?, resolver))?;
+        let worker_loop = current_loop(py)?;
+        start.call1(py, (dispatch, request, worker_loop.loop_obj(), resolver))?;
         Ok::<_, PyErr>(())
     })?;
 
@@ -613,7 +668,7 @@ pub async fn dispatch(dispatch: Py<PyAny>, request: Py<PyAny>) -> PyResult<Py<Py
 }
 
 /// Holds the asyncio Task created by `worker_dispatch_start_cancellable` so a
-/// later cancellation can reach it. Filled from the WorkerLoop thread.
+/// later cancellation can reach it. Filled from the loop's pump thread.
 #[pyclass(frozen)]
 pub struct WorkerTaskHandle {
     task: std::sync::Mutex<Option<Py<PyAny>>>,
@@ -664,12 +719,13 @@ pub async fn dispatch_cancellable(
             &WORKER_DISPATCH_START_CANCELLABLE,
             "worker_dispatch_start_cancellable",
         )?;
+        let worker_loop = current_loop(py)?;
         start.call1(
             py,
             (
                 dispatch,
                 payload,
-                get_loop(py)?,
+                worker_loop.loop_obj(),
                 resolver,
                 handle.clone_ref(py),
             ),
@@ -712,5 +768,6 @@ pub fn dispatch_sync(
     request: &Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let call = get_worker_fn(py, &WORKER_SYNC_DISPATCH, "worker_sync_dispatch")?;
-    call.call1(py, (dispatch, request, get_loop(py)?))
+    let worker_loop = current_loop(py)?;
+    call.call1(py, (dispatch, request, worker_loop.loop_obj()))
 }

@@ -12,10 +12,14 @@ from __future__ import annotations
 import pytest
 from django.contrib.auth import alogin, alogout
 from django.contrib.auth.decorators import login_required, permission_required
+from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.auth.models import Permission, User
 from django.contrib.contenttypes.models import ContentType
+from django.contrib.sessions.middleware import SessionMiddleware
+from django.utils.deprecation import MiddlewareMixin
 
 from django_bolt import BoltAPI, Request
+from django_bolt.middleware import DjangoMiddleware
 from django_bolt.testing import TestClient
 
 
@@ -272,8 +276,48 @@ class TestSessionData:
             assert "b" in keys
 
 
+class _PassThroughMiddleware(MiddlewareMixin):
+    def process_request(self, request):
+        pass
+
+
 class TestSessionWithAuth:
     """Tests for session data combined with authentication."""
+
+    @pytest.mark.django_db(transaction=True)
+    def test_auser_of_a_session_user_behind_chained_wrappers(self):
+        """A wrapper after ``AuthenticationMiddleware`` must keep Django's async ``auser``.
+
+        Each wrapper copies the Django request attributes again. The session
+        user that the first copy took is then already the user of the request.
+        """
+        api = BoltAPI(
+            middleware=[
+                DjangoMiddleware(SessionMiddleware),
+                DjangoMiddleware(AuthenticationMiddleware),
+                DjangoMiddleware(_PassThroughMiddleware),
+            ]
+        )
+
+        @api.post("/login")
+        async def login(request: Request, username: str = "", password: str = ""):
+            user = await User.objects.aget(username=username)
+            await alogin(request, user)
+            return {"status": "ok"}
+
+        @api.get("/me")
+        async def me(request: Request):
+            user = await request.auser()
+            return {"authenticated": user.is_authenticated, "username": user.username}
+
+        create_test_user()
+        with TestClient(api) as client:
+            response = client.post("/login", params={"username": "sessionuser", "password": "testpass123"})
+            assert response.status_code == 200, response.text
+            response = client.get("/me")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"authenticated": True, "username": "sessionuser"}
 
     @pytest.mark.django_db(transaction=True)
     def test_session_data_with_login(self, session_api):

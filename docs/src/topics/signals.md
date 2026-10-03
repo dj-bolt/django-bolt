@@ -6,7 +6,7 @@ icon: lucide/radio
 
 Django Bolt supports optional Django signal emission for compatibility with Django ecosystem features that depend on `request_started` and `request_finished` signals.
 
-For more information on Django signals, see the [Django Signals documentation](https://docs.djangoproject.com/en/5.1/topics/signals/).
+For more information on Django signals, see the [Django Signals documentation](https://docs.djangoproject.com/en/stable/topics/signals/).
 
 ## Why Signals Are Optional
 
@@ -25,15 +25,12 @@ BOLT_EMIT_SIGNALS = True
 
 ### Database Connection Management
 
-Django Bolt disables signals by default, which means Django's automatic connection cleanup doesn't run. For async applications, Django [recommends using connection pooling](https://docs.djangoproject.com/en/5.1/ref/databases/#persistent-connections) instead of relying on signals.
+Django Bolt keeps database connections open across requests. Bolt does not need the request signals to manage them:
 
-**Recommended: Use connection pooling (no signals needed)**
+- Always: a handler, a QuerySet evaluation, or the load of `request.user` on the executor pool can raise. Bolt then runs `close_if_unusable_or_obsolete()` on that thread. Bolt drops the dead connection, and the next request reconnects. The request that met the dead connection fails: the connection looks fine until it is used. Bolt skips a connection inside an open `atomic` block. The next check after the block ends drops it.
+- With a positive `CONN_MAX_AGE` or with `CONN_HEALTH_CHECKS`: Bolt runs the same check before each executor call too. Timed recycling and health checks then work as in Django. A health check finds a dead connection before the query and replaces it, so no request fails.
 
-See [Database connections](../getting-started/deployment.md#database-connections) in the deployment guide for setup instructions.
-
-**Alternative: Enable signals for `CONN_MAX_AGE`**
-
-If you need Django's timed connection recycling:
+Neither setting is on by default. A project that sets neither gets the first tier only. After a database failover or a restart of PostgreSQL, one request on each executor thread fails. The ones after it serve. Set `CONN_HEALTH_CHECKS = True` to serve them all. With the default `CONN_MAX_AGE` of `0`, the same check closes the connection as obsolete before every call, so each call reconnects. Set a positive `CONN_MAX_AGE` as well to keep connections between calls.
 
 ```python
 # settings.py
@@ -41,14 +38,13 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": "mydb",
-        "CONN_MAX_AGE": 600,  # Close connections after 600s idle
-        "CONN_HEALTH_CHECKS": True,  # Verify connections before use
+        "CONN_MAX_AGE": 600,  # Recycle connections older than 600s
+        "CONN_HEALTH_CHECKS": True,  # Ping before the first query of a request
     }
 }
-BOLT_EMIT_SIGNALS = True  # Required for CONN_MAX_AGE to work!
 ```
 
-Django's `request_finished` signal triggers `close_old_connections()` which checks `CONN_MAX_AGE` and closes stale connections.
+The check before each call costs about 2 µs per open connection. Leave both settings unset to skip it. For PostgreSQL, a connection pool is the better option. See [Database connections](../getting-started/deployment.md#database-connections) in the deployment guide.
 
 ### Third-Party Packages
 
@@ -69,6 +65,6 @@ BOLT_EMIT_SIGNALS = True
 | Setting | Performance | Use Case |
 |---------|-------------|----------|
 | `BOLT_EMIT_SIGNALS=False` (default) | Maximum | Most APIs with connection pooling |
-| `BOLT_EMIT_SIGNALS=True` | Slight overhead | Need `CONN_MAX_AGE`, debug tools, signal receivers |
+| `BOLT_EMIT_SIGNALS=True` | Slight overhead | Debug tools, signal receivers |
 
 **Rule of thumb:** Use connection pooling and keep signals disabled unless you have a specific reason to enable them.

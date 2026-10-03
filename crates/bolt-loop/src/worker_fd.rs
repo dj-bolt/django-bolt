@@ -3,8 +3,9 @@
 //! `add_reader`/`add_writer` register the descriptor with the Tokio reactor
 //! directly, so asyncio transports, `sock_*` helpers, pipes, and drivers such
 //! as psycopg that use the selector-style fd API never leave the worker
-//! runtime. Readiness is delivered as a `WorkerLoopCommand::Ready` on the same
-//! pump that services `call_soon`, so callbacks stay FIFO with other handles.
+//! runtime. Each loop has its own registry. Readiness is delivered as a
+//! `WorkerLoopCommand::Ready` on the pump that services that loop's
+//! `call_soon`, so callbacks stay FIFO with other handles.
 //!
 //! asyncio's selector is level-triggered while Tokio's reactor is
 //! edge-triggered. After each callback the pump re-checks the descriptor with
@@ -65,7 +66,7 @@ impl FdWatchers {
     /// registration. The caller (Python) has already cancelled the previous
     /// Handle, so a readiness event still in flight for it is a no-op.
     pub fn add(
-        &self,
+        self: &Arc<Self>,
         runtime: &tokio::runtime::Handle,
         tx: &tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
         fd: RawFd,
@@ -81,7 +82,14 @@ impl FdWatchers {
             let _guard = runtime.enter();
             AsyncFd::with_interest(owned, direction.interest()).map_err(PyErr::from)?
         };
-        let task = runtime.spawn(watch(async_fd, fd, direction, Arc::new(handle), tx.clone()));
+        let task = runtime.spawn(watch(
+            async_fd,
+            fd,
+            direction,
+            Arc::new(handle),
+            tx.clone(),
+            Arc::clone(self),
+        ));
         if let Some(previous) = self
             .tasks
             .lock()
@@ -165,11 +173,13 @@ fn still_ready(fd: RawFd, direction: Direction) -> bool {
 struct Retire {
     fd: RawFd,
     direction: Direction,
+    watchers: Arc<FdWatchers>,
 }
 
 impl Drop for Retire {
     fn drop(&mut self) {
-        crate::fd_watchers().retire(self.fd, self.direction, tokio::task::id());
+        self.watchers
+            .retire(self.fd, self.direction, tokio::task::id());
     }
 }
 
@@ -179,10 +189,12 @@ async fn watch(
     direction: Direction,
     handle: Arc<Py<PyAny>>,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerLoopCommand>,
+    watchers: Arc<FdWatchers>,
 ) {
     let _retire = Retire {
         fd: key_fd,
         direction,
+        watchers,
     };
     let fd = async_fd.get_ref().as_raw_fd();
     loop {

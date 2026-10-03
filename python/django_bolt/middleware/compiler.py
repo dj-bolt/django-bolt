@@ -16,7 +16,7 @@ from django.core.exceptions import ImproperlyConfigured
 
 from ..auth.backends import get_default_authentication_classes
 from ..auth.guards import BasePermission, get_default_permission_classes
-from ..typing import is_msgspec_struct, unwrap_optional
+from ..typing import is_msgspec_struct, resolve_type_alias, unwrap_optional
 
 # Type hint constants - MUST match src/type_coercion.rs
 TYPE_INT = 1
@@ -43,8 +43,8 @@ def get_type_hint_id(annotation: Any) -> int:
     Returns:
         Type hint ID constant (TYPE_INT, TYPE_STRING, etc.)
     """
-    # Unwrap Optional[T] or T | None
-    unwrapped = unwrap_optional(annotation)
+    # Unwrap Optional[T] or T | None, and a NewType or a type alias
+    unwrapped = unwrap_optional(resolve_type_alias(annotation))
 
     # Get base type if it's a generic
     origin = get_origin(unwrapped)
@@ -54,7 +54,7 @@ def get_type_hint_id(annotation: Any) -> int:
         args = get_args(unwrapped)
         if args:
             # First arg is the actual type, rest are metadata
-            unwrapped = args[0]
+            unwrapped = unwrap_optional(resolve_type_alias(args[0]))
             origin = get_origin(unwrapped)
 
     if origin is not None:
@@ -114,6 +114,17 @@ def _compile_guard(guard: Any, method: str, path: str) -> dict[str, Any]:
     return instance.to_metadata()
 
 
+def route_auth_backends(auth: list[Any] | None) -> list[Any]:
+    """Return the auth backends that Rust gets for a route, in Rust order.
+
+    The position of a backend in this list is its identity at dispatch. Rust
+    reports it as ``auth_backend_index``. Two backends can have the same
+    scheme name, so Python must not find a backend by its scheme name.
+    """
+    backends = auth if auth is not None else get_default_authentication_classes()
+    return [backend for backend in backends if hasattr(backend, "to_metadata")]
+
+
 def compile_middleware_meta(
     handler: Callable,
     method: str,
@@ -149,17 +160,7 @@ def compile_middleware_meta(
             all_middleware.append(mw_dict)
 
     # Compile authentication backends
-    auth_backends = []
-    if auth is not None:
-        # Per-route auth override
-        for auth_backend in auth:
-            if hasattr(auth_backend, "to_metadata"):
-                auth_backends.append(auth_backend.to_metadata())
-    else:
-        # Use global default authentication classes
-        for auth_backend in get_default_authentication_classes():
-            if hasattr(auth_backend, "to_metadata"):
-                auth_backends.append(auth_backend.to_metadata())
+    auth_backends = [auth_backend.to_metadata() for auth_backend in route_auth_backends(auth)]
 
     # Compile guards/permissions
     guard_list = []
@@ -196,52 +197,71 @@ def compile_middleware_meta(
     return result
 
 
-def _extract_type_hints_from_field(field: Any, target: dict[str, int], skip_string: bool = False) -> None:
-    """Extract type hints from a field (struct or individual) into target dict.
+def _header_wire_name(name: str) -> str:
+    """Return the HTTP header name that the header extractors look up."""
+    return name.lower().replace("_", "-")
 
-    For struct fields, registers both the attribute name and the encoded name
-    (for msgspec field aliases and rename strategies).
+
+def _extract_type_hints_from_field(field: Any, claims: dict[str, tuple[str, int]]) -> None:
+    """Record the type hint of each wire key that a field reads.
+
+    Rust converts a value by the key that arrives on the wire. Thus the key is
+    the name that the extractor reads: the alias or the name, the msgspec
+    encoded name for struct fields, and the lowercase hyphen form for headers.
+    ``claims`` maps each wire key to the parameter that declared it and its type hint.
+
+    Raises:
+        TypeError: Two parameters read one wire key with different types.
+            Rust converts a wire value one time, so one of them would get the wrong type.
     """
     unwrapped = unwrap_optional(field.annotation)
     if is_msgspec_struct(unwrapped):
-        for struct_field in msgspec.structs.fields(unwrapped):
-            struct_type_hint = get_type_hint_id(struct_field.type)
-            if skip_string and struct_type_hint == TYPE_STRING:
-                continue
-            target[struct_field.name] = struct_type_hint
-            encoded_name = getattr(struct_field, "encode_name", struct_field.name)
-            if encoded_name != struct_field.name:
-                target[encoded_name] = struct_type_hint
+        entries = [
+            (f"{field.name}.{struct_field.name}", struct_field.encode_name, struct_field.type)
+            for struct_field in msgspec.structs.fields(unwrapped)
+        ]
     else:
-        type_hint = get_type_hint_id(field.annotation)
-        if skip_string and type_hint == TYPE_STRING:
-            return
-        target[field.name] = type_hint
+        entries = [(field.name, field.alias or field.name, field.annotation)]
+
+    for label, wire_name, annotation in entries:
+        key = _header_wire_name(wire_name) if field.source == "header" else wire_name
+        type_hint = get_type_hint_id(annotation)
+        owner, owner_type_hint = claims.setdefault(key, (label, type_hint))
+        if owner_type_hint != type_hint:
+            raise TypeError(
+                f"Parameters '{owner}' and '{label}' read the same {field.source} key '{key}' "
+                f"with different types. Give them the same type or different aliases."
+            )
 
 
-_SEQUENCE_ORIGINS_FOR_FORM = (list, set, frozenset, tuple)
+_SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
 
 
-def _collect_form_seq_field_names(field: Any, target: set[str]) -> None:
+def _is_sequence_annotation(annotation: Any) -> bool:
+    """True for a list, set, frozenset or tuple type, also bare or behind Optional, msgspec.Meta or an alias."""
+    inner = unwrap_optional(resolve_type_alias(annotation))
+    if get_origin(inner) is Annotated:
+        inner = unwrap_optional(resolve_type_alias(get_args(inner)[0]))
+    return (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
+
+
+def _collect_seq_field_names(field: Any, target: set[str]) -> None:
     """Collect wire-side field names whose declared type is a sequence (list/set/tuple/frozenset).
 
     Rust uses this set to always emit a Python list for those keys, even when the
-    form contained only a single occurrence — eliminating a scalar→list wrap step
-    on the Python hot path.
+    form or the query contained only a single occurrence. A repeated query key
+    then gives each of its values, not only the last one.
     """
     unwrapped = unwrap_optional(field.annotation)
     if is_msgspec_struct(unwrapped):
         for struct_field in msgspec.structs.fields(unwrapped):
-            inner = unwrap_optional(struct_field.type)
-            if get_origin(inner) in _SEQUENCE_ORIGINS_FOR_FORM:
+            if _is_sequence_annotation(struct_field.type):
                 target.add(struct_field.name)
                 encoded_name = getattr(struct_field, "encode_name", struct_field.name)
                 if encoded_name != struct_field.name:
                     target.add(encoded_name)
-    else:
-        inner = unwrap_optional(field.annotation)
-        if get_origin(inner) in _SEQUENCE_ORIGINS_FOR_FORM:
-            target.add(field.alias or field.name)
+    elif _is_sequence_annotation(field.annotation):
+        target.add(field.alias or field.name)
 
 
 def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -264,9 +284,15 @@ def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, A
     if mode == "request_only":
         return None
 
+    signature_params = handler_meta["sig"].parameters
+
     # Validate every field first; bail out entirely on anything unsupported so
     # the Python injector keeps full ownership of the route's semantics.
     for field in fields:
+        # Rust omits a missing optional keyword, so the handler's own default applies.
+        # A marker default (Query(default=1)) is not in the signature. The injector gives it.
+        if field.is_optional and signature_params[field.name].default is not field.default:
+            return None
         if field.source not in ("path", "query", "header", "cookie"):
             return None
         if not field.is_simple_type:
@@ -295,7 +321,7 @@ def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, A
         arg_kind = "keyword" if has_optional or field.kind is inspect.Parameter.KEYWORD_ONLY else "positional"
 
         if field.source == "header":
-            lookup_key = (field.alias or field.name).lower().replace("_", "-")
+            lookup_key = _header_wire_name(field.alias or field.name)
         else:
             lookup_key = field.alias or field.name
 
@@ -325,8 +351,8 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     These flags indicate which request components the handler actually needs,
     allowing Rust to skip parsing unused data.
 
-    Also extracts type hints for path and query parameters to enable
-    Rust-side type coercion (avoiding Python's convert_primitive overhead).
+    Also extracts type hints for path, query, header and cookie parameters.
+    Rust uses them to convert and validate the values before Python runs.
 
     Args:
         metadata: Existing middleware metadata dict (or None to create new)
@@ -359,22 +385,36 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
 
     # Extract type hints for all parameter sources
     # This enables Rust-side type coercion, eliminating Python overhead
-    # Format: {"param_name": type_hint_id, ...}
-    param_types: dict[str, int] = {}
-    form_type_hints: dict[str, int] = {}
+    # Format: {"wire_key": type_hint_id, ...}
+    # Each source has its own map, so a header and a query parameter with
+    # the same name do not clash. Path and query share one map in Rust.
+    param_claims: dict[str, tuple[str, int]] = {}
+    header_claims: dict[str, tuple[str, int]] = {}
+    cookie_claims: dict[str, tuple[str, int]] = {}
+    form_claims: dict[str, tuple[str, int]] = {}
     form_seq_fields: set[str] = set()
+    query_seq_fields: set[str] = set()
     file_constraints: dict[str, dict[str, Any]] = {}
 
-    fields = handler_meta.get("fields", [])
-    for field in fields:
-        # Include type hints for path, query, header, cookie
-        if field.source in ("path", "query", "header", "cookie"):
-            _extract_type_hints_from_field(field, param_types, skip_string=True)
+    # The fields of the dependencies count too. Each field goes into the claim
+    # map of its source, so two fields that read one wire key with different
+    # types fail here, whatever their Python names.
+    for field in (*handler_meta.get("fields", []), *handler_meta.get("dependency_fields", ())):
+        if field.source in ("path", "query"):
+            _extract_type_hints_from_field(field, param_claims)
+            if field.source == "query":
+                _collect_seq_field_names(field, query_seq_fields)
+
+        elif field.source == "header":
+            _extract_type_hints_from_field(field, header_claims)
+
+        elif field.source == "cookie":
+            _extract_type_hints_from_field(field, cookie_claims)
 
         # Form fields - extract type hints for Rust-side form parsing
         elif field.source == "form":
-            _extract_type_hints_from_field(field, form_type_hints, skip_string=False)
-            _collect_form_seq_field_names(field, form_seq_fields)
+            _extract_type_hints_from_field(field, form_claims)
+            _collect_seq_field_names(field, form_seq_fields)
 
         # File fields - extract constraints for Rust-side validation
         elif field.source == "file":
@@ -392,14 +432,26 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
             if constraints:
                 file_constraints[field.name] = constraints
 
-    if param_types:
-        metadata["param_types"] = param_types
+    # Rust keeps string values as they are, so leave string keys out of these maps.
+    for metadata_key, claims in (
+        ("param_types", param_claims),
+        ("header_types", header_claims),
+        ("cookie_types", cookie_claims),
+    ):
+        type_hints = {key: type_hint for key, (_, type_hint) in claims.items() if type_hint != TYPE_STRING}
+        if type_hints:
+            metadata[metadata_key] = type_hints
+
+    form_type_hints = {key: type_hint for key, (_, type_hint) in form_claims.items()}
 
     if form_type_hints:
         metadata["form_type_hints"] = form_type_hints
 
     if form_seq_fields:
         metadata["form_seq_fields"] = sorted(form_seq_fields)
+
+    if query_seq_fields:
+        metadata["query_seq_fields"] = sorted(query_seq_fields)
 
     if file_constraints:
         metadata["file_constraints"] = file_constraints
