@@ -308,6 +308,15 @@ class SchemaGenerator:
             return replace(schema, default=default)
         return Schema(all_of=[schema], default=default)
 
+    def _form_field_schema(self, annotation: Any, marker: Any, default: Any) -> Schema | Reference:
+        """The schema of one form field, with the description and the default of its marker."""
+        schema = self._type_to_schema(annotation)
+        if isinstance(schema, Schema) and marker and marker.description:
+            schema = replace(schema, description=marker.description)
+        if default not in (inspect.Parameter.empty, None):
+            schema = self._with_default(schema, default)
+        return schema
+
     @staticmethod
     def _enum_values_schema(values: list[Any] | tuple[Any, ...]) -> Schema:
         """Infer the narrowest enum schema that fits the provided values."""
@@ -979,13 +988,7 @@ class SchemaGenerator:
                                 required.append(sub_name)
                         continue
 
-                    property_schema = self._type_to_schema(annotation)
-                    marker = field.param
-                    if isinstance(property_schema, Schema) and marker and marker.description:
-                        property_schema = replace(property_schema, description=marker.description)
-                    if default not in (inspect.Parameter.empty, None):
-                        property_schema = self._with_default(property_schema, default)
-                    properties[name] = property_schema
+                    properties[name] = self._form_field_schema(annotation, field.param, default)
                     if default == inspect.Parameter.empty and not is_optional(annotation):
                         required.append(name)
 
