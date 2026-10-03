@@ -17,11 +17,15 @@ All notable changes to this project will be documented in this file.
 
 - **A `revoked_token_handler` can read the claims of the token** - A handler with two parameters gets the verified claims: `handler(jti, claims)`. A handler with one parameter still gets the `jti` only. Bolt reads the number of parameters one time, at registration. Use it to reject a token whose session ended. For example, a django-allauth access token names its session in `sid`, and allauth ends that session at logout. See [Session-bound tokens](docs/src/topics/authentication.md#session-bound-tokens-django-allauth).
 
+- **WebSocket subprotocol negotiation** - `accept(subprotocol=...)` now puts the subprotocol in the `Sec-WebSocket-Protocol` header of the `101` response. Before, Bolt dropped it, and a browser that requested a subprotocol failed the connection with close code 1006. This blocked GraphQL subscriptions (`graphql-transport-ws`), versioned protocols, `mqtt` and `stomp`. `websocket.subprotocols` and `scope["subprotocols"]` give the subprotocols that the client requested. `accept()` raises `ValueError` for a subprotocol that the client did not request, as RFC 6455 requires. `accept(headers=[...])` adds headers to the `101` response. See [Subprotocols](docs/src/topics/websocket.md#subprotocols).
+
 ### Removed
 
 - **Django 4.2, 5.0, and 5.1** - All three reached end of life upstream (5.0 in April 2025, 5.1 in December 2025, 4.2 LTS in April 2026) and are no longer supported. The minimum is now Django 5.2 LTS, and the supported series are 5.2, 6.0, and 6.1. Projects on an end-of-life Django receive no upstream security fixes; pin `django-bolt<0.12` if you cannot upgrade Django yet.
 
 ### Changed
+
+- **The WebSocket `101` response waits for `accept()`** - Bolt sent the `101` response before the handler started. It now sends it when the handler calls `accept()`. Auth, guards, origin checks and rate limits still run before the handler. A handler that calls `close()` or returns before `accept()` now refuses the handshake with HTTP `403`, as uvicorn and Daphne do. A handler that raises before `accept()` gets HTTP `500`. Before, the client got a `101` and then a close frame.
 
 - **asgiref 3.12 or later is required** - A sync read of `request.user` on the event loop runs its loader on the lane, while the loop waits. asgiref 3.11 kept a parent loop on each `async_to_sync` wrapper, from when the wrapper was made or first called. A loader that used such a wrapper then sent its coroutine to the waiting loop, and the request never answered. asgiref 3.12 finds the parent loop at each call.
 - **The CI test matrix is derived from the `pyproject.toml` classifiers** - The Django axis is now read from the `Framework :: Django :: X.Y` classifiers, as the Python axis already was. The declared support matrix and the versions actually tested can no longer disagree. A new `support-matrix` workflow checks those classifiers against [endoflife.date](https://endoflife.date) every week. It opens an issue when a series goes end of life, or when a new one ships. Run `python scripts/check_support_matrix.py` to check locally.

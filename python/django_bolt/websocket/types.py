@@ -86,6 +86,11 @@ class WebSocket:
         return self._scope.get("cookies", {})
 
     @property
+    def subprotocols(self) -> list[str]:
+        """Subprotocols that the client requested, in order of preference."""
+        return self._scope.get("subprotocols", [])
+
+    @property
     def client(self) -> tuple[str, int] | None:
         """Client address as (host, port) tuple."""
         return self._scope.get("client")
@@ -99,6 +104,11 @@ class WebSocket:
         Accept the WebSocket connection.
 
         Must be called before sending or receiving messages.
+
+        Args:
+            subprotocol: One of ``subprotocols``. The server sends it in the
+                ``Sec-WebSocket-Protocol`` header of the 101 response.
+            headers: Extra ``(name, value)`` byte pairs for the 101 response.
         """
         if self._accepted:
             return

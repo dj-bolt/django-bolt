@@ -164,6 +164,7 @@ class WebSocketTestClient:
         self._closed = False
         self._close_code: int | None = None
         self._accepted_subprotocol: str | None = None
+        self._requested_subprotocols: list[str] = []
         self._handler_task: asyncio.Task | None = None
         self._handler_exception: Exception | None = None
 
@@ -231,8 +232,10 @@ class WebSocketTestClient:
         """
         app_id = self._get_or_create_app_id()
 
-        # Build headers list for Rust
+        # Build headers list for Rust. Rust parses the subprotocols into the scope.
         headers_list = list(self.headers.items())
+        if self.subprotocols:
+            headers_list.append(("sec-websocket-protocol", ", ".join(self.subprotocols)))
 
         try:
             found, handler_id, handler, path_params, scope = _core.handle_test_websocket(
@@ -253,7 +256,6 @@ class WebSocketTestClient:
 
         # Convert scope from Rust dict to Python dict and add extras
         scope_dict = dict(scope) if scope else {}
-        scope_dict["subprotocols"] = self.subprotocols
 
         # Add auth context if provided (for Python-side guard evaluation fallback)
         if self.auth_context is not None:
@@ -270,8 +272,15 @@ class WebSocketTestClient:
         msg_type = message.get("type", "")
 
         if msg_type == "websocket.accept":
+            subprotocol = message.get("subprotocol")
+            # The server rejects a subprotocol that the client did not request (RFC 6455).
+            if subprotocol is not None and subprotocol not in self._requested_subprotocols:
+                raise ValueError(
+                    f"Subprotocol '{subprotocol}' was not requested by the client "
+                    f"(requested: {self._requested_subprotocols})"
+                )
             self._accepted = True
-            self._accepted_subprotocol = message.get("subprotocol")
+            self._accepted_subprotocol = subprotocol
 
         elif msg_type == "websocket.close":
             self._closed = True
@@ -305,6 +314,8 @@ class WebSocketTestClient:
             check = self.api._handler_middleware[handler_id]["websocket_revocation_check"]
             if await check(revocation_auth):
                 raise PermissionError("WebSocket connection denied: Token has been revoked")
+
+        self._requested_subprotocols = scope["subprotocols"]
 
         # Create WebSocket instance
         ws = WebSocket(scope, self._receive, self._send)

@@ -1553,6 +1553,13 @@ pub fn handle_test_websocket(
     }
     scope_dict.set_item("headers", headers_dict)?;
     scope_dict.set_item("path_params", &path_params_dict)?;
+    let subprotocols = bolt_websocket::requested_subprotocols(
+        headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-protocol"))
+            .map(|(_, v)| v.as_str()),
+    );
+    scope_dict.set_item("subprotocols", subprotocols)?;
 
     // Parse cookies
     let cookies_dict = pyo3::types::PyDict::new(py);

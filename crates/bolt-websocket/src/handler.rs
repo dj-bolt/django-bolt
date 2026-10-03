@@ -1,16 +1,18 @@
 //! WebSocket upgrade handler with full Python integration
 
 use actix::Addr;
+use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
+use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_web_actors::ws;
 use ahash::AHashMap;
 use futures_util::FutureExt;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::{mpsc, oneshot};
 
 use bolt_core::metadata::{CorsConfig, RouteMetadata};
 use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
@@ -26,7 +28,7 @@ use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 use super::actor::WebSocketActor;
 use super::config::WS_CONFIG;
 use super::messages::{SendToClient, WsMessage};
-use super::ACTIVE_WS_CONNECTIONS;
+use super::{ConnectionSlot, ACTIVE_WS_CONNECTIONS};
 
 /// Cached Python imports - loaded once at first WebSocket connection
 static WS_CLASS: OnceCell<Py<PyAny>> = OnceCell::new();
@@ -76,6 +78,18 @@ pub fn is_websocket_upgrade(req: &HttpRequest) -> bool {
         .unwrap_or(false)
 }
 
+/// Subprotocols that the client requests in `Sec-WebSocket-Protocol`, in order.
+///
+/// The header can occur more than once. Each value is a comma-separated list.
+pub fn requested_subprotocols<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    values
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Build scope dict for Python WebSocket handler
 ///
 /// Parses and coerces query, path, header and cookie values to typed Python
@@ -83,6 +97,7 @@ pub fn is_websocket_upgrade(req: &HttpRequest) -> bool {
 fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
+    subprotocols: &[String],
     path_params: &AHashMap<String, String>,
     route_meta: Option<&RouteMetadata>,
     max_param_length: usize,
@@ -183,6 +198,7 @@ fn build_scope(
         }
     }
     scope_dict.set_item("cookies", cookies_dict)?;
+    scope_dict.set_item("subprotocols", PyList::new(py, subprotocols)?)?;
 
     // Add client info
     if let Some(peer) = req.peer_addr() {
@@ -193,12 +209,73 @@ fn build_scope(
     Ok(scope_dict.into())
 }
 
+/// The handshake decision of the handler.
+enum Handshake {
+    /// Send the 101 response. `ready` gets the result when the actor runs.
+    Accept {
+        subprotocol: Option<String>,
+        headers: Vec<(HeaderName, HeaderValue)>,
+        ready: oneshot::Sender<()>,
+    },
+    /// Refuse the upgrade with this HTTP status.
+    Refuse(StatusCode),
+}
+
 /// Shared state for WebSocket connection - passed to Python receive/send functions
 struct WsConnectionState {
     /// Channel to receive messages from Actix actor
     from_actor_rx: tokio::sync::Mutex<mpsc::Receiver<WsMessage>>,
-    /// Actor address to send messages to client
-    actor_addr: Addr<WebSocketActor>,
+    /// Actor address to send messages to client, set on accept
+    actor_addr: OnceLock<Addr<WebSocketActor>>,
+    /// Sender of the handshake decision, taken by the first decision
+    handshake: Mutex<Option<oneshot::Sender<Handshake>>>,
+    /// Subprotocols that the client requested
+    subprotocols: Vec<String>,
+}
+
+impl WsConnectionState {
+    fn take_handshake(&self) -> Option<oneshot::Sender<Handshake>> {
+        self.handshake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Refuse the upgrade if the handler did not decide the handshake.
+    fn refuse(&self, status: StatusCode) {
+        if let Some(handshake) = self.take_handshake() {
+            let _ = handshake.send(Handshake::Refuse(status));
+        }
+    }
+
+    fn actor(&self) -> PyResult<Addr<WebSocketActor>> {
+        self.actor_addr.get().cloned().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "WebSocket is not open: call accept() before send, or the client left",
+            )
+        })
+    }
+}
+
+/// Read the `headers` of `websocket.accept`: an iterable of `[name, value]` byte pairs.
+fn accept_headers(message: &Bound<'_, PyDict>) -> PyResult<Vec<(HeaderName, HeaderValue)>> {
+    let Some(items) = message.get_item("headers")? else {
+        return Ok(Vec::new());
+    };
+    let mut headers = Vec::new();
+    for item in items.try_iter()? {
+        let item = item?;
+        let name: Vec<u8> = item.get_item(0)?.extract()?;
+        let value: Vec<u8> = item.get_item(1)?.extract()?;
+        let name = HeaderName::from_bytes(&name).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid accept header name: {}", e))
+        })?;
+        let value = HeaderValue::from_bytes(&value).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid accept header value: {}", e))
+        })?;
+        headers.push((name, value));
+    }
+    Ok(headers)
 }
 
 /// Create Python receive function that reads from channel
@@ -269,7 +346,7 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                 .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'type' key"))?
                 .extract()?;
 
-            let state = self.state.clone();
+            let state = &self.state;
 
             match msg_type.as_str() {
                 "websocket.accept" => {
@@ -277,18 +354,35 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                         .get_item("subprotocol")?
                         .map(|v| v.extract())
                         .transpose()?;
-                    let state = state.clone();
+                    // RFC 6455: the server selects one of the subprotocols of the client.
+                    if let Some(ref selected) = subprotocol {
+                        if !state.subprotocols.contains(selected) {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                                "Subprotocol '{}' was not requested by the client (requested: {:?})",
+                                selected, state.subprotocols
+                            )));
+                        }
+                    }
+                    let headers = accept_headers(message)?;
+                    let handshake = state.take_handshake().ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err(
+                            "WebSocket handshake is already complete",
+                        )
+                    })?;
+                    let (ready_tx, ready_rx) = oneshot::channel();
                     let future = pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                        state
-                            .actor_addr
-                            .send(SendToClient(WsMessage::Accept { subprotocol }))
-                            .await
-                            .map_err(|e| {
-                                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "Failed to send accept: {}",
-                                    e
-                                ))
-                            })?;
+                        // A failed send or a dropped `ready` means the client left during
+                        // the handshake. The next receive() then gives a disconnect.
+                        if handshake
+                            .send(Handshake::Accept {
+                                subprotocol,
+                                headers,
+                                ready: ready_tx,
+                            })
+                            .is_ok()
+                        {
+                            let _ = ready_rx.await;
+                        }
                         Ok(Python::attach(|py| {
                             py.None().into_pyobject(py).unwrap().unbind()
                         }))
@@ -298,10 +392,9 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                 "websocket.send" => {
                     if let Some(text) = message.get_item("text")? {
                         let text: String = text.extract()?;
-                        let state = state.clone();
+                        let actor = state.actor()?;
                         let future = pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                            state
-                                .actor_addr
+                            actor
                                 .send(SendToClient(WsMessage::SendText(text)))
                                 .await
                                 .map_err(|e| {
@@ -317,10 +410,9 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                         Ok(future.into())
                     } else if let Some(bytes) = message.get_item("bytes")? {
                         let data: Vec<u8> = bytes.extract()?;
-                        let state = state.clone();
+                        let actor = state.actor()?;
                         let future = pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                            state
-                                .actor_addr
+                            actor
                                 .send(SendToClient(WsMessage::SendBinary(data)))
                                 .await
                                 .map_err(|e| {
@@ -351,18 +443,23 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                         .map(|v| v.extract())
                         .transpose()?
                         .unwrap_or_default();
-                    let state = state.clone();
+                    let actor = state.actor_addr.get().cloned();
+                    if actor.is_none() {
+                        // Close before accept refuses the upgrade with 403, as in uvicorn.
+                        state.refuse(StatusCode::FORBIDDEN);
+                    }
                     let future = pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                        state
-                            .actor_addr
-                            .send(SendToClient(WsMessage::Close { code, reason }))
-                            .await
-                            .map_err(|e| {
-                                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "Failed to send close: {}",
-                                    e
-                                ))
-                            })?;
+                        if let Some(actor) = actor {
+                            actor
+                                .send(SendToClient(WsMessage::Close { code, reason }))
+                                .await
+                                .map_err(|e| {
+                                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                        "Failed to send close: {}",
+                                        e
+                                    ))
+                                })?;
+                        }
                         Ok(Python::attach(|py| {
                             py.None().into_pyobject(py).unwrap().unbind()
                         }))
@@ -492,6 +589,10 @@ pub async fn handle_websocket_upgrade_with_handler(
     if !is_websocket_upgrade(&req) {
         return Ok(HttpResponse::BadRequest().body("Expected WebSocket upgrade request"));
     }
+    // Check the key and version before the handler runs, as the 101 comes later.
+    if let Err(e) = ws::handshake(&req) {
+        return Err(e.into());
+    }
 
     // Refuse new connections while draining for shutdown/recycle; clients
     // that retry will land on a healthy worker via SO_REUSEPORT.
@@ -609,9 +710,8 @@ pub async fn handle_websocket_upgrade_with_handler(
         }
     }
 
-    // Increment connection counter BEFORE any fallible operations
-    // This ensures we always decrement if we fail after this point
-    ACTIVE_WS_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+    // The slot counts this connection until the handshake fails or the actor stops.
+    let slot = ConnectionSlot::acquire();
 
     // Create channels for bidirectional communication (configurable size)
     let (to_python_tx, to_python_rx) = mpsc::channel::<WsMessage>(config.channel_buffer_size);
@@ -619,14 +719,25 @@ pub async fn handle_websocket_upgrade_with_handler(
     // Route metadata holds the type hints and the sequence query keys
     let route_meta = ROUTE_METADATA.get().and_then(|m| m.get(handler_id));
 
-    // Build scope for Python - if this fails, decrement counter
+    let subprotocols = requested_subprotocols(
+        req.headers()
+            .get_all(SEC_WEBSOCKET_PROTOCOL)
+            .filter_map(|value| value.to_str().ok()),
+    );
+
+    // Build scope for Python. A bad value rejects the upgrade.
     let scope = match Python::attach(|py| {
-        build_scope(py, &req, &path_params, route_meta, state.max_param_length)
+        build_scope(
+            py,
+            &req,
+            &subprotocols,
+            &path_params,
+            route_meta,
+            state.max_param_length,
+        )
     }) {
         Ok(s) => s,
         Err(e) => {
-            // CRITICAL: Decrement counter on error to prevent resource leak
-            ACTIVE_WS_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
             return Err(actix_web::error::ErrorBadRequest(format!(
                 "Invalid request: {}",
                 e
@@ -634,34 +745,72 @@ pub async fn handle_websocket_upgrade_with_handler(
         }
     };
 
-    // Start the WebSocket actor
-    let actor = WebSocketActor::new(to_python_tx);
-
-    // Use WsResponseBuilder to start actor and get address - if this fails, decrement counter
-    let (addr, resp) = match ws::WsResponseBuilder::new(actor, &req, stream)
-        .frame_size(config.max_message_size)
-        .start_with_addr()
-    {
-        Ok(result) => result,
-        Err(e) => {
-            // CRITICAL: Decrement counter on error to prevent resource leak
-            ACTIVE_WS_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
-            return Err(actix_web::error::ErrorInternalServerError(format!(
-                "WebSocket error: {}",
-                e
-            )));
-        }
-    };
-
-    // Create shared state for Python functions
+    // The handler decides the handshake: accept sends the 101, close refuses it.
+    let (handshake_tx, handshake_rx) = oneshot::channel::<Handshake>();
     let ws_state = Arc::new(WsConnectionState {
         from_actor_rx: tokio::sync::Mutex::new(to_python_rx),
-        actor_addr: addr.clone(),
+        actor_addr: OnceLock::new(),
+        handshake: Mutex::new(Some(handshake_tx)),
+        subprotocols,
     });
 
-    // Spawn task to run Python handler using proper async integration
-    // We use catch_unwind to ensure cleanup happens even on panic
-    let ws_state_clone = ws_state.clone();
+    spawn_handler(ws_state.clone(), scope, handler, injector);
+
+    match handshake_rx.await {
+        Ok(Handshake::Accept {
+            subprotocol,
+            headers,
+            ready,
+        }) => {
+            let actor = WebSocketActor::new(to_python_tx, slot);
+            let protocols: Vec<&str> = subprotocol.as_deref().into_iter().collect();
+            let (addr, mut resp) = ws::WsResponseBuilder::new(actor, &req, stream)
+                .frame_size(config.max_message_size)
+                .protocols(&protocols)
+                .start_with_addr()
+                .map_err(|e| {
+                    actix_web::error::ErrorInternalServerError(format!("WebSocket error: {}", e))
+                })?;
+            append_headers(resp.headers_mut(), headers);
+            let _ = ws_state.actor_addr.set(addr);
+            let _ = ready.send(());
+            Ok(resp)
+        }
+        Ok(Handshake::Refuse(status)) => Ok(refusal(status)),
+        // The handler task ends with a decision, so a dropped sender is a bug.
+        Err(_) => Ok(refusal(StatusCode::INTERNAL_SERVER_ERROR)),
+    }
+}
+
+/// Add the `accept` headers of the handler to the 101 response.
+fn append_headers(target: &mut HeaderMap, headers: Vec<(HeaderName, HeaderValue)>) {
+    for (name, value) in headers {
+        target.append(name, value);
+    }
+}
+
+/// Build a refused handshake: a plain HTTP response with no upgrade headers.
+fn refusal(status: StatusCode) -> HttpResponse {
+    let detail = if status == StatusCode::FORBIDDEN {
+        r#"{"detail":"WebSocket connection refused"}"#
+    } else {
+        r#"{"detail":"WebSocket handler failed"}"#
+    };
+    HttpResponse::build(status)
+        .content_type("application/json")
+        .body(detail)
+}
+
+/// Run the Python handler on this thread's WorkerLoop.
+///
+/// The handler decides the handshake. If it ends without a decision, the
+/// upgrade gets 403 on return and 500 on error, as in uvicorn.
+fn spawn_handler(
+    ws_state: Arc<WsConnectionState>,
+    scope: Py<PyAny>,
+    handler: Py<PyAny>,
+    injector: Option<Py<PyAny>>,
+) {
     actix_web::rt::spawn(async move {
         // Wrap the entire handler execution in catch_unwind to handle panics
         let result = std::panic::AssertUnwindSafe(async {
@@ -671,8 +820,8 @@ pub async fn handle_websocket_upgrade_with_handler(
                 let ws_class = get_ws_class(py)?;
 
                 // Create receive and send functions
-                let receive_fn = create_receive_fn(py, ws_state_clone.clone())?;
-                let send_fn = create_send_fn(py, ws_state_clone.clone())?;
+                let receive_fn = create_receive_fn(py, ws_state.clone())?;
+                let send_fn = create_send_fn(py, ws_state.clone())?;
 
                 // Create WebSocket instance
                 let websocket = ws_class.call1(py, (scope.clone_ref(py), receive_fn, send_fn))?;
@@ -719,47 +868,57 @@ pub async fn handle_websocket_upgrade_with_handler(
                 pyo3_async_runtimes::into_future_with_locals(&locals, coro.bind(py).clone())
             });
 
-            match future_result {
-                Ok(future) => {
-                    if let Err(e) = future.await {
-                        eprintln!("[django-bolt] WebSocket handler error: {}", e);
-                        // Close the connection on error - this triggers actor stopped() which decrements counter
-                        let _ = addr
-                            .send(SendToClient(WsMessage::Close {
-                                code: 1011,
-                                reason: "Internal error".to_string(),
-                            }))
-                            .await;
-                    }
-                    // Normal completion - actor will be stopped when handler returns and Python closes
-                }
-                Err(e) => {
-                    eprintln!("[django-bolt] WebSocket handler setup error: {}", e);
-                    // Close the connection on setup error - this triggers actor stopped() which decrements counter
-                    let _ = addr
-                        .send(SendToClient(WsMessage::Close {
-                            code: 1011,
-                            reason: "Handler setup failed".to_string(),
-                        }))
-                        .await;
+            let error = match future_result {
+                Ok(future) => future.await.err(),
+                Err(e) => Some(e),
+            };
+            match error {
+                None => ws_state.refuse(StatusCode::FORBIDDEN),
+                Some(e) => {
+                    eprintln!("[django-bolt] WebSocket handler error: {}", e);
+                    ws_state.refuse(StatusCode::INTERNAL_SERVER_ERROR);
+                    close_with_error(&ws_state, "Internal error").await;
                 }
             }
         })
         .catch_unwind()
         .await;
 
-        // If the task panicked, ensure we close the actor to trigger cleanup
         if result.is_err() {
             eprintln!("[django-bolt] WebSocket handler task panicked - closing connection");
-            // Send close message to trigger actor stopped() which decrements counter
-            let _ = addr
-                .send(SendToClient(WsMessage::Close {
-                    code: 1011,
-                    reason: "Internal server error".to_string(),
-                }))
-                .await;
+            ws_state.refuse(StatusCode::INTERNAL_SERVER_ERROR);
+            close_with_error(&ws_state, "Internal server error").await;
         }
     });
+}
 
-    Ok(resp)
+/// Close an accepted connection with 1011. The actor stop releases the slot.
+async fn close_with_error(ws_state: &WsConnectionState, reason: &str) {
+    if let Some(addr) = ws_state.actor_addr.get() {
+        let _ = addr
+            .send(SendToClient(WsMessage::Close {
+                code: 1011,
+                reason: reason.to_string(),
+            }))
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::requested_subprotocols;
+
+    #[test]
+    fn requested_subprotocols_splits_trims_and_keeps_order() {
+        let values = ["graphql-transport-ws , graphql-ws", " ,chat.v1,"];
+        assert_eq!(
+            requested_subprotocols(values.into_iter()),
+            vec!["graphql-transport-ws", "graphql-ws", "chat.v1"]
+        );
+    }
+
+    #[test]
+    fn requested_subprotocols_is_empty_without_header() {
+        assert!(requested_subprotocols(std::iter::empty()).is_empty());
+    }
 }

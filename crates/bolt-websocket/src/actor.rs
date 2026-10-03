@@ -4,13 +4,12 @@
 
 use actix::{Actor, ActorContext, AsyncContext, Handler, StreamHandler};
 use actix_web_actors::ws;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::config::WS_CONFIG;
 use super::messages::{SendToClient, WsMessage};
-use super::ACTIVE_WS_CONNECTIONS;
+use super::ConnectionSlot;
 
 /// How often each connection polls the process-wide drain flag.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -21,8 +20,8 @@ pub struct WebSocketActor {
     hb: Instant,
     /// Channel to send received messages to Python handler
     to_python_tx: mpsc::Sender<WsMessage>,
-    /// Whether connection has been accepted
-    accepted: bool,
+    /// Count in the active connections, released when the actor drops
+    _slot: ConnectionSlot,
     /// Close code if connection was closed
     close_code: Option<u16>,
     /// Heartbeat interval (from cached config)
@@ -34,13 +33,14 @@ pub struct WebSocketActor {
 }
 
 impl WebSocketActor {
-    pub fn new(to_python_tx: mpsc::Sender<WsMessage>) -> Self {
+    /// Create the actor of an accepted connection.
+    pub(crate) fn new(to_python_tx: mpsc::Sender<WsMessage>, slot: ConnectionSlot) -> Self {
         // Use cached config - no Python/GIL access here
         let config = &*WS_CONFIG;
         WebSocketActor {
             hb: Instant::now(),
             to_python_tx,
-            accepted: false,
+            _slot: slot,
             close_code: None,
             heartbeat_interval: config.heartbeat_interval,
             client_timeout: config.client_timeout,
@@ -105,9 +105,6 @@ impl Actor for WebSocketActor {
         // Notify Python handler that connection is closed
         let code = self.close_code.unwrap_or(1000);
         let _ = self.to_python_tx.try_send(WsMessage::Disconnect { code });
-
-        // Decrement active connection counter
-        ACTIVE_WS_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -117,20 +114,9 @@ impl Handler<SendToClient> for WebSocketActor {
 
     fn handle(&mut self, msg: SendToClient, ctx: &mut Self::Context) {
         match msg.0 {
-            WsMessage::Accept { subprotocol: _ } => {
-                self.accepted = true;
-                // Accept is implicit in Actix - connection is already open
-            }
-            WsMessage::SendText(text) => {
-                if self.accepted {
-                    ctx.text(text);
-                }
-            }
-            WsMessage::SendBinary(data) => {
-                if self.accepted {
-                    ctx.binary(data);
-                }
-            }
+            // The actor exists only after the handler accepts the connection.
+            WsMessage::SendText(text) => ctx.text(text),
+            WsMessage::SendBinary(data) => ctx.binary(data),
             WsMessage::Close { code, reason } => {
                 self.close_code = Some(code);
                 ctx.close(Some(ws::CloseReason {

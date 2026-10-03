@@ -865,6 +865,8 @@ class SimpleWebSocketClient:
         self.headers = headers or {}
         self.timeout = timeout
         self.socket: socket.socket | None = None
+        # Headers of the 101 response, lowercase names.
+        self.response_headers: dict[str, str] = {}
 
     def connect(self) -> None:
         key = base64.b64encode(secrets.token_bytes(16)).decode()
@@ -907,6 +909,7 @@ class SimpleWebSocketClient:
             hashlib.sha1(f"{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11".encode()).digest()
         ).decode()
         assert accept == expected_accept, f"Unexpected Sec-WebSocket-Accept: {accept}"
+        self.response_headers = headers
         self.socket = sock
 
     def _require_socket(self) -> socket.socket:
