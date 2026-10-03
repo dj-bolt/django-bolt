@@ -99,3 +99,20 @@ def test_send_after_client_left_during_handshake_raises_disconnect(server):
         errors = server.get("/send-after-leave").json()["errors"]
         time.sleep(0.1)
     assert errors == ["WebSocketDisconnect"]
+
+
+def test_mounted_asgi_app_negotiates_subprotocol_and_headers(server):
+    with SimpleWebSocketClient(
+        server.host,
+        server.port,
+        "/mounted/chat",
+        headers={"Sec-WebSocket-Protocol": "graphql-transport-ws, graphql-ws"},
+    ) as websocket:
+        assert websocket.response_headers["sec-websocket-protocol"] == "graphql-transport-ws"
+        assert websocket.response_headers["x-mounted"] == "yes"
+        assert websocket.receive_text() == "graphql-transport-ws,graphql-ws"
+
+
+def test_mounted_asgi_app_close_before_accept_refuses_with_403(server):
+    status_line, _body = attempt_ws_upgrade(server.host, server.port, "/mounted/refuse")
+    assert " 403 " in status_line

@@ -80,3 +80,27 @@ async def slow_accept(websocket: WebSocket):
 @api.get("/send-after-leave")
 async def send_after_leave():
     return {"errors": SEND_AFTER_LEAVE}
+
+
+async def negotiating_app(scope, receive, send):
+    """Mounted ASGI app: refuses on /refuse, else accepts the first subprotocol."""
+    connect = await receive()
+    if connect["type"] != "websocket.connect":
+        raise AssertionError(f"expected websocket.connect, got {connect['type']}")
+    if scope["path"].endswith("/refuse"):
+        await send({"type": "websocket.close", "code": 1000})
+        return
+    subprotocols = scope["subprotocols"]
+    await send(
+        {
+            "type": "websocket.accept",
+            "subprotocol": subprotocols[0] if subprotocols else None,
+            "headers": [(b"x-mounted", b"yes")],
+        }
+    )
+    await send({"type": "websocket.send", "text": ",".join(subprotocols)})
+    while (await receive())["type"] != "websocket.disconnect":
+        pass
+
+
+api.mount_asgi("/mounted", negotiating_app)

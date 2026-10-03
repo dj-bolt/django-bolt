@@ -26,7 +26,7 @@ pub use actor::WebSocketActor;
 #[allow(unused_imports)] // Re-exported for external use
 pub use config::WS_CONFIG;
 pub use handler::{
-    handle_websocket_upgrade_with_handler, is_websocket_upgrade, requested_subprotocols,
+    handle_websocket_upgrade, is_websocket_upgrade, requested_subprotocols, WsTarget,
 };
 #[allow(unused_imports)] // Re-exported for external use
 pub use messages::{SendToClient, WsMessage};

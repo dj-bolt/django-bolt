@@ -203,6 +203,10 @@ class WebSocketTestClient:
         if ws_routes:
             _core.register_test_websocket_routes(self._app_id, ws_routes)
 
+        # Register ASGI mounts so an unmatched path can fall back to one
+        if self.api._asgi_mounts:
+            _core.register_test_asgi_mounts(self._app_id, list(self.api._asgi_mounts))
+
         # Register middleware metadata for guards/auth
         if self.api._handler_middleware:
             middleware_data = [(handler_id, meta) for handler_id, meta in self.api._handler_middleware.items()]
@@ -224,13 +228,13 @@ class WebSocketTestClient:
                 _core.destroy_test_app(self._app_id)
             self._app_id = None
 
-    def _find_handler_via_rust(self) -> tuple[bool, int, Callable, dict[str, Any], dict[str, Any]]:
+    def _find_handler_via_rust(self) -> tuple[bool, bool, int, Callable, dict[str, Any], dict[str, Any]]:
         """Find WebSocket handler and build scope via Rust.
 
         Routes through Rust for path matching, auth, and guard evaluation.
 
         Returns:
-            Tuple of (found, handler_id, handler, path_params, scope)
+            Tuple of (found, is_asgi_mount, handler_id, handler, path_params, scope)
 
         Raises:
             ValueError: If no handler found for path
@@ -244,7 +248,7 @@ class WebSocketTestClient:
             headers_list.append(("sec-websocket-protocol", ", ".join(self.subprotocols)))
 
         try:
-            found, handler_id, handler, path_params, scope = _core.handle_test_websocket(
+            found, is_asgi_mount, handler_id, handler, path_params, scope = _core.handle_test_websocket(
                 app_id,
                 self.path,
                 headers_list,
@@ -263,11 +267,12 @@ class WebSocketTestClient:
         # Convert scope from Rust dict to Python dict and add extras
         scope_dict = dict(scope) if scope else {}
 
-        # Add auth context if provided (for Python-side guard evaluation fallback)
-        if self.auth_context is not None:
+        # A mounted app gets the ASGI scope exactly as Rust built it.
+        # A route gets the auth context if provided (for Python-side guard evaluation fallback).
+        if not is_asgi_mount and self.auth_context is not None:
             scope_dict["auth_context"] = self.auth_context
 
-        return found, handler_id, handler, path_params_dict, scope_dict
+        return found, is_asgi_mount, handler_id, handler, path_params_dict, scope_dict
 
     def _decide(self, outcome: int | BaseException | None) -> None:
         """Record the handshake decision. The first decision wins."""
@@ -325,7 +330,21 @@ class WebSocketTestClient:
 
     async def _enter(self) -> WebSocketTestClient:
         # Use Rust for path matching, auth, and guard evaluation
-        _found, handler_id, handler, path_params, scope = self._find_handler_via_rust()
+        (
+            _found,
+            is_asgi_mount,
+            handler_id,
+            handler,
+            path_params,
+            scope,
+        ) = self._find_handler_via_rust()
+
+        self._requested_subprotocols = scope["subprotocols"]
+
+        if is_asgi_mount:
+            # A mounted app takes the raw triple. Its first receive gets websocket.connect.
+            await self._start_handler(handler, [scope, self._receive, self._send], {})
+            return self
 
         # A revoked token fails the handshake, as the server checks before the upgrade.
         revocation_auth = scope.pop("_bolt_revocation_auth", None)
@@ -333,8 +352,6 @@ class WebSocketTestClient:
             check = self.api._handler_middleware[handler_id]["websocket_revocation_check"]
             if await check(revocation_auth):
                 raise PermissionError("WebSocket connection denied: Token has been revoked")
-
-        self._requested_subprotocols = scope["subprotocols"]
 
         # Create WebSocket instance
         ws = WebSocket(scope, self._receive, self._send)
@@ -364,34 +381,16 @@ class WebSocketTestClient:
             args = [ws] if ws_param_name else []
             kwargs = {}
 
-        # Start handler in background task
-        async def run_handler():
-            try:
-                await handler(*args, **kwargs)
-            except Exception as e:
-                if not self._accepted:
-                    # An error before accept fails the handshake, as the server answers 500.
-                    self._decide(e)
-                    return
-                self._handler_exception = e
-                # Send disconnect on error
-                if not self._closed:
-                    await self._server_to_client.put(
-                        {
-                            "type": "websocket.close",
-                            "code": CloseCode.INTERNAL_ERROR,
-                        }
-                    )
-                    self._closed = True
-                    self._close_code = CloseCode.INTERNAL_ERROR
-            else:
-                # A return before accept refuses the handshake with 403.
-                self._decide(403)
+        await self._start_handler(handler, args, kwargs)
+        return self
 
+    async def _start_handler(self, handler: Callable, args: list, kwargs: dict) -> None:
+        """Start the handler and wait for its handshake decision, as the server does.
+
+        The server sends the 101 only on accept. A refusal raises here.
+        """
         self._handshake = asyncio.get_running_loop().create_future()
-        self._handler_task = asyncio.create_task(run_handler())
-
-        # Wait for the handshake decision, as the server sends the 101 only on accept.
+        self._handler_task = asyncio.create_task(self._run_handler(handler, args, kwargs))
         try:
             outcome = await asyncio.wait_for(asyncio.shield(self._handshake), HANDSHAKE_TIMEOUT)
         except TimeoutError as e:
@@ -401,7 +400,29 @@ class WebSocketTestClient:
         if outcome is not None:
             raise HandshakeRejected(outcome)
 
-        return self
+    async def _run_handler(self, handler: Callable, args: list, kwargs: dict) -> None:
+        """Run the handler, recording any error as an internal-error close."""
+        try:
+            await handler(*args, **kwargs)
+        except Exception as e:
+            if not self._accepted:
+                # An error before accept fails the handshake, as the server answers 500.
+                self._decide(e)
+                return
+            self._handler_exception = e
+            # Send disconnect on error
+            if not self._closed:
+                await self._server_to_client.put(
+                    {
+                        "type": "websocket.close",
+                        "code": CloseCode.INTERNAL_ERROR,
+                    }
+                )
+                self._closed = True
+                self._close_code = CloseCode.INTERNAL_ERROR
+        else:
+            # A return before accept refuses the handshake with 403.
+            self._decide(403)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Exit async context - close connection and cleanup."""

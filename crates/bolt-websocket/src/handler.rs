@@ -9,7 +9,7 @@ use ahash::AHashMap;
 use futures_util::FutureExt;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
@@ -243,6 +243,90 @@ enum Handshake {
     Refuse(StatusCode),
 }
 
+/// Build an ASGI WebSocket scope for a mounted application.
+///
+/// `build_scope` builds the Bolt-specific scope that the `WebSocket` wrapper
+/// reads. This one follows the ASGI specification instead.
+///
+/// `path` keeps the mount prefix, and `root_path` reports it, as the
+/// specification requires. `path` is percent-decoded. `raw_path` keeps the
+/// request bytes. A router such as `channels.routing.URLRouter`
+/// strips `root_path` itself. A scope with the prefix already removed makes
+/// such a router strip it twice and match nothing.
+///
+/// Takes parts, not an `HttpRequest`, so the `TestClient` backend builds the
+/// same scope as the server.
+pub fn build_asgi_scope_from_parts<'a, I>(
+    py: Python<'_>,
+    mount_prefix: &str,
+    request_path: &str,
+    query_string: &[u8],
+    headers: I,
+    secure: bool,
+    client: Option<(String, u16)>,
+) -> PyResult<Py<PyAny>>
+where
+    I: IntoIterator<Item = (&'a str, &'a [u8])>,
+{
+    let scope = PyDict::new(py);
+
+    let asgi_info = PyDict::new(py);
+    asgi_info.set_item("version", "3.0")?;
+    asgi_info.set_item("spec_version", "2.3")?;
+    scope.set_item("asgi", asgi_info)?;
+
+    scope.set_item("type", "websocket")?;
+    scope.set_item("scheme", if secure { "wss" } else { "ws" })?;
+
+    scope.set_item("raw_path", PyBytes::new(py, request_path.as_bytes()))?;
+    let path =
+        String::from_utf8_lossy(&urlencoding::decode_binary(request_path.as_bytes())).into_owned();
+    scope.set_item("path", path)?;
+    scope.set_item("query_string", PyBytes::new(py, query_string))?;
+    if mount_prefix == "/" {
+        scope.set_item("root_path", "")?;
+    } else {
+        scope.set_item("root_path", mount_prefix)?;
+    }
+
+    let header_list = PyList::empty(py);
+    let mut protocol_values = Vec::new();
+    for (name, value) in headers {
+        header_list.append((PyBytes::new(py, name.as_bytes()), PyBytes::new(py, value)))?;
+        if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+            protocol_values.push(String::from_utf8_lossy(value).into_owned());
+        }
+    }
+    scope.set_item("headers", header_list)?;
+    let subprotocols = requested_subprotocols(protocol_values.iter().map(String::as_str));
+    scope.set_item("subprotocols", subprotocols)?;
+
+    if let Some((host, port)) = client {
+        scope.set_item("client", (host, port))?;
+    }
+
+    Ok(scope.into())
+}
+
+fn build_asgi_scope(py: Python<'_>, req: &HttpRequest, mount_prefix: &str) -> PyResult<Py<PyAny>> {
+    let secure = req.connection_info().scheme() == "https";
+    let headers = req
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_bytes()));
+
+    build_asgi_scope_from_parts(
+        py,
+        mount_prefix,
+        req.path(),
+        req.query_string().as_bytes(),
+        headers,
+        secure,
+        req.peer_addr()
+            .map(|peer| (peer.ip().to_string(), peer.port())),
+    )
+}
+
 /// Shared state for WebSocket connection - passed to Python receive/send functions
 struct WsConnectionState {
     /// Channel to receive messages from Actix actor
@@ -402,8 +486,9 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                 "websocket.accept" => {
                     let subprotocol: Option<String> = message
                         .get_item("subprotocol")?
-                        .map(|v| v.extract())
-                        .transpose()?;
+                        .map(|v| v.extract::<Option<String>>())
+                        .transpose()?
+                        .flatten();
                     // RFC 6455: the server selects one of the subprotocols of the client.
                     if let Some(ref selected) = subprotocol {
                         if !state.subprotocols.contains(selected) {
@@ -587,6 +672,24 @@ fn is_origin_allowed(
     false
 }
 
+/// What a WebSocket upgrade dispatches to.
+pub enum WsTarget {
+    /// A route registered with `@api.websocket`. Runs auth, guards, and rate
+    /// limiting, then calls the handler with a `WebSocket` object.
+    Route {
+        handler: Py<PyAny>,
+        handler_id: usize,
+        path_params: AHashMap<String, String>,
+        injector: Option<Py<PyAny>>,
+    },
+    /// An ASGI application registered with `api.mount_asgi`. Receives the
+    /// scope, receive, and send triple directly.
+    AsgiMount {
+        app: Py<PyAny>,
+        mount_prefix: String,
+    },
+}
+
 /// Await the revocation check of a WebSocket route on this thread's WorkerLoop.
 async fn token_revoked(check: &Py<PyAny>, auth_ctx: &AuthContext) -> PyResult<bool> {
     let future = Python::attach(|py| -> PyResult<_> {
@@ -608,15 +711,19 @@ async fn token_revoked(check: &Py<PyAny>, auth_ctx: &AuthContext) -> PyResult<bo
 /// - Origin validation (CORS-like protection)
 /// - Authentication and guards
 /// - WebSocket upgrade and actor setup
-pub async fn handle_websocket_upgrade_with_handler(
+///
+/// Routes run the full middleware chain. ASGI mounts skip the steps that need
+/// route metadata, exactly as HTTP mounts do.
+pub async fn handle_websocket_upgrade(
     req: HttpRequest,
     stream: web::Payload,
-    handler: Py<PyAny>,
-    handler_id: usize,
-    path_params: AHashMap<String, String>,
+    target: WsTarget,
     state: Arc<AppState>,
-    injector: Option<Py<PyAny>>,
 ) -> actix_web::Result<HttpResponse> {
+    let route_handler_id = match &target {
+        WsTarget::Route { handler_id, .. } => Some(*handler_id),
+        WsTarget::AsgiMount { .. } => None,
+    };
     // Use cached config - no Python/GIL access
     let config = &*WS_CONFIG;
 
@@ -665,8 +772,8 @@ pub async fn handle_websocket_upgrade_with_handler(
     // Check rate limiting BEFORE origin validation (reuse HTTP rate limit).
     // Address and header keys run here; identity keys run after auth below.
     let mut client_ip = None;
-    if let Some(route_metadata) = ROUTE_METADATA.get() {
-        if let Some(route_meta) = route_metadata.get(handler_id) {
+    if let Some(handler_id) = route_handler_id {
+        if let Some(route_meta) = ROUTE_METADATA.get().and_then(|m| m.get(handler_id)) {
             if let Some(ref rate_config) = route_meta.rate_limit_config {
                 if !matches!(
                     rate_config.key,
@@ -701,8 +808,8 @@ pub async fn handle_websocket_upgrade_with_handler(
     }
 
     // Evaluate authentication and guards before upgrading
-    if let Some(route_metadata) = ROUTE_METADATA.get() {
-        if let Some(route_meta) = route_metadata.get(handler_id) {
+    if let Some(handler_id) = route_handler_id {
+        if let Some(route_meta) = ROUTE_METADATA.get().and_then(|m| m.get(handler_id)) {
             match validate_auth_and_guards(&headers, &route_meta.auth_backends, &route_meta.guards)
             {
                 AuthGuardResult::Allow(ctx) => {
@@ -751,9 +858,6 @@ pub async fn handle_websocket_upgrade_with_handler(
     // Create channels for bidirectional communication (configurable size)
     let (to_python_tx, to_python_rx) = mpsc::channel::<WsMessage>(config.channel_buffer_size);
 
-    // Route metadata holds the type hints and the sequence query keys
-    let route_meta = ROUTE_METADATA.get().and_then(|m| m.get(handler_id));
-
     let subprotocols = requested_subprotocols(
         req.headers()
             .get_all(SEC_WEBSOCKET_PROTOCOL)
@@ -761,15 +865,24 @@ pub async fn handle_websocket_upgrade_with_handler(
     );
 
     // Build scope for Python. A bad value rejects the upgrade.
-    let scope = match Python::attach(|py| {
-        build_scope(
-            py,
-            &req,
-            &subprotocols,
-            &path_params,
-            route_meta,
-            state.max_param_length,
-        )
+    let scope = match Python::attach(|py| match &target {
+        WsTarget::Route {
+            handler_id,
+            path_params,
+            ..
+        } => {
+            // Route metadata holds the type hints and the sequence query keys
+            let route_meta = ROUTE_METADATA.get().and_then(|m| m.get(*handler_id));
+            build_scope(
+                py,
+                &req,
+                &subprotocols,
+                path_params,
+                route_meta,
+                state.max_param_length,
+            )
+        }
+        WsTarget::AsgiMount { mount_prefix, .. } => build_asgi_scope(py, &req, mount_prefix),
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -790,7 +903,7 @@ pub async fn handle_websocket_upgrade_with_handler(
         connect_sent: AtomicBool::new(false),
     });
 
-    spawn_handler(ws_state.clone(), scope, handler, injector);
+    spawn_handler(ws_state.clone(), scope, target);
 
     match handshake_rx.await {
         Ok(Handshake::Accept {
@@ -853,54 +966,61 @@ fn refusal(status: StatusCode) -> HttpResponse {
 ///
 /// The handler decides the handshake. If it ends without a decision, the
 /// upgrade gets 403 on return and 500 on error, as in uvicorn.
-fn spawn_handler(
-    ws_state: Arc<WsConnectionState>,
-    scope: Py<PyAny>,
-    handler: Py<PyAny>,
-    injector: Option<Py<PyAny>>,
-) {
+fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsTarget) {
     actix_web::rt::spawn(async move {
         // Wrap the entire handler execution in catch_unwind to handle panics
         let result = std::panic::AssertUnwindSafe(async {
             // Create WebSocket instance and get the coroutine
             let future_result = Python::attach(|py| -> PyResult<_> {
-                // Use cached WebSocket class (imports once, reuses)
-                let ws_class = get_ws_class(py)?;
-
                 // Create receive and send functions
                 let receive_fn = create_receive_fn(py, ws_state.clone())?;
                 let send_fn = create_send_fn(py, ws_state.clone())?;
 
-                // Create WebSocket instance
-                let websocket = ws_class.call1(py, (scope.clone_ref(py), receive_fn, send_fn))?;
-
-                // Use cached build_websocket_request function (imports once, reuses)
-                let build_request = get_build_request_fn(py)?;
-                let request = build_request.call1(py, (scope,))?;
-
-                // Call handler with proper parameter injection
-                // Injector is pre-compiled at route registration and passed from router
-                let coro = if let Some(ref inj) = injector {
-                    // Use pre-compiled injector to extract parameters
-                    // Sync injector - call directly
-                    // Note: WebSocket handlers don't support async injectors (dependencies)
-                    // since the injector is called synchronously during connection setup
-                    let result = inj.call1(py, (request,))?;
-                    let (args, kwargs): (Py<PyAny>, Py<PyAny>) = result.extract(py)?;
-
-                    // Prepend websocket to args (accept any iterable: tuple or list)
-                    let new_args = pyo3::types::PyList::new(py, std::iter::once(&websocket))?;
-                    for item in args.bind(py).try_iter()? {
-                        new_args.append(item?)?;
+                let coro = match &target {
+                    // An ASGI app takes the raw triple, with no wrapper.
+                    WsTarget::AsgiMount { app, .. } => {
+                        app.call1(py, (scope, receive_fn, send_fn))?
                     }
-                    let args_tuple = PyTuple::new(py, new_args.iter())?;
+                    WsTarget::Route {
+                        handler, injector, ..
+                    } => {
+                        // Use cached WebSocket class (imports once, reuses)
+                        let ws_class = get_ws_class(py)?;
 
-                    // Call handler with websocket + extracted args
-                    let kwargs_dict = kwargs.bind(py).cast::<PyDict>()?;
-                    handler.call(py, args_tuple, Some(&kwargs_dict))?
-                } else {
-                    // No injector (simple handler) - just pass websocket
-                    handler.call1(py, (&websocket,))?
+                        // Create WebSocket instance
+                        let websocket =
+                            ws_class.call1(py, (scope.clone_ref(py), receive_fn, send_fn))?;
+
+                        // Use cached build_websocket_request function (imports once, reuses)
+                        let build_request = get_build_request_fn(py)?;
+                        let request = build_request.call1(py, (scope,))?;
+
+                        // Call handler with proper parameter injection
+                        // Injector is pre-compiled at route registration and passed from router
+                        if let Some(ref inj) = injector {
+                            // Use pre-compiled injector to extract parameters
+                            // Sync injector - call directly
+                            // Note: WebSocket handlers don't support async injectors (dependencies)
+                            // since the injector is called synchronously during connection setup
+                            let result = inj.call1(py, (request,))?;
+                            let (args, kwargs): (Py<PyAny>, Py<PyAny>) = result.extract(py)?;
+
+                            // Prepend websocket to args (accept any iterable: tuple or list)
+                            let new_args =
+                                pyo3::types::PyList::new(py, std::iter::once(&websocket))?;
+                            for item in args.bind(py).try_iter()? {
+                                new_args.append(item?)?;
+                            }
+                            let args_tuple = PyTuple::new(py, new_args.iter())?;
+
+                            // Call handler with websocket + extracted args
+                            let kwargs_dict = kwargs.bind(py).cast::<PyDict>()?;
+                            handler.call(py, args_tuple, Some(&kwargs_dict))?
+                        } else {
+                            // No injector (simple handler) - just pass websocket
+                            handler.call1(py, (&websocket,))?
+                        }
+                    }
                 };
 
                 // Run the handler on this thread's WorkerLoop — the loop that

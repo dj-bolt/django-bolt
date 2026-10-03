@@ -20,6 +20,9 @@ pub use bolt_loop::TASK_LOCALS;
 pub struct AsgiMount {
     pub prefix: String,
     pub app: Py<PyAny>,
+    /// False when the app serves HTTP only, such as Django's `ASGIHandler`.
+    /// Read once at registration.
+    pub websocket: bool,
 }
 
 impl AsgiMount {
@@ -49,6 +52,18 @@ impl AsgiMount {
 fn find_mount_in_slice<'a>(mounts: &'a [AsgiMount], path: &str) -> Option<&'a AsgiMount> {
     // Mounts are pre-sorted by descending prefix length.
     mounts.iter().find(|mount| mount.matches_path(path))
+}
+
+/// Find the mounted ASGI app for a WebSocket path. Skip HTTP-only mounts.
+#[inline]
+pub fn find_websocket_mount_in_slice<'a>(
+    mounts: &'a [AsgiMount],
+    path: &str,
+) -> Option<&'a AsgiMount> {
+    // Mounts are pre-sorted by descending prefix length.
+    mounts
+        .iter()
+        .find(|mount| mount.websocket && mount.matches_path(path))
 }
 
 /// Which security policy a file-serving scope uses.
@@ -124,6 +139,18 @@ pub fn find_asgi_mount<'a>(state: &'a AppState, path: &str) -> Option<&'a AsgiMo
     GLOBAL_ASGI_MOUNTS
         .get()
         .and_then(|mounts| find_mount_in_slice(mounts.as_ref(), path))
+}
+
+/// Find the mounted ASGI app for a WebSocket path, as `find_asgi_mount` does.
+#[inline]
+pub fn find_websocket_mount<'a>(state: &'a AppState, path: &str) -> Option<&'a AsgiMount> {
+    if let Some(ref mounts) = state.asgi_mounts {
+        return find_websocket_mount_in_slice(mounts.as_ref(), path);
+    }
+
+    GLOBAL_ASGI_MOUNTS
+        .get()
+        .and_then(|mounts| find_websocket_mount_in_slice(mounts.as_ref(), path))
 }
 
 // Sync streaming thread limiting to prevent thread exhaustion DoS

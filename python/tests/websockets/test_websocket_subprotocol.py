@@ -114,3 +114,36 @@ async def test_receive_before_accept_gives_connect_event():
 
     async with WebSocketTestClient(api, "/ws/connect-first") as ws:
         assert await ws.receive_text() == "websocket.connect"
+
+
+def _mounted_api() -> BoltAPI:
+    api = BoltAPI()
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        if scope["path"].endswith("/refuse"):
+            await send({"type": "websocket.close", "code": 1000})
+            return
+        subprotocols = scope["subprotocols"]
+        await send({"type": "websocket.accept", "subprotocol": subprotocols[-1]})
+        await send({"type": "websocket.send", "text": ",".join(subprotocols)})
+        while (await receive())["type"] != "websocket.disconnect":
+            pass
+
+    api.mount_asgi("/mounted", app)
+    return api
+
+
+@pytest.mark.asyncio
+async def test_mounted_asgi_app_gets_subprotocols_and_accepts_one():
+    async with WebSocketTestClient(_mounted_api(), "/mounted/chat", subprotocols=["chat.v1", "chat.v2"]) as ws:
+        assert await ws.receive_text() == "chat.v1,chat.v2"
+        assert ws.accepted_subprotocol == "chat.v2"
+
+
+@pytest.mark.asyncio
+async def test_mounted_asgi_app_close_before_accept_rejects_handshake():
+    with pytest.raises(HandshakeRejected) as rejected:
+        async with WebSocketTestClient(_mounted_api(), "/mounted/refuse"):
+            pass
+    assert rejected.value.status_code == 403
