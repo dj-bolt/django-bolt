@@ -1347,14 +1347,11 @@ class SchemaGenerator:
             if len(non_none_args) == 1:
                 return self._typing_to_schema(non_none_args[0], register_component)
 
+        # A bare list, set, frozenset or tuple has no origin. msgspec reads it as items of any type.
+        type_annotation = _BARE_COLLECTIONS.get(type_annotation, type_annotation)
         origin_handler = _TYPING_ORIGIN_HANDLERS.get(get_origin(type_annotation))
         if origin_handler is not None:
             return origin_handler(self, get_args(type_annotation), register_component)
-        # A bare list, set, frozenset or tuple has no origin. msgspec reads it as items of any type.
-        if isinstance(type_annotation, type) and type_annotation in _BARE_COLLECTION_ARGS:
-            return _TYPING_ORIGIN_HANDLERS[type_annotation](
-                self, _BARE_COLLECTION_ARGS[type_annotation], register_component
-            )
 
         if type_annotation is UploadFile:
             return Schema(type="string", format="binary")
@@ -1622,7 +1619,7 @@ def _node_list(gen: SchemaGenerator, node: Any, register: bool) -> Schema:
             items=items,
             min_items=node.min_length,
             max_items=node.max_length,
-            # msgspec rejects a repeated item of a set, as JSON Schema does for uniqueItems.
+            # msgspec.json.schema also gives uniqueItems. msgspec drops a repeated item, it does not reject it.
             unique_items=True if type(node).__name__ in ("SetType", "FrozenSetType") else None,
         )
     )
@@ -1744,12 +1741,12 @@ _TYPING_ORIGIN_HANDLERS: dict[Any, Callable[[SchemaGenerator, tuple[Any, ...], b
     Literal: lambda gen, args, _r: gen._enum_values_schema(args),
 }
 
-# The type arguments that msgspec gives a bare collection: `set` is `set[Any]`, `tuple` is `tuple[Any, ...]`.
-_BARE_COLLECTION_ARGS: dict[type, tuple[Any, ...]] = {
-    list: (Any,),
-    set: (Any,),
-    frozenset: (Any,),
-    tuple: (Any, ...),
+# The type that msgspec reads for a bare collection: `set` is `set[Any]`, `tuple` is `tuple[Any, ...]`.
+_BARE_COLLECTIONS: dict[Any, Any] = {
+    list: list[Any],
+    set: set[Any],
+    frozenset: frozenset[Any],
+    tuple: tuple[Any, ...],
 }
 
 # Kwargs, not Schema instances: callers may mutate the returned Schema.
