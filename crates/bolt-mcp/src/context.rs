@@ -34,12 +34,15 @@ pub enum CtxEvent {
         data_json: String,
         logger: Option<String>,
     },
-    /// Live-mode server->client request (elicitation/create or
-    /// sampling/createMessage). `reply` is an asyncio Future created by the
-    /// tool coroutine on the WorkerLoop; the pump resolves it thread-safely
-    /// with a JSON envelope: {"result": ...} or {"error": {...}}.
+    /// Server->client request (elicitation/create or sampling/createMessage)
+    /// awaited in-flight: a live request on legacy peers, or an in-task input
+    /// request answered through `tasks/update`. `key` names the input point
+    /// (task path only). `reply` is an asyncio Future created by the tool
+    /// coroutine on the WorkerLoop; the pump resolves it thread-safely with a
+    /// JSON envelope: {"result": ...} or {"error": {...}}.
     ServerRequest {
         method: &'static str,
+        key: String,
         params_json: String,
         reply: Py<PyAny>,
     },
@@ -81,6 +84,9 @@ pub struct McpPyContext {
     pub is_replay: bool,
     /// Raw request `_meta` JSON for Python-side passthrough.
     pub meta_json: Option<String>,
+    /// SEP-2663 task id when the call runs as a task. Input requests then
+    /// suspend the coroutine until `tasks/update` answers them.
+    pub task_id: Option<String>,
 }
 
 #[pymethods]
@@ -119,6 +125,11 @@ impl McpPyContext {
         self.meta_json.as_deref()
     }
 
+    #[getter]
+    fn task_id(&self) -> Option<&str> {
+        self.task_id.as_deref()
+    }
+
     /// True when a log at `level` would actually be emitted for this request.
     /// Lets Python skip serializing log data that Rust would drop.
     fn wants_log(&self, level: &str) -> bool {
@@ -132,9 +143,10 @@ impl McpPyContext {
     }
 
     /// Emit notifications/progress for this request. Dropped (no-op) when the
-    /// client sent no progressToken, per spec.
+    /// client sent no progressToken, per spec. A task call always reports
+    /// progress: it becomes the task status message.
     fn notify_progress(&self, progress: f64, total: Option<f64>, message: Option<String>) {
-        if !self.has_progress_token {
+        if !self.has_progress_token && self.task_id.is_none() {
             return;
         }
         let _ = self.tx.send(CtxEvent::Progress {
@@ -163,12 +175,14 @@ impl McpPyContext {
         self.input_responses.lock().unwrap().get(key).cloned()
     }
 
-    /// Live path (legacy peers): send a server->client request and resolve
-    /// `reply_future` (an asyncio Future created by the calling coroutine on
-    /// the WorkerLoop) with the JSON envelope when the client responds.
+    /// Live path (legacy peers) and task path: send a server->client request
+    /// and resolve `reply_future` (an asyncio Future created by the calling
+    /// coroutine on the WorkerLoop) with the JSON envelope when the client
+    /// responds. `key` names the input point in the task's `inputRequests`.
     fn server_request_send(
         &self,
         kind: &str,
+        key: String,
         params_json: String,
         reply_future: Bound<'_, PyAny>,
     ) -> PyResult<()> {
@@ -184,6 +198,7 @@ impl McpPyContext {
         self.tx
             .send(CtxEvent::ServerRequest {
                 method,
+                key,
                 params_json,
                 reply: reply_future.unbind(),
             })

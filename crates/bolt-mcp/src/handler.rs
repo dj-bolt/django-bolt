@@ -4,7 +4,10 @@
 //! `server/discover`, `get_tool`) are answered from the registry snapshot
 //! with zero Python. Execution requests (`tools/call`, `resources/read`,
 //! `prompts/get`) dispatch to the registered Python callables on the
-//! WorkerLoop. Per-tool guards evaluate in Rust — the single guard
+//! WorkerLoop. A `tools/call` of a task tool from a client that declared the
+//! Tasks extension (SEP-2663) runs as a task: the response is a
+//! `CreateTaskResult`, and `tasks/get` / `tasks/update` / `tasks/cancel`
+//! reach the running call. Per-tool guards evaluate in Rust — the single guard
 //! implementation for both routes and tools.
 //!
 //! GIL discipline: Python objects are built inside scoped `Python::attach`
@@ -13,23 +16,28 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
-    ErrorCode, ErrorData as McpError, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
-    InputRequest, InputRequests, InputRequiredResult, ListPromptsResult,
-    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
-    ResultType, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
+    CreateTaskResult, DiscoverResult, ErrorCode, ErrorData as McpError, GetPromptRequestParams,
+    GetPromptResponse, GetPromptResult, GetTaskParams, GetTaskResult, InputRequest, InputRequests,
+    InputRequiredResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, ResultType, ServerInfo, Tool, UpdateTaskParams,
 };
 use rmcp::service::RequestContext;
+use rmcp::task_manager::{TaskContext, TaskExit, TaskOptions};
 use rmcp::RoleServer;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::context::{CtxEvent, McpPyContext, ProtocolMode};
 use crate::registry::{McpRegistry, McpToolEntry};
 use crate::state_codec;
+use crate::tasks::McpTasks;
 use crate::McpAuthExt;
 use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
 use bolt_core::permissions::{evaluate_guards, GuardResult};
@@ -183,6 +191,265 @@ fn auth_dict(py: Python<'_>, auth: Option<&AuthContext>) -> PyResult<Py<PyAny>> 
     }
 }
 
+/// Request-derived inputs of one tool call. They are copied out of the rmcp
+/// `RequestContext` so that a task can run after its request has ended.
+struct CallInputs {
+    mode: ProtocolMode,
+    arguments_json: String,
+    caps_elicitation: bool,
+    caps_sampling: bool,
+    log_gate: Option<u8>,
+    meta_json: Option<String>,
+    has_progress_token: bool,
+}
+
+impl CallInputs {
+    fn from_request(
+        params: &CallToolRequestParams,
+        ctx: &RequestContext<RoleServer>,
+        is_task: bool,
+    ) -> Self {
+        let mode = protocol_mode(ctx);
+        let arguments_json = match &params.arguments {
+            Some(args) => serde_json::to_string(args).unwrap_or_else(|_| "null".to_string()),
+            None => "null".to_string(),
+        };
+        let caps = ctx.client_capabilities();
+        let (caps_elicitation, caps_sampling) = caps
+            .map(|c| (c.elicitation.is_some(), c.sampling.is_some()))
+            .unwrap_or((false, false));
+        let log_gate = match mode {
+            ProtocolMode::Live => Some(0),
+            #[allow(deprecated)]
+            ProtocolMode::Mrtr => ctx.meta.log_level().map(|level| {
+                // Convert via the wire name to avoid depending on enum layout.
+                serde_json::to_value(level)
+                    .ok()
+                    .and_then(|v| v.as_str().and_then(crate::context::level_rank))
+                    .unwrap_or(0)
+            }),
+        };
+        // A task turns logs into its status message, which the client polls.
+        // Without a requested level, info and above update the message.
+        let log_gate = if is_task {
+            log_gate.or(crate::context::level_rank("info"))
+        } else {
+            log_gate
+        };
+        Self {
+            mode,
+            arguments_json,
+            caps_elicitation,
+            caps_sampling,
+            log_gate,
+            meta_json: serde_json::to_string(&ctx.meta).ok(),
+            has_progress_token: ctx.meta.get_progress_token().is_some(),
+        }
+    }
+}
+
+type PreparedCall = (
+    Py<PyAny>,
+    Py<PyAny>,
+    Option<tokio::sync::mpsc::UnboundedReceiver<CtxEvent>>,
+);
+
+/// Build the Python dispatch payload (and the Context event channel when the
+/// tool declared a Context parameter).
+fn prepare_call(
+    entry: &McpToolEntry,
+    inputs: &CallInputs,
+    auth: Option<&AuthContext>,
+    responses: &BTreeMap<String, Value>,
+    is_replay: bool,
+    task_id: Option<String>,
+) -> Result<PreparedCall, McpError> {
+    let mut rx = None;
+    let (callable, payload) = Python::attach(|py| {
+        let ctx_obj: Py<PyAny> = if entry.needs_context {
+            let (tx, receiver) = tokio::sync::mpsc::unbounded_channel();
+            rx = Some(receiver);
+            let replay_map: std::collections::HashMap<String, String> = responses
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::json!({ "result": v }).to_string()))
+                .collect();
+            Py::new(
+                py,
+                McpPyContext {
+                    tx,
+                    has_progress_token: inputs.has_progress_token,
+                    mode: inputs.mode,
+                    log_gate: inputs.log_gate,
+                    caps_elicitation: inputs.caps_elicitation,
+                    caps_sampling: inputs.caps_sampling,
+                    input_responses: std::sync::Mutex::new(replay_map),
+                    is_replay,
+                    meta_json: inputs.meta_json.clone(),
+                    task_id,
+                },
+            )?
+            .into_any()
+        } else {
+            py.None()
+        };
+        let payload = build_payload(
+            py,
+            &[
+                (
+                    "arguments_json",
+                    PyString::new(py, &inputs.arguments_json)
+                        .into_any()
+                        .unbind(),
+                ),
+                ("ctx", ctx_obj),
+                ("auth", auth_dict(py, auth)?),
+            ],
+        )?;
+        Ok::<_, PyErr>((entry.dispatch.clone_ref(py), payload))
+    })
+    .map_err(|e| McpError::internal_error(format!("MCP payload build failed: {e}"), None))?;
+    Ok((callable, payload, rx))
+}
+
+/// Build a typed `InputRequest` from a method name and its params.
+fn input_request(method: impl Into<String>, params: Value) -> Result<InputRequest, McpError> {
+    serde_json::from_value(serde_json::json!({ "method": method.into(), "params": params }))
+        .map_err(|e| McpError::internal_error(format!("invalid input request: {e}"), None))
+}
+
+async fn recv_event(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<CtxEvent>>,
+) -> Option<CtxEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Map a progress or log event to the task status message.
+fn set_task_status(task_ctx: &TaskContext, event: CtxEvent) {
+    let message = match event {
+        CtxEvent::Progress {
+            progress,
+            total,
+            message,
+        } => message.unwrap_or_else(|| match total {
+            Some(total) => format!("{progress}/{total}"),
+            None => progress.to_string(),
+        }),
+        CtxEvent::Log { data_json, .. } => match serde_json::from_str::<Value>(&data_json) {
+            Ok(Value::String(text)) => text,
+            _ => data_json,
+        },
+        CtxEvent::ServerRequest { .. } => return,
+    };
+    task_ctx.set_status_message(message);
+}
+
+/// One in-task input request, waiting for its `tasks/update` answer. Yields
+/// the Python reply future with the outcome.
+type PendingInput = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Py<PyAny>, Result<Value, TaskExit>)> + Send>,
+>;
+
+fn reply_error(reply: &Py<PyAny>, message: &str) {
+    crate::context::resolve_reply_future(
+        reply,
+        &serde_json::json!({ "error": { "message": message } }).to_string(),
+    );
+}
+
+/// Turn a Context server request into a pending task input request. An
+/// invalid request fails the Python reply future at once.
+fn queue_input(
+    task_ctx: &TaskContext,
+    pending: &FuturesUnordered<PendingInput>,
+    method: &'static str,
+    key: String,
+    params_json: &str,
+    reply: Py<PyAny>,
+) {
+    let request = serde_json::from_str::<Value>(params_json)
+        .map_err(|e| McpError::internal_error(format!("invalid input params: {e}"), None))
+        .and_then(|params| input_request(method, params));
+    match request {
+        Ok(request) => {
+            let task_ctx = task_ctx.clone();
+            pending.push(Box::pin(async move {
+                let outcome = task_ctx.request_input(key, request).await;
+                (reply, outcome)
+            }));
+        }
+        Err(err) => reply_error(&reply, &err.message),
+    }
+}
+
+/// Deliver an input answer to the Python reply future. Returns `true` when
+/// `tasks/cancel` dropped the request instead: the caller then cancels.
+fn deliver_input(reply: &Py<PyAny>, outcome: Result<Value, TaskExit>) -> bool {
+    match outcome {
+        Ok(value) => crate::context::resolve_reply_future(
+            reply,
+            &serde_json::json!({ "result": value }).to_string(),
+        ),
+        Err(TaskExit::Cancelled) => return true,
+        Err(TaskExit::Error(err)) => reply_error(reply, &err.message),
+    }
+    false
+}
+
+/// The body of a SEP-2663 task: run the tool on the WorkerLoop. Context
+/// events update the status message or become `inputRequests`, which
+/// `tasks/update` answers. `tasks/cancel` cancels the Python coroutine.
+async fn run_task(
+    prepared: Result<PreparedCall, McpError>,
+    task_ctx: TaskContext,
+    mode: ProtocolMode,
+) -> Result<CallToolResult, TaskExit> {
+    let (callable, payload, mut rx) = prepared?;
+    let ct = CancellationToken::new();
+    let mut dispatch = std::pin::pin!(worker_loop::dispatch_cancellable(
+        callable,
+        payload,
+        ct.clone()
+    ));
+    let mut pending_inputs: FuturesUnordered<PendingInput> = FuturesUnordered::new();
+    let mut cancel_requested = false;
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = task_ctx.cancelled(), if !cancel_requested => cancel_requested = true,
+            result = &mut dispatch => break result,
+            event = recv_event(&mut rx) => match event {
+                Some(CtxEvent::ServerRequest { method, key, params_json, reply }) => {
+                    queue_input(&task_ctx, &pending_inputs, method, key, &params_json, reply);
+                }
+                Some(event) => set_task_status(&task_ctx, event),
+                // The Python Context is gone; the tool is about to finish.
+                None => rx = None,
+            },
+            Some((reply, outcome)) = pending_inputs.next(), if !pending_inputs.is_empty() => {
+                cancel_requested |= deliver_input(&reply, outcome);
+            }
+        }
+        if cancel_requested {
+            ct.cancel();
+        }
+    };
+    if cancel_requested {
+        return Err(TaskExit::Cancelled);
+    }
+    let raw = extract_result_string(result)?;
+    match parse_py_result::<CallToolResult>(&raw, mode) {
+        PyOutcome::Ok(result) => Ok(result),
+        PyOutcome::Error(err) => Err(err.into()),
+        // Python suspends on input inside a task; it never replays.
+        PyOutcome::InputRequired(_) => {
+            Err(McpError::internal_error("input_required produced inside a task", None).into())
+        }
+    }
+}
+
 impl McpHandler {
     /// Forward one execution request to Python and parse its result.
     async fn dispatch_simple<T: serde::de::DeserializeOwned>(
@@ -221,7 +488,8 @@ impl McpHandler {
         ctx: &RequestContext<RoleServer>,
         auth: Option<Arc<AuthContext>>,
     ) -> Result<CallToolResponse, McpError> {
-        let mode = protocol_mode(ctx);
+        let inputs = CallInputs::from_request(params, ctx, false);
+        let mode = inputs.mode;
 
         // ---- MRTR state: open sealed state, merge fresh client responses ----
         let mut responses: BTreeMap<String, Value> = BTreeMap::new();
@@ -248,70 +516,8 @@ impl McpHandler {
             }
         }
 
-        let arguments_json = match &params.arguments {
-            Some(args) => serde_json::to_string(args).unwrap_or_else(|_| "null".to_string()),
-            None => "null".to_string(),
-        };
-
-        // ---- Context wiring ----
-        let caps = ctx.client_capabilities();
-        let (caps_elicitation, caps_sampling) = caps
-            .map(|c| (c.elicitation.is_some(), c.sampling.is_some()))
-            .unwrap_or((false, false));
-        let log_gate = match mode {
-            ProtocolMode::Live => Some(0),
-            #[allow(deprecated)]
-            ProtocolMode::Mrtr => ctx.meta.log_level().map(|level| {
-                // Convert via the wire name to avoid depending on enum layout.
-                serde_json::to_value(level)
-                    .ok()
-                    .and_then(|v| v.as_str().and_then(crate::context::level_rank))
-                    .unwrap_or(0)
-            }),
-        };
-        let meta_json = serde_json::to_string(&ctx.meta).ok();
-
-        let mut rx = None;
-        let (callable, payload) = Python::attach(|py| {
-            let ctx_obj: Py<PyAny> = if entry.needs_context {
-                let (tx, receiver) = tokio::sync::mpsc::unbounded_channel();
-                rx = Some(receiver);
-                let replay_map: std::collections::HashMap<String, String> = responses
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_json::json!({ "result": v }).to_string()))
-                    .collect();
-                Py::new(
-                    py,
-                    McpPyContext {
-                        tx,
-                        has_progress_token: ctx.meta.get_progress_token().is_some(),
-                        mode,
-                        log_gate,
-                        caps_elicitation,
-                        caps_sampling,
-                        input_responses: std::sync::Mutex::new(replay_map),
-                        is_replay,
-                        meta_json: meta_json.clone(),
-                    },
-                )?
-                .into_any()
-            } else {
-                py.None()
-            };
-            let payload = build_payload(
-                py,
-                &[
-                    (
-                        "arguments_json",
-                        PyString::new(py, &arguments_json).into_any().unbind(),
-                    ),
-                    ("ctx", ctx_obj),
-                    ("auth", auth_dict(py, auth.as_deref())?),
-                ],
-            )?;
-            Ok::<_, PyErr>((entry.dispatch.clone_ref(py), payload))
-        })
-        .map_err(|e| McpError::internal_error(format!("MCP payload build failed: {e}"), None))?;
+        let (callable, payload, rx) =
+            prepare_call(entry, &inputs, auth.as_deref(), &responses, is_replay, None)?;
 
         // ---- Run + notification pump ----
         let dispatch_fut = worker_loop::dispatch_cancellable(callable, payload, ctx.ct.clone());
@@ -356,14 +562,7 @@ impl McpHandler {
                 }
                 let mut requests: InputRequests = BTreeMap::new();
                 for item in items {
-                    let request: InputRequest = serde_json::from_value(serde_json::json!({
-                        "method": item.method,
-                        "params": item.params,
-                    }))
-                    .map_err(|e| {
-                        McpError::internal_error(format!("invalid input request: {e}"), None)
-                    })?;
-                    requests.insert(item.key, request);
+                    requests.insert(item.key, input_request(item.method, item.params)?);
                 }
                 let state = state_codec::McpRequestState {
                     tool: entry.tool.name.to_string(),
@@ -377,6 +576,51 @@ impl McpHandler {
                 Ok(InputRequiredResult::new(Some(requests), Some(sealed)).into())
             }
         }
+    }
+
+    /// SEP-2663: run the tool as a task and answer with `CreateTaskResult`.
+    /// The task outlives this request; `tasks/*` reach it by id.
+    fn spawn_task(
+        &self,
+        tasks: &McpTasks,
+        options: &TaskOptions,
+        entry: &McpToolEntry,
+        params: &CallToolRequestParams,
+        ctx: &RequestContext<RoleServer>,
+        auth: Option<Arc<AuthContext>>,
+    ) -> CallToolResponse {
+        let inputs = CallInputs::from_request(params, ctx, true);
+        let task = tasks.manager.spawn(options.clone(), |task_ctx| {
+            let prepared = prepare_call(
+                entry,
+                &inputs,
+                auth.as_deref(),
+                &BTreeMap::new(),
+                false,
+                Some(task_ctx.task_id().to_owned()),
+            );
+            Box::pin(run_task(prepared, task_ctx, inputs.mode))
+        });
+        tasks.record_owner(&task, state_codec::principal_hash(auth.as_deref()));
+        CallToolResponse::Task(CreateTaskResult::new(task))
+    }
+
+    /// The task store, after checking that the caller created `task_id`.
+    fn owned_tasks(
+        &self,
+        task_id: &str,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<&McpTasks, McpError> {
+        // rmcp answers `tasks/*` with -32601 itself when the capability is
+        // not advertised, so a missing store is a wiring bug.
+        let tasks = self
+            .registry
+            .tasks
+            .as_ref()
+            .ok_or_else(|| McpError::internal_error("MCP tasks are not enabled", None))?;
+        let auth = auth_from_ctx(ctx);
+        tasks.check_owner(task_id, &state_codec::principal_hash(auth.as_deref()))?;
+        Ok(tasks)
     }
 
     /// Forward one context event to the rmcp peer. Notifications ride the
@@ -426,6 +670,7 @@ impl McpHandler {
                 method,
                 params_json,
                 reply,
+                ..
             } => {
                 let envelope = self.live_server_request(ctx, method, &params_json).await;
                 crate::context::resolve_reply_future(&reply, &envelope);
@@ -542,7 +787,46 @@ impl rmcp::ServerHandler for McpHandler {
                 }
             }
         }
+        if let (Some(tasks), Some(options)) = (&self.registry.tasks, &entry.task) {
+            let client_declared_tasks = context
+                .client_capabilities()
+                .is_some_and(|caps| caps.supports_tasks());
+            if client_declared_tasks {
+                return Ok(self.spawn_task(tasks, options, entry, &request, &context, auth));
+            }
+        }
         self.run_tool(entry, &request, &context, auth).await
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        let tasks = self.owned_tasks(&request.task_id, &context)?;
+        Ok(GetTaskResult::new(
+            tasks.manager.get_task(&request.task_id)?,
+        ))
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let tasks = self.owned_tasks(&request.task_id, &context)?;
+        tasks
+            .manager
+            .update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let tasks = self.owned_tasks(&request.task_id, &context)?;
+        tasks.manager.cancel_task(&request.task_id)
     }
 
     async fn list_resources(

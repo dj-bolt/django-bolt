@@ -118,8 +118,16 @@ def modern_meta(
     return meta
 
 
-# Methods whose Mcp-Name header mirrors params.name / params.uri (SEP-2243).
-_NAME_HEADER_KEYS = {"tools/call": "name", "resources/read": "uri", "prompts/get": "name"}
+# Methods whose Mcp-Name header mirrors params.name / params.uri (SEP-2243)
+# or params.taskId (SEP-2663 Tasks).
+_NAME_HEADER_KEYS = {
+    "tools/call": "name",
+    "resources/read": "uri",
+    "prompts/get": "name",
+    "tasks/get": "taskId",
+    "tasks/update": "taskId",
+    "tasks/cancel": "taskId",
+}
 
 
 def post_rpc_modern(

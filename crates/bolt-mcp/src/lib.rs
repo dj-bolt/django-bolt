@@ -5,7 +5,8 @@
 //! DNS-rebinding checks. This module owns the integration: the Actix bridge
 //! (`bridge`), the registry snapshot compiled from Python at mount time
 //! (`registry`), the `ServerHandler` (`handler`), the per-call Python context
-//! (`context`), and the MRTR requestState policy (`state_codec`).
+//! (`context`), the MRTR requestState policy (`state_codec`), and the
+//! SEP-2663 task store (`tasks`).
 //!
 //! MCP mounts are checked only on router miss (see `handler.rs` /
 //! `testing.rs`), so the non-MCP hot path pays nothing.
@@ -15,6 +16,7 @@ pub mod context;
 pub mod handler;
 pub mod registry;
 pub mod state_codec;
+pub mod tasks;
 
 use std::collections::HashMap;
 use std::sync::Arc;
