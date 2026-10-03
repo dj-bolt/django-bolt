@@ -375,3 +375,74 @@ def test_websocket_explicit_tags_survive_mount():
     api.mount("/v1", child)
 
     assert _websocket_operation_tags(api, "/v1/ws/stream") == ["Streaming"]
+
+
+def test_websocket_empty_tags_match_http():
+    """An empty tag list stays empty on a WebSocket route, as on an HTTP route."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/stream", tags=[])
+    async def stream(websocket: WebSocket):
+        await websocket.accept()
+
+    @api.get("/items", tags=[])
+    async def get_items():
+        return []
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
+    assert schema.paths["/ws/stream"].get.tags == schema.paths["/items"].get.tags == []
+
+
+def test_websocket_summary_and_description():
+    """Explicit summary and description on a WebSocket route replace the docstring."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/stream", summary="Stream prices", description="Sends each price change.")
+    async def stream(websocket: WebSocket):
+        """Docstring summary."""
+        await websocket.accept()
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
+    operation = schema.paths["/ws/stream"].get
+    assert operation.summary == "WebSocket: Stream prices"
+    assert "Sends each price change." in operation.description
+    assert "Docstring summary." not in operation.description
+
+
+def test_websocket_include_in_schema_false():
+    """A WebSocket route with include_in_schema=False is not in the schema."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/hidden", include_in_schema=False)
+    async def hidden(websocket: WebSocket):
+        await websocket.accept()
+
+    @api.websocket("/ws/shown")
+    async def shown(websocket: WebSocket):
+        await websocket.accept()
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
+    assert "/ws/hidden" not in schema.paths
+    assert "/ws/shown" in schema.paths
+
+
+def test_websocket_include_in_schema_api_default_and_mount():
+    """A WebSocket route takes include_in_schema from its API, also after mount."""
+    child = BoltAPI(include_in_schema=False)
+
+    @child.websocket("/ws/hidden")
+    async def hidden(websocket: WebSocket):
+        await websocket.accept()
+
+    @child.websocket("/ws/shown", include_in_schema=True)
+    async def shown(websocket: WebSocket):
+        await websocket.accept()
+
+    api = BoltAPI()
+    api.mount("/v1", child)
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
+    assert "/v1/ws/hidden" not in schema.paths
+    assert "/v1/ws/shown" in schema.paths
+    child_schema = SchemaGenerator(child, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
+    assert "/ws/hidden" not in child_schema.paths
