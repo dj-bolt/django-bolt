@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
@@ -86,6 +87,11 @@ class WebSocket:
         return self._scope.get("cookies", {})
 
     @property
+    def subprotocols(self) -> list[str]:
+        """Subprotocols that the client requested, in order of preference."""
+        return self._scope.get("subprotocols", [])
+
+    @property
     def client(self) -> tuple[str, int] | None:
         """Client address as (host, port) tuple."""
         return self._scope.get("client")
@@ -99,6 +105,11 @@ class WebSocket:
         Accept the WebSocket connection.
 
         Must be called before sending or receiving messages.
+
+        Args:
+            subprotocol: One of ``subprotocols``. The server sends it in the
+                ``Sec-WebSocket-Protocol`` header of the 101 response.
+            headers: Extra ``(name, value)`` byte pairs for the 101 response.
         """
         if self._accepted:
             return
@@ -160,7 +171,12 @@ class WebSocket:
         """Send a raw WebSocket message."""
         if self._state != WebSocketState.CONNECTED:
             raise RuntimeError("WebSocket is not connected")
-        await self._send(message)
+        try:
+            await self._send(message)
+        except OSError as exc:
+            # The server raises OSError when the client left (ASGI).
+            self._state = WebSocketState.DISCONNECTED
+            raise WebSocketDisconnect(CloseCode.ABNORMAL_CLOSURE) from exc
 
     async def send_text(self, data: str) -> None:
         """Send a text message."""
@@ -199,14 +215,16 @@ class WebSocket:
         if self._state == WebSocketState.DISCONNECTED:
             return
 
-        await self._send(
-            {
-                "type": "websocket.close",
-                "code": code,
-                "reason": reason,
-            }
-        )
         self._state = WebSocketState.DISCONNECTED
+        # A client that left needs no close frame.
+        with contextlib.suppress(OSError):
+            await self._send(
+                {
+                    "type": "websocket.close",
+                    "code": code,
+                    "reason": reason,
+                }
+            )
 
     async def iter_text(self):
         """Async iterator for text messages."""

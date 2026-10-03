@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub use actor::WebSocketActor;
 #[allow(unused_imports)] // Re-exported for external use
 pub use config::WS_CONFIG;
-pub use handler::{handle_websocket_upgrade, is_websocket_upgrade, WsTarget};
+pub use handler::{
+    handle_websocket_upgrade, is_websocket_upgrade, requested_subprotocols, WsTarget,
+};
 #[allow(unused_imports)] // Re-exported for external use
 pub use messages::{SendToClient, WsMessage};
 #[allow(unused_imports)] // Re-exported for external use
@@ -38,6 +40,25 @@ pub static GLOBAL_WEBSOCKET_ROUTER: once_cell::sync::OnceCell<std::sync::Arc<Web
 
 /// Global counter for active WebSocket connections
 pub static ACTIVE_WS_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// One count in `ACTIVE_WS_CONNECTIONS`, released on drop.
+///
+/// The upgrade holds the slot while the handler decides the handshake.
+/// The actor takes it on accept. A refused or dropped handshake releases it.
+pub(crate) struct ConnectionSlot(());
+
+impl ConnectionSlot {
+    pub(crate) fn acquire() -> Self {
+        ACTIVE_WS_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        ConnectionSlot(())
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        ACTIVE_WS_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Process-wide flag: the server is shutting down or being recycled.
 ///

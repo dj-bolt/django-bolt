@@ -40,9 +40,9 @@ async def echo_app(scope, receive, send):
 api.mount_asgi("/ws", echo_app)
 ```
 
-Bolt completes the HTTP upgrade before it runs the app. Therefore `websocket.accept` cannot refuse the handshake. A `websocket.close` before the accept sends a close frame instead of an HTTP error.
+Bolt sends the `101` response when the app sends `websocket.accept`. A `websocket.close` before the accept refuses the handshake with HTTP `403`. An app that returns before the accept also gets `403`. An app that raises before the accept gets `500`.
 
-For the same reason, Bolt ignores the `subprotocol` key of `websocket.accept`. The handshake response does not contain `Sec-WebSocket-Protocol`. A browser that requests a subprotocol closes such a connection. Do not use subprotocols with a mounted app.
+`scope["subprotocols"]` lists the subprotocols that the client requested. Bolt puts the `subprotocol` of `websocket.accept` in the `Sec-WebSocket-Protocol` header of the `101` response, and the `headers` of `websocket.accept` too. A subprotocol that the client did not request fails the handshake with `500`.
 
 A WebSocket connection that matches no route goes to the mounted app with the longest matching prefix. Bolt skips a `mount_django()` mount of Django's own ASGI app, because that app serves HTTP only. A `mount_django()` mount with a custom app, such as a Channels `ProtocolTypeRouter`, gets WebSocket connections.
 
