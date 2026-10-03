@@ -168,9 +168,12 @@ async def search(
 ```
 
 The marker can be the default of the parameter, or an item of `Annotated`.
-In both forms, `default` gives the value of a missing parameter.
+After `=`, the `default` of the marker gives the value of a missing parameter.
 Without `default`, the parameter is required.
-Do not give a default both in the marker and after `=`. Registration then raises `TypeError`.
+In `Annotated`, write the default after `=`, as in FastAPI.
+A default in an `Annotated` marker raises `TypeError` when the route registers.
+The first argument of a marker is its default, not its alias.
+Use `Query(alias="q")` to read another key.
 `Header()`, `Cookie()` and `Form()` take `default` in the same way.
 The OpenAPI schema shows the `description`, `example` and `deprecated` arguments of the marker.
 

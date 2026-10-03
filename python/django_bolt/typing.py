@@ -586,12 +586,16 @@ class FieldDefinition:
             FieldDefinition instance
         """
         name = parameter.name
-        # A marker after "=" is not a value. Its own default is the default of the parameter.
-        default = inspect.Parameter.empty if isinstance(parameter.default, Param) else parameter.default
-        if isinstance(explicit_marker, Param) and explicit_marker.default is not ...:
-            if default is not inspect.Parameter.empty:
-                raise TypeError(f"Parameter '{name}' has a default in its marker and after '='. Remove one of them.")
-            default = explicit_marker.default
+        default = parameter.default
+        if isinstance(default, Param):
+            # A marker after "=" is not a value. Its own default is the default of the parameter.
+            default = inspect.Parameter.empty if default.default is ... else default.default
+        elif isinstance(explicit_marker, Param) and explicit_marker.default is not ...:
+            # As in FastAPI. Else Form("tag") in Annotated silently makes "tag" the default.
+            raise TypeError(
+                f"`{explicit_marker.source.capitalize()}` default value cannot be set in `Annotated` "
+                f"for '{name}'. Set the default value with `=` instead."
+            )
 
         # Handle explicit markers
         source: str

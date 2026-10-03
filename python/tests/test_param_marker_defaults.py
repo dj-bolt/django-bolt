@@ -3,7 +3,8 @@
 A marker can be the default of a parameter (``page: int = Query(ge=1, default=1)``)
 or an ``Annotated`` item (``page: Annotated[int, Query(ge=1)] = 1``). In both forms:
 
-- ``default`` is the value of a missing parameter. ``...`` (the default) makes it required.
+- The default of the parameter is the value of a missing parameter. No default makes it required.
+  An ``Annotated`` marker cannot hold the default, as in FastAPI. Write it after ``=``.
 - The constraint arguments (``gt``, ``ge``, ``lt``, ``le``, ``min_length``,
   ``max_length``, ``pattern``) apply to the value, and a bad value gives a 422.
 - ``description``, ``example`` and ``deprecated`` go into the OpenAPI schema.
@@ -44,14 +45,14 @@ def api():
     @api.get("/annotated")
     async def annotated(
         name: Annotated[str, Query(min_length=3, max_length=5, pattern="^[a-z]+$")],
-        category: Annotated[str, Query(default="all")],
+        category: Annotated[str, Query()] = "all",
         page: Annotated[int, Query(gt=0, lt=100)] = 1,
     ):
         return {"name": name, "category": category, "page": page}
 
     # No constraint, so this route also binds its arguments in Rust.
     @api.get("/annotated-default")
-    async def annotated_default(category: Annotated[str, Query(default="all")]):
+    async def annotated_default(category: Annotated[str, Query()] = "all"):
         return {"category": category}
 
     @api.get("/optional")
@@ -150,12 +151,25 @@ async def test_a_websocket_marker_gives_its_default_and_checks_its_constraints()
         assert await ws_client.receive_json() == {"page": 4}
 
 
-def test_a_default_in_the_marker_and_after_the_equals_sign_fails_at_registration():
+def test_a_default_in_an_annotated_marker_fails_at_registration():
+    """``Form("tag")`` sets the default, not the alias. In ``Annotated``, it fails as in FastAPI."""
     api = BoltAPI()
-    with pytest.raises(TypeError, match="page"):
+    with pytest.raises(TypeError, match="'page'.*Set the default value with `=` instead"):
+
+        @api.get("/annotated-default")
+        async def annotated_default(page: Annotated[int, Query(default=1)]):
+            return {}
+
+    with pytest.raises(TypeError, match="'page'"):
 
         @api.get("/twice")
         async def twice(page: Annotated[int, Query(default=1)] = 2):
+            return {}
+
+    with pytest.raises(TypeError, match="'tag'"):
+
+        @api.post("/positional")
+        async def positional(tag: Annotated[str, Form("tag")]):
             return {}
 
 
