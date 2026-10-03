@@ -1,0 +1,47 @@
+name: Install the built Linux wheel
+description: >-
+  Install the django-bolt wheel of the linux-amd64 job into the uv
+  environment. The tests then run the release binary, and the job does not
+  build Rust.
+inputs:
+  python-version:
+    description: The interpreter of the environment, for example 3.12 or 3.14t.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Download the Linux wheels
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: wheels-linux-x86_64
+        path: dist
+
+    - name: Install the wheel
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: |
+        set -euo pipefail
+        # A GIL build uses the abi3 wheel. A free-threaded build (3.14t) uses
+        # its own cp314-cp314t wheel.
+        case "$PYTHON_VERSION" in
+          *t)
+            tag="cp${PYTHON_VERSION%t}"
+            tag="${tag/./}"
+            pattern="django_bolt-*-${tag}-${tag}t-*.whl"
+            ;;
+          *) pattern="django_bolt-*-abi3-*.whl" ;;
+        esac
+        shopt -s nullglob
+        wheels=(dist/$pattern)
+        if [ "${#wheels[@]}" -ne 1 ]; then
+          echo "Expected one wheel matching $pattern; found ${#wheels[@]}" >&2
+          exit 1
+        fi
+        # The wheel installs the metadata and the entry points of the package.
+        uv pip install --no-deps "${wheels[0]}"
+        # pytest puts python/ first on sys.path, so the source tree shadows the
+        # installed package. Copy the extension of the wheel into the source tree.
+        unzip -o -j "${wheels[0]}" 'django_bolt/_core*' -d python/django_bolt
+        ls python/django_bolt/_core*

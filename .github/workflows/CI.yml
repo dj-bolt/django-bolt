@@ -219,12 +219,12 @@ jobs:
   test:
     name: Test Python ${{ matrix.python-version }} / Django ${{ matrix.django-version }}
     runs-on: ubuntu-latest
-    needs: python-versions
+    needs: [python-versions, linux-amd64]
     strategy:
       fail-fast: false
       matrix:
         # Includes the free-threaded builds (e.g. 3.14t): `uv python install`
-        # resolves the "t" suffix, and maturin builds a cp314t module for it.
+        # resolves the "t" suffix, and linux-amd64 builds a cp314t wheel for it.
         python-version: ${{ fromJSON(needs.python-versions.outputs.test-versions-json) }}
         # Newest supported Django on every Python; each older series once on the
         # oldest Python. Both derived from the pyproject classifiers, so dropping
@@ -245,38 +245,26 @@ jobs:
       - name: Set up Python
         run: |
           uv python install ${{ matrix.python-version }}
-          uv venv
-
-      - name: Install Rust
-        # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
-        # `toolchain` so the action reads the file. Default rust-cache is safe to
-        # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
-        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
-        # config on the interpreter, so a shared cache only costs a rebuild of
-        # the PyO3 crates.
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
-          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
-          # defaulting it to "deny". Empty means "leave the variable unset", so
-          # warnings stay warnings and don't block tests.
-          build-warnings: ""
+          uv venv --python ${{ matrix.python-version }}
 
       - name: Install dependencies
         # One explicit sync (dev group pins the newest Django), then swap in the
         # matrix Django. Every later `uv run` is --no-sync so the lockfile's
-        # Django is not reinstalled over it.
+        # Django is not reinstalled over it. --no-install-project: installing
+        # the project would build the Rust extension.
         run: |
-          uv sync --all-extras
+          uv sync --all-extras --no-install-project
           uv pip install "django~=${{ matrix.django-version }}.0"
           uv run --no-sync python -c "import django; print('Django', django.__version__)"
 
-      - name: Build extension
-        run: uv run --no-sync maturin develop --release
+      # No Rust build: install the release wheel of the linux-amd64 job.
+      - name: Install the built wheel
+        uses: ./.github/actions/install-built-wheel
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Run tests
-        run: uv run --no-sync pytest python/tests -m "not server_integration and not artifact_smoke" -v
+        run: uv run --no-sync pytest python/tests -m "not server_integration and not artifact_smoke" -n auto -v
 
       # Separate invocation: bolt-mcp's conftest configures Django (OAuth app,
       # file-backed sqlite) incompatibly with the main suite's settings.
@@ -317,7 +305,7 @@ jobs:
     name: Server Smoke Linux
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
-    needs: python-versions
+    needs: [python-versions, linux-amd64]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -335,37 +323,26 @@ jobs:
           python-version: ${{ needs.python-versions.outputs.newest-version }}
 
       - name: Create virtual environment
-        run: uv venv
+        run: uv venv --python ${{ needs.python-versions.outputs.newest-version }}
 
-      - name: Install Rust
-        # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
-        # `toolchain` so the action reads the file. Default rust-cache is safe to
-        # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
-        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
-        # config on the interpreter, so a shared cache only costs a rebuild of
-        # the PyO3 crates.
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
-          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
-          # defaulting it to "deny". Empty means "leave the variable unset", so
-          # warnings stay warnings and don't block tests.
-          build-warnings: ""
-
+      # --no-install-project: installing the project would build the Rust
+      # extension. The dependencies and the bolt-mcp workspace member install.
       - name: Install dependencies
-        run: uv pip install -e ".[dev]"
+        run: uv sync --all-extras --no-install-project
 
-      - name: Build extension
-        run: uv run maturin develop --release
+      # No Rust build: install the release wheel of the linux-amd64 job.
+      - name: Install the built wheel
+        uses: ./.github/actions/install-built-wheel
+        with:
+          python-version: ${{ needs.python-versions.outputs.newest-version }}
 
       - name: Run platform smoke tests
-        run: uv run pytest python/tests/integration -m platform_smoke -v
+        run: uv run --no-sync pytest python/tests/integration -m platform_smoke -v
 
   server_integration_linux:
     name: Server Integration Linux Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    needs: python-versions
+    needs: [python-versions, linux-amd64]
     strategy:
       fail-fast: false
       matrix:
@@ -404,35 +381,26 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Create virtual environment
-        run: uv venv
+        run: uv venv --python ${{ matrix.python-version }}
 
-      - name: Install Rust
-        # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
-        # `toolchain` so the action reads the file. Default rust-cache is safe to
-        # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
-        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
-        # config on the interpreter, so a shared cache only costs a rebuild of
-        # the PyO3 crates.
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
-          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
-          # defaulting it to "deny". Empty means "leave the variable unset", so
-          # warnings stay warnings and don't block tests.
-          build-warnings: ""
-
+      # --no-install-project: installing the project would build the Rust
+      # extension. The dependencies and the bolt-mcp workspace member install.
       - name: Install dependencies
-        run: uv pip install -e ".[dev]" -e python/bolt-mcp
+        run: uv sync --all-extras --no-install-project
 
-      - name: Build extension
-        run: uv run maturin develop --release
+      # No Rust build: install the release wheel of the linux-amd64 job.
+      - name: Install the built wheel
+        uses: ./.github/actions/install-built-wheel
+        with:
+          python-version: ${{ matrix.python-version }}
 
+      # Each test starts its own server on a free port, and each PostgreSQL
+      # test makes its own database, so the tests run in parallel.
       - name: Run server integration tests
-        run: uv run pytest python/tests/integration -m "server_integration and not artifact_smoke" -v
+        run: uv run --no-sync pytest python/tests/integration -m "server_integration and not artifact_smoke" -n auto --dist loadfile -v
 
       - name: Run bolt-mcp server integration tests
-        run: uv run pytest python/bolt-mcp/tests/integration -m "server_integration and not artifact_smoke" -v
+        run: uv run --no-sync pytest python/bolt-mcp/tests/integration -m "server_integration and not artifact_smoke" -v
 
   platform_smoke:
     name: Platform Smoke ${{ matrix.os }}
@@ -460,7 +428,7 @@ jobs:
           python-version: ${{ needs.python-versions.outputs.newest-version }}
 
       - name: Create virtual environment
-        run: uv venv
+        run: uv venv --python ${{ needs.python-versions.outputs.newest-version }}
 
       - name: Install Rust
         # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
@@ -478,11 +446,14 @@ jobs:
           # warnings stay warnings and don't block tests.
           build-warnings: ""
 
+      # --no-install-project: installing the project would build the Rust
+      # extension. The dependencies and the bolt-mcp workspace member install.
       - name: Install dependencies
-        run: uv pip install -e ".[dev]"
+        run: uv sync --all-extras --no-install-project
 
+      # No Linux wheel fits this runner, so build the extension here, once.
       - name: Build extension
-        run: uv run maturin develop --release
+        run: uv run --no-sync maturin develop --release
 
       # psycopg (a dev dependency) loads libpq when a test module imports it.
       # The macOS image has no libpq, and Homebrew's libpq is keg-only. ctypes
@@ -494,10 +465,10 @@ jobs:
           brew install libpq
           sudo mkdir -p /usr/local/lib
           sudo ln -sf "$(brew --prefix libpq)"/lib/libpq*.dylib /usr/local/lib/
-          uv run python -c "import psycopg; print('libpq', psycopg.pq.version())"
+          uv run --no-sync python -c "import psycopg; print('libpq', psycopg.pq.version())"
 
       - name: Run platform smoke tests
-        run: uv run pytest python/tests/integration -m platform_smoke -v
+        run: uv run --no-sync pytest python/tests/integration -m platform_smoke -v
 
   # Build wheels for Linux x86_64 (covers most Linux users including Arch)
   linux-amd64:
@@ -751,34 +722,18 @@ jobs:
       - name: Create virtual environment
         run: uv venv --python "${{ matrix.python-version }}"
 
-      - name: Install Rust
-        # Toolchain (channel + rustfmt) comes from rust-toolchain.toml — omit
-        # `toolchain` so the action reads the file. Default rust-cache is safe to
-        # share across the Python matrix: the abi3 build is version-agnostic
-        # (one artifact for 3.12/3.13/3.14), so cached deps are identical. The
-        # free-threaded entry (3.14t) is a separate cp314t build; PyO3 keys its
-        # config on the interpreter, so a shared cache only costs a rebuild of
-        # the PyO3 crates.
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          # v2 dropped the `-D warnings` RUSTFLAGS default and enforces
-          # warning-free builds via CARGO_BUILD_WARNINGS (cargo 1.97+) instead,
-          # defaulting it to "deny". Empty means "leave the variable unset", so
-          # warnings stay warnings and don't block tests.
-          build-warnings: ""
-
+      # --no-install-project: installing the project would build the Rust
+      # extension. The dependencies and the bolt-mcp workspace member install.
       - name: Install dependencies
-        run: uv pip install -e ".[dev]"
+        run: uv sync --all-extras --no-install-project
 
-      - name: Build extension
-        run: uv run maturin develop --release
-
-      - name: Download Linux wheel artifact
-        if: matrix.artifact-kind == 'wheel'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      # The test process needs django_bolt too. This step also puts the Linux
+      # wheels in dist/ for the wheel artifact under test.
+      - name: Install the built wheel
+        uses: ./.github/actions/install-built-wheel
         with:
-          name: wheels-linux-x86_64
-          path: dist
+          python-version: ${{ matrix.python-version }}
+
 
       - name: Download source artifact
         if: matrix.artifact-kind == 'sdist'
@@ -803,7 +758,7 @@ jobs:
       - name: Run artifact smoke tests
         env:
           DJANGO_BOLT_ARTIFACT_PATH: ${{ steps.artifact.outputs.path }}
-        run: uv run pytest python/tests/integration/test_artifact_smoke.py -m artifact_smoke -v
+        run: uv run --no-sync pytest python/tests/integration/test_artifact_smoke.py -m artifact_smoke -v
 
   # Build the documentation site when a pull request changes docs/, uv.lock,
   # or pyproject.toml. This job only builds. The Documentation workflow
