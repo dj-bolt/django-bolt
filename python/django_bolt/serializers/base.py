@@ -270,13 +270,9 @@ def _get_django_relation_info(model_cls: type, attr_name: str) -> _DjangoRelatio
         model_cache[attr_name] = None
         return None
 
-    cache_name = attr_name
-    get_cache_name = getattr(field, "get_cache_name", None)
-    if callable(get_cache_name):
-        try:
-            cache_name = get_cache_name()
-        except TypeError:
-            cache_name = attr_name
+    # Read `cache_name`. Django 5.2 relations raise NotImplementedError from the
+    # deprecated get_cache_name(), and Django 6.0 removes it.
+    cache_name = getattr(field, "cache_name", attr_name)
 
     related_model = getattr(field, "related_model", None)
 
