@@ -305,6 +305,33 @@ def _orm_handoff() -> tuple[concurrent.futures.ThreadPoolExecutor, Callable[...,
     return _get_orm_executor(), _call_in_orm_slot
 
 
+class _ThreadSensitiveExecutor:
+    """The asgiref executor for thread-sensitive calls of a request with no thread-sensitive context.
+
+    Django's async ORM API (``aget``, ``acount``, ``async for``, ``auser``) is
+    ``sync_to_async(thread_sensitive=True)``. For a plain async route, asgiref
+    sends these calls to its class-level executor. That default is one thread
+    per process: one query in flight, whatever the worker count. No bolt code
+    runs on that thread, so a dead connection on it never gets dropped.
+
+    This executor sends the call to the ORM pool through ``_orm_handoff``: the
+    pool is bounded by ``DJANGO_BOLT_ORM_THREADS`` and the call runs through
+    ``_call_guarded``, which drops a broken connection on the error path.
+    A request with Django middleware has a thread-sensitive context, and
+    asgiref never reaches this executor for it.
+    """
+
+    __slots__ = ()
+
+    def submit(self, fn: Callable[..., object], *args: object) -> concurrent.futures.Future:
+        executor, call = _orm_handoff()
+        return executor.submit(contextvars.copy_context().run, call, fn, *args)
+
+
+# Installed once at import. asgiref reads the attribute on each call.
+SyncToAsync.single_thread_executor = _ThreadSensitiveExecutor()
+
+
 # Bound once: ``run_orm_blocking`` reads it on each forced ``request.user``.
 _thread_sensitive_context = SyncToAsync.thread_sensitive_context
 
