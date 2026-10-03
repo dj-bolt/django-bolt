@@ -273,5 +273,3 @@ __all__ = [
     "WebSocketException",
     "CloseCode",
 ]
-
-default_app_config = "django_bolt.apps.DjangoBoltConfig"

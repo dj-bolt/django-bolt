@@ -135,8 +135,3 @@ def _validate_many_nested(
             )
 
     return result
-
-
-def is_nested_field(metadata: Any) -> bool:
-    """Check if a field type resolves to a nested serializer field."""
-    return resolve_nested_config(metadata) is not None

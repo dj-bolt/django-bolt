@@ -13,7 +13,6 @@ import atexit
 import contextlib
 import importlib
 import logging
-import logging.config
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -121,55 +120,6 @@ class LoggingConfig:
             return False
 
         return not (status_code and status_code in self.skip_status_codes)
-
-
-@dataclass
-class RequestLogFields:
-    """Available fields for request logging."""
-
-    # HTTP method (GET, POST, etc.)
-    method: str = "method"
-
-    # Request path
-    path: str = "path"
-
-    # Query string
-    query: str = "query"
-
-    # Request headers
-    headers: str = "headers"
-
-    # Request body
-    body: str = "body"
-
-    # Client IP address
-    client_ip: str = "client_ip"
-
-    # User agent
-    user_agent: str = "user_agent"
-
-    # Request ID (if available)
-    request_id: str = "request_id"
-
-
-@dataclass
-class ResponseLogFields:
-    """Available fields for response logging."""
-
-    # HTTP status code
-    status_code: str = "status_code"
-
-    # Response headers
-    headers: str = "headers"
-
-    # Response body
-    body: str = "body"
-
-    # Response time (in seconds)
-    duration: str = "duration"
-
-    # Response size (in bytes)
-    size: str = "size"
 
 
 def get_default_logging_config() -> LoggingConfig:
