@@ -199,7 +199,8 @@ fn build_scope(
 /// reads. This one follows the ASGI specification instead.
 ///
 /// `path` keeps the mount prefix, and `root_path` reports it, as the
-/// specification requires. A router such as `channels.routing.URLRouter`
+/// specification requires. `path` is percent-decoded. `raw_path` keeps the
+/// request bytes. A router such as `channels.routing.URLRouter`
 /// strips `root_path` itself. A scope with the prefix already removed makes
 /// such a router strip it twice and match nothing.
 ///
@@ -215,7 +216,7 @@ pub fn build_asgi_scope_from_parts<'a, I>(
     client: Option<(String, u16)>,
 ) -> PyResult<Py<PyAny>>
 where
-    I: IntoIterator<Item = (&'a str, &'a str)>,
+    I: IntoIterator<Item = (&'a str, &'a [u8])>,
 {
     let scope = PyDict::new(py);
 
@@ -228,7 +229,9 @@ where
     scope.set_item("scheme", if secure { "wss" } else { "ws" })?;
 
     scope.set_item("raw_path", PyBytes::new(py, request_path.as_bytes()))?;
-    scope.set_item("path", request_path)?;
+    let path =
+        String::from_utf8_lossy(&urlencoding::decode_binary(request_path.as_bytes())).into_owned();
+    scope.set_item("path", path)?;
     scope.set_item("query_string", PyBytes::new(py, query_string))?;
     if mount_prefix == "/" {
         scope.set_item("root_path", "")?;
@@ -239,12 +242,9 @@ where
     let header_list = PyList::empty(py);
     let subprotocols = PyList::empty(py);
     for (name, value) in headers {
-        header_list.append((
-            PyBytes::new(py, name.as_bytes()),
-            PyBytes::new(py, value.as_bytes()),
-        ))?;
+        header_list.append((PyBytes::new(py, name.as_bytes()), PyBytes::new(py, value)))?;
         if name.eq_ignore_ascii_case("sec-websocket-protocol") {
-            for protocol in value.split(',') {
+            for protocol in String::from_utf8_lossy(value).split(',') {
                 let protocol = protocol.trim();
                 if !protocol.is_empty() {
                     subprotocols.append(protocol)?;
@@ -267,7 +267,7 @@ fn build_asgi_scope(py: Python<'_>, req: &HttpRequest, mount_prefix: &str) -> Py
     let headers = req
         .headers()
         .iter()
-        .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value)));
+        .map(|(name, value)| (name.as_str(), value.as_bytes()));
 
     build_asgi_scope_from_parts(
         py,
@@ -305,7 +305,10 @@ fn create_receive_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<
         fn __call__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
             let state = self.state.clone();
             let future = pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                if state.connect_pending.swap(false, Ordering::Relaxed) {
+                // A plain load first, so a route connection never pays the swap.
+                if state.connect_pending.load(Ordering::Relaxed)
+                    && state.connect_pending.swap(false, Ordering::Relaxed)
+                {
                     return Python::attach(|py| {
                         let dict = PyDict::new(py);
                         dict.set_item("type", "websocket.connect")?;
@@ -374,8 +377,9 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                 "websocket.accept" => {
                     let subprotocol: Option<String> = message
                         .get_item("subprotocol")?
-                        .map(|v| v.extract())
-                        .transpose()?;
+                        .map(|v| v.extract::<Option<String>>())
+                        .transpose()?
+                        .flatten();
                     let state = state.clone();
                     let future = pyo3_async_runtimes::tokio::future_into_py(py, async move {
                         state

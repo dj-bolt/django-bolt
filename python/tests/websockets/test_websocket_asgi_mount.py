@@ -120,6 +120,23 @@ async def test_mounted_app_gets_asgi_scope(api):
 
 
 @pytest.mark.asyncio
+async def test_mounted_app_path_keeps_trailing_slash(api):
+    # A Channels route such as path("room/<name>/") needs the slash.
+    async with WebSocketTestClient(api, "/scope/inner/path/") as ws:
+        path, *_ = (await ws.receive_text()).split("|")
+
+    assert path == "/scope/inner/path/"
+
+
+@pytest.mark.asyncio
+async def test_mounted_app_path_is_percent_decoded(api):
+    async with WebSocketTestClient(api, "/scope/caf%C3%A9") as ws:
+        path, *_ = (await ws.receive_text()).split("|")
+
+    assert path == "/scope/café"
+
+
+@pytest.mark.asyncio
 async def test_router_app_reads_url_captures(api):
     async with WebSocketTestClient(api, "/routed/room/lobby") as ws:
         assert await ws.receive_text() == "room:lobby"
@@ -136,3 +153,39 @@ async def test_unmatched_path_still_raises(api):
     with pytest.raises(ValueError, match="No WebSocket handler found"):
         async with WebSocketTestClient(api, "/nowhere"):
             pass
+
+
+@pytest.mark.asyncio
+async def test_django_mount_does_not_take_websocket_connections():
+    # Django's ASGI handler serves HTTP only. The path must stay unmatched.
+    api = BoltAPI()
+    api.mount_django("/django")
+
+    with pytest.raises(ValueError, match="No WebSocket handler found"):
+        async with WebSocketTestClient(api, "/django/ws"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_websocket_mount_wins_over_root_django_mount():
+    api = BoltAPI()
+    api.mount_django("/")
+    api.mount_asgi("/mounted", echo_app)
+
+    async with WebSocketTestClient(api, "/mounted/ws") as ws:
+        await ws.send_text("hello")
+        assert await ws.receive_text() == "echo:hello"
+
+    with pytest.raises(ValueError, match="No WebSocket handler found"):
+        async with WebSocketTestClient(api, "/other"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_django_mount_with_custom_app_keeps_websocket():
+    api = BoltAPI()
+    api.mount_django("/custom", echo_app)
+
+    async with WebSocketTestClient(api, "/custom/ws") as ws:
+        await ws.send_text("hello")
+        assert await ws.receive_text() == "echo:hello"

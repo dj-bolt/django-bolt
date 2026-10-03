@@ -37,7 +37,8 @@ use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
 use bolt_core::state::{
-    find_asgi_mount, find_mount_in_slice, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS,
+    find_asgi_mount, find_websocket_mount_in_slice, AppState, AsgiMount, ScopeConfig, ServeMode,
+    TASK_LOCALS,
 };
 use bolt_websocket::handler::build_asgi_scope_from_parts;
 use bolt_websocket::WebSocketRouter;
@@ -418,7 +419,7 @@ pub fn register_test_websocket_routes(
 /// Register HTTP ASGI mounts for a test app.
 #[pyfunction]
 pub fn register_test_asgi_mounts(
-    _py: Python<'_>,
+    py: Python<'_>,
     app_id: u64,
     mounts: Vec<(String, Py<PyAny>)>,
 ) -> PyResult<()> {
@@ -427,7 +428,7 @@ pub fn register_test_asgi_mounts(
         .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
 
     let mut app = entry.write();
-    let asgi_mounts = validate_and_sort_asgi_mounts(mounts)?;
+    let asgi_mounts = validate_and_sort_asgi_mounts(py, mounts)?;
     app.asgi_mounts = Arc::new(asgi_mounts);
     Ok(())
 }
@@ -1384,16 +1385,17 @@ pub fn handle_test_websocket(
         Some((route, params)) => (route, params),
         // No route matched: fall back to a mounted ASGI app, as the server does.
         None => {
-            return match find_mount_in_slice(&app.asgi_mounts, normalized_path) {
+            return match find_websocket_mount_in_slice(&app.asgi_mounts, normalized_path) {
                 Some(mount) => {
+                    // Give the app the request path as sent, as the server does.
                     let scope = build_asgi_scope_from_parts(
                         py,
                         &mount.prefix,
-                        normalized_path,
+                        &path,
                         query_string.as_deref().unwrap_or_default().as_bytes(),
                         header_map
                             .iter()
-                            .map(|(name, value)| (name.as_str(), value.as_str())),
+                            .map(|(name, value)| (name.as_str(), value.as_bytes())),
                         false,
                         Some(("127.0.0.1".to_string(), 0)),
                     )?;

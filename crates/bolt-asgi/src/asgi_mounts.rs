@@ -3,7 +3,10 @@ use pyo3::prelude::*;
 use bolt_core::state::AsgiMount;
 
 /// Validate, normalize ordering, and de-duplicate ASGI mount configuration.
-pub fn validate_and_sort_asgi_mounts(mounts: Vec<(String, Py<PyAny>)>) -> PyResult<Vec<AsgiMount>> {
+pub fn validate_and_sort_asgi_mounts(
+    py: Python<'_>,
+    mounts: Vec<(String, Py<PyAny>)>,
+) -> PyResult<Vec<AsgiMount>> {
     let mut asgi_mounts: Vec<AsgiMount> = Vec::with_capacity(mounts.len());
 
     for (prefix, app) in mounts {
@@ -21,7 +24,17 @@ pub fn validate_and_sort_asgi_mounts(mounts: Vec<(String, Py<PyAny>)>) -> PyResu
             )));
         }
 
-        asgi_mounts.push(AsgiMount { prefix, app });
+        // `mount_django()` marks an app that serves HTTP only.
+        let websocket = match app.bind(py).getattr_opt("_bolt_http_only")? {
+            Some(http_only) => !http_only.is_truthy()?,
+            None => true,
+        };
+
+        asgi_mounts.push(AsgiMount {
+            prefix,
+            app,
+            websocket,
+        });
     }
 
     // Longest-prefix match requires descending sort.

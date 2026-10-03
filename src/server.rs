@@ -22,7 +22,7 @@ use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
 use bolt_core::state::{
-    find_asgi_mount, AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
+    find_websocket_mount, AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
     ROUTE_METADATA, ROUTE_METADATA_TEMP, TASK_LOCALS,
 };
 use bolt_core::static_files::handle_file;
@@ -195,8 +195,8 @@ pub fn register_websocket_routes(
 }
 
 #[pyfunction]
-pub fn register_asgi_mounts(_py: Python<'_>, mounts: Vec<(String, Py<PyAny>)>) -> PyResult<()> {
-    let asgi_mounts = validate_and_sort_asgi_mounts(mounts)?;
+pub fn register_asgi_mounts(py: Python<'_>, mounts: Vec<(String, Py<PyAny>)>) -> PyResult<()> {
+    let asgi_mounts = validate_and_sort_asgi_mounts(py, mounts)?;
 
     GLOBAL_ASGI_MOUNTS.set(Arc::new(asgi_mounts)).map_err(|_| {
         pyo3::exceptions::PyRuntimeError::new_err("ASGI mounts already initialized")
@@ -1194,7 +1194,7 @@ async fn websocket_not_found_handler(
         path
     };
 
-    if let Some(mount) = find_asgi_mount(state.get_ref(), normalized_path) {
+    if let Some(mount) = find_websocket_mount(state.get_ref(), normalized_path) {
         let app = Python::attach(|py| mount.app.clone_ref(py));
         let mount_prefix = mount.prefix.clone();
         return handle_websocket_upgrade(

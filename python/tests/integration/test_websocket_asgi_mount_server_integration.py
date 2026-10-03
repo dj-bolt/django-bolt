@@ -52,6 +52,26 @@ def test_mounted_asgi_websocket_scope_follows_spec(make_server_project):
     assert scope["authorization"] == "Bearer secret-token"
 
 
+def test_mounted_asgi_websocket_scope_decodes_path_and_keeps_utf8_headers(make_server_project):
+    project = _make_project(make_server_project)
+
+    with (
+        project.start() as server,
+        SimpleWebSocketClient(
+            server.host,
+            server.port,
+            "/mounted/caf%C3%A9/",
+            headers={"X-Name": "café"},
+        ) as websocket,
+    ):
+        scope = json.loads(websocket.receive_text())
+
+    # ASGI decodes path. raw_path keeps the bytes from the request line.
+    assert scope["path"] == "/mounted/café/"
+    assert scope["raw_path"] == "/mounted/caf%C3%A9/"
+    assert scope["x_name"] == "café"
+
+
 def test_registered_route_still_wins_over_mounts(make_server_project):
     project = _make_project(make_server_project)
 
@@ -60,3 +80,17 @@ def test_registered_route_still_wins_over_mounts(make_server_project):
         SimpleWebSocketClient(server.host, server.port, "/ws/direct") as websocket,
     ):
         assert websocket.receive_text() == "route"
+
+
+def test_django_mount_does_not_take_websocket_connections(make_server_project):
+    project = _make_project(make_server_project)
+
+    with (
+        project.start() as server,
+        SimpleWebSocketClient(server.host, server.port, "/django/ws") as websocket,
+    ):
+        code, reason = websocket.receive_close()
+
+    # Django serves HTTP only, so the path stays unmatched.
+    assert code == 1000
+    assert reason == "Not Found"

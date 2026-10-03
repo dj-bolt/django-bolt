@@ -32,7 +32,8 @@ async def echo_app(scope, receive, send):
     if connect["type"] != "websocket.connect":
         raise AssertionError(f"expected websocket.connect, got {connect['type']}")
 
-    await send({"type": "websocket.accept"})
+    # Channels always sends the subprotocol key, often as None.
+    await send({"type": "websocket.accept", "subprotocol": None})
 
     headers = {name.decode(): value.decode() for name, value in scope["headers"]}
     await send(
@@ -41,9 +42,11 @@ async def echo_app(scope, receive, send):
             "text": json.dumps(
                 {
                     "path": scope["path"],
+                    "raw_path": scope["raw_path"].decode(),
                     "root_path": scope["root_path"],
                     "query_string": scope["query_string"].decode(),
                     "authorization": headers.get("authorization"),
+                    "x_name": headers.get("x-name"),
                 }
             ),
         }
@@ -61,3 +64,4 @@ async def echo_app(scope, receive, send):
 
 
 api.mount_asgi("/mounted", echo_app)
+api.mount_django("/django")
