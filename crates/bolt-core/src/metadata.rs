@@ -548,7 +548,7 @@ pub struct RouteMetadata {
     pub form_seq_fields: HashSet<String>,
     // Query keys whose annotated type is a sequence. A repeated key gives each of
     // its values as a Python list; the plain query map keeps the last value only.
-    pub query_seq_fields: HashSet<String>,
+    pub query_seq_fields: AHashSet<String>,
     pub file_constraints: HashMap<String, FileFieldConstraints>,
     pub max_upload_size: usize,
     pub memory_spool_threshold: usize,
@@ -767,7 +767,7 @@ impl RouteMetadata {
             .map(|v| v.into_iter().collect())
             .unwrap_or_default();
 
-        let query_seq_fields: HashSet<String> = py_meta
+        let query_seq_fields: AHashSet<String> = py_meta
             .get_item("query_seq_fields")
             .ok()
             .flatten()

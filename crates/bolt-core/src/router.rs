@@ -1,4 +1,4 @@
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use matchit::{Match, Router as MatchRouter};
 use pyo3::prelude::*;
 use std::borrow::Cow;
@@ -344,6 +344,9 @@ pub fn decode_path_params(params: &mut AHashMap<String, String>) {
 /// A key or a value borrows from the query string when it needs no decode.
 pub type QueryParams<'a> = AHashMap<Cow<'a, str>, Cow<'a, str>>;
 
+/// Each sequence query key of a route, with its values in the order of the query.
+pub type QuerySequences<'a> = Vec<(Cow<'a, str>, Vec<Cow<'a, str>>)>;
+
 /// Decode one query key or value, as Django `QueryDict` does (`application/x-www-form-urlencoded`).
 /// A `+` becomes a space and `%XX` becomes a byte, so `%2B` gives a literal `+`.
 /// Bytes that are not UTF-8 become U+FFFD, as in Python `unquote`.
@@ -441,20 +444,17 @@ pub fn parse_query_string(query: &str) -> QueryParams<'_> {
 /// parameter (`list[int]`, `set[str]`) takes all of them, so the route lists
 /// its sequence keys and this second pass reads only those. It splits and
 /// decodes the pairs with `query_pairs`, so a value decodes as a scalar does.
-/// A key that is not in the query is not in the result.
-pub fn collect_query_sequences(
-    query: &str,
-    keys: &std::collections::HashSet<String>,
-) -> Vec<(String, Vec<String>)> {
-    let mut sequences: Vec<(String, Vec<String>)> = Vec::new();
+/// A key that is not in the query is not in the result. A value that has no
+/// escape borrows from the query, so it does not allocate.
+pub fn collect_query_sequences<'a>(query: &'a str, keys: &AHashSet<String>) -> QuerySequences<'a> {
+    let mut sequences: QuerySequences<'a> = Vec::new();
     for (key, value) in query_pairs(query) {
         if !keys.contains(key.as_ref()) {
             continue;
         }
-        let value = value.into_owned();
-        match sequences.iter_mut().find(|(name, _)| name == key.as_ref()) {
+        match sequences.iter_mut().find(|(name, _)| *name == key) {
             Some((_, values)) => values.push(value),
-            None => sequences.push((key.into_owned(), vec![value])),
+            None => sequences.push((key, vec![value])),
         }
     }
     sequences
@@ -464,11 +464,25 @@ pub fn collect_query_sequences(
 mod tests {
     use super::*;
 
+    fn owned(sequences: QuerySequences<'_>) -> Vec<(String, Vec<String>)> {
+        sequences
+            .into_iter()
+            .map(|(name, values)| {
+                (
+                    name.into_owned(),
+                    values.into_iter().map(Cow::into_owned).collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn collect_query_sequences_keeps_each_value_of_a_listed_key_in_order() {
-        let keys: std::collections::HashSet<String> =
-            ["tag".to_string(), "id".to_string()].into_iter().collect();
-        let sequences = collect_query_sequences("tag=b&page=2&tag=a%20c&id=1&tag=b&empty", &keys);
+        let keys: AHashSet<String> = ["tag".to_string(), "id".to_string()].into_iter().collect();
+        let sequences = owned(collect_query_sequences(
+            "tag=b&page=2&tag=a%20c&id=1&tag=b&empty",
+            &keys,
+        ));
         assert_eq!(
             sequences,
             vec![
@@ -483,9 +497,9 @@ mod tests {
 
     #[test]
     fn collect_query_sequences_reads_a_key_with_no_value_as_empty() {
-        let keys: std::collections::HashSet<String> = ["tag".to_string()].into_iter().collect();
+        let keys: AHashSet<String> = ["tag".to_string()].into_iter().collect();
         assert_eq!(
-            collect_query_sequences("tag&tag=", &keys),
+            owned(collect_query_sequences("tag&tag=", &keys)),
             vec![("tag".to_string(), vec![String::new(), String::new()])]
         );
         assert!(collect_query_sequences("other=1", &keys).is_empty());
@@ -493,9 +507,9 @@ mod tests {
 
     #[test]
     fn collect_query_sequences_decodes_plus_as_a_space_as_the_scalar_parser_does() {
-        let keys: std::collections::HashSet<String> = ["tag".to_string()].into_iter().collect();
+        let keys: AHashSet<String> = ["tag".to_string()].into_iter().collect();
         assert_eq!(
-            collect_query_sequences("tag=a+b&t%61g=c%2Bd", &keys),
+            owned(collect_query_sequences("tag=a+b&t%61g=c%2Bd", &keys)),
             vec![(
                 "tag".to_string(),
                 vec!["a b".to_string(), "c+d".to_string()]

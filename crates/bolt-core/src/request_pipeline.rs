@@ -4,13 +4,13 @@
 //! between the production handler (handler.rs) and test handler (testing.rs).
 
 use actix_web::{HttpRequest, HttpResponse};
-use ahash::AHashMap;
-use std::borrow::Borrow;
+use ahash::{AHashMap, AHashSet};
+use std::borrow::{Borrow, Cow};
 use std::hash::Hash;
 
 use crate::form_parsing::ValidationError;
 use crate::responses;
-use crate::router::QueryParams;
+use crate::router::{QueryParams, QuerySequences};
 use crate::type_coercion::{
     coerce_param, coerced_value_to_py, CoercedValue, CoercedValues, TypeHints, TYPE_STRING,
 };
@@ -116,11 +116,11 @@ where
 ///
 /// A route with no sequence keys, or a request with no query, gives an empty
 /// result that does not allocate. The length limit applies to each value.
-pub fn query_sequences(
-    query: Option<&str>,
-    keys: &std::collections::HashSet<String>,
+pub fn query_sequences<'a>(
+    query: Option<&'a str>,
+    keys: &AHashSet<String>,
     max_length: usize,
-) -> Result<Vec<(String, Vec<String>)>, HttpResponse> {
+) -> Result<QuerySequences<'a>, HttpResponse> {
     let query = match query {
         Some(query) if !keys.is_empty() && !query.is_empty() => query,
         _ => return Ok(Vec::new()),
@@ -138,7 +138,7 @@ pub fn query_sequences(
 pub fn set_query_sequences(
     py: Python<'_>,
     query_dict: &Bound<'_, PyDict>,
-    sequences: &[(String, Vec<String>)],
+    sequences: &[(Cow<'_, str>, Vec<Cow<'_, str>>)],
 ) -> PyResult<()> {
     for (name, values) in sequences {
         query_dict.set_item(name, pyo3::types::PyList::new(py, values)?)?;
@@ -265,11 +265,11 @@ mod tests {
 
     #[test]
     fn query_sequences_checks_the_length_of_each_value() {
-        let keys: std::collections::HashSet<String> = ["tag".to_string()].into_iter().collect();
+        let keys: AHashSet<String> = ["tag".to_string()].into_iter().collect();
         let sequences = query_sequences(Some("tag=abc&tag=de"), &keys, 3).unwrap();
         assert_eq!(
             sequences,
-            vec![("tag".to_string(), vec!["abc".to_string(), "de".to_string()])]
+            vec![(Cow::from("tag"), vec![Cow::from("abc"), Cow::from("de")])]
         );
         let response = query_sequences(Some("tag=abcd&tag=a"), &keys, 3).unwrap_err();
         assert_eq!(
