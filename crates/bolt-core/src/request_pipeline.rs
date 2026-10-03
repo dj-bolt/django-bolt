@@ -169,10 +169,11 @@ pub fn coerce_declared_value(
     }
 }
 
-/// Check the length of one path or query value, then coerce it as `types` declares.
+/// Coerce one path or query value as `types` declares, and check its length.
 ///
 /// Unlike [`coerce_declared_value`], the length limit applies to all values,
-/// including strings. The error is the detail text, as there.
+/// including strings. `coerce_param` checks a typed value, so this function
+/// checks only a value that it does not coerce. The error is the detail text.
 #[inline]
 pub fn coerce_param_value(
     name: &str,
@@ -181,10 +182,11 @@ pub fn coerce_param_value(
     max_length: usize,
     label: &str,
 ) -> Result<Option<CoercedValue>, String> {
-    if value.len() > max_length {
+    let coerced = coerce_declared_value(name, value, types, max_length, label)?;
+    if coerced.is_none() && value.len() > max_length {
         return Err(too_long_detail(label, name, value.len(), max_length));
     }
-    coerce_declared_value(name, value, types, max_length, label)
+    Ok(coerced)
 }
 
 /// Set `name` in a WebSocket scope dict, coerced when `types` declares it.
@@ -383,6 +385,12 @@ mod tests {
             coerce_param_value("limit", "7", &hints, 64, "Query parameter"),
             Ok(Some(CoercedValue::Int(7)))
         ));
+        let detail = coerce_param_value("limit", &"1".repeat(65), &hints, 64, "Query parameter")
+            .unwrap_err();
+        assert_eq!(
+            detail,
+            "Query parameter 'limit': Parameter too long: 65 bytes (max 64 bytes)"
+        );
     }
 
     #[test]
