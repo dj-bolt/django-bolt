@@ -33,6 +33,11 @@ async def with_headers(websocket: WebSocket):
     await websocket.receive_text()
 
 
+@api.websocket("/ws/owned-header")
+async def owned_header(websocket: WebSocket):
+    await websocket.accept(subprotocol="chat.v1", headers=[(b"sec-websocket-protocol", b"other")])
+
+
 @api.websocket("/ws/unrequested")
 async def unrequested(websocket: WebSocket):
     await websocket.accept(subprotocol="not-requested")

@@ -116,3 +116,13 @@ def test_mounted_asgi_app_negotiates_subprotocol_and_headers(server):
 def test_mounted_asgi_app_close_before_accept_refuses_with_403(server):
     status_line, _body = attempt_ws_upgrade(server.host, server.port, "/mounted/refuse")
     assert " 403 " in status_line
+
+
+def test_accept_header_owned_by_the_handshake_fails_handshake(server):
+    status_line, _body = attempt_ws_upgrade(
+        server.host,
+        server.port,
+        "/ws/owned-header",
+        headers={"Sec-WebSocket-Protocol": "chat.v1"},
+    )
+    assert " 500 " in status_line

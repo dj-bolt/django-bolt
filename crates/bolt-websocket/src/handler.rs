@@ -1,7 +1,10 @@
 //! WebSocket upgrade handler with full Python integration
 
 use actix::Addr;
-use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
+use actix_web::http::header::{
+    HeaderMap, HeaderName, HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS,
+    SEC_WEBSOCKET_PROTOCOL, UPGRADE,
+};
 use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_web_actors::ws;
@@ -380,6 +383,17 @@ impl WsConnectionState {
     }
 }
 
+/// Response headers that the handshake sets. `accept(headers=...)` cannot set them.
+///
+/// RFC 6455 4.2.2 allows one `Sec-WebSocket-Protocol` field. Bolt sets it from `subprotocol`.
+const HANDSHAKE_HEADERS: [HeaderName; 5] = [
+    SEC_WEBSOCKET_PROTOCOL,
+    SEC_WEBSOCKET_ACCEPT,
+    SEC_WEBSOCKET_EXTENSIONS,
+    UPGRADE,
+    CONNECTION,
+];
+
 /// Read the `headers` of `websocket.accept`: an iterable of `[name, value]` byte pairs.
 fn accept_headers(message: &Bound<'_, PyDict>) -> PyResult<Vec<(HeaderName, HeaderValue)>> {
     let Some(items) = message.get_item("headers")? else {
@@ -393,6 +407,12 @@ fn accept_headers(message: &Bound<'_, PyDict>) -> PyResult<Vec<(HeaderName, Head
         let name = HeaderName::from_bytes(&name).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid accept header name: {}", e))
         })?;
+        if HANDSHAKE_HEADERS.contains(&name) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "The handshake sets the '{}' header. Use accept(subprotocol=...) to select a subprotocol.",
+                name
+            )));
+        }
         let value = HeaderValue::from_bytes(&value).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid accept header value: {}", e))
         })?;

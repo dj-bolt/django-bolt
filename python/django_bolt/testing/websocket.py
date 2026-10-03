@@ -34,6 +34,11 @@ from django_bolt.websocket.handlers import build_websocket_request, get_websocke
 # Seconds the client waits for the handler to accept or refuse the handshake.
 HANDSHAKE_TIMEOUT = 5.0
 
+# Response headers that the handshake sets. `accept(headers=...)` cannot set them, as on the server.
+HANDSHAKE_HEADERS = frozenset(
+    {b"sec-websocket-protocol", b"sec-websocket-accept", b"sec-websocket-extensions", b"upgrade", b"connection"}
+)
+
 try:
     from django.conf import settings
 except ImportError:
@@ -299,6 +304,12 @@ class WebSocketTestClient:
                     f"Subprotocol '{subprotocol}' was not requested by the client "
                     f"(requested: {self._requested_subprotocols})"
                 )
+            for name, _value in message.get("headers") or ():
+                if name.lower() in HANDSHAKE_HEADERS:
+                    raise ValueError(
+                        f"The handshake sets the '{name.decode()}' header. "
+                        "Use accept(subprotocol=...) to select a subprotocol."
+                    )
             self._accepted = True
             self._accepted_subprotocol = subprotocol
             self._decide(None)

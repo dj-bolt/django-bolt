@@ -147,3 +147,19 @@ async def test_mounted_asgi_app_close_before_accept_rejects_handshake():
         async with WebSocketTestClient(_mounted_api(), "/mounted/refuse"):
             pass
     assert rejected.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name", [b"sec-websocket-protocol", b"Sec-WebSocket-Accept", b"sec-websocket-extensions", b"upgrade", b"connection"]
+)
+async def test_accept_rejects_headers_owned_by_the_handshake(name):
+    api = BoltAPI()
+
+    @api.websocket("/ws/owned")
+    async def owned(websocket: WebSocket):
+        await websocket.accept(subprotocol="chat.v1", headers=[(name, b"other")])
+
+    with pytest.raises(ValueError, match="handshake"):
+        async with WebSocketTestClient(api, "/ws/owned", subprotocols=["chat.v1"]):
+            pass

@@ -260,6 +260,10 @@ Give `accept()` extra headers for the `101` response as `(name, value)` byte pai
 await websocket.accept(headers=[(b"x-session-id", session_id.encode())])
 ```
 
+The handshake sets `Sec-WebSocket-Protocol`, `Sec-WebSocket-Accept`,
+`Sec-WebSocket-Extensions`, `Upgrade` and `Connection`. `accept()` raises
+`ValueError` for these headers. Select the subprotocol with `subprotocol=...`.
+
 ## Authentication
 
 Apply authentication to WebSocket endpoints:
