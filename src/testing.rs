@@ -36,7 +36,11 @@ use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
-use bolt_core::state::{find_asgi_mount, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS};
+use bolt_core::state::{
+    find_asgi_mount, find_websocket_mount_in_slice, AppState, AsgiMount, ScopeConfig, ServeMode,
+    TASK_LOCALS,
+};
+use bolt_websocket::handler::build_asgi_scope_from_parts;
 use bolt_websocket::WebSocketRouter;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -415,7 +419,7 @@ pub fn register_test_websocket_routes(
 /// Register HTTP ASGI mounts for a test app.
 #[pyfunction]
 pub fn register_test_asgi_mounts(
-    _py: Python<'_>,
+    py: Python<'_>,
     app_id: u64,
     mounts: Vec<(String, Py<PyAny>)>,
 ) -> PyResult<()> {
@@ -424,7 +428,7 @@ pub fn register_test_asgi_mounts(
         .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
 
     let mut app = entry.write();
-    let asgi_mounts = validate_and_sort_asgi_mounts(mounts)?;
+    let asgi_mounts = validate_and_sort_asgi_mounts(py, mounts)?;
     app.asgi_mounts = Arc::new(asgi_mounts);
     Ok(())
 }
@@ -1316,6 +1320,10 @@ async fn handle_test_request_internal(
 }
 
 /// Handle WebSocket test request - validates and routes WebSocket connections
+///
+/// Returns `(found, is_asgi_mount, handler_id, handler, path_params, scope)`.
+/// When `is_asgi_mount` is true, `handler` is a raw ASGI application and the
+/// caller must drive it with the scope, receive, and send triple.
 #[pyfunction]
 pub fn handle_test_websocket(
     py: Python<'_>,
@@ -1323,7 +1331,7 @@ pub fn handle_test_websocket(
     path: String,
     headers: Vec<(String, String)>,
     query_string: Option<String>,
-) -> PyResult<(bool, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
+) -> PyResult<(bool, bool, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
     use bolt_core::middleware::auth::authenticate;
     use bolt_core::permissions::{evaluate_guards, GuardResult};
     use bolt_core::router::parse_query_string;
@@ -1375,7 +1383,34 @@ pub fn handle_test_websocket(
     // Find WebSocket route
     let (route, path_params) = match app.websocket_router.find(normalized_path) {
         Some((route, params)) => (route, params),
-        None => return Ok((false, 0, py.None(), py.None(), py.None())),
+        // No route matched: fall back to a mounted ASGI app, as the server does.
+        None => {
+            return match find_websocket_mount_in_slice(&app.asgi_mounts, normalized_path) {
+                Some(mount) => {
+                    // Give the app the request path as sent, as the server does.
+                    let scope = build_asgi_scope_from_parts(
+                        py,
+                        &mount.prefix,
+                        &path,
+                        query_string.as_deref().unwrap_or_default().as_bytes(),
+                        header_map
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+                        false,
+                        Some(("127.0.0.1".to_string(), 0)),
+                    )?;
+                    Ok((
+                        true,
+                        true,
+                        0,
+                        mount.app.clone_ref(py),
+                        pyo3::types::PyDict::new(py).into(),
+                        scope,
+                    ))
+                }
+                None => Ok((false, false, 0, py.None(), py.None(), py.None())),
+            };
+        }
     };
 
     let handler_id = route.handler_id;
@@ -1553,6 +1588,13 @@ pub fn handle_test_websocket(
     }
     scope_dict.set_item("headers", headers_dict)?;
     scope_dict.set_item("path_params", &path_params_dict)?;
+    let subprotocols = bolt_websocket::requested_subprotocols(
+        headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-protocol"))
+            .map(|(_, v)| v.as_str()),
+    );
+    scope_dict.set_item("subprotocols", subprotocols)?;
 
     // Parse cookies
     let cookies_dict = pyo3::types::PyDict::new(py);
@@ -1602,6 +1644,7 @@ pub fn handle_test_websocket(
 
     Ok((
         true,
+        false,
         handler_id,
         handler,
         path_params_dict.into(),

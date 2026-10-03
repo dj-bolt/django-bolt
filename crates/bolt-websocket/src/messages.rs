@@ -11,11 +11,6 @@ pub enum WsMessage {
     Binary(Vec<u8>),
     /// Client disconnected
     Disconnect { code: u16 },
-    /// Connection accepted by Python handler
-    Accept {
-        #[allow(dead_code)] // Reserved for subprotocol negotiation
-        subprotocol: Option<String>,
-    },
     /// Send text to client (from Python)
     SendText(String),
     /// Send binary to client (from Python)

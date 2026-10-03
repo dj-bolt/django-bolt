@@ -25,7 +25,7 @@ async def echo(websocket: WebSocket):
 A WebSocket connection goes through these stages:
 
 1. **Connection** - Client initiates WebSocket handshake
-2. **Accept** - Server accepts the connection
+2. **Accept** - The handler calls `accept()`. Bolt then sends the `101 Switching Protocols` response.
 3. **Communication** - Exchange messages
 4. **Close** - Either party closes the connection
 
@@ -161,6 +161,30 @@ await websocket.close()
 await websocket.close(code=1000, reason="Normal closure")
 ```
 
+### Refuse the handshake
+
+Bolt sends the `101` response only when the handler calls `accept()`.
+Before that, the handler can refuse the connection with an HTTP status:
+
+| Handler action before `accept()` | Response |
+|----------------------------------|----------|
+| Calls `close()` | `403 Forbidden` |
+| Returns | `403 Forbidden` |
+| Raises an exception | `500 Internal Server Error` |
+
+```python
+@api.websocket("/ws/rooms/{room}")
+async def room(websocket: WebSocket, room: str):
+    if room not in OPEN_ROOMS:
+        await websocket.close()  # The client gets 403. The connection does not open.
+        return
+    await websocket.accept()
+```
+
+A call to `receive()` before `accept()` gives `{"type": "websocket.connect"}`
+one time, as the ASGI specification requires. A second call waits until the
+handler accepts or refuses the handshake.
+
 ### Handling client disconnect
 
 ```python
@@ -175,6 +199,9 @@ async def handler(websocket: WebSocket):
     except WebSocketDisconnect:
         print("Client disconnected")
 ```
+
+A send to a client that left raises `WebSocketDisconnect` with code 1006.
+Bolt does not log it as a handler error.
 
 ## Close codes
 
@@ -196,6 +223,46 @@ from django_bolt import CloseCode
 
 await websocket.close(code=CloseCode.NORMAL_CLOSURE)
 ```
+
+## Subprotocols
+
+A client can request one or more subprotocols in the `Sec-WebSocket-Protocol`
+header. `websocket.subprotocols` gives the list, in the order of the client.
+Select one with `accept(subprotocol=...)`. Bolt sends it in the `101` response:
+
+```python
+@api.websocket("/graphql")
+async def graphql(websocket: WebSocket):
+    if "graphql-transport-ws" not in websocket.subprotocols:
+        await websocket.close()
+        return
+    await websocket.accept(subprotocol="graphql-transport-ws")
+```
+
+```javascript
+const ws = new WebSocket("ws://localhost:8000/graphql", ["graphql-transport-ws"]);
+ws.onopen = () => console.log(ws.protocol); // "graphql-transport-ws"
+```
+
+A browser closes the connection if it requests a subprotocol and the `101`
+response does not select one. RFC 6455 lets the server select only a
+subprotocol that the client requested. Thus `accept()` raises `ValueError`
+for any other value, and the handshake gets `500`.
+
+The scope also has the list, in `scope["subprotocols"]`, as the ASGI
+specification requires.
+
+### Response headers
+
+Give `accept()` extra headers for the `101` response as `(name, value)` byte pairs:
+
+```python
+await websocket.accept(headers=[(b"x-session-id", session_id.encode())])
+```
+
+The handshake sets `Sec-WebSocket-Protocol`, `Sec-WebSocket-Accept`,
+`Sec-WebSocket-Extensions`, `Upgrade` and `Connection`. `accept()` raises
+`ValueError` for these headers. Select the subprotocol with `subprotocol=...`.
 
 ## Authentication
 
@@ -278,6 +345,30 @@ States:
 - `WebSocketState.CONNECTED` - After `accept()`
 - `WebSocketState.DISCONNECTED` - After close
 
+## OpenAPI metadata
+
+A WebSocket route appears in the OpenAPI schema with the `WebSocket` tag.
+Use `tags` to set different tags.
+Use `summary` and `description` to replace the text from the docstring.
+Set `include_in_schema=False` to keep the route out of the schema:
+
+```python
+@api.websocket(
+    "/ws/stream",
+    tags=["Streaming"],
+    summary="Stream prices",
+    description="Sends each price change.",
+)
+async def stream(websocket: WebSocket):
+    await websocket.accept()
+
+@api.websocket("/ws/internal", include_in_schema=False)
+async def internal(websocket: WebSocket):
+    await websocket.accept()
+```
+
+A route without `include_in_schema` uses the value of its `BoltAPI`, as an HTTP route does.
+
 ## Testing WebSockets
 
 Use the `WebSocketTestClient`:
@@ -291,6 +382,20 @@ with TestClient(api) as client:
         response = ws.receive_text()
         assert response == "Echo: Hello"
 ```
+
+`WebSocketTestClient` waits for the handshake decision of the handler, as the
+server does. A refused handshake fails the `async with`:
+
+```python
+from django_bolt.testing import HandshakeRejected, WebSocketTestClient
+
+with pytest.raises(HandshakeRejected) as rejected:
+    async with WebSocketTestClient(api, "/ws/rooms/closed"):
+        pass
+assert rejected.value.status_code == 403
+```
+
+An error in the handler before `accept()` fails the `async with` with that error.
 
 ## Real-time patterns
 

@@ -562,6 +562,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "regex",
  "tokio",
+ "urlencoding",
 ]
 
 [[package]]

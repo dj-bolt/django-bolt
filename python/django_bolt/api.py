@@ -24,6 +24,7 @@ except ImportError:
 import msgspec
 from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
+from django.core.handlers.asgi import ASGIHandler
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
 
@@ -845,9 +846,16 @@ class BoltAPI:
         name: str | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
+        tags: list[str] | None = None,
+        summary: str | None = None,
+        description: str | None = None,
+        include_in_schema: bool | None = None,
     ):
         """
         Register a WebSocket endpoint with FastAPI-like syntax.
+
+        ``tags`` sets the OpenAPI tags. Without it, the operation gets only the ``WebSocket`` tag.
+        ``summary``, ``description`` and ``include_in_schema`` work as on HTTP routes.
 
         Usage:
             from django_bolt.websocket import WebSocket
@@ -866,7 +874,16 @@ class BoltAPI:
                 async for message in websocket.iter_json():
                     await websocket.send_json({"echo": message})
         """
-        return self._websocket_decorator(path, name=name, guards=guards, auth=auth)
+        return self._websocket_decorator(
+            path,
+            name=name,
+            guards=guards,
+            auth=auth,
+            tags=tags,
+            summary=summary,
+            description=description,
+            include_in_schema=include_in_schema,
+        )
 
     def _websocket_decorator(
         self,
@@ -875,6 +892,10 @@ class BoltAPI:
         name: str | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
+        tags: list[str] | None = None,
+        summary: str | None = None,
+        description: str | None = None,
+        include_in_schema: bool | None = None,
     ):
         """Internal decorator for WebSocket routes."""
 
@@ -908,6 +929,13 @@ class BoltAPI:
             meta["name"] = name if name is not None else fn.__name__
             meta["name_explicit"] = name is not None
             meta["namespace"] = self.namespace or ""
+            meta["include_in_schema"] = include_in_schema
+            if tags is not None:
+                meta["openapi_tags"] = tags
+            if summary is not None:
+                meta["openapi_summary"] = summary
+            if description is not None:
+                meta["openapi_description"] = description
 
             # Compile optimized argument injector (same as HTTP handlers)
             injector = self._compile_argument_injector(meta)
@@ -3151,9 +3179,13 @@ class BoltAPI:
             self._websocket_routes.append((new_path, new_handler_id, handler))
             self._handlers[new_handler_id] = handler
 
-            # Copy handler metadata (now keyed by handler_id for performance)
+            # Copy handler metadata, layered as for HTTP routes above.
             if handler_id in app._handler_meta:
-                self._handler_meta[new_handler_id] = app._handler_meta[handler_id]
+                meta = app._handler_meta[handler_id]
+                self._handler_meta[new_handler_id] = {
+                    **meta,
+                    "include_in_schema": _layer(meta["include_in_schema"], app.include_in_schema),
+                }
 
             if handler_id in app._handler_middleware:
                 middleware_meta = app._handler_middleware[handler_id].copy()
@@ -3230,6 +3262,10 @@ class BoltAPI:
                 await send(rewritten)
 
             await asgi_app(django_scope, receive, django_send)
+
+        # Django's ASGIHandler serves HTTP only. Keep WebSocket connections off it.
+        if isinstance(asgi_app, ASGIHandler):
+            django_mount_wrapper._bolt_http_only = True
 
         self.mount_asgi(path, django_mount_wrapper)
 
