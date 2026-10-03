@@ -13,6 +13,12 @@ on:
 permissions:
   contents: read
 
+# One group per pull request: a new push cancels the run for the old commit.
+# Runs for master and for tags always finish, so a release is never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Find if a pull request changes documentation only. Such a pull request
   # skips the build and test jobs. The ci-ok job reports one result for all.
