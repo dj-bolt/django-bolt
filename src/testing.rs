@@ -35,7 +35,7 @@ use bolt_core::metadata::{CorsConfig, RateLimitKey, RouteMetadata, RouteMetadata
 use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
-use bolt_core::router::{query_pairs, Router};
+use bolt_core::router::Router;
 use bolt_core::state::{find_asgi_mount, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS};
 use bolt_websocket::WebSocketRouter;
 use futures_util::StreamExt;
@@ -45,13 +45,11 @@ use crate::handler::{
     build_prebound_from_values, form_result_to_py, response_from_wire_result, SourceValues,
 };
 use bolt_core::request_pipeline::{
-    set_declared_item, validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
+    set_declared_item, set_param_item, validate_and_cache_source, validate_and_cache_typed_params,
+    EMPTY_TYPES,
 };
 use bolt_core::static_files::handle_file;
-use bolt_core::type_coercion::coerced_value_to_py;
-use bolt_core::type_coercion::{
-    coerce_param, string_map_to_py_dict, CoerceError, TypeHints, TYPE_STRING,
-};
+use bolt_core::type_coercion::{string_map_to_py_dict, TypeHints};
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
@@ -1315,6 +1313,7 @@ pub fn handle_test_websocket(
 ) -> PyResult<(bool, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
     use bolt_core::middleware::auth::authenticate;
     use bolt_core::permissions::{evaluate_guards, GuardResult};
+    use bolt_core::router::parse_query_string;
 
     let entry = registry()
         .get(&app_id)
@@ -1474,22 +1473,17 @@ pub fn handle_test_websocket(
     // Build path_params dict with type coercion
     let max_param_length = app.max_param_length;
     let path_params_dict = pyo3::types::PyDict::new(py);
+    // A value that is too long or a bad typed value rejects the upgrade, as in production.
     for (k, v) in path_params.iter() {
-        let type_hint = param_types.get(k).copied().unwrap_or(TYPE_STRING);
-        match coerce_param(v, type_hint, max_param_length) {
-            Ok(coerced) => {
-                let py_value = coerced_value_to_py(py, &coerced)?;
-                path_params_dict.set_item(k, py_value)?;
-            }
-            // Oversized values are a hard error — never fall back to the raw string.
-            Err(e @ CoerceError::TooLong { .. }) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-            }
-            // Genuine type-coercion failure: fall back to the raw string.
-            Err(CoerceError::Invalid(_)) => {
-                path_params_dict.set_item(k, v)?;
-            }
-        }
+        set_param_item(
+            py,
+            &path_params_dict,
+            k,
+            v,
+            param_types,
+            max_param_length,
+            "Path parameter",
+        )?;
     }
 
     // Build scope dict
@@ -1500,27 +1494,19 @@ pub fn handle_test_websocket(
         scope_dict.set_item("_bolt_revocation_auth", context)?;
     }
 
-    // Parse and coerce query parameters
+    // Parse the query string with the HTTP parser, as production does.
     let query_dict = pyo3::types::PyDict::new(py);
-    for (key, value) in query_pairs(query_string.as_deref().unwrap_or_default()) {
-        let type_hint = param_types
-            .get(key.as_ref())
-            .copied()
-            .unwrap_or(TYPE_STRING);
-
-        match coerce_param(&value, type_hint, max_param_length) {
-            Ok(coerced) => {
-                let py_value = coerced_value_to_py(py, &coerced)?;
-                query_dict.set_item(key.as_ref(), py_value)?;
-            }
-            // Oversized values are a hard error — never fall back to raw string.
-            Err(e @ CoerceError::TooLong { .. }) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
-            }
-            // Genuine type-coercion failure: fall back to the raw string.
-            Err(CoerceError::Invalid(_)) => {
-                query_dict.set_item(key.as_ref(), value.as_ref())?;
-            }
+    if let Some(ref qs) = query_string {
+        for (key, value) in &parse_query_string(qs) {
+            set_param_item(
+                py,
+                &query_dict,
+                key,
+                value,
+                param_types,
+                max_param_length,
+                "Query parameter",
+            )?;
         }
     }
     scope_dict.set_item("query_params", query_dict)?;

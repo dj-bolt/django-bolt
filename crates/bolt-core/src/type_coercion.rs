@@ -211,12 +211,12 @@ impl CoercedValue {
 
 /// Error returned by [`coerce_param`].
 ///
-/// Callers distinguish the two variants structurally:
-/// * [`CoerceError::TooLong`] is a hard security limit — it MUST always be
-///   rejected (422 for HTTP, upgrade rejection for WebSockets). Never fall back
-///   to passing the oversized value through.
-/// * [`CoerceError::Invalid`] is a normal type-coercion failure. Some callers
-///   (WebSocket scope building) intentionally fall back to the raw string here.
+/// * [`CoerceError::TooLong`] is a hard security limit. Never pass the
+///   oversized value through.
+/// * [`CoerceError::Invalid`] is a normal type-coercion failure.
+///
+/// Callers reject both variants: a 422 for HTTP, a rejected upgrade for
+/// WebSockets. No caller gives the raw string to the handler.
 ///
 /// `Display` reproduces the exact same messages the old `String` errors used,
 /// so existing `format!("{e}")` / `.to_string()` consumers are unchanged.

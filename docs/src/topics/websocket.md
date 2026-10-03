@@ -108,6 +108,9 @@ async def room(websocket: WebSocket, room_id: str):
         await websocket.send_text(f"[{room_id}] {message}")
 ```
 
+Bolt decodes path values as for HTTP routes. Thus `/ws/room/hello%20world`
+gives `hello world`.
+
 ## Query parameters
 
 Access query parameters from the connection:
@@ -122,6 +125,30 @@ async def connect(websocket: WebSocket, token: str | None = None):
     await websocket.accept()
     # ...
 ```
+
+When a query key repeats, the parameter gets the last value, as for HTTP
+routes.
+
+## Typed parameters
+
+Declare a path, query, header or cookie parameter with a type, for example
+`int`. Rust converts the value before the handler runs. A value that does not
+convert rejects the upgrade with a 400. The body names the parameter:
+
+```python
+from typing import Annotated
+
+from django_bolt.param_functions import Query
+
+@api.websocket("/ws/feed")
+async def feed(websocket: WebSocket, limit: Annotated[int, Query()] = 10):
+    await websocket.accept()
+    await websocket.send_json({"limit": limit})
+```
+
+`?limit=50` gives the integer `50`. `?limit=abc` gives a 400 with
+`Query parameter 'limit': Invalid integer 'abc'`. `WebSocketTestClient`
+raises `ValueError` with the same text.
 
 ## Closing connections
 
