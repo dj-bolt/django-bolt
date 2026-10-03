@@ -82,18 +82,43 @@ async def slow_accept(websocket: WebSocket):
         SEND_AFTER_LEAVE.append("no error")
 
 
+# Each entry is one call of the handler that the version test probes.
+VERSION_PROBE_CALLS: list[str] = []
+
+
+@api.websocket("/ws/version-probe")
+async def version_probe(websocket: WebSocket):
+    VERSION_PROBE_CALLS.append("called")
+    await websocket.accept()
+
+
+@api.get("/version-probe-calls")
+async def version_probe_calls():
+    return {"calls": len(VERSION_PROBE_CALLS)}
+
+
 @api.get("/send-after-leave")
 async def send_after_leave():
     return {"errors": SEND_AFTER_LEAVE}
 
 
 async def negotiating_app(scope, receive, send):
-    """Mounted ASGI app: refuses on /refuse, else accepts the first subprotocol."""
+    """Mounted ASGI app. The last path segment selects the handshake decision.
+
+    /refuse closes before accept, /boom raises before accept, /unrequested
+    accepts a subprotocol that the client did not request. Any other path
+    accepts the first requested subprotocol.
+    """
     connect = await receive()
     if connect["type"] != "websocket.connect":
         raise AssertionError(f"expected websocket.connect, got {connect['type']}")
     if scope["path"].endswith("/refuse"):
         await send({"type": "websocket.close", "code": 1000})
+        return
+    if scope["path"].endswith("/boom"):
+        raise RuntimeError("mounted app failed before accept")
+    if scope["path"].endswith("/unrequested"):
+        await send({"type": "websocket.accept", "subprotocol": "not-requested"})
         return
     subprotocols = scope["subprotocols"]
     await send(
