@@ -23,6 +23,12 @@ use crate::streaming_compression::accepts_encoding;
 /// Compression middleware factory
 pub struct CompressionMiddleware;
 
+impl Default for CompressionMiddleware {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CompressionMiddleware {
     pub fn new() -> Self {
         Self
@@ -278,15 +284,17 @@ mod select_encoding_tests {
     }
 
     fn cfg_gzip() -> CompressionConfig {
-        let mut c = CompressionConfig::default();
-        c.backend = "gzip".to_string();
-        c
+        CompressionConfig {
+            backend: "gzip".to_string(),
+            ..Default::default()
+        }
     }
 
     fn cfg_zstd() -> CompressionConfig {
-        let mut c = CompressionConfig::default();
-        c.backend = "zstd".to_string();
-        c
+        CompressionConfig {
+            backend: "zstd".to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]

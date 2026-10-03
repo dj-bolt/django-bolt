@@ -347,8 +347,7 @@ fn parse_datetime(value: &str) -> Result<CoercedValue, String> {
     }
 
     // Try ISO 8601 with Z suffix
-    if value.ends_with('Z') {
-        let without_z = &value[..value.len() - 1];
+    if let Some(without_z) = value.strip_suffix('Z') {
         if let Ok(ndt) = NaiveDateTime::parse_from_str(without_z, "%Y-%m-%dT%H:%M:%S%.f") {
             return Ok(CoercedValue::DateTime(ndt.and_utc()));
         }
@@ -441,6 +440,94 @@ where
         dict.set_item(name, coerced_value_to_py(py, typed)?)?;
     }
     Ok(dict)
+}
+
+/// Convert CoercedValue to Python object
+///
+/// Constructs actual Python typed objects (uuid.UUID, decimal.Decimal, datetime, etc.)
+/// directly — datetime/date/time go through PyO3's chrono integration (C-API
+/// construction, no ISO-string round trip) and UUID is built from its 128-bit
+/// value instead of re-parsing a hex string in Python.
+///
+/// `coerce_param` rejects the values that Python cannot build, so this fails
+/// only on a Python error such as memory exhaustion. The error is returned,
+/// never unwrapped: a panic under the GIL would abort the worker.
+pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> PyResult<Py<PyAny>> {
+    Ok(match value {
+        // Primitives - direct conversion
+        CoercedValue::Int(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Float(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Bool(v) => v.into_pyobject(py)?.to_owned().unbind().into_any(),
+        CoercedValue::String(v) => v.into_pyobject(py)?.into_any().unbind(),
+
+        // UUID: built from the 128-bit integer, no hex string round trip.
+        CoercedValue::Uuid(v) => uuid_to_py(py, *v)?,
+
+        // Decimal: construct Python decimal.Decimal from the validated input
+        // string (kept as-is so large exponents are never expanded into their
+        // full digit string in Rust).
+        CoercedValue::Decimal(v) => get_decimal_class(py).call1(py, (v.as_str(),))?,
+
+        // Temporal types: direct C-API construction via pyo3's chrono feature.
+        CoercedValue::DateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::NaiveDateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Date(v) => v.into_pyobject(py)?.into_any().unbind(),
+        CoercedValue::Time(v) => v.into_pyobject(py)?.into_any().unbind(),
+
+        CoercedValue::Null => py.None(),
+    })
+}
+
+/// Build a Python `uuid.UUID` from the parsed 128-bit value.
+///
+/// `uuid.UUID(int=...)` runs the Python `__init__`, which checks its arguments
+/// again. This function builds the object as CPython 3.14 `UUID._from_int` does:
+/// `object.__new__(UUID)`, then it sets the `int` and `is_safe` slots.
+/// `UUID.__setattr__` blocks assignment, so the slots are set with the generic
+/// setter, as `object.__setattr__` does. The 128-bit value is always in range.
+#[inline]
+pub fn uuid_to_py(py: Python<'_>, v: uuid::Uuid) -> PyResult<Py<PyAny>> {
+    let object_new = OBJECT_NEW.get_or_init(py, || {
+        py.import("builtins")
+            .unwrap()
+            .getattr("object")
+            .unwrap()
+            .getattr("__new__")
+            .unwrap()
+            .unbind()
+    });
+    let safe_unknown = SAFE_UUID_UNKNOWN.get_or_init(py, || {
+        py.import("uuid")
+            .unwrap()
+            .getattr("SafeUUID")
+            .unwrap()
+            .getattr("unknown")
+            .unwrap()
+            .unbind()
+    });
+    let value = object_new.bind(py).call1((get_uuid_class(py).bind(py),))?;
+    let int = v.as_u128().into_pyobject(py)?;
+    set_slot(&value, pyo3::intern!(py, "int"), int.as_any())?;
+    set_slot(&value, pyo3::intern!(py, "is_safe"), safe_unknown.bind(py))?;
+    Ok(value.unbind())
+}
+
+/// Set an attribute with the generic setter, as `object.__setattr__` does.
+#[inline]
+fn set_slot(
+    object: &pyo3::Bound<'_, PyAny>,
+    name: &pyo3::Bound<'_, pyo3::types::PyString>,
+    value: &pyo3::Bound<'_, PyAny>,
+) -> PyResult<()> {
+    // SAFETY: the three pointers are valid for the call: the Bound references keep them alive.
+    let status = unsafe {
+        pyo3::ffi::PyObject_GenericSetAttr(object.as_ptr(), name.as_ptr(), value.as_ptr())
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(pyo3::PyErr::fetch(object.py()))
+    }
 }
 
 #[cfg(test)]
@@ -702,93 +789,5 @@ mod tests {
             parse_max_param_length(Some(&MAX_ALLOWED_PARAM_LENGTH.to_string())),
             MAX_ALLOWED_PARAM_LENGTH
         );
-    }
-}
-
-/// Convert CoercedValue to Python object
-///
-/// Constructs actual Python typed objects (uuid.UUID, decimal.Decimal, datetime, etc.)
-/// directly — datetime/date/time go through PyO3's chrono integration (C-API
-/// construction, no ISO-string round trip) and UUID is built from its 128-bit
-/// value instead of re-parsing a hex string in Python.
-///
-/// `coerce_param` rejects the values that Python cannot build, so this fails
-/// only on a Python error such as memory exhaustion. The error is returned,
-/// never unwrapped: a panic under the GIL would abort the worker.
-pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> PyResult<Py<PyAny>> {
-    Ok(match value {
-        // Primitives - direct conversion
-        CoercedValue::Int(v) => v.into_pyobject(py)?.into_any().unbind(),
-        CoercedValue::Float(v) => v.into_pyobject(py)?.into_any().unbind(),
-        CoercedValue::Bool(v) => v.into_pyobject(py)?.to_owned().unbind().into_any(),
-        CoercedValue::String(v) => v.into_pyobject(py)?.into_any().unbind(),
-
-        // UUID: built from the 128-bit integer, no hex string round trip.
-        CoercedValue::Uuid(v) => uuid_to_py(py, *v)?,
-
-        // Decimal: construct Python decimal.Decimal from the validated input
-        // string (kept as-is so large exponents are never expanded into their
-        // full digit string in Rust).
-        CoercedValue::Decimal(v) => get_decimal_class(py).call1(py, (v.as_str(),))?,
-
-        // Temporal types: direct C-API construction via pyo3's chrono feature.
-        CoercedValue::DateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
-        CoercedValue::NaiveDateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
-        CoercedValue::Date(v) => v.into_pyobject(py)?.into_any().unbind(),
-        CoercedValue::Time(v) => v.into_pyobject(py)?.into_any().unbind(),
-
-        CoercedValue::Null => py.None(),
-    })
-}
-
-/// Build a Python `uuid.UUID` from the parsed 128-bit value.
-///
-/// `uuid.UUID(int=...)` runs the Python `__init__`, which checks its arguments
-/// again. This function builds the object as CPython 3.14 `UUID._from_int` does:
-/// `object.__new__(UUID)`, then it sets the `int` and `is_safe` slots.
-/// `UUID.__setattr__` blocks assignment, so the slots are set with the generic
-/// setter, as `object.__setattr__` does. The 128-bit value is always in range.
-#[inline]
-pub fn uuid_to_py(py: Python<'_>, v: uuid::Uuid) -> PyResult<Py<PyAny>> {
-    let object_new = OBJECT_NEW.get_or_init(py, || {
-        py.import("builtins")
-            .unwrap()
-            .getattr("object")
-            .unwrap()
-            .getattr("__new__")
-            .unwrap()
-            .unbind()
-    });
-    let safe_unknown = SAFE_UUID_UNKNOWN.get_or_init(py, || {
-        py.import("uuid")
-            .unwrap()
-            .getattr("SafeUUID")
-            .unwrap()
-            .getattr("unknown")
-            .unwrap()
-            .unbind()
-    });
-    let value = object_new.bind(py).call1((get_uuid_class(py).bind(py),))?;
-    let int = v.as_u128().into_pyobject(py)?;
-    set_slot(&value, pyo3::intern!(py, "int"), int.as_any())?;
-    set_slot(&value, pyo3::intern!(py, "is_safe"), safe_unknown.bind(py))?;
-    Ok(value.unbind())
-}
-
-/// Set an attribute with the generic setter, as `object.__setattr__` does.
-#[inline]
-fn set_slot(
-    object: &pyo3::Bound<'_, PyAny>,
-    name: &pyo3::Bound<'_, pyo3::types::PyString>,
-    value: &pyo3::Bound<'_, PyAny>,
-) -> PyResult<()> {
-    // SAFETY: the three pointers are valid for the call: the Bound references keep them alive.
-    let status = unsafe {
-        pyo3::ffi::PyObject_GenericSetAttr(object.as_ptr(), name.as_ptr(), value.as_ptr())
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(pyo3::PyErr::fetch(object.py()))
     }
 }

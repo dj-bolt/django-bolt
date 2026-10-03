@@ -13,12 +13,26 @@ import platform
 import signal
 import socket
 import subprocess
+import sys
+import sysconfig
 import time
 
 import pytest
 
 # Suppress httpx INFO logs during tests
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _gil_stays_disabled():
+    """Fail a free-threaded run when an import turns the GIL back on.
+
+    CPython enables the GIL when it loads a C extension that does not declare
+    free-threading support. The run then tests GIL behavior, not free threading.
+    """
+    yield
+    if sysconfig.get_config_var("Py_GIL_DISABLED") and sys._is_gil_enabled():
+        pytest.fail("An imported C extension enabled the GIL. The RuntimeWarning in the warnings summary names it.")
 
 
 def pytest_configure(config):

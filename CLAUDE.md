@@ -8,6 +8,8 @@ Django-Bolt: Rust-powered (Actix Web + PyO3) API endpoints for Django, msgspec s
 just build                 # rebuild the Rust extension (required after any Rust change)
 just rebuild               # clean + build
 just test-py               # Python tests
+just test-rs               # Rust unit tests
+just clippy                # Rust lint, -D warnings (CI gate)
 uv run --with pytest pytest python/tests/test_syntax.py::test_name -s -vv
 just lint                  # ruff on everything; `just lint-lib` must always pass
 just format
@@ -63,4 +65,5 @@ Do it once at registration, reuse forever at runtime. In `_dispatch`, `_dispatch
 - Subprocess `runbolt` tests only for what `TestClient` cannot exercise: startup wiring, `--dev` reload, multi-process, signals, real TCP, streaming, WebSocket handshakes, artifacts. Author such apps as real modules in `python/tests/integration/apps/` (self-contained `api = BoltAPI()` + `/health`; secondary apps use a namespaced health path). Prefer `make_server_project(api_module=app_module("x"))`; use `api_source=app_source("x")` only when an on-disk file is needed (autodiscovery, reload, artifact tests).
 - Markers: `server_integration` (real `runbolt`), `platform_smoke`, `artifact_smoke`. Apply `server_integration` per subprocess test, never module-wide when the module also has in-process tests. Changes to startup/reload/multiprocessing/TCP/streaming/WebSocket/packaging need a `server_integration` or `artifact_smoke` test.
 - Rust tests: `#[cfg(test)]` next to the code in the owning crate.
+- pytest runs strict (`pytest.ini`): unknown markers fail, and any warning fails. Fix the cause. Add an `ignore` to `filterwarnings` only with its reason. Do not skip on a missing dev dependency; add it to the dev group.
 - Run with `-s -vv`. bolt-mcp shares the integration harness — when changing `helpers.py`, grep repo-wide under `python/` and run the bolt-mcp suite too.

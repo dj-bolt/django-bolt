@@ -840,7 +840,7 @@ async fn handle_test_request_internal(
     let route_meta = route_metadata.get(handler_id).cloned();
     let can_lane_dispatch = route_meta
         .as_ref()
-        .map_or(false, |m| m.plan.can_lane_dispatch());
+        .is_some_and(|m| m.plan.can_lane_dispatch());
 
     // Parse query string
     let needs_query = route_meta
@@ -909,9 +909,11 @@ async fn handle_test_request_internal(
 
     // Host and scheme retain Actix behavior; REMOTE_ADDR uses Bolt's explicit
     // forwarding-header trust policy.
-    let conn_info = req.connection_info();
-    let conn_host = conn_info.host().to_owned();
-    let conn_scheme = conn_info.scheme().to_owned();
+    // Copy the values out, so the `RefCell` borrow ends before the awaits below.
+    let (conn_host, conn_scheme) = {
+        let conn_info = req.connection_info();
+        (conn_info.host().to_owned(), conn_info.scheme().to_owned())
+    };
     let conn_remote_addr = client_ip;
 
     // Rate limiting: address and header keys before auth, identity keys after.
@@ -1019,7 +1021,7 @@ async fn handle_test_request_internal(
     // production helpers so payload-size limits behave identically under
     // TestClient (per src/CLAUDE.md: tests reuse production code). Only computed
     // for routes that read a body.
-    let needs_body = route_meta.as_ref().map_or(true, |m| m.plan.needs_body());
+    let needs_body = route_meta.as_ref().is_none_or(|m| m.plan.needs_body());
     let reads_body = needs_body || needs_form_parsing;
     let content_length = if reads_body {
         parse_content_length(&req)
@@ -1620,7 +1622,7 @@ pub fn handle_test_websocket(
     }
     scope_dict.set_item("cookies", cookies_dict)?;
 
-    let client_tuple = pyo3::types::PyTuple::new(py, &["127.0.0.1", "12345"])?;
+    let client_tuple = pyo3::types::PyTuple::new(py, ["127.0.0.1", "12345"])?;
     scope_dict.set_item("client", client_tuple)?;
 
     // Add auth context if present

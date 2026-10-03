@@ -151,6 +151,8 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             # Close TLS before TCP. A bare close races the close_notify
             # of the probe, and the socket then answers with RST.
             self.request.unwrap()
+            # socketserver closes only the original socket, which wrap_socket detached.
+            self.request.close()
 
     starttls_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), StartTLSHandler)
     starttls_thread = threading.Thread(target=starttls_server.serve_forever, daemon=True)

@@ -8,9 +8,8 @@ catch regressions in plumbing (Rust → Python → wire). One handler, many
 
 from __future__ import annotations
 
+import brotlicffi  # noqa: F401  # httpx decodes `br` responses only with a brotli binding
 import pytest
-
-pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import CompressionConfig

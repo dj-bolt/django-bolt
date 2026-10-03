@@ -18,12 +18,11 @@ integrity).
 
 from __future__ import annotations
 
+import brotlicffi  # noqa: F401  # httpx decodes `br` responses only with a brotli binding
 import pytest
 
 from .apps import app_module
 from .helpers import ServerProject
-
-pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
 
 pytestmark = pytest.mark.server_integration
 
@@ -75,7 +74,6 @@ def test_buffered_gzip_roundtrip_end_to_end(make_server_project):
 
 
 def test_buffered_zstd_roundtrip_end_to_end(make_server_project):
-    pytest.importorskip("zstandard", reason="zstandard package not installed")
     project = _make_buffered_project(make_server_project, backend="zstd")
     with project.start(startup_path="/health") as server:
         resp = server.get("/data", headers={"Accept-Encoding": "zstd"})
@@ -200,7 +198,6 @@ def test_zstd_level_extreme_value_roundtrip(make_server_project):
     """Zstd at max compression (level=22, "ultra" mode) flows through and
     roundtrips. Guards against the level being silently clamped or dropped
     by the Python→Rust dict parsing."""
-    pytest.importorskip("zstandard", reason="zstandard package not installed")
     project = _make_buffered_project(make_server_project, backend="zstd", zstd_level=22)
     with project.start(startup_path="/health") as server:
         resp = server.get("/data", headers={"Accept-Encoding": "zstd"})

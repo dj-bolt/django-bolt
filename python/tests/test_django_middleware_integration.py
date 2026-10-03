@@ -1118,7 +1118,7 @@ class TestRequestConversion:
             return {"has_cookies": bool(request.cookies)}
 
         with TestClient(api) as client:
-            response = client.get("/test", cookies={"test_cookie": "value"})
+            response = client.get("/test", headers={"Cookie": "test_cookie=value"})
             assert response.status_code == 200
 
     def test_headers_available(self):
@@ -1959,7 +1959,7 @@ class TestTypedParamsKeepRawStringsForDjango:
             return {"count": count, "x_count": x_count}
 
         with TestClient(api) as client:
-            response = client.get("/typed", cookies={"n": "0005"}, headers={"X-Count": "0007"})
+            response = client.get("/typed", headers={"X-Count": "0007", "Cookie": "n=0005"})
 
         assert response.status_code == 200, response.text
         assert response.json() == {"count": 5, "x_count": 7}

@@ -317,7 +317,7 @@ impl PerChunkEncoder for BrotliEncoder {
 
     fn finish(self: Box<Self>) -> std::io::Result<Vec<u8>> {
         // CompressorWriter::into_inner runs BROTLI_OPERATION_FINISH.
-        let sink = (*self).inner.into_inner();
+        let sink = self.inner.into_inner();
         Ok(sink.buf)
     }
 }
@@ -348,7 +348,7 @@ impl PerChunkEncoder for GzipEncoder {
 
     fn finish(self: Box<Self>) -> std::io::Result<Vec<u8>> {
         // GzEncoder::finish writes the final block + gzip trailer.
-        let sink = (*self).inner.finish()?;
+        let sink = self.inner.finish()?;
         Ok(sink.buf)
     }
 }
@@ -379,7 +379,7 @@ impl PerChunkEncoder for ZstdEncoder {
     }
 
     fn finish(self: Box<Self>) -> std::io::Result<Vec<u8>> {
-        let sink = (*self).inner.finish()?;
+        let sink = self.inner.finish()?;
         Ok(sink.buf)
     }
 }
@@ -646,8 +646,10 @@ mod tests {
 
     #[test]
     fn select_skips_fallback_when_disabled() {
-        let mut cfg = CompressionConfig::default();
-        cfg.gzip_fallback = false;
+        let cfg = CompressionConfig {
+            gzip_fallback: false,
+            ..Default::default()
+        };
         let r = req_with_ae("gzip");
         assert!(select_stream_encoding(&r, Some(&cfg), false).is_none());
     }
@@ -661,8 +663,10 @@ mod tests {
 
     #[test]
     fn select_picks_zstd_when_configured() {
-        let mut cfg = CompressionConfig::default();
-        cfg.backend = "zstd".to_string();
+        let cfg = CompressionConfig {
+            backend: "zstd".to_string(),
+            ..Default::default()
+        };
         let r = req_with_ae("zstd, gzip");
         match select_stream_encoding(&r, Some(&cfg), false).unwrap() {
             StreamCodec::Zstd { .. } => {}

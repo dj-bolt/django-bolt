@@ -23,7 +23,7 @@ pub fn extract_http_exception(
     let headers: Vec<(String, String)> = exc
         .getattr("headers")
         .ok()
-        .and_then(|h| {
+        .map(|h| {
             if let Ok(dict) = h.cast::<PyDict>() {
                 let mut result = Vec::new();
                 for (k, v) in dict {
@@ -31,12 +31,12 @@ pub fn extract_http_exception(
                         result.push((key, value));
                     }
                 }
-                Some(result)
+                result
             } else {
-                Some(Vec::new())
+                Vec::new()
             }
         })
-        .unwrap_or_else(|| Vec::new());
+        .unwrap_or_else(Vec::new);
 
     let extra: Option<Py<PyAny>> =
         exc.getattr("extra")
@@ -238,7 +238,7 @@ fn serialize_error_dict(py: Python, dict: &Bound<PyDict>) -> String {
     }
 
     // Fallback to manual JSON construction
-    format!(r#"{{"detail":"Serialization error"}}"#)
+    r#"{"detail":"Serialization error"}"#.to_string()
 }
 
 /// Escape JSON string
@@ -248,18 +248,6 @@ fn escape_json(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_escape_json() {
-        assert_eq!(escape_json(r#"Hello "World""#), r#"Hello \"World\""#);
-        assert_eq!(escape_json("Line1\nLine2"), "Line1\\nLine2");
-        assert_eq!(escape_json("Tab\there"), "Tab\\there");
-    }
 }
 
 /// Handle Python errors and convert to HTTP response
@@ -285,5 +273,17 @@ pub fn handle_python_error(
             None,
             debug,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_json() {
+        assert_eq!(escape_json(r#"Hello "World""#), r#"Hello \"World\""#);
+        assert_eq!(escape_json("Line1\nLine2"), "Line1\\nLine2");
+        assert_eq!(escape_json("Tab\there"), "Tab\\there");
     }
 }

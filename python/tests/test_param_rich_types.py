@@ -183,7 +183,7 @@ def test_a_sequence_header_or_cookie_gives_one_item(form_client):
         "item_types": ["int"],
     }
     assert form_client.get("/header", headers={"X-Tag": "x"}).status_code == 422
-    assert form_client.get("/cookie", cookies={"tags": "a"}).json() == {"value": ["a"], "type": "set"}
+    assert form_client.get("/cookie", headers={"Cookie": "tags=a"}).json() == {"value": ["a"], "type": "set"}
 
 
 @pytest.mark.parametrize(
@@ -229,7 +229,7 @@ def test_a_bare_collection_parameter_takes_each_value_of_its_key():
     with TestClient(api) as client:
         response = client.get("/bare?tag=b&tag=a&tag=b&ids=1&ids=2", headers={"X-Names": "n"})
         form_response = client.post("/bare-form", data={"tag": ["b", "a", "b"]})
-        cookie_response = client.get("/bare-cookie-struct", cookies={"themes": "dark"})
+        cookie_response = client.get("/bare-cookie-struct", headers={"Cookie": "themes=dark"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {
@@ -301,7 +301,7 @@ def test_a_newtype_or_type_alias_parameter_converts_as_its_base_type(alias_clien
     assert alias_client.get("/maybe").json() == {"value": None, "type": "NoneType"}
     assert alias_client.get("/maybe?user_id=3").json() == {"value": 3, "type": "int"}
     assert alias_client.get("/header", headers={"X-User-Id": "7"}).json() == {"value": 7, "type": "int"}
-    assert alias_client.get("/cookie", cookies={"page": "8"}).json() == {"value": 8, "type": "int"}
+    assert alias_client.get("/cookie", headers={"Cookie": "page=8"}).json() == {"value": 8, "type": "int"}
     assert alias_client.post("/form", data={"user_id": "9"}).json() == {"value": 9, "type": "int"}
 
 
@@ -313,7 +313,7 @@ def test_a_newtype_or_type_alias_parameter_converts_as_its_base_type(alias_clien
         ("get", "/query?user_id=1&page=x", {}),
         ("get", "/maybe?user_id=x", {}),
         ("get", "/header", {"headers": {"X-User-Id": "x"}}),
-        ("get", "/cookie", {"cookies": {"page": "x"}}),
+        ("get", "/cookie", {"headers": {"Cookie": "page=x"}}),
         ("post", "/form", {"data": {"user_id": "x"}}),
     ],
 )
@@ -415,7 +415,7 @@ def constraint_client():
         ("get", "/marker?code=ABC", {}, {"value": "ABC", "type": "str"}),
         ("get", "/positive?count=2", {}, {"value": 2, "type": "int"}),
         ("get", "/header", {"headers": {"X-Name": "abc"}}, {"value": "abc", "type": "str"}),
-        ("get", "/cookie", {"cookies": {"size": "0.5"}}, {"value": 0.5, "type": "float"}),
+        ("get", "/cookie", {"headers": {"Cookie": "size=0.5"}}, {"value": 0.5, "type": "float"}),
         ("post", "/form", {"data": {"tags": ["0", "4"]}}, {"value": [0, 4], "type": "list", "item_types": ["int"]}),
     ],
 )
@@ -434,7 +434,7 @@ def test_a_value_within_its_constraints_passes(constraint_client, method, url, k
         ("get", "/marker?code=abc", {}),
         ("get", "/positive?count=0", {}),
         ("get", "/header", {"headers": {"X-Name": "abcd"}}),
-        ("get", "/cookie", {"cookies": {"size": "0"}}),
+        ("get", "/cookie", {"headers": {"Cookie": "size=0"}}),
         ("post", "/form", {"data": {"tags": ["-1"]}}),
         ("post", "/form", {"data": {"tags": ["1", "2", "3"]}}),
     ],

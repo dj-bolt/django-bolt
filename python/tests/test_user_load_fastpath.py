@@ -137,7 +137,7 @@ def test_custom_get_user_sync_override_is_untouched():
 
     class CustomQueryAuth(JWTAuthentication):
         def get_user_sync(self, user_id):
-            return User.objects.select_related().only("username").get(pk=user_id)
+            return User.objects.only("username").get(pk=user_id)
 
     user = User.objects.create(username="custom_query")
     loaded = CustomQueryAuth(secret=SECRET).get_user_sync(str(user.pk))

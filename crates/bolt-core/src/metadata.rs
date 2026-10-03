@@ -155,15 +155,8 @@ impl CorsConfig {
         expose_headers: Option<Vec<String>>,
         max_age: Option<u32>,
     ) -> Self {
-        let mut config = CorsConfig::default();
-
-        // Build origin set for O(1) lookups
-        config.origin_set = origins.iter().cloned().collect();
-        config.origins = origins;
-
         // Compile origin regex patterns at startup
-        config.origin_regexes = origin_regexes.clone();
-        config.compiled_origin_regexes = origin_regexes
+        let compiled_origin_regexes = origin_regexes
             .iter()
             .filter_map(|pattern| {
                 Regex::new(pattern).ok().or_else(|| {
@@ -176,8 +169,16 @@ impl CorsConfig {
             })
             .collect();
 
-        config.allow_all_origins = allow_all_origins;
-        config.credentials = allow_credentials;
+        let mut config = CorsConfig {
+            // Build origin set for O(1) lookups
+            origin_set: origins.iter().cloned().collect(),
+            origins,
+            origin_regexes,
+            compiled_origin_regexes,
+            allow_all_origins,
+            credentials: allow_credentials,
+            ..Default::default()
+        };
 
         if let Some(methods) = allow_methods {
             config.methods_str = methods.join(", ");

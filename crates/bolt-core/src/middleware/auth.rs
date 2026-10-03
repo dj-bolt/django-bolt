@@ -625,13 +625,10 @@ fn try_api_key_auth(
     let api_key_header = headers.get(header_name)?;
 
     // Extract key (remove "Bearer " or "ApiKey " prefix if present)
-    let api_key = if api_key_header.starts_with("Bearer ") {
-        &api_key_header[7..]
-    } else if api_key_header.starts_with("ApiKey ") {
-        &api_key_header[7..]
-    } else {
-        api_key_header
-    };
+    let api_key = api_key_header
+        .strip_prefix("Bearer ")
+        .or_else(|| api_key_header.strip_prefix("ApiKey "))
+        .unwrap_or(api_key_header);
 
     // Check if key is valid - use constant-time comparison for security
     if api_keys.contains(api_key) {

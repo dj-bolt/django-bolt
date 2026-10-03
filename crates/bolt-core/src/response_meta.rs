@@ -26,6 +26,10 @@ pub enum ResponseType {
 impl ResponseType {
     /// Parse from Python string
     #[inline]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "infallible: an unknown name maps to OctetStream, so FromStr's Result adds nothing"
+    )]
     pub fn from_str(s: &str) -> Self {
         match s {
             "empty" => Self::Empty,

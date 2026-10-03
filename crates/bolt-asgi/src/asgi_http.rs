@@ -192,13 +192,11 @@ impl AsgiSend {
 
                 return pyo3_async_runtimes::tokio::future_into_py(py, async move {
                     if let Some(tx) = tx {
-                        if !body.is_empty() {
-                            if tx.send(Bytes::from(body)).await.is_err() {
-                                log::debug!(
-                                    "ASGI mount: body chunk dropped — receiver already closed \
+                        if !body.is_empty() && tx.send(Bytes::from(body)).await.is_err() {
+                            log::debug!(
+                                "ASGI mount: body chunk dropped — receiver already closed \
                                      (request may have timed out or been cancelled)"
-                                );
-                            }
+                            );
                         }
                     }
                     Ok(())
@@ -336,8 +334,7 @@ fn mounted_subpath(request_path: &str, mount_prefix: &str) -> String {
         return "/".to_string();
     }
 
-    if request_path.starts_with(mount_prefix) {
-        let path = &request_path[mount_prefix.len()..];
+    if let Some(path) = request_path.strip_prefix(mount_prefix) {
         if path.is_empty() {
             "/".to_string()
         } else {

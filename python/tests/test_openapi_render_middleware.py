@@ -47,7 +47,6 @@ def test_explicit_yaml_plugin():
 
 @pytest.mark.parametrize("plugin", [ScalarRenderPlugin(), SwaggerRenderPlugin()])
 def test_debug_toolbar_in_docs(plugin, monkeypatch):
-    pytest.importorskip("debug_toolbar")
     with override_settings(
         INSTALLED_APPS=[*settings.INSTALLED_APPS, "debug_toolbar"],
         ROOT_URLCONF=__name__,
