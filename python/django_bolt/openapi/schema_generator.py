@@ -582,11 +582,13 @@ class SchemaGenerator:
             if should_exclude:
                 continue
 
-            if ws_path not in paths:
-                paths[ws_path] = PathItem()
-
             # Get handler metadata
             meta = self.api._handler_meta.get(handler_id, {})
+            if _layer(meta.get("include_in_schema"), self.api.include_in_schema) is False:
+                continue
+
+            if ws_path not in paths:
+                paths[ws_path] = PathItem()
 
             # Create WebSocket operation (as GET with upgrade)
             operation = self._create_websocket_operation(
@@ -797,17 +799,10 @@ class SchemaGenerator:
         # Extract security requirements
         security = self._extract_security(handler_id)
 
-        # Prefer explicit tags over auto-extracted tags
+        # Use explicit tags as given. Otherwise use only the "WebSocket" tag.
+        # A second auto-extracted tag makes renderers show the operation twice.
         tags = meta.get("openapi_tags")
         if tags is None:
-            # Fallback to auto-extraction from handler module or class name
-            tags = self._extract_tags(handler)
-
-        # Add "WebSocket" tag if not present
-        if tags:
-            if "WebSocket" not in tags and "Websocket" not in tags and "websocket" not in tags:
-                tags = ["WebSocket"] + tags
-        else:
             tags = ["WebSocket"]
 
         operation = Operation(

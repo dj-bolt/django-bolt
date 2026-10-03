@@ -278,6 +278,30 @@ States:
 - `WebSocketState.CONNECTED` - After `accept()`
 - `WebSocketState.DISCONNECTED` - After close
 
+## OpenAPI metadata
+
+A WebSocket route appears in the OpenAPI schema with the `WebSocket` tag.
+Use `tags` to set different tags.
+Use `summary` and `description` to replace the text from the docstring.
+Set `include_in_schema=False` to keep the route out of the schema:
+
+```python
+@api.websocket(
+    "/ws/stream",
+    tags=["Streaming"],
+    summary="Stream prices",
+    description="Sends each price change.",
+)
+async def stream(websocket: WebSocket):
+    await websocket.accept()
+
+@api.websocket("/ws/internal", include_in_schema=False)
+async def internal(websocket: WebSocket):
+    await websocket.accept()
+```
+
+A route without `include_in_schema` uses the value of its `BoltAPI`, as an HTTP route does.
+
 ## Testing WebSockets
 
 Use the `WebSocketTestClient`:
