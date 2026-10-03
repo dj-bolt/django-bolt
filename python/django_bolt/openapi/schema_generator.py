@@ -797,18 +797,9 @@ class SchemaGenerator:
         # Extract security requirements
         security = self._extract_security(handler_id)
 
-        # Prefer explicit tags over auto-extracted tags
-        tags = meta.get("openapi_tags")
-        if tags is None:
-            # Fallback to auto-extraction from handler module or class name
-            tags = self._extract_tags(handler)
-
-        # Add "WebSocket" tag if not present
-        if tags:
-            if "WebSocket" not in tags and "Websocket" not in tags and "websocket" not in tags:
-                tags = ["WebSocket"] + tags
-        else:
-            tags = ["WebSocket"]
+        # Use explicit tags as given. Otherwise use only the "WebSocket" tag.
+        # A second auto-extracted tag makes renderers show the operation twice.
+        tags = meta.get("openapi_tags") or ["WebSocket"]
 
         operation = Operation(
             summary=summary,

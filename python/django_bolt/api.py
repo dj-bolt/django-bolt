@@ -845,9 +845,12 @@ class BoltAPI:
         name: str | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
+        tags: list[str] | None = None,
     ):
         """
         Register a WebSocket endpoint with FastAPI-like syntax.
+
+        ``tags`` sets the OpenAPI tags. Without it, the operation gets only the ``WebSocket`` tag.
 
         Usage:
             from django_bolt.websocket import WebSocket
@@ -866,7 +869,7 @@ class BoltAPI:
                 async for message in websocket.iter_json():
                     await websocket.send_json({"echo": message})
         """
-        return self._websocket_decorator(path, name=name, guards=guards, auth=auth)
+        return self._websocket_decorator(path, name=name, guards=guards, auth=auth, tags=tags)
 
     def _websocket_decorator(
         self,
@@ -875,6 +878,7 @@ class BoltAPI:
         name: str | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
+        tags: list[str] | None = None,
     ):
         """Internal decorator for WebSocket routes."""
 
@@ -908,6 +912,8 @@ class BoltAPI:
             meta["name"] = name if name is not None else fn.__name__
             meta["name_explicit"] = name is not None
             meta["namespace"] = self.namespace or ""
+            if tags is not None:
+                meta["openapi_tags"] = tags
 
             # Compile optimized argument injector (same as HTTP handlers)
             injector = self._compile_argument_injector(meta)

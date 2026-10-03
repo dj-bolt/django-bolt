@@ -278,6 +278,17 @@ States:
 - `WebSocketState.CONNECTED` - After `accept()`
 - `WebSocketState.DISCONNECTED` - After close
 
+## OpenAPI tags
+
+A WebSocket route appears in the OpenAPI schema with the `WebSocket` tag.
+Use `tags` to set different tags:
+
+```python
+@api.websocket("/ws/stream", tags=["Streaming"])
+async def stream(websocket: WebSocket):
+    await websocket.accept()
+```
+
 ## Testing WebSockets
 
 Use the `WebSocketTestClient`:

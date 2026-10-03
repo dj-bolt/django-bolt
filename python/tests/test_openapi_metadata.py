@@ -8,6 +8,7 @@ from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.openapi.spec import Tag
 from django_bolt.views import ViewSet
+from django_bolt.websocket import WebSocket
 
 
 def test_route_decorator_with_tags():
@@ -333,3 +334,44 @@ def test_partial_metadata_override():
     assert operation.summary == "Custom summary only"
     # Description should fall back to docstring
     assert operation.description == "Docstring description that should be used."
+
+
+def _websocket_operation_tags(api: BoltAPI, path: str) -> list[str] | None:
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
+    return schema.paths[path].get.tags
+
+
+def test_websocket_default_tags_only_websocket():
+    """A WebSocket route without tags gets only the WebSocket tag (issue #368)."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/stream")
+    async def stream(websocket: WebSocket):
+        await websocket.accept()
+
+    assert _websocket_operation_tags(api, "/ws/stream") == ["WebSocket"]
+
+
+def test_websocket_explicit_tags():
+    """Explicit tags on a WebSocket route replace the default tag."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/stream", tags=["Streaming"])
+    async def stream(websocket: WebSocket):
+        await websocket.accept()
+
+    assert _websocket_operation_tags(api, "/ws/stream") == ["Streaming"]
+
+
+def test_websocket_explicit_tags_survive_mount():
+    """Explicit tags on a WebSocket route stay after mount."""
+    child = BoltAPI()
+
+    @child.websocket("/ws/stream", tags=["Streaming"])
+    async def stream(websocket: WebSocket):
+        await websocket.accept()
+
+    api = BoltAPI()
+    api.mount("/v1", child)
+
+    assert _websocket_operation_tags(api, "/v1/ws/stream") == ["Streaming"]

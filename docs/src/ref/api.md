@@ -238,9 +238,9 @@ Notes:
 
 ### WebSocket decorator
 
-#### @api.websocket(path)
+#### @api.websocket(path, *, name=None, guards=None, auth=None, tags=None)
 
-Register a WebSocket endpoint.
+Register a WebSocket endpoint. `tags` sets the OpenAPI tags. The default is `["WebSocket"]`.
 
 ```python
 @api.websocket("/ws")
