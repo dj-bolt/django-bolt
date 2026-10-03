@@ -454,6 +454,18 @@ jobs:
       - name: Build extension
         run: uv run maturin develop --release
 
+      # psycopg (a dev dependency) loads libpq when a test module imports it.
+      # The macOS image has no libpq, and Homebrew's libpq is keg-only. ctypes
+      # finds a library in /usr/local/lib, so link it there. DYLD_* variables
+      # do not reach the tests: macOS removes them when it starts /bin/bash.
+      - name: Install libpq (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libpq
+          sudo mkdir -p /usr/local/lib
+          sudo ln -sf "$(brew --prefix libpq)"/lib/libpq*.dylib /usr/local/lib/
+          uv run python -c "import psycopg; print('libpq', psycopg.pq.version())"
+
       - name: Run platform smoke tests
         run: uv run pytest python/tests/integration -m platform_smoke -s -vv
 
