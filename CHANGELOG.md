@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
 
 - **A `revoked_token_handler` can read the claims of the token** - A handler with two parameters gets the verified claims: `handler(jti, claims)`. A handler with one parameter still gets the `jti` only. Bolt reads the number of parameters one time, at registration. Use it to reject a token whose session ended. For example, a django-allauth access token names its session in `sid`, and allauth ends that session at logout. See [Session-bound tokens](docs/src/topics/authentication.md#session-bound-tokens-django-allauth).
 
+- **bolt-mcp: MCP Tasks extension (SEP-2663)** - `@mcp.tool(task=True, ttl=, poll_interval=)` runs a tool as a task. A client that declares `io.modelcontextprotocol/tasks` gets `resultType: "task"` from `tools/call`, then polls `tasks/get`. The server also serves `tasks/update` and `tasks/cancel`. `tasks/cancel` and an elapsed TTL cancel the Python coroutine. In a task, `ctx.elicit()` and `ctx.sample()` suspend the tool until `tasks/update` answers, with no MRTR replay. `ctx.report_progress()` and log lines set the task `statusMessage`. `ctx.task_id` gives the task id. Only the principal that created a task can reach it. Tasks live in process memory, so `runbolt` stops at startup when a mount has a task tool and `--processes` is more than 1. (#299)
+
 ### Removed
 
 - **Django 4.2, 5.0, and 5.1** - All three reached end of life upstream (5.0 in April 2025, 5.1 in December 2025, 4.2 LTS in April 2026) and are no longer supported. The minimum is now Django 5.2 LTS, and the supported series are 5.2, 6.0, and 6.1. Projects on an end-of-life Django receive no upstream security fixes; pin `django-bolt<0.12` if you cannot upgrade Django yet.

@@ -688,12 +688,48 @@ impl WorkerTaskHandle {
     }
 }
 
+/// Cancels the asyncio Task behind a `WorkerTaskHandle` when dropped while
+/// armed. A dropped `dispatch_cancellable` future (an aborted MCP task) thus
+/// stops the Python coroutine too.
+struct CancelOnDrop(Option<Py<WorkerTaskHandle>>);
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some(handle) = self.0.take() else {
+            return;
+        };
+        Python::attach(|py| {
+            let inner = handle.bind(py).get();
+            inner
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(task) = inner.task.lock().unwrap().take() {
+                // Schedule `.cancel()` on the task's own loop; calling it
+                // from this thread directly is not loop-safe.
+                let task = task.bind(py);
+                if let (Ok(task_loop), Ok(cancel)) =
+                    (task.call_method0("get_loop"), task.getattr("cancel"))
+                {
+                    let _ = task_loop.call_method1("call_soon_threadsafe", (cancel,));
+                }
+            }
+        });
+    }
+}
+
 /// Cancellable variant of [`dispatch`], used by MCP tool calls: rmcp fires the
 /// request's `CancellationToken` when the client closes the SSE response
 /// stream (the 2026-07-28 cancellation signal) or sends
 /// `notifications/cancelled` (legacy sessions). Plain routes keep the
 /// non-cancelling `dispatch` semantics deliberately (tasks may outlive
-/// responses); MCP semantics require the tool to actually stop.
+/// responses); MCP semantics require the tool to actually stop. A drop of
+/// this future before the result arrives cancels the Python task as well.
 pub async fn dispatch_cancellable(
     dispatch: Py<PyAny>,
     payload: Py<PyAny>,
@@ -733,32 +769,21 @@ pub async fn dispatch_cancellable(
         Ok::<_, PyErr>(handle)
     })?;
 
+    let mut guard = CancelOnDrop(Some(handle));
     tokio::select! {
-        result = &mut rx => match result {
-            Ok(result) => result,
-            Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "worker dispatch resolver dropped without a result",
-            )),
+        result = &mut rx => {
+            guard.disarm();
+            match result {
+                Ok(result) => result,
+                Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "worker dispatch resolver dropped without a result",
+                )),
+            }
         },
-        _ = ct.cancelled() => {
-            Python::attach(|py| {
-                let inner = handle.bind(py).get();
-                inner.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(task) = inner.task.lock().unwrap().take() {
-                    // Schedule `.cancel()` on the task's own loop; calling it
-                    // from this thread directly is not loop-safe.
-                    let task = task.bind(py);
-                    if let (Ok(task_loop), Ok(cancel)) =
-                        (task.call_method0("get_loop"), task.getattr("cancel"))
-                    {
-                        let _ = task_loop.call_method1("call_soon_threadsafe", (cancel,));
-                    }
-                }
-            });
-            Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "MCP request cancelled by client",
-            ))
-        }
+        // The armed guard cancels the Python task when this function returns.
+        _ = ct.cancelled() => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "MCP request cancelled by client",
+        )),
     }
 }
 

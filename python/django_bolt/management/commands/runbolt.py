@@ -45,6 +45,22 @@ _ENV_DEV_SPAWN_MS = "DJANGO_BOLT_DEV_SPAWN_UNIX_MS"
 DEV_RELOAD_DEBOUNCE_MS = 50
 
 
+def _reject_multiprocess_mcp_tasks(mcp_mounts: list[dict]) -> None:
+    """Stop startup when an MCP mount has task tools and more than one process serves it.
+
+    MCP Tasks (SEP-2663) live in the memory of the process that created them.
+    With SO_REUSEPORT, tasks/get can reach a different process.
+    """
+    for mount in mcp_mounts:
+        task_tools = sorted(name for name, tool in mount["tools"].items() if tool["task"] is not None)
+        if task_tools:
+            raise CommandError(
+                f"The MCP mount at {mount['path']!r} has task tools ({', '.join(task_tools)}). "
+                "MCP Tasks live in the memory of one process, so tasks/get must reach that process. "
+                "Run with --processes 1, or remove task=True from these tools."
+            )
+
+
 class _Ansi:
     """Minimal ANSI palette; every attribute is '' when colors are disabled."""
 
@@ -785,6 +801,8 @@ class Command(BaseCommand):
             return
 
         merged_api = self.merge_apis(apis)
+        if options["processes"] > 1:
+            _reject_multiprocess_mcp_tasks(merged_api._mcp_mounts)
         _user_route_count = len(merged_api._routes)
 
         features: list[tuple[str, str]] = []

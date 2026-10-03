@@ -234,6 +234,34 @@ How `elicit` reaches the client depends on the client's protocol era:
 
     `ctx.sample` (asking the client's LLM to generate) is deprecated by the 2026-07-28 spec (SEP-2577). It still works for legacy session clients that advertised the `sampling` capability; on 2026-07-28 clients it raises, surfaced as an in-band tool error — integrate with an LLM provider API directly instead. A client that never advertised the capability also gets a clear in-band error.
 
+## Long-running tools: tasks
+
+A tool can run as a task (the MCP Tasks extension, SEP-2663). Add `task=True` to the decorator:
+
+```python
+@mcp.tool(task=True, ttl=600_000, poll_interval=2_000)
+async def build_report(month: str, ctx: Context) -> dict:
+    await ctx.report_progress(1, 3, "Collecting data")
+    rows = await collect(month)
+    answer = await ctx.elicit(f"Send the report for {month}?")
+    return {"rows": len(rows), "sent": answer["action"] == "accept"}
+```
+
+The client must declare the `io.modelcontextprotocol/tasks` extension in its capabilities. Then `tools/call` returns `resultType: "task"` at once, with a `taskId`. The tool continues on the server. The client polls `tasks/get` until the status is `completed`, `failed` or `cancelled`. A completed task holds the tool result in `result`. A client that does not declare the extension gets the usual direct result.
+
+- `ttl` is the task lifetime in milliseconds. The default is 300 000 (5 minutes). When the TTL elapses, the task fails and Bolt cancels the tool coroutine.
+- `poll_interval` is the polling interval that the server suggests, in milliseconds. The default is 1 000.
+- `tasks/cancel` cancels the tool coroutine. The task then reports `cancelled`.
+- `ctx.report_progress()` and the log methods set the `statusMessage` of the task. A log line updates it at `info` level and above, unless the request sets a log level.
+- `ctx.elicit()` and `ctx.sample()` suspend the tool. The task reports `input_required` with the request in `inputRequests`. The client answers with `tasks/update`, and the tool continues from the same point. Unlike MRTR, the tool does not run again from the top.
+- `ctx.task_id` gives the task id. It is `None` when the call does not run as a task.
+
+The server advertises the extension only when at least one tool has `task=True`. Only the principal that created a task can get, update or cancel it.
+
+!!! warning "Tasks need one process"
+
+    Tasks live in the memory of the process that runs them. With more than one process, `tasks/get` can reach a process that does not have the task. Thus `runbolt` stops at startup when a mount has a task tool and `--processes` is more than 1. A restart of the process loses its tasks.
+
 ## Exposing existing REST routes as tools
 
 You can surface existing Django-Bolt endpoints as MCP tools without rewriting them. Exposure is **explicit and per-handler** — there is no "expose everything" switch, because a stray marker must never silently turn a route into an AI-callable tool.
@@ -528,6 +556,6 @@ See the [Testing guide](testing.md) for more on `TestClient`.
 
 ## Supported MCP methods
 
-The protocol is implemented by the official MCP Rust SDK (rmcp) embedded in Django-Bolt. Served methods: `server/discover`, `tools/list`, `tools/call` (with MRTR `input_required` results), `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, `prompts/get`, `subscriptions/listen` — plus, for legacy-era clients, `initialize`, `ping`, and the session `GET`/`DELETE` endpoints. List results carry the SEP-2549 `ttlMs`/`cacheScope` caching hints (configure with `MCP(list_ttl_ms=..., list_cache_scope=...)`), and the SEP-2243 routing headers (`Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`) are validated against the body. With the built-in Authorization Server (Tier 3) it additionally serves `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, and `/oauth/{register,authorize,token,revoke}`, with RFC 9207 `iss` on authorization responses. The advertised `resource` (and token audience) is the full MCP endpoint URL — issuer + mount path.
+The protocol is implemented by the official MCP Rust SDK (rmcp) embedded in Django-Bolt. Served methods: `server/discover`, `tools/list`, `tools/call` (with MRTR `input_required` results), `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, `prompts/get`, `subscriptions/listen`, `tasks/get`, `tasks/update` and `tasks/cancel` (when a tool has `task=True`) — plus, for legacy-era clients, `initialize`, `ping`, and the session `GET`/`DELETE` endpoints. List results carry the SEP-2549 `ttlMs`/`cacheScope` caching hints (configure with `MCP(list_ttl_ms=..., list_cache_scope=...)`), and the SEP-2243 routing headers (`Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`) are validated against the body. With the built-in Authorization Server (Tier 3) it additionally serves `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, and `/oauth/{register,authorize,token,revoke}`, with RFC 9207 `iss` on authorization responses. The advertised `resource` (and token audience) is the full MCP endpoint URL — issuer + mount path.
 
 The server advertises protocol version **2026-07-28** and negotiates every earlier revision back to `2024-11-05` with legacy clients.

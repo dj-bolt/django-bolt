@@ -11,6 +11,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+# SEP-2663 task defaults (milliseconds), matching rmcp's TaskManager.
+DEFAULT_TASK_TTL_MS = 300_000
+DEFAULT_TASK_POLL_INTERVAL_MS = 1_000
+
 
 @dataclass
 class ToolDef:
@@ -28,6 +32,10 @@ class ToolDef:
     is_async: bool = False
     injects_request: bool = False
     ctx_param: str | None = None  # name of the parameter to inject the Context under
+    # SEP-2663 Tasks opt-in; the TTL and poll interval are in milliseconds.
+    task: bool = False
+    task_ttl_ms: int = DEFAULT_TASK_TTL_MS
+    task_poll_interval_ms: int = DEFAULT_TASK_POLL_INTERVAL_MS
 
 
 @dataclass

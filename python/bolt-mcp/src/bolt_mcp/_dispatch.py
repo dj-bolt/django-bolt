@@ -89,6 +89,7 @@ def tool_entry(mcp: MCP, tool: ToolDef) -> dict[str, Any]:
         "dispatch": partial(_run_tool, tool, mcp),
         "needs_context": tool.ctx_param is not None,
         "guards": [g.to_metadata() for g in tool.guards],
+        "task": {"ttl_ms": tool.task_ttl_ms, "poll_interval_ms": tool.task_poll_interval_ms} if tool.task else None,
     }
 
 

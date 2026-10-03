@@ -86,6 +86,21 @@ client replies on a separate POST (correlated by id). They therefore require **s
 capabilities — otherwise they raise (surfaced as an in-band tool error). `report_progress`/logging
 work in stateless mode too.
 
+## Long-running tools: tasks
+
+`@mcp.tool(task=True)` opts a tool in to the MCP Tasks extension (SEP-2663). A client that
+declares `io.modelcontextprotocol/tasks` gets `resultType: "task"` at once and polls
+`tasks/get`. `ctx.elicit` suspends the task until the client answers with `tasks/update`.
+`tasks/cancel` cancels the tool coroutine. Tasks live in process memory, so `runbolt` refuses
+to start with `--processes` above 1 when a mount has a task tool.
+
+```python
+@mcp.tool(task=True, ttl=600_000, poll_interval=2_000)  # milliseconds
+async def build_report(month: str, ctx: Context) -> dict:
+    await ctx.report_progress(1, 2, "Collecting data")  # becomes the task statusMessage
+    return {"month": month}
+```
+
 ## Expose existing endpoints as tools
 
 Existing REST routes are **never exposed implicitly** — `api.mount_mcp(mcp)` serves only

@@ -15,7 +15,9 @@ schema, like ``request``). Through it a tool can, while running:
   answer attached — **the tool function re-runs from the top on each retry**
   (earlier ``elicit`` calls return instantly from the replayed answers).
   Code before an ``elicit`` must therefore be idempotent, or guarded with
-  ``ctx.is_replay``.
+  ``ctx.is_replay``. Inside a task (``@mcp.tool(task=True)``) the tool
+  suspends instead: the task reports ``input_required``, and the coroutine
+  resumes when the client answers through ``tasks/update``. No replay occurs.
 
 The heavy lifting lives in Rust (``django_bolt._core.McpCallContext``): this
 class is a thin asyncio-friendly wrapper.
@@ -77,6 +79,11 @@ class Context:
         return self._rust.era
 
     @property
+    def task_id(self) -> str | None:
+        """The SEP-2663 task id when this call runs as a task, else ``None``."""
+        return self._rust.task_id
+
+    @property
     def is_replay(self) -> bool:
         """True when this invocation is an MRTR retry (requestState was present)."""
         return self._rust.is_replay
@@ -131,16 +138,19 @@ class Context:
     async def _input(self, kind: str, params: dict[str, Any], *, key: str | None) -> Any:
         self._input_seq += 1
         key = key or f"input-{self._input_seq}"
-        if self._rust.era == "legacy":
+        in_task = self._rust.task_id is not None
+        if in_task or self._rust.era == "legacy":
+            # Suspend until the client answers: a live server->client request
+            # (legacy session), or an input request answered by tasks/update.
             capability_ok = self._rust.supports_elicitation if kind == "elicitation" else self._rust.supports_sampling
             if not capability_ok:
                 raise RuntimeError(
-                    f"The connected MCP client did not advertise the {kind!r} capability at "
-                    f"initialize, so this tool cannot call back into it. Use a client that "
+                    f"The connected MCP client did not advertise the {kind!r} capability, "
+                    f"so this tool cannot call back into it. Use a client that "
                     f"supports {kind} (e.g. MCP Inspector)."
                 )
             future: asyncio.Future = asyncio.get_running_loop().create_future()
-            self._rust.server_request_send(kind, json_encode(params).decode(), future)
+            self._rust.server_request_send(kind, key, json_encode(params).decode(), future)
             envelope = json_decode(await future)
         else:
             if kind == "sampling":
@@ -186,7 +196,7 @@ class Context:
         """Ask the client's LLM to generate (``sampling/createMessage``); await the result.
 
         Deprecated in MCP 2026-07-28 (SEP-2577); supported only for legacy
-        session clients.
+        session clients and inside tasks.
         """
         params: dict[str, Any] = {"messages": _normalize_messages(messages), "maxTokens": max_tokens}
         if system_prompt is not None:

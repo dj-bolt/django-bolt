@@ -16,11 +16,24 @@ from typing import Any, get_type_hints
 
 from . import schema
 from .context import Context
-from .registry import PromptDef, ResourceDef, ResourceTemplateDef, ToolDef
+from .registry import (
+    DEFAULT_TASK_POLL_INTERVAL_MS,
+    DEFAULT_TASK_TTL_MS,
+    PromptDef,
+    ResourceDef,
+    ResourceTemplateDef,
+    ToolDef,
+)
 
 _TEMPLATE_VAR = re.compile(r"\{(\w+)\}")
 
 _CACHE_SCOPES = frozenset({"public", "private"})
+
+
+def _positive_ms(name: str, value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer of milliseconds, got {value!r}")
+    return value
 
 
 def _compile_uri_template(uri_template: str) -> tuple[re.Pattern[str], list[str]]:
@@ -139,6 +152,9 @@ class MCP:
         annotations: dict[str, Any] | None = None,
         icons: list[dict[str, Any]] | None = None,
         guards: list[Any] | None = None,
+        task: bool = False,
+        ttl: int | None = None,
+        poll_interval: int | None = None,
     ):
         """Register a tool.
 
@@ -147,9 +163,21 @@ class MCP:
         only). ``annotations`` is an MCP ToolAnnotations dict (``readOnlyHint``
         etc.). ``guards`` are evaluated natively in Rust, both for
         ``tools/call`` denial and per-principal ``tools/list`` filtering.
+
+        ``task=True`` opts the tool in to the MCP Tasks extension (SEP-2663).
+        A call from a client that declares the extension returns a task
+        handle at once. The client polls ``tasks/get`` for the result.
+        ``ttl`` and ``poll_interval`` are in milliseconds. Tasks live in
+        process memory, so serve them with ``runbolt --processes 1``.
         """
         if isinstance(output_schema, str) and output_schema != "auto":
             raise ValueError(f"output_schema must be a JSON Schema dict, 'auto', or None, got {output_schema!r}")
+        if not task and (ttl is not None or poll_interval is not None):
+            raise ValueError("ttl and poll_interval apply only to task=True tools")
+        task_ttl_ms = _positive_ms("ttl", DEFAULT_TASK_TTL_MS if ttl is None else ttl)
+        task_poll_interval_ms = _positive_ms(
+            "poll_interval", DEFAULT_TASK_POLL_INTERVAL_MS if poll_interval is None else poll_interval
+        )
 
         def register(fn: Callable) -> Callable:
             tool_name = name or getattr(fn, "__name__", "tool")
@@ -178,6 +206,9 @@ class MCP:
                 is_async=inspect.iscoroutinefunction(fn),
                 injects_request=bool(params & schema.INJECTED_PARAMS),
                 ctx_param=ctx_param,
+                task=task,
+                task_ttl_ms=task_ttl_ms,
+                task_poll_interval_ms=task_poll_interval_ms,
             )
             return fn
 
