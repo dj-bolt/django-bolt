@@ -168,7 +168,8 @@ class MCP:
         A call from a client that declares the extension returns a task
         handle at once. The client polls ``tasks/get`` for the result.
         ``ttl`` and ``poll_interval`` are in milliseconds. Tasks live in
-        process memory, so serve them with ``runbolt --processes 1``.
+        process memory, so serve them with ``runbolt --processes 1`` and
+        without worker recycling (``--max-rss``, ``--workers-lifetime``).
         Cancel and TTL expiry stop an async tool. A sync tool runs in a
         thread, which continues to the end.
         """

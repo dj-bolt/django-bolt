@@ -45,19 +45,32 @@ _ENV_DEV_SPAWN_MS = "DJANGO_BOLT_DEV_SPAWN_UNIX_MS"
 DEV_RELOAD_DEBOUNCE_MS = 50
 
 
-def _reject_multiprocess_mcp_tasks(mcp_mounts: list[dict]) -> None:
-    """Stop startup when an MCP mount has task tools and more than one process serves it.
+def _mcp_task_unsafe_option(options) -> str | None:
+    """Return the runbolt option that lets another process answer tasks/get, if one is set.
 
     MCP Tasks (SEP-2663) live in the memory of the process that created them.
-    With SO_REUSEPORT, tasks/get can reach a different process.
+    With SO_REUSEPORT, a second process can get the request. Worker recycling
+    starts the new worker before the old one stops, so it has the same effect.
     """
+    if options["processes"] > 1:
+        return "--processes above 1"
+    if options["max_rss"]:
+        return "--max-rss"
+    if options["workers_lifetime"]:
+        return "--workers-lifetime"
+    return None
+
+
+def _reject_mcp_tasks(mcp_mounts: list[dict], option: str) -> None:
+    """Stop startup when an MCP mount has task tools and ``option`` splits tasks across processes."""
     for mount in mcp_mounts:
         task_tools = sorted(name for name, tool in mount["tools"].items() if tool["task"] is not None)
         if task_tools:
             raise CommandError(
                 f"The MCP mount at {mount['path']!r} has task tools ({', '.join(task_tools)}). "
                 "MCP Tasks live in the memory of one process, so tasks/get must reach that process. "
-                "Run with --processes 1, or remove task=True from these tools."
+                f"With {option}, a different process can get the request. "
+                "Run one process without --max-rss and --workers-lifetime, or remove task=True from these tools."
             )
 
 
@@ -737,8 +750,9 @@ class Command(BaseCommand):
         discovered = self._discover_multiprocess_apis()
         if discovered is not None:
             apis, merged_api = discovered
-            if processes > 1:
-                _reject_multiprocess_mcp_tasks(merged_api._mcp_mounts)
+            unsafe_option = _mcp_task_unsafe_option(options)
+            if unsafe_option is not None:
+                _reject_mcp_tasks(merged_api._mcp_mounts, unsafe_option)
             self._print_multiprocess_banner(options, apis, merged_api)
 
         # Give Actix the same graceful-shutdown window the supervisor allows

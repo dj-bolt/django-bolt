@@ -79,10 +79,23 @@ def test_in_task_elicitation_over_tcp(make_server_project):
         assert final["result"]["structuredContent"] == {"answer": {"go": True}}
 
 
-def test_task_tools_reject_multiple_processes(make_server_project):
+@pytest.mark.parametrize(
+    ("spawn_kwargs", "option"),
+    [
+        ({"processes": 2}, "--processes above 1"),
+        # Recycling replaces a worker spawn-first: tasks/get can reach the
+        # new worker while the task still runs in the old one.
+        ({"extra_args": ["--workers-lifetime", "3600"]}, "--workers-lifetime"),
+        ({"extra_args": ["--max-rss", "4096"]}, "--max-rss"),
+    ],
+)
+def test_task_tools_reject_options_that_split_tasks_across_processes(make_server_project, spawn_kwargs, option):
     project = make_server_project(api_source=mcp_app_source("tasks"))
-    process, _port = project.spawn(processes=2)
-    stdout, stderr = process.communicate(timeout=60)
+    process, _port = project.spawn(**spawn_kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+    finally:
+        process.kill()
     assert process.returncode != 0, stdout
-    assert "--processes 1" in stderr
+    assert option in stderr
     assert "confirm, multiply" in stderr

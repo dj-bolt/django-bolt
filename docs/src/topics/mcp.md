@@ -260,7 +260,7 @@ The server advertises the extension only when at least one tool has `task=True`.
 
 !!! warning "Tasks need one process"
 
-    Tasks live in the memory of the process that runs them. With more than one process, `tasks/get` can reach a process that does not have the task. Thus `runbolt` stops at startup when a mount has a task tool and `--processes` is more than 1. A restart of the process loses its tasks.
+    Tasks live in the memory of the process that runs them. With more than one process, `tasks/get` can reach a process that does not have the task. Worker recycling (`--max-rss`, `--workers-lifetime`) starts the new worker before the old one stops, with the same result. Thus `runbolt` stops at startup when a mount has a task tool and one of these options is set, or `--processes` is more than 1. A restart of the process loses its tasks.
 
 ## Exposing existing REST routes as tools
 

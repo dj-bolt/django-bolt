@@ -94,7 +94,7 @@ declares `io.modelcontextprotocol/tasks` gets `resultType: "task"` at once and p
 `tasks/cancel` cancels the tool coroutine; a sync `def` tool runs in a thread, which continues
 to the end. Only the principal that created a task can reach it, and all unauthenticated callers
 are one principal. Tasks live in process memory, so `runbolt` refuses to start with
-`--processes` above 1 when a mount has a task tool.
+`--processes` above 1, `--max-rss` or `--workers-lifetime` when a mount has a task tool.
 
 ```python
 @mcp.tool(task=True, ttl=600_000, poll_interval=2_000)  # milliseconds
@@ -176,6 +176,5 @@ SEP-2243 routing-header validation, Rust-evaluated per-tool guards, all three au
 validation by default, and configurable Host/Origin DNS-rebinding protection
 (`mount_mcp(allowed_hosts=..., allowed_origins=...)`).
 
-Not yet: `completion/complete`, the tasks extension (`io.modelcontextprotocol/tasks`),
-list-changed notifications (catalogs are static), and CIMD client registration in the
-built-in Authorization Server.
+Not yet: `completion/complete`, list-changed notifications (catalogs are static), and CIMD
+client registration in the built-in Authorization Server.

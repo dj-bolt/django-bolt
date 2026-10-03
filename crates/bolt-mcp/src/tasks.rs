@@ -3,7 +3,9 @@
 //!
 //! `TaskManager` keeps tasks in process memory. With `SO_REUSEPORT`
 //! multi-process serving, `tasks/get` can reach a process that does not hold
-//! the task, so runbolt rejects task tools with `--processes > 1`.
+//! the task. Worker recycling has the same effect while the old worker
+//! drains. Thus runbolt rejects task tools with `--processes > 1`,
+//! `--max-rss` and `--workers-lifetime`.
 //!
 //! Task ids are random UUIDs, but `tasks/get` / `tasks/update` /
 //! `tasks/cancel` from a different principal must still not reach the task:
