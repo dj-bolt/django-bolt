@@ -111,7 +111,9 @@ jobs:
       # and the wheel `--interpreter` list. Free-threaded builds are emitted
       # only while the "Free Threading" classifier is present.
       test-versions-json: ${{ steps.extract.outputs.test-versions-json }}
-      interpreters: ${{ steps.extract.outputs.interpreters }}
+      # One wheel build per entry: the abi3 wheel, and one per free-threaded
+      # interpreter. The wheel jobs build them in parallel.
+      wheel-builds-json: ${{ steps.extract.outputs.wheel-builds-json }}
       # Oldest, newest, and newest free-threaded: the server-integration matrix.
       integration-versions-json: ${{ steps.extract.outputs.integration-versions-json }}
       # Oldest and newest supported Python, for the jobs that need exactly one
@@ -119,9 +121,6 @@ jobs:
       # that could fall out of the supported set unnoticed.
       oldest-version: ${{ steps.extract.outputs.oldest-version }}
       newest-version: ${{ steps.extract.outputs.newest-version }}
-      # The free-threaded interpreters (e.g. 3.14t), newline-separated for
-      # setup-python's multi-version input. Empty when free threading is off.
-      free-threaded-versions: ${{ steps.extract.outputs.free-threaded-versions }}
       # The whole artifact-smoke include list. Generated here so each entry's
       # wheel pattern is derived from its interpreter and the two cannot drift.
       artifact-include-json: ${{ steps.extract.outputs.artifact-include-json }}
@@ -158,16 +157,13 @@ jobs:
           )
           print(f"versions-json={json.dumps(versions)}")
           print(f"test-versions-json={json.dumps(versions + free_threaded)}")
-          print(f"interpreters={' '.join(versions + free_threaded)}")
+          # abi3 needs only the oldest GIL interpreter: one wheel covers the rest.
+          wheel_builds = [{"name": "abi3", "interpreter": versions[0]}]
+          wheel_builds += [{"name": "cp" + v.replace(".", ""), "interpreter": v} for v in free_threaded]
+          print(f"wheel-builds-json={json.dumps(wheel_builds)}")
           print(f"integration-versions-json={json.dumps([versions[0], versions[-1], *free_threaded[-1:]])}")
           print(f"oldest-version={versions[0]}")
           print(f"newest-version={versions[-1]}")
-
-          # Multiline output: setup-python takes one version per line.
-          print("free-threaded-versions<<__FT__")
-          for v in free_threaded:
-              print(v)
-          print("__FT__")
 
           # Artifact smoke: the abi3 wheel and the sdist install on the oldest
           # supported Python, since that is what the abi3 tag and
@@ -472,9 +468,13 @@ jobs:
 
   # Build wheels for Linux x86_64 (covers most Linux users including Arch)
   linux-amd64:
-    name: Build wheels on Linux x86_64
+    name: Build wheels on Linux x86_64 (${{ matrix.build.name }})
     runs-on: ubuntu-latest
     needs: python-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{ fromJSON(needs.python-versions.outputs.wheel-builds-json) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -490,7 +490,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x86_64
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
+          args: --release --out dist --interpreter ${{ matrix.build.interpreter }}
           sccache: "true"
           manylinux: auto
           docker-options: --pull always
@@ -498,14 +498,18 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wheels-linux-x86_64
+          name: wheels-linux-x86_64-${{ matrix.build.name }}
           path: dist
 
   # Build wheels for Linux arm64
   linux-arm64:
-    name: Build wheels on Linux ARM
+    name: Build wheels on Linux ARM (${{ matrix.build.name }})
     runs-on: ubuntu-24.04-arm
     needs: python-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{ fromJSON(needs.python-versions.outputs.wheel-builds-json) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -521,7 +525,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: aarch64
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
+          args: --release --out dist --interpreter ${{ matrix.build.interpreter }}
           sccache: "true"
           manylinux: auto
           docker-options: --pull always
@@ -529,69 +533,79 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wheels-linux-aarch64
+          name: wheels-linux-aarch64-${{ matrix.build.name }}
           path: dist
 
-  # Build wheels for macOS
+  # Build wheels for macOS on Apple silicon. Intel Macs install the sdist.
   macos:
-    name: Build wheels on macOS
+    name: Build wheels on macOS arm64 (${{ matrix.build.name }})
     runs-on: macos-latest
     needs: python-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{ fromJSON(needs.python-versions.outputs.wheel-builds-json) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Set up free-threaded Python
-        # The GIL interpreters come from the runner tool cache; the
-        # free-threaded ones must be installed for maturin to find them.
-        if: needs.python-versions.outputs.free-threaded-versions != ''
+      # setup-python gives one interpreter path. maturin can find the same
+      # interpreter under two names and then builds the wheel twice.
+      - name: Set up Python
+        id: python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ needs.python-versions.outputs.free-threaded-versions }}
+          python-version: ${{ matrix.build.interpreter }}
 
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
-          target: universal2-apple-darwin
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
+          target: aarch64-apple-darwin
+          args: --release --out dist --interpreter ${{ steps.python.outputs.python-path }}
           sccache: "true"
 
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wheels-macos-universal2
+          name: wheels-macos-arm64-${{ matrix.build.name }}
           path: dist
 
   # Build wheels for Windows
   windows:
-    name: Build wheels on Windows
+    name: Build wheels on Windows (${{ matrix.build.name }})
     runs-on: windows-latest
     needs: python-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{ fromJSON(needs.python-versions.outputs.wheel-builds-json) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Set up free-threaded Python
-        if: needs.python-versions.outputs.free-threaded-versions != ''
+      # setup-python gives one interpreter path. maturin found the
+      # free-threaded interpreter under two names and built its wheel twice.
+      - name: Set up Python
+        id: python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ needs.python-versions.outputs.free-threaded-versions }}
+          python-version: ${{ matrix.build.interpreter }}
 
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x64
-          args: --release --out dist --interpreter ${{ needs.python-versions.outputs.interpreters }}
+          args: --release --out dist --interpreter ${{ steps.python.outputs.python-path }}
           sccache: "true"
 
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wheels-windows-x64
+          name: wheels-windows-x64-${{ matrix.build.name }}
           path: dist
 
   # Build source distribution
