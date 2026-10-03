@@ -1,0 +1,110 @@
+name: Coverage
+
+# Report only: this workflow does not gate a merge. It measures Python and
+# Rust coverage over the whole test suite and shows it in the job summary.
+# The HTML reports are an artifact of the run.
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Python and Rust coverage
+    runs-on: ubuntu-latest
+    # The PostgreSQL tests skip without a DSN; the service lets them count.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DJANGO_BOLT_TEST_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "latest"
+
+      # One GIL interpreter is enough: coverage measures lines, not threading.
+      # Use the newest version in the pyproject.toml classifiers, like CI.yml.
+      - name: Set up Python
+        run: |
+          newest=$(python3 - <<'PY'
+          import re, tomllib
+          classifiers = tomllib.load(open("pyproject.toml", "rb"))["project"]["classifiers"]
+          found = [m.group(1) for c in classifiers if (m := re.fullmatch(r"Programming Language :: Python :: (3\.\d+)", c))]
+          print(max(found, key=lambda v: tuple(map(int, v.split(".")))))
+          PY
+          )
+          uv python install "$newest"
+          uv venv --python "$newest"
+
+      - name: Install Rust
+        # Toolchain comes from rust-toolchain.toml.
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          build-warnings: ""
+
+      - name: Install the LLVM tools
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        with:
+          tool: cargo-llvm-cov
+
+      # --no-install-project: scripts/coverage.sh builds the instrumented
+      # extension itself.
+      - name: Install dependencies
+        run: uv sync --all-extras --no-install-project
+
+      - name: Measure coverage
+        run: ./scripts/coverage.sh
+
+      - name: Write the job summary
+        if: always()
+        run: |
+          {
+            echo "## Python coverage"
+            echo
+            cat coverage/python.md
+            echo
+            echo "## Rust coverage"
+            echo
+            echo '```'
+            cat coverage/rust.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the HTML reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-html
+          path: |
+            coverage/python-html
+            coverage/rust-html
