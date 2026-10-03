@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
 import http.server
 import os
+import re
 import signal
+import socket
 import sys
 import threading
 import time
@@ -124,3 +128,34 @@ def test_request_fails_loudly_when_server_process_died(make_server_project):
         # server does. The harness must refuse to talk to it.
         with _decoy_server(port=server.port), pytest.raises(AssertionError, match="runbolt exited"):
             server.get("/health")
+
+
+def test_websocket_client_keeps_a_frame_sent_with_the_handshake():
+    """A frame in the same read as the 101 response is not lost."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+
+    def serve_once() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                request += conn.recv(4096)
+            key = re.search(rb"Sec-WebSocket-Key: (\S+)", request).group(1)
+            accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            handshake = (
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+            )
+            # One write: the handshake and the first text frame arrive together.
+            conn.sendall(handshake + b"\x81\x02hi")
+            conn.recv(4096)
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    try:
+        with helpers.SimpleWebSocketClient("127.0.0.1", port, "/ws", timeout=2.0) as websocket:
+            assert websocket.receive_text() == "hi"
+    finally:
+        listener.close()
+        thread.join(timeout=2.0)
