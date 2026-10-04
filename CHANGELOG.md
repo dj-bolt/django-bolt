@@ -15,6 +15,12 @@ All notable changes to this project will be documented in this file.
 ### Removed
 
 - **`OpenAPIConfig(django_auth=...)`** - The docs routes take `auth` and `guards`, as every route does. For docs behind a Django login, use `auth=[SessionAuthentication(login_url="/admin/login/")]` and `guards=[Requires("is_staff", True)]`. `django_auth` wrapped the docs in a Django decorator and still used the global default auth. With a JWT default, a browser got 401 for every user ([#378](https://github.com/dj-bolt/django-bolt/issues/378)). See [Protecting documentation](docs/src/topics/openapi.md#protecting-documentation).
+
+### Security
+
+- **`DjangoMiddleware` runs `process_view`** - `BoltAPI(middleware=[DjangoMiddleware(CsrfViewMiddleware)])` accepted a POST with no CSRF token. The wrapper called only the `__call__` method of the middleware. `__call__` runs `process_request` and `process_response`. Django's request handler runs `process_view`, and `CsrfViewMiddleware` checks the token in `process_view`. Thus no check occurred. Each middleware that does its work in `process_view` had the same problem. The wrapper now runs `process_view` before the handler, as `django_middleware=[...]` and `DjangoMiddlewareStack` do. A route with `@csrf_exempt` still skips the CSRF check. If you use `DjangoMiddleware(CsrfViewMiddleware)`, make sure that your clients send the CSRF token.
+- **`process_view` gets the route handler as the view** - Bolt gave `process_view` a stand-in view that had only the `csrf_exempt` flag. Thus `LoginRequiredMiddleware` sent each route to the login page, also a route with `@login_not_required`. Now the hook gets the route handler, as Django gives the view, so the flags of view decorators work. The handler also gets the request attributes that a `process_view` hook sets. This applies to `DjangoMiddleware`, `DjangoMiddlewareStack` and `django_middleware=[...]`.
+
 ### Fixed
 
 - **A 204 response has no body** - `Response(status_code=204)` has the default content `{}`, and Bolt wrote it after the headers. Actix drops the `content-length` header for a 204 but writes the bytes it gets. On a keep-alive connection, the next response then started with `{}`. A browser or an HTTP client that reuses connections failed the request after a delete. Rust now drops the body of each 204, for every response type a handler can return.
