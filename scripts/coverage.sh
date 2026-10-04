@@ -14,6 +14,10 @@ out="${COVERAGE_DIR:-coverage}"
 rm -rf "$out" .coverage .coverage.*
 mkdir -p "$out"
 
+# A separate target directory. cargo does not rebuild when only the coverage
+# rustc wrapper changes, so a shared target/ would give later `cargo test` and
+# `maturin develop` runs instrumented artifacts.
+export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
 eval "$(cargo llvm-cov show-env --sh)"
 cargo llvm-cov clean --workspace
 uv run --no-sync maturin develop
