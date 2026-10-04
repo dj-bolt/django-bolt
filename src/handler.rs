@@ -36,7 +36,7 @@ use bolt_core::response_builder;
 use bolt_core::response_meta::ResponseMeta;
 use bolt_core::responses;
 use bolt_core::router::{parse_query_string, QueryParams};
-use bolt_core::state::{find_asgi_mount, AppState, GLOBAL_ROUTER, ROUTE_METADATA};
+use bolt_core::state::{find_asgi_mount, AppState};
 use bolt_core::streaming::{create_python_stream, create_sse_stream};
 use bolt_core::type_coercion::{
     coerced_value_to_py, string_map_to_py_dict, CoercedValue, TypeHints,
@@ -678,32 +678,11 @@ pub(crate) fn content_length_exceeds_limit(
     matches!(content_length, Some(len) if len > max_payload_size)
 }
 
-thread_local! {
-    static TSTATE_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Pin a Python thread state to this (actix worker) thread on first use.
-/// Without it every `Python::attach` creates+destroys a PyThreadState, and a
-/// fresh thread state mmaps/munmaps a 16KiB frame-datastack chunk — measured
-/// as exactly one mmap+munmap syscall pair PER REQUEST. Actix worker threads
-/// live for the process lifetime, so the pinned state is never torn down.
-#[inline]
-fn ensure_pinned_thread_state() {
-    TSTATE_PINNED.with(|c| {
-        if !c.get() {
-            bolt_core::state::pin_python_thread_state();
-            c.set(true);
-        }
-    });
-}
-
 pub async fn handle_request<const ACCESS_LOG: bool>(
     req: HttpRequest,
     mut payload: web::Payload,
     state: web::Data<Arc<AppState>>,
 ) -> HttpResponse {
-    ensure_pinned_thread_state();
-
     // Keep as &str - no allocation, only clone on error paths
     let method = req.method().as_str();
     let path = req.path();
@@ -715,7 +694,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         None
     };
 
-    let router = GLOBAL_ROUTER.get().expect("Router not initialized");
+    let router = &state.router;
 
     // Find the route for the requested method and path.
     // RouteMatch enum allows us to skip path param processing for static routes.
@@ -823,9 +802,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 
     // Get parsed route metadata (Rust-native) by reference.
     // NOTE: Fetch metadata EARLY so we can use optimization flags to skip unnecessary parsing.
-    let route_metadata = ROUTE_METADATA
-        .get()
-        .and_then(|meta_map| meta_map.get(handler_id));
+    let route_metadata = state.route_metadata.get(handler_id);
 
     // OPTIMIZATION: Extract the execution plan bitfield once (Copy u16).
     // All subsequent flag reads are direct bit-tests, avoiding repeated Option::map closures.

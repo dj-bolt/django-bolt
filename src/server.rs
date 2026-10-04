@@ -23,7 +23,7 @@ use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
 use bolt_core::state::{
     find_websocket_mount, AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
-    ROUTE_METADATA, ROUTE_METADATA_TEMP, TASK_LOCALS,
+    ROUTE_METADATA_TEMP, TASK_LOCALS,
 };
 use bolt_core::static_files::handle_file;
 use bolt_websocket::{
@@ -876,11 +876,9 @@ pub fn start_server(
     let max_payload_size = config.max_payload_size;
     let (access_log_enabled, access_logger_obj) = read_access_logger(py);
 
-    if let Some(metadata_temp) = ROUTE_METADATA_TEMP.get() {
-        let mut metadata = metadata_temp.clone();
-        inject_global_cors(&mut metadata, config.global_cors_config.as_ref());
-        let _ = ROUTE_METADATA.set(Arc::new(RouteMetadataStore::from_map(metadata)));
-    }
+    let mut metadata = ROUTE_METADATA_TEMP.get().cloned().unwrap_or_default();
+    inject_global_cors(&mut metadata, config.global_cors_config.as_ref());
+    let route_metadata = Arc::new(RouteMetadataStore::from_map(metadata));
 
     let global_compression_config = match compression_config {
         Some(config_py) => Some(Arc::new(Python::attach(|py| {
@@ -902,10 +900,16 @@ pub fn start_server(
         global_compression_config: global_compression_config.clone(),
         trusted_proxies: config.trusted_proxies,
         rate_limiters: Arc::default(),
-        router: None,                        // Production uses GLOBAL_ROUTER
-        route_metadata: None,                // Production uses ROUTE_METADATA
-        asgi_mounts: None,                   // Production uses GLOBAL_ASGI_MOUNTS
-        extensions: http::Extensions::new(), // Production uses per-crate globals (e.g. mcp::GLOBAL_MCP_MOUNTS)
+        router: Arc::clone(GLOBAL_ROUTER.get().expect("checked at the start")),
+        route_metadata,
+        asgi_mounts: GLOBAL_ASGI_MOUNTS.get().cloned().unwrap_or_default(),
+        extensions: {
+            let mut extensions = http::Extensions::new();
+            if let Some(mounts) = bolt_mcp::GLOBAL_MCP_MOUNTS.get() {
+                extensions.insert(Arc::clone(mounts));
+            }
+            extensions
+        },
         static_files_config: config.static_files_config,
         media_files_config: config.media_files_config,
         access_logger: access_logger_obj,
@@ -940,6 +944,13 @@ pub fn start_server(
                         // Actix runs this factory once on every worker thread,
                         // inside that worker's runtime: bind the thread's own
                         // WorkerLoop here so async dispatch never crosses threads.
+                        // Pin a Python thread state to this worker thread for its
+                        // lifetime. Without it every `Python::attach` creates and
+                        // destroys a PyThreadState, and a fresh thread state
+                        // mmaps/munmaps a 16KiB frame-datastack chunk: one
+                        // mmap+munmap syscall pair per request. Worker threads
+                        // live for the process, so the state is never torn down.
+                        bolt_core::state::pin_python_thread_state();
                         Python::attach(bolt_loop::bind_thread_loop).unwrap_or_else(|e| {
                             panic!("failed to create the worker asyncio loop: {e}")
                         });

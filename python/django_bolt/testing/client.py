@@ -104,8 +104,8 @@ def _warn_if_inside_atomic_block() -> None:
 class BoltTestTransport(httpx.BaseTransport):
     """HTTP transport that routes requests through django-bolt's test handler.
 
-    Uses Actix's native test infrastructure which runs synchronously
-    with an internal tokio runtime for proper request handling.
+    Each request runs on a test worker thread, through the request pipeline
+    of runbolt. The calling thread waits for the response.
 
     Args:
         app_id: Test app instance ID
@@ -139,8 +139,7 @@ class BoltTestTransport(httpx.BaseTransport):
         method = request.method
 
         try:
-            # Call the synchronous Rust test_request function
-            # It creates its own tokio runtime internally for Actix test utilities
+            # The Rust function waits for the response of a test worker thread.
             status_code, resp_headers, resp_body = _core.test_request(
                 app_id=self.app_id,
                 method=method,
@@ -173,9 +172,8 @@ class BoltTestTransport(httpx.BaseTransport):
 class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
     """Async HTTP transport that routes requests through django-bolt's test handler.
 
-    Uses Actix's native test infrastructure. The underlying Rust function is
-    synchronous (it creates its own tokio runtime), so we run it in a thread
-    executor to avoid blocking the async event loop.
+    The Rust function waits for the response of a test worker thread. Thus
+    it runs in a thread executor, so it does not block the event loop.
 
     Args:
         app_id: Test app instance ID
@@ -242,6 +240,18 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
                 content=f"Test client error: {e}".encode(),
                 request=request,
             )
+
+
+def _close_server_connections() -> None:
+    """Close the database connections that the test server threads hold.
+
+    A test client stands for a server, and a new server starts with no open
+    connections. An open connection also blocks the drop of the test database
+    at teardown. The lanes close theirs when they stop, and the test workers
+    close theirs here.
+    """
+    _core.stop_idle_lanes()
+    _core.close_test_worker_connections()
 
 
 class TestClient(httpx.Client):
@@ -431,15 +441,14 @@ class TestClient(httpx.Client):
                     self._db_share.uninstall()
             finally:
                 self._release_app()
-                # A lane keeps its database connections open. An open connection
-                # blocks the drop of the test database at teardown.
-                _core.stop_idle_lanes()
+                _close_server_connections()
         return super().__exit__(exc_type, exc_val, exc_tb)
 
     def close(self) -> None:
         """Close the client and release its native test app."""
         super().close()
         self._release_app()
+        _close_server_connections()
 
     # Override HTTP methods to support stream=True
     def _add_streaming_methods(self, response: Response) -> Response:
@@ -727,11 +736,11 @@ class AsyncTestClient(httpx.AsyncClient):
                 await self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb)
         finally:
             self._release_app()
-            # As in TestClient.__exit__: close the database connections of the lanes.
-            _core.stop_idle_lanes()
+            _close_server_connections()
         return await super().__aexit__(exc_type, exc_val, exc_tb)
 
     async def aclose(self) -> None:
         """Close the client and release its native test app."""
         await super().aclose()
         self._release_app()
+        _close_server_connections()

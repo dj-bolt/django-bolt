@@ -44,11 +44,12 @@ fn parse_idle_time(raw: Option<String>) -> Duration {
 }
 
 enum Job {
-    /// A complete sync request. The lane is idle again after it.
+    /// A complete sync request. The lane is idle again after it. The server
+    /// awaits the result on its Tokio runtime.
     Request {
         callable: Py<PyAny>,
         request: Py<PyAny>,
-        done: Done,
+        done: oneshot::Sender<PyResult<Py<PyAny>>>,
     },
     /// One sync call of an async request. The request keeps the lane until `Release`.
     Call {
@@ -61,14 +62,6 @@ enum Job {
     /// Stop the lane. The sender, if one exists, gets a message after the
     /// lane closed its database connections.
     Stop(Option<Sender<()>>),
-}
-
-/// Where the result of a complete request goes.
-enum Done {
-    /// The server awaits the result on its Tokio runtime.
-    Async(oneshot::Sender<PyResult<Py<PyAny>>>),
-    /// The TestClient blocks its thread. Tokio channels cannot block inside a runtime.
-    Blocking(Sender<PyResult<Py<PyAny>>>),
 }
 
 struct IdleLane {
@@ -158,10 +151,7 @@ fn lane_main(id: u64, sender: Sender<Job>, receiver: Receiver<Job>) {
                 owned = false;
                 let stopping = !go_idle(id, &sender);
                 // The receiver is gone when the client disconnected.
-                match done {
-                    Done::Async(done) => drop(done.send(result)),
-                    Done::Blocking(done) => drop(done.send(result)),
-                }
+                drop(done.send(result));
                 if stopping {
                     break;
                 }
@@ -251,7 +241,11 @@ fn call_concurrency_attached(py: Python<'_>, function: &str) {
     }
 }
 
-fn submit_request(callable: Py<PyAny>, request: Py<PyAny>, done: Done) -> PyResult<()> {
+fn submit_request(
+    callable: Py<PyAny>,
+    request: Py<PyAny>,
+    done: oneshot::Sender<PyResult<Py<PyAny>>>,
+) -> PyResult<()> {
     acquire()?
         .sender
         .send(Job::Request {
@@ -272,24 +266,11 @@ pub fn dispatch(
     request: Py<PyAny>,
 ) -> impl std::future::Future<Output = PyResult<Py<PyAny>>> + Send + 'static {
     let (done, result) = oneshot::channel();
-    let submitted = submit_request(callable, request, Done::Async(done));
+    let submitted = submit_request(callable, request, done);
     async move {
         submitted?;
         result.await.unwrap_or_else(lane_stopped)
     }
-}
-
-/// Run `callable(request)` on a lane and block the calling thread. The GIL is
-/// released during the wait. The TestClient uses this form.
-pub fn dispatch_blocking(
-    py: Python<'_>,
-    callable: Py<PyAny>,
-    request: Py<PyAny>,
-) -> PyResult<Py<PyAny>> {
-    let (done, result) = channel();
-    submit_request(callable, request, Done::Blocking(done))?;
-    py.detach(move || result.recv())
-        .unwrap_or_else(lane_stopped)
 }
 
 /// Stop all idle lanes. A busy lane stops after its current request.

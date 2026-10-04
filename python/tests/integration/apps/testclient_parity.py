@@ -7,6 +7,7 @@ process and over a real server, and expects the same answers.
 from __future__ import annotations
 
 from django_bolt import BoltAPI, Request
+from django_bolt.responses import JSON
 
 api = BoltAPI()
 
@@ -34,3 +35,8 @@ async def plain():
 @api.get("/remote")
 async def remote(request: Request):
     return {"remote": request.META["REMOTE_ADDR"]}
+
+
+@api.get("/utf8-header")
+async def utf8_header():
+    return JSON({"ok": True}, headers={"X-Name": "日本"})

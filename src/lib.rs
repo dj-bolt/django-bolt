@@ -48,9 +48,9 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         register_websocket_routes, start_server,
     };
     use crate::testing::{
-        create_test_app, destroy_test_app, handle_test_websocket, register_test_asgi_mounts,
-        register_test_middleware_metadata, register_test_routes, register_test_websocket_routes,
-        test_request, TestRateLimiters,
+        close_test_worker_connections, create_test_app, destroy_test_app, handle_test_websocket,
+        register_test_asgi_mounts, register_test_middleware_metadata, register_test_routes,
+        register_test_websocket_routes, test_request, TestRateLimiters,
     };
 
     // Class
@@ -74,6 +74,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TestRateLimiters>()?;
     m.add_function(wrap_pyfunction!(create_test_app, m)?)?;
     m.add_function(wrap_pyfunction!(destroy_test_app, m)?)?;
+    m.add_function(wrap_pyfunction!(close_test_worker_connections, m)?)?;
     m.add_function(wrap_pyfunction!(register_test_routes, m)?)?;
     m.add_function(wrap_pyfunction!(register_test_websocket_routes, m)?)?;
     m.add_function(wrap_pyfunction!(register_test_asgi_mounts, m)?)?;

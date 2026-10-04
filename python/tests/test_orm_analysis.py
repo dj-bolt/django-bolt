@@ -358,10 +358,10 @@ class TestRequestComponentAnalysis:
         analysis = analyze_handler(handler_reads_request_unknown_keys, request_param_names={"request"})
         self.assert_request_flags(analysis)
 
-    def test_external_helper_usage_is_not_currently_inferred(self):
-        """Document current limitation: external helper calls are not analyzed transitively."""
+    def test_a_request_handed_to_a_helper_needs_every_component(self):
+        """The helper can read any part of the request, where this analysis does not look."""
         analysis = analyze_handler(handler_passes_request_to_external_helper, request_param_names={"request"})
-        self.assert_request_flags(analysis)
+        self.assert_request_flags(analysis, body=True, query=True, headers=True, cookies=True)
 
 
 class TestAnalysisFailure:

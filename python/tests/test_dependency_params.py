@@ -7,12 +7,13 @@ the parameters and the body of its dependencies in its OpenAPI schema.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Annotated
 
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI, Depends, UploadFile
+from django_bolt import BoltAPI, Depends, UploadFile, ViewSet
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.param_functions import Body, Cookie, File, Form, Header, Query
@@ -501,3 +502,97 @@ def test_a_cycle_of_async_dependencies_fails_at_registration():
         @api.get("/cycle")
         async def cycle(value=Depends(cycle_first)):
             return {"value": value}
+
+
+# A handler with a request parameter and another parameter is analyzed for the
+# request parts it reads. A request that the handler hands on (to a callable, a
+# name, a container or an attribute) can be read there, so the handler must get
+# every part of it. Before, it got an empty body.
+
+
+def _current_user() -> dict:
+    return {"id": 1}
+
+
+def _read_body(request) -> bytes:
+    return request.body
+
+
+def _read_context_body(context: dict) -> bytes:
+    return context["request"].body
+
+
+def _escape_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.post("/positional")
+    async def positional(request, user: Annotated[dict, Depends(_current_user)]):
+        return {"body": _read_body(request).decode(), "user": user["id"]}
+
+    @api.post("/keyword")
+    async def keyword(request, user: Annotated[dict, Depends(_current_user)]):
+        return {"body": _read_body(request=request).decode(), "user": user["id"]}
+
+    @api.post("/sync")
+    def sync(request, user: Annotated[dict, Depends(_current_user)]):
+        return {"body": _read_body(request).decode(), "user": user["id"]}
+
+    @api.post("/alias")
+    async def alias(request, user: Annotated[dict, Depends(_current_user)]):
+        req = request
+        return {"body": _read_body(req).decode(), "user": user["id"]}
+
+    @api.post("/container")
+    async def container(request, user: Annotated[dict, Depends(_current_user)]):
+        return {"body": _read_context_body({"request": request}).decode(), "user": user["id"]}
+
+    @api.post("/attribute")
+    async def attribute(request, user: Annotated[dict, Depends(_current_user)]):
+        holder = SimpleNamespace()
+        holder.request = request
+        return {"body": _read_body(holder.request).decode(), "user": user["id"]}
+
+    @api.post("/subscript")
+    async def subscript(request, user: Annotated[dict, Depends(_current_user)]):
+        # A key known only at run time: the analysis cannot tell the part.
+        key = "body"
+        return {"body": request[key].decode(), "user": user["id"]}
+
+    @api.post("/get-key")
+    async def get_key(request, user: Annotated[dict, Depends(_current_user)]):
+        key = "body"
+        return {"body": request.get(key).decode(), "user": user["id"]}
+
+    @api.post("/path/{user_id}")
+    async def path_param(request, user_id: int):
+        req = request
+        return {"body": _read_body(req).decode(), "user": user_id}
+
+    class Base(ViewSet):
+        async def create(self, request):
+            return {"body": request.body.decode()}
+
+    @api.viewset("/items")
+    class Items(Base):
+        async def create(self, request, user: Annotated[dict, Depends(_current_user)]):
+            return await super().create(request)
+
+    return api
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/positional", "/keyword", "/sync", "/alias", "/container", "/attribute", "/subscript", "/get-key", "/path/1"],
+)
+def test_a_request_handed_on_keeps_its_body(path):
+    with TestClient(_escape_api()) as client:
+        response = client.post(path, content=b"payload")
+    assert response.status_code == 200
+    assert response.json() == {"body": "payload", "user": 1}
+
+
+def test_a_viewset_method_that_delegates_to_super_keeps_the_body():
+    with TestClient(_escape_api()) as client:
+        response = client.post("/items", content=b"payload")
+    assert response.status_code == 201
+    assert response.json() == {"body": "payload"}

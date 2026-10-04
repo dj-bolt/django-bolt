@@ -50,31 +50,9 @@ If RPS drops, the change needs optimization or rejection.
 
 ### Examples
 
-**Response building**: Use `response_builder::build_response_with_headers()` instead of manually iterating headers:
+**Requests**: `test_request` runs `handler::handle_request`, the handler of `runbolt`. Never add a second dispatch path for tests. Put the change in `handler.rs`, and the test client gets it.
 
-```rust
-// GOOD: Reuses production code
-let http_response = crate::response_builder::build_response_with_headers(
-    status,
-    headers,
-    skip_compression,
-    body,
-);
-
-// BAD: Duplicates production logic
-let mut response = HttpResponse::build(status);
-for (name, value) in &headers {
-    response.append_header((name.as_str(), value.as_str()));
-}
-```
-
-**CORS handling**: Use shared functions from `cors.rs`:
-- `add_cors_response_headers()` - for adding CORS headers to responses
-- `add_preflight_headers_simple()` - for OPTIONS preflight responses
-
-**Authentication/Guards**: Use shared functions from `middleware/auth.rs` and `permissions.rs`:
-- `authenticate()` - for running auth backends
-- `evaluate_guards()` - for checking permissions
+**Worker threads**: A test request runs on a test worker thread. Set up each worker as `start_server` sets up an Actix worker: pin the Python thread state, then bind the `WorkerLoop`.
 
 **Settings**: Read each Django setting in `ServerConfig::from_django_settings` (`server.rs`). `runbolt` and the test client both use it. Never read a setting a second time in `testing.rs` or in the Python test client.
 

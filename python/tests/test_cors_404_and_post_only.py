@@ -312,6 +312,90 @@ class TestCorsPreflightOnPostOnlyRoutes:
             assert response.status_code == 200
             assert response.headers.get("Access-Control-Allow-Origin") == "https://example.com"
 
+    @pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+    def test_preflight_uses_route_cors_beside_global_cors(self, method):
+        """A route config applies to a preflight when a global CORS config also exists."""
+        api = BoltAPI()
+
+        @getattr(api, method)("/items")
+        @cors(origins=["https://route.example"])
+        async def items():
+            return {"ok": True}
+
+        with TestClient(api, cors_allowed_origins=["https://global.example"]) as client:
+            response = client.options(
+                "/items",
+                headers={"Origin": "https://route.example", "Access-Control-Request-Method": method.upper()},
+            )
+
+        assert response.status_code == 204
+        assert response.headers.get("Access-Control-Allow-Origin") == "https://route.example"
+
+    def test_preflight_uses_the_route_of_the_requested_method(self):
+        """Two methods on one path have their own CORS configs."""
+        api = BoltAPI()
+
+        @api.get("/items")
+        @cors(origins=["https://get.example"])
+        async def list_items():
+            return []
+
+        @api.post("/items")
+        @cors(origins=["https://post.example"])
+        async def create_item():
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            response = client.options(
+                "/items",
+                headers={"Origin": "https://post.example", "Access-Control-Request-Method": "POST"},
+            )
+
+        assert response.status_code == 204
+        assert response.headers.get("Access-Control-Allow-Origin") == "https://post.example"
+
+    def test_preflight_for_a_method_with_no_route_gets_no_route_config(self):
+        """A preflight names its method. The config of another method does not apply.
+
+        /items has only GET. A DELETE preflight must not get the origins of GET.
+        """
+        api = BoltAPI()
+
+        @api.get("/items")
+        @cors(origins=["https://get.example"])
+        async def list_items():
+            return []
+
+        with TestClient(api) as client:
+            response = client.options(
+                "/items",
+                headers={"Origin": "https://get.example", "Access-Control-Request-Method": "DELETE"},
+            )
+
+        assert "access-control-allow-origin" not in response.headers
+
+    def test_preflight_for_a_route_without_cors_uses_the_global_config(self):
+        """The CORS config of another method on the path does not apply."""
+        api = BoltAPI()
+
+        @api.get("/items")
+        @cors(origins=["https://get.example"])
+        async def list_items():
+            return []
+
+        @api.post("/items")
+        async def create_item():
+            return {"ok": True}
+
+        with TestClient(api, cors_allowed_origins=["https://global.example"]) as client:
+            response = client.options(
+                "/items",
+                headers={"Origin": "https://global.example", "Access-Control-Request-Method": "POST"},
+            )
+
+        assert response.status_code == 204
+        assert response.headers.get("Access-Control-Allow-Origin") == "https://global.example"
+
 
 class TestCorsOriginSchemeRequired:
     """
