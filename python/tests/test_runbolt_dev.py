@@ -184,6 +184,9 @@ def test_execute_from_command_line_dev_calls_reloader_with_debounce(monkeypatch)
         return 0
 
     monkeypatch.setattr(sys, "argv", argv)
+    # Script mode, as `python manage.py`: no `-m` spec on __main__. Under
+    # `python -m pytest`, the real __main__ has the spec of pytest.
+    monkeypatch.setitem(sys.modules, "__main__", SimpleNamespace(__spec__=None))
 
     def fake_collect_dev_watch_paths(reload_dirs):
         recorded["reload_dirs"] = reload_dirs

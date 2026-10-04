@@ -20,11 +20,13 @@ import time
 import pytest
 from asgiref.sync import async_to_sync
 from django.contrib.auth import get_user_model
+from django.db import connections
 
 from django_bolt import concurrency
 from django_bolt.auth import JWTAuthentication, user_loader
 from django_bolt.auth.pk_loader import load_user_by_pk_sync
 from django_bolt.auth.user_loader import default_django_user_loader, resolve_user_loader
+from tests.thread_pools import shutdown_closing_connections
 
 # Loads are asserted from other threads, which cannot see rows held open in an
 # uncommitted test transaction — these tests need real committed data.
@@ -68,7 +70,7 @@ def fresh_orm_executor(monkeypatch):
             built.append(current)
         for executor in built:
             if executor is not previous:
-                executor.shutdown(wait=True)
+                shutdown_closing_connections(executor)
         concurrency._orm_executor = previous
 
 
@@ -290,7 +292,12 @@ def test_async_to_sync_on_an_orm_worker_leaves_the_callers_pool(fresh_orm_execut
 
     def recording_pk_load(model, user_id):
         seen.append(threading.current_thread().name)
-        return load_user_by_pk_sync(model, user_id)
+        try:
+            return load_user_by_pk_sync(model, user_id)
+        finally:
+            # This can run on the loop thread of async_to_sync, which ends with
+            # the test. Close its connection, so the thread does not leak it.
+            connections.close_all()
 
     async def nested():
         loop_thread.append(threading.current_thread().name)
@@ -397,9 +404,9 @@ def test_default_executor_is_built_once_under_concurrent_first_use(monkeypatch):
     finally:
         for executor in built:
             if executor is not concurrency._default_executor:
-                executor.shutdown(wait=True)
+                shutdown_closing_connections(executor)
         if concurrency._default_executor is not previous and concurrency._default_executor is not None:
-            concurrency._default_executor.shutdown(wait=True)
+            shutdown_closing_connections(concurrency._default_executor)
         concurrency._default_executor = previous
 
     assert len({id(p) for p in pools}) == 1, "racing callers received different default pools"

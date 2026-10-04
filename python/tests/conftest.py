@@ -1,21 +1,17 @@
 """
 Pytest configuration for Django-Bolt tests.
 
-Ensures Django settings are properly reset between tests.
-Provides utilities for subprocess-based testing.
+Configures Django once for the test process. Each test process gets a new
+SQLite database in a temporary directory, removed at exit, so no schema from
+an earlier run survives.
 """
 
-import builtins
-import contextlib
 import logging
 import os
-import platform
-import signal
-import socket
-import subprocess
+import shutil
 import sys
 import sysconfig
-import time
+import tempfile
 
 import pytest
 
@@ -37,6 +33,8 @@ def _gil_stays_disabled():
 
 def pytest_configure(config):
     """Configure Django settings for pytest-django."""
+    # One directory per test process (each xdist worker has its own).
+    config._bolt_db_dir = tempfile.mkdtemp(prefix="django_bolt_test_")
     import django  # noqa: PLC0415
     from django.conf import settings  # noqa: PLC0415
 
@@ -109,11 +107,10 @@ def pytest_configure(config):
             DATABASES={
                 "default": {
                     "ENGINE": "django.db.backends.sqlite3",
-                    # File-based for better thread isolation. One file per xdist worker
-                    # (PYTEST_XDIST_WORKER is unset in serial runs): concurrent workers
-                    # sharing a single SQLite file fail with locked-database, UNIQUE
-                    # (django_content_type), and FK errors.
-                    "NAME": f"/tmp/django_bolt_test{os.environ.get('PYTEST_XDIST_WORKER', '')}.sqlite3",
+                    # A file, not :memory:, so that threads share the database.
+                    # Concurrent workers sharing one SQLite file fail with
+                    # locked-database, UNIQUE and FK errors, so each has its own.
+                    "NAME": os.path.join(config._bolt_db_dir, "db.sqlite3"),
                 }
             },
             USE_TZ=True,
@@ -154,7 +151,7 @@ def django_db_setup(django_db_blocker):
         call_command("migrate", "--run-syncdb", verbosity=0)
 
         # Create test model tables manually since they're not in migrations
-        # But only if they don't already exist (for persistent file-based databases)
+        # migrate --run-syncdb can already create them; create only the missing ones.
         with connection.schema_editor() as schema_editor:
             from .test_models import (  # noqa: PLC0415
                 Article,
@@ -174,45 +171,8 @@ def django_db_setup(django_db_blocker):
                     schema_editor.create_model(model)
 
 
-def spawn_process(command):
-    """Spawn a subprocess in a new process group"""
-    if platform.system() == "Windows":
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    else:
-        process = subprocess.Popen(command, preexec_fn=os.setsid, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return process
-
-
-def kill_process(process):
-    """Kill a subprocess and its process group"""
-    if platform.system() == "Windows":
-        with contextlib.suppress(builtins.BaseException):
-            process.send_signal(signal.CTRL_BREAK_EVENT)
-        with contextlib.suppress(builtins.BaseException):
-            process.kill()
-    else:
-        with contextlib.suppress(Exception):
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-
-
-def wait_for_server(host, port, timeout=15):
-    """Wait for server to be reachable"""
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            sock = socket.create_connection((host, port), timeout=2)
-            sock.close()
-            return True
-        except Exception:
-            time.sleep(0.5)
-    return False
-
-
-# Django configuration is now handled by pytest-django
-# via pytest_configure above
+def pytest_unconfigure(config):
+    """Remove the database directory of this test process."""
+    db_dir = getattr(config, "_bolt_db_dir", None)
+    if db_dir:
+        shutil.rmtree(db_dir, ignore_errors=True)
