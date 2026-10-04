@@ -253,6 +253,28 @@ async def test_websocket_rate_limit_exceeded():
 
 
 @pytest.mark.asyncio
+async def test_websocket_rate_limit_buckets_belong_to_one_api():
+    """Two APIs have their own buckets, as two servers do. Their handler ids are the same."""
+
+    def limited_api() -> BoltAPI:
+        api = BoltAPI()
+
+        @api.websocket("/ws/limited")
+        @rate_limit(rps=1, burst=1)
+        async def handler(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("connected")
+
+        return api
+
+    for api in (limited_api(), limited_api()):
+        async with WebSocketTestClient(
+            api, "/ws/limited", cors_allowed_origins=["*"], read_django_settings=False
+        ) as ws:
+            assert await ws.receive_text() == "connected"
+
+
+@pytest.mark.asyncio
 async def test_websocket_no_rate_limit():
     """Test WebSocket without rate limit allows unlimited connections."""
     api = BoltAPI()

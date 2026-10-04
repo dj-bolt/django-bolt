@@ -917,6 +917,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     if let Some(config) = rate_config {
         if let Some(headers_map) = headers.as_ref() {
             if let Some(response) = middleware::rate_limit::check_before_auth(
+                &state.rate_limiters,
                 handler_id,
                 headers_map,
                 client_ip.as_ref(),
@@ -976,6 +977,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     if let Some(config) = rate_config {
         if let Some(headers_map) = headers.as_ref() {
             if let Some(response) = middleware::rate_limit::check_after_auth(
+                &state.rate_limiters,
                 handler_id,
                 headers_map,
                 client_ip.as_ref(),
