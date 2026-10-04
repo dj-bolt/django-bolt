@@ -1807,9 +1807,10 @@ class BoltAPI:
             # get_running_loop() valid even when the coroutine never awaits.
             middleware_meta["is_async"] = meta["is_async"]
 
-            # Python middleware requires cookies, headers and the query regardless of handler params
-            # Django middleware needs cookies/headers (CSRF, session, auth, etc.)
-            # and the query (request.GET, QUERY_STRING and get_full_path() for redirects).
+            # Python middleware requires every request part regardless of handler params.
+            # Django middleware needs cookies/headers (CSRF, session, auth, etc.),
+            # the query (request.GET, QUERY_STRING and get_full_path() for redirects),
+            # and the body (CsrfViewMiddleware reads the form token from request.POST).
             # Custom middleware may also inspect headers for routing, auth, etc.
             if (
                 self._has_django_middleware
@@ -1819,6 +1820,7 @@ class BoltAPI:
                 middleware_meta["needs_cookies"] = True
                 middleware_meta["needs_headers"] = True
                 middleware_meta["needs_query"] = True
+                middleware_meta["needs_body"] = True
             elif "rust_arg_bindings" in middleware_meta:
                 # Rust binds every argument from its own request maps, so the
                 # Python source dicts have no reader. Rust then does not build them.
