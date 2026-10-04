@@ -175,6 +175,28 @@ def test_parallel_workers_get_disjoint_ports_outside_the_ephemeral_range(monkeyp
     assert not seen["gw1"] & seen["gw7"]
 
 
+def test_restarted_worker_gets_ports_outside_the_ephemeral_range(monkeypatch):
+    """A worker that pytest-xdist starts again after a crash gets the next id.
+
+    The id of such a worker, for example ``gw4`` of 4, can be the worker count
+    or more. Its ports must stay below the ephemeral range.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER_COUNT", "4")
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw4")
+
+    ports = {helpers.get_free_port() for _ in range(5)}
+
+    assert all(helpers._WORKER_PORTS.start <= port < 32768 for port in ports), ports
+
+
+def test_worker_without_a_worker_count_gets_a_port(monkeypatch):
+    """Without ``PYTEST_XDIST_WORKER_COUNT``, the OS picks the port."""
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw1")
+    monkeypatch.delenv("PYTEST_XDIST_WORKER_COUNT", raising=False)
+
+    assert helpers.get_free_port() > 0
+
+
 def test_websocket_client_keeps_a_frame_sent_with_the_handshake():
     """A frame in the same read as the 101 response is not lost."""
     listener = socket.create_server(("127.0.0.1", 0))

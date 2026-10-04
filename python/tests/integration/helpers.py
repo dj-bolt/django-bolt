@@ -198,17 +198,20 @@ def get_free_port(host: str = DEFAULT_HOST) -> int:
 
     A port from bind(0) is free only until its socket closes. A parallel
     pytest-xdist worker can get the same port before the server binds it, so
-    each worker uses its own block of ``_WORKER_PORTS``. A serial run lets the
-    OS pick the port.
+    each worker uses its own block of ``_WORKER_PORTS``. A serial run, or a run
+    without the worker count, lets the OS pick the port.
     """
     worker = os.environ.get("PYTEST_XDIST_WORKER")
-    if worker is None:
+    worker_count = os.environ.get("PYTEST_XDIST_WORKER_COUNT")
+    if worker is None or worker_count is None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind((host, 0))
             return int(sock.getsockname()[1])
 
-    block_size = len(_WORKER_PORTS) // int(os.environ["PYTEST_XDIST_WORKER_COUNT"])
-    start = _WORKER_PORTS.start + int(worker.removeprefix("gw")) * block_size
+    # A worker that xdist starts again after a crash gets a new id, such as gw4
+    # of 4. The modulo keeps its block in the range.
+    block_size = len(_WORKER_PORTS) // int(worker_count)
+    start = _WORKER_PORTS.start + (int(worker.removeprefix("gw")) % int(worker_count)) * block_size
     for _ in range(block_size):
         port = start + next(_port_offsets) % block_size
         if _port_is_free(host, port):
