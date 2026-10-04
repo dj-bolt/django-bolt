@@ -391,9 +391,13 @@ mod tests {
             .append_header(("cookie", "a=1"))
             .append_header(("cookie", "b=2"))
             .append_header(("cookie", "c=3"))
+            .append_header(("x-tag", "first"))
+            .append_header(("x-tag", "last"))
             .to_http_request();
         let headers = extract_headers(&request, 1024).unwrap();
         assert_eq!(headers["cookie"], "a=1; b=2; c=3");
+        // Only `Cookie` lines join. Another repeated header keeps its last line.
+        assert_eq!(headers["x-tag"], "last");
     }
 
     #[test]
