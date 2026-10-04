@@ -76,9 +76,16 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
 
+      # The prebuilt cargo-fuzz is a musl binary, and by default it builds for
+      # its own target. The address sanitizer refuses the static libc of musl,
+      # so build for the target of the runner.
       - name: Fuzz
         working-directory: fuzz
-        run: cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="$FUZZ_SECONDS"
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          host=$(rustc +nightly -vV | sed -n 's/^host: //p')
+          cargo +nightly fuzz run --target "$host" "$TARGET" -- -max_total_time="$FUZZ_SECONDS"
 
       # Save also after a failure. A plain actions/cache saves only after success,
       # and the run that finds a crash is the run whose corpus matters.
