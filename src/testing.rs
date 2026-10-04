@@ -227,7 +227,13 @@ pub struct TestAppState {
     /// Global compression config (mirrors production server). Drives the
     /// streaming-compression codec selection in `handler.rs`.
     pub global_compression_config: Option<Arc<bolt_core::metadata::CompressionConfig>>,
+    /// The rate-limit scope of the routes of this app. See `create_test_app`.
+    pub rate_limit_scope: u64,
 }
+
+/// The top bit marks the rate-limit scope of one test app, so it never equals
+/// a scope that Python passes.
+const OWN_RATE_LIMIT_SCOPE: u64 = 1 << 63;
 
 /// Registry for test app instances
 static TEST_REGISTRY: OnceCell<DashMap<u64, Arc<RwLock<TestAppState>>>> = OnceCell::new();
@@ -243,8 +249,13 @@ fn registry() -> &'static DashMap<u64, Arc<RwLock<TestAppState>>> {
 /// With `read_django_settings=False`, it uses no global CORS, static or media
 /// settings. `cors_allowed_origins` and `static_files_config` replace the
 /// settings for one test.
+///
+/// Without `rate_limit_scope`, the app has its own rate-limit buckets: an HTTP
+/// test client starts empty, as a new server does. A WebSocket test client is
+/// one connection, so it passes the scope of its API, and the connections to
+/// one API share their buckets, as on a server.
 #[pyfunction]
-#[pyo3(signature = (dispatch, read_django_settings=true, cors_allowed_origins=None, static_files_config=None, compression_config=None))]
+#[pyo3(signature = (dispatch, read_django_settings=true, cors_allowed_origins=None, static_files_config=None, compression_config=None, rate_limit_scope=None))]
 pub fn create_test_app(
     py: Python<'_>,
     dispatch: Py<PyAny>,
@@ -252,13 +263,11 @@ pub fn create_test_app(
     cors_allowed_origins: Option<Vec<String>>,
     static_files_config: Option<&Bound<'_, PyDict>>,
     compression_config: Option<&Bound<'_, PyDict>>,
+    rate_limit_scope: Option<u64>,
 ) -> PyResult<u64> {
-    let mut config = ServerConfig::from_django_settings(py)?;
-    if !read_django_settings {
-        config.global_cors_config = None;
-        config.static_files_config = None;
-        config.media_files_config = None;
-    }
+    // Without read_django_settings, the CORS, static and media settings are not
+    // read at all, so their warnings do not show either.
+    let mut config = ServerConfig::read(py, read_django_settings)?;
     if let Some(origins) = cors_allowed_origins {
         config.set_cors_origins(origins);
     }
@@ -273,6 +282,7 @@ pub fn create_test_app(
         None => None,
     };
 
+    let id = TEST_ID_GEN.fetch_add(1, Ordering::Relaxed);
     let app = TestAppState {
         router: Arc::new(Router::new()),
         websocket_router: Arc::new(WebSocketRouter::new()),
@@ -282,9 +292,9 @@ pub fn create_test_app(
         dispatch: dispatch.clone_ref(py),
         config,
         global_compression_config,
+        rate_limit_scope: rate_limit_scope.unwrap_or(OWN_RATE_LIMIT_SCOPE | id),
     };
 
-    let id = TEST_ID_GEN.fetch_add(1, Ordering::Relaxed);
     registry().insert(id, Arc::new(RwLock::new(app)));
     Ok(id)
 }
@@ -466,12 +476,17 @@ pub fn register_test_middleware_metadata(
         })?;
         // Propagate parse failures so tests fail loudly instead of the route
         // silently losing its auth/middleware config.
-        let route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
+        let mut route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "Failed to parse route metadata for handler {}: {}",
                 handler_id, e
             ))
         })?;
+        // Test apps reuse handler ids, and each request comes from 127.0.0.1.
+        // The scope keeps the rate-limit buckets of two test apps apart.
+        if let Some(rate_limit) = route_meta.rate_limit_config.as_mut() {
+            rate_limit.scope = app.rate_limit_scope;
+        }
         parsed_metadata.insert(handler_id, route_meta);
     }
     inject_global_cors(&mut parsed_metadata, app.config.global_cors_config.as_ref());
