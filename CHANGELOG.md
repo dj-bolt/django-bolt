@@ -14,10 +14,13 @@ All notable changes to this project will be documented in this file.
   - Each request comes from `127.0.0.1`, so `BOLT_TRUSTED_PROXIES` and `X-Forwarded-For` work as on a server.
 
   The `cors_allowed_origins`, `static_files_config` and `read_django_settings` arguments still work.
+- **`TestClient` runs the request handler of `runbolt`** - The test client had its own copy of the request pipeline. Now each test request goes through the handler of the server, on a test worker thread. A sync handler no longer runs on the thread of the test, so its context variables and thread-locals stay out of the test. At exit, the client closes the database connections of the test workers.
 - **macOS wheels are for Apple silicon only** - PyPI gets a macOS arm64 wheel, not a universal2 wheel. On an Intel Mac, pip installs from the source distribution, which needs a Rust toolchain.
 
 ### Fixed
 
+- **A handler that hands the request to another callable gets the body** - Bolt reads the source of a handler to find the request parts it uses, and skips the others. A request given to a helper or to `super().create(request)` can be read there. Such a handler with a `Depends` parameter got an empty body, query, headers and cookies. Now a handler that hands on the request gets every part.
+- **A CSRF form POST works when the handler does not read the body** - `CsrfViewMiddleware` reads the token from `request.POST`. A route behind Django middleware got no body when its handler did not read it, so a valid form POST got 403. Now a route behind Django middleware always gets the body.
 - **The `/ready` database check uses the connection of the thread that runs it** - The check ran `connection.ensure_connection` on a pool thread, but bound it on the calling thread first. Thus it opened the connection of the event-loop thread from the pool thread, and that connection stayed open outside the pool. The check now looks up the connection on the pool thread.
 - **The CORS settings reference names the setting that Bolt reads** - The docs named `CORS_MAX_AGE`, but Bolt reads `CORS_PREFLIGHT_MAX_AGE`. The docs also gave wrong defaults for `CORS_ALLOW_HEADERS`, `CORS_ALLOW_METHODS` and the max-age.
 - **Nested serializers work on Django 5.2** - On Django 5.2, a serializer with a relation field (a foreign key, a many-to-many field or a reverse relation) raised `NotImplementedError`. A route that returned such a serializer answered 500. Bolt called the deprecated `get_cache_name()`, and Django 5.2 relations raise in it. Bolt now reads `cache_name`, which each supported Django version has. The CI jobs for Django 5.2 and 6.0 did not find this: a build step reinstalled Django 6.1 before the tests ran.

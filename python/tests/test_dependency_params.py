@@ -12,7 +12,7 @@ from typing import Annotated
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI, Depends, UploadFile
+from django_bolt import BoltAPI, Depends, UploadFile, ViewSet
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.param_functions import Body, Cookie, File, Form, Header, Query
@@ -501,3 +501,58 @@ def test_a_cycle_of_async_dependencies_fails_at_registration():
         @api.get("/cycle")
         async def cycle(value=Depends(cycle_first)):
             return {"value": value}
+
+
+# A handler with a dependency is analyzed for the request parts it reads. A
+# request that the handler hands to another callable can be read there, so the
+# handler must get every part of it. Before, it got an empty body.
+
+
+def _current_user() -> dict:
+    return {"id": 1}
+
+
+def _read_body(request) -> bytes:
+    return request.body
+
+
+def _escape_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.post("/positional")
+    async def positional(request, user: Annotated[dict, Depends(_current_user)]):
+        return {"body": _read_body(request).decode(), "user": user["id"]}
+
+    @api.post("/keyword")
+    async def keyword(request, user: Annotated[dict, Depends(_current_user)]):
+        return {"body": _read_body(request=request).decode(), "user": user["id"]}
+
+    @api.post("/sync")
+    def sync(request, user: Annotated[dict, Depends(_current_user)]):
+        return {"body": _read_body(request).decode(), "user": user["id"]}
+
+    class Base(ViewSet):
+        async def create(self, request):
+            return {"body": request.body.decode()}
+
+    @api.viewset("/items")
+    class Items(Base):
+        async def create(self, request, user: Annotated[dict, Depends(_current_user)]):
+            return await super().create(request)
+
+    return api
+
+
+@pytest.mark.parametrize("path", ["/positional", "/keyword", "/sync"])
+def test_a_request_handed_to_another_callable_keeps_its_body(path):
+    with TestClient(_escape_api()) as client:
+        response = client.post(path, content=b"payload")
+    assert response.status_code == 200
+    assert response.json() == {"body": "payload", "user": 1}
+
+
+def test_a_viewset_method_that_delegates_to_super_keeps_the_body():
+    with TestClient(_escape_api()) as client:
+        response = client.post("/items", content=b"payload")
+    assert response.status_code == 201
+    assert response.json() == {"body": "payload"}

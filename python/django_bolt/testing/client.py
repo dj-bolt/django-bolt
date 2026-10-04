@@ -244,6 +244,18 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
             )
 
 
+def _close_server_connections() -> None:
+    """Close the database connections that the test server threads hold.
+
+    A test client stands for a server, and a new server starts with no open
+    connections. An open connection also blocks the drop of the test database
+    at teardown. The lanes close theirs when they stop, and the test workers
+    close theirs here.
+    """
+    _core.stop_idle_lanes()
+    _core.close_test_worker_connections()
+
+
 class TestClient(httpx.Client):
     """Synchronous test client for django-bolt using async-native Rust testing.
 
@@ -431,15 +443,14 @@ class TestClient(httpx.Client):
                     self._db_share.uninstall()
             finally:
                 self._release_app()
-                # A lane keeps its database connections open. An open connection
-                # blocks the drop of the test database at teardown.
-                _core.stop_idle_lanes()
+                _close_server_connections()
         return super().__exit__(exc_type, exc_val, exc_tb)
 
     def close(self) -> None:
         """Close the client and release its native test app."""
         super().close()
         self._release_app()
+        _close_server_connections()
 
     # Override HTTP methods to support stream=True
     def _add_streaming_methods(self, response: Response) -> Response:
@@ -727,11 +738,11 @@ class AsyncTestClient(httpx.AsyncClient):
                 await self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb)
         finally:
             self._release_app()
-            # As in TestClient.__exit__: close the database connections of the lanes.
-            _core.stop_idle_lanes()
+            _close_server_connections()
         return await super().__aexit__(exc_type, exc_val, exc_tb)
 
     async def aclose(self) -> None:
         """Close the client and release its native test app."""
         await super().aclose()
         self._release_app()
+        _close_server_connections()

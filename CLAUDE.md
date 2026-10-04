@@ -26,7 +26,7 @@ only upstream-supported Django series, enforced by `scripts/check_support_matrix
 
 Cargo workspace, layered bottom-up with no back-edges: `bolt-loop` → `bolt-core` → {`bolt-asgi`, `bolt-websocket`, `bolt-mcp`} → root `django-bolt` (`src/`, the `_core` PyO3 module).
 
-- `src/` — `lib.rs` (module entry), `server.rs` (Actix + tokio, CORS/compression), `handler.rs` (dispatch, `DispatchOutcome`), `testing.rs` (`TestClient` backend), `dev_reload.rs`
+- `src/` — `lib.rs` (module entry), `server.rs` (Actix + tokio, CORS/compression), `handler.rs` (dispatch, `DispatchOutcome`), `testing.rs` (`TestClient` backend: `handle_request` on test worker threads), `dev_reload.rs`
 - `crates/bolt-loop` — per-worker-thread asyncio `WorkerLoop` (a real `SelectorEventLoop` on the Tokio reactor; one shared loop for TestClient/MCP), timer thread
 - `crates/bolt-core` — router (matchit), `request_pipeline.rs`, `validation.rs`, `type_coercion.rs`, `middleware/` (auth, rate_limit), `permissions.rs`, `streaming.rs`, `response_meta.rs` / `response_builder.rs`, `form_parsing.rs`, `metadata.rs`, `error.rs`
 - `crates/bolt-asgi`, `crates/bolt-websocket`, `crates/bolt-mcp` — ASGI mounts, WebSocket, MCP transport (rmcp)
@@ -62,7 +62,7 @@ Do it once at registration, reuse forever at runtime. In `_dispatch`, `_dispatch
 ## Testing
 
 - **Red-Green**: write the test first, see it fail, implement, confirm it fails again when reverted. A test that passes without the change is bogus. Never delete failing asserts or skip tests to go green.
-- Use `TestClient(api)` (in-process, full Rust pipeline, lifespan-aware) for integration tests. Test behavior via HTTP responses, not internals; no mocks of things we own.
+- Use `TestClient(api)` (in-process, the `runbolt` request pipeline on worker threads, lifespan-aware) for integration tests. Test behavior via HTTP responses, not internals; no mocks of things we own.
 - Subprocess `runbolt` tests only for what `TestClient` cannot exercise: startup wiring, `--dev` reload, multi-process, signals, real TCP, streaming, WebSocket handshakes, artifacts. Author such apps as real modules in `python/tests/integration/apps/` (self-contained `api = BoltAPI()` + `/health`; secondary apps use a namespaced health path). Prefer `make_server_project(api_module=app_module("x"))`; use `api_source=app_source("x")` only when an on-disk file is needed (autodiscovery, reload, artifact tests).
 - Markers: `server_integration` (real `runbolt`), `platform_smoke`, `artifact_smoke`. Apply `server_integration` per subprocess test, never module-wide when the module also has in-process tests. Changes to startup/reload/multiprocessing/TCP/streaming/WebSocket/packaging need a `server_integration` or `artifact_smoke` test.
 - Rust tests: `#[cfg(test)]` next to the code in the owning crate.

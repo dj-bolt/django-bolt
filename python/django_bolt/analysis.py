@@ -370,6 +370,14 @@ class OrmVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         """Detect function calls that might be blocking."""
+        # A request handed to another callable (a helper, super().create(request))
+        # can be read there, where this analysis does not look. It needs every part.
+        if any(self._is_request_name(arg) for arg in node.args) or any(
+            self._is_request_name(keyword.value) for keyword in node.keywords
+        ):
+            for attr_name in ("body", "query", "headers", "cookies"):
+                self._mark_request_component_attr(attr_name)
+
         # Check for direct blocking function calls
         if isinstance(node.func, ast.Name):
             func_name = node.func.id

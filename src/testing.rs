@@ -1,18 +1,15 @@
-//! Async testing infrastructure for django-bolt using Actix Web's official test utilities.
+//! In-process test server for the Python `TestClient`.
 //!
-//! This module provides testing capabilities that:
-//! - Use Actix Web's native test framework (`actix_web::test`)
-//! - Run asynchronously in Rust (native async, no blocking)
-//! - Reuse production code paths (handle_request, middleware, CORS, etc.)
-//! - Support per-instance test apps (no global state conflicts)
-//!
-//! The test infrastructure mirrors the production server configuration exactly,
-//! ensuring tests validate the actual request pipeline.
+//! Each request runs through `handler::handle_request`, the handler of `runbolt`.
+//! The Actix app has the same middleware, CORS, compression and file scopes.
+//! The request runs on a test worker thread, set up as an Actix worker of the
+//! server. Each test app has its own routes, metadata and mounts, so tests do
+//! not share state.
 
 use actix_web::dev::Service;
 use actix_web::http::header::HeaderValue;
 use actix_web::middleware::{NormalizePath, TrailingSlash};
-use actix_web::{test, web, App, HttpRequest, HttpResponse};
+use actix_web::{test, web, App};
 use ahash::AHashMap;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -24,34 +21,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use actix_multipart::Multipart;
-use bolt_asgi::asgi_http;
 use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
-use bolt_core::form_parsing::{
-    parse_multipart, parse_urlencoded, FormParseResult, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
-};
 use bolt_core::metadata::{RateLimitKey, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
 use bolt_core::state::{
-    find_asgi_mount, find_websocket_mount_in_slice, AppState, AsgiMount, ScopeConfig, ServeMode,
-    TASK_LOCALS,
+    find_websocket_mount_in_slice, AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS,
 };
 use bolt_websocket::handler::build_asgi_scope_from_parts;
 use bolt_websocket::WebSocketRouter;
-use futures_util::StreamExt;
-use std::collections::HashMap;
 
-use crate::handler::{
-    build_prebound_from_values, form_result_to_py, response_from_wire_result, SourceValues,
-};
 use crate::server::{configure_file_scopes, inject_global_cors, static_scope_prefix, ServerConfig};
 use bolt_core::request_pipeline::{
-    query_sequences, set_declared_item, set_param_item, set_query_sequences,
-    validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
+    query_sequences, set_declared_item, set_param_item, set_query_sequences, EMPTY_TYPES,
 };
-use bolt_core::type_coercion::{string_map_to_py_dict, TypeHints};
+use bolt_core::type_coercion::TypeHints;
 
 static ASYNC_RUNTIME_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
@@ -114,6 +99,114 @@ fn ensure_task_locals_initialized() {
             });
         }
     });
+}
+
+/// A request for a test worker: it builds the request future on the worker thread.
+type TestJob = Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> + Send>;
+
+static TEST_WORKERS: OnceCell<Vec<tokio::sync::mpsc::UnboundedSender<TestJob>>> = OnceCell::new();
+static NEXT_TEST_WORKER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The worker threads of the test server, started on first use.
+///
+/// Each one is set up as an Actix worker of `runbolt`: a current-thread Tokio
+/// runtime with a `LocalSet`, a pinned Python thread state, and its own bound
+/// `WorkerLoop`. Thus a handler runs as on the server, and never on the thread
+/// of the test: its context variables and thread-locals stay out of the test.
+/// There are at least four, so concurrent test requests can run in parallel.
+fn test_workers() -> &'static [tokio::sync::mpsc::UnboundedSender<TestJob>] {
+    TEST_WORKERS.get_or_init(|| {
+        let count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(4);
+        (0..count)
+            .map(|index| {
+                let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<TestJob>();
+                std::thread::Builder::new()
+                    .name(format!("bolt-test-worker-{index}"))
+                    .spawn(move || {
+                        bolt_core::state::pin_python_thread_state();
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build a test worker runtime");
+                        let local = tokio::task::LocalSet::new();
+                        local.block_on(&runtime, async move {
+                            Python::attach(bolt_loop::bind_thread_loop).unwrap_or_else(|e| {
+                                panic!("failed to create the test worker asyncio loop: {e}")
+                            });
+                            while let Some(job) = receiver.recv().await {
+                                tokio::task::spawn_local(job());
+                            }
+                        });
+                    })
+                    .expect("failed to start a test worker thread");
+                sender
+            })
+            .collect()
+    })
+}
+
+thread_local! {
+    /// The test worker of the calling thread, picked on its first request.
+    static TEST_WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Send a request to the test worker of the calling thread.
+///
+/// A thread keeps its worker, as a keep-alive connection keeps its Actix
+/// worker: consecutive requests of a test run on one worker thread. Requests
+/// from other threads go to other workers, so they can run in parallel.
+fn submit_test_job(job: TestJob) -> PyResult<()> {
+    let workers = test_workers();
+    let index = TEST_WORKER_INDEX.with(|slot| match slot.get() {
+        Some(index) => index,
+        None => {
+            let index = NEXT_TEST_WORKER.fetch_add(1, Ordering::Relaxed) % workers.len();
+            slot.set(Some(index));
+            index
+        }
+    });
+    workers[index]
+        .send(job)
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("the test worker stopped"))
+}
+
+/// Close the Django connections of each test worker, and wait until they are
+/// closed. A test client calls this at exit: a new `runbolt` process starts
+/// with no connections, so a connection that a test broke must not stay.
+#[pyfunction]
+pub fn close_test_worker_connections(py: Python<'_>) -> PyResult<()> {
+    let Some(workers) = TEST_WORKERS.get() else {
+        return Ok(());
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    for worker in workers {
+        let done_tx = done_tx.clone();
+        let job: TestJob = Box::new(move || {
+            Box::pin(async move {
+                Python::attach(|py| {
+                    let closed = py
+                        .import("django_bolt.concurrency")
+                        .and_then(|module| module.call_method0("close_lane_connections"));
+                    if let Err(err) = closed {
+                        err.print(py);
+                    }
+                });
+                drop(done_tx);
+            })
+        });
+        if worker.send(job).is_err() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "the test worker stopped",
+            ));
+        }
+    }
+    drop(done_tx);
+    // The channel closes after the last worker dropped its sender.
+    py.detach(move || while done_rx.recv().is_ok() {});
+    Ok(())
 }
 
 /// The peer address of each test request: a client on the loopback interface.
@@ -416,745 +509,163 @@ pub fn test_request(
         let app_state = entry.clone();
         drop(entry); // Release DashMap lock
 
-        // Use the global runtime (initialized by pyo3_async_runtimes::tokio::init())
-        // This ensures handler execution and streaming use the same runtime context
-        let runtime_handle = pyo3_async_runtimes::tokio::get_runtime();
-
-        runtime_handle.block_on(async {
-            // Read test app state
-            let (router, route_metadata, asgi_mounts, mcp_mounts, dispatch, config, compression) = {
-                let state = app_state.read();
-                (
-                    state.router.clone(),
-                    state.route_metadata.clone(),
-                    state.asgi_mounts.clone(),
-                    state.mcp_mounts.clone(),
-                    Python::attach(|py| state.dispatch.clone_ref(py)),
-                    state.config.clone(),
-                    state.global_compression_config.clone(),
-                )
-            };
-            let max_payload_size = config.max_payload_size;
-
-            // Build AppState matching production
-            // Include router and route_metadata so CorsMiddleware can find route-level CORS config
-            let cors_origin_regexes = config.cors_origin_regexes();
-            let app_state_arc = Arc::new(AppState {
-                dispatch,
-                debug: config.debug,
-                max_header_size: config.max_header_size,
-                max_payload_size,
-                max_param_length: config.max_param_length,
-                asgi_mount_timeout: config.asgi_mount_timeout,
-                global_cors_config: config.global_cors_config,
-                cors_origin_regexes,
-                global_compression_config: compression,
-                trusted_proxies: config.trusted_proxies,
-                router: router.clone(),
-                route_metadata: route_metadata.clone(),
-                asgi_mounts: asgi_mounts.clone(),
-                extensions: {
-                    let mut ext = http::Extensions::new();
-                    ext.insert(mcp_mounts.clone());
-                    ext
-                },
-                static_files_config: config.static_files_config,
-                media_files_config: config.media_files_config,
-                access_logger: None,
-            });
-
-            // Clone the Arc values for the handler closure
-            let router_for_handler = router.clone();
-            let metadata_for_handler = route_metadata.clone();
-
-            // Create the test handler that uses per-instance state
-            // Use web::Payload to support multipart form parsing (which needs the stream)
-            let handler = move |req: HttpRequest, payload: web::Payload| {
-                let router = router_for_handler.clone();
-                let metadata = metadata_for_handler.clone();
-
-                async move { handle_test_request_internal(req, payload, router, metadata).await }
-            };
-
-            // Create Actix test service with production middleware stack
-            // Use MergeOnly for NormalizePath (only normalizes // -> /)
-            // Trailing slash handling is done via Starlette-style redirect in handler
-            let app = test::init_service(
-                App::new()
-                    .app_data(web::Data::new(app_state_arc.clone()))
-                    .app_data(web::PayloadConfig::new(max_payload_size))
-                    .wrap(NormalizePath::new(TrailingSlash::MergeOnly))
-                    .wrap(CorsMiddleware::new())
-                    .wrap(CompressionMiddleware::new())
-                    .configure(|cfg| configure_file_scopes(cfg, &app_state_arc))
-                    .default_service(web::to(handler)),
-            )
-            .await;
-
-            // Build full URI
-            let uri = if let Some(qs) = query_string {
-                format!("{}?{}", path, qs)
-            } else {
-                path.clone()
-            };
-
-            // `TestRequest::with_uri` panics on an invalid URI. Check it first.
-            if let Err(e) = actix_web::http::Uri::try_from(uri.as_str()) {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid request URI {uri:?}: {e}"
-                )));
-            }
-            // A real client has a peer address. Without one, client-IP rate
-            // limits and BOLT_TRUSTED_PROXIES cannot work as in production.
-            let mut req = test::TestRequest::with_uri(&uri).peer_addr(TEST_PEER_ADDR);
-
-            // Set method
-            let method_upper = method.to_uppercase();
-            req = match method_upper.as_str() {
-                "GET" => req.method(actix_web::http::Method::GET),
-                "POST" => req.method(actix_web::http::Method::POST),
-                "PUT" => req.method(actix_web::http::Method::PUT),
-                "PATCH" => req.method(actix_web::http::Method::PATCH),
-                "DELETE" => req.method(actix_web::http::Method::DELETE),
-                "OPTIONS" => req.method(actix_web::http::Method::OPTIONS),
-                "HEAD" => req.method(actix_web::http::Method::HEAD),
-                // QUERY is a supported method but has no actix constant.
-                "QUERY" => req.method(
-                    actix_web::http::Method::from_bytes(b"QUERY")
-                        .expect("QUERY is a valid HTTP method token"),
-                ),
-                // Reject anything that isn't a supported method instead of
-                // silently defaulting to GET, which would hide typos in tests.
-                other => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "Unsupported HTTP method {other:?}"
-                    )));
-                }
-            };
-
-            // Append, so a repeated header keeps each value as on the wire.
-            for (name, value) in headers {
-                req = req.append_header((name, value));
-            }
-
-            // Set body
-            if !body.is_empty() {
-                req = req.set_payload(Bytes::from(body));
-            }
-
-            // Execute request
-            let request = req.to_request();
-            let response = app.call(request).await.map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Service call failed: {}", e))
-            })?;
-
-            // Extract response
-            let status = response.status().as_u16();
-
-            let resp_headers: Vec<(String, String)> = response
-                .headers()
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                .collect();
-
-            // Use test::read_body which handles various body types including Encoder
-            let resp_body = test::read_body(response).await.to_vec();
-
-            Ok((status, resp_headers, resp_body))
-        })
-    })
-}
-
-/// Internal handler for test requests that uses per-instance state.
-/// This mirrors the production `handle_request` but uses the provided router and metadata.
-async fn handle_test_request_internal(
-    req: HttpRequest,
-    mut payload: web::Payload,
-    router: Arc<Router>,
-    route_metadata: Arc<RouteMetadataStore>,
-) -> HttpResponse {
-    use crate::handler::{content_length_exceeds_limit, parse_content_length};
-    use bolt_core::error::handle_python_error;
-    use bolt_core::middleware;
-    use bolt_core::middleware::auth::populate_auth_context;
-    use bolt_core::request::PyRequest;
-    use bolt_core::request_pipeline::{build_validation_error_response, extract_headers};
-    use bolt_core::responses;
-    use bolt_core::router::{parse_query_string, QueryParams};
-    use bolt_core::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
-
-    let method = req.method().as_str();
-    let path = req.path();
-
-    // Get state from app data
-    let state = match req.app_data::<web::Data<Arc<AppState>>>() {
-        Some(s) => s.get_ref().clone(),
-        None => {
-            return HttpResponse::InternalServerError().body("App state not found");
-        }
-    };
-
-    // Find route
-    let (route_handler, path_params, handler_id) = {
-        if let Some(route_match) = router.find(method, path) {
-            let handler_id = route_match.handler_id();
-            let handler = Python::attach(|py| route_match.route().handler.clone_ref(py));
-            let path_params = route_match.path_params().map(|mut params| {
-                bolt_core::router::decode_path_params(&mut params);
-                params
-            });
-            (handler, path_params, handler_id)
-        } else {
-            // No route found - check for trailing slash redirect FIRST
-            // Starlette-style: redirect to canonical URL if alternate path exists
-            if path != "/" {
-                let alternate_path = if path.ends_with('/') {
-                    path.trim_end_matches('/').to_string()
-                } else {
-                    format!("{}/", path)
-                };
-
-                // Try alternate path - if it matches, send 308 redirect
-                if router.find(method, &alternate_path).is_some() {
-                    let query = req.query_string();
-                    let location = if query.is_empty() {
-                        alternate_path
-                    } else {
-                        format!("{}?{}", alternate_path, query)
+        // The request runs on a test worker thread, as a request of the server
+        // runs on an Actix worker. The handler never runs on the thread of the test.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let job: TestJob = Box::new(move || {
+            Box::pin(async move {
+                let result: PyResult<(u16, Vec<(String, String)>, Vec<u8>)> = async move {
+                    // Read test app state
+                    let (
+                        router,
+                        route_metadata,
+                        asgi_mounts,
+                        mcp_mounts,
+                        dispatch,
+                        config,
+                        compression,
+                    ) = {
+                        let state = app_state.read();
+                        (
+                            state.router.clone(),
+                            state.route_metadata.clone(),
+                            state.asgi_mounts.clone(),
+                            state.mcp_mounts.clone(),
+                            Python::attach(|py| state.dispatch.clone_ref(py)),
+                            state.config.clone(),
+                            state.global_compression_config.clone(),
+                        )
                     };
-                    return HttpResponse::PermanentRedirect() // 308
-                        .insert_header(("Location", location))
-                        .finish();
-                }
-            }
+                    let max_payload_size = config.max_payload_size;
 
-            // Automatic OPTIONS handling
-            if method == "OPTIONS" {
-                let available_methods = router.find_all_methods(path);
-                if !available_methods.is_empty() {
-                    let allow_header = available_methods.join(", ");
-                    return HttpResponse::NoContent()
-                        .insert_header(("Allow", allow_header))
-                        .insert_header(("Content-Type", "application/json"))
-                        .finish();
-                }
-            }
+                    // Build AppState matching production
+                    // Include router and route_metadata so CorsMiddleware can find route-level CORS config
+                    let cors_origin_regexes = config.cors_origin_regexes();
+                    let app_state_arc = Arc::new(AppState {
+                        dispatch,
+                        debug: config.debug,
+                        max_header_size: config.max_header_size,
+                        max_payload_size,
+                        max_param_length: config.max_param_length,
+                        asgi_mount_timeout: config.asgi_mount_timeout,
+                        global_cors_config: config.global_cors_config,
+                        cors_origin_regexes,
+                        global_compression_config: compression,
+                        trusted_proxies: config.trusted_proxies,
+                        router: router.clone(),
+                        route_metadata: route_metadata.clone(),
+                        asgi_mounts: asgi_mounts.clone(),
+                        extensions: {
+                            let mut ext = http::Extensions::new();
+                            ext.insert(mcp_mounts.clone());
+                            ext
+                        },
+                        static_files_config: config.static_files_config,
+                        media_files_config: config.media_files_config,
+                        access_logger: None,
+                    });
 
-            // MCP mount check (mirrors production handle_request): only on
-            // router miss, before the ASGI fallback.
-            if let Some(mcp_mount) = bolt_mcp::find_mcp_mount(&state, path) {
-                return bolt_mcp::bridge::handle_mcp_request(req, payload, mcp_mount, &state).await;
-            }
+                    // Create Actix test service with production middleware stack
+                    // Use MergeOnly for NormalizePath (only normalizes // -> /)
+                    // Trailing slash handling is done via Starlette-style redirect in handler
+                    let app = test::init_service(
+                        App::new()
+                            .app_data(web::Data::new(app_state_arc.clone()))
+                            .app_data(web::PayloadConfig::new(max_payload_size))
+                            .wrap(NormalizePath::new(TrailingSlash::MergeOnly))
+                            .wrap(CorsMiddleware::new())
+                            .wrap(CompressionMiddleware::new())
+                            .configure(|cfg| configure_file_scopes(cfg, &app_state_arc))
+                            // The production request pipeline, with this app's state.
+                            .default_service(web::to(crate::handler::handle_request::<false>)),
+                    )
+                    .await;
 
-            // HTTP ASGI mount fallback:
-            // - only after Bolt route miss
-            // - only after trailing-slash/API-method near-miss checks above
-            if let Some(asgi_mount) = find_asgi_mount(&state, path) {
-                return asgi_http::handle_asgi_mount_request(
-                    req,
-                    payload,
-                    asgi_mount,
-                    state.debug,
-                    state.max_payload_size,
-                    state.asgi_mount_timeout,
-                )
-                .await;
-            }
+                    // Build full URI
+                    let uri = if let Some(qs) = query_string {
+                        format!("{}?{}", path, qs)
+                    } else {
+                        path.clone()
+                    };
 
-            if method == "OPTIONS" {
-                // Handle OPTIONS preflight for non-existent routes
-                if state.global_cors_config.is_some() {
-                    return HttpResponse::NoContent().finish();
-                }
-            }
-
-            return responses::error_404();
-        }
-    };
-
-    // Get route metadata
-    let route_meta = route_metadata.get(handler_id).cloned();
-    let can_lane_dispatch = route_meta
-        .as_ref()
-        .is_some_and(|m| m.plan.can_lane_dispatch());
-
-    // Parse query string
-    let needs_query = route_meta
-        .as_ref()
-        .map(|m| m.plan.needs_query())
-        .unwrap_or(true);
-    // The map borrows its keys and values from the URI when they need no decode.
-    let query_string = if needs_query { req.uri().query() } else { None };
-    let query_params: Option<QueryParams<'_>> = query_string
-        .map(parse_query_string)
-        .filter(|parsed| !parsed.is_empty());
-
-    // Max parameter length resolved once at startup; read the plain field here.
-    let max_param_length = state.max_param_length;
-
-    // A sequence query parameter takes each value of its repeated key.
-    let query_sequences = match route_meta.as_ref() {
-        Some(meta) if needs_query => {
-            match query_sequences(req.uri().query(), &meta.query_seq_fields, max_param_length) {
-                Ok(sequences) => sequences,
-                Err(detail) => return bolt_core::responses::error_422_validation(&detail),
-            }
-        }
-        _ => Vec::new(),
-    };
-
-    // Validate typed parameters before GIL acquisition and cache non-string coerced values.
-    let (path_coerced, query_coerced) = if let Some(ref meta) = route_meta {
-        match validate_and_cache_typed_params(
-            path_params.as_ref(),
-            query_params.as_ref(),
-            &meta.param_types,
-            max_param_length,
-        ) {
-            Ok(cached) => cached,
-            Err(response) => return response,
-        }
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    // Extract headers
-    let needs_headers = route_meta
-        .as_ref()
-        .map(|m| m.plan.needs_headers())
-        .unwrap_or(true);
-    let skip_cors = route_meta
-        .as_ref()
-        .map(|m| m.plan.skip_cors())
-        .unwrap_or(false);
-    let skip_compression = route_meta
-        .as_ref()
-        .map(|m| m.plan.skip_compression())
-        .unwrap_or(false);
-
-    let headers = match extract_headers(&req, state.max_header_size) {
-        Ok(h) => h,
-        Err(response) => return response,
-    };
-
-    let client_ip = bolt_core::middleware::client_ip::resolve_from_headers(
-        req.headers(),
-        req.peer_addr().map(|address| address.ip()),
-        &state.trusted_proxies,
-    );
-
-    // Host and scheme retain Actix behavior; REMOTE_ADDR uses Bolt's explicit
-    // forwarding-header trust policy.
-    // Copy the values out, so the `RefCell` borrow ends before the awaits below.
-    let (conn_host, conn_scheme) = {
-        let conn_info = req.connection_info();
-        (conn_info.host().to_owned(), conn_info.scheme().to_owned())
-    };
-    let conn_remote_addr = client_ip;
-
-    // Rate limiting: address and header keys before auth, identity keys after.
-    let rate_config = route_meta
-        .as_ref()
-        .and_then(|m| m.rate_limit_config.as_ref());
-    if let Some(rate_config) = rate_config {
-        if let Some(response) = middleware::rate_limit::check_before_auth(
-            handler_id,
-            &headers,
-            client_ip.as_ref(),
-            rate_config,
-            method,
-            path,
-        ) {
-            return response;
-        }
-    }
-
-    // Auth and guards
-    let auth_ctx = if let Some(ref meta) = route_meta {
-        match validate_auth_and_guards(&headers, &meta.auth_backends, &meta.guards) {
-            AuthGuardResult::Allow(ctx) => {
-                let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
-                if bolt_core::validation::cookie_csrf_blocks(
-                    method,
-                    &headers,
-                    requires_csrf,
-                    &conn_scheme,
-                ) {
-                    return responses::error_403();
-                }
-                ctx
-            }
-            AuthGuardResult::Unauthorized => return responses::error_401(),
-            AuthGuardResult::Forbidden(denial) => {
-                return responses::error_403_denial(denial.as_deref())
-            }
-        }
-    } else {
-        None
-    };
-
-    if let Some(rate_config) = rate_config {
-        if let Some(response) = middleware::rate_limit::check_after_auth(
-            handler_id,
-            &headers,
-            client_ip.as_ref(),
-            auth_ctx.as_ref(),
-            rate_config,
-            method,
-            path,
-        ) {
-            return response;
-        }
-    }
-
-    // Cookies
-    let needs_cookies = route_meta
-        .as_ref()
-        .map(|m| m.plan.needs_cookies())
-        .unwrap_or(true);
-    let cookies = if needs_cookies {
-        parse_cookies_inline(headers.get("cookie").map(|s| s.as_str()))
-    } else {
-        AHashMap::new()
-    };
-
-    // Validate and pre-coerce the header and cookie values that Python receives.
-    let empty_types: &TypeHints = &EMPTY_TYPES;
-    let header_types = route_meta.as_ref().map_or(empty_types, |m| &m.header_types);
-    let cookie_types = route_meta.as_ref().map_or(empty_types, |m| &m.cookie_types);
-    let headers_coerced = if needs_headers {
-        match validate_and_cache_source(&headers, header_types, max_param_length, "Header") {
-            Ok(cached) => cached,
-            Err(response) => return response,
-        }
-    } else {
-        Vec::new()
-    };
-    let cookies_coerced = if needs_cookies {
-        match validate_and_cache_source(&cookies, cookie_types, max_param_length, "Cookie") {
-            Ok(cached) => cached,
-            Err(response) => return response,
-        }
-    } else {
-        Vec::new()
-    };
-
-    // Form parsing (URL-encoded and multipart)
-    let needs_form_parsing = route_meta
-        .as_ref()
-        .map(|m| m.plan.needs_form_parsing())
-        .unwrap_or(false);
-
-    let content_type = headers
-        .get("content-type")
-        .map(|s| s.as_str())
-        .unwrap_or("");
-
-    let is_multipart = content_type.starts_with("multipart/form-data");
-    let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
-
-    // Fast-reject oversized requests before reading body bytes, reusing the
-    // production helpers so payload-size limits behave identically under
-    // TestClient (per src/CLAUDE.md: tests reuse production code). Only computed
-    // for routes that read a body.
-    let needs_body = route_meta.as_ref().is_none_or(|m| m.plan.needs_body());
-    let reads_body = needs_body || needs_form_parsing;
-    let content_length = if reads_body {
-        parse_content_length(&req)
-    } else {
-        None
-    };
-    if content_length_exceeds_limit(content_length, state.max_payload_size) {
-        return responses::error_413();
-    }
-
-    // Read body from payload (before form parsing consumes it for multipart)
-    let (body, form_result): (Vec<u8>, Option<FormParseResult>) =
-        if needs_form_parsing && is_multipart {
-            // Multipart form parsing - uses the payload stream directly
-            let form_type_hints = route_meta
-                .as_ref()
-                .map(|m| &m.form_type_hints)
-                .cloned()
-                .unwrap_or_default();
-            let file_constraints = route_meta
-                .as_ref()
-                .map(|m| &m.file_constraints)
-                .cloned()
-                .unwrap_or_default();
-            let max_upload_size = route_meta
-                .as_ref()
-                .map(|m| m.max_upload_size)
-                .unwrap_or(1024 * 1024);
-            let memory_spool_threshold = route_meta
-                .as_ref()
-                .map(|m| m.memory_spool_threshold)
-                .unwrap_or(DEFAULT_MEMORY_LIMIT);
-
-            // Create Multipart from the payload
-            let multipart = Multipart::new(req.headers(), payload);
-
-            match parse_multipart(
-                multipart,
-                &form_type_hints,
-                &file_constraints,
-                max_upload_size,
-                memory_spool_threshold,
-                DEFAULT_MAX_PARTS,
-                max_param_length,
-                state.max_payload_size,
-            )
-            .await
-            {
-                Ok(result) => (Vec::new(), Some(result)),
-                Err(validation_error) => {
-                    // Aggregate-size overflow maps to 413 to match the non-multipart
-                    // path; other multipart failures stay 422 validation errors.
-                    if validation_error.error_type
-                        == bolt_core::form_parsing::ERROR_TYPE_PAYLOAD_TOO_LARGE
-                    {
-                        return responses::error_413();
+                    // `TestRequest::with_uri` panics on an invalid URI. Check it first.
+                    if let Err(e) = actix_web::http::Uri::try_from(uri.as_str()) {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "Invalid request URI {uri:?}: {e}"
+                        )));
                     }
-                    return build_validation_error_response(&validation_error);
-                }
-            }
-        } else {
-            // Read payload as bytes (for non-multipart requests).
-            // Bound the aggregate body against max_payload_size during streaming
-            // so chunked requests (no Content-Length) are also enforced — mirrors
-            // the production handler.
-            let mut body_bytes = web::BytesMut::new();
-            let mut total_read: usize = 0;
-            while let Some(chunk) = payload.next().await {
-                match chunk {
-                    Ok(data) => {
-                        total_read = match total_read.checked_add(data.len()) {
-                            Some(v) => v,
-                            None => return responses::error_413(),
-                        };
-                        if total_read > state.max_payload_size {
-                            return responses::error_413();
+                    // A real client has a peer address. Without one, client-IP rate
+                    // limits and BOLT_TRUSTED_PROXIES cannot work as in production.
+                    let mut req = test::TestRequest::with_uri(&uri).peer_addr(TEST_PEER_ADDR);
+
+                    // Set method
+                    let method_upper = method.to_uppercase();
+                    req = match method_upper.as_str() {
+                        "GET" => req.method(actix_web::http::Method::GET),
+                        "POST" => req.method(actix_web::http::Method::POST),
+                        "PUT" => req.method(actix_web::http::Method::PUT),
+                        "PATCH" => req.method(actix_web::http::Method::PATCH),
+                        "DELETE" => req.method(actix_web::http::Method::DELETE),
+                        "OPTIONS" => req.method(actix_web::http::Method::OPTIONS),
+                        "HEAD" => req.method(actix_web::http::Method::HEAD),
+                        // QUERY is a supported method but has no actix constant.
+                        "QUERY" => req.method(
+                            actix_web::http::Method::from_bytes(b"QUERY")
+                                .expect("QUERY is a valid HTTP method token"),
+                        ),
+                        // Reject anything that isn't a supported method instead of
+                        // silently defaulting to GET, which would hide typos in tests.
+                        other => {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                                "Unsupported HTTP method {other:?}"
+                            )));
                         }
-                        body_bytes.extend_from_slice(&data);
+                    };
+
+                    // Append, so a repeated header keeps each value as on the wire.
+                    for (name, value) in headers {
+                        req = req.append_header((name, value));
                     }
-                    Err(e) => {
-                        return HttpResponse::BadRequest()
-                            .content_type("application/json")
-                            .body(format!(
-                                "{{\"error\": \"Failed to read request body: {}\"}}",
-                                e
-                            ));
+
+                    // Set body
+                    if !body.is_empty() {
+                        req = req.set_payload(Bytes::from(body));
                     }
+
+                    // Execute request
+                    let request = req.to_request();
+                    let response = app.call(request).await.map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Service call failed: {}",
+                            e
+                        ))
+                    })?;
+
+                    // Extract response
+                    let status = response.status().as_u16();
+
+                    let resp_headers: Vec<(String, String)> = response
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| {
+                            (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
+                        })
+                        .collect();
+
+                    // Use test::read_body which handles various body types including Encoder
+                    let resp_body = test::read_body(response).await.to_vec();
+
+                    Ok((status, resp_headers, resp_body))
                 }
-            }
-            let body = body_bytes.freeze();
-
-            // URL-encoded form parsing
-            if needs_form_parsing && is_urlencoded {
-                let form_type_hints = route_meta
-                    .as_ref()
-                    .map(|m| &m.form_type_hints)
-                    .cloned()
-                    .unwrap_or_default();
-
-                match parse_urlencoded(&body, &form_type_hints, max_param_length) {
-                    Ok(form_map) => {
-                        let result = FormParseResult {
-                            form_map,
-                            files_map: HashMap::new(),
-                        };
-                        (body.to_vec(), Some(result))
-                    }
-                    Err(validation_error) => {
-                        return build_validation_error_response(&validation_error);
-                    }
-                }
-            } else {
-                (body.to_vec(), None)
-            }
-        };
-
-    let is_head_request = method == "HEAD";
-
-    // Execute handler using run_coroutine_threadsafe to submit to background event loop
-    // This reuses the global event loop instead of creating one per request via asyncio.run()
-    let result_obj = match Python::attach(|py| -> PyResult<Py<PyAny>> {
-        let dispatch = state.dispatch.clone_ref(py);
-        let handler = route_handler.clone_ref(py);
-
-        let context = if let Some(ref auth) = auth_ctx {
-            let ctx_dict = PyDict::new(py);
-            let ctx_py = ctx_dict.unbind();
-            populate_auth_context(&ctx_py, auth, py);
-            Some(ctx_py)
-        } else {
-            None
-        };
-
-        // Bind the handler arguments from the Rust maps (matches production).
-        let state_lock = std::sync::OnceLock::new();
-        let mut skip_dicts = false;
-        if let Some(bindings) = route_meta
-            .as_ref()
-            .and_then(|m| m.rust_arg_bindings.as_deref())
-        {
-            let prebound = build_prebound_from_values(
-                py,
-                bindings,
-                &SourceValues {
-                    values: path_params.as_ref(),
-                    coerced: &path_coerced,
-                },
-                &SourceValues {
-                    values: query_params.as_ref(),
-                    coerced: &query_coerced,
-                },
-                &SourceValues {
-                    values: Some(&headers),
-                    coerced: &headers_coerced,
-                },
-                &SourceValues {
-                    values: Some(&cookies),
-                    coerced: &cookies_coerced,
-                },
-            );
-            if let Some((pre_args, pre_kwargs)) = prebound? {
-                let state_dict = PyDict::new(py);
-                state_dict.set_item("_bolt_prebound_args", pre_args)?;
-                state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
-                let _ = state_lock.set(state_dict.unbind());
-                skip_dicts = route_meta.as_ref().is_some_and(|m| m.prebind_only);
-            }
-        }
-
-        // Create typed dicts - reuse pre-coerced values from the validation phase.
-        let path_params_dict = match path_params.as_ref() {
-            Some(_) if skip_dicts => None,
-            Some(path_params) => {
-                Some(string_map_to_py_dict(py, path_params, &path_coerced)?.unbind())
-            }
-            None => None,
-        };
-
-        let query_params_dict = match query_params.as_ref() {
-            Some(_) if skip_dicts => None,
-            Some(query_params) => {
-                let query_dict = string_map_to_py_dict(py, query_params, &query_coerced)?;
-                set_query_sequences(py, &query_dict, &query_sequences)?;
-                Some(query_dict.unbind())
-            }
-            None => None,
-        };
-
-        let headers_dict = if needs_headers && !skip_dicts {
-            Some(string_map_to_py_dict(py, &headers, &headers_coerced)?)
-        } else {
-            None
-        };
-        let cookies_dict = if needs_cookies && !skip_dicts {
-            Some(string_map_to_py_dict(py, &cookies, &cookies_coerced)?)
-        } else {
-            None
-        };
-        // Django middleware reads the original strings (matches production).
-        let keep_raw_headers = !headers_coerced.is_empty();
-        let keep_raw_cookies = !cookies_coerced.is_empty();
-
-        // Only create form/files dicts when form data is present (matches production).
-        let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {
-            static EMPTY_SEQ: std::sync::OnceLock<std::collections::HashSet<String>> =
-                std::sync::OnceLock::new();
-            let seq_fields = route_meta
-                .as_ref()
-                .map(|m| &m.form_seq_fields)
-                .unwrap_or_else(|| EMPTY_SEQ.get_or_init(std::collections::HashSet::new));
-            let (fm, fi) = form_result_to_py(py, result, seq_fields)
-                .unwrap_or_else(|_| (PyDict::new(py).unbind(), PyDict::new(py).unbind()));
-            (Some(fm), Some(fi))
-        } else {
-            (None, None)
-        };
-
-        let request = PyRequest {
-            method: crate::handler::static_method_name(method),
-            path: path.to_string(),
-            body: body.to_vec(),
-            path_params: path_params_dict,
-            query_params: query_params_dict,
-            query_string: query_string.map(str::to_owned).unwrap_or_default(),
-            headers: headers_dict.map(|d| d.unbind()),
-            cookies: cookies_dict.map(|d| d.unbind()),
-            raw_headers: keep_raw_headers.then_some(headers),
-            raw_cookies: keep_raw_cookies.then_some(cookies),
-            context,
-            user: None,
-            state: state_lock,
-            form_map: form_map_opt,
-            files_map: files_map_opt,
-            meta_cache: std::sync::OnceLock::new(),
-            conn_host: conn_host.clone(),
-            conn_scheme: conn_scheme.clone(),
-            conn_remote_addr,
-        };
-        let request_obj = Py::new(py, request)?;
-
-        // LANE PATH: mirrors production `handle_request`.
-        if can_lane_dispatch {
-            if let Some(route_match) = router.find(method, path) {
-                let dispatch_sync = route_match.route().dispatch_sync.clone_ref(py);
-                return bolt_core::lane::dispatch_blocking(
-                    py,
-                    dispatch_sync,
-                    request_obj.into_any(),
-                );
-            }
-        }
-
-        // Get the event loop from TASK_LOCALS (initialized by ensure_task_locals_initialized)
-        let locals = TASK_LOCALS.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
-        })?;
-        let event_loop = locals.event_loop(py);
-
-        // Call dispatch to get a coroutine
-        let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
-
-        // Submit coroutine to background event loop using run_coroutine_threadsafe
-        // This returns a concurrent.futures.Future that we can wait on
-        let asyncio = py.import("asyncio")?;
-        let future = asyncio.call_method1("run_coroutine_threadsafe", (coroutine, event_loop))?;
-
-        // Wait for the result (releases GIL while waiting)
-        let result = future.call_method0("result")?;
-        Ok(result.unbind())
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            return Python::attach(|py| handle_python_error(py, e, path, method, state.debug));
-        }
-    };
-
-    match response_from_wire_result(
-        result_obj,
-        skip_compression,
-        skip_cors,
-        is_head_request,
-        &req,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(e) => Python::attach(|py| {
-            bolt_core::error::build_error_response(
-                py,
-                500,
-                format!("Handler returned unsupported response wire format: {}", e),
-                vec![],
-                None,
-                state.debug,
-            )
-        }),
-    }
+                .await;
+                let _ = done_tx.send(result);
+            })
+        });
+        submit_test_job(job)?;
+        done_rx.recv().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("the test worker dropped the request")
+        })?
+    })
 }
 
 /// Handle WebSocket test request - validates and routes WebSocket connections
