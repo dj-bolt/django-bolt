@@ -1,0 +1,140 @@
+name: Fuzz
+
+# Long runs that look for new failing inputs: cargo-fuzz on the request
+# parsers, and the Hypothesis and proptest properties with many random cases.
+# This workflow does not gate a merge. CI.yml runs the same properties on each
+# pull request, with fixed cases.
+
+on:
+  schedule:
+    # Each Monday.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds for each fuzz target
+        default: "600"
+  # A pull request that changes the fuzz setup checks that it still runs.
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+
+permissions:
+  contents: read
+
+# One group per pull request: a new push cancels the run for the old commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A pull request run is short. It shows that the targets build and run.
+  FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '30' || inputs.seconds || '600' }}
+
+jobs:
+  cargo-fuzz:
+    name: cargo-fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The [[bin]] targets of fuzz/Cargo.toml.
+        target: [query_string, cookies, coerce_param, urlencoded_form, cookie_csrf]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # bolt-core links libpython through PyO3.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: pyproject.toml
+
+      # cargo-fuzz needs nightly for the sanitizer flags.
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        with:
+          tool: cargo-fuzz
+
+      # The corpus of each run starts from the corpus of the last run.
+      - name: Restore the corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        working-directory: fuzz
+        run: cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="$FUZZ_SECONDS"
+
+      # The failing input. Reproduce it with
+      # `cargo +nightly fuzz run <target> <file>`.
+      - name: Upload the failing input
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+
+  properties:
+    name: Hypothesis and proptest, many cases
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: pyproject.toml
+
+      - name: Install Rust
+        # Toolchain comes from rust-toolchain.toml.
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          build-warnings: ""
+
+      # Builds the Rust extension into the project environment.
+      - name: Install dependencies
+        run: uv sync --all-extras --python "$(command -v python)"
+
+      # Hypothesis keeps each failing example here and tries it first next time.
+      - name: Restore the Hypothesis database
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .hypothesis
+          key: hypothesis-${{ github.run_id }}
+          restore-keys: hypothesis-
+
+      - name: Hypothesis properties
+        run: uv run --no-sync pytest python/tests/test_properties.py --hypothesis-profile=fuzz -n auto -v
+
+      # A random seed for each run, not the fixed seed of CI.yml.
+      - name: proptest properties
+        env:
+          PROPTEST_CASES: "20000"
+        run: cargo test -p bolt-core --lib
+
+      - name: Upload the failing examples
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: property-failures
+          path: |
+            .hypothesis
+            crates/bolt-core/proptest-regressions
+          include-hidden-files: true
