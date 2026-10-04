@@ -398,6 +398,82 @@ mod tests {
         requires(claim, values, Quantifier::None)
     }
 
+    /// Each typed claim of `Claims` matches its guard, and another value does
+    /// not. A typed claim that `ClaimKey::parse` sent to `Extra` never
+    /// matches: serde puts a known claim in its field, not in `extra`.
+    #[test]
+    fn every_typed_claim_matches_its_guard() {
+        let payload = serde_json::json!({
+            "sub": "u1", "iss": "issuer", "jti": "id1", "typ": "access", "fam": "f1",
+            "exp": 2_000_000_000i64, "iat": 1_000, "nbf": 1_001, "oat": 1_002, "ver": 3,
+            "is_staff": true, "is_superuser": true, "is_admin": true,
+            "amr": ["pwd", "otp"], "aud": "api", "permissions": ["read"],
+        });
+        let claims: Claims = serde_json::from_value(payload.clone()).unwrap();
+        let ctx = AuthContext::from_jwt_claims(claims, "jwt", false);
+        for (name, value) in payload.as_object().unwrap() {
+            let (expected, other) = match value {
+                Json::Array(items) => (items[0].clone(), Json::from("other")),
+                Json::String(_) => (value.clone(), Json::from("other")),
+                Json::Bool(flag) => (value.clone(), Json::from(!flag)),
+                Json::Number(number) => (value.clone(), Json::from(number.as_i64().unwrap() + 1)),
+                _ => unreachable!("the payload has no other type"),
+            };
+            assert_eq!(
+                evaluate_guards(&any_of(name, &[expected]), Some(&ctx)),
+                GuardResult::Allow,
+                "{name}"
+            );
+            assert_eq!(
+                evaluate_guards(&any_of(name, &[other]), Some(&ctx)),
+                GuardResult::Forbidden(None),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_authenticated_needs_a_user() {
+        let guards = GuardSet::from_guards(vec![Guard::IsAuthenticated]);
+        let mut ctx = jwt_ctx(&[], &[]);
+        assert_eq!(evaluate_guards(&guards, Some(&ctx)), GuardResult::Allow);
+        ctx.user_id = None;
+        assert_eq!(
+            evaluate_guards(&guards, Some(&ctx)),
+            GuardResult::Unauthorized
+        );
+        assert_eq!(evaluate_guards(&guards, None), GuardResult::Unauthorized);
+    }
+
+    /// A bare `Requires(claim)` checks that the claim is present.
+    #[test]
+    fn a_presence_check_needs_the_claim() {
+        let with_role = jwt_ctx(&["read"], &[("role", Json::from("client"))]);
+        let without = jwt_ctx(&[], &[]);
+        for claim in ["role", "permissions"] {
+            assert_eq!(
+                evaluate_guards(&any_of(claim, &[]), Some(&with_role)),
+                GuardResult::Allow,
+                "{claim}"
+            );
+            assert_eq!(
+                evaluate_guards(&any_of(claim, &[]), Some(&without)),
+                GuardResult::Forbidden(None),
+                "{claim}"
+            );
+            assert_eq!(
+                evaluate_guards(&none_of(claim, &[]), Some(&with_role)),
+                GuardResult::Forbidden(None),
+                "{claim}"
+            );
+            assert_eq!(
+                evaluate_guards(&none_of(claim, &[]), Some(&without)),
+                GuardResult::Allow,
+                "{claim}"
+            );
+        }
+    }
+
     #[test]
     fn extra_claim_string_equality() {
         let ctx = jwt_ctx(&[], &[("role", Json::from("client"))]);

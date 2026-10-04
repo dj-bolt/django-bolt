@@ -92,9 +92,9 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
     if let Some(ref samesite) = c.samesite {
         let ss = match samesite.to_lowercase().as_str() {
             "strict" => SameSite::Strict,
-            "lax" => SameSite::Lax,
             "none" => SameSite::None,
-            _ => SameSite::Lax, // Default to Lax for invalid values
+            // "lax", and Lax for an invalid value
+            _ => SameSite::Lax,
         };
         cookie = cookie.same_site(ss);
     }
@@ -207,10 +207,8 @@ pub fn unquote_cookie_value(value: &str) -> Cow<'_, str> {
         unquoted.push_str(&rest[..pos]);
         let after = &rest[pos + 1..];
         match after.as_bytes() {
-            [high @ b'0'..=b'3', mid @ b'0'..=b'7', low @ b'0'..=b'7', ..] => {
-                let code = u32::from(high - b'0') << 6
-                    | u32::from(mid - b'0') << 3
-                    | u32::from(low - b'0');
+            [b'0'..=b'3', b'0'..=b'7', b'0'..=b'7', ..] => {
+                let code = u32::from_str_radix(&after[..3], 8).expect("three octal digits");
                 unquoted.push(char::from_u32(code).expect("an octal escape is below 256"));
                 rest = &after[3..];
             }
@@ -346,9 +344,8 @@ mod tests {
             httponly: false,
             samesite: None,
         };
-        // Cookie crate handles quoting/encoding
         let result = format_cookie(&c).unwrap();
-        assert!(result.contains("data="));
+        assert!(result.starts_with(r#"data="hello world"; "#), "{result}");
     }
 
     #[test]
@@ -401,6 +398,16 @@ mod tests {
     }
 
     #[test]
+    fn a_name_must_be_a_token() {
+        for name in ["!", "~", "session_id", "a.b-c"] {
+            assert!(is_valid_cookie_name(name), "{name:?}");
+        }
+        for name in ["", "a b", "a\x7f", "a=b", "a;b", "a\"b", "é"] {
+            assert!(!is_valid_cookie_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
     fn a_value_cannot_add_an_attribute() {
         let result = format_cookie(&cookie_with_value("x; Domain=evil.example")).unwrap();
         assert!(
@@ -419,6 +426,9 @@ mod tests {
             (r"back\slash", r#""back\\slash""#),
             ("café", r#""caf\351""#),
             ("a,b", r#""a\054b""#),
+            // As in Python `_quote`, the first character above Latin-1 gets no
+            // escape. `format_cookie` refuses it (see `a_value_above_latin1_is_rejected`).
+            ("\u{ff}\u{100}", "\"\\377\u{100}\""),
         ] {
             assert_eq!(quote_cookie_value(value), quoted, "{value}");
             assert_eq!(unquote_cookie_value(quoted), value, "{quoted}");

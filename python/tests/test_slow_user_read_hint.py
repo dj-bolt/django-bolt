@@ -17,7 +17,7 @@ import jwt
 import pytest
 from django.test import override_settings
 
-from django_bolt import BoltAPI, Request
+from django_bolt import BoltAPI, Request, concurrency
 from django_bolt.auth import JWTAuthentication
 from django_bolt.testing import TestClient
 
@@ -32,6 +32,16 @@ def _bolt_logs_reach_caplog(monkeypatch):
     root logger, so the records must propagate for these tests.
     """
     monkeypatch.setattr(logging.getLogger("django_bolt"), "propagate", True)
+
+
+@pytest.fixture(autouse=True)
+def _each_test_reports_again(monkeypatch):
+    """Bolt reports each line one time for each process.
+
+    Each test starts with no line reported. Thus a second pytest session in
+    the same process (as mutmut runs) reports the line again.
+    """
+    monkeypatch.setattr(concurrency, "_reported_slow_reads", set())
 
 
 class _SlowAuth(JWTAuthentication):

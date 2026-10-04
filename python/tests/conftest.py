@@ -2,8 +2,8 @@
 Pytest configuration for Django-Bolt tests.
 
 Configures Django once for the test process. Each test process gets a new
-SQLite database in a temporary directory, removed at exit, so no schema from
-an earlier run survives.
+SQLite database in a temporary directory, removed at the end of each session,
+so no schema from an earlier run survives.
 """
 
 import logging
@@ -53,10 +53,14 @@ def _gil_stays_disabled():
         )
 
 
+# One database directory per test process (each xdist worker has its own).
+# Django keeps this path for the life of the process. `pytest_unconfigure`
+# removes the directory, and `django_db_setup` makes it again.
+_DB_DIR = tempfile.mkdtemp(prefix="django_bolt_test_")
+
+
 def pytest_configure(config):
     """Configure Django settings for pytest-django."""
-    # One directory per test process (each xdist worker has its own).
-    config._bolt_db_dir = tempfile.mkdtemp(prefix="django_bolt_test_")
     import django  # noqa: PLC0415
     from django.conf import settings  # noqa: PLC0415
 
@@ -132,7 +136,7 @@ def pytest_configure(config):
                     # A file, not :memory:, so that threads share the database.
                     # Concurrent workers sharing one SQLite file fail with
                     # locked-database, UNIQUE and FK errors, so each has its own.
-                    "NAME": os.path.join(config._bolt_db_dir, "db.sqlite3"),
+                    "NAME": os.path.join(_DB_DIR, "db.sqlite3"),
                 }
             },
             USE_TZ=True,
@@ -194,7 +198,13 @@ def django_db_setup(django_db_blocker):
 
 
 def pytest_unconfigure(config):
-    """Remove the database directory of this test process."""
-    db_dir = getattr(config, "_bolt_db_dir", None)
-    if db_dir:
-        shutil.rmtree(db_dir, ignore_errors=True)
+    """Remove the database directory at the end of the session.
+
+    mutmut ends each child process with `os._exit`, which skips atexit
+    handlers. A later session in the same process opens a new database at the
+    same path, so the connections of this thread close first.
+    """
+    from django.db import connections  # noqa: PLC0415
+
+    connections.close_all()
+    shutil.rmtree(_DB_DIR, ignore_errors=True)

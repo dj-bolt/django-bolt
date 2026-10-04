@@ -164,3 +164,19 @@ bolt_mcp = ["python/bolt-mcp/src/bolt_mcp", "*/site-packages/bolt_mcp"]
 [tool.coverage.report]
 skip_empty = true
 precision = 1
+
+# mutmut (Python mutation testing). scripts/mutmut.sh copies python/django_bolt
+# to django_bolt/ and python/tests to tests/ in a work directory, because
+# mutmut looks for the code in ./, src/ or source/. The paths are in that layout.
+[tool.mutmut]
+source_paths = ["django_bolt"]
+only_mutate = [
+    "django_bolt/analysis.py",
+    "django_bolt/middleware/compiler.py",
+]
+# The test client starts Rust threads, and a forked child has none of them.
+# The fork server forks each mutant from a process that ran no test.
+process_isolation = "forkserver"
+forkserver_warmup = "none"
+# The integration tests run the code in a runbolt process, which mutmut does not reach.
+pytest_add_cli_args_test_selection = ["tests", "--ignore=tests/integration", "-m", "not postgres"]

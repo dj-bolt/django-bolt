@@ -283,6 +283,29 @@ fn client_from_forwarded_for<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The first `prefix_len` bits are equal exactly when the XOR of the
+        /// addresses has no set bit in them.
+        #[test]
+        fn prefix_eq_compares_the_leading_bits(network in any::<u32>(), noise in any::<u32>(), shift in 0u32..=32, prefix_len in 0u8..=32) {
+            // The addresses differ only after the first `shift` bits.
+            let differing = noise.checked_shr(shift).unwrap_or(0);
+            let candidate = network ^ differing;
+            let expected = prefix_len == 0 || differing >> (32 - u32::from(prefix_len)) == 0;
+            prop_assert_eq!(prefix_eq(&network.to_be_bytes(), &candidate.to_be_bytes(), prefix_len), expected);
+        }
+
+        #[test]
+        fn prefix_eq_compares_the_leading_bits_of_ipv6(network in any::<u128>(), noise in any::<u128>(), shift in 0u32..=128, prefix_len in 0u8..=128) {
+            let differing = noise.checked_shr(shift).unwrap_or(0);
+            let candidate = network ^ differing;
+            let expected = prefix_len == 0 || differing >> (128 - u32::from(prefix_len)) == 0;
+            prop_assert_eq!(prefix_eq(&network.to_be_bytes(), &candidate.to_be_bytes(), prefix_len), expected);
+        }
+    }
+
     use actix_web::http::header::{HeaderName, HeaderValue};
 
     // Keep expectations readable while the production API stays allocation-free.

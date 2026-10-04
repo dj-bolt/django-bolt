@@ -55,6 +55,8 @@ just lint-lib
 | `just clippy` | Lint the Rust code (CI fails on any warning) |
 | `just coverage` | Measure Python and Rust coverage into `coverage/` (needs `cargo-llvm-cov`) |
 | `just fuzz TARGET [SECONDS]` | Fuzz one request parser (needs nightly Rust and `cargo-fuzz`) |
+| `just mutants [JOBS]` | Mutation-test the Rust parsers and security checks (needs `cargo-mutants`). JOBS defaults to half the CPUs, at most 8 |
+| `just mutmut` | Mutation-test the Python modules in `[tool.mutmut]` |
 | `just lint` | Run ruff on library, tests, and examples |
 | `just lint-lib` | Lint library code only (must always pass) |
 | `just ruff-fix` | Auto-fix lint errors |
@@ -131,6 +133,7 @@ Guidelines:
 
 - **PostgreSQL tests** (`@pytest.mark.postgres`) skip unless `DJANGO_BOLT_TEST_POSTGRES_DSN` is set. `just test-pg` starts a Docker server and runs them. On macOS, set `PGGSSENCMODE=disable` (for example `PGGSSENCMODE=disable just test-pg`), because forked `runbolt` workers can hang in libpq. See [the FAQ](docs/src/faq.md#why-does-runbolt-hang-on-macos-when-it-connects-to-postgresql).
 - **Subprocess (`runbolt`) tests** are only for behavior `TestClient` cannot exercise: startup wiring, auto-reload, multi-process, real TCP, streaming, WebSocket handshakes. Mark them `@pytest.mark.server_integration` and author the app as a real module in `python/tests/integration/apps/`.
+- **Mutation testing.** `just mutants` (Rust) and `just mutmut` (Python) change the code in small ways and check that a test fails. A mutant that no test catches shows a gap in the tests. To close a gap, add a test that fails for that mutant. If the mutant cannot change the behavior, make the code simpler. cargo-mutants runs only the Rust tests, so it cannot see the Python tests of a function. CI does not run these: a full run takes a long time.
 - **Test behavior, not implementation.** Assert on HTTP responses and observable side effects.
 - **Property tests for parsers.** A parser of request data (query, form, cookies, typed values) gets a property: a rule for every input. In Python, write a Hypothesis test in `python/tests/test_properties.py`, and compare with Django where Django has the same parser. In Rust, write a `proptest!` block next to the parser. CI runs both with fixed cases. Each week, the Fuzz workflow runs many random cases and the `cargo-fuzz` targets in `fuzz/`. To run more cases locally, use `uv run pytest python/tests/test_properties.py --hypothesis-profile=fuzz` or `PROPTEST_CASES=20000 just test-rs`.
 - **Don't delete or skip failing asserts** to make a test pass — investigate the root cause.

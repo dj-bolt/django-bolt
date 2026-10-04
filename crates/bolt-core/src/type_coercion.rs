@@ -108,12 +108,11 @@ fn is_valid_decimal_literal(s: &str) -> bool {
         if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
             i += 1;
         }
-        let mut exponent_digits = 0;
+        let exponent_start = i;
         while i < b.len() && b[i].is_ascii_digit() {
             i += 1;
-            exponent_digits += 1;
         }
-        if exponent_digits == 0 {
+        if i == exponent_start {
             return false;
         }
     }
@@ -201,28 +200,6 @@ pub enum CoercedValue {
     // large exponent (e.g. "1e999999999") is never expanded into its full digit
     // string in Rust.
     Decimal(String),
-    #[allow(dead_code)]
-    Null,
-}
-
-impl CoercedValue {
-    /// Convert to string representation (for future use with typed PyRequest)
-    #[allow(dead_code)]
-    pub fn to_string_repr(&self) -> String {
-        match self {
-            CoercedValue::Int(v) => v.to_string(),
-            CoercedValue::Float(v) => v.to_string(),
-            CoercedValue::Bool(v) => v.to_string(),
-            CoercedValue::String(v) => v.clone(),
-            CoercedValue::Uuid(v) => v.to_string(),
-            CoercedValue::DateTime(v) => v.to_rfc3339(),
-            CoercedValue::NaiveDateTime(v) => v.to_string(),
-            CoercedValue::Date(v) => v.to_string(),
-            CoercedValue::Time(v) => v.to_string(),
-            CoercedValue::Decimal(v) => v.clone(),
-            CoercedValue::Null => "null".to_string(),
-        }
-    }
 }
 
 /// Error returned by [`coerce_param`].
@@ -494,8 +471,6 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> PyResult<Py<
         CoercedValue::NaiveDateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
         CoercedValue::Date(v) => v.into_pyobject(py)?.into_any().unbind(),
         CoercedValue::Time(v) => v.into_pyobject(py)?.into_any().unbind(),
-
-        CoercedValue::Null => py.None(),
     })
 }
 
