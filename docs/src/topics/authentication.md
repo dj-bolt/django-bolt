@@ -308,6 +308,12 @@ When `cookie=` is set, the token is read from the named cookie only — the
 raw token, no `Bearer` prefix needed. Extraction and validation both
 happen in Rust, without acquiring the GIL.
 
+A request that sends the named cookie two times is not authenticated by
+this backend. A sibling subdomain can set a cookie with the same name, and
+the order of the two cookies does not show which one your site set. A
+`__Host-` cookie name prevents such a cookie: the browser accepts it only
+from your exact host.
+
 To serve both browser (cookie) and API (bearer header) clients on the same
 endpoint, register two backends — they're tried in order:
 
