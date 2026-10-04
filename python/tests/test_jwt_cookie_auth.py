@@ -68,6 +68,20 @@ class TestJWTCookieAuth:
             assert response.status_code == 200
             assert response.json()["user_id"] == "cookie-user"
 
+    @pytest.mark.parametrize("site_token_first", [True, False], ids=["site-first", "other-first"])
+    def test_repeated_token_cookie_rejected(self, cookie_api, site_token_first):
+        """A sibling subdomain can add a second access_token cookie.
+
+        The order of the two in the header does not show which one the site
+        set, so neither one authenticates.
+        """
+        tokens = [create_token(user_id="site-user"), create_token(user_id="other-user")]
+        if not site_token_first:
+            tokens.reverse()
+        with TestClient(cookie_api) as client:
+            response = client.get("/whoami", headers={"Cookie": f"access_token={tokens[0]}; access_token={tokens[1]}"})
+            assert response.status_code == 401
+
     def test_missing_token_rejected(self, cookie_api):
         with TestClient(cookie_api) as client:
             response = client.get("/whoami")
