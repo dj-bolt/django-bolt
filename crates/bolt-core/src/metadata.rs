@@ -222,10 +222,6 @@ pub struct RateLimitConfig {
     pub rps: u32,
     pub burst: u32,
     pub key: RateLimitKey,
-    /// 0 in a server, which merges its APIs and gives each route its own
-    /// handler id. Test apps reuse handler ids, so the test client sets a
-    /// scope that keeps the buckets of two test apps apart.
-    pub scope: u64,
 }
 
 /// What a rate limit buckets on. Decided once at registration.
@@ -256,7 +252,6 @@ impl Default for RateLimitConfig {
             rps: 100,
             burst: 200,
             key: RateLimitKey::Ip,
-            scope: 0,
         }
     }
 }

@@ -806,6 +806,7 @@ pub async fn handle_websocket_upgrade(
                     );
                 }
                 if let Some(response) = check_before_auth(
+                    &state.rate_limiters,
                     handler_id,
                     &headers,
                     client_ip.as_ref(),
@@ -835,6 +836,7 @@ pub async fn handle_websocket_upgrade(
                 AuthGuardResult::Allow(ctx) => {
                     if let Some(ref rate_config) = route_meta.rate_limit_config {
                         if let Some(response) = check_after_auth(
+                            &state.rate_limiters,
                             handler_id,
                             &headers,
                             client_ip.as_ref(),

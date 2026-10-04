@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import itertools
 import json
 import weakref
 from collections.abc import AsyncIterator, Callable
@@ -35,17 +34,15 @@ from django_bolt.websocket.handlers import build_websocket_request, get_websocke
 
 # Each WebSocketTestClient is one connection with its own test app. The
 # connections to one API share its rate-limit buckets, as the connections to
-# one server do, so each API gets one scope. A counter, not id(): an id can
-# come back for a later API.
-_rate_limit_scopes: weakref.WeakKeyDictionary[BoltAPI, int] = weakref.WeakKeyDictionary()
-_next_rate_limit_scope = itertools.count(1)
+# one server do. The buckets go away with the API.
+_api_rate_limiters: weakref.WeakKeyDictionary[BoltAPI, _core.TestRateLimiters] = weakref.WeakKeyDictionary()
 
 
-def _rate_limit_scope(api: BoltAPI) -> int:
-    scope = _rate_limit_scopes.get(api)
-    if scope is None:
-        scope = _rate_limit_scopes[api] = next(_next_rate_limit_scope)
-    return scope
+def _rate_limiters(api: BoltAPI) -> _core.TestRateLimiters:
+    limiters = _api_rate_limiters.get(api)
+    if limiters is None:
+        limiters = _api_rate_limiters[api] = _core.TestRateLimiters()
+    return limiters
 
 
 # Seconds the client waits for the handler to accept or refuse the handshake.
@@ -55,11 +52,6 @@ HANDSHAKE_TIMEOUT = 5.0
 HANDSHAKE_HEADERS = frozenset(
     {b"sec-websocket-protocol", b"sec-websocket-accept", b"sec-websocket-extensions", b"upgrade", b"connection"}
 )
-
-try:
-    from django.conf import settings
-except ImportError:
-    settings = None  # type: ignore
 
 
 class WebSocketTestClient:
@@ -146,7 +138,7 @@ class WebSocketTestClient:
             self._cors_allowed_origins,
             None,
             self.api._rust_compression_config(),
-            _rate_limit_scope(self.api),
+            _rate_limiters(self.api),
         )
 
         # Register WebSocket routes with pre-compiled injectors (same as production)
