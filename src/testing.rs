@@ -561,6 +561,7 @@ pub fn test_request(
                         max_payload_size,
                         max_param_length: config.max_param_length,
                         asgi_mount_timeout: config.asgi_mount_timeout,
+                        stream_config: config.stream_config,
                         global_cors_config: config.global_cors_config,
                         cors_origin_regexes,
                         global_compression_config: compression,
@@ -570,6 +571,7 @@ pub fn test_request(
                         asgi_mounts: asgi_mounts.clone(),
                         extensions: {
                             let mut ext = http::Extensions::new();
+                            ext.insert(config.ws_config);
                             ext.insert(mcp_mounts.clone());
                             ext
                         },

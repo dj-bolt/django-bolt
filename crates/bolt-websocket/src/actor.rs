@@ -7,7 +7,7 @@ use actix_web_actors::ws;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use super::config::WS_CONFIG;
+use super::config::WsConfig;
 use super::messages::{SendToClient, WsMessage};
 use super::ConnectionSlot;
 
@@ -34,9 +34,11 @@ pub struct WebSocketActor {
 
 impl WebSocketActor {
     /// Create the actor of an accepted connection.
-    pub(crate) fn new(to_python_tx: mpsc::Sender<WsMessage>, slot: ConnectionSlot) -> Self {
-        // Use cached config - no Python/GIL access here
-        let config = &*WS_CONFIG;
+    pub(crate) fn new(
+        to_python_tx: mpsc::Sender<WsMessage>,
+        slot: ConnectionSlot,
+        config: &WsConfig,
+    ) -> Self {
         WebSocketActor {
             hb: Instant::now(),
             to_python_tx,

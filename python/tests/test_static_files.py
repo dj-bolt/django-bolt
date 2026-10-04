@@ -18,7 +18,7 @@ import tempfile
 
 import pytest
 from django.contrib.staticfiles.finders import get_finder
-from django.core.exceptions import SuspiciousFileOperation
+from django.core.exceptions import ImproperlyConfigured, SuspiciousFileOperation
 from django.test import override_settings
 
 from django_bolt import BoltAPI
@@ -647,61 +647,73 @@ class TestSymlinkSecurity:
 
 
 class TestContentSecurityPolicy:
-    """Tests for Content-Security-Policy header on static files."""
+    """Bolt builds the CSP header of static files from SECURE_CSP as Django does."""
 
-    def test_csp_header_applied_when_configured(self, settings):
-        """Test that CSP header is applied when BOLT_STATIC_CSP is set."""
-        # Configure CSP
-        settings.STATIC_ROOT = TEST_STATIC_DIR
-        settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
-        settings.STATIC_URL = "/static/"
-        settings.BOLT_STATIC_CSP = "default-src 'self'; script-src 'self'"
+    @staticmethod
+    def _get_css(**csp_settings):
+        with (
+            override_settings(
+                STATIC_ROOT=TEST_STATIC_DIR,
+                STATICFILES_DIRS=[TEST_STATIC_DIR],
+                STATIC_URL="/static/",
+                **csp_settings,
+            ),
+            TestClient(BoltAPI()) as client,
+        ):
+            return client.get("/static/css/style.css")
 
-        api = BoltAPI()
+    def test_csp_header_follows_the_rules_of_django(self):
+        """Django skips None and False, and writes True as a directive with no value.
 
-        client = TestClient(api, use_http_layer=True)
-        response = client.get("/static/css/style.css")
-
-        assert response.status_code == 200
-        # Note: CSP is applied at the Actix server level, which may not be
-        # active in the test client. This test verifies the setting is read.
-        # Full CSP testing requires integration tests with the actual server.
-
-    def test_no_csp_header_when_not_configured(self, settings):
-        """Test that no CSP header is added when not configured."""
-        settings.STATIC_ROOT = TEST_STATIC_DIR
-        settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
-        settings.STATIC_URL = "/static/"
-
-        # Ensure CSP is not configured
-        if hasattr(settings, "BOLT_STATIC_CSP"):
-            delattr(settings, "BOLT_STATIC_CSP")
-
-        api = BoltAPI()
-
-        client = TestClient(api, use_http_layer=True)
-        response = client.get("/static/css/style.css")
-
-        assert response.status_code == 200
-        # CSP header should not be present
-        # (Note: test client may not fully replicate Actix behavior)
-
-    def test_csp_setting_formats(self, settings):
-        """Test various CSP setting formats are accepted."""
-        # Test string format
-        settings.BOLT_STATIC_CSP = "default-src 'self'"
-        assert settings.BOLT_STATIC_CSP == "default-src 'self'"
-
-        # Test more complex CSP
-        settings.BOLT_STATIC_CSP = (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; "
-            "font-src 'self'"
+        It sorts a set and reads one str as one value. The order of the dict stays.
+        """
+        response = self._get_css(
+            SECURE_CSP={
+                "default-src": ["'self'"],
+                "img-src": {"data:", "'self'"},
+                "script-src": "'self'",
+                "object-src": None,
+                "frame-src": False,
+                "upgrade-insecure-requests": True,
+            }
         )
-        assert "script-src" in settings.BOLT_STATIC_CSP
-        assert "style-src" in settings.BOLT_STATIC_CSP
+
+        assert response.status_code == 200
+        assert response.headers["content-security-policy"] == (
+            "default-src 'self'; img-src 'self' data:; script-src 'self'; upgrade-insecure-requests"
+        )
+
+    def test_nonce_is_removed(self):
+        """A static file has no nonce. A directive with no other value is skipped."""
+        nonce = "<CSP_NONCE_SENTINEL>"  # The value of CSP.NONCE in Django 6.0+
+        response = self._get_css(SECURE_CSP={"script-src": ["'self'", nonce], "style-src": [nonce]})
+
+        assert response.headers["content-security-policy"] == "script-src 'self'"
+
+    @pytest.mark.parametrize(
+        "csp_settings", [{}, {"SECURE_CSP": {}}, {"SECURE_CSP": None}], ids=["unset", "empty", "none"]
+    )
+    def test_no_csp_header_without_a_policy(self, csp_settings):
+        response = self._get_css(**csp_settings)
+
+        assert response.status_code == 200
+        assert "content-security-policy" not in response.headers
+
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            ("default-src 'self'", "SECURE_CSP must be a dict, got str"),
+            ({"default-src": ["'self'", 1]}, "SECURE_CSP is not valid: "),
+            (
+                {"default-src": ["'self'\r\nx-injected: 1"]},
+                "SECURE_CSP gives a value that is not valid in an HTTP header",
+            ),
+        ],
+        ids=["str", "int-source", "header-injection"],
+    )
+    def test_invalid_secure_csp_stops_startup(self, value, message):
+        with override_settings(SECURE_CSP=value), pytest.raises(ImproperlyConfigured, match=message):
+            TestClient(BoltAPI())
 
 
 class TestEdgeCases:

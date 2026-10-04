@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A Django setting with the wrong type stops startup** - Bolt used the default when a setting had the wrong type, and gave no error. For example, `BOLT_MAX_UPLOAD_SIZE = os.environ["MAX_UPLOAD"]` is a str, so a 2 MB upload got 413 although the setting said 10 MB. Now `runbolt` and `TestClient` raise `ImproperlyConfigured` that names the setting. A missing setting still gives the default. Bolt checks these settings:
+  - `DEBUG`, `CORS_ALLOW_ALL_ORIGINS` and `CORS_ALLOW_CREDENTIALS` must be a bool. Before, `DEBUG = 1` and `DEBUG = "True"` gave `False` in Bolt.
+  - `BOLT_MAX_UPLOAD_SIZE`, `BOLT_MAX_HEADER_SIZE`, `BOLT_MEMORY_SPOOL_THRESHOLD`, `BOLT_WS_MAX_CONNECTIONS`, `BOLT_WS_CLIENT_TIMEOUT` and `BOLT_WS_MAX_MESSAGE_SIZE` must be an int of 0 or more. A bool is not an int.
+  - `BOLT_MAX_SYNC_STREAMING_THREADS`, `BOLT_WS_CHANNEL_SIZE` and `BOLT_WS_HEARTBEAT_INTERVAL` must be an int of 1 or more.
+  - `BOLT_ASGI_MOUNT_TIMEOUT` must be a number more than 0. Before, a value of 0 or less gave 30 seconds.
+  - `CORS_ALLOWED_ORIGINS`, `CORS_ALLOWED_ORIGIN_REGEXES`, `CORS_ALLOW_METHODS`, `CORS_ALLOW_HEADERS` and `CORS_EXPOSE_HEADERS` must be a list of str. One str is not a list, and a compiled regex is not a str.
+  - `CORS_PREFLIGHT_MAX_AGE` must be an int from 0 to 4294967295.
+  - `STATIC_URL` and `MEDIA_URL` must be a str or `None`.
+
+  Bolt now reads `BOLT_MAX_SYNC_STREAMING_THREADS` and the `BOLT_WS_*` settings once at startup. Before, it read them at each sync streaming response or at the first WebSocket.
+- **An invalid `DJANGO_BOLT_*` environment variable stops startup** - Bolt used the default when a variable did not parse, and gave no error. For example, `DJANGO_BOLT_SHUTDOWN_TIMEOUT=soon` gave 30 seconds. Now `runbolt` and `TestClient` raise `ImproperlyConfigured` that names the variable and the value. An unset or empty variable still gives the default. These documented rules change:
+  - `DJANGO_BOLT_MAX_PARAM_LENGTH` must be an int from 1 to 1048576. Before, `0` or text gave 8192, and a larger value became 1048576.
+  - `DJANGO_BOLT_LANE_IDLE_SECONDS` must be a number more than 0. Before, an invalid value gave 10 seconds.
+  - `DJANGO_BOLT_ORM_THREADS` and `DJANGO_BOLT_EXECUTOR_THREADS` must be an int of 1 or more. Before, text logged a warning and gave the default, and a value below 1 gave one thread.
+
+  The other variables also stop startup: `DJANGO_BOLT_WORKERS`, `DJANGO_BOLT_BACKLOG`, `DJANGO_BOLT_KEEP_ALIVE`, `DJANGO_BOLT_SHUTDOWN_TIMEOUT`, `DJANGO_BOLT_REUSE_PORT` (1, 0, true or false), `DJANGO_BOLT_BLOCKING_THREADS`, `DJANGO_BOLT_MAX_SYNC_STREAMING_THREADS`, `DJANGO_BOLT_STREAM_SYNC_BATCH_SIZE`, `DJANGO_BOLT_STREAM_CHANNEL_CAPACITY` and the `DJANGO_BOLT_WS_*` variables. Bolt reads the `DJANGO_BOLT_STREAM_*` variables once at startup, not for each streaming response. Bolt no longer reads `DJANGO_BOLT_STREAM_BATCH_SIZE`: it had no effect.
 - **`TestClient` reads the Django settings as `runbolt` does** - The test client had its own settings reader, and it disagreed with the server. Now one reader serves both. A test can see these changes:
   - A request body over `BOLT_MAX_UPLOAD_SIZE` gets 413. The default limit is 1 MB, not 10 MB. Set `BOLT_MAX_UPLOAD_SIZE` in a test that uploads more.
   - `BOLT_MAX_HEADER_SIZE` applies.
@@ -23,6 +39,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Static and media files get the CSP header of every valid `SECURE_CSP`** - Bolt read `SECURE_CSP` only as a dict of str lists. Django also accepts `True`, `None`, `False`, a set and one str as a directive value. With such a value, for example `"upgrade-insecure-requests": True`, Bolt sent no `Content-Security-Policy` header at all, and gave no warning. Now Bolt builds the header with the rules of Django `build_policy`, in the order of the dict. A `SECURE_CSP` that is not a dict, or that does not give a valid header value, stops startup with `ImproperlyConfigured`.
 - **Cookies are read as Django reads them** - `request.cookies`, `Cookie()` parameters, the JWT cookie and the WebSocket scope now follow Django `parse_cookie`. A quoted value loses its quotes, and its escapes are decoded, so a cookie that Django or Bolt sets reads back unchanged. Spaces around the name and the value are removed. A pair with no `=` is a value with an empty name. When a name occurs two times, the last value is used, also for the JWT cookie.
 - **A time or datetime with second 60 gets 422** - A leap second such as `23:59:60` became `23:59:59`, and Python logged a warning. Python cannot show a leap second, so Bolt now refuses the value.
 - **A handler that hands the request to another callable gets the body** - Bolt reads the source of a handler to find the request parts it uses, and skips the others. A request given to a helper or to `super().create(request)` can be read there. Such a handler with a `Depends` parameter got an empty body, query, headers and cookies. Now a handler that hands on the request gets every part.

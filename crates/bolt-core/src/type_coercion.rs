@@ -41,17 +41,18 @@ pub const DEFAULT_MAX_PARAM_LENGTH: usize = 8192;
 
 /// Hard upper bound for the configurable parameter length (1MB).
 /// A misconfigured `DJANGO_BOLT_MAX_PARAM_LENGTH` (e.g. an enormous value) must
-/// not be able to nullify the DoS guardrail, so any configured value is clamped
-/// to this cap.
+/// not be able to nullify the DoS guardrail, so a larger value is an error.
 pub const MAX_ALLOWED_PARAM_LENGTH: usize = 1024 * 1024;
 
 #[inline]
-fn parse_max_param_length(value: Option<&str>) -> usize {
-    value
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|parsed| *parsed > 0)
-        .map(|parsed| parsed.min(MAX_ALLOWED_PARAM_LENGTH))
-        .unwrap_or(DEFAULT_MAX_PARAM_LENGTH)
+fn parse_max_param_length(value: Option<&str>) -> Result<usize, String> {
+    Ok(crate::settings::parse_env(
+        "DJANGO_BOLT_MAX_PARAM_LENGTH",
+        value,
+        "an int from 1 to 1048576",
+        |parsed: &usize| (1..=MAX_ALLOWED_PARAM_LENGTH).contains(parsed),
+    )?
+    .unwrap_or(DEFAULT_MAX_PARAM_LENGTH))
 }
 
 /// Resolve the configured maximum parameter length from the
@@ -59,14 +60,16 @@ fn parse_max_param_length(value: Option<&str>) -> usize {
 ///
 /// Call this exactly ONCE at server startup and store the result in
 /// `AppState.max_param_length`. The per-request hot path then reads that plain
-/// field — no env access, no lock, no atomics. Missing, empty, non-integer, or
-/// `0` values fall back to [`DEFAULT_MAX_PARAM_LENGTH`].
-pub fn resolve_max_param_length() -> usize {
+/// field — no env access, no lock, no atomics. An unset or empty value gives
+/// [`DEFAULT_MAX_PARAM_LENGTH`]. Any other value that is not an int from 1 to
+/// [`MAX_ALLOWED_PARAM_LENGTH`] raises `ImproperlyConfigured`.
+pub fn resolve_max_param_length(py: Python<'_>) -> PyResult<usize> {
     parse_max_param_length(
         std::env::var("DJANGO_BOLT_MAX_PARAM_LENGTH")
             .ok()
             .as_deref(),
     )
+    .map_err(|message| crate::settings::improperly_configured(py, message))
 }
 
 /// Validate a decimal literal without parsing it into a numeric value.
@@ -870,33 +873,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_max_param_length_defaults_for_invalid_values() {
-        assert_eq!(parse_max_param_length(None), DEFAULT_MAX_PARAM_LENGTH);
-        assert_eq!(parse_max_param_length(Some("")), DEFAULT_MAX_PARAM_LENGTH);
-        assert_eq!(parse_max_param_length(Some("0")), DEFAULT_MAX_PARAM_LENGTH);
+    fn test_parse_max_param_length_defaults_when_unset_or_empty() {
+        assert_eq!(parse_max_param_length(None), Ok(DEFAULT_MAX_PARAM_LENGTH));
         assert_eq!(
-            parse_max_param_length(Some("not-a-number")),
-            DEFAULT_MAX_PARAM_LENGTH
+            parse_max_param_length(Some("")),
+            Ok(DEFAULT_MAX_PARAM_LENGTH)
         );
     }
 
     #[test]
-    fn test_parse_max_param_length_accepts_valid_positive_value() {
-        assert_eq!(parse_max_param_length(Some("16384")), 16384);
+    fn test_parse_max_param_length_rejects_invalid_values() {
+        // A value above the cap is an error too, so it cannot nullify the DoS
+        // guardrail.
+        for raw in ["0", "-1", "not-a-number", "999999999999"] {
+            assert_eq!(
+                parse_max_param_length(Some(raw)),
+                Err(format!(
+                    "DJANGO_BOLT_MAX_PARAM_LENGTH must be an int from 1 to 1048576, got '{raw}'."
+                )),
+                "{raw}"
+            );
+        }
     }
 
     #[test]
-    fn test_parse_max_param_length_clamps_to_upper_bound() {
-        // A misconfigured oversized value must be clamped to the hard cap so it
-        // cannot nullify the DoS guardrail.
-        assert_eq!(
-            parse_max_param_length(Some("999999999999")),
-            MAX_ALLOWED_PARAM_LENGTH
-        );
+    fn test_parse_max_param_length_accepts_valid_values() {
+        assert_eq!(parse_max_param_length(Some("16384")), Ok(16384));
         // The cap itself is accepted as-is.
         assert_eq!(
             parse_max_param_length(Some(&MAX_ALLOWED_PARAM_LENGTH.to_string())),
-            MAX_ALLOWED_PARAM_LENGTH
+            Ok(MAX_ALLOWED_PARAM_LENGTH)
         );
     }
 }

@@ -23,6 +23,7 @@ from functools import partial
 
 from asgiref.sync import AsyncToSync, SyncToAsync, ThreadSensitiveContext, sync_to_async
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.db import connections
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,43 @@ _default_executor: concurrent.futures.ThreadPoolExecutor | None = None
 _default_executor_lock = threading.Lock()
 
 
+def _thread_count(name: str) -> int | None:
+    """
+    Read a thread count from the environment variable `name`.
+
+    Returns:
+        The count, or None when the variable is not set or is empty.
+
+    Raises:
+        ImproperlyConfigured: The value is not an int of 1 or more.
+    """
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return None
+    try:
+        count = int(raw)
+    except ValueError:
+        count = 0
+    if count < 1:
+        raise ImproperlyConfigured(f"{name} must be an int of 1 or more, got {raw!r}.")
+    return count
+
+
+def check_pool_environment() -> None:
+    """
+    Check the thread counts of the pools at startup.
+
+    The pools start at their first use. The server calls this function at
+    startup, so an invalid value stops startup and not a later request.
+
+    Raises:
+        ImproperlyConfigured: DJANGO_BOLT_EXECUTOR_THREADS or
+            DJANGO_BOLT_ORM_THREADS is not an int of 1 or more.
+    """
+    _thread_count("DJANGO_BOLT_EXECUTOR_THREADS")
+    _thread_count("DJANGO_BOLT_ORM_THREADS")
+
+
 def _get_default_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _default_executor
     executor = _default_executor
@@ -178,20 +216,10 @@ def _get_default_executor() -> concurrent.futures.ThreadPoolExecutor:
         return executor
     with _default_executor_lock:
         if _default_executor is None:
-            raw = os.environ.get("DJANGO_BOLT_EXECUTOR_THREADS")
-            platform_default = min(32, (os.cpu_count() or 1) + 4)
-            try:
-                workers = int(raw) if raw else platform_default
-            except ValueError:
-                workers = platform_default
-                logger.warning(
-                    "Ignoring invalid DJANGO_BOLT_EXECUTOR_THREADS=%r; using the default of %d",
-                    raw,
-                    workers,
-                )
+            workers = _thread_count("DJANGO_BOLT_EXECUTOR_THREADS") or min(32, (os.cpu_count() or 1) + 4)
             configure_connection_checks()
             _default_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, workers), thread_name_prefix="bolt_default"
+                max_workers=workers, thread_name_prefix="bolt_default"
             )
         return _default_executor
 
@@ -261,19 +289,10 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
         return executor
     with _orm_executor_lock:
         if _orm_executor is None:
-            raw = os.environ.get("DJANGO_BOLT_ORM_THREADS")
-            try:
-                workers = int(raw) if raw else _default_orm_workers()
-            except ValueError:
-                workers = _default_orm_workers()
-                logger.warning(
-                    "Ignoring invalid DJANGO_BOLT_ORM_THREADS=%r; using the default of %d",
-                    raw,
-                    workers,
-                )
+            workers = _thread_count("DJANGO_BOLT_ORM_THREADS") or _default_orm_workers()
             configure_connection_checks()
             _orm_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, workers),
+                max_workers=workers,
                 thread_name_prefix="bolt_orm",
                 initializer=_mark_orm_thread,
             )

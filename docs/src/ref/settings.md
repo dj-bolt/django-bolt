@@ -6,6 +6,20 @@ icon: lucide/settings
 
 Django-Bolt settings are configured in your Django `settings.py` file.
 
+Bolt reads its settings at startup. A missing setting gives its default. A setting with the wrong type stops startup with `ImproperlyConfigured`. The error names the setting:
+
+- A size or a count must be an `int`, such as `10 * 1024 * 1024` or `FileSize.MB_10`. A str such as `"10485760"` is not an int. A bool is not an int.
+- A flag such as `DEBUG` or `CORS_ALLOW_CREDENTIALS` must be a `bool`. `DEBUG = 1` stops startup.
+- A list setting such as `CORS_ALLOWED_ORIGINS` must be a list of str. One str is not a list.
+
+Convert a value that you read from an environment variable:
+
+```python
+import os
+
+BOLT_MAX_UPLOAD_SIZE = int(os.environ["BOLT_MAX_UPLOAD_SIZE"])
+```
+
 ## CORS settings
 
 ### CORS_ALLOWED_ORIGINS
@@ -136,6 +150,8 @@ BOLT_ASGI_MOUNT_TIMEOUT = 30
 
 **Default:** `30`
 
+The value must be more than 0. An int or a float is valid.
+
 When exceeded, Django-Bolt returns `504 Gateway Timeout` for the mounted request.
 
 ### BOLT_MEMORY_SPOOL_THRESHOLD
@@ -159,6 +175,8 @@ This setting controls memory usage during file uploads:
 
 ## Runtime environment variables
 
+Bolt reads its `DJANGO_BOLT_*` environment variables at startup. An unset or empty variable gives the default. A value that is not valid stops startup with `ImproperlyConfigured`. The error names the variable and the value, for example `DJANGO_BOLT_ORM_THREADS must be an int of 1 or more, got '0'.`
+
 ### DJANGO_BOLT_MAX_PARAM_LENGTH
 
 Maximum allowed size for path/query/form parameter values, in bytes. Requests that exceed this limit are rejected with HTTP `422`.
@@ -169,9 +187,9 @@ export DJANGO_BOLT_MAX_PARAM_LENGTH=65536
 
 **Default:** `8192`
 
-**Maximum:** `1048576` (1 MB). Values above this are clamped down to the maximum so a misconfiguration can never effectively disable the limit.
+**Maximum:** `1048576` (1 MB). A larger value stops startup, so a misconfiguration can never disable the limit.
 
-This value is read once at startup (first access) and then cached. Missing, empty, non-integer, or `0` values are ignored and the default is used.
+The value must be an int from `1` to `1048576`.
 
 ### DJANGO_BOLT_ORM_THREADS
 
@@ -183,7 +201,7 @@ export DJANGO_BOLT_ORM_THREADS=8
 
 **Default:** `1` when every database is SQLite, otherwise `4`.
 
-Each thread holds one database connection. Increase the value when one free-threaded process runs many worker threads. See [Size the database thread pools](../getting-started/deployment.md#size-the-database-thread-pools). An invalid value logs a warning, and the default applies. A value below `1` gives a pool of one thread.
+Each thread holds one database connection. Increase the value when one free-threaded process runs many worker threads. See [Size the database thread pools](../getting-started/deployment.md#size-the-database-thread-pools). The value must be an int of `1` or more.
 
 ### DJANGO_BOLT_LANE_IDLE_SECONDS
 
@@ -193,7 +211,7 @@ Idle time, in seconds, after which a request lane closes its database connection
 export DJANGO_BOLT_LANE_IDLE_SECONDS=30
 ```
 
-**Default:** `10`. A fraction such as `0.5` is valid. An invalid value or a value that is not positive gives the default.
+**Default:** `10`. A fraction such as `0.5` is valid. The value must be a number more than `0`.
 
 ### DJANGO_BOLT_EXECUTOR_THREADS
 
@@ -205,7 +223,7 @@ export DJANGO_BOLT_EXECUTOR_THREADS=16
 
 **Default:** CPU count + 4, maximum `32`.
 
-An invalid value logs a warning, and the default applies. A value below `1` gives a pool of one thread.
+The value must be an int of `1` or more.
 
 ## File serving settings
 
@@ -483,7 +501,7 @@ api = BoltAPI(
 | `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |
 | `BOLT_AUTHENTICATION_CLASSES` | `list` | `[]` | Default authentication backends |
 | `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |
-| `DJANGO_BOLT_MAX_PARAM_LENGTH` | `int` (env var) | `8192` | Max path/query/form parameter size in bytes, clamped to `1048576` (1 MB); requests over the limit return `422` |
+| `DJANGO_BOLT_MAX_PARAM_LENGTH` | `int` (env var) | `8192` | Max path/query/form parameter size in bytes, from `1` to `1048576` (1 MB); requests over the limit return `422` |
 | `DJANGO_BOLT_ORM_THREADS` | `int` (env var) | `1` (SQLite) or `4` | Threads in the ORM pool of each process |
 | `DJANGO_BOLT_LANE_IDLE_SECONDS` | `float` (env var) | `10` | Idle time after which a request lane stops |
 | `DJANGO_BOLT_EXECUTOR_THREADS` | `int` (env var) | CPU count + 4 (max `32`) | Threads in the shared executor pool of each process |

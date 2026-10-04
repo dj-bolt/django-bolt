@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
-use crate::state::{get_max_sync_streaming_threads, ACTIVE_SYNC_STREAMING_THREADS};
+use crate::settings::{env_positive_int, env_var, DjangoSettings};
+use crate::state::ACTIVE_SYNC_STREAMING_THREADS;
 // Streaming uses direct_stream only in higher-level handler; not directly here
 
 // Buffer pool imports removed (unused)
@@ -198,22 +199,51 @@ fn schedule_async_stream_forwarder(
     Ok(())
 }
 
-/// Create a stream with default batch sizes from environment
+/// Streaming limits, read once at startup.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamConfig {
+    /// Items a sync generator sends per batch (`DJANGO_BOLT_STREAM_SYNC_BATCH_SIZE`).
+    pub sync_batch_size: usize,
+    /// Chunks the channel to the response holds (`DJANGO_BOLT_STREAM_CHANNEL_CAPACITY`).
+    pub channel_capacity: usize,
+    /// Maximum concurrent sync streaming threads.
+    pub max_sync_threads: u64,
+}
+
+impl StreamConfig {
+    /// Read the streaming limits. An invalid environment variable or setting
+    /// raises `ImproperlyConfigured`.
+    ///
+    /// The maximum of sync streaming threads comes from (in order of precedence):
+    /// 1. Environment variable: DJANGO_BOLT_MAX_SYNC_STREAMING_THREADS
+    /// 2. Django setting: BOLT_MAX_SYNC_STREAMING_THREADS
+    /// 3. Default: 1000
+    pub fn read(settings: &DjangoSettings<'_>) -> PyResult<Self> {
+        let py = settings.py();
+        let max_sync_threads = match env_var(
+            py,
+            "DJANGO_BOLT_MAX_SYNC_STREAMING_THREADS",
+            "an int of 1 or more",
+            |n: &u64| *n >= 1,
+        )? {
+            Some(n) => n,
+            None => settings.positive_int("BOLT_MAX_SYNC_STREAMING_THREADS", 1000)?,
+        };
+        Ok(Self {
+            sync_batch_size: env_positive_int(py, "DJANGO_BOLT_STREAM_SYNC_BATCH_SIZE", 5)?,
+            channel_capacity: env_positive_int(py, "DJANGO_BOLT_STREAM_CHANNEL_CAPACITY", 32)?,
+            max_sync_threads,
+        })
+    }
+}
+
+/// Create a stream with the configured batch size
 pub fn create_python_stream(
     content: Py<PyAny>,
     is_async_generator: bool,
+    config: StreamConfig,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
-    let batch_size: usize = std::env::var("DJANGO_BOLT_STREAM_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(20);
-    let sync_batch_size: usize = std::env::var("DJANGO_BOLT_STREAM_SYNC_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(5);
-    create_python_stream_with_config(content, batch_size, sync_batch_size, is_async_generator)
+    create_python_stream_with_config(content, is_async_generator, config)
 }
 
 /// Create a stream for SSE that sends items immediately (batch_size=1)
@@ -224,8 +254,13 @@ pub fn create_sse_stream(
     is_async_generator: bool,
     ping_interval: Option<f64>,
     codec: Option<crate::streaming_compression::StreamCodec>,
+    config: StreamConfig,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
-    let inner = create_python_stream_with_config(content, 1, 1, is_async_generator);
+    let sse_config = StreamConfig {
+        sync_batch_size: 1,
+        ..config
+    };
+    let inner = create_python_stream_with_config(content, is_async_generator, sse_config);
 
     let with_keepalive: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
         match ping_interval {
@@ -276,15 +311,14 @@ fn keepalive_stream(
 /// Internal function with configurable batch sizes
 fn create_python_stream_with_config(
     content: Py<PyAny>,
-    _async_batch_size: usize,
-    sync_batch_size: usize,
     is_async_from_metadata: bool,
+    config: StreamConfig,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
-    let channel_capacity: usize = std::env::var("DJANGO_BOLT_STREAM_CHANNEL_CAPACITY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(32);
+    let StreamConfig {
+        sync_batch_size,
+        channel_capacity,
+        max_sync_threads,
+    } = config;
     // Note: content is guaranteed to be a generator instance (not a callable)
     // because StreamingResponse validates this in Python at instantiation time.
     // The is_async_generator flag was pre-computed from Python's inspect.
@@ -321,13 +355,12 @@ fn create_python_stream_with_config(
         let tx_for_spawn = tx.clone();
 
         // Check connection limits to prevent thread exhaustion DoS
-        let max_threads = get_max_sync_streaming_threads();
         let current_threads = ACTIVE_SYNC_STREAMING_THREADS.load(Ordering::Relaxed);
 
-        if current_threads >= max_threads {
+        if current_threads >= max_sync_threads {
             eprintln!(
                 "[SSE WARNING] Sync streaming thread limit reached: {} >= {}",
-                current_threads, max_threads
+                current_threads, max_sync_threads
             );
             // Spawn async task to send retry directive (can't use blocking_send from runtime)
             tokio::spawn({
