@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
   - `BOLT_MAX_HEADER_SIZE` applies.
   - CORS uses the server defaults: the headers `Content-Type, Authorization`, and a preflight max-age of 3600 seconds. `CORS_ALLOWED_ORIGIN_REGEXES` applies. A `"*"` entry in `CORS_ALLOWED_ORIGINS` is not a wildcard; use `CORS_ALLOW_ALL_ORIGINS`.
   - `MEDIA_URL` is served, and `BOLT_STATIC_MAX_AGE` and `BOLT_MEDIA_MAX_AGE` add `Cache-Control`.
+  - With `DEBUG=True` and `STATIC_URL`, the test client mounts the static files scope also when the scope has no directory. Thus the scope hides the API routes under its prefix, as in `runbolt`.
   - Each request comes from `127.0.0.1`, so `BOLT_TRUSTED_PROXIES` and `X-Forwarded-For` work as on a server.
 
   The `cors_allowed_origins`, `static_files_config` and `read_django_settings` arguments still work. An explicit `cors_allowed_origins` also gets the server defaults above, not the old test defaults (nine allowed headers and a max-age of 86400 seconds).

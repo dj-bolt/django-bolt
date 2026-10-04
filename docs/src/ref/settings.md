@@ -19,6 +19,16 @@ CORS_ALLOWED_ORIGINS = [
 ]
 ```
 
+### CORS_ALLOWED_ORIGIN_REGEXES
+
+List of regular expressions for allowed origins. An origin is allowed when it is in `CORS_ALLOWED_ORIGINS` or when a pattern matches it. A pattern can match a part of the origin, so start each pattern with `^` and end it with `$`. Bolt ignores an invalid pattern and writes a warning at startup.
+
+```python
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://\w+\.example\.com$",
+]
+```
+
 ### CORS_ALLOW_ALL_ORIGINS
 
 Allow all origins (development only).
@@ -466,6 +476,7 @@ api = BoltAPI(
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `CORS_ALLOWED_ORIGINS` | `list[str]` | `[]` | Allowed CORS origins |
+| `CORS_ALLOWED_ORIGIN_REGEXES` | `list[str]` | `[]` | Patterns for allowed CORS origins |
 | `CORS_ALLOW_ALL_ORIGINS` | `bool` | `False` | Allow all origins |
 | `CORS_ALLOW_CREDENTIALS` | `bool` | `False` | Allow credentials |
 | `CORS_ALLOW_METHODS` | `list[str]` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `QUERY` | Allowed methods |
