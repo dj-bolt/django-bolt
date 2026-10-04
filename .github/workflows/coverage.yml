@@ -4,12 +4,19 @@ name: Coverage
 # Rust coverage over the whole test suite and shows it in the job summary.
 # The HTML reports are an artifact of the run.
 
+# A change to the docs only cannot change coverage, so it does not run this.
 on:
   push:
     branches:
       - master
       - main
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
   workflow_dispatch:
 
 permissions:
@@ -50,17 +57,12 @@ jobs:
         with:
           version: "latest"
 
-      # One GIL interpreter is enough: coverage measures lines, not threading.
-      # Use the newest version in the pyproject.toml classifiers, like CI.yml.
+      # The newest GIL interpreter, as CI.yml gets it. The Rust code under
+      # #[cfg(Py_GIL_DISABLED)] (src/response_body.rs) compiles only for a
+      # free-threaded interpreter, so this report does not include it.
       - name: Set up Python
         run: |
-          newest=$(python3 - <<'PY'
-          import re, tomllib
-          classifiers = tomllib.load(open("pyproject.toml", "rb"))["project"]["classifiers"]
-          found = [m.group(1) for c in classifiers if (m := re.fullmatch(r"Programming Language :: Python :: (3\.\d+)", c))]
-          print(max(found, key=lambda v: tuple(map(int, v.split(".")))))
-          PY
-          )
+          newest=$(python3 scripts/ci_versions.py | sed -n 's/^newest-version=//p')
           uv python install "$newest"
           uv venv --python "$newest"
 
@@ -76,7 +78,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.9.1
 
       # --no-install-project: scripts/coverage.sh builds the instrumented
       # extension itself.
@@ -89,16 +91,21 @@ jobs:
       - name: Write the job summary
         if: always()
         run: |
+          # A report that the script could not write is missing; say so.
           {
             echo "## Python coverage"
             echo
-            cat coverage/python.md
+            if [ -s coverage/python.md ]; then cat coverage/python.md; else echo "No report. See the Measure coverage step."; fi
             echo
             echo "## Rust coverage"
             echo
-            echo '```'
-            cat coverage/rust.txt
-            echo '```'
+            if [ -s coverage/rust.txt ]; then
+              echo '```'
+              cat coverage/rust.txt
+              echo '```'
+            else
+              echo "No report. See the Measure coverage step."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the HTML reports

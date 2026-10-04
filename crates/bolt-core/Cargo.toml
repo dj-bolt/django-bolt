@@ -7,9 +7,6 @@ repository.workspace = true
 publish = false
 description = "Shared HTTP core for django-bolt: request/response types, routing, auth, guards, middleware, streaming"
 
-[lints]
-workspace = true
-
 [dependencies]
 actix-files = { workspace = true }
 actix-http = { workspace = true }

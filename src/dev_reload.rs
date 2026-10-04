@@ -1,3 +1,4 @@
+use notify::event::ModifyKind;
 use notify::{Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use pyo3::prelude::*;
 use std::collections::HashSet;
@@ -163,8 +164,13 @@ fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> 
     }
 
     // The watch on a new directory starts after its create event. A file
-    // written before that sends no event, so look in the new directory.
-    if matches!(event.kind, EventKind::Create(_)) {
+    // written before that sends no event, so look in the new directory. A
+    // directory moved into the tree sends one rename event and none for its
+    // files, so look in it too.
+    if matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+    ) {
         return event
             .paths
             .iter()
@@ -379,6 +385,9 @@ fn run_dev_reloader_inner(
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_flag = shutdown.clone();
 
+    // SIGINT, SIGTERM and SIGHUP (the ctrlc `termination` feature) stop the
+    // worker first. If SIGTERM killed only the supervisor, the worker would
+    // keep the port.
     ctrlc::set_handler(move || {
         shutdown_flag.store(true, Ordering::SeqCst);
     })
@@ -542,7 +551,10 @@ pub fn run_dev_reloader(
 #[cfg(test)]
 mod tests {
     use super::{first_relevant_path, is_temporary_path, terminal_worker_exit_code, ReloadFilter};
-    use notify::{event::CreateKind, Event, EventKind};
+    use notify::{
+        event::{CreateKind, ModifyKind, RenameMode},
+        Event, EventKind,
+    };
     use std::path::PathBuf;
     use std::process::{Command, ExitStatus};
 
@@ -675,6 +687,26 @@ mod tests {
         assert_eq!(
             first_relevant_path(&create_folder_event(package.clone()), &filter),
             Some(package.join("nested").join("helpers.py"))
+        );
+    }
+
+    #[test]
+    fn directory_moved_into_the_tree_with_a_file_triggers_reload() {
+        // A move sends one rename event for the directory, and none for its files.
+        let root = TempDir::new("moved-dir");
+        let package = root.0.join("generated");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("models.py"), "VALUE = 1\n").unwrap();
+        let filter = ReloadFilter::new(vec![], vec![]);
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            paths: vec![package.clone()],
+            attrs: Default::default(),
+        };
+
+        assert_eq!(
+            first_relevant_path(&event, &filter),
+            Some(package.join("models.py"))
         );
     }
 

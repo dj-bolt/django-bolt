@@ -351,6 +351,10 @@ pub fn destroy_test_app(app_id: u64) -> PyResult<()> {
 
 /// Register HTTP routes for a test app
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: Python passes each route as one tuple"
+)]
 pub fn register_test_routes(
     _py: Python<'_>,
     app_id: u64,
@@ -373,6 +377,10 @@ pub fn register_test_routes(
 
 /// Register WebSocket routes for a test app
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: Python passes each WebSocket route as one tuple"
+)]
 pub fn register_test_websocket_routes(
     _py: Python<'_>,
     app_id: u64,
@@ -489,6 +497,10 @@ pub fn register_test_middleware_metadata(
 /// and cannot be used with pyo3_async_runtimes::future_into_py. We create
 /// a local tokio runtime for each request instead.
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: TestClient reads (status, headers, body) as one tuple"
+)]
 pub fn test_request(
     py: Python<'_>,
     app_id: u64,
@@ -675,6 +687,10 @@ pub fn test_request(
 /// When `is_asgi_mount` is true, `handler` is a raw ASGI application and the
 /// caller must drive it with the scope, receive, and send triple.
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: the Python TestClient unpacks this tuple"
+)]
 pub fn handle_test_websocket(
     py: Python<'_>,
     app_id: u64,

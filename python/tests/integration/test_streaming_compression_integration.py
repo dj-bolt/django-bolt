@@ -17,7 +17,6 @@ decoded body for payload integrity.
 
 from __future__ import annotations
 
-import brotlicffi  # noqa: F401  # httpx decodes `br` responses only with a brotli binding
 import pytest
 
 from .apps import app_module

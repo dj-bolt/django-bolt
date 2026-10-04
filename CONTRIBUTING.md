@@ -160,7 +160,8 @@ Docs live in `docs/src/` and are published at [bolt.farhana.li](https://bolt.far
 
 1. Make sure `just test-py` and `just lint-lib` pass.
 2. If you touched Rust, make sure `just build` succeeds from clean (`just rebuild`), and that `just clippy` and `just test-rs` pass.
-3. If you touched hot paths, include before/after numbers from `4. Push your branch and open a PR against `master`. Fill in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
+3. If you touched hot paths, include before/after numbers from `just save-bench`.
+4. Push your branch and open a PR against `master`. Fill in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
 5. Keep the PR description focused on **what** changed and **why**; link related issues.
 
 A maintainer will review your PR. Please be patient — and feel free to ping on Discord if it has been quiet for a while.
