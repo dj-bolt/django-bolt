@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from django.http import HttpResponse
 
 from django_bolt import JSON, BoltAPI, Cookie, Response, StreamingResponse
 from django_bolt.cookies import make_delete_cookie
@@ -262,6 +263,20 @@ class TestResponseDeleteCookie:
         response = Response({"ok": True}).delete_cookie("session", domain=".example.com")
         cookie = response._cookies[0]
         assert cookie.domain == ".example.com"
+
+    @pytest.mark.parametrize("name", ["session", "__Secure-session", "__Host-session"])
+    def test_delete_cookie_is_secure_as_django_makes_it(self, name):
+        """A browser ignores a `__Secure-` or `__Host-` cookie with no `Secure`, and thus its delete."""
+        api = BoltAPI()
+
+        @api.get("/logout")
+        async def logout():
+            return Response({"ok": True}).delete_cookie(name)
+
+        attributes = TestClient(api).get("/logout").headers["set-cookie"].split("; ")
+        django_response = HttpResponse()
+        django_response.delete_cookie(name)
+        assert ("Secure" in attributes) == bool(django_response.cookies[name]["secure"])
 
     def test_combined_set_and_delete(self):
         """Test setting new cookies while deleting old ones."""
