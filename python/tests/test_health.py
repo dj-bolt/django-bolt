@@ -4,6 +4,8 @@ import asyncio
 import time
 
 import pytest
+from asgiref.sync import sync_to_async
+from django.db import connection
 
 from django_bolt import BoltAPI
 from django_bolt.health import (
@@ -97,21 +99,21 @@ class TestDatabaseCheck:
     """Test database health check."""
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
     async def test_check_database_success(self):
-        """Test database check succeeds with valid connection."""
-        # This test requires Django to be configured
+        """With database access, the check connects and reports success.
+
+        The check runs on another thread. It must use the connection of that
+        thread, not open the connection of the calling thread from there.
+        """
+        before = connection.connection
         try:
-            from django.conf import settings  # noqa: PLC0415
-
-            if not settings.configured:
-                pytest.skip("Django not configured")
-
-            healthy, message = await check_database()
-            # Should either succeed or fail gracefully
-            assert isinstance(healthy, bool)
-            assert isinstance(message, str)
-        except ImportError:
-            pytest.skip("Django not available")
+            assert await check_database() == (True, "Database connection OK")
+            assert connection.connection is before
+        finally:
+            # The check connects on the thread of sync_to_async. Close it there:
+            # resolve `connection` on that thread, not on this one.
+            await sync_to_async(lambda: connection.close())()
 
     @pytest.mark.asyncio
     async def test_check_database_handles_error(self):
