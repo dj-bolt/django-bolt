@@ -41,7 +41,8 @@ fn idle_time() -> Duration {
 /// An invalid value raises `ImproperlyConfigured`. The first call sets the idle
 /// time of the process; a later call only checks the variable.
 pub fn configure_idle_time(py: Python<'_>) -> PyResult<()> {
-    let raw = std::env::var("DJANGO_BOLT_LANE_IDLE_SECONDS").ok();
+    let raw =
+        crate::settings::read_env(py, "DJANGO_BOLT_LANE_IDLE_SECONDS", "a number more than 0")?;
     let idle = parse_idle_time(raw.as_deref())
         .map_err(|message| crate::settings::improperly_configured(py, message))?;
     let _ = IDLE.set(idle);

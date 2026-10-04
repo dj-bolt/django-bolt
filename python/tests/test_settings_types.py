@@ -183,6 +183,26 @@ def test_invalid_environment_variable_stops_startup(monkeypatch, name, value, ex
     assert str(excinfo.value) == f"{name} must be {expected}, got '{value}'."
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("DJANGO_BOLT_MAX_PARAM_LENGTH", "an int from 1 to 1048576"),
+        ("DJANGO_BOLT_LANE_IDLE_SECONDS", "a number more than 0"),
+        ("DJANGO_BOLT_WS_MAX_CONNECTIONS", "an int of 0 or more"),
+    ],
+)
+def test_environment_variable_that_is_not_utf8_stops_startup(monkeypatch, name, expected):
+    """A value that is not UTF-8 is not unset: it does not give the default."""
+    api = _upload_api()
+    # os.environ writes this str as the byte 0xff, which is not UTF-8.
+    monkeypatch.setenv(name, "\udcff")
+
+    with pytest.raises(ImproperlyConfigured) as excinfo:
+        TestClient(api)
+
+    assert str(excinfo.value) == f"{name} must be {expected}, got a value that is not UTF-8."
+
+
 def test_empty_environment_variable_gives_the_default(monkeypatch):
     """An empty variable is not set, as in a template that leaves a value out."""
     for name in {name for name, _value, _expected in ENV_CASES}:

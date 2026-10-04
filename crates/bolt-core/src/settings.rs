@@ -254,7 +254,7 @@ pub fn env_flag(py: Python<'_>, name: &str, default: bool) -> PyResult<bool> {
 
 /// Read the raw value of an environment variable. A value that is not UTF-8
 /// raises `ImproperlyConfigured`.
-fn read_env(py: Python<'_>, name: &str, expected: &str) -> PyResult<Option<String>> {
+pub(crate) fn read_env(py: Python<'_>, name: &str, expected: &str) -> PyResult<Option<String>> {
     match std::env::var(name) {
         Ok(raw) => Ok(Some(raw)),
         Err(VarError::NotPresent) => Ok(None),

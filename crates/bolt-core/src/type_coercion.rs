@@ -64,12 +64,13 @@ fn parse_max_param_length(value: Option<&str>) -> Result<usize, String> {
 /// [`DEFAULT_MAX_PARAM_LENGTH`]. Any other value that is not an int from 1 to
 /// [`MAX_ALLOWED_PARAM_LENGTH`] raises `ImproperlyConfigured`.
 pub fn resolve_max_param_length(py: Python<'_>) -> PyResult<usize> {
-    parse_max_param_length(
-        std::env::var("DJANGO_BOLT_MAX_PARAM_LENGTH")
-            .ok()
-            .as_deref(),
-    )
-    .map_err(|message| crate::settings::improperly_configured(py, message))
+    let raw = crate::settings::read_env(
+        py,
+        "DJANGO_BOLT_MAX_PARAM_LENGTH",
+        "an int from 1 to 1048576",
+    )?;
+    parse_max_param_length(raw.as_deref())
+        .map_err(|message| crate::settings::improperly_configured(py, message))
 }
 
 /// Validate a decimal literal without parsing it into a numeric value.
