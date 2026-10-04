@@ -171,13 +171,14 @@ enum CorsConfigRef<'a> {
     Skipped,
 }
 
-/// The methods that a preflight without a usable requested method tries, in order.
+/// The methods that an OPTIONS request with no requested method tries, in order.
 const PREFLIGHT_METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "QUERY"];
 
 /// Find the CORS config of a request: the config of its route, else the global config.
 ///
-/// A preflight uses the route of the method in `Access-Control-Request-Method`.
-/// When no route has that method, it uses the first route on the path with its
+/// A preflight uses only the route of the method in `Access-Control-Request-Method`.
+/// The config of another method grants nothing to that method. An OPTIONS
+/// request with no requested method uses the first route on the path with its
 /// own CORS decision.
 #[inline]
 fn find_cors_config<'a>(
@@ -187,33 +188,30 @@ fn find_cors_config<'a>(
     state: &'a AppState,
 ) -> Option<CorsConfigRef<'a>> {
     let route_config = if method == Method::OPTIONS {
-        match requested_method.and_then(|m| route_cors_config(m, path, state)) {
-            Some(decision) => decision,
+        match requested_method {
+            Some(requested) => route_cors_config(requested, path, state),
             None => PREFLIGHT_METHODS
                 .iter()
-                .find_map(|m| route_cors_config(m, path, state).flatten()),
+                .find_map(|m| route_cors_config(m, path, state)),
         }
     } else {
-        route_cors_config(method.as_str(), path, state).flatten()
+        route_cors_config(method.as_str(), path, state)
     };
     route_config.or_else(|| state.global_cors_config.as_ref().map(CorsConfigRef::Global))
 }
 
-/// The CORS decision of the route for `method` on `path`. The outer `None`
-/// means that no route matches. The inner `None` means that the route has no
-/// CORS config of its own.
+/// The CORS decision of the route for `method` on `path`, or None when no
+/// route matches or the route has no CORS config of its own.
 #[inline]
 fn route_cors_config<'a>(
     method: &str,
     path: &str,
     state: &'a AppState,
-) -> Option<Option<CorsConfigRef<'a>>> {
+) -> Option<CorsConfigRef<'a>> {
     let route_match = state.router.find(method, path)?;
-    let Some(meta) = state.route_metadata.get(route_match.handler_id()) else {
-        return Some(None);
-    };
+    let meta = state.route_metadata.get(route_match.handler_id())?;
     if meta.skip.contains("cors") {
-        return Some(Some(CorsConfigRef::Skipped));
+        return Some(CorsConfigRef::Skipped);
     }
-    Some(meta.cors_config.as_ref().map(CorsConfigRef::Route))
+    meta.cors_config.as_ref().map(CorsConfigRef::Route)
 }
