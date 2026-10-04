@@ -154,13 +154,22 @@ fn has_relevant_extension(path: &Path) -> bool {
     )
 }
 
-fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> {
+/// The first relevant path in the event. An access is not a change.
+fn named_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> {
     if matches!(event.kind, EventKind::Access(_)) {
         return None;
     }
 
-    if let Some(path) = event.paths.iter().find(|path| filter.is_relevant(path)) {
-        return Some(path.clone());
+    event
+        .paths
+        .iter()
+        .find(|path| filter.is_relevant(path))
+        .cloned()
+}
+
+fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> {
+    if let Some(path) = named_relevant_path(event, filter) {
+        return Some(path);
     }
 
     // The watch on a new directory starts after its create event. A file
@@ -171,10 +180,13 @@ fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> 
         event.kind,
         EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
     ) {
+        // read_dir follows a symbolic link, so look only in a real directory.
         return event
             .paths
             .iter()
-            .filter(|path| !filter.is_ignored(path))
+            .filter(|path| {
+                !filter.is_ignored(path) && path.symlink_metadata().is_ok_and(|meta| meta.is_dir())
+            })
             .find_map(|path| first_relevant_file_in(path, filter));
     }
 
@@ -182,7 +194,7 @@ fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> 
 }
 
 /// The first relevant file in `dir` or its subdirectories. None when `dir` is
-/// not a directory. Symbolic links are not followed.
+/// not a directory. Symbolic links in `dir` are not followed.
 fn first_relevant_file_in(dir: &Path, filter: &ReloadFilter) -> Option<PathBuf> {
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
@@ -314,7 +326,9 @@ fn recv_change(
             while Instant::now() < deadline {
                 match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(Ok(next_event)) => {
-                        if let Some(next_path) = first_relevant_path(&next_event, filter) {
+                        // The reload is already due. This path is only for the
+                        // log, so do not look in a new directory again.
+                        if let Some(next_path) = named_relevant_path(&next_event, filter) {
                             changed_path = next_path;
                         }
                     }
@@ -717,6 +731,27 @@ mod tests {
         let filter = ReloadFilter::new(vec!["__pycache__".to_string()], vec![]);
 
         assert!(first_relevant_path(&create_folder_event(package), &filter).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_symbolic_link_to_a_directory_does_not_trigger_reload() {
+        // The scan does not follow symbolic links, also not the new path itself.
+        let root = TempDir::new("symlink");
+        let outside = root.0.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("lib.py"), "VALUE = 1\n").unwrap();
+        let link = root.0.join("linked");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let filter = ReloadFilter::new(vec![], vec![]);
+        // inotify reports a new symbolic link as a new file.
+        let event = Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![link],
+            attrs: Default::default(),
+        };
+
+        assert!(first_relevant_path(&event, &filter).is_none());
     }
 
     #[test]
