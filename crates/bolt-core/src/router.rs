@@ -467,6 +467,7 @@ pub fn collect_query_sequences<'a>(query: &'a str, keys: &AHashSet<String>) -> Q
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn owned(sequences: QuerySequences<'_>) -> Vec<(String, Vec<String>)> {
         sequences
@@ -597,27 +598,50 @@ mod tests {
         assert_eq!(pairs, expected.map(|(k, v)| (k.to_string(), v.to_string())));
     }
 
-    /// The parser gives the pairs of the WHATWG `application/x-www-form-urlencoded`
-    /// parser (in `serde_urlencoded`), which gives what Django `QueryDict` gives.
-    #[test]
-    fn test_parse_query_string_matches_the_whatwg_parser() {
-        let parts: Vec<&str> =
-            "a Z 0 é + % %2 %2B %20 %3D %26 %C3%A9 %FF %E2%82 %ED%A0%80 %zz = & &&"
-                .split(' ')
-                .collect();
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for _ in 0..20_000 {
-            let count = next() % 12;
-            let query: String = (0..count)
-                .map(|_| parts[(next() % parts.len() as u64) as usize])
-                .collect();
+    /// Pieces of a raw query: separators, valid and broken escapes, and
+    /// escapes of UTF-8 bytes, valid and not.
+    const QUERY_PIECES: &[&str] = &[
+        "a",
+        "Z",
+        "0",
+        "é",
+        "+",
+        "%",
+        "%2",
+        "%2B",
+        "%20",
+        "%3D",
+        "%26",
+        "%C3%A9",
+        "%FF",
+        "%E2%82",
+        "%ED%A0%80",
+        "%zz",
+        "=",
+        "&",
+        "&&",
+    ];
 
+    fn raw_query() -> impl Strategy<Value = String> {
+        prop::collection::vec(prop::sample::select(QUERY_PIECES), 0..16)
+            .prop_map(|pieces| pieces.concat())
+    }
+
+    /// Encode a form component, with `+` or `%20` for a space.
+    fn form_encode(text: &str, plus_for_space: bool) -> String {
+        let encoded = urlencoding::encode(text).into_owned();
+        if plus_for_space {
+            encoded.replace("%20", "+")
+        } else {
+            encoded
+        }
+    }
+
+    proptest! {
+        /// The parser gives the pairs of the WHATWG `application/x-www-form-urlencoded`
+        /// parser (in `serde_urlencoded`), which gives what Django `QueryDict` gives.
+        #[test]
+        fn parse_query_string_matches_the_whatwg_parser(query in raw_query()) {
             let expected: AHashMap<String, String> =
                 serde_urlencoded::from_str::<Vec<(String, String)>>(&query)
                     .unwrap()
@@ -625,9 +649,71 @@ mod tests {
                     .collect();
             let actual: AHashMap<String, String> = parse_query_string(&query)
                 .into_iter()
-                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
                 .collect();
-            assert_eq!(actual, expected, "query {query:?}");
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn an_encoded_component_decodes_to_its_text(text in any::<String>(), plus in any::<bool>()) {
+            let encoded = form_encode(&text, plus);
+            prop_assert_eq!(decode_query_component(&encoded), text.as_str());
+        }
+
+        #[test]
+        fn a_component_with_no_escape_is_borrowed(text in any::<String>()) {
+            let escaped = text.contains(['%', '+']);
+            prop_assert_eq!(matches!(decode_query_component(&text), Cow::Owned(_)), escaped);
+        }
+
+        #[test]
+        fn encoded_pairs_decode_in_their_order(
+            pairs in prop::collection::vec((any::<String>(), any::<String>()), 0..8),
+            plus in any::<bool>(),
+        ) {
+            let query = pairs
+                .iter()
+                .map(|(key, value)| format!("{}={}", form_encode(key, plus), form_encode(value, plus)))
+                .collect::<Vec<_>>()
+                .join("&");
+            let decoded: Vec<(String, String)> = query_pairs(&query)
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            prop_assert_eq!(decoded, pairs);
+        }
+
+        /// A sequence key gets each of its values, in order; the map gets the last one.
+        #[test]
+        fn sequences_and_the_map_agree_with_the_pairs(query in raw_query()) {
+            let map = parse_query_string(&query);
+            let pairs: Vec<(String, String)> = query_pairs(&query)
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            let keys: AHashSet<String> = pairs.iter().map(|(key, _)| key.clone()).collect();
+            for (key, values) in owned(collect_query_sequences(&query, &keys)) {
+                let expected: Vec<String> = pairs
+                    .iter()
+                    .filter(|(name, _)| *name == key)
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                let last = map.get(key.as_str()).map(|value| value.to_string());
+                prop_assert_eq!(values.last(), last.as_ref());
+                prop_assert_eq!(values, expected);
+            }
+        }
+
+        /// A path param decodes `%XX` only. A `+` stays a `+`.
+        #[test]
+        fn an_encoded_path_param_decodes_to_its_text(text in any::<String>()) {
+            let encoded = urlencoding::encode(&text).into_owned();
+            let mut params = AHashMap::from_iter([("value".to_string(), encoded)]);
+            decode_path_params(&mut params);
+            prop_assert_eq!(&params["value"], &text);
+
+            let mut params = AHashMap::from_iter([("value".to_string(), text.replace('%', ""))]);
+            let unchanged = params["value"].clone();
+            decode_path_params(&mut params);
+            prop_assert_eq!(&params["value"], &unchanged);
         }
     }
 }

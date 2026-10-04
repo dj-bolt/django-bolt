@@ -300,7 +300,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # A fixed proptest seed: a red check comes from the change, not from a
+      # new random case. The Fuzz workflow runs many random cases each week.
       - name: Rust tests
+        env:
+          PROPTEST_RNG_SEED: "0"
         run: cargo test --workspace
 
   server_smoke_linux:

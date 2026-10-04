@@ -36,3 +36,6 @@ python/benchmark/BENCHMARK_DEV.md
 .coverage.*
 /coverage/
 *.profraw
+
+# Hypothesis example database (python/tests/test_properties.py)
+.hypothesis/

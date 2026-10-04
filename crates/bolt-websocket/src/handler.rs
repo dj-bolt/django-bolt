@@ -9,6 +9,7 @@ use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_web_actors::ws;
 use ahash::AHashMap;
+use bolt_core::cookies::cookie_pairs;
 use futures_util::FutureExt;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
@@ -204,21 +205,16 @@ fn build_scope(
     let cookies_dict = PyDict::new(py);
     if let Some(cookie_header) = req.headers().get("cookie") {
         if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                let pair = pair.trim();
-                if let Some(eq_pos) = pair.find('=') {
-                    let key = &pair[..eq_pos];
-                    let value = &pair[eq_pos + 1..];
-                    set_declared_item(
-                        py,
-                        &cookies_dict,
-                        key,
-                        value,
-                        cookie_types,
-                        max_param_length,
-                        "Cookie",
-                    )?;
-                }
+            for (key, value) in cookie_pairs(cookie_str) {
+                set_declared_item(
+                    py,
+                    &cookies_dict,
+                    key,
+                    &value,
+                    cookie_types,
+                    max_param_length,
+                    "Cookie",
+                )?;
             }
         }
     }

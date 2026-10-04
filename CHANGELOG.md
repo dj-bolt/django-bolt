@@ -17,8 +17,14 @@ All notable changes to this project will be documented in this file.
 - **`TestClient` runs the request handler of `runbolt`** - The test client had its own copy of the request pipeline. Now each test request goes through the handler of the server, on a test worker thread. A sync handler no longer runs on the thread of the test, so its context variables and thread-locals stay out of the test. At exit, the client closes the database connections of the test workers.
 - **macOS wheels are for Apple silicon only** - PyPI gets a macOS arm64 wheel, not a universal2 wheel. On an Intel Mac, pip installs from the source distribution, which needs a Rust toolchain.
 
+### Security
+
+- **`set_cookie` quotes the cookie value as Django does** - Bolt wrote the value into `Set-Cookie` as it was. A value with `;` could add an attribute, for example `Domain` or `Max-Age`. Thus a value from a user could change the scope of the cookie. Now Bolt quotes a value as Django `set_cookie` does: a value with a character that is not safe gets double quotes, and each such character gets an escape. For example, `a b` gives `"a b"`, and `;` gives `\073`. A value of letters, digits and the characters `` !#$%&'*+-.^_`|~: `` does not change.
+
 ### Fixed
 
+- **Cookies are read as Django reads them** - `request.cookies`, `Cookie()` parameters, the JWT cookie and the WebSocket scope now follow Django `parse_cookie`. A quoted value loses its quotes, and its escapes are decoded, so a cookie that Django or Bolt sets reads back unchanged. Spaces around the name and the value are removed. A pair with no `=` is a value with an empty name. When a name occurs two times, the last value is used, also for the JWT cookie.
+- **A time or datetime with second 60 gets 422** - A leap second such as `23:59:60` became `23:59:59`, and Python logged a warning. Python cannot show a leap second, so Bolt now refuses the value.
 - **A handler that hands the request to another callable gets the body** - Bolt reads the source of a handler to find the request parts it uses, and skips the others. A request given to a helper or to `super().create(request)` can be read there. Such a handler with a `Depends` parameter got an empty body, query, headers and cookies. Now a handler that hands on the request gets every part.
 - **A CSRF form POST works when the handler does not read the body** - `CsrfViewMiddleware` reads the token from `request.POST`. A route behind Django middleware got no body when its handler did not read it, so a valid form POST got 403. Now a route behind Django middleware always gets the body.
 - **The `/ready` database check uses the connection of the thread that runs it** - The check ran `connection.ensure_connection` on a pool thread, but bound it on the calling thread first. Thus it opened the connection of the event-loop thread from the pool thread, and that connection stayed open outside the pool. The check now looks up the connection on the pool thread.

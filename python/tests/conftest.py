@@ -14,9 +14,26 @@ import sysconfig
 import tempfile
 
 import pytest
+from hypothesis import settings as hypothesis_settings
+from hypothesis.database import DirectoryBasedExampleDatabase
 
 # Suppress httpx INFO logs during tests
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Hypothesis profiles. On CI, Hypothesis loads its own "ci" profile: the same
+# examples on each run and no deadline. A test request takes a variable time,
+# so the local profile has no deadline either.
+hypothesis_settings.register_profile("default", deadline=None)
+# The scheduled fuzz job (--hypothesis-profile=fuzz): new random examples,
+# many more of them. The job keeps the database of failing examples.
+hypothesis_settings.register_profile(
+    "fuzz",
+    deadline=None,
+    derandomize=False,
+    max_examples=5000,
+    print_blob=True,
+    database=DirectoryBasedExampleDatabase(".hypothesis/examples"),
+)
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -72,6 +72,8 @@ http-body = "1"
 http-body-util = "0.1"
 tokio-util = "0.7"
 sha2 = "0.10"  # MRTR requestState digests (args/principal)
+# Property tests (dev only)
+proptest = "1"
 # Internal crates
 bolt-loop = { path = "crates/bolt-loop" }
 bolt-core = { path = "crates/bolt-core" }

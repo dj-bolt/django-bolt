@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
+use bolt_core::cookies::cookie_pairs;
 use bolt_core::metadata::{RateLimitKey, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
@@ -945,21 +946,16 @@ pub fn handle_test_websocket(
     let cookies_dict = pyo3::types::PyDict::new(py);
     for (k, v) in headers.iter() {
         if k.to_lowercase() == "cookie" {
-            for pair in v.split(';') {
-                let pair = pair.trim();
-                if let Some(eq_pos) = pair.find('=') {
-                    let key = &pair[..eq_pos];
-                    let value = &pair[eq_pos + 1..];
-                    set_declared_item(
-                        py,
-                        &cookies_dict,
-                        key,
-                        value,
-                        cookie_types,
-                        max_param_length,
-                        "Cookie",
-                    )?;
-                }
+            for (key, value) in cookie_pairs(v) {
+                set_declared_item(
+                    py,
+                    &cookies_dict,
+                    key,
+                    &value,
+                    cookie_types,
+                    max_param_length,
+                    "Cookie",
+                )?;
             }
         }
     }
