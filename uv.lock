@@ -455,6 +455,7 @@ yaml = [
 dev = [
     { name = "bolt-mcp" },
     { name = "brotlicffi" },
+    { name = "coverage" },
     { name = "cryptography" },
     { name = "django" },
     { name = "django-allauth" },
@@ -502,6 +503,7 @@ provides-extras = ["yaml", "nanodjango", "mcp", "bolt-mcp"]
 dev = [
     { name = "bolt-mcp", editable = "python/bolt-mcp" },
     { name = "brotlicffi", specifier = ">=1.1" },
+    { name = "coverage", specifier = ">=7.10.4" },
     { name = "cryptography", specifier = ">=42" },
     { name = "django", specifier = "==6.1.1" },
     { name = "django-allauth", specifier = ">=65.19" },
