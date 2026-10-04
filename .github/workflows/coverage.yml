@@ -5,6 +5,9 @@ name: Coverage
 # The HTML reports are an artifact of the run.
 
 # A change to the docs only cannot change coverage, so it does not run this.
+# A pull request runs it only when it targets master. A stacked pull request
+# would run it again for each push to the stack, and wait for runners. Start
+# it by hand (workflow_dispatch) for a branch that needs a report earlier.
 on:
   push:
     branches:
@@ -14,6 +17,9 @@ on:
       - "docs/**"
       - "**.md"
   pull_request:
+    branches:
+      - master
+      - main
     paths-ignore:
       - "docs/**"
       - "**.md"
