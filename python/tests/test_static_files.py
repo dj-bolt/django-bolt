@@ -147,48 +147,22 @@ with open(IMG_FILE, "wb") as f:
 class TestFindStaticFile:
     """Tests for the find_static_file function used by Django finders fallback."""
 
-    def test_find_file_in_static_root(self, settings, monkeypatch):
+    def test_find_file_in_static_root(self, settings):
         """Test that finder-only lookup does not search STATIC_ROOT."""
-        original_root = getattr(settings, "STATIC_ROOT", None)
-        original_dirs = getattr(settings, "STATICFILES_DIRS", None)
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATICFILES_DIRS = []
 
-        try:
-            result = find_static_file("css/style.css")
-            assert result is None
-        finally:
-            if original_root is not None:
-                settings.STATIC_ROOT = original_root
-            elif hasattr(settings, "STATIC_ROOT"):
-                delattr(settings, "STATIC_ROOT")
-            if original_dirs is not None:
-                settings.STATICFILES_DIRS = original_dirs
-            elif hasattr(settings, "STATICFILES_DIRS"):
-                delattr(settings, "STATICFILES_DIRS")
+        assert find_static_file("css/style.css") is None
 
-    def test_find_file_in_staticfiles_dirs(self, settings, monkeypatch):
+    def test_find_file_in_staticfiles_dirs(self, settings, tmp_path):
         """Test finding a file in STATICFILES_DIRS."""
-        # Create a second static directory
-        second_dir = tempfile.mkdtemp(prefix="django_bolt_static2_")
-        second_css = os.path.join(second_dir, "custom.css")
-        with open(second_css, "w") as f:
-            f.write("/* Custom styles */")
-
-        # Temporarily set STATICFILES_DIRS
-        original_dirs = getattr(settings, "STATICFILES_DIRS", None)
-        settings.STATICFILES_DIRS = [second_dir]
+        (tmp_path / "custom.css").write_text("/* Custom styles */")
+        settings.STATICFILES_DIRS = [str(tmp_path)]
         settings.STATIC_ROOT = None  # Clear to test STATICFILES_DIRS
 
-        try:
-            result = find_static_file("custom.css")
-            assert result is not None
-            assert result.endswith("custom.css")
-        finally:
-            if original_dirs is not None:
-                settings.STATICFILES_DIRS = original_dirs
-            elif hasattr(settings, "STATICFILES_DIRS"):
-                delattr(settings, "STATICFILES_DIRS")
+        result = find_static_file("custom.css")
+        assert result is not None
+        assert result.endswith("custom.css")
 
     def test_find_nonexistent_file(self):
         """Test that None is returned for non-existent files."""
@@ -314,20 +288,16 @@ def test_admin_static_served_via_native_finder_fallback(settings):
     This is the fresh-install-with-admin scenario that replaced the old Python
     admin static route: the scope still registers in DEBUG (mirroring Django
     runserver) so finders resolve admin assets. pytest-django forces
-    DEBUG=False during tests, so we opt back in explicitly and restore.
+    DEBUG=False during tests, so we opt back in explicitly.
     """
-    original_debug = settings.DEBUG
-    try:
-        settings.DEBUG = True
+    settings.DEBUG = True
 
-        api = BoltAPI(django_middleware=True)
-        api._register_admin_routes("127.0.0.1", 8000)
+    api = BoltAPI(django_middleware=True)
+    api._register_admin_routes("127.0.0.1", 8000)
 
-        static_config = {"url_prefix": "/static", "directories": [], "csp_header": None}
-        with TestClient(api, static_files_config=static_config) as client:
-            response = client.get("/static/admin/css/base.css")
-    finally:
-        settings.DEBUG = original_debug
+    static_config = {"url_prefix": "/static", "directories": [], "csp_header": None}
+    with TestClient(api, static_files_config=static_config) as client:
+        response = client.get("/static/admin/css/base.css")
 
     assert response.status_code == 200
     assert response.headers.get("content-type", "").startswith("text/css")
@@ -821,18 +791,13 @@ class TestDebugModeFinders:
 
     def test_admin_static_found_in_debug_mode(self, settings):
         """Test that Django admin static files are found when DEBUG=True."""
-        original_debug = getattr(settings, "DEBUG", None)
         settings.DEBUG = True
 
-        try:
-            # Admin CSS should be found via Django finders (not in STATIC_ROOT)
-            result = find_static_file("admin/css/base.css")
-            assert result is not None, "Admin CSS should be found in debug mode"
-            assert "admin" in result
-            assert os.path.isfile(result)
-        finally:
-            if original_debug is not None:
-                settings.DEBUG = original_debug
+        # Admin CSS should be found via Django finders (not in STATIC_ROOT)
+        result = find_static_file("admin/css/base.css")
+        assert result is not None, "Admin CSS should be found in debug mode"
+        assert "admin" in result
+        assert os.path.isfile(result)
 
     def test_configured_dirs_work_regardless_of_debug(self, settings):
         """Test that explicitly configured directories always work."""
@@ -848,7 +813,7 @@ class TestDebugModeFinders:
             assert result is not None, f"Configured static file should be found with DEBUG={debug_value}"
             assert "style.css" in result
 
-    def test_finders_fallback_disabled_in_production_mode(self, settings):
+    def test_finders_fallback_disabled_in_production_mode(self, settings, tmp_path):
         """Test that Django finders fallback is disabled when DEBUG=False.
 
         This test verifies the security behavior: in production mode,
@@ -859,48 +824,33 @@ class TestDebugModeFinders:
         The actual Rust handler checks app_state.debug before calling Django finders.
         """
         # Create an empty STATIC_ROOT with no admin files
-        empty_static_root = tempfile.mkdtemp(prefix="empty_static_")
+        empty_static_root = str(tmp_path)
 
-        original_debug = getattr(settings, "DEBUG", None)
-        original_root = getattr(settings, "STATIC_ROOT", None)
-        original_dirs = getattr(settings, "STATICFILES_DIRS", None)
+        settings.DEBUG = False
+        settings.STATIC_ROOT = empty_static_root
+        settings.STATICFILES_DIRS = []
 
-        try:
-            settings.DEBUG = False
-            settings.STATIC_ROOT = empty_static_root
-            settings.STATICFILES_DIRS = []
+        # In production mode, admin files should NOT be found
+        # because they're not in STATIC_ROOT or STATICFILES_DIRS
+        # The Rust handler won't call Django finders when debug=False
 
-            # In production mode, admin files should NOT be found
-            # because they're not in STATIC_ROOT or STATICFILES_DIRS
-            # The Rust handler won't call Django finders when debug=False
+        # Verify the admin file exists (Django has it)
+        settings.DEBUG = True  # Temporarily enable to verify admin exists
+        admin_result = find_static_file("admin/css/base.css")
+        assert admin_result is not None, "Admin CSS should exist in Django"
 
-            # Verify the admin file exists (Django has it)
-            settings.DEBUG = True  # Temporarily enable to verify admin exists
-            admin_result = find_static_file("admin/css/base.css")
-            assert admin_result is not None, "Admin CSS should exist in Django"
+        # Now verify our configured dirs don't have it
+        settings.DEBUG = False
+        find_static_file("admin/css/base.css")
+        # The Python find_static_file always checks finders
+        # but the Rust handler gates this behind debug flag
+        # This test documents that the file won't be in our configured dirs
 
-            # Now verify our configured dirs don't have it
-            settings.DEBUG = False
-            find_static_file("admin/css/base.css")
-            # The Python find_static_file always checks finders
-            # but the Rust handler gates this behind debug flag
-            # This test documents that the file won't be in our configured dirs
+        # Verify empty static root doesn't have admin files
+        admin_in_configured_dir = os.path.exists(os.path.join(empty_static_root, "admin/css/base.css"))
+        assert not admin_in_configured_dir, "Admin files should not be in our empty STATIC_ROOT"
 
-            # Verify empty static root doesn't have admin files
-            admin_in_configured_dir = os.path.exists(os.path.join(empty_static_root, "admin/css/base.css"))
-            assert not admin_in_configured_dir, "Admin files should not be in our empty STATIC_ROOT"
-
-        finally:
-            if original_debug is not None:
-                settings.DEBUG = original_debug
-            if original_root is not None:
-                settings.STATIC_ROOT = original_root
-            if original_dirs is not None:
-                settings.STATICFILES_DIRS = original_dirs
-            # Cleanup
-            shutil.rmtree(empty_static_root, ignore_errors=True)
-
-    def test_rust_handler_debug_flag_integration(self, settings):
+    def test_rust_handler_debug_flag_integration(self, settings, tmp_path):
         """Test that the Rust handler respects debug flag for finders fallback.
 
         This is an integration test that verifies the full flow:
@@ -911,56 +861,41 @@ class TestDebugModeFinders:
         Note: This test uses the TestClient which exercises the Rust static file handler.
         """
         # Create empty static root (no admin files)
-        empty_static_root = tempfile.mkdtemp(prefix="empty_static_")
+        empty_static_root = str(tmp_path)
 
-        original_debug = getattr(settings, "DEBUG", None)
-        original_root = getattr(settings, "STATIC_ROOT", None)
-        original_dirs = getattr(settings, "STATICFILES_DIRS", None)
+        settings.STATIC_ROOT = empty_static_root
+        settings.STATICFILES_DIRS = []
+        settings.STATIC_URL = "/static/"
 
-        try:
-            settings.STATIC_ROOT = empty_static_root
-            settings.STATICFILES_DIRS = []
-            settings.STATIC_URL = "/static/"
+        # Configure static files for testing
+        static_config = {
+            "url_prefix": "/static",
+            "directories": [empty_static_root],
+            "csp_header": None,
+        }
 
-            # Configure static files for testing
-            static_config = {
-                "url_prefix": "/static",
-                "directories": [empty_static_root],
-                "csp_header": None,
-            }
+        # Test with DEBUG=True (finders fallback should work)
+        settings.DEBUG = True
 
-            # Test with DEBUG=True (finders fallback should work)
-            settings.DEBUG = True
+        api_debug = BoltAPI()
+        client_debug = TestClient(api_debug, static_files_config=static_config)
 
-            api_debug = BoltAPI()
-            client_debug = TestClient(api_debug, static_files_config=static_config)
+        # Admin CSS is only available via Django finders, not in our empty STATIC_ROOT
+        response = client_debug.get("/static/admin/css/base.css")
+        assert response.status_code == 200, (
+            f"Admin CSS should be served in debug mode via Django finders (got {response.status_code})"
+        )
 
-            # Admin CSS is only available via Django finders, not in our empty STATIC_ROOT
-            response = client_debug.get("/static/admin/css/base.css")
-            assert response.status_code == 200, (
-                f"Admin CSS should be served in debug mode via Django finders (got {response.status_code})"
-            )
+        # Test with DEBUG=False (finders fallback should be disabled)
+        settings.DEBUG = False
 
-            # Test with DEBUG=False (finders fallback should be disabled)
-            settings.DEBUG = False
+        api_prod = BoltAPI()
+        client_prod = TestClient(api_prod, static_files_config=static_config)
 
-            api_prod = BoltAPI()
-            client_prod = TestClient(api_prod, static_files_config=static_config)
-
-            # Admin CSS should NOT be found because:
-            # 1. It's not in STATIC_ROOT or STATICFILES_DIRS
-            # 2. Django finders fallback is disabled in production
-            response = client_prod.get("/static/admin/css/base.css")
-            assert response.status_code == 404, (
-                f"Admin CSS should NOT be served in production mode (got {response.status_code})"
-            )
-
-        finally:
-            if original_debug is not None:
-                settings.DEBUG = original_debug
-            if original_root is not None:
-                settings.STATIC_ROOT = original_root
-            if original_dirs is not None:
-                settings.STATICFILES_DIRS = original_dirs
-            # Cleanup
-            shutil.rmtree(empty_static_root, ignore_errors=True)
+        # Admin CSS should NOT be found because:
+        # 1. It's not in STATIC_ROOT or STATICFILES_DIRS
+        # 2. Django finders fallback is disabled in production
+        response = client_prod.get("/static/admin/css/base.css")
+        assert response.status_code == 404, (
+            f"Admin CSS should NOT be served in production mode (got {response.status_code})"
+        )
