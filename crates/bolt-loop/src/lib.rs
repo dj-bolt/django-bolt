@@ -35,8 +35,8 @@ static WORKER_HANDLE_FAILED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// The loop for every thread without a bound loop of its own. Its pump task
 /// lives in whichever Tokio runtime first calls `current_loop`, but the
-/// static is process-level, so every such entry point (TestClient, MCP)
-/// must share one process-lived runtime — if that runtime were torn down,
+/// static is process-level, so every such entry point must share one
+/// process-lived runtime — if that runtime were torn down,
 /// every later `call_soon` would fail with "worker asyncio loop is
 /// unavailable" with no recovery path.
 static SHARED_LOOP: PyOnceLock<Arc<WorkerLoop>> = PyOnceLock::new();
@@ -147,7 +147,8 @@ impl WorkerLoop {
 
 /// Bind a WorkerLoop to the calling thread. Idempotent. The server calls
 /// this from the Actix app factory, which runs once on every worker thread
-/// at startup, inside that worker's runtime.
+/// at startup, inside that worker's runtime. Each TestClient worker thread
+/// calls it at start, inside its own runtime.
 pub fn bind_thread_loop(py: Python<'_>) -> PyResult<()> {
     THREAD_LOOP.with(|slot| {
         if slot.get().is_none() {

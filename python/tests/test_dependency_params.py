@@ -7,6 +7,7 @@ the parameters and the body of its dependencies in its OpenAPI schema.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Annotated
 
 import msgspec
@@ -503,9 +504,10 @@ def test_a_cycle_of_async_dependencies_fails_at_registration():
             return {"value": value}
 
 
-# A handler with a dependency is analyzed for the request parts it reads. A
-# request that the handler hands to another callable can be read there, so the
-# handler must get every part of it. Before, it got an empty body.
+# A handler with a request parameter and another parameter is analyzed for the
+# request parts it reads. A request that the handler hands on (to a callable, a
+# name, a container or an attribute) can be read there, so the handler must get
+# every part of it. Before, it got an empty body.
 
 
 def _current_user() -> dict:
@@ -514,6 +516,10 @@ def _current_user() -> dict:
 
 def _read_body(request) -> bytes:
     return request.body
+
+
+def _read_context_body(context: dict) -> bytes:
+    return context["request"].body
 
 
 def _escape_api() -> BoltAPI:
@@ -531,6 +537,26 @@ def _escape_api() -> BoltAPI:
     def sync(request, user: Annotated[dict, Depends(_current_user)]):
         return {"body": _read_body(request).decode(), "user": user["id"]}
 
+    @api.post("/alias")
+    async def alias(request, user: Annotated[dict, Depends(_current_user)]):
+        req = request
+        return {"body": _read_body(req).decode(), "user": user["id"]}
+
+    @api.post("/container")
+    async def container(request, user: Annotated[dict, Depends(_current_user)]):
+        return {"body": _read_context_body({"request": request}).decode(), "user": user["id"]}
+
+    @api.post("/attribute")
+    async def attribute(request, user: Annotated[dict, Depends(_current_user)]):
+        holder = SimpleNamespace()
+        holder.request = request
+        return {"body": _read_body(holder.request).decode(), "user": user["id"]}
+
+    @api.post("/path/{user_id}")
+    async def path_param(request, user_id: int):
+        req = request
+        return {"body": _read_body(req).decode(), "user": user_id}
+
     class Base(ViewSet):
         async def create(self, request):
             return {"body": request.body.decode()}
@@ -543,8 +569,8 @@ def _escape_api() -> BoltAPI:
     return api
 
 
-@pytest.mark.parametrize("path", ["/positional", "/keyword", "/sync"])
-def test_a_request_handed_to_another_callable_keeps_its_body(path):
+@pytest.mark.parametrize("path", ["/positional", "/keyword", "/sync", "/alias", "/container", "/attribute", "/path/1"])
+def test_a_request_handed_on_keeps_its_body(path):
     with TestClient(_escape_api()) as client:
         response = client.post(path, content=b"payload")
     assert response.status_code == 200
