@@ -28,7 +28,9 @@ if [[ "$(uname)" == "Darwin" ]]; then
 fi
 # --project: use the environment of the repository, not a new one for the
 # copied pyproject.toml. --no-sync: do not rebuild the extension.
-mutmut=(uv run --project "$root" --no-sync --with "mutmut>=3.3,<4" mutmut)
+# mutmut 3.8 is the first version with process_isolation and forkserver_warmup.
+# An older version ignores them, and forks each mutant from a process that ran tests.
+mutmut=(uv run --project "$root" --no-sync --with "mutmut>=3.8,<4" mutmut)
 "${mutmut[@]}" run --max-children "${MUTMUT_CHILDREN:-$(getconf _NPROCESSORS_ONLN)}"
 "${mutmut[@]}" export-cicd-stats
 "${mutmut[@]}" results --all false > summary.txt

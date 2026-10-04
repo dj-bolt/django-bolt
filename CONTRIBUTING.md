@@ -57,7 +57,7 @@ just lint-lib
 | `just clippy` | Lint the Rust code (CI fails on any warning) |
 | `just coverage` | Measure Python and Rust coverage into `coverage/` (needs `cargo-llvm-cov`) |
 | `just fuzz TARGET [SECONDS]` | Fuzz one request parser (needs nightly Rust and `cargo-fuzz`) |
-| `just mutants` | Mutation-test the Rust parsers and security checks (needs `cargo-mutants`) |
+| `just mutants [JOBS]` | Mutation-test the Rust parsers and security checks (needs `cargo-mutants`). JOBS defaults to half the CPUs, at most 8 |
 | `just mutmut` | Mutation-test the Python modules in `[tool.mutmut]` |
 | `just lint` | Run ruff on library, tests, and examples |
 | `just lint-lib` | Lint library code only (must always pass) |

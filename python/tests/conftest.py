@@ -2,11 +2,10 @@
 Pytest configuration for Django-Bolt tests.
 
 Configures Django once for the test process. Each test process gets a new
-SQLite database in a temporary directory, removed at exit, so no schema from
-an earlier run survives.
+SQLite database in a temporary directory, removed at the end of each session,
+so no schema from an earlier run survives.
 """
 
-import atexit
 import logging
 import os
 import shutil
@@ -55,10 +54,9 @@ def _gil_stays_disabled():
 
 
 # One database directory per test process (each xdist worker has its own).
-# The process removes it at exit, not at the end of a pytest session: mutmut
-# runs several sessions in one process, and Django keeps the first path.
+# Django keeps this path for the life of the process. `pytest_unconfigure`
+# removes the directory, and `django_db_setup` makes it again.
 _DB_DIR = tempfile.mkdtemp(prefix="django_bolt_test_")
-atexit.register(shutil.rmtree, _DB_DIR, ignore_errors=True)
 
 
 def pytest_configure(config):
@@ -197,3 +195,16 @@ def django_db_setup(django_db_blocker):
                 # Check if table already exists
                 if model._meta.db_table not in connection.introspection.table_names():
                     schema_editor.create_model(model)
+
+
+def pytest_unconfigure(config):
+    """Remove the database directory at the end of the session.
+
+    mutmut ends each child process with `os._exit`, which skips atexit
+    handlers. A later session in the same process opens a new database at the
+    same path, so the connections of this thread close first.
+    """
+    from django.db import connections  # noqa: PLC0415
+
+    connections.close_all()
+    shutil.rmtree(_DB_DIR, ignore_errors=True)
