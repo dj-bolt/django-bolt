@@ -398,6 +398,12 @@ impl RequestLane {
         let mut idle = IDLE_LANES.lock();
         if !STOPPING.load(Ordering::Relaxed) {
             idle.push(lane);
+        } else {
+            // Shutdown took the idle list already, so it does not stop this
+            // lane, and a lane that ran its `Release` before `STOPPING` would
+            // wait for an owner. A send fails only when the lane thread is
+            // gone. Then no stop is necessary.
+            let _ = lane.sender.send(Job::Stop(None));
         }
     }
 }
@@ -411,6 +417,26 @@ impl Drop for RequestLane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shutdown can take the idle list before a request releases its lane.
+    /// That lane is then in no list, so `release` must stop it.
+    #[test]
+    fn release_during_shutdown_stops_the_lane() {
+        let (sender, receiver) = channel::<Job>();
+        let lane = RequestLane {
+            lane: Mutex::new(Some(IdleLane {
+                id: u64::MAX,
+                sender,
+            })),
+        };
+        STOPPING.store(true, Ordering::Relaxed);
+        lane.release();
+        STOPPING.store(false, Ordering::Relaxed);
+
+        assert!(matches!(receiver.try_recv(), Ok(Job::Release)));
+        assert!(matches!(receiver.try_recv(), Ok(Job::Stop(None))));
+        assert!(IDLE_LANES.lock().iter().all(|idle| idle.id != u64::MAX));
+    }
 
     #[test]
     fn idle_time_uses_a_valid_value() {
