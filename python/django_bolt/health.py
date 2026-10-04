@@ -72,7 +72,14 @@ _health_check = HealthCheck()
 def _ensure_connection() -> None:
     # Resolve `connection` on the thread that runs this. A method bound on the
     # calling thread would use the connection object of that thread.
-    connection.ensure_connection()
+    try:
+        connection.ensure_connection()
+    finally:
+        # ensure_connection does nothing for an open connection. Close it, so
+        # that the next check connects again and sees a lost database. A
+        # connection in a transaction stays open.
+        if not connection.in_atomic_block:
+            connection.close()
 
 
 async def check_database() -> tuple[bool, str]:
