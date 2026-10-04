@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Performance
 
-- **A client's next async request reuses its lane** - An async request on a route with Django middleware gave its lane back only after the response left. Thus the next request of the same client often started a new lane, with a new thread and a new database connection. The lane now goes back to the idle list before the response leaves. The lane still closes the previous request before it runs the next one.
+- **A client's next async request reuses its lane** - An async request on a route with Django middleware gave its lane back only after the response left. Thus the next request of the same client often started a new lane, with a new thread and a new database connection. The lane now goes back to the idle list before the response leaves, when no sync call of the request still runs on it. The lane still closes the previous request before it runs the next one. A lane that still runs such a call, for example after `asyncio.wait_for` stopped waiting, goes to no other request until the call ends.
 
 ### Fixed
 
