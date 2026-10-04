@@ -36,10 +36,6 @@ pub fn parse_cookies_inline(cookie_header: Option<&str>) -> AHashMap<String, Str
 
 /// Result of authentication and guard evaluation
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a Box would allocate once per authenticated request on the hot path"
-)]
 pub enum AuthGuardResult {
     /// Authentication and guards passed
     Allow(Option<AuthContext>),
