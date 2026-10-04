@@ -393,14 +393,20 @@ fn authenticate_with(
     }
 }
 
-/// Find a cookie value by name in a raw Cookie header string.
-/// The header is read as `request.cookies` reads it, so the last value wins.
-/// The value borrows from the header unless it has quotes to remove.
+/// Find a cookie value by name in a raw Cookie header string, as
+/// `request.cookies` reads the header. A name that occurs two times gives
+/// None: a sibling subdomain can add a cookie with the same name, and the
+/// order of the two does not show which one the site set. A token must not
+/// come from such a choice. The value borrows from the header unless it has
+/// quotes to remove.
 pub fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<Cow<'a, str>> {
-    cookie_pairs(raw_cookie)
+    let mut values = cookie_pairs(raw_cookie)
         .filter(|(cookie_name, _)| *cookie_name == name)
-        .last()
-        .map(|(_, value)| value)
+        .map(|(_, value)| value);
+    match (values.next(), values.next()) {
+        (Some(value), None) => Some(value),
+        _ => None,
+    }
 }
 
 /// Minimal JOSE header: only the field the validation loop acts on.
@@ -730,6 +736,18 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cookie_name_that_occurs_two_times_gives_no_value() {
+        // A sibling subdomain can add a cookie with the same name, and the
+        // order of the two does not show which one the site set.
+        assert_eq!(find_cookie_value("tok=a; tok=b", "tok"), None);
+        assert_eq!(
+            find_cookie_value("tok=a; other=b", "tok").as_deref(),
+            Some("a")
+        );
+        assert_eq!(find_cookie_value("other=b", "tok"), None);
+    }
     use jsonwebtoken::EncodingKey;
 
     const SECRET: &str = "test-secret";
@@ -1294,7 +1312,7 @@ mod tests {
     #[test]
     fn a_cookie_value_is_read_as_request_cookies_reads_it() {
         assert_eq!(
-            find_cookie_value(r#"a=1; tok=x; tok="y z""#, "tok").as_deref(),
+            find_cookie_value(r#"a=1; tok="y z""#, "tok").as_deref(),
             Some("y z")
         );
         assert_eq!(find_cookie_value(" tok = x ", "tok").as_deref(), Some("x"));
