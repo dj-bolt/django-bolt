@@ -9,13 +9,21 @@
 #
 # Needs: the extension built into python/django_bolt (`just build`).
 # Output: $MUTMUT_DIR (default: mutants-work/), with the mutmut results in
-# mutants/ and a summary in summary.txt.
+# mutants/ and a summary in summary.txt. A relative MUTMUT_DIR starts at the
+# repository root. The script removes MUTMUT_DIR only when it made it before.
 set -euo pipefail
 
-root="$PWD"
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
 work="${MUTMUT_DIR:-mutants-work}"
+marker=".mutmut-work"
+if [[ -e "$work" && ! -f "$work/$marker" ]]; then
+    echo "mutmut.sh: $work exists, but this script did not make it. Remove it or set another MUTMUT_DIR." >&2
+    exit 1
+fi
 rm -rf "$work"
 mkdir -p "$work"
+touch "$work/$marker"
 cp -R python/django_bolt "$work/django_bolt"
 cp -R python/tests "$work/tests"
 cp pytest.ini pyproject.toml "$work/"
