@@ -315,3 +315,39 @@ def test_runbolt_dev_stops_its_worker_on_sigterm(make_server_project):
         while _process_group_alive(server.process.pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert not _process_group_alive(server.process.pid), "the dev worker outlived its supervisor"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Reload integration runs only on Linux.")
+def test_runbolt_dev_under_nohup_ignores_sighup(make_server_project):
+    """``nohup runbolt --dev`` keeps serving when the terminal closes.
+
+    ``nohup`` starts the process with SIGHUP ignored. The SIGTERM handler of the
+    supervisor also catches SIGHUP, so it must keep SIGHUP ignored. Then the
+    worker also starts with SIGHUP ignored.
+    """
+    project = make_server_project(api_source=app_source("reload_state"))
+
+    # Start as nohup does. The child keeps SIG_IGN across fork and exec.
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        server = project.start(dev=True)
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+    with server:
+        worker_pid = server.get("/reload-state").json()["pid"]
+
+        # A closed terminal sends SIGHUP to the process group.
+        os.killpg(server.process.pid, signal.SIGHUP)
+        time.sleep(2)
+
+        assert server.process.poll() is None, "SIGHUP stopped the dev supervisor"
+        assert server.get("/reload-state").json()["pid"] == worker_pid, "SIGHUP stopped the dev worker"
+
+        os.kill(server.process.pid, signal.SIGTERM)
+        assert server.process.wait(timeout=15) == 0
+
+        deadline = time.monotonic() + 10
+        while _process_group_alive(server.process.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _process_group_alive(server.process.pid), "the dev worker outlived its supervisor"

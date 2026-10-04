@@ -220,6 +220,17 @@ fn wait_for_child_exit(
     }
 }
 
+/// True when the process ignores SIGHUP, as under `nohup`.
+#[cfg(unix)]
+fn sighup_is_ignored() -> bool {
+    // SAFETY: a null new action only reads the current action into `current`.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction == libc::SIG_IGN
+    }
+}
+
 fn stop_worker(worker: &mut Option<Child>, timeout: Duration) -> PyResult<()> {
     let Some(child) = worker.as_mut() else {
         return Ok(());
@@ -347,6 +358,11 @@ fn run_dev_reloader_inner(
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_flag = shutdown.clone();
 
+    // `nohup` starts the process with SIGHUP ignored. The handler below
+    // replaces that setting, so read it first.
+    #[cfg(unix)]
+    let keep_sighup_ignored = sighup_is_ignored();
+
     // SIGINT, SIGTERM and SIGHUP (the ctrlc `termination` feature) stop the
     // worker first. If SIGTERM killed only the supervisor, the worker would
     // keep the port.
@@ -359,6 +375,19 @@ fn run_dev_reloader_inner(
             err
         ))
     })?;
+
+    // Ignore SIGHUP again. The worker keeps SIG_IGN across exec, so both
+    // processes continue when the terminal closes.
+    #[cfg(unix)]
+    if keep_sighup_ignored {
+        // SAFETY: SIG_IGN for a valid signal number installs no Rust code.
+        if unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) } == libc::SIG_ERR {
+            return Err(py_runtime_error(format!(
+                "Failed to keep SIGHUP ignored for dev reload: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
 
     let (tx, rx) = mpsc::channel();
 
