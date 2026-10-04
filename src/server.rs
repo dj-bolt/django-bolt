@@ -819,6 +819,11 @@ pub fn start_server(
         ));
     }
 
+    // Read the Django settings ONCE at startup, not per request. The test
+    // client reads them with the same function. A bad setting fails here,
+    // before the runtime and the loop thread start.
+    let config = ServerConfig::from_django_settings(py)?;
+
     // Configure tokio runtime with adequate blocking thread pool for concurrent streaming
     // Default is 512, but with concurrent SSE clients doing blocking operations (time.sleep),
     // we need enough threads to handle simultaneous blocking tasks
@@ -868,9 +873,6 @@ pub fn start_server(
         });
     });
 
-    // Read the Django settings ONCE at startup, not per request. The test
-    // client reads them with the same function.
-    let config = ServerConfig::from_django_settings(py)?;
     let max_payload_size = config.max_payload_size;
     let (access_log_enabled, access_logger_obj) = read_access_logger(py);
 
