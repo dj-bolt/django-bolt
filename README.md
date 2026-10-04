@@ -16,7 +16,6 @@
     <br/>
     <a href="https://pepy.tech/projects/django-bolt"><img src="https://static.pepy.tech/personalized-badge/django-bolt?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="Downloads"/></a>
     <a href="https://discord.gg/4xErptXK82"><img src="https://img.shields.io/discord/1513537500000292894?logo=discord&logoColor=white&label=Discord&color=5865F2" alt="Discord"/></a>
-    <a href="https://deepwiki.com/FarhanAliRaza/django-bolt"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"/></a>
     <a href="https://opencollective.com/django-bolt"><img src="https://img.shields.io/badge/Sponsor-Django%20Bolt-ff69b4?logo=opencollective&logoColor=white" alt="Sponsor"/></a>
   </p>
 
