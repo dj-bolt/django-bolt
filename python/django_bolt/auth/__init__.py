@@ -11,6 +11,7 @@ from .backends import (
     AuthContext,
     BaseAuthentication,
     JWTAuthentication,
+    SessionAuthentication,
     get_default_authentication_classes,
 )
 
@@ -70,6 +71,7 @@ __all__ = [
     "BaseAuthentication",
     "JWTAuthentication",
     "APIKeyAuthentication",
+    "SessionAuthentication",
     "AuthContext",
     "get_default_authentication_classes",
     # Guards/Permissions

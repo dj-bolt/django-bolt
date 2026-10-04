@@ -13,6 +13,7 @@ from types import UnionType
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_origin, is_typeddict
 
 import msgspec
+from django.conf import settings as django_settings
 
 from ..datastructures import UploadFile
 from ..responses import (
@@ -124,6 +125,7 @@ class ComponentNameCollisionError(ValueError):
 _SCHEME_NAME_MAP: dict[str, str] = {
     "jwt": "BearerAuth",
     "api_key": "ApiKeyAuth",
+    "session": "SessionAuth",
 }
 
 
@@ -1192,8 +1194,9 @@ class SchemaGenerator:
         existing = openapi.components.security_schemes or {}
         needs_jwt = "jwt" in self._seen_schemes and "BearerAuth" not in existing
         needs_api_key = "api_key" in self._seen_schemes and "ApiKeyAuth" not in existing
+        needs_session = "session" in self._seen_schemes and "SessionAuth" not in existing
 
-        if not needs_jwt and not needs_api_key:
+        if not needs_jwt and not needs_api_key and not needs_session:
             return
 
         schemes = dict(existing)
@@ -1210,6 +1213,13 @@ class SchemaGenerator:
                 type="apiKey",
                 name=self._api_key_header,
                 security_scheme_in="header",
+            )
+
+        if needs_session:
+            schemes["SessionAuth"] = SecurityScheme(
+                type="apiKey",
+                name=django_settings.SESSION_COOKIE_NAME,
+                security_scheme_in="cookie",
             )
 
         openapi.components.security_schemes = schemes
