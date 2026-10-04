@@ -164,6 +164,25 @@ fn read_max_age_setting(
     }
 }
 
+/// The scope prefix for a static URL such as `"/static/"`, or None when the
+/// URL cannot be mounted. An empty prefix (`"/"`) would shadow every route.
+pub(crate) fn static_scope_prefix(static_url: &str) -> Option<String> {
+    // Normalize URL prefix (remove trailing slash for actix-files)
+    let url_prefix = static_url.trim_end_matches('/');
+    if url_prefix.is_empty() {
+        return None;
+    }
+    if !is_literal_prefix(url_prefix) {
+        eprintln!(
+            "[django-bolt] Warning: STATIC_URL contains scope-param chars \
+             (got {:?}); refusing to mount. Use a literal prefix like \"/static/\".",
+            static_url
+        );
+        return None;
+    }
+    Some(url_prefix.to_string())
+}
+
 /// The Django settings that `runbolt` and the test client both read.
 ///
 /// One reader keeps the test client on the production configuration: the
@@ -176,7 +195,6 @@ pub(crate) struct ServerConfig {
     pub max_param_length: usize,
     pub asgi_mount_timeout: Duration,
     pub global_cors_config: Option<CorsConfig>,
-    pub cors_origin_regexes: Vec<regex::Regex>,
     pub trusted_proxies: Arc<TrustedProxies>,
     pub static_files_config: Option<Arc<ScopeConfig>>,
     pub media_files_config: Option<Arc<ScopeConfig>>,
@@ -280,19 +298,9 @@ impl ServerConfig {
                 None => return Ok(None), // No static URL configured
             };
 
-            // Normalize URL prefix (remove trailing slash for actix-files)
-            let url_prefix = static_url.trim_end_matches('/').to_string();
-            if url_prefix.is_empty() {
-                return Ok(None); // Invalid static URL
-            }
-            if !is_literal_prefix(&url_prefix) {
-                eprintln!(
-                    "[django-bolt] Warning: STATIC_URL contains scope-param chars \
-                         (got {:?}); refusing to mount. Use a literal prefix like \"/static/\".",
-                    static_url
-                );
+            let Some(url_prefix) = static_scope_prefix(&static_url) else {
                 return Ok(None);
-            }
+            };
 
             let mut directories: Vec<String> = Vec::new();
 
@@ -517,20 +525,6 @@ impl ServerConfig {
                 None
             };
 
-        // Compile origin regex patterns at startup (zero runtime overhead)
-        let cors_origin_regexes: Vec<regex::Regex> = origin_regex_patterns
-            .iter()
-            .filter_map(|pattern| {
-                regex::Regex::new(pattern).ok().or_else(|| {
-                    eprintln!(
-                        "[django-bolt] Warning: Invalid CORS origin regex pattern: {}",
-                        pattern
-                    );
-                    None
-                })
-            })
-            .collect();
-
         // Build static files configuration.
         // Directories are canonicalized ONCE here so the request hot path never
         // runs `canonicalize()` (a multi-syscall realpath) on the directory root.
@@ -595,7 +589,6 @@ impl ServerConfig {
             max_param_length,
             asgi_mount_timeout,
             global_cors_config,
-            cors_origin_regexes,
             trusted_proxies,
             static_files_config,
             media_files_config,
@@ -626,7 +619,15 @@ impl ServerConfig {
                 None,
             ))
         };
-        self.cors_origin_regexes = vec![];
+    }
+
+    /// The compiled `CORS_ALLOWED_ORIGIN_REGEXES` of the global CORS config,
+    /// for `AppState`. The global config compiles them once at startup.
+    pub(crate) fn cors_origin_regexes(&self) -> Vec<regex::Regex> {
+        self.global_cors_config
+            .as_ref()
+            .map(|cors| cors.compiled_origin_regexes.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -858,6 +859,7 @@ pub fn start_server(
         None => None,
     };
 
+    let cors_origin_regexes = config.cors_origin_regexes();
     let app_state = Arc::new(AppState {
         dispatch,
         debug: config.debug,
@@ -866,7 +868,7 @@ pub fn start_server(
         max_param_length: config.max_param_length,
         asgi_mount_timeout: config.asgi_mount_timeout,
         global_cors_config: config.global_cors_config,
-        cors_origin_regexes: config.cors_origin_regexes,
+        cors_origin_regexes,
         global_compression_config: global_compression_config.clone(),
         trusted_proxies: config.trusted_proxies,
         router: None,                        // Production uses GLOBAL_ROUTER

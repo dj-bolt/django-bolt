@@ -161,7 +161,7 @@ impl CorsConfig {
             .filter_map(|pattern| {
                 Regex::new(pattern).ok().or_else(|| {
                     eprintln!(
-                        "[django-bolt] Warning: Invalid route-level CORS origin regex pattern: {}",
+                        "[django-bolt] Warning: Invalid CORS origin regex pattern: {}",
                         pattern
                     );
                     None

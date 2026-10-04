@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use crate::handler::{
     build_prebound_from_values, form_result_to_py, response_from_wire_result, SourceValues,
 };
-use crate::server::{configure_file_scopes, inject_global_cors, ServerConfig};
+use crate::server::{configure_file_scopes, inject_global_cors, static_scope_prefix, ServerConfig};
 use bolt_core::request_pipeline::{
     query_sequences, set_declared_item, set_param_item, set_query_sequences,
     validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
@@ -162,7 +162,6 @@ pub fn create_test_app(
     let mut config = ServerConfig::from_django_settings(py)?;
     if !read_django_settings {
         config.global_cors_config = None;
-        config.cors_origin_regexes = vec![];
         config.static_files_config = None;
         config.media_files_config = None;
     }
@@ -206,6 +205,10 @@ fn static_scope_from_dict(
         .get_item("url_prefix")?
         .map(|v| v.extract().unwrap_or_default())
         .unwrap_or_else(|| "/static".to_string());
+    // The same prefix rules as STATIC_URL in runbolt.
+    let Some(url_prefix) = static_scope_prefix(&url_prefix) else {
+        return Ok(None);
+    };
 
     let directories: Vec<String> = static_dict
         .get_item("directories")?
@@ -236,7 +239,7 @@ fn static_scope_from_dict(
         return Ok(None);
     }
     Ok(Some(Arc::new(ScopeConfig {
-        url_prefix: url_prefix.trim_end_matches('/').to_string(),
+        url_prefix,
         directories,
         csp_header,
         cache_control,
@@ -435,6 +438,7 @@ pub fn test_request(
 
             // Build AppState matching production
             // Include router and route_metadata so CorsMiddleware can find route-level CORS config
+            let cors_origin_regexes = config.cors_origin_regexes();
             let app_state_arc = Arc::new(AppState {
                 dispatch,
                 debug: config.debug,
@@ -443,7 +447,7 @@ pub fn test_request(
                 max_param_length: config.max_param_length,
                 asgi_mount_timeout: config.asgi_mount_timeout,
                 global_cors_config: config.global_cors_config,
-                cors_origin_regexes: config.cors_origin_regexes,
+                cors_origin_regexes,
                 global_compression_config: compression,
                 trusted_proxies: config.trusted_proxies,
                 router: Some(router.clone()),
@@ -1185,18 +1189,14 @@ pub fn handle_test_websocket(
     // Origin validation for WebSocket
     let origin = header_map.get("origin");
     if let Some(origin_value) = origin {
-        let origin_allowed = if let Some(ref cors_config) = app.config.global_cors_config {
-            if cors_config.allow_all_origins {
-                true
-            } else {
-                cors_config.origin_set.contains(origin_value)
-                    || cors_config
-                        .compiled_origin_regexes
-                        .iter()
-                        .any(|re| re.is_match(origin_value))
-            }
-        } else {
-            false // No CORS = deny cross-origin
+        // The production check. No CORS config denies a cross-origin connection.
+        let origin_allowed = match app.config.global_cors_config {
+            Some(ref cors_config) => bolt_websocket::handler::is_origin_allowed(
+                origin_value,
+                cors_config,
+                &app.config.cors_origin_regexes(),
+            ),
+            None => false,
         };
 
         if !origin_allowed {
