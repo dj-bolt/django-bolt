@@ -7,9 +7,6 @@ repository.workspace = true
 publish = false
 description = "WebSocket routing and actor handling for django-bolt"
 
-[lints]
-workspace = true
-
 [dependencies]
 actix = { workspace = true }
 actix-web = { workspace = true }

@@ -151,6 +151,10 @@ impl ResponseMeta {
         let custom_headers: Option<Vec<(String, String)>> = tuple.get_item(2)?.extract()?;
 
         // Element 3: cookies (None or list of 9-tuples)
+        #[expect(
+            clippy::type_complexity,
+            reason = "PyO3 wire format: ResponseWireV1 sends each cookie as one 9-tuple"
+        )]
         let cookies_raw: Option<
             Vec<(
                 String,         // name

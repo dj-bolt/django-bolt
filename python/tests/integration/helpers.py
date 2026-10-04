@@ -4,6 +4,7 @@ import base64
 import collections
 import contextlib
 import hashlib
+import itertools
 import os
 import platform
 import secrets
@@ -176,10 +177,43 @@ def generate_load(
     )
 
 
-def get_free_port(host: str = DEFAULT_HOST) -> int:
+# Under pytest-xdist, each worker takes server ports from its own block of this
+# range. The range is below the ephemeral ports (32768 and up on Linux, 49152 and
+# up on macOS and Windows), so no port from bind(0) falls into it.
+_WORKER_PORTS = range(20000, 32768)
+_port_offsets = itertools.count()
+
+
+def _port_is_free(host: str, port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((host, 0))
-        return int(sock.getsockname()[1])
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+        return True
+
+
+def get_free_port(host: str = DEFAULT_HOST) -> int:
+    """Return a free port for a test server.
+
+    A port from bind(0) is free only until its socket closes. A parallel
+    pytest-xdist worker can get the same port before the server binds it, so
+    each worker uses its own block of ``_WORKER_PORTS``. A serial run lets the
+    OS pick the port.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker is None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, 0))
+            return int(sock.getsockname()[1])
+
+    block_size = len(_WORKER_PORTS) // int(os.environ["PYTEST_XDIST_WORKER_COUNT"])
+    start = _WORKER_PORTS.start + int(worker.removeprefix("gw")) * block_size
+    for _ in range(block_size):
+        port = start + next(_port_offsets) % block_size
+        if _port_is_free(host, port):
+            return port
+    raise RuntimeError(f"pytest-xdist worker {worker} has no free port in {start}-{start + block_size - 1}")
 
 
 def _listening_inodes_for_port(port: int) -> set[str]:
@@ -267,27 +301,31 @@ def _python_list_literal(items: list[str]) -> str:
 
 
 def _terminate_process(process: subprocess.Popen[str], timeout: float = 5.0) -> tuple[str, str]:
-    if process.poll() is None:
-        if platform.system() == "Windows":
+    """Stop the process and its process group, and return their output.
+
+    On POSIX, ``_spawn_process`` makes the process a group leader, so the group
+    id is its pid. The group gets the signals also when the leader already
+    exited: a child, such as a ``runbolt --dev`` worker, can outlive it and
+    keep the output pipes open. No wait is without a limit.
+    """
+    if platform.system() == "Windows":
+        if process.poll() is None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 process.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+
+    try:
+        return process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if platform.system() == "Windows":
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                process.kill()
         else:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-            return stdout, stderr
-        except subprocess.TimeoutExpired:
-            if platform.system() == "Windows":
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    process.kill()
-            else:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-
-    stdout, stderr = process.communicate()
-    return stdout, stderr
+                os.killpg(process.pid, signal.SIGKILL)
+    return process.communicate(timeout=timeout)
 
 
 class _DrainedPopen(subprocess.Popen):
