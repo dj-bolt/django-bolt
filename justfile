@@ -123,10 +123,10 @@ test-rs:
 clippy:
     uv run cargo clippy --workspace --all-targets -- -D warnings
 
+# The script puts back the extension build that it found.
 # Measure Python and Rust coverage; reports go to coverage/ (needs cargo-llvm-cov)
 coverage:
     ./scripts/coverage.sh
-    @echo "The extension is instrumented now. Run 'just build' to rebuild it."
 
 # Run the tests that need PostgreSQL (`@pytest.mark.postgres`) against a
 # throwaway Docker server. These skip in `test-py` unless
