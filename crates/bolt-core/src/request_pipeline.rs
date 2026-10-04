@@ -6,6 +6,7 @@
 use actix_web::{HttpRequest, HttpResponse};
 use ahash::{AHashMap, AHashSet};
 use std::borrow::{Borrow, Cow};
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
 
 use crate::form_parsing::ValidationError;
@@ -302,10 +303,34 @@ pub fn extract_headers(
                 return Err(responses::error_400_header_too_large(max_header_size));
             }
             // HeaderName::as_str() returns lowercase already (http crate stores canonically)
-            headers.insert(name.as_str().to_owned(), v.to_owned());
+            insert_header_line(&mut headers, name.as_str(), v);
         }
     }
     Ok(headers)
+}
+
+/// Add one header line to `headers`. `name` must be lowercase.
+///
+/// Django joins repeated `Cookie` lines with `"; "`, so each line counts.
+/// Another repeated header keeps its last line.
+#[inline]
+pub fn insert_header_line(headers: &mut AHashMap<String, String>, name: &str, value: &str) {
+    match headers.entry(name.to_owned()) {
+        // The common request: the first line of a name takes the vacant slot.
+        // One hash and the same two copies as a plain insert. No join.
+        Entry::Vacant(slot) => {
+            slot.insert(value.to_owned());
+        }
+        // Only a second `Cookie` line gets here and grows the joined value.
+        Entry::Occupied(mut joined) if name == "cookie" => {
+            let joined = joined.get_mut();
+            joined.push_str("; ");
+            joined.push_str(value);
+        }
+        Entry::Occupied(mut last) => {
+            last.insert(value.to_owned());
+        }
+    }
 }
 
 /// Build HTTP 422 response for validation errors
@@ -358,6 +383,17 @@ mod tests {
         assert_eq!(response.status(), 422);
         let bytes = response.into_body().try_into_bytes().unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn repeated_cookie_lines_join_as_django_joins_them() {
+        let request = actix_web::test::TestRequest::default()
+            .append_header(("cookie", "a=1"))
+            .append_header(("cookie", "b=2"))
+            .append_header(("cookie", "c=3"))
+            .to_http_request();
+        let headers = extract_headers(&request, 1024).unwrap();
+        assert_eq!(headers["cookie"], "a=1; b=2; c=3");
     }
 
     #[test]

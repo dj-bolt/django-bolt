@@ -18,6 +18,7 @@ use crate::response_meta::CookieData;
 /// Uses the `cookie` crate for RFC 6265 compliant serialization:
 /// - Validates cookie names (rejects invalid characters)
 /// - Rejects control characters in the value, as Django does
+/// - Rejects a value character above U+00FF, which Django cannot send
 /// - Quotes the value as Django does (see `quote_cookie_value`)
 ///
 /// Returns None if the cookie name or value is invalid, with a warning logged.
@@ -37,6 +38,17 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
     if contains_control_chars(&c.value) {
         eprintln!(
             "[django-bolt] WARNING: Cookie '{}' value contains control characters - rejected for security",
+            c.name
+        );
+        return None;
+    }
+
+    // Reject a character above U+00FF. Django cannot send it, because it encodes
+    // a header as Latin-1. A browser that sends it back makes the `Cookie` header
+    // unreadable, so the request gets no cookies.
+    if c.value.chars().any(|ch| ch > '\u{ff}') {
+        eprintln!(
+            "[django-bolt] WARNING: Cookie '{}' value contains a character above U+00FF - rejected",
             c.name
         );
         return None;
@@ -239,8 +251,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Text with no control character: `format_cookie` refuses those.
-    const COOKIE_TEXT: &str = "[^\\x00-\\x1f\\x7f]*";
+    /// Latin-1 text with no control character: `format_cookie` refuses the rest.
+    const COOKIE_TEXT: &str = "[^\\x00-\\x1f\\x7f\\x{100}-\\x{10ffff}]*";
     /// An RFC 6265 cookie name (a token).
     const COOKIE_NAME: &str = "[!#$%&'*+.^_`|~0-9A-Za-z-]{1,12}";
 
@@ -256,6 +268,8 @@ mod tests {
         #[test]
         fn a_quoted_value_stays_one_value(value in COOKIE_TEXT) {
             let quoted = quote_cookie_value(&value);
+            // ASCII only, so the browser sends back a header that Bolt can read.
+            prop_assert!(quoted.is_ascii());
             prop_assert!(!quoted.contains([';', ',']));
             prop_assert!(!quoted.bytes().any(|byte| byte < 32 || byte == 127));
             let inner = quoted.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(&quoted);
@@ -374,6 +388,18 @@ mod tests {
         assert!(format_cookie(&cookie_with_value("del\x7f")).is_none());
     }
 
+    /// Django cannot send a character above U+00FF in a header. A browser that
+    /// sends it back makes the `Cookie` header unreadable for each later request.
+    #[test]
+    fn a_value_above_latin1_is_rejected() {
+        assert!(format_cookie(&cookie_with_value("日本")).is_none());
+        assert!(format_cookie(&cookie_with_value("a\u{100}")).is_none());
+        assert_eq!(
+            format_cookie(&cookie_with_value("\u{ff}")).unwrap(),
+            r#"session="\377"; Path=/"#
+        );
+    }
+
     #[test]
     fn a_value_cannot_add_an_attribute() {
         let result = format_cookie(&cookie_with_value("x; Domain=evil.example")).unwrap();
@@ -393,7 +419,6 @@ mod tests {
             (r"back\slash", r#""back\\slash""#),
             ("café", r#""caf\351""#),
             ("a,b", r#""a\054b""#),
-            ("日本", r#""日本""#),
         ] {
             assert_eq!(quote_cookie_value(value), quoted, "{value}");
             assert_eq!(unquote_cookie_value(quoted), value, "{quoted}");
