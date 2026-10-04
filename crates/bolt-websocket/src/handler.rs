@@ -659,8 +659,8 @@ fn validate_origin(req: &HttpRequest, state: &AppState) -> bool {
 }
 
 /// Check if an origin is allowed by the CORS configuration
-/// Reuses the same logic as HTTP CORS validation
-fn is_origin_allowed(
+/// Reuses the same logic as HTTP CORS validation. The test client calls it too.
+pub fn is_origin_allowed(
     origin: &str,
     cors_config: &CorsConfig,
     global_regexes: &[regex::Regex],
@@ -806,6 +806,7 @@ pub async fn handle_websocket_upgrade(
                     );
                 }
                 if let Some(response) = check_before_auth(
+                    &state.rate_limiters,
                     handler_id,
                     &headers,
                     client_ip.as_ref(),
@@ -835,6 +836,7 @@ pub async fn handle_websocket_upgrade(
                 AuthGuardResult::Allow(ctx) => {
                     if let Some(ref rate_config) = route_meta.rate_limit_config {
                         if let Some(response) = check_after_auth(
+                            &state.rate_limiters,
                             handler_id,
                             &headers,
                             client_ip.as_ref(),

@@ -147,14 +147,8 @@ def compile_middleware_meta(
     # Merge global and handler middleware
     all_middleware = []
 
-    # Add global middleware first
-    for mw in global_middleware:
-        mw_dict = middleware_to_dict(mw)
-        if mw_dict and mw_dict.get("type") not in skip_middleware:
-            all_middleware.append(mw_dict)
-
-    # Add handler-specific middleware (also filtered by skip_middleware)
-    for mw in handler_middleware:
+    # Global middleware first, then handler middleware, each filtered by skip_middleware
+    for mw in [*global_middleware, *handler_middleware]:
         mw_dict = middleware_to_dict(mw)
         if mw_dict and mw_dict.get("type") not in skip_middleware:
             all_middleware.append(mw_dict)

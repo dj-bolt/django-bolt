@@ -44,6 +44,11 @@ CORS_ALLOWED_ORIGINS = [
     "https://app.example.com",
 ]
 
+# Allow each origin that matches a pattern
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://\w+\.example\.com$",
+]
+
 # Allow all origins (development only!)
 CORS_ALLOW_ALL_ORIGINS = True
 
@@ -52,8 +57,10 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
 CORS_ALLOW_HEADERS = ["Content-Type", "Authorization", "X-Requested-With"]
 CORS_EXPOSE_HEADERS = ["X-Total-Count", "X-Page-Count"]
-CORS_MAX_AGE = 86400  # 24 hours
+CORS_PREFLIGHT_MAX_AGE = 86400  # 24 hours
 ```
+
+Without these settings, Bolt allows the methods `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `QUERY`, and the headers `Content-Type` and `Authorization`. A preflight answer is cached for 3600 seconds. A `"*"` entry in `CORS_ALLOWED_ORIGINS` is not a wildcard. Use `CORS_ALLOW_ALL_ORIGINS = True` to allow each origin. A pattern in `CORS_ALLOWED_ORIGIN_REGEXES` can match a part of the origin, so start it with `^` and end it with `$`.
 
 ## Rate limiting
 

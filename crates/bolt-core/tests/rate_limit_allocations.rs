@@ -6,7 +6,7 @@
 
 use ahash::AHashMap;
 use bolt_core::metadata::{RateLimitConfig, RateLimitKey};
-use bolt_core::middleware::rate_limit::check_before_auth;
+use bolt_core::middleware::rate_limit::{check_before_auth, RateLimiters};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -57,11 +57,15 @@ fn a_header_keyed_request_allocates_nothing() {
 
     // The first request creates the limiter for this bucket, which allocates.
     // Steady state is what a served request costs.
-    check_before_auth(9_001, &map, None, &config, "GET", "/limited");
+    let limiters = RateLimiters::default();
+    check_before_auth(&limiters, 9_001, &map, None, &config, "GET", "/limited");
 
     let allocations = count(|| {
         for _ in 0..1_000 {
-            assert!(check_before_auth(9_001, &map, None, &config, "GET", "/limited").is_none());
+            assert!(
+                check_before_auth(&limiters, 9_001, &map, None, &config, "GET", "/limited")
+                    .is_none()
+            );
         }
     });
 
@@ -82,11 +86,15 @@ fn a_long_header_value_allocates_nothing_either() {
     };
     let map = headers(&"t".repeat(4096));
 
-    check_before_auth(9_002, &map, None, &config, "GET", "/limited");
+    let limiters = RateLimiters::default();
+    check_before_auth(&limiters, 9_002, &map, None, &config, "GET", "/limited");
 
     let allocations = count(|| {
         for _ in 0..1_000 {
-            assert!(check_before_auth(9_002, &map, None, &config, "GET", "/limited").is_none());
+            assert!(
+                check_before_auth(&limiters, 9_002, &map, None, &config, "GET", "/limited")
+                    .is_none()
+            );
         }
     });
 

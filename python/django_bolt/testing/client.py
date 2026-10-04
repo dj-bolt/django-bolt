@@ -270,124 +270,6 @@ class TestClient(httpx.Client):
     __test__ = False  # Tell pytest this is not a test class
 
     @staticmethod
-    def _read_cors_settings_from_django() -> dict | None:
-        """Read all CORS settings from Django settings (same as production server).
-
-        Returns:
-            Dict with CORS config from Django settings, or None if not configured.
-            Keys: origins, credentials, methods, headers, expose_headers, max_age
-        """
-        try:
-            # Check if any CORS setting is defined
-            has_origins = hasattr(settings, "CORS_ALLOWED_ORIGINS")
-            has_all_origins = hasattr(settings, "CORS_ALLOW_ALL_ORIGINS") and settings.CORS_ALLOW_ALL_ORIGINS
-
-            if not has_origins and not has_all_origins:
-                return None
-
-            # Build CORS config dict matching production server format
-            cors_config = {}
-
-            # Origins
-            if has_all_origins:
-                cors_config["origins"] = ["*"]
-            elif has_origins:
-                origins = settings.CORS_ALLOWED_ORIGINS
-                if isinstance(origins, (list, tuple)):
-                    cors_config["origins"] = list(origins)
-                else:
-                    cors_config["origins"] = []
-            else:
-                cors_config["origins"] = []
-
-            # Credentials
-            cors_config["credentials"] = getattr(settings, "CORS_ALLOW_CREDENTIALS", False)
-
-            # Methods
-            if hasattr(settings, "CORS_ALLOW_METHODS"):
-                methods = settings.CORS_ALLOW_METHODS
-                if isinstance(methods, (list, tuple)):
-                    cors_config["methods"] = list(methods)
-
-            # Headers
-            if hasattr(settings, "CORS_ALLOW_HEADERS"):
-                headers = settings.CORS_ALLOW_HEADERS
-                if isinstance(headers, (list, tuple)):
-                    cors_config["headers"] = list(headers)
-
-            # Expose headers
-            if hasattr(settings, "CORS_EXPOSE_HEADERS"):
-                expose = settings.CORS_EXPOSE_HEADERS
-                if isinstance(expose, (list, tuple)):
-                    cors_config["expose_headers"] = list(expose)
-
-            # Max age
-            if hasattr(settings, "CORS_PREFLIGHT_MAX_AGE"):
-                cors_config["max_age"] = settings.CORS_PREFLIGHT_MAX_AGE
-
-            return cors_config
-        except (ImportError, AttributeError):
-            # Django not configured or settings not available
-            return None
-
-    @staticmethod
-    def _read_static_files_settings_from_django() -> dict | None:
-        """Read static files settings from Django settings.
-
-        Returns:
-            Dict with static files config, or None if not configured.
-            Keys: url_prefix, directories, csp_header
-        """
-        try:
-            if not hasattr(settings, "STATIC_URL") or not settings.STATIC_URL:
-                return None
-
-            url_prefix = settings.STATIC_URL.rstrip("/")
-            if not url_prefix:
-                return None
-
-            directories = []
-
-            # Get STATIC_ROOT
-            if hasattr(settings, "STATIC_ROOT") and settings.STATIC_ROOT:
-                static_root = str(settings.STATIC_ROOT)
-                if static_root:
-                    directories.append(static_root)
-
-            # Get STATICFILES_DIRS
-            if hasattr(settings, "STATICFILES_DIRS"):
-                for d in settings.STATICFILES_DIRS:
-                    dir_str = str(d)
-                    if dir_str and dir_str not in directories:
-                        directories.append(dir_str)
-
-            if not directories:
-                return None
-
-            # Get CSP header if configured
-            csp_header = None
-            if hasattr(settings, "SECURE_CSP") and settings.SECURE_CSP:
-                # Build CSP header string from directives
-                csp_parts = []
-                for directive, sources in settings.SECURE_CSP.items():
-                    if sources:
-                        filtered = [s for s in sources if "CSP_NONCE_SENTINEL" not in s]
-                        if filtered:
-                            csp_parts.append(f"{directive} {' '.join(filtered)}")
-                    elif directive in ("upgrade-insecure-requests", "block-all-mixed-content"):
-                        csp_parts.append(directive)
-                if csp_parts:
-                    csp_header = "; ".join(csp_parts)
-
-            return {
-                "url_prefix": url_prefix,
-                "directories": directories,
-                "csp_header": csp_header,
-            }
-        except (ImportError, AttributeError):
-            return None
-
-    @staticmethod
     def _validate_asgi_mount_conflicts(api: BoltAPI) -> None:
         """Validate exact-path conflicts for ASGI mounts (same rule as production startup)."""
         _validate_asgi_mount_conflicts(api._routes, getattr(api, "_asgi_mounts", []))
@@ -431,14 +313,14 @@ class TestClient(httpx.Client):
             api: BoltAPI instance to test
             base_url: Base URL for requests
             raise_server_exceptions: If True, raise exceptions from handlers
-            cors_allowed_origins: Global CORS allowed origins for testing.
-                                  If None and read_django_settings=True, reads from Django settings.
-            read_django_settings: If True, read CORS settings from Django settings
-                                 when cors_allowed_origins is None. Default True.
+            cors_allowed_origins: Global CORS allowed origins for this test. They
+                                  replace the CORS settings. A "*" entry allows every origin.
+            read_django_settings: If True (the default), read the CORS, static and media
+                                 settings as runbolt reads them. If False, use none of them.
             use_http_layer: Ignored - all requests go through HTTP layer (Actix test utilities).
             static_files_config: Static files configuration dict with keys:
-                                 url_prefix, directories, csp_header.
-                                 If None and read_django_settings=True, reads from Django settings.
+                                 url_prefix, directories, csp_header, cache_control.
+                                 It replaces the static settings.
             share_db_connection: If True (the default), handlers use the database
                                  connection of the test while the client is open, so
                                  plain ``TestCase`` and ``django_db`` see the rows of
@@ -450,36 +332,17 @@ class TestClient(httpx.Client):
         # use_http_layer is ignored - we always use the HTTP layer now
         _ = use_http_layer
 
-        # Build CORS config dict for Rust
-        cors_config = None
-
-        if cors_allowed_origins is not None:
-            # Explicit origins provided - create minimal config
-            cors_config = {"origins": cors_allowed_origins}
-        elif read_django_settings:
-            # Read full CORS config from Django settings (same as production server)
-            cors_config = self._read_cors_settings_from_django()
-
-        # Build static files config
-        static_config = static_files_config
-        if static_config is None and read_django_settings:
-            static_config = self._read_static_files_settings_from_django()
-
         # Validate before allocating native test-app state. A failed constructor
         # has no client instance available to release that state.
         self._validate_asgi_mount_conflicts(api)
         self._validate_mcp_mount_conflicts(api)
 
-        # Create test app instance with full CORS config
-        # Pass trailing_slash setting to configure NormalizePath middleware
-        trailing_slash = getattr(api, "trailing_slash", "strip")
-        debug = getattr(settings, "DEBUG", False) if settings else False
+        # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
             api._dispatch,
-            debug,
-            cors_config,
-            trailing_slash,
-            static_config,
+            read_django_settings,
+            cors_allowed_origins,
+            static_files_config,
             api._rust_compression_config(),
         )
 
@@ -760,40 +623,26 @@ class AsyncTestClient(httpx.AsyncClient):
             api: BoltAPI instance to test
             base_url: Base URL for requests
             raise_server_exceptions: If True, raise exceptions from handlers
-            cors_allowed_origins: Global CORS allowed origins for testing.
-            read_django_settings: If True, read CORS settings from Django settings.
+            cors_allowed_origins: Global CORS allowed origins for this test. They
+                                  replace the CORS settings. A "*" entry allows every origin.
+            read_django_settings: If True (the default), read the CORS, static and media
+                                 settings as runbolt reads them. If False, use none of them.
             static_files_config: Static files configuration dict with keys:
-                                 url_prefix, directories, csp_header.
-                                 If None and read_django_settings=True, reads from Django settings.
+                                 url_prefix, directories, csp_header, cache_control.
+                                 It replaces the static settings.
             **kwargs: Additional arguments passed to httpx.AsyncClient
         """
-        # Build CORS config dict for Rust
-        cors_config = None
-
-        if cors_allowed_origins is not None:
-            cors_config = {"origins": cors_allowed_origins}
-        elif read_django_settings:
-            cors_config = TestClient._read_cors_settings_from_django()
-
-        # Build static files config
-        static_config = static_files_config
-        if static_config is None and read_django_settings:
-            static_config = TestClient._read_static_files_settings_from_django()
-
         # Validate before allocating native test-app state. A failed constructor
         # has no client instance available to release that state.
         TestClient._validate_asgi_mount_conflicts(api)
         TestClient._validate_mcp_mount_conflicts(api)
 
-        # Create test app instance with trailing_slash setting
-        trailing_slash = getattr(api, "trailing_slash", "strip")
-        debug = getattr(settings, "DEBUG", False) if settings else False
+        # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
             api._dispatch,
-            debug,
-            cors_config,
-            trailing_slash,
-            static_config,
+            read_django_settings,
+            cors_allowed_origins,
+            static_files_config,
             api._rust_compression_config(),
         )
 

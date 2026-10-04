@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
 use crate::middleware::client_ip::TrustedProxies;
+use crate::middleware::rate_limit::RateLimiters;
 use crate::router::Router;
 pub use bolt_loop::TASK_LOCALS;
 
@@ -112,6 +113,8 @@ pub struct AppState {
     pub global_compression_config: Option<Arc<CompressionConfig>>, // Global compression configuration used by middleware
     /// Deployment-wide forwarding-header trust policy.
     pub trusted_proxies: Arc<TrustedProxies>,
+    /// The rate-limit buckets. All workers of a process share one.
+    pub rate_limiters: Arc<RateLimiters>,
     pub router: Option<Arc<Router>>, // Router (used by test infrastructure, optional in production)
     pub route_metadata: Option<Arc<RouteMetadataStore>>, // Route metadata (used by test infrastructure)
     pub asgi_mounts: Option<Arc<Vec<AsgiMount>>>, // ASGI mounts (tests). Production uses GLOBAL_ASGI_MOUNTS.

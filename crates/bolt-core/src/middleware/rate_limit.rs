@@ -77,18 +77,19 @@ impl fmt::Display for KeySource<'_> {
     }
 }
 
-/// Per-key limiters. The quota is part of the identity: handler ids are reused
-/// after a reload or by the next test app, and a stale limiter must not keep
-/// an old quota alive.
-#[expect(
-    clippy::type_complexity,
-    reason = "the key is the limiter identity: handler id, quota and client key"
-)]
-static LIMITERS: Lazy<DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>>> =
-    Lazy::new(DashMap::new);
-
-// Track total limiter count for cleanup
-static LIMITER_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Per-key limiters of one server process. The quota is part of the
+/// identity: handler ids are reused after a reload, and a stale limiter must
+/// not keep an old quota alive.
+///
+/// `runbolt` makes one for all workers. A test app makes its own, because
+/// each test app starts its handler ids at 0.
+#[derive(Default)]
+pub struct RateLimiters {
+    /// Keyed on handler id, quota and client key.
+    limiters: DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>>,
+    /// The number of limiters, for cleanup.
+    count: AtomicUsize,
+}
 
 // SECURITY: Maximum number of rate limiters to prevent memory exhaustion
 const MAX_LIMITERS: usize = 100_000;
@@ -97,6 +98,7 @@ const MAX_LIMITERS: usize = 100_000;
 /// flood never pays for token verification. Identity keys return `None` here.
 #[inline]
 pub fn check_before_auth(
+    limiters: &RateLimiters,
     handler_id: usize,
     headers: &AHashMap<String, String>,
     client_ip: Option<&IpAddr>,
@@ -107,13 +109,20 @@ pub fn check_before_auth(
     if config.key.needs_identity() {
         return None;
     }
-    check_rate_limit(handler_id, headers, client_ip, None, config, method, path)
+    check_rate_limit(
+        limiters, handler_id, headers, client_ip, None, config, method, path,
+    )
 }
 
 /// The check for identity keys. Runs after authentication, with the
 /// `AuthContext` of the request. Other keys return `None` here.
 #[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the hot path passes borrowed request parts, with no struct to build"
+)]
 pub fn check_after_auth(
+    limiters: &RateLimiters,
     handler_id: usize,
     headers: &AHashMap<String, String>,
     client_ip: Option<&IpAddr>,
@@ -126,11 +135,16 @@ pub fn check_after_auth(
         return None;
     }
     check_rate_limit(
-        handler_id, headers, client_ip, auth_ctx, config, method, path,
+        limiters, handler_id, headers, client_ip, auth_ctx, config, method, path,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the hot path passes borrowed request parts, with no struct to build"
+)]
 pub fn check_rate_limit(
+    limiters: &RateLimiters,
     handler_id: usize,
     headers: &AHashMap<String, String>,
     client_ip: Option<&IpAddr>,
@@ -164,18 +178,19 @@ pub fn check_rate_limit(
     .unwrap_or(KeySource::Unknown);
 
     // SECURITY: Check if we've exceeded max limiters (prevent memory exhaustion)
-    let current_count = LIMITER_COUNT.load(Ordering::Relaxed);
+    let current_count = limiters.count.load(Ordering::Relaxed);
     if current_count >= MAX_LIMITERS {
         // Trigger cleanup of old limiters (simple LRU-style)
-        cleanup_old_limiters();
+        limiters.cleanup_old_limiters();
     }
 
     // Get or create rate limiter for this handler + key combination
-    let limiter = LIMITERS
+    let limiter = limiters
+        .limiters
         .entry((handler_id, rps, burst, source.bucket()))
         .or_insert_with(|| {
             // Increment counter
-            LIMITER_COUNT.fetch_add(1, Ordering::Relaxed);
+            limiters.count.fetch_add(1, Ordering::Relaxed);
 
             // Use NonZero constructors properly
             let rps_nonzero = std::num::NonZeroU32::new(rps.max(1)).unwrap();
@@ -223,22 +238,24 @@ fn identity_source<'a>(
         .or_else(|| client_ip.map(|ip| KeySource::Ip(*ip)))
 }
 
-/// Cleanup old rate limiters when limit is reached
-/// Simple strategy: remove 20% of limiters to make room for new ones
-fn cleanup_old_limiters() {
-    let to_remove = (MAX_LIMITERS as f64 * 0.2) as usize;
-    let mut removed = 0;
+impl RateLimiters {
+    /// Cleanup old rate limiters when limit is reached
+    /// Simple strategy: remove 20% of limiters to make room for new ones
+    fn cleanup_old_limiters(&self) {
+        let to_remove = (MAX_LIMITERS as f64 * 0.2) as usize;
+        let mut removed = 0;
 
-    // Remove first N entries (simple cleanup, not LRU)
-    LIMITERS.retain(|_, _| {
-        if removed < to_remove {
-            removed += 1;
-            LIMITER_COUNT.fetch_sub(1, Ordering::Relaxed);
-            false // Remove this entry
-        } else {
-            true // Keep this entry
-        }
-    });
+        // Remove first N entries (simple cleanup, not LRU)
+        self.limiters.retain(|_, _| {
+            if removed < to_remove {
+                removed += 1;
+                self.count.fetch_sub(1, Ordering::Relaxed);
+                false // Remove this entry
+            } else {
+                true // Keep this entry
+            }
+        });
+    }
 }
 
 #[cfg(test)]
