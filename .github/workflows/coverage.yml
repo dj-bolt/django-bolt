@@ -1,0 +1,127 @@
+name: Coverage
+
+# Report only: this workflow does not gate a merge. It measures Python and
+# Rust coverage over the whole test suite and shows it in the job summary.
+# The HTML reports are an artifact of the run.
+
+# A change to the docs only cannot change coverage, so it does not run this.
+# A pull request runs it only when it targets master. A stacked pull request
+# would run it again for each push to the stack, and wait for runners. Start
+# it by hand (workflow_dispatch) for a branch that needs a report earlier.
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  pull_request:
+    branches:
+      - master
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One group per pull request: a new push cancels the run for the old commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Python and Rust coverage
+    runs-on: ubuntu-latest
+    # A full run takes about 10 minutes. A hung test must not hold a runner
+    # until a new push cancels the run.
+    timeout-minutes: 30
+    # The PostgreSQL tests skip without a DSN; the service lets them count.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DJANGO_BOLT_TEST_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "latest"
+
+      # The newest GIL interpreter, as CI.yml gets it. The Rust code under
+      # #[cfg(Py_GIL_DISABLED)] (src/response_body.rs) compiles only for a
+      # free-threaded interpreter, so this report does not include it.
+      - name: Set up Python
+        run: |
+          newest=$(python3 scripts/ci_versions.py | sed -n 's/^newest-version=//p')
+          uv python install "$newest"
+          uv venv --python "$newest"
+
+      - name: Install Rust
+        # Toolchain comes from rust-toolchain.toml.
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          build-warnings: ""
+
+      - name: Install the LLVM tools
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      # --no-install-project: scripts/coverage.sh builds the instrumented
+      # extension itself.
+      - name: Install dependencies
+        run: uv sync --all-extras --no-install-project
+
+      - name: Measure coverage
+        run: ./scripts/coverage.sh
+
+      - name: Write the job summary
+        if: always()
+        run: |
+          # A report that the script could not write is missing; say so.
+          {
+            echo "## Python coverage"
+            echo
+            if [ -s coverage/python.md ]; then cat coverage/python.md; else echo "No report. See the Measure coverage step."; fi
+            echo
+            echo "## Rust coverage"
+            echo
+            if [ -s coverage/rust.txt ]; then
+              echo '```'
+              cat coverage/rust.txt
+              echo '```'
+            else
+              echo "No report. See the Measure coverage step."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the HTML reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-html
+          path: |
+            coverage/python-html
+            coverage/rust-html

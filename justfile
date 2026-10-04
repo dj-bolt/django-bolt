@@ -123,6 +123,11 @@ test-rs:
 clippy:
     uv run cargo clippy --workspace --all-targets -- -D warnings
 
+# The script puts back the extension build that it found.
+# Measure Python and Rust coverage; reports go to coverage/ (needs cargo-llvm-cov)
+coverage:
+    ./scripts/coverage.sh
+
 # Run the tests that need PostgreSQL (`@pytest.mark.postgres`) against a
 # throwaway Docker server. These skip in `test-py` unless
 # DJANGO_BOLT_TEST_POSTGRES_DSN is set.

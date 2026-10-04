@@ -51,6 +51,9 @@ just lint-lib
 | `just rebuild` | Clean and rebuild from scratch |
 | `just clean` | Remove build artifacts |
 | `just test-py` | Run the Python test suite |
+| `just test-rs` | Run the Rust unit tests |
+| `just clippy` | Lint the Rust code (CI fails on any warning) |
+| `just coverage` | Measure Python and Rust coverage into `coverage/` (needs `cargo-llvm-cov`) |
 | `just lint` | Run ruff on library, tests, and examples |
 | `just lint-lib` | Lint library code only (must always pass) |
 | `just ruff-fix` | Auto-fix lint errors |
@@ -98,13 +101,16 @@ Anything on the per-request path (`api.py:_dispatch`, `serialization.py`, `_kwar
 ## Testing
 
 ```bash
-just test-py                                                    # everything
-uv run --with pytest pytest python/tests/test_syntax.py -s -vv  # one file
-uv run --with pytest pytest python/tests/test_syntax.py::test_name -s -vv
+just test-py                                         # everything
+uv run pytest python/tests/test_syntax.py -s -vv     # one file
+uv run pytest python/tests/test_syntax.py::test_name -s -vv
+just test-rs                                         # Rust unit tests
 ```
 
 Guidelines:
 
+- **Warnings fail the tests.** `pytest.ini` turns each warning into an error. Fix the cause of a warning. If you must silence a warning, add an `ignore` line to `filterwarnings` and give the reason.
+- **Do not skip on a missing dev dependency.** Add the dependency to the `dev` group in `pyproject.toml`.
 - **Red-Green.** Write the test first and confirm it fails without your change. A test that passes without the fix is not testing the fix.
 - **Use `TestClient`** for integration tests. It runs requests through the full Rust pipeline in-process — fast and deterministic:
 
@@ -148,8 +154,9 @@ Docs live in `docs/src/` and are published at [bolt.farhana.li](https://bolt.far
 ## Submitting a pull request
 
 1. Make sure `just test-py` and `just lint-lib` pass.
-2. If you touched Rust, make sure `just build` succeeds from clean (`just rebuild`).
-3. If you touched hot paths, include before/after numbers from `4. Push your branch and open a PR against `master`. Fill in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
+2. If you touched Rust, make sure `just build` succeeds from clean (`just rebuild`), and that `just clippy` and `just test-rs` pass.
+3. If you touched hot paths, include before/after numbers from `just save-bench`.
+4. Push your branch and open a PR against `master`. Fill in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
 5. Keep the PR description focused on **what** changed and **why**; link related issues.
 
 A maintainer will review your PR. Please be patient — and feel free to ping on Discord if it has been quiet for a while.
