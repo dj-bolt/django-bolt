@@ -206,11 +206,22 @@ def test_the_next_request_takes_a_lane_that_still_finishes_a_call():
             await asyncio.wait_for(sync_to_thread(wait_for_finish), 0.01)
         return {}
 
-    with TestClient(api) as client:
-        lane = client.get("/ident").json()["ident"]
-        assert client.get("/abandon").status_code == 200
-        threading.Timer(0.2, finish.set).start()
-        next_lane = client.get("/ident").json()["ident"]
+    @api.get("/next")
+    async def next_ident():
+        # The first step of the task submits its call, so it takes a lane.
+        call = asyncio.ensure_future(sync_to_thread(threading.get_ident))
+        await asyncio.sleep(0)
+        # Only now let the abandoned call end. Its lane must already be idle.
+        finish.set()
+        return {"ident": await call}
+
+    try:
+        with TestClient(api) as client:
+            lane = client.get("/ident").json()["ident"]
+            assert client.get("/abandon").status_code == 200
+            next_lane = client.get("/next").json()["ident"]
+    finally:
+        finish.set()
 
     assert next_lane == lane
 
