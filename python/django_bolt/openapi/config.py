@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .plugins import (
     RapidocRenderPlugin,
@@ -224,52 +223,22 @@ class OpenAPIConfig:
     auth: list[BaseAuthentication] | None = field(default=None)
     """Authentication backends for OpenAPI documentation endpoints.
 
-    When set, these authentication backends will be used to authenticate
-    requests to documentation endpoints. Required when using guards that
-    depend on authentication (e.g., IsAuthenticated, Requires).
+    These backends authenticate requests to the documentation endpoints, as
+    ``auth`` does on a route. Without a value, the docs use
+    ``BOLT_AUTHENTICATION_CLASSES``. A browser sends no token, so use
+    ``SessionAuthentication`` for docs that people open in a browser.
 
     Example:
         ```python
         from django_bolt.openapi import OpenAPIConfig
-        from django_bolt.auth import JWTAuthentication, IsAuthenticated
+        from django_bolt.auth import SessionAuthentication, Requires
 
-        # Protect docs with JWT authentication
+        # Staff users who logged in to the Django admin
         OpenAPIConfig(
             title="My API",
             version="1.0.0",
-            auth=[JWTAuthentication()],
-            guards=[IsAuthenticated()]
-        )
-        ```
-    """
-
-    django_auth: Callable[..., Any] | bool | None = field(default=None)
-    """Django authentication decorator for OpenAPI documentation endpoints.
-
-    Use this to protect docs with Django's built-in authentication decorators
-    like login_required or staff_member_required.
-
-    Can be:
-    - True: Apply login_required (redirects to login page if not authenticated)
-    - A Django decorator: Apply directly (e.g., staff_member_required)
-
-    Example:
-        ```python
-        from django.contrib.auth.decorators import login_required
-        from django.contrib.admin.views.decorators import staff_member_required
-
-        # Login required (shorthand)
-        OpenAPIConfig(
-            title="My API",
-            version="1.0.0",
-            django_auth=True
-        )
-
-        # Staff only
-        OpenAPIConfig(
-            title="My API",
-            version="1.0.0",
-            django_auth=staff_member_required
+            auth=[SessionAuthentication(login_url="/admin/login/")],
+            guards=[Requires("is_staff", True)]
         )
         ```
     """

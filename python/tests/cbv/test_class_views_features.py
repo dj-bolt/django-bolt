@@ -185,7 +185,7 @@ def test_cookie_parameter_extraction(api):
 
     with TestClient(api) as client:
         # With cookies
-        response = client.get("/session", cookies={"session": "abc123", "theme": "dark"})
+        response = client.get("/session", headers={"Cookie": "session=abc123; theme=dark"})
         assert response.status_code == 200
         assert response.json()["session_id"] == "abc123"
         assert response.json()["theme"] == "dark"

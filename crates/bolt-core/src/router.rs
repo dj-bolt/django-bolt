@@ -162,6 +162,12 @@ pub struct Router {
     query: MethodRouter,
 }
 
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Router {
     pub fn new() -> Self {
         Router {
@@ -306,12 +312,10 @@ impl Router {
         ];
 
         for (method_name, method_router) in method_routers.iter() {
-            // Check static routes first (O(1))
-            if method_router.static_routes.contains_key(path) {
-                methods.push(method_name.to_string());
-            }
-            // Then check dynamic routes (radix tree)
-            else if method_router.dynamic_router.at(path).is_ok() {
+            // Check static routes first (O(1)), then dynamic routes (radix tree).
+            if method_router.static_routes.contains_key(path)
+                || method_router.dynamic_router.at(path).is_ok()
+            {
                 methods.push(method_name.to_string());
             }
         }

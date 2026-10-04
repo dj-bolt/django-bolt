@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
 from _helpers import initialize, mint_jwt, parse_rpc, post_rpc
 from bolt_mcp import MCP, mount_mcp
+from django.core.exceptions import ImproperlyConfigured
+from django.test import override_settings
 
-from django_bolt import BoltAPI, IsAuthenticated, JWTAuthentication, Request, Requires
+from django_bolt import BoltAPI, IsAuthenticated, JWTAuthentication, Request, Requires, SessionAuthentication
 from django_bolt.testing import TestClient
 
 SECRET = "tier1-secret-key-0123456789-abcdefgh"
@@ -97,3 +100,22 @@ def test_per_tool_guard_allows_then_rejects_call():
         body = parse_rpc(rejected)
         succeeded = "error" not in body and body.get("result", {}).get("isError") is False
         assert not succeeded, "a tool whose guard fails must not execute successfully"
+
+
+def test_session_backend_on_a_mount_is_an_error():
+    """Django middleware does not run on a mount, so a session backend cannot work there."""
+    with pytest.raises(ImproperlyConfigured, match="SessionAuthentication"):
+        mount_mcp(BoltAPI(), MCP("session-server"), auth=[SessionAuthentication()])
+
+
+def test_a_session_default_is_dropped_on_a_mount():
+    """The other default backends still authenticate the mount."""
+    with override_settings(
+        BOLT_AUTHENTICATION_CLASSES=[SessionAuthentication(), JWTAuthentication(secret=SECRET)],
+    ):
+        api = BoltAPI()
+        mount_mcp(api, MCP("default-server"), guards=[IsAuthenticated()])
+        with TestClient(api) as client:
+            assert initialize(client)[0].status_code == 401
+            bearer = f"Bearer {mint_jwt(SECRET, sub='7')}"
+            assert initialize(client, authorization=bearer)[0].status_code == 200

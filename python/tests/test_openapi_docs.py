@@ -12,10 +12,19 @@ from typing import Annotated
 import jwt
 import msgspec
 import pytest
-from django.contrib.admin.views.decorators import staff_member_required
+from django.contrib.auth import alogin
+from django.contrib.auth.models import User
+from django.test import override_settings
 
-from django_bolt import BoltAPI
-from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
+from django_bolt import BoltAPI, Request
+from django_bolt.auth import (
+    AllowAny,
+    APIKeyAuthentication,
+    IsAuthenticated,
+    JWTAuthentication,
+    Requires,
+    SessionAuthentication,
+)
 from django_bolt.datastructures import UploadFile
 from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, SwaggerRenderPlugin
 from django_bolt.openapi.spec import Components, SecurityScheme
@@ -379,80 +388,61 @@ def test_openapi_all_routes_protected():
             assert response.status_code == 401, f"Route {route} should be protected (401), got {response.status_code}"
 
 
-def test_openapi_django_auth_redirects_to_login():
-    """Test that django_auth=True redirects unauthenticated users to login."""
+def _docs_api_with_login(**config) -> BoltAPI:
+    """Docs protected by the session backend, plus a route that logs a user in."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0", **config))
 
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0", django_auth=True))
-
-    @api.get("/test")
-    async def test_endpoint():
-        return {"status": "ok"}
-
-    api._register_openapi_routes()
-
-    with TestClient(api) as client:
-        # Without authentication, should redirect to login
-        response = client.get("/docs", follow_redirects=False)
-
-        # Django's login_required returns 302 redirect to login page
-        assert response.status_code == 302, f"Expected 302 redirect, got {response.status_code}"
-
-        # Should redirect to login URL (contains 'login' or 'accounts/login')
-        location = response.headers.get("location", "")
-        assert "login" in location.lower(), f"Should redirect to login page, got: {location}"
-
-
-def test_openapi_django_auth_with_staff_member_required():
-    """Test that staff_member_required decorator redirects non-staff to admin login."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0", django_auth=staff_member_required))
-
-    @api.get("/test")
-    async def test_endpoint():
-        return {"status": "ok"}
+    @api.post("/login", auth=[SessionAuthentication()], guards=[AllowAny()])
+    async def login(request: Request, username: str):
+        await alogin(request, await User.objects.aget(username=username))
+        return {"ok": True}
 
     api._register_openapi_routes()
-
-    with TestClient(api) as client:
-        # staff_member_required redirects to admin login
-        response = client.get("/docs", follow_redirects=False)
-        assert response.status_code == 302, f"Expected 302 redirect, got {response.status_code}"
-
-        # Should redirect to admin login
-        location = response.headers.get("location", "")
-        assert "admin" in location.lower() or "login" in location.lower(), (
-            f"Should redirect to admin login, got: {location}"
-        )
+    return api
 
 
-def test_openapi_django_auth_all_routes_protected():
-    """Test that all OpenAPI routes are protected when django_auth is set."""
-    api = BoltAPI(
-        openapi_config=OpenAPIConfig(
-            title="Test API", version="1.0.0", path="/docs", django_auth=True, render_plugins=[SwaggerRenderPlugin()]
-        )
+@pytest.mark.django_db(transaction=True)
+def test_openapi_session_auth_redirects_to_login():
+    """An anonymous browser goes to the login page of the session backend."""
+    api = _docs_api_with_login(
+        auth=[SessionAuthentication(login_url="/admin/login/")],
+        guards=[IsAuthenticated()],
+        render_plugins=[SwaggerRenderPlugin()],
     )
 
-    @api.get("/test")
-    async def test_endpoint():
-        return {"status": "ok"}
-
-    api._register_openapi_routes()
-
     with TestClient(api) as client:
-        # All doc routes should redirect to login (302)
-        routes_to_test = [
-            "/docs/openapi.json",
-            "/docs/openapi.yaml",
-            "/docs/openapi.yml",
-            "/docs",
-            "/docs/swagger",
-        ]
-
-        for route in routes_to_test:
+        for route in ("/docs/openapi.json", "/docs/openapi.yaml", "/docs/openapi.yml", "/docs", "/docs/swagger"):
             response = client.get(route, follow_redirects=False)
-            assert response.status_code == 302, (
-                f"Route {route} should redirect to login (302), got {response.status_code}"
-            )
+            assert response.status_code == 302, f"{route}: {response.status_code}"
+            assert response.headers["location"].startswith("/admin/login/?next="), response.headers["location"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_openapi_session_auth_ignores_global_jwt_default():
+    """Docs with a session backend work when the project default is JWT.
+
+    Regression test for https://github.com/dj-bolt/django-bolt/issues/378.
+    """
+    User.objects.create_user(username="docs_member", password="pw-for-tests")
+    User.objects.create_user(username="docs_staff", password="pw-for-tests", is_staff=True)
+    with override_settings(
+        BOLT_AUTHENTICATION_CLASSES=[JWTAuthentication(secret="test-secret")],
+        BOLT_DEFAULT_PERMISSION_CLASSES=[IsAuthenticated()],
+    ):
+        api = _docs_api_with_login(
+            auth=[SessionAuthentication(login_url="/admin/login/")],
+            guards=[Requires("is_staff", True)],
+        )
+        with TestClient(api) as member, TestClient(api) as staff:
+            assert member.get("/docs", follow_redirects=False).status_code == 302
+            for client, username in ((member, "docs_member"), (staff, "docs_staff")):
+                response = client.post(f"/login?username={username}", headers={"sec-fetch-site": "same-origin"})
+                assert response.status_code == 200, response.text
+
+            assert member.get("/docs").status_code == 403
+            for route in ("/docs", "/docs/openapi.json"):
+                response = staff.get(route, follow_redirects=False)
+                assert response.status_code == 200, f"{route}: {response.status_code} {response.text}"
 
 
 def test_openapi_security_requirements_for_authenticated_routes():

@@ -32,7 +32,7 @@ impl Audience {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: Option<String>,              // Subject (user ID)
     pub exp: Option<i64>,                 // Expiry time
@@ -115,6 +115,23 @@ impl AuthContext {
             claims: None,
             permissions,
             cookie_csrf: false,
+        }
+    }
+
+    /// The context of a request that carries a Django session cookie.
+    ///
+    /// Rust cannot read a Django session, so the context has no user.
+    /// Django loads the user, and Python checks the guards of the route.
+    pub fn from_session(backend_index: usize, cookie_csrf: bool) -> Self {
+        AuthContext {
+            user_id: None,
+            is_staff: false,
+            is_superuser: false,
+            backend: "session".to_string(),
+            backend_index: Some(backend_index),
+            claims: None,
+            permissions: HashSet::new(),
+            cookie_csrf,
         }
     }
 }
@@ -256,6 +273,19 @@ pub enum AuthBackend {
         header: String,
         key_permissions: HashMap<String, Vec<String>>,
     },
+    /// Django session authentication. Rust only finds the session cookie.
+    /// Django's middleware loads the session and the user (see
+    /// `session_context`).
+    Session {
+        /// Django's `SESSION_COOKIE_NAME`, read at registration.
+        cookie: String,
+        /// Enforce the CSRF origin check on unsafe methods.
+        csrf: bool,
+        /// The backend redirects a request with no logged-in user to a login
+        /// page. Python builds the redirect, so a request with no cookie also
+        /// gets a session context.
+        login_redirect: bool,
+    },
 }
 
 fn algorithm_family(alg: Algorithm) -> AlgorithmFamily {
@@ -343,6 +373,10 @@ pub fn build_jwks_key_source(jwks_json: &str) -> Result<JwtKeySource, String> {
 /// Authenticate using configured backends and return AuthContext.
 /// Returns None if no authentication was successful. The context records
 /// the position of the backend that accepted the credential.
+///
+/// A session backend never authenticates here. Rust cannot verify a
+/// session, so a token that Rust can verify comes first. See
+/// `session_context`.
 pub fn authenticate(
     headers: &AHashMap<String, String>,
     backends: &[AuthBackend],
@@ -388,7 +422,56 @@ fn authenticate_with(
             header,
             key_permissions,
         } => try_api_key_auth(headers, api_keys, header, key_permissions),
+        AuthBackend::Session { .. } => None,
     }
+}
+
+/// The session context of a request on a route with a session backend.
+///
+/// Rust cannot read a Django session, so the context has no user. The first
+/// session backend of the route gives the context:
+///
+/// - When the guards cannot reject, always. Its CSRF flag then covers every
+///   unsafe request, also with no cookie, so a cross-site page cannot log a
+///   browser in.
+/// - When the guards can reject, only for a request that Django must decide:
+///   one with a session cookie, or any request when the backend redirects to
+///   a login page. Other requests get 401 in Rust.
+pub fn session_context(
+    headers: &AHashMap<String, String>,
+    backends: &[AuthBackend],
+    guards_enforcing: bool,
+) -> Option<AuthContext> {
+    let (index, cookie, csrf, login_redirect) =
+        backends
+            .iter()
+            .enumerate()
+            .find_map(|(index, backend)| match backend {
+                AuthBackend::Session {
+                    cookie,
+                    csrf,
+                    login_redirect,
+                } => Some((index, cookie, *csrf, *login_redirect)),
+                _ => None,
+            })?;
+    let defer = !guards_enforcing
+        || login_redirect
+        || headers
+            .get("cookie")
+            .is_some_and(|raw| has_cookie_value(raw, cookie));
+    defer.then(|| AuthContext::from_session(index, csrf))
+}
+
+/// Whether any pair of a raw Cookie header has this name and a value.
+///
+/// Django reads the last pair of a name, Rust code elsewhere the first. An
+/// empty pair must not hide another pair, so every pair counts.
+fn has_cookie_value(raw_cookie: &str, name: &str) -> bool {
+    raw_cookie.split(';').any(|pair| {
+        pair.trim()
+            .split_once('=')
+            .is_some_and(|(key, value)| key == name && !value.is_empty())
+    })
 }
 
 /// Find a cookie value by name in a raw Cookie header string.
@@ -625,13 +708,10 @@ fn try_api_key_auth(
     let api_key_header = headers.get(header_name)?;
 
     // Extract key (remove "Bearer " or "ApiKey " prefix if present)
-    let api_key = if api_key_header.starts_with("Bearer ") {
-        &api_key_header[7..]
-    } else if api_key_header.starts_with("ApiKey ") {
-        &api_key_header[7..]
-    } else {
-        api_key_header
-    };
+    let api_key = api_key_header
+        .strip_prefix("Bearer ")
+        .or_else(|| api_key_header.strip_prefix("ApiKey "))
+        .unwrap_or(api_key_header);
 
     // Check if key is valid - use constant-time comparison for security
     if api_keys.contains(api_key) {

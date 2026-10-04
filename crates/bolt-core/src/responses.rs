@@ -178,7 +178,6 @@ mod tests {
         let body = response
             .into_body()
             .try_into_bytes()
-            .ok()
             .expect("body is bytes");
         let json: serde_json::Value =
             serde_json::from_slice(&body).expect("422 body is valid JSON");

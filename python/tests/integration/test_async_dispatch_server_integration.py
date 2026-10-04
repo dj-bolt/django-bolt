@@ -146,11 +146,14 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
             assert self.read_line(self.request) == b"STARTTLS\n"
             self.request.sendall(b"READY\n")
             self.request = tls_context.wrap_socket(self.request, server_side=True)
-            assert self.read_line(self.request) == b"over-tls\n"
-            self.request.sendall(b"tls-ok\n")
-            # Close TLS before TCP. A bare close races the close_notify
-            # of the probe, and the socket then answers with RST.
-            self.request.unwrap()
+            # socketserver closes only the original socket, which wrap_socket detached.
+            # The with block closes the TLS socket also when a step below raises.
+            with self.request:
+                assert self.read_line(self.request) == b"over-tls\n"
+                self.request.sendall(b"tls-ok\n")
+                # Close TLS before TCP. A bare close races the close_notify
+                # of the probe, and the socket then answers with RST.
+                self.request.unwrap()
 
     starttls_server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), StartTLSHandler)
     starttls_thread = threading.Thread(target=starttls_server.serve_forever, daemon=True)

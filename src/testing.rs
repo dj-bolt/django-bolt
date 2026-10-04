@@ -375,6 +375,10 @@ pub fn destroy_test_app(app_id: u64) -> PyResult<()> {
 
 /// Register HTTP routes for a test app
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: Python passes each route as one tuple"
+)]
 pub fn register_test_routes(
     _py: Python<'_>,
     app_id: u64,
@@ -397,6 +401,10 @@ pub fn register_test_routes(
 
 /// Register WebSocket routes for a test app
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: Python passes each WebSocket route as one tuple"
+)]
 pub fn register_test_websocket_routes(
     _py: Python<'_>,
     app_id: u64,
@@ -516,6 +524,10 @@ pub fn register_test_middleware_metadata(
 /// and cannot be used with pyo3_async_runtimes::future_into_py. We create
 /// a local tokio runtime for each request instead.
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: TestClient reads (status, headers, body) as one tuple"
+)]
 pub fn test_request(
     py: Python<'_>,
     app_id: u64,
@@ -840,7 +852,7 @@ async fn handle_test_request_internal(
     let route_meta = route_metadata.get(handler_id).cloned();
     let can_lane_dispatch = route_meta
         .as_ref()
-        .map_or(false, |m| m.plan.can_lane_dispatch());
+        .is_some_and(|m| m.plan.can_lane_dispatch());
 
     // Parse query string
     let needs_query = route_meta
@@ -909,9 +921,11 @@ async fn handle_test_request_internal(
 
     // Host and scheme retain Actix behavior; REMOTE_ADDR uses Bolt's explicit
     // forwarding-header trust policy.
-    let conn_info = req.connection_info();
-    let conn_host = conn_info.host().to_owned();
-    let conn_scheme = conn_info.scheme().to_owned();
+    // Copy the values out, so the `RefCell` borrow ends before the awaits below.
+    let (conn_host, conn_scheme) = {
+        let conn_info = req.connection_info();
+        (conn_info.host().to_owned(), conn_info.scheme().to_owned())
+    };
     let conn_remote_addr = client_ip;
 
     // Rate limiting: address and header keys before auth, identity keys after.
@@ -933,24 +947,21 @@ async fn handle_test_request_internal(
 
     // Auth and guards
     let auth_ctx = if let Some(ref meta) = route_meta {
-        match validate_auth_and_guards(&headers, &meta.auth_backends, &meta.guards) {
-            AuthGuardResult::Allow(ctx) => {
-                let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
-                if bolt_core::validation::cookie_csrf_blocks(
-                    method,
-                    &headers,
-                    requires_csrf,
-                    &conn_scheme,
-                ) {
-                    return responses::error_403();
-                }
-                ctx
-            }
+        let ctx = match validate_auth_and_guards(&headers, &meta.auth_backends, &meta.guards) {
+            AuthGuardResult::Allow(ctx) => ctx,
+            // The Python dispatch checks the guards against the Django user.
+            AuthGuardResult::Deferred(ctx) => Some(ctx),
             AuthGuardResult::Unauthorized => return responses::error_401(),
             AuthGuardResult::Forbidden(denial) => {
                 return responses::error_403_denial(denial.as_deref())
             }
+        };
+        let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
+        if bolt_core::validation::cookie_csrf_blocks(method, &headers, requires_csrf, &conn_scheme)
+        {
+            return responses::error_403();
         }
+        ctx
     } else {
         None
     };
@@ -1019,7 +1030,7 @@ async fn handle_test_request_internal(
     // production helpers so payload-size limits behave identically under
     // TestClient (per src/CLAUDE.md: tests reuse production code). Only computed
     // for routes that read a body.
-    let needs_body = route_meta.as_ref().map_or(true, |m| m.plan.needs_body());
+    let needs_body = route_meta.as_ref().is_none_or(|m| m.plan.needs_body());
     let reads_body = needs_body || needs_form_parsing;
     let content_length = if reads_body {
         parse_content_length(&req)
@@ -1325,6 +1336,10 @@ async fn handle_test_request_internal(
 /// When `is_asgi_mount` is true, `handler` is a raw ASGI application and the
 /// caller must drive it with the scope, receive, and send triple.
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: the Python TestClient unpacks this tuple"
+)]
 pub fn handle_test_websocket(
     py: Python<'_>,
     app_id: u64,
@@ -1620,7 +1635,7 @@ pub fn handle_test_websocket(
     }
     scope_dict.set_item("cookies", cookies_dict)?;
 
-    let client_tuple = pyo3::types::PyTuple::new(py, &["127.0.0.1", "12345"])?;
+    let client_tuple = pyo3::types::PyTuple::new(py, ["127.0.0.1", "12345"])?;
     scope_dict.set_item("client", client_tuple)?;
 
     // Add auth context if present

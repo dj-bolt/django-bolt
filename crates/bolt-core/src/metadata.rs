@@ -6,17 +6,20 @@ use actix_web::http::header::HeaderValue;
 use ahash::{AHashMap, AHashSet};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
-    build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, JwtKeySource,
-    RefreshingJwks,
+    build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, AuthContext,
+    Claims, JwtKeySource, RefreshingJwks,
 };
-use crate::permissions::{ClaimKey, Guard, GuardDenial, GuardSet, Quantifier};
+use crate::permissions::{
+    evaluate_guards, ClaimKey, Guard, GuardDenial, GuardResult, GuardSet, Quantifier,
+};
+use crate::responses::{ERROR_BODY_401, ERROR_BODY_403};
 use crate::type_coercion::TypeHints;
 
 /// Request value source for Rust-side argument prebinding.
@@ -145,6 +148,10 @@ impl Default for CorsConfig {
 
 impl CorsConfig {
     /// Create CorsConfig from Django settings (django-cors-headers compatible)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument for each django-cors-headers setting"
+    )]
     pub fn from_django_settings(
         origins: Vec<String>,
         origin_regexes: Vec<String>,
@@ -155,15 +162,8 @@ impl CorsConfig {
         expose_headers: Option<Vec<String>>,
         max_age: Option<u32>,
     ) -> Self {
-        let mut config = CorsConfig::default();
-
-        // Build origin set for O(1) lookups
-        config.origin_set = origins.iter().cloned().collect();
-        config.origins = origins;
-
         // Compile origin regex patterns at startup
-        config.origin_regexes = origin_regexes.clone();
-        config.compiled_origin_regexes = origin_regexes
+        let compiled_origin_regexes = origin_regexes
             .iter()
             .filter_map(|pattern| {
                 Regex::new(pattern).ok().or_else(|| {
@@ -176,8 +176,16 @@ impl CorsConfig {
             })
             .collect();
 
-        config.allow_all_origins = allow_all_origins;
-        config.credentials = allow_credentials;
+        let mut config = CorsConfig {
+            // Build origin set for O(1) lookups
+            origin_set: origins.iter().cloned().collect(),
+            origins,
+            origin_regexes,
+            compiled_origin_regexes,
+            allow_all_origins,
+            credentials: allow_credentials,
+            ..Default::default()
+        };
 
         if let Some(methods) = allow_methods {
             config.methods_str = methods.join(", ");
@@ -1104,10 +1112,94 @@ pub fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyRe
                 key_permissions,
             })
         }
+        "session" => {
+            let cookie = dict
+                .get("cookie")
+                .ok_or_else(|| PyValueError::new_err("Session auth backend missing 'cookie'"))?
+                .extract::<String>(py)?;
+            let csrf = match dict.get("csrf") {
+                Some(value) => value.extract::<bool>(py)?,
+                None => true,
+            };
+            let login_redirect = match dict.get("login_redirect") {
+                Some(value) => value.extract::<bool>(py)?,
+                None => false,
+            };
+            Ok(AuthBackend::Session {
+                cookie,
+                csrf,
+                login_redirect,
+            })
+        }
         other => Err(PyValueError::new_err(format!(
             "Unknown auth backend type '{}'",
             other
         ))),
+    }
+}
+
+/// The guards of a route, checked against a user that Django loaded.
+///
+/// Rust cannot read a Django session. For a session request, Python loads
+/// the user through Django and calls `check`. The guards keep one
+/// implementation: `evaluate_guards`.
+#[pyclass(frozen, module = "django_bolt._core")]
+pub struct GuardCheck {
+    guards: GuardSet,
+}
+
+#[pymethods]
+impl GuardCheck {
+    /// Build the check once at registration from the compiled guard metadata.
+    #[new]
+    fn new(py: Python<'_>, guards: Vec<HashMap<String, Py<PyAny>>>) -> PyResult<Self> {
+        let guards = guards
+            .iter()
+            .map(|guard| parse_guard(guard, py))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Self {
+            guards: GuardSet::from_guards(guards),
+        })
+    }
+
+    /// Check the guards against the user. `user_id` is None for an anonymous
+    /// user. Returns None when the guards allow the request, else the status
+    /// and the JSON body of the rejection.
+    fn check<'py>(
+        &self,
+        py: Python<'py>,
+        user_id: Option<String>,
+        is_staff: bool,
+        is_superuser: bool,
+        permissions: HashSet<String>,
+    ) -> Option<(u16, Bound<'py, PyBytes>)> {
+        // An anonymous user has no credential, as a request with no token.
+        let ctx = user_id.map(|sub| AuthContext {
+            user_id: Some(sub.clone()),
+            is_staff,
+            is_superuser,
+            backend: "session".to_string(),
+            backend_index: None,
+            // `Requires` reads these claims. `permissions` reads the set below.
+            claims: Some(Claims {
+                sub: Some(sub),
+                is_staff: Some(is_staff),
+                is_superuser: Some(is_superuser),
+                ..Claims::default()
+            }),
+            permissions,
+            cookie_csrf: false,
+        });
+        match evaluate_guards(&self.guards, ctx.as_ref()) {
+            GuardResult::Allow => None,
+            GuardResult::Unauthorized => Some((401, PyBytes::new(py, ERROR_BODY_401))),
+            GuardResult::Forbidden(denial) => {
+                let body = denial
+                    .as_deref()
+                    .map_or(ERROR_BODY_403, |denial| &denial.body[..]);
+                Some((403, PyBytes::new(py, body)))
+            }
+        }
     }
 }
 

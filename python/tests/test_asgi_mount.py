@@ -345,6 +345,7 @@ def test_mount_django_rewrites_root_relative_redirect_location():
         (b"location", b"/accounts/", b"/django/accounts/"),
         ("location", "/accounts/", "/django/accounts/"),
     ],
+    ids=["bytes", "str"],
 )
 def test_rewrite_django_mount_redirect_message_handles_location_value_types(header_name, header_value, expected_value):
     message = {

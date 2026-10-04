@@ -165,6 +165,10 @@ fn read_max_age_setting(
 }
 
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: Python passes each route as one tuple"
+)]
 pub fn register_routes(
     _py: Python<'_>,
     routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
@@ -180,13 +184,17 @@ pub fn register_routes(
 }
 
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: Python passes each WebSocket route as one tuple"
+)]
 pub fn register_websocket_routes(
     _py: Python<'_>,
     routes: Vec<(String, usize, Py<PyAny>, Option<Py<PyAny>>)>,
 ) -> PyResult<()> {
     let mut router = WebSocketRouter::new();
     for (path, handler_id, handler, injector) in routes {
-        router.register(&path, handler_id, handler.into(), injector)?;
+        router.register(&path, handler_id, handler, injector)?;
     }
     GLOBAL_WEBSOCKET_ROUTER.set(Arc::new(router)).map_err(|_| {
         pyo3::exceptions::PyRuntimeError::new_err("WebSocket router already initialized")
@@ -294,7 +302,7 @@ pub fn start_server(
         };
         let locals = pyo3_async_runtimes::TaskLocals::new(ev.clone()).copy_context(py)?;
         let _ = TASK_LOCALS.set(locals);
-        ev.unbind().into()
+        ev.unbind()
     };
     std::thread::spawn(move || {
         Python::attach(|py| {
@@ -339,7 +347,7 @@ pub fn start_server(
             let settings = django_conf.getattr("settings")?;
             settings.getattr("BOLT_MAX_UPLOAD_SIZE")?.extract::<usize>()
         })()
-        .unwrap_or(1 * 1024 * 1024); // Default 1MB
+        .unwrap_or(1024 * 1024); // Default 1MB
 
         let asgi_mount_timeout = (|| -> PyResult<f64> {
             let django_conf = py.import("django.conf")?;
@@ -354,6 +362,7 @@ pub fn start_server(
         .unwrap_or_else(|| Duration::from_secs(30)); // Default 30s
 
         // Read django-cors-headers compatible CORS settings
+        #[expect(clippy::type_complexity, reason = "the tuple holds the CORS settings until CorsConfig::from_django_settings takes them")]
         let cors_data = (|| -> PyResult<(Vec<String>, Vec<String>, bool, bool, Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>, Option<u32>)> {
             let django_conf = py.import("django.conf")?;
             let settings = django_conf.getattr("settings")?;
@@ -714,7 +723,7 @@ pub fn start_server(
         // Clone the metadata HashMap to make it mutable
         let mut updated_metadata = metadata_temp.clone();
 
-        for (_handler_id, route_meta) in updated_metadata.iter_mut() {
+        for route_meta in updated_metadata.values_mut() {
             // Inject CORS if:
             // 1. Route doesn't have explicit cors_config
             // 2. CORS not skipped via @skip_middleware("cors")
@@ -797,7 +806,7 @@ pub fn start_server(
     let max_param_length = bolt_core::type_coercion::resolve_max_param_length();
 
     let app_state = Arc::new(AppState {
-        dispatch: dispatch.into(),
+        dispatch,
         debug,
         max_header_size,
         max_payload_size,
@@ -845,7 +854,7 @@ pub fn start_server(
                         // Actix runs this factory once on every worker thread,
                         // inside that worker's runtime: bind the thread's own
                         // WorkerLoop here so async dispatch never crosses threads.
-                        Python::attach(|py| bolt_loop::bind_thread_loop(py)).unwrap_or_else(|e| {
+                        Python::attach(bolt_loop::bind_thread_loop).unwrap_or_else(|e| {
                             panic!("failed to create the worker asyncio loop: {e}")
                         });
                         let mut app = App::new()
@@ -887,20 +896,21 @@ pub fn start_server(
                         // Both scopes route to the same `handle_file`; per-scope
                         // behaviour (finders fallback, media XSS-disarm, cache
                         // visibility) is data on each `ScopeConfig`.
-                        for cfg in [
+                        for config in [
                             &app_state.static_files_config,
                             &app_state.media_files_config,
-                        ] {
-                            if let Some(config) = cfg {
-                                let scope_data = web::Data::new(config.clone());
-                                app = app.service(
-                                    web::scope(&config.url_prefix).app_data(scope_data).service(
-                                        web::resource("/{path:.*}")
-                                            .route(web::get().to(handle_file))
-                                            .route(web::head().to(handle_file)),
-                                    ),
-                                );
-                            }
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            let scope_data = web::Data::new(config.clone());
+                            app = app.service(
+                                web::scope(&config.url_prefix).app_data(scope_data).service(
+                                    web::resource("/{path:.*}")
+                                        .route(web::get().to(handle_file))
+                                        .route(web::head().to(handle_file)),
+                                ),
+                            );
                         }
 
                         // Default service handles all unmatched HTTP requests.
@@ -952,33 +962,27 @@ pub fn start_server(
                         IpAddr::V6(_) => Domain::IPV6,
                     };
                     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        .map_err(std::io::Error::other)?;
                     socket
                         .set_reuse_address(true)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        .map_err(std::io::Error::other)?;
 
                     // Only set SO_REUSEPORT when explicitly requested (multi-process mode)
                     #[cfg(not(target_os = "windows"))]
                     if use_reuse_port {
-                        socket
-                            .set_reuse_port(true)
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        socket.set_reuse_port(true).map_err(std::io::Error::other)?;
                     }
 
                     let addr = SocketAddr::new(ip, port);
-                    socket
-                        .bind(&addr.into())
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                    socket
-                        .listen(backlog)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    socket.bind(&addr.into()).map_err(std::io::Error::other)?;
+                    socket.listen(backlog).map_err(std::io::Error::other)?;
                     let listener: std::net::TcpListener = socket.into();
                     listener
                         .set_nonblocking(true)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        .map_err(std::io::Error::other)?;
                     let server = server
                         .listen(listener)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                        .map_err(std::io::Error::other)?
                         .run();
 
                     // Custom shutdown sequencing (Actix signals disabled above):
@@ -1019,7 +1023,7 @@ pub fn start_server(
                     served
                 }
             })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+            .map_err(|e| std::io::Error::other(format!("{:?}", e)))
     })
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Server error: {}", e)))?;
 

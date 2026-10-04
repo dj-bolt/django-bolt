@@ -84,7 +84,7 @@ def test_python_middleware_keeps_the_dicts() -> None:
 
 
 def test_typed_values_bind_from_rust_maps(client: TestClient) -> None:
-    response = client.get("/typed?p=3", headers={"X-Count": "5"}, cookies={"flag": "yes"})
+    response = client.get("/typed?p=3", headers={"X-Count": "5", "Cookie": "flag=yes"})
     assert response.status_code == 200
     assert response.json() == {"x_count": 5, "page": 3, "flag": True}
 
@@ -114,7 +114,7 @@ def test_bad_typed_value_is_422(client: TestClient) -> None:
 
 
 def test_sync_route_binds_from_rust_maps(client: TestClient) -> None:
-    response = client.get("/sync", headers={"X-Count": "3"}, cookies={"count": "9"})
+    response = client.get("/sync", headers={"X-Count": "3", "Cookie": "count=9"})
     assert response.json() == {"x_count": 3, "count": 9}
 
 

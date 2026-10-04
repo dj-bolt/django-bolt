@@ -26,6 +26,10 @@ pub enum ResponseType {
 impl ResponseType {
     /// Parse from Python string
     #[inline]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "infallible: an unknown name maps to OctetStream, so FromStr's Result adds nothing"
+    )]
     pub fn from_str(s: &str) -> Self {
         match s {
             "empty" => Self::Empty,
@@ -147,6 +151,10 @@ impl ResponseMeta {
         let custom_headers: Option<Vec<(String, String)>> = tuple.get_item(2)?.extract()?;
 
         // Element 3: cookies (None or list of 9-tuples)
+        #[expect(
+            clippy::type_complexity,
+            reason = "PyO3 wire format: ResponseWireV1 sends each cookie as one 9-tuple"
+        )]
         let cookies_raw: Option<
             Vec<(
                 String,         // name

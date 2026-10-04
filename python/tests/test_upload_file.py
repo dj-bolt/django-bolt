@@ -6,6 +6,7 @@ import asyncio
 from typing import Annotated
 
 import msgspec
+import pytest
 from django.core.files.base import File as DjangoFile
 
 from django_bolt import BoltAPI, UploadFile
@@ -59,9 +60,23 @@ class DocumentFormAnnotated(msgspec.Struct):
 class TestUploadFileClass:
     """Test basic UploadFile class functionality."""
 
-    def test_create_upload_file(self):
+    @pytest.fixture
+    def make_upload(self):
+        """Build UploadFile objects and close each one after the test."""
+        uploads = []
+
+        def make(**kwargs):
+            upload = UploadFileClass(**kwargs)
+            uploads.append(upload)
+            return upload
+
+        yield make
+        for upload in uploads:
+            upload.close_sync()
+
+    def test_create_upload_file(self, make_upload):
         """Test creating an UploadFile instance."""
-        upload = UploadFileClass(
+        upload = make_upload(
             filename="test.txt",
             content_type="text/plain",
             size=12,
@@ -88,9 +103,9 @@ class TestUploadFileClass:
         assert upload.content_type == "image/png"
         assert upload.size == 15
 
-    def test_sync_read(self):
+    def test_sync_read(self, make_upload):
         """Test sync read via .file property."""
-        upload = UploadFileClass(
+        upload = make_upload(
             filename="test.txt",
             content_type="text/plain",
             size=5,
@@ -105,11 +120,11 @@ class TestUploadFileClass:
         content = upload.file.read(3)
         assert content == b"Hel"
 
-    def test_async_read(self):
+    def test_async_read(self, make_upload):
         """Test async read method."""
 
         async def do_test():
-            upload = UploadFileClass(
+            upload = make_upload(
                 filename="test.txt",
                 content_type="text/plain",
                 size=5,
@@ -125,11 +140,11 @@ class TestUploadFileClass:
 
         asyncio.run(do_test())
 
-    def test_async_close(self):
+    def test_async_close(self, make_upload):
         """Test async close method."""
 
         async def do_test():
-            upload = UploadFileClass(
+            upload = make_upload(
                 filename="test.txt",
                 content_type="text/plain",
                 size=5,
@@ -141,9 +156,9 @@ class TestUploadFileClass:
 
         asyncio.run(do_test())
 
-    def test_repr(self):
+    def test_repr(self, make_upload):
         """Test string representation."""
-        upload = UploadFileClass(
+        upload = make_upload(
             filename="test.txt",
             content_type="text/plain",
             size=100,
@@ -155,9 +170,9 @@ class TestUploadFileClass:
         assert "text/plain" in repr_str
         assert "100" in repr_str
 
-    def test_file_is_django_file(self):
+    def test_file_is_django_file(self, make_upload):
         """Test that .file returns a Django File object."""
-        upload = UploadFileClass(
+        upload = make_upload(
             filename="document.pdf",
             content_type="application/pdf",
             size=15,
