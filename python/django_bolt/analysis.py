@@ -336,7 +336,8 @@ class OrmVisitor(ast.NodeVisitor):
         """Detect attribute access patterns like Model.objects.filter()."""
         attr_name = node.attr
 
-        if self._is_request_name(node.value):
+        reads_request = self._is_request_name(node.value)
+        if reads_request:
             self._mark_request_component_attr(attr_name)
 
         # Check for .objects manager access
@@ -365,19 +366,22 @@ class OrmVisitor(ast.NodeVisitor):
             self.analysis.uses_orm = True
             self.analysis.orm_operations.add(attr_name)
 
-        # Continue visiting children
-        self.generic_visit(node)
+        # Continue visiting children. A request receiver is a read, not a hand-on.
+        if not reads_request:
+            self.generic_visit(node)
 
-    def visit_Call(self, node: ast.Call) -> None:
-        """Detect function calls that might be blocking."""
-        # A request handed to another callable (a helper, super().create(request))
-        # can be read there, where this analysis does not look. It needs every part.
-        if any(self._is_request_name(arg) for arg in node.args) or any(
-            self._is_request_name(keyword.value) for keyword in node.keywords
-        ):
+    def visit_Name(self, node: ast.Name) -> None:
+        """Mark every request part when the request goes anywhere but a read.
+
+        A request handed on (to a callable, another name, a container or an
+        attribute) can be read where this analysis does not look.
+        """
+        if isinstance(node.ctx, ast.Load) and node.id in self.request_param_names:
             for attr_name in ("body", "query", "headers", "cookies"):
                 self._mark_request_component_attr(attr_name)
 
+    def visit_Call(self, node: ast.Call) -> None:
+        """Detect function calls that might be blocking."""
         # Check for direct blocking function calls
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
@@ -410,12 +414,12 @@ class OrmVisitor(ast.NodeVisitor):
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         """Detect request['headers'] style access."""
-        if (
-            self._is_request_name(node.value)
-            and isinstance(node.slice, ast.Constant)
-            and isinstance(node.slice.value, str)
-        ):
-            self._mark_request_component_key(node.slice.value)
+        if self._is_request_name(node.value):
+            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                self._mark_request_component_key(node.slice.value)
+            # A request receiver is a read, not a hand-on.
+            self.visit(node.slice)
+            return
 
         self.generic_visit(node)
 
