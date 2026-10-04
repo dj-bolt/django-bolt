@@ -267,27 +267,31 @@ def _python_list_literal(items: list[str]) -> str:
 
 
 def _terminate_process(process: subprocess.Popen[str], timeout: float = 5.0) -> tuple[str, str]:
-    if process.poll() is None:
-        if platform.system() == "Windows":
+    """Stop the process and its process group, and return their output.
+
+    On POSIX, ``_spawn_process`` makes the process a group leader, so the group
+    id is its pid. The group gets the signals also when the leader already
+    exited: a child, such as a ``runbolt --dev`` worker, can outlive it and
+    keep the output pipes open. No wait is without a limit.
+    """
+    if platform.system() == "Windows":
+        if process.poll() is None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 process.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+
+    try:
+        return process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if platform.system() == "Windows":
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                process.kill()
         else:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-            return stdout, stderr
-        except subprocess.TimeoutExpired:
-            if platform.system() == "Windows":
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    process.kill()
-            else:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-
-    stdout, stderr = process.communicate()
-    return stdout, stderr
+                os.killpg(process.pid, signal.SIGKILL)
+    return process.communicate(timeout=timeout)
 
 
 class _DrainedPopen(subprocess.Popen):

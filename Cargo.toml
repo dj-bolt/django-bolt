@@ -55,7 +55,8 @@ serde_urlencoded = "0.7"
 tempfile = "3"
 log = "0.4"
 notify = "8"
-ctrlc = "3"
+# termination: the dev supervisor also stops its worker on SIGTERM and SIGHUP.
+ctrlc = { version = "3", features = ["termination"] }
 libc = "0.2"
 # MCP protocol core (official Rust SDK). Trimmed features: no axum/hyper/reqwest.
 # actix uses `http` 0.2; rmcp uses `http` 1.x — both coexist, the MCP bridge
