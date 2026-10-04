@@ -4,7 +4,7 @@
 //! eliminating the need for Python's convert_primitive() function.
 //! Performance improvement: ~100-500µs per parameter.
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
 use pyo3::{IntoPyObject, Py, PyAny, PyResult, Python};
@@ -157,6 +157,22 @@ fn check_python_year(year: i32, kind: &str, value: &str) -> Result<(), String> {
     }
 }
 
+/// Check that Python can build a `time` or `datetime` for this second.
+///
+/// chrono parses a leap second (`23:59:60`). Python has no leap second, so
+/// pyo3 changes it to `23:59:59` and warns. Such a value must be a 422.
+fn check_python_second(time: NaiveTime, kind: &str, value: &str) -> Result<(), String> {
+    // chrono stores a leap second as a nanosecond value of one second or more.
+    if time.nanosecond() < 1_000_000_000 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid {} '{}': second 60 is out of range (0 to 59)",
+            kind, value
+        ))
+    }
+}
+
 /// Type hint constants (must match Python's get_type_hint_id() in compiler.py)
 pub const TYPE_INT: u8 = 1;
 pub const TYPE_FLOAT: u8 = 2;
@@ -304,12 +320,13 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
 
         TYPE_DATETIME => {
             let parsed = parse_datetime(value)?;
-            let year = match &parsed {
-                CoercedValue::DateTime(dt) => dt.year(),
-                CoercedValue::NaiveDateTime(ndt) => ndt.year(),
+            let (year, time) = match &parsed {
+                CoercedValue::DateTime(dt) => (dt.year(), dt.time()),
+                CoercedValue::NaiveDateTime(ndt) => (ndt.year(), ndt.time()),
                 _ => unreachable!("parse_datetime returns a datetime"),
             };
             check_python_year(year, "datetime", value)?;
+            check_python_second(time, "datetime", value)?;
             Ok(parsed)
         }
 
@@ -333,7 +350,11 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
             Ok(CoercedValue::Date(date))
         }
 
-        TYPE_TIME => parse_time(value),
+        TYPE_TIME => {
+            let time = parse_time(value)?;
+            check_python_second(time, "time", value)?;
+            Ok(CoercedValue::Time(time))
+        }
 
         _ => Ok(CoercedValue::String(value.to_string())),
     }
@@ -385,12 +406,12 @@ fn parse_datetime(value: &str) -> Result<CoercedValue, String> {
 }
 
 /// Parse time string supporting multiple formats
-fn parse_time(value: &str) -> Result<CoercedValue, String> {
+fn parse_time(value: &str) -> Result<NaiveTime, String> {
     let formats = ["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"];
 
     for fmt in &formats {
         if let Ok(time) = NaiveTime::parse_from_str(value, fmt) {
-            return Ok(CoercedValue::Time(time));
+            return Ok(time);
         }
     }
 
@@ -487,6 +508,21 @@ mod tests {
         }
         assert!(coerce_param("0001-01-01", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
         assert!(coerce_param("9999-12-31", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
+    }
+
+    #[test]
+    fn leap_seconds_are_refused() {
+        for (value, type_hint) in [
+            ("23:59:60", TYPE_TIME),
+            ("23:59:60.5", TYPE_TIME),
+            ("2016-12-31T23:59:60Z", TYPE_DATETIME),
+            ("2016-12-31T23:59:60+00:00", TYPE_DATETIME),
+            ("2016-12-31T23:59:60", TYPE_DATETIME),
+        ] {
+            let error = coerce_param(value, type_hint, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
+            assert!(error.to_string().contains("second 60"), "{value}: {error}");
+        }
+        assert!(coerce_param("23:59:59.999999", TYPE_TIME, DEFAULT_MAX_PARAM_LENGTH).is_ok());
     }
 
     #[test]

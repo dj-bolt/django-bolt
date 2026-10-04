@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - **A 204 response has no body** - `Response(status_code=204)` has the default content `{}`, and Bolt wrote it after the headers. Actix drops the `content-length` header for a 204 but writes the bytes it gets. On a keep-alive connection, the next response then started with `{}`. A browser or an HTTP client that reuses connections failed the request after a delete. Rust now drops the body of each 204, for every response type a handler can return.
 - **A return annotation validates the default status code only** - A handler with `-> Item` that returned `JSON(errors, status_code=400)` got a 500 `ResponseValidationError`, because Bolt checked the error map against `Item`. The annotation and a single `response_model` describe the body of the default status code. Bolt now validates a `JSON` or `Response` only when its status code is that default, and encodes other status codes as-is. This matches the per-status-code form, `response_model={200: Item, 400: Error}`, which never validated them.
+- **A time or datetime with second 60 gets 422** - A leap second such as `23:59:60` became `23:59:59`, and Python logged a warning. Python cannot show a leap second, so Bolt now refuses the value.
 
 ## [0.12.0]
 

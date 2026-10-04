@@ -57,6 +57,10 @@ def client():
     ) -> dict:
         return {"v": str(v), "h": str(h), "c": str(c)}
 
+    @api.get("/time")
+    async def time_query(v: dt.time | None = None) -> dict:
+        return {"v": str(v)}
+
     @api.get("/decimal/{v}")
     async def decimal_path(v: decimal.Decimal) -> dict:
         return {"v": str(v)}
@@ -105,8 +109,18 @@ def test_cookie_value_python_rejects_is_422(client, kind, value, reason):
     assert reason in response.json()["detail"]
 
 
+@pytest.mark.parametrize(("kind", "value"), [("time", "23:59:60"), ("datetime", "2016-12-31T23:59:60")])
+def test_leap_second_is_422(client, kind, value):
+    """Python has no leap second. Bolt must refuse it, not change it to 23:59:59."""
+    response = client.get(f"/{kind}", params={"v": value})
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"].startswith("Query parameter 'v'")
+    assert "second 60" in response.json()["detail"]
+
+
 def test_values_python_accepts_still_pass(client):
     assert client.get("/date/0001-01-01").json() == {"v": "0001-01-01"}
     assert client.get("/date/9999-12-31").json() == {"v": "9999-12-31"}
+    assert client.get("/time", params={"v": "23:59:59.999999"}).json() == {"v": "23:59:59.999999"}
     assert client.get("/decimal/1E+2147483648").json() == {"v": "1E+2147483648"}
     assert client.get("/decimal/-0.5e-7").json() == {"v": "-5E-8"}
