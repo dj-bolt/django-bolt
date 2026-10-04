@@ -1536,9 +1536,9 @@ class BoltAPI:
             meta["name_explicit"] = name is not None and _name_explicit
             meta["namespace"] = self.namespace or ""
 
-            # Detect csrf_exempt for Django CSRF middleware support
-            # Django's @csrf_exempt decorator sets handler.csrf_exempt = True
-            meta["csrf_exempt"] = getattr(fn, "csrf_exempt", False)
+            # Django middleware gets the handler as the view in process_view. It reads
+            # the flags that view decorators set, such as @csrf_exempt and @login_not_required.
+            meta["view_func"] = fn
 
             request_param_names = {
                 field.name for field in meta.get("fields", []) if getattr(field, "source", None) == "request"
@@ -2864,8 +2864,8 @@ class BoltAPI:
 
         request_state = request.setdefault("state", {})
 
-        # Store csrf_exempt in request.state for CSRF middleware to check.
-        request_state["_csrf_exempt"] = meta.get("csrf_exempt", False)
+        # Django middleware gets this view in process_view.
+        request_state["_view_func"] = meta["view_func"]
         request_state["_bolt_route_executor"] = self._get_route_executor(api, handler, meta)
 
         try:

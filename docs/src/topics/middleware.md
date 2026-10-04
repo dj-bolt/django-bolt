@@ -354,6 +354,10 @@ api = BoltAPI(
 )
 ```
 
+Each wrapper runs the `process_view` hook of its middleware before the handler. The hook gets the route handler as the view, so view decorators such as `@csrf_exempt` and `@login_not_required` work.
+
+A list of wrappers runs the hooks in a different order from Django. Each wrapper runs its `process_request` and then its `process_view`, before the next wrapper starts. Django runs all `process_request` hooks first, and then all `process_view` hooks. If the order of the hooks is important, use `django_middleware=[...]` or `DjangoMiddlewareStack`. They use the order of Django.
+
 ### Using DjangoMiddlewareStack
 
 When using multiple Django middleware, `DjangoMiddlewareStack` is more efficient as it performs a single request conversion instead of one per middleware:
