@@ -31,6 +31,9 @@ jobs:
   coverage:
     name: Python and Rust coverage
     runs-on: ubuntu-latest
+    # A full run takes about 10 minutes. A hung test must not hold a runner
+    # until a new push cancels the run.
+    timeout-minutes: 30
     # The PostgreSQL tests skip without a DSN; the service lets them count.
     services:
       postgres:
