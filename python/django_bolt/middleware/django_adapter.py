@@ -268,6 +268,16 @@ class DjangoMiddleware:
             # Copy the middleware attributes before the handler reads them.
             _sync_request_attributes(django_request, bolt_request)
 
+            # __call__ does not run process_view. Django's handler runs it, so the bridge runs it.
+            if view_hook is not None:
+                callback = _view_callback(bolt_request)
+                if view_hook is raw_view_hook:
+                    response = view_hook(django_request, callback, _EMPTY_TUPLE, _EMPTY_DICT)
+                else:
+                    response = await view_hook(django_request, callback, _EMPTY_TUPLE, _EMPTY_DICT)
+                if response is not None:
+                    return response
+
             # Await the async get_response directly - no bridging needed
             bolt_resp = await self.get_response(bolt_request)
 
@@ -294,6 +304,12 @@ class DjangoMiddleware:
 
         # Create middleware instance with the bridge
         self._middleware_instance = self.middleware_class(get_response_bridge, **self.init_kwargs)
+        # The bridge above reads these hooks. A third-party hook can block, so it
+        # runs on the thread of the request, as in DjangoMiddlewareStack.
+        raw_view_hook = getattr(self._middleware_instance, "process_view", None)
+        view_hook = raw_view_hook
+        if raw_view_hook is not None and not _is_django_builtin_middleware(self.middleware_class):
+            view_hook = sync_to_async(raw_view_hook, thread_sensitive=True)
 
         # Check if the middleware instance is async-capable
         # MiddlewareMixin sets this when get_response is async
@@ -327,11 +343,16 @@ class DjangoMiddleware:
                 ctx = _request_context.get()
                 bolt_request = ctx["bolt_request"]
                 _sync_request_attributes(django_request, bolt_request)
+                if lane_view_hook is not None:
+                    response = lane_view_hook(django_request, _view_callback(bolt_request), _EMPTY_TUPLE, _EMPTY_DICT)
+                    if response is not None:
+                        return response
                 bolt_resp = drive_on_lane(self.get_response(bolt_request))
                 ctx["bolt_response"] = bolt_resp
                 return _to_django_response(bolt_resp)
 
             self._lane_instance = self.middleware_class(lane_get_response, **self.init_kwargs)
+            lane_view_hook = getattr(self._lane_instance, "process_view", None)
 
     @property
     def supports_lane_dispatch(self) -> bool:
@@ -431,6 +452,12 @@ def _csrf_callback_exempt(request):
 
 _csrf_callback_exempt.csrf_exempt = True
 _csrf_callback_not_exempt.csrf_exempt = False
+
+
+def _view_callback(request: Request) -> Callable:
+    """Return the view that ``process_view`` gets. It has the ``csrf_exempt`` flag of the route."""
+    csrf_exempt = request.state.get("_csrf_exempt", False) if request.state else False
+    return _csrf_callback_exempt if csrf_exempt else _csrf_callback_not_exempt
 
 
 # Module-level constants to avoid allocation on hot path
@@ -713,8 +740,7 @@ class DjangoMiddlewareStack:
                     return response, entered
 
         _sync_request_attributes(django_request, request)
-        csrf_exempt = request.state.get("_csrf_exempt", False) if request.state else False
-        csrf_callback = _csrf_callback_exempt if csrf_exempt else _csrf_callback_not_exempt
+        csrf_callback = _view_callback(request)
         for entry in entries:
             hook = entry["raw_process_view"]
             if hook is not None:
@@ -765,8 +791,7 @@ class DjangoMiddlewareStack:
 
             _sync_request_attributes(django_request, bolt_request)
 
-            csrf_exempt = bolt_request.state.get("_csrf_exempt", False) if bolt_request.state else False
-            csrf_callback = _csrf_callback_exempt if csrf_exempt else _csrf_callback_not_exempt
+            csrf_callback = _view_callback(bolt_request)
 
             for entry in entered_hook_entries:
                 if entry["process_view"] is None:

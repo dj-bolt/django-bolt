@@ -1467,6 +1467,138 @@ class TestCSRFMiddleware:
 
 
 # =============================================================================
+# Test process_view through the single DjangoMiddleware wrapper
+# =============================================================================
+
+# A CSRF secret has 32 letters or digits. The cookie and the header carry it.
+_CSRF_SECRET = "abcdefghijklmnopqrstuvwxyz012345"
+
+
+class _BlockInViewMiddleware(MiddlewareMixin):
+    """Return a response from process_view, before the handler."""
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        return HttpResponse("blocked in process_view", status=418)
+
+    def process_response(self, request, response):
+        response["X-Response-Hook"] = "ran"
+        return response
+
+
+class _MarkInViewMiddleware:
+    """A plain middleware class. Its process_view returns None."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response["X-View-Hook"] = "ran" if getattr(request, "_view_hook_ran", False) else "skipped"
+        return response
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        request._view_hook_ran = True
+
+
+def _add_submit_route(api: BoltAPI, kind: str, calls: list) -> None:
+    """Add POST /submit. A sync handler runs on a lane, an async handler on the loop."""
+    if kind == "sync":
+
+        @api.post("/submit")
+        def submit():
+            calls.append(kind)
+            return {"status": "submitted"}
+
+    else:
+
+        @api.post("/submit")
+        async def submit():
+            calls.append(kind)
+            return {"status": "submitted"}
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+class TestSingleWrapperProcessView:
+    """DjangoMiddleware runs process_view, as Django's handler and DjangoMiddlewareStack do."""
+
+    def test_csrf_rejects_a_post_with_no_token(self, kind):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+        calls = []
+        _add_submit_route(api, kind, calls)
+
+        with TestClient(api) as client:
+            response = client.post("/submit", json={"data": "test"})
+
+        assert response.status_code == 403
+        assert calls == []
+
+    def test_csrf_accepts_a_post_with_a_valid_token(self, kind):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+        calls = []
+        _add_submit_route(api, kind, calls)
+
+        with TestClient(api) as client:
+            response = client.post(
+                "/submit",
+                json={"data": "test"},
+                headers={"X-CSRFToken": _CSRF_SECRET},
+                cookies={"csrftoken": _CSRF_SECRET},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "submitted"}
+        assert calls == [kind]
+
+    def test_csrf_exempt_route_accepts_a_post_with_no_token(self, kind):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+
+        if kind == "sync":
+
+            @api.post("/webhook")
+            @csrf_exempt
+            def webhook(request):
+                return {"status": "received"}
+
+        else:
+
+            @api.post("/webhook")
+            @csrf_exempt
+            async def webhook(request):
+                return {"status": "received"}
+
+        with TestClient(api) as client:
+            response = client.post("/webhook", json={"event": "test"})
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "received"}
+
+    def test_process_view_response_stops_the_request(self, kind):
+        api = BoltAPI(middleware=[DjangoMiddleware(_BlockInViewMiddleware)])
+        calls = []
+        _add_submit_route(api, kind, calls)
+
+        with TestClient(api) as client:
+            response = client.post("/submit", json={"data": "test"})
+
+        assert response.status_code == 418
+        assert response.content == b"blocked in process_view"
+        assert response.headers["x-response-hook"] == "ran"
+        assert calls == []
+
+    def test_process_view_that_returns_none_lets_the_handler_run(self, kind):
+        api = BoltAPI(middleware=[DjangoMiddleware(_MarkInViewMiddleware)])
+        calls = []
+        _add_submit_route(api, kind, calls)
+
+        with TestClient(api) as client:
+            response = client.post("/submit", json={"data": "test"})
+
+        assert response.status_code == 200
+        assert response.headers["x-view-hook"] == "ran"
+        assert calls == [kind]
+
+
+# =============================================================================
 # Test Multiple Set-Cookie Headers (Cookie Overwriting Bug Fix)
 # =============================================================================
 
