@@ -471,7 +471,6 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> PyResult<Py<
         CoercedValue::NaiveDateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
         CoercedValue::Date(v) => v.into_pyobject(py)?.into_any().unbind(),
         CoercedValue::Time(v) => v.into_pyobject(py)?.into_any().unbind(),
-
     })
 }
 
