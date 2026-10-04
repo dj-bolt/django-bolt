@@ -11,6 +11,10 @@ All notable changes to this project will be documented in this file.
 ### Removed
 
 - **`OpenAPIConfig(django_auth=...)`** - The docs routes take `auth` and `guards`, as every route does. For docs behind a Django login, use `auth=[SessionAuthentication(login_url="/admin/login/")]` and `guards=[Requires("is_staff", True)]`. `django_auth` wrapped the docs in a Django decorator and still used the global default auth. With a JWT default, a browser got 401 for every user ([#378](https://github.com/dj-bolt/django-bolt/issues/378)). See [Protecting documentation](docs/src/topics/openapi.md#protecting-documentation).
+### Fixed
+
+- **A 204 response has no body** - `Response(status_code=204)` has the default content `{}`, and Bolt wrote it after the headers. Actix drops the `content-length` header for a 204 but writes the bytes it gets. On a keep-alive connection, the next response then started with `{}`. A browser or an HTTP client that reuses connections failed the request after a delete. Rust now drops the body of each 204, for every response type a handler can return.
+- **A return annotation validates the default status code only** - A handler with `-> Item` that returned `JSON(errors, status_code=400)` got a 500 `ResponseValidationError`, because Bolt checked the error map against `Item`. The annotation and a single `response_model` describe the body of the default status code. Bolt now validates a `JSON` or `Response` only when its status code is that default, and encodes other status codes as-is. This matches the per-status-code form, `response_model={200: Item, 400: Error}`, which never validated them.
 
 ## [0.12.0]
 

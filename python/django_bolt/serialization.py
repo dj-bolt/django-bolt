@@ -979,9 +979,13 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             f"Return dict, list, or a Bolt response type (JSON, PlainText, HTML, Redirect, etc.)"
         )
 
+    # The response type describes the body of the default status code only. A
+    # JSON or Response with another status (a 400 error map, a 202 receipt)
+    # carries a different body, so Bolt encodes it as-is. Per-status schemas
+    # come from ``response_model={code: type}``.
     async def response_type_handler(result: Any) -> ResponseWireV1:
         if isinstance(result, JSON):
-            if validator_async is not None:
+            if validator_async is not None and result.status_code == default_status_code:
                 try:
                     validated = await validator_async(result.data)
                 except ResponseValidationError:
@@ -1008,7 +1012,11 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, ResponseClass):
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
-            if validator_async is not None and not isinstance(result.content, (bytes, bytearray, memoryview)):
+            if (
+                validator_async is not None
+                and result.status_code == default_status_code
+                and not isinstance(result.content, (bytes, bytearray, memoryview))
+            ):
                 try:
                     validated = await validator_async(result.content)
                 except ResponseValidationError:
@@ -1027,7 +1035,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
 
     def response_type_handler_sync(result: Any) -> ResponseWireV1:
         if isinstance(result, JSON):
-            if validator_sync is not None:
+            if validator_sync is not None and result.status_code == default_status_code:
                 try:
                     validated = validator_sync(result.data)
                 except ResponseValidationError:
@@ -1054,7 +1062,11 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, ResponseClass):
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
-            if validator_sync is not None and not isinstance(result.content, (bytes, bytearray, memoryview)):
+            if (
+                validator_sync is not None
+                and result.status_code == default_status_code
+                and not isinstance(result.content, (bytes, bytearray, memoryview))
+            ):
                 try:
                     validated = validator_sync(result.content)
                 except ResponseValidationError:
