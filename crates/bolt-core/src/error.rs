@@ -3,6 +3,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 /// Extract error information from a Python HTTPException
+#[expect(
+    clippy::type_complexity,
+    reason = "the one caller destructures the tuple at once"
+)]
 pub fn extract_http_exception(
     _py: Python,
     exc: &Bound<PyAny>,

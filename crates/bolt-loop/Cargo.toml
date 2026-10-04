@@ -7,9 +7,6 @@ repository.workspace = true
 publish = false
 description = "Process-lived asyncio WorkerLoop pump, fd reactor bridge and timer thread for django-bolt"
 
-[lints]
-workspace = true
-
 [dependencies]
 libc = { workspace = true }
 once_cell = { workspace = true }

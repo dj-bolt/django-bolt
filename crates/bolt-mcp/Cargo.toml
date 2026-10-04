@@ -7,9 +7,6 @@ repository.workspace = true
 publish = false
 description = "MCP (Model Context Protocol) Streamable HTTP transport core for django-bolt, built on rmcp"
 
-[lints]
-workspace = true
-
 [dependencies]
 actix-web = { workspace = true }
 ahash = { workspace = true }
