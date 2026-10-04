@@ -33,6 +33,7 @@ use bolt_core::form_parsing::{
 use bolt_core::metadata::{RateLimitKey, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
+use bolt_core::middleware::rate_limit::RateLimiters;
 use bolt_core::router::Router;
 use bolt_core::state::{
     find_asgi_mount, find_websocket_mount_in_slice, AppState, AsgiMount, ScopeConfig, ServeMode,
@@ -133,13 +134,23 @@ pub struct TestAppState {
     /// Global compression config (mirrors production server). Drives the
     /// streaming-compression codec selection in `handler.rs`.
     pub global_compression_config: Option<Arc<bolt_core::metadata::CompressionConfig>>,
-    /// The rate-limit scope of the routes of this app. See `create_test_app`.
-    pub rate_limit_scope: u64,
+    /// The rate-limit buckets of this app. See `create_test_app`.
+    pub rate_limiters: Arc<RateLimiters>,
 }
 
-/// The top bit marks the rate-limit scope of one test app, so it never equals
-/// a scope that Python passes.
-const OWN_RATE_LIMIT_SCOPE: u64 = 1 << 63;
+/// Rate-limit buckets that several test apps share. The WebSocket test client
+/// keeps one for each API.
+#[pyclass(frozen, name = "TestRateLimiters", module = "django_bolt._core")]
+#[derive(Default)]
+pub struct TestRateLimiters(Arc<RateLimiters>);
+
+#[pymethods]
+impl TestRateLimiters {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// Registry for test app instances
 static TEST_REGISTRY: OnceCell<DashMap<u64, Arc<RwLock<TestAppState>>>> = OnceCell::new();
@@ -156,12 +167,12 @@ fn registry() -> &'static DashMap<u64, Arc<RwLock<TestAppState>>> {
 /// settings. `cors_allowed_origins` and `static_files_config` replace the
 /// settings for one test.
 ///
-/// Without `rate_limit_scope`, the app has its own rate-limit buckets: an HTTP
+/// Without `rate_limiters`, the app has its own rate-limit buckets: an HTTP
 /// test client starts empty, as a new server does. A WebSocket test client is
-/// one connection, so it passes the scope of its API, and the connections to
+/// one connection, so it passes the buckets of its API, and the connections to
 /// one API share their buckets, as on a server.
 #[pyfunction]
-#[pyo3(signature = (dispatch, read_django_settings=true, cors_allowed_origins=None, static_files_config=None, compression_config=None, rate_limit_scope=None))]
+#[pyo3(signature = (dispatch, read_django_settings=true, cors_allowed_origins=None, static_files_config=None, compression_config=None, rate_limiters=None))]
 pub fn create_test_app(
     py: Python<'_>,
     dispatch: Py<PyAny>,
@@ -169,7 +180,7 @@ pub fn create_test_app(
     cors_allowed_origins: Option<Vec<String>>,
     static_files_config: Option<&Bound<'_, PyDict>>,
     compression_config: Option<&Bound<'_, PyDict>>,
-    rate_limit_scope: Option<u64>,
+    rate_limiters: Option<&Bound<'_, TestRateLimiters>>,
 ) -> PyResult<u64> {
     // Without read_django_settings, the CORS, static and media settings are not
     // read at all, so their warnings do not show either.
@@ -198,7 +209,9 @@ pub fn create_test_app(
         dispatch: dispatch.clone_ref(py),
         config,
         global_compression_config,
-        rate_limit_scope: rate_limit_scope.unwrap_or(OWN_RATE_LIMIT_SCOPE | id),
+        rate_limiters: rate_limiters
+            .map(|shared| Arc::clone(&shared.get().0))
+            .unwrap_or_default(),
     };
 
     registry().insert(id, Arc::new(RwLock::new(app)));
@@ -382,17 +395,12 @@ pub fn register_test_middleware_metadata(
         })?;
         // Propagate parse failures so tests fail loudly instead of the route
         // silently losing its auth/middleware config.
-        let mut route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
+        let route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "Failed to parse route metadata for handler {}: {}",
                 handler_id, e
             ))
         })?;
-        // Test apps reuse handler ids, and each request comes from 127.0.0.1.
-        // The scope keeps the rate-limit buckets of two test apps apart.
-        if let Some(rate_limit) = route_meta.rate_limit_config.as_mut() {
-            rate_limit.scope = app.rate_limit_scope;
-        }
         parsed_metadata.insert(handler_id, route_meta);
     }
     inject_global_cors(&mut parsed_metadata, app.config.global_cors_config.as_ref());
@@ -449,7 +457,16 @@ pub fn test_request(
 
         runtime_handle.block_on(async {
             // Read test app state
-            let (router, route_metadata, asgi_mounts, mcp_mounts, dispatch, config, compression) = {
+            let (
+                router,
+                route_metadata,
+                asgi_mounts,
+                mcp_mounts,
+                dispatch,
+                config,
+                compression,
+                rate_limiters,
+            ) = {
                 let state = app_state.read();
                 (
                     state.router.clone(),
@@ -459,6 +476,7 @@ pub fn test_request(
                     Python::attach(|py| state.dispatch.clone_ref(py)),
                     state.config.clone(),
                     state.global_compression_config.clone(),
+                    state.rate_limiters.clone(),
                 )
             };
             let max_payload_size = config.max_payload_size;
@@ -477,6 +495,7 @@ pub fn test_request(
                 cors_origin_regexes,
                 global_compression_config: compression,
                 trusted_proxies: config.trusted_proxies,
+                rate_limiters,
                 router: Some(router.clone()),
                 route_metadata: Some(route_metadata.clone()),
                 asgi_mounts: Some(asgi_mounts.clone()),
@@ -785,6 +804,7 @@ async fn handle_test_request_internal(
         .and_then(|m| m.rate_limit_config.as_ref());
     if let Some(rate_config) = rate_config {
         if let Some(response) = middleware::rate_limit::check_before_auth(
+            &state.rate_limiters,
             handler_id,
             &headers,
             client_ip.as_ref(),
@@ -822,6 +842,7 @@ async fn handle_test_request_internal(
 
     if let Some(rate_config) = rate_config {
         if let Some(response) = middleware::rate_limit::check_after_auth(
+            &state.rate_limiters,
             handler_id,
             &headers,
             client_ip.as_ref(),
@@ -1301,6 +1322,7 @@ pub fn handle_test_websocket(
                 })
                 .flatten();
             if bolt_core::middleware::rate_limit::check_before_auth(
+                &app.rate_limiters,
                 handler_id,
                 &header_map,
                 client_ip.as_ref(),
@@ -1359,6 +1381,7 @@ pub fn handle_test_websocket(
         // upgrade must not spend the bucket it would have been counted in.
         if let Some(rate_config) = route_meta.rate_limit_config.as_ref() {
             if bolt_core::middleware::rate_limit::check_after_auth(
+                &app.rate_limiters,
                 handler_id,
                 &header_map,
                 client_ip.as_ref(),

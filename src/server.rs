@@ -899,6 +899,7 @@ pub fn start_server(
         cors_origin_regexes,
         global_compression_config: global_compression_config.clone(),
         trusted_proxies: config.trusted_proxies,
+        rate_limiters: Arc::default(),
         router: None,                        // Production uses GLOBAL_ROUTER
         route_metadata: None,                // Production uses ROUTE_METADATA
         asgi_mounts: None,                   // Production uses GLOBAL_ASGI_MOUNTS
