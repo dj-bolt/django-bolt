@@ -12,8 +12,9 @@ from typing import Annotated
 
 import msgspec
 import pytest
+from django.conf import settings
 from django.contrib.auth import alogin, alogout
-from django.contrib.auth.decorators import login_required
+from django.contrib.auth.decorators import login_not_required, login_required
 from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.auth.models import User
 from django.contrib.messages.middleware import MessageMiddleware
@@ -1355,8 +1356,8 @@ class TestCSRFMiddleware:
         Test that @csrf_exempt decorated endpoints allow POST without token.
 
         Django's @csrf_exempt decorator should bypass CSRF validation.
-        The csrf_exempt attribute is detected at route registration time
-        and passed via request.state["_csrf_exempt"] to the middleware.
+        The middleware gets the handler as the view in process_view, and
+        reads its csrf_exempt attribute, as with a Django view.
 
         Note: Django's @csrf_exempt wraps the function to expect a `request`
         parameter (Django view signature), so the handler must accept it.
@@ -1467,7 +1468,7 @@ class TestCSRFMiddleware:
 
 
 # =============================================================================
-# Test process_view through the single DjangoMiddleware wrapper
+# Test process_view through the single wrapper and the stack
 # =============================================================================
 
 # A CSRF secret has 32 letters or digits. The cookie and the header carry it.
@@ -1500,6 +1501,45 @@ class _MarkInViewMiddleware:
         request._view_hook_ran = True
 
 
+class _TagInViewMiddleware(MiddlewareMixin):
+    """Set a request attribute in process_view."""
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        request.view_tag = "set in process_view"
+
+
+class _CallOnlyMiddleware:
+    """A middleware with no hooks. In a stack with a hook middleware, the stack uses its compatibility chain."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        return self.get_response(request)
+
+
+_LOGIN_MIDDLEWARE = [
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.auth.middleware.LoginRequiredMiddleware",
+]
+
+
+def _add_get_route(api: BoltAPI, kind: str, path: str, view, decorator=None) -> None:
+    """Add GET ``path``, which returns ``view(request)``. ``decorator`` goes on the handler."""
+    if kind == "sync":
+
+        def handler(request):
+            return view(request)
+
+    else:
+
+        async def handler(request):
+            return view(request)
+
+    api.get(path)(decorator(handler) if decorator else handler)
+
+
 def _add_submit_route(api: BoltAPI, kind: str, calls: list) -> None:
     """Add POST /submit. A sync handler runs on a lane, an async handler on the loop."""
     if kind == "sync":
@@ -1518,8 +1558,8 @@ def _add_submit_route(api: BoltAPI, kind: str, calls: list) -> None:
 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
-class TestSingleWrapperProcessView:
-    """DjangoMiddleware runs process_view, as Django's handler and DjangoMiddlewareStack do."""
+class TestProcessView:
+    """DjangoMiddleware and DjangoMiddlewareStack run process_view, as Django's handler does."""
 
     def test_csrf_rejects_a_post_with_no_token(self, kind):
         api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
@@ -1541,8 +1581,7 @@ class TestSingleWrapperProcessView:
             response = client.post(
                 "/submit",
                 json={"data": "test"},
-                headers={"X-CSRFToken": _CSRF_SECRET},
-                cookies={"csrftoken": _CSRF_SECRET},
+                headers={"X-CSRFToken": _CSRF_SECRET, "Cookie": f"csrftoken={_CSRF_SECRET}"},
             )
 
         assert response.status_code == 200
@@ -1596,6 +1635,43 @@ class TestSingleWrapperProcessView:
         assert response.status_code == 200
         assert response.headers["x-view-hook"] == "ran"
         assert calls == [kind]
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize("layout", ["wrapper", "stack"])
+    def test_login_not_required_route_skips_the_login_check(self, kind, layout):
+        if layout == "wrapper":
+            api = BoltAPI(middleware=[DjangoMiddleware(path) for path in _LOGIN_MIDDLEWARE])
+        else:
+            api = BoltAPI(django_middleware=_LOGIN_MIDDLEWARE)
+        _add_get_route(api, kind, "/public", lambda _request: {"public": True}, decorator=login_not_required)
+        _add_get_route(api, kind, "/private", lambda _request: {"public": False})
+
+        with TestClient(api) as client:
+            public = client.get("/public", follow_redirects=False)
+            private = client.get("/private", follow_redirects=False)
+
+        assert public.status_code == 200
+        assert public.json() == {"public": True}
+        assert private.status_code == 302
+        assert private.headers["location"].startswith(settings.LOGIN_URL)
+
+    @pytest.mark.parametrize(
+        "middleware",
+        [
+            pytest.param(DjangoMiddleware(_TagInViewMiddleware), id="wrapper"),
+            pytest.param(DjangoMiddlewareStack([_TagInViewMiddleware]), id="stack"),
+            pytest.param(DjangoMiddlewareStack([_TagInViewMiddleware, _CallOnlyMiddleware]), id="mixed-stack"),
+        ],
+    )
+    def test_handler_gets_the_attributes_that_process_view_sets(self, kind, middleware):
+        api = BoltAPI(middleware=[middleware])
+        _add_get_route(api, kind, "/tag", lambda request: {"tag": request.state.get("view_tag")})
+
+        with TestClient(api) as client:
+            response = client.get("/tag")
+
+        assert response.status_code == 200
+        assert response.json() == {"tag": "set in process_view"}
 
 
 # =============================================================================

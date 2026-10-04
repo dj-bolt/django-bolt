@@ -277,6 +277,8 @@ class DjangoMiddleware:
                     response = await view_hook(django_request, callback, _EMPTY_TUPLE, _EMPTY_DICT)
                 if response is not None:
                     return response
+                # process_view can set request attributes for the handler.
+                _sync_request_attributes(django_request, bolt_request)
 
             # Await the async get_response directly - no bridging needed
             bolt_resp = await self.get_response(bolt_request)
@@ -347,6 +349,8 @@ class DjangoMiddleware:
                     response = lane_view_hook(django_request, _view_callback(bolt_request), _EMPTY_TUPLE, _EMPTY_DICT)
                     if response is not None:
                         return response
+                    # process_view can set request attributes for the handler.
+                    _sync_request_attributes(django_request, bolt_request)
                 bolt_resp = drive_on_lane(self.get_response(bolt_request))
                 ctx["bolt_response"] = bolt_resp
                 return _to_django_response(bolt_resp)
@@ -440,24 +444,18 @@ def _noop_get_response(request):
     raise RuntimeError("Hook-based middleware should not call get_response")
 
 
-# Pre-created CSRF callback singletons to avoid function creation on hot path
-# Django's CsrfViewMiddleware checks getattr(callback, "csrf_exempt", False)
-def _csrf_callback_not_exempt(request):
-    pass
-
-
-def _csrf_callback_exempt(request):
-    pass
-
-
-_csrf_callback_exempt.csrf_exempt = True
-_csrf_callback_not_exempt.csrf_exempt = False
+def _no_view_func(request):
+    """The view for a request that no route dispatched. It has no decorator flags."""
 
 
 def _view_callback(request: Request) -> Callable:
-    """Return the view that ``process_view`` gets. It has the ``csrf_exempt`` flag of the route."""
-    csrf_exempt = request.state.get("_csrf_exempt", False) if request.state else False
-    return _csrf_callback_exempt if csrf_exempt else _csrf_callback_not_exempt
+    """Return the view that ``process_view`` gets: the route handler, as Django gives the view.
+
+    Django middleware reads the flags of view decorators on it, for example
+    ``csrf_exempt`` (CsrfViewMiddleware) and ``login_required`` (LoginRequiredMiddleware).
+    """
+    state = request.state
+    return state.get("_view_func", _no_view_func) if state else _no_view_func
 
 
 # Module-level constants to avoid allocation on hot path
@@ -740,13 +738,18 @@ class DjangoMiddlewareStack:
                     return response, entered
 
         _sync_request_attributes(django_request, request)
-        csrf_callback = _view_callback(request)
+        view_func = _view_callback(request)
+        ran_view_hook = False
         for entry in entries:
             hook = entry["raw_process_view"]
             if hook is not None:
-                response = hook(django_request, csrf_callback, _EMPTY_TUPLE, _EMPTY_DICT)
+                ran_view_hook = True
+                response = hook(django_request, view_func, _EMPTY_TUPLE, _EMPTY_DICT)
                 if response is not None:
                     return response, entered
+        if ran_view_hook:
+            # process_view can set request attributes for the handler.
+            _sync_request_attributes(django_request, request)
         return None, entered
 
     def _run_response_phase(self, django_request: HttpRequest, django_response: HttpResponse, entered: int):
@@ -791,21 +794,26 @@ class DjangoMiddlewareStack:
 
             _sync_request_attributes(django_request, bolt_request)
 
-            csrf_callback = _view_callback(bolt_request)
+            view_func = _view_callback(bolt_request)
+            ran_view_hook = False
 
             for entry in entered_hook_entries:
                 if entry["process_view"] is None:
                     continue
+                ran_view_hook = True
                 response = await self._invoke_hook(
                     entry["raw_process_view"],
                     entry["process_view"],
                     django_request,
-                    csrf_callback,
+                    view_func,
                     _EMPTY_TUPLE,
                     _EMPTY_DICT,
                 )
                 if response is not None:
                     return response
+            if ran_view_hook:
+                # process_view can set request attributes for the handler.
+                _sync_request_attributes(django_request, bolt_request)
 
             bolt_response = await self.get_response(bolt_request)
             return _to_django_response(bolt_response)
