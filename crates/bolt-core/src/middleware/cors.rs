@@ -10,7 +10,7 @@
 /// errors from authentication, rate limiting, and Python exceptions.
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    http::header::ORIGIN,
+    http::header::{ACCESS_CONTROL_REQUEST_METHOD, ORIGIN},
     http::Method,
     Error,
 };
@@ -94,6 +94,15 @@ where
 
         let method = req.method().clone();
         let path = req.path().to_string();
+        // A preflight names the method of the real request.
+        let requested_method = if method == Method::OPTIONS {
+            req.headers()
+                .get(ACCESS_CONTROL_REQUEST_METHOD)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        } else {
+            None
+        };
 
         // Get app state for CORS config
         let app_state = req
@@ -118,7 +127,8 @@ where
             let state_ref = state.get_ref();
 
             // Find CORS config: route-level first, then global
-            let cors_config = find_cors_config(&method, &path, state_ref);
+            let cors_config =
+                find_cors_config(&method, requested_method.as_deref(), &path, state_ref);
 
             // Apply CORS headers
             match cors_config {
@@ -161,11 +171,18 @@ enum CorsConfigRef<'a> {
     Skipped,
 }
 
-/// Find CORS config for a request
-/// Returns route-level config if present, otherwise global config
+/// The methods that a preflight without a usable requested method tries, in order.
+const PREFLIGHT_METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "QUERY"];
+
+/// Find the CORS config of a request: the config of its route, else the global config.
+///
+/// A preflight uses the route of the method in `Access-Control-Request-Method`.
+/// When no route has that method, it uses the first route on the path with its
+/// own CORS decision.
 #[inline]
 fn find_cors_config<'a>(
     method: &Method,
+    requested_method: Option<&str>,
     path: &str,
     state: &'a AppState,
 ) -> Option<CorsConfigRef<'a>> {
@@ -176,32 +193,28 @@ fn find_cors_config<'a>(
         return state.global_cors_config.as_ref().map(CorsConfigRef::Global);
     }
 
-    // For OPTIONS, try multiple methods to find route config
-    let methods_to_try: &[&str] = if method == &Method::OPTIONS {
-        &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "QUERY"]
-    } else {
-        // Use a slice pointing to the method string
-        // This avoids allocation for the common case
-        return find_cors_for_method(method.as_str(), path, state);
-    };
-
-    // OPTIONS: try each method to find route-level CORS
-    for try_method in methods_to_try {
-        if let Some(result) = find_cors_for_method(try_method, path, state) {
-            return Some(result);
+    let route_config = if method == Method::OPTIONS {
+        match requested_method.and_then(|m| route_cors_config(m, path, state)) {
+            Some(decision) => decision,
+            None => PREFLIGHT_METHODS
+                .iter()
+                .find_map(|m| route_cors_config(m, path, state).flatten()),
         }
-    }
-
-    // Fall back to global CORS
-    state.global_cors_config.as_ref().map(CorsConfigRef::Global)
+    } else {
+        route_cors_config(method.as_str(), path, state).flatten()
+    };
+    route_config.or_else(|| state.global_cors_config.as_ref().map(CorsConfigRef::Global))
 }
 
+/// The CORS decision of the route for `method` on `path`. The outer `None`
+/// means that no route matches. The inner `None` means that the route has no
+/// CORS config of its own.
 #[inline]
-fn find_cors_for_method<'a>(
+fn route_cors_config<'a>(
     method: &str,
     path: &str,
     state: &'a AppState,
-) -> Option<CorsConfigRef<'a>> {
+) -> Option<Option<CorsConfigRef<'a>>> {
     // Try AppState router first (tests), then global router (production)
     let route_match = if let Some(ref router) = state.router {
         router.find(method, path)
@@ -209,33 +222,22 @@ fn find_cors_for_method<'a>(
         GLOBAL_ROUTER
             .get()
             .and_then(|router| router.find(method, path))
+    }?;
+    let handler_id = route_match.handler_id();
+
+    // Try AppState metadata first (tests), then global metadata (production)
+    let meta = if let Some(ref meta_map) = state.route_metadata {
+        meta_map.get(handler_id)
+    } else {
+        ROUTE_METADATA
+            .get()
+            .and_then(|meta_map| meta_map.get(handler_id))
     };
-
-    if let Some(route_match) = route_match {
-        let handler_id = route_match.handler_id();
-
-        // Try AppState metadata first (tests), then global metadata (production)
-        let meta = if let Some(ref meta_map) = state.route_metadata {
-            meta_map.get(handler_id)
-        } else {
-            ROUTE_METADATA
-                .get()
-                .and_then(|meta_map| meta_map.get(handler_id))
-        };
-
-        if let Some(meta) = meta {
-            // Check if CORS is skipped
-            if meta.skip.contains("cors") {
-                return Some(CorsConfigRef::Skipped);
-            }
-
-            // Return route-level CORS if present
-            if let Some(ref cors_cfg) = meta.cors_config {
-                return Some(CorsConfigRef::Route(cors_cfg));
-            }
-        }
+    let Some(meta) = meta else {
+        return Some(None);
+    };
+    if meta.skip.contains("cors") {
+        return Some(Some(CorsConfigRef::Skipped));
     }
-
-    // Fall back to global CORS
-    state.global_cors_config.as_ref().map(CorsConfigRef::Global)
+    Some(meta.cors_config.as_ref().map(CorsConfigRef::Route))
 }
