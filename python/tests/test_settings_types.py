@@ -44,8 +44,8 @@ def _post_two_mb(client: TestClient):
         ("BOLT_MAX_UPLOAD_SIZE", -1, "an int of 0 or more"),
         ("BOLT_MAX_UPLOAD_SIZE", 1.5, "an int of 0 or more"),
         ("BOLT_MAX_HEADER_SIZE", "8192", "an int of 0 or more"),
-        ("DEBUG", "False", "a bool"),
-        ("DEBUG", 1, "a bool"),
+        ("DEBUG", "False", "a bool or an int"),
+        ("DEBUG", 1.0, "a bool or an int"),
         ("BOLT_ASGI_MOUNT_TIMEOUT", "30", "a number more than 0"),
         ("BOLT_ASGI_MOUNT_TIMEOUT", True, "a number more than 0"),
         ("BOLT_ASGI_MOUNT_TIMEOUT", 0, "a number more than 0"),
@@ -216,4 +216,29 @@ def test_wrong_runtime_debug_is_reported(capfd):
         response = client.get("/broken")
 
     assert response.status_code == 500
-    assert "DEBUG must be a bool, got str" in capfd.readouterr().err
+    assert "DEBUG must be a bool or an int, got str" in capfd.readouterr().err
+
+
+def _broken_mount_api() -> BoltAPI:
+    api = BoltAPI()
+
+    def broken(scope, receive, send):
+        # A plain function: the call fails before Bolt gets a coroutine.
+        raise RuntimeError("boom")
+
+    api.mount_asgi("/broken", broken)
+    return api
+
+
+@pytest.mark.parametrize(("value", "detail"), [(1, "RuntimeError: boom"), (0, "Internal Server Error")])
+def test_an_int_debug_is_read_as_django_reads_it(capfd, value, detail):
+    """Django tests DEBUG for truth, so `DEBUG = int(os.environ["DEBUG"])` is valid.
+
+    1 shows the error as DEBUG = True does, and 0 hides it as DEBUG = False does.
+    """
+    with override_settings(DEBUG=value), TestClient(_broken_mount_api()) as client:
+        response = client.get("/broken")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == detail
+    assert "DEBUG must be" not in capfd.readouterr().err

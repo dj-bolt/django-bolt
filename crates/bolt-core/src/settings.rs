@@ -12,7 +12,7 @@
 use pyo3::conversion::FromPyObjectOwned;
 use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyType};
+use pyo3::types::{PyBool, PyInt, PyType};
 use std::env::VarError;
 use std::str::FromStr;
 use std::time::Duration;
@@ -62,6 +62,22 @@ impl<'py> DjangoSettings<'py> {
             .cast::<PyBool>()
             .map(|flag| flag.is_true())
             .map_err(|_| wrong_type(name, "a bool", &value))
+    }
+
+    /// Read a flag that Django tests for truth, such as DEBUG. A bool or an
+    /// int is valid, and 0 is False, as in Django. Another type raises: a str
+    /// such as "False" is true in Django, which is not what it says.
+    pub fn truth_flag(&self, name: &str, default: bool) -> PyResult<bool> {
+        let Some(value) = self.get(name)? else {
+            return Ok(default);
+        };
+        if let Ok(flag) = value.cast::<PyBool>() {
+            return Ok(flag.is_true());
+        }
+        if value.is_instance_of::<PyInt>() {
+            return value.is_truthy();
+        }
+        Err(wrong_type(name, "a bool or an int", &value))
     }
 
     /// Read an int setting that is 0 or more.

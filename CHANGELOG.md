@@ -7,7 +7,8 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - **A Django setting with the wrong type stops startup** - Bolt used the default when a setting had the wrong type, and gave no error. For example, `BOLT_MAX_UPLOAD_SIZE = os.environ["MAX_UPLOAD"]` is a str, so a 2 MB upload got 413 although the setting said 10 MB. Now `runbolt` and `TestClient` raise `ImproperlyConfigured` that names the setting. A missing setting still gives the default. Bolt checks these settings:
-  - `DEBUG`, `CORS_ALLOW_ALL_ORIGINS` and `CORS_ALLOW_CREDENTIALS` must be a bool. Before, `DEBUG = 1` and `DEBUG = "True"` gave `False` in Bolt.
+  - `CORS_ALLOW_ALL_ORIGINS` and `CORS_ALLOW_CREDENTIALS` must be a bool.
+  - `DEBUG` must be a bool or an int. Bolt reads an int as Django does: `0` is off, and another int is on. A str such as `"False"` stops startup, because Django reads it as on. Before, Bolt used `False` for `DEBUG = 1` and for `DEBUG = "True"`.
   - `BOLT_MAX_UPLOAD_SIZE`, `BOLT_MAX_HEADER_SIZE`, `BOLT_MEMORY_SPOOL_THRESHOLD`, `BOLT_WS_MAX_CONNECTIONS`, `BOLT_WS_CLIENT_TIMEOUT` and `BOLT_WS_MAX_MESSAGE_SIZE` must be an int of 0 or more. A bool is not an int.
   - `BOLT_MAX_SYNC_STREAMING_THREADS`, `BOLT_WS_CHANNEL_SIZE` and `BOLT_WS_HEARTBEAT_INTERVAL` must be an int of 1 or more.
   - `BOLT_ASGI_MOUNT_TIMEOUT` must be a number more than 0. Before, a value of 0 or less gave 30 seconds.

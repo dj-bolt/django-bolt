@@ -134,13 +134,14 @@ pub fn handle_python_exception(
     // Override debug flag with Django's DEBUG setting (for dynamic checking).
     // Startup rejects a DEBUG that is not a bool, but a test can change DEBUG
     // later. Then report the error and keep the DEBUG value of startup.
-    let debug = match DjangoSettings::load(py).and_then(|settings| settings.bool("DEBUG", debug)) {
-        Ok(debug) => debug,
-        Err(err) => {
-            eprintln!("[django-bolt] Warning: {err} Using DEBUG={debug} from startup.");
-            debug
-        }
-    };
+    let debug =
+        match DjangoSettings::load(py).and_then(|settings| settings.truth_flag("DEBUG", debug)) {
+            Ok(debug) => debug,
+            Err(err) => {
+                eprintln!("[django-bolt] Warning: {err} Using DEBUG={debug} from startup.");
+                debug
+            }
+        };
     // Check if it's an HTTPException
     if is_http_exception(py, exc) {
         if let Some((status_code, detail, headers, extra)) = extract_http_exception(py, exc) {

@@ -222,7 +222,7 @@ impl ServerConfig {
         // A missing setting gives the default. A present setting with the wrong
         // type raises ImproperlyConfigured that names the setting.
         let settings = DjangoSettings::load(py)?;
-        let debug = settings.bool("DEBUG", false)?;
+        let debug = settings.truth_flag("DEBUG", false)?;
         let max_header_size = settings.non_negative_int("BOLT_MAX_HEADER_SIZE", 8192)?; // Default 8KB
         let max_payload_size = settings.non_negative_int("BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)?; // Default 1MB
         let asgi_mount_timeout =

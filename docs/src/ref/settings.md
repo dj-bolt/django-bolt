@@ -9,7 +9,8 @@ Django-Bolt settings are configured in your Django `settings.py` file.
 Bolt reads its settings at startup. A missing setting gives its default. A setting with the wrong type stops startup with `ImproperlyConfigured`. The error names the setting:
 
 - A size or a count must be an `int`, such as `10 * 1024 * 1024` or `FileSize.MB_10`. A str such as `"10485760"` is not an int. A bool is not an int.
-- A flag such as `DEBUG` or `CORS_ALLOW_CREDENTIALS` must be a `bool`. `DEBUG = 1` stops startup.
+- A flag such as `CORS_ALLOW_CREDENTIALS` must be a `bool`.
+- `DEBUG` must be a `bool` or an `int`, as Django reads it: `DEBUG = 1` is on, and `DEBUG = 0` is off. A str such as `"False"` stops startup, because Django reads a str that is not empty as on.
 - A list setting such as `CORS_ALLOWED_ORIGINS` must be a list of str. One str is not a list.
 
 Convert a value that you read from an environment variable:
