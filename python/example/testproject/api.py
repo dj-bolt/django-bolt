@@ -82,7 +82,7 @@ async def read_root():
     """
     Endpoint that returns a simple "Hello World" dictionary.
     """
-    return {"message": "Hello Django"}
+    return {"message": "Hello World"}
 
 
 #

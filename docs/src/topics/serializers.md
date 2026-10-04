@@ -151,6 +151,9 @@ and the one that makes the `cls` parameter explicit to type checkers. Both
 forms are accepted, in either decorator order:
 
 ```python
+class UserSerializer(Serializer):
+    email: str
+
     @field_validator("email")
     @classmethod
     def validate_email(cls, value):

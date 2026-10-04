@@ -301,7 +301,7 @@ class TestCookieStructEndpoints:
         """GET /missions/preferences reads cookies."""
         response = client.get(
             "/missions/preferences",
-            cookies={"theme": "dark", "language": "es"},
+            headers={"cookie": "theme=dark; language=es"},
         )
         assert response.status_code == 200
         data = response.json()
@@ -320,7 +320,7 @@ class TestCookieStructEndpoints:
         """GET /missions/preferences uses default for missing cookie."""
         response = client.get(
             "/missions/preferences",
-            cookies={"theme": "dark"},
+            headers={"cookie": "theme=dark"},
         )
         assert response.status_code == 200
         data = response.json()

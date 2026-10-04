@@ -24,6 +24,7 @@ async def get_data():
 ### CORS options
 
 ```python
+@api.get("/api/data")
 @cors(
     origins=["https://example.com", "https://app.example.com"],
     methods=["GET", "POST", "PUT", "DELETE"],
@@ -31,6 +32,8 @@ async def get_data():
     credentials=True,
     max_age=3600,  # Preflight cache duration
 )
+async def get_data():
+    return {"data": "value"}
 ```
 
 ### Global CORS

@@ -30,7 +30,7 @@ Add it to your `INSTALLED_APPS` in `settings.py`:
 
 ```python
 INSTALLED_APPS = [
-    ...
+    # ...
     "django_bolt",
     "missions",
 ]
