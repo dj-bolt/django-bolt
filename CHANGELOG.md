@@ -4,10 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Performance
+### Added
 
-- **A client's next async request reuses its lane** - An async request on a route with Django middleware gave its lane back only after the response left. Thus the next request of the same client often started a new lane, with a new thread and a new database connection. The lane now goes back to the idle list before the response leaves, when no sync call of the request still runs on it. The lane still closes the previous request before it runs the next one. A lane that still runs such a call, for example after `asyncio.wait_for` stopped waiting, goes to no other request until the call ends.
+- **`SessionAuthentication`** - A route can use Django session auth as it uses a token backend: `auth=[SessionAuthentication()]`. Django does the session work. Bolt adds Django's `SessionMiddleware` and `AuthenticationMiddleware` to the route when its middleware has neither. When it has only one of them, startup fails. Rust rejects a request with no session cookie. For a request with the cookie, Django loads the user, and Bolt checks the guards of the route against `request.user`. A guard can read `is_staff`, `is_superuser` and `permissions` of the user. A `none_of` guard on another claim is an error at startup. `login_url` sends an anonymous user to a login page with Django's `redirect_to_login`. Each unsafe request to the route gets the CSRF origin check of a JWT cookie, also with no cookie, so a login route is protected too. `csrf=False` turns the check off. A token backend on the same route comes first. The backend works on HTTP routes only. A WebSocket route or an MCP mount with it in `auth` raises an error at startup. A session backend from `BOLT_AUTHENTICATION_CLASSES` is left out there. See [Session authentication](docs/src/topics/authentication.md#session-authentication).
 
+### Removed
+
+- **`OpenAPIConfig(django_auth=...)`** - The docs routes take `auth` and `guards`, as every route does. For docs behind a Django login, use `auth=[SessionAuthentication(login_url="/admin/login/")]` and `guards=[Requires("is_staff", True)]`. `django_auth` wrapped the docs in a Django decorator and still used the global default auth. With a JWT default, a browser got 401 for every user ([#378](https://github.com/dj-bolt/django-bolt/issues/378)). See [Protecting documentation](docs/src/topics/openapi.md#protecting-documentation).
 ### Fixed
 
 - **A 204 response has no body** - `Response(status_code=204)` has the default content `{}`, and Bolt wrote it after the headers. Actix drops the `content-length` header for a 204 but writes the bytes it gets. On a keep-alive connection, the next response then started with `{}`. A browser or an HTTP client that reuses connections failed the request after a delete. Rust now drops the body of each 204, for every response type a handler can return.

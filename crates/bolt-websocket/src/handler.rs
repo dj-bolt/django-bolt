@@ -862,7 +862,8 @@ pub async fn handle_websocket_upgrade(
                         }
                     }
                 }
-                AuthGuardResult::Unauthorized => {
+                // Registration refuses a session backend on a WebSocket route. Fail closed.
+                AuthGuardResult::Deferred(_) | AuthGuardResult::Unauthorized => {
                     return Ok(bolt_core::responses::error_401());
                 }
                 AuthGuardResult::Forbidden(denial) => {

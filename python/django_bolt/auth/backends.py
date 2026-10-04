@@ -5,7 +5,7 @@ Provides DRF-inspired authentication classes that are compiled to Rust types
 for zero-GIL performance in the hot path.
 
 The authentication flow:
-1. Python defines auth backends (JWT, API key)
+1. Python defines auth backends (JWT, API key, session)
 2. Backends compile to metadata dicts via to_metadata()
 3. Rust parses metadata at registration time
 4. Rust validates tokens/keys without GIL on each request
@@ -465,6 +465,49 @@ class APIKeyAuthentication(BaseAuthentication):
             "api_keys": list(self.api_keys),
             "header": self.header.lower(),
             "key_permissions": {k: list(v) for k, v in self.key_permissions.items()},
+        }
+
+
+class SessionAuthentication(BaseAuthentication):
+    """
+    Django session authentication.
+
+    Django does the work. Bolt adds Django's ``SessionMiddleware`` and
+    ``AuthenticationMiddleware`` to each route that uses this backend, when
+    the API does not run them. Log in and log out with Django's ``alogin``
+    and ``alogout``.
+
+    Rust rejects a request with no session cookie, unless ``login_url`` is
+    set. For other requests, Django loads the user, and Bolt checks the guards of the route
+    against ``request.user``. A guard can read ``is_staff``,
+    ``is_superuser`` and ``permissions`` of the user. A ``Requires`` on
+    another claim rejects a session request.
+
+    A token backend on the same route comes first, because Rust can verify
+    a token.
+
+    Args:
+        login_url: Redirect a request with no logged-in user to this URL,
+            with Django's ``redirect_to_login``. Without it, the request
+            gets 401.
+        csrf: Reject a cross-site request with an unsafe method that sends
+            the session cookie. The check is the same as for a JWT cookie.
+    """
+
+    def __init__(self, *, login_url: str | None = None, csrf: bool = True):
+        self.login_url = login_url
+        self.csrf = csrf
+
+    @property
+    def scheme_name(self) -> str:
+        return "session"
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "type": "session",
+            "cookie": settings.SESSION_COOKIE_NAME,
+            "csrf": self.csrf,
+            "login_redirect": self.login_url is not None,
         }
 
 

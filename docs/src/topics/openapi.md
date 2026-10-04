@@ -48,9 +48,9 @@ OpenAPIConfig(
     version="1.0.0",             # API version
     description="Description",   # API description
     enabled=True,                # Enable/disable docs
-    docs_url="/docs",            # Swagger UI URL
-    openapi_url="/openapi.json", # OpenAPI JSON URL
-    django_auth=False,           # Enable Django admin auth for docs
+    path="/docs",                # Docs URL. The schema is at {path}/openapi.json
+    auth=None,                   # Auth backends for the docs routes
+    guards=None,                 # Guards for the docs routes
     strict=False,                # Fail generation on untypeable shapes (see below)
 )
 ```
@@ -281,37 +281,36 @@ The raw OpenAPI specification is always available at:
 
 ## Protecting documentation
 
+The docs routes take `auth` and `guards`, as every route does. Without them, the docs use `BOLT_AUTHENTICATION_CLASSES` and `BOLT_DEFAULT_PERMISSION_CLASSES`.
+
 ### Django session authentication
 
-Require Django user login to access docs (redirects to login page):
+A browser does not send a token. Use `SessionAuthentication` for docs that people open in a browser. Bolt adds Django's session and auth middleware to the docs routes.
+
+This example gives the docs to staff users who logged in to the Django admin:
 
 ```python
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        django_auth=True,  # Requires any logged-in Django user
-    )
-)
-```
-
-For staff-only access, use Django's `staff_member_required`:
-
-```python
-from django.contrib.admin.views.decorators import staff_member_required
+from django_bolt.auth import Requires, SessionAuthentication
 
 api = BoltAPI(
     openapi_config=OpenAPIConfig(
         title="My API",
         version="1.0.0",
-        django_auth=staff_member_required,  # Requires staff user
+        auth=[SessionAuthentication(login_url="/admin/login/")],
+        guards=[Requires("is_staff", True)],
     )
 )
 ```
 
-### API-based authentication
+- An anonymous user goes to the admin login page. After the login, Django sends the user back to the docs.
+- A logged-in user who is not staff gets 403.
+- Without `login_url`, an anonymous user gets 401.
 
-Protect docs with JWT or API key authentication (returns 401/403 instead of redirects):
+To let any logged-in user see the docs, use `guards=[IsAuthenticated()]`.
+
+### Token authentication
+
+Protect the docs with a JWT or an API key. A request with no valid token gets 401 or 403, with no redirect:
 
 ```python
 from django_bolt.auth import JWTAuthentication, IsAuthenticated
@@ -322,21 +321,6 @@ api = BoltAPI(
         version="1.0.0",
         auth=[JWTAuthentication()],
         guards=[IsAuthenticated()],
-    )
-)
-```
-
-For staff-only API access:
-
-```python
-from django_bolt.auth import JWTAuthentication, Requires
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        auth=[JWTAuthentication()],
-        guards=[Requires("is_staff", True)],
     )
 )
 ```

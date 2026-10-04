@@ -1,4 +1,4 @@
-use crate::middleware::auth::{authenticate, AuthBackend, AuthContext};
+use crate::middleware::auth::{authenticate, session_context, AuthBackend, AuthContext};
 use crate::permissions::{evaluate_guards, GuardDenial, GuardResult, GuardSet};
 use actix_web::http::uri::Authority;
 /// Shared validation logic used by both production handler and test handler
@@ -43,6 +43,11 @@ pub fn parse_cookies_inline(cookie_header: Option<&str>) -> AHashMap<String, Str
 pub enum AuthGuardResult {
     /// Authentication and guards passed
     Allow(Option<AuthContext>),
+    /// The request carries a Django session cookie and the guards can reject.
+    /// Rust cannot read the session. The Python dispatch of the route checks
+    /// the guards after Django loads the user. A transport that does not run
+    /// that check must reject the request.
+    Deferred(AuthContext),
     /// Authentication required (401)
     Unauthorized,
     /// Permission denied (403), with the failing guard's custom detail if it
@@ -205,6 +210,19 @@ pub fn validate_auth_and_guards(
         None
     };
 
+    // A session request gets a context with no user. Rust cannot evaluate
+    // the guards for it, so Python checks them against the Django user.
+    if auth_ctx.is_none() {
+        let enforcing = guards.is_enforcing();
+        if let Some(session_ctx) = session_context(headers, auth_backends, enforcing) {
+            return if enforcing {
+                AuthGuardResult::Deferred(session_ctx)
+            } else {
+                AuthGuardResult::Allow(Some(session_ctx))
+            };
+        }
+    }
+
     // Evaluate guards if configured
     if !guards.is_empty() {
         match evaluate_guards(guards, auth_ctx.as_ref()) {
@@ -267,6 +285,130 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    fn session_backend() -> AuthBackend {
+        AuthBackend::Session {
+            cookie: "sessionid".to_string(),
+            csrf: true,
+            login_redirect: false,
+        }
+    }
+
+    fn api_key_backend() -> AuthBackend {
+        AuthBackend::APIKey {
+            api_keys: ["key-1".to_string()].into_iter().collect(),
+            header: "x-api-key".to_string(),
+            key_permissions: Default::default(),
+        }
+    }
+
+    fn requires_login() -> GuardSet {
+        GuardSet::from_guards(vec![crate::permissions::Guard::IsAuthenticated])
+    }
+
+    #[test]
+    fn session_cookie_defers_enforcing_guards_to_python() {
+        let headers = headers_with(&[("cookie", "theme=dark; sessionid=abc")]);
+        let backends = [api_key_backend(), session_backend()];
+        match validate_auth_and_guards(&headers, &backends, &requires_login()) {
+            AuthGuardResult::Deferred(ctx) => {
+                assert_eq!(ctx.backend, "session");
+                assert_eq!(ctx.backend_index, Some(1));
+                assert_eq!(ctx.user_id, None);
+                assert!(ctx.cookie_csrf);
+            }
+            other => panic!("expected Deferred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_route_with_no_enforcing_guard_gets_the_csrf_flag_with_or_without_cookie() {
+        // With no cookie, the flag protects a login route against login CSRF.
+        let guards = GuardSet::from_guards(vec![crate::permissions::Guard::AllowAny]);
+        for headers in [
+            headers_with(&[("cookie", "sessionid=abc")]),
+            AHashMap::new(),
+        ] {
+            match validate_auth_and_guards(&headers, &[session_backend()], &guards) {
+                AuthGuardResult::Allow(Some(ctx)) => {
+                    assert_eq!(ctx.backend, "session");
+                    assert!(ctx.cookie_csrf);
+                }
+                other => panic!("expected Allow with a session context, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn csrf_false_turns_off_the_flag() {
+        let backend = AuthBackend::Session {
+            cookie: "sessionid".to_string(),
+            csrf: false,
+            login_redirect: false,
+        };
+        let headers = headers_with(&[("cookie", "sessionid=abc")]);
+        match validate_auth_and_guards(&headers, &[backend], &requires_login()) {
+            AuthGuardResult::Deferred(ctx) => assert!(!ctx.cookie_csrf),
+            other => panic!("expected Deferred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_pair_does_not_hide_the_session_cookie() {
+        // Django reads the last pair. Every non-empty pair counts.
+        for cookie in ["sessionid=; sessionid=abc", "sessionid=abc; sessionid="] {
+            let headers = headers_with(&[("cookie", cookie)]);
+            match validate_auth_and_guards(&headers, &[session_backend()], &requires_login()) {
+                AuthGuardResult::Deferred(ctx) => assert!(ctx.cookie_csrf),
+                other => panic!("expected Deferred for {cookie:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_or_empty_session_cookie_is_unauthorized_in_rust() {
+        for cookie in ["theme=dark", "sessionid=", "xsessionid=abc", "sessionid"] {
+            let headers = headers_with(&[("cookie", cookie)]);
+            assert!(matches!(
+                validate_auth_and_guards(&headers, &[session_backend()], &requires_login()),
+                AuthGuardResult::Unauthorized
+            ));
+        }
+        assert!(matches!(
+            validate_auth_and_guards(&AHashMap::new(), &[session_backend()], &requires_login()),
+            AuthGuardResult::Unauthorized
+        ));
+    }
+
+    #[test]
+    fn a_login_redirect_defers_a_request_with_no_cookie() {
+        let backend = AuthBackend::Session {
+            cookie: "sessionid".to_string(),
+            csrf: true,
+            login_redirect: true,
+        };
+        match validate_auth_and_guards(&AHashMap::new(), &[backend], &requires_login()) {
+            AuthGuardResult::Deferred(ctx) => {
+                assert_eq!(ctx.backend, "session");
+                assert!(ctx.cookie_csrf);
+            }
+            other => panic!("expected Deferred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_verified_credential_wins_over_a_session_cookie() {
+        // The session backend comes first, but Rust cannot verify a session.
+        let headers = headers_with(&[("cookie", "sessionid=abc"), ("x-api-key", "key-1")]);
+        let backends = [session_backend(), api_key_backend()];
+        match validate_auth_and_guards(&headers, &backends, &requires_login()) {
+            AuthGuardResult::Allow(Some(ctx)) => {
+                assert_eq!(ctx.backend, "api_key");
+                assert_eq!(ctx.backend_index, Some(1));
+            }
+            other => panic!("expected the API key to authenticate, got {other:?}"),
+        }
     }
 
     #[test]
