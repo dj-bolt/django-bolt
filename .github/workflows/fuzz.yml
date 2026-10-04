@@ -47,11 +47,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # The newest supported Python, as CI.yml and coverage.yml pick it.
+      # requires-python has no upper bound, so it would give an unsupported release.
+      - name: Pick the Python version
+        id: python
+        run: python3 scripts/ci_versions.py | grep '^newest-version=' >> "$GITHUB_OUTPUT"
+
       # bolt-core links libpython through PyO3.
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version-file: pyproject.toml
+          python-version: ${{ steps.python.outputs.newest-version }}
 
       # cargo-fuzz needs nightly for the sanitizer flags.
       - name: Install Rust nightly
@@ -64,15 +70,24 @@ jobs:
 
       # The corpus of each run starts from the corpus of the last run.
       - name: Restore the corpus
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
 
       - name: Fuzz
         working-directory: fuzz
         run: cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="$FUZZ_SECONDS"
+
+      # Save also after a failure. A plain actions/cache saves only after success,
+      # and the run that finds a crash is the run whose corpus matters.
+      - name: Save the corpus
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # The failing input. Reproduce it with
       # `cargo +nightly fuzz run <target> <file>`.
@@ -97,10 +112,15 @@ jobs:
         with:
           version: "latest"
 
+      # The newest supported Python, as CI.yml and coverage.yml pick it.
+      - name: Pick the Python version
+        id: python
+        run: python3 scripts/ci_versions.py | grep '^newest-version=' >> "$GITHUB_OUTPUT"
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version-file: pyproject.toml
+          python-version: ${{ steps.python.outputs.newest-version }}
 
       - name: Install Rust
         # Toolchain comes from rust-toolchain.toml.
@@ -114,10 +134,10 @@ jobs:
 
       # Hypothesis keeps each failing example here and tries it first next time.
       - name: Restore the Hypothesis database
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .hypothesis
-          key: hypothesis-${{ github.run_id }}
+          key: hypothesis-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: hypothesis-
 
       - name: Hypothesis properties
@@ -128,6 +148,14 @@ jobs:
         env:
           PROPTEST_CASES: "20000"
         run: cargo test -p bolt-core --lib
+
+      # Save also after a failure: the failing example must reach the next run.
+      - name: Save the Hypothesis database
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .hypothesis
+          key: hypothesis-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload the failing examples
         if: failure()

@@ -222,8 +222,9 @@ pub struct RateLimitConfig {
     pub rps: u32,
     pub burst: u32,
     pub key: RateLimitKey,
-    /// The `BoltAPI` that registered the route. Test apps reuse handler ids,
-    /// so the scope keeps the buckets of two APIs apart.
+    /// 0 in a server, which merges its APIs and gives each route its own
+    /// handler id. Test apps reuse handler ids, so the test client sets a
+    /// scope that keeps the buckets of two test apps apart.
     pub scope: u64,
 }
 
@@ -962,12 +963,6 @@ fn parse_rate_limit_config(
     } else {
         // If burst not specified, default to 2x rps
         config.burst = config.rps * 2;
-    }
-
-    if let Some(scope_py) = dict.get("scope") {
-        if let Ok(scope) = scope_py.extract::<u64>(py) {
-            config.scope = scope;
-        }
     }
 
     // Parse key_type (optional, defaults to "ip").

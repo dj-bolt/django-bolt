@@ -104,8 +104,8 @@ def _warn_if_inside_atomic_block() -> None:
 class BoltTestTransport(httpx.BaseTransport):
     """HTTP transport that routes requests through django-bolt's test handler.
 
-    Uses Actix's native test infrastructure which runs synchronously
-    with an internal tokio runtime for proper request handling.
+    Each request runs on a test worker thread, through the request pipeline
+    of runbolt. The calling thread waits for the response.
 
     Args:
         app_id: Test app instance ID
@@ -139,8 +139,7 @@ class BoltTestTransport(httpx.BaseTransport):
         method = request.method
 
         try:
-            # Call the synchronous Rust test_request function
-            # It creates its own tokio runtime internally for Actix test utilities
+            # The Rust function waits for the response of a test worker thread.
             status_code, resp_headers, resp_body = _core.test_request(
                 app_id=self.app_id,
                 method=method,
@@ -173,9 +172,8 @@ class BoltTestTransport(httpx.BaseTransport):
 class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
     """Async HTTP transport that routes requests through django-bolt's test handler.
 
-    Uses Actix's native test infrastructure. The underlying Rust function is
-    synchronous (it creates its own tokio runtime), so we run it in a thread
-    executor to avoid blocking the async event loop.
+    The Rust function waits for the response of a test worker thread. Thus
+    it runs in a thread executor, so it does not block the event loop.
 
     Args:
         app_id: Test app instance ID

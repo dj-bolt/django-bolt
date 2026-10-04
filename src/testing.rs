@@ -227,7 +227,13 @@ pub struct TestAppState {
     /// Global compression config (mirrors production server). Drives the
     /// streaming-compression codec selection in `handler.rs`.
     pub global_compression_config: Option<Arc<bolt_core::metadata::CompressionConfig>>,
+    /// The rate-limit scope of the routes of this app. See `create_test_app`.
+    pub rate_limit_scope: u64,
 }
+
+/// The top bit marks the rate-limit scope of one test app, so it never equals
+/// a scope that Python passes.
+const OWN_RATE_LIMIT_SCOPE: u64 = 1 << 63;
 
 /// Registry for test app instances
 static TEST_REGISTRY: OnceCell<DashMap<u64, Arc<RwLock<TestAppState>>>> = OnceCell::new();
@@ -237,14 +243,29 @@ fn registry() -> &'static DashMap<u64, Arc<RwLock<TestAppState>>> {
     TEST_REGISTRY.get_or_init(DashMap::new)
 }
 
+/// Return the state of one test app. The registry lock ends before the return.
+/// A Python call can run the finalizer of an unclosed TestClient, and that
+/// finalizer removes an app from the registry.
+fn test_app(app_id: u64) -> PyResult<Arc<RwLock<TestAppState>>> {
+    registry()
+        .get(&app_id)
+        .map(|entry| Arc::clone(entry.value()))
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))
+}
+
 /// Create a test app instance and return its ID.
 ///
 /// The app reads the Django settings with the function that `runbolt` uses.
 /// With `read_django_settings=False`, it uses no global CORS, static or media
 /// settings. `cors_allowed_origins` and `static_files_config` replace the
 /// settings for one test.
+///
+/// Without `rate_limit_scope`, the app has its own rate-limit buckets: an HTTP
+/// test client starts empty, as a new server does. A WebSocket test client is
+/// one connection, so it passes the scope of its API, and the connections to
+/// one API share their buckets, as on a server.
 #[pyfunction]
-#[pyo3(signature = (dispatch, read_django_settings=true, cors_allowed_origins=None, static_files_config=None, compression_config=None))]
+#[pyo3(signature = (dispatch, read_django_settings=true, cors_allowed_origins=None, static_files_config=None, compression_config=None, rate_limit_scope=None))]
 pub fn create_test_app(
     py: Python<'_>,
     dispatch: Py<PyAny>,
@@ -252,13 +273,11 @@ pub fn create_test_app(
     cors_allowed_origins: Option<Vec<String>>,
     static_files_config: Option<&Bound<'_, PyDict>>,
     compression_config: Option<&Bound<'_, PyDict>>,
+    rate_limit_scope: Option<u64>,
 ) -> PyResult<u64> {
-    let mut config = ServerConfig::from_django_settings(py)?;
-    if !read_django_settings {
-        config.global_cors_config = None;
-        config.static_files_config = None;
-        config.media_files_config = None;
-    }
+    // Without read_django_settings, the CORS, static and media settings are not
+    // read at all, so their warnings do not show either.
+    let mut config = ServerConfig::read(py, read_django_settings)?;
     if let Some(origins) = cors_allowed_origins {
         config.set_cors_origins(origins);
     }
@@ -273,6 +292,7 @@ pub fn create_test_app(
         None => None,
     };
 
+    let id = TEST_ID_GEN.fetch_add(1, Ordering::Relaxed);
     let app = TestAppState {
         router: Arc::new(Router::new()),
         websocket_router: Arc::new(WebSocketRouter::new()),
@@ -282,9 +302,9 @@ pub fn create_test_app(
         dispatch: dispatch.clone_ref(py),
         config,
         global_compression_config,
+        rate_limit_scope: rate_limit_scope.unwrap_or(OWN_RATE_LIMIT_SCOPE | id),
     };
 
-    let id = TEST_ID_GEN.fetch_add(1, Ordering::Relaxed);
     registry().insert(id, Arc::new(RwLock::new(app)));
     Ok(id)
 }
@@ -360,9 +380,7 @@ pub fn register_test_routes(
     app_id: u64,
     routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
 ) -> PyResult<()> {
-    let entry = registry()
-        .get(&app_id)
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
+    let entry = test_app(app_id)?;
 
     let mut app = entry.write();
 
@@ -386,9 +404,7 @@ pub fn register_test_websocket_routes(
     app_id: u64,
     routes: Vec<(String, usize, Py<PyAny>, Option<Py<PyAny>>)>,
 ) -> PyResult<()> {
-    let entry = registry()
-        .get(&app_id)
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
+    let entry = test_app(app_id)?;
 
     let mut app = entry.write();
 
@@ -407,9 +423,7 @@ pub fn register_test_asgi_mounts(
     app_id: u64,
     mounts: Vec<(String, Py<PyAny>)>,
 ) -> PyResult<()> {
-    let entry = registry()
-        .get(&app_id)
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
+    let entry = test_app(app_id)?;
 
     let mut app = entry.write();
     let asgi_mounts = validate_and_sort_asgi_mounts(py, mounts)?;
@@ -434,9 +448,7 @@ pub fn register_test_mcp_mounts(
         parsed.push(bolt_mcp::parse_mount(py, dict)?);
     }
 
-    let entry = registry()
-        .get(&app_id)
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
+    let entry = test_app(app_id)?;
     let mut app = entry.write();
     app.mcp_mounts = Arc::new(parsed);
     Ok(())
@@ -449,9 +461,7 @@ pub fn register_test_middleware_metadata(
     app_id: u64,
     metadata: Vec<(usize, Py<PyAny>)>,
 ) -> PyResult<()> {
-    let entry = registry()
-        .get(&app_id)
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
+    let entry = test_app(app_id)?;
 
     let mut app = entry.write();
 
@@ -466,12 +476,17 @@ pub fn register_test_middleware_metadata(
         })?;
         // Propagate parse failures so tests fail loudly instead of the route
         // silently losing its auth/middleware config.
-        let route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
+        let mut route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "Failed to parse route metadata for handler {}: {}",
                 handler_id, e
             ))
         })?;
+        // Test apps reuse handler ids, and each request comes from 127.0.0.1.
+        // The scope keeps the rate-limit buckets of two test apps apart.
+        if let Some(rate_limit) = route_meta.rate_limit_config.as_mut() {
+            rate_limit.scope = app.rate_limit_scope;
+        }
         parsed_metadata.insert(handler_id, route_meta);
     }
     inject_global_cors(&mut parsed_metadata, app.config.global_cors_config.as_ref());
@@ -480,22 +495,18 @@ pub fn register_test_middleware_metadata(
     Ok(())
 }
 
-/// Handle a test request using Actix's native test infrastructure.
+/// Run one test request through the request pipeline of `runbolt`.
 ///
-/// This function:
-/// 1. Creates an Actix test service matching production configuration
-/// 2. Executes the request using a local tokio runtime
-/// 3. Returns the response as (status_code, headers, body)
-///
-/// The request flows through the exact same code path as production:
+/// The request goes to the test worker of the calling thread (see
+/// `test_workers`). There, an Actix test service with the production
+/// middleware runs it:
 /// - NormalizePath middleware
 /// - CorsMiddleware
 /// - CompressionMiddleware
 /// - handle_request handler
 ///
-/// Note: This is a synchronous function because Actix test utilities are !Send
-/// and cannot be used with pyo3_async_runtimes::future_into_py. We create
-/// a local tokio runtime for each request instead.
+/// The calling thread releases the GIL and waits for the response. The
+/// result is `(status_code, headers, body)`. Each header value is bytes.
 #[pyfunction]
 #[expect(
     clippy::type_complexity,
@@ -509,25 +520,20 @@ pub fn test_request(
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     query_string: Option<String>,
-) -> PyResult<(u16, Vec<(String, String)>, Vec<u8>)> {
+) -> PyResult<(u16, Vec<(String, Vec<u8>)>, Vec<u8>)> {
     py.detach(move || {
         // Ensure TASK_LOCALS is initialized for SSE/streaming support
         ensure_task_locals_initialized();
 
         // Get test app state
-        let entry = registry()
-            .get(&app_id)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
-
-        let app_state = entry.clone();
-        drop(entry); // Release DashMap lock
+        let app_state = test_app(app_id)?;
 
         // The request runs on a test worker thread, as a request of the server
         // runs on an Actix worker. The handler never runs on the thread of the test.
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let job: TestJob = Box::new(move || {
             Box::pin(async move {
-                let result: PyResult<(u16, Vec<(String, String)>, Vec<u8>)> = async move {
+                let result: PyResult<(u16, Vec<(String, Vec<u8>)>, Vec<u8>)> = async move {
                     // Read test app state
                     let (
                         router,
@@ -659,12 +665,12 @@ pub fn test_request(
                     // Extract response
                     let status = response.status().as_u16();
 
-                    let resp_headers: Vec<(String, String)> = response
+                    // The bytes of each value, as a real client gets them. httpx
+                    // decodes them, also a value that is not ASCII.
+                    let resp_headers: Vec<(String, Vec<u8>)> = response
                         .headers()
                         .iter()
-                        .map(|(k, v)| {
-                            (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
-                        })
+                        .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
                         .collect();
 
                     // Use test::read_body which handles various body types including Encoder
@@ -704,9 +710,7 @@ pub fn handle_test_websocket(
     use bolt_core::permissions::{evaluate_guards, GuardResult};
     use bolt_core::router::parse_query_string;
 
-    let entry = registry()
-        .get(&app_id)
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Invalid test app id"))?;
+    let entry = test_app(app_id)?;
 
     let app = entry.read();
 
@@ -1009,4 +1013,99 @@ pub fn handle_test_websocket(
         path_params_dict.into(),
         scope_dict.into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        destroy_test_app, register_test_middleware_metadata, registry, RouteMetadataStore, Router,
+        ServerConfig, TestAppState, WebSocketRouter, OWN_RATE_LIMIT_SCOPE, TEST_ID_GEN,
+    };
+    use bolt_core::middleware::client_ip::TrustedProxies;
+    use bolt_core::streaming::StreamConfig;
+    use bolt_websocket::WsConfig;
+    use parking_lot::RwLock;
+    use pyo3::prelude::*;
+    use pyo3::types::{PyCFunction, PyDict, PyModule};
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Put an app with no routes and no Django settings into the registry.
+    fn insert_app(py: Python<'_>) -> u64 {
+        let id = TEST_ID_GEN.fetch_add(1, Ordering::Relaxed);
+        let app = TestAppState {
+            router: Arc::new(Router::new()),
+            websocket_router: Arc::new(WebSocketRouter::new()),
+            asgi_mounts: Arc::new(Vec::new()),
+            mcp_mounts: Arc::new(Vec::new()),
+            route_metadata: Arc::new(RouteMetadataStore::default()),
+            dispatch: py.None(),
+            config: ServerConfig {
+                debug: false,
+                max_header_size: 8192,
+                max_payload_size: 1024 * 1024,
+                max_param_length: 1024,
+                asgi_mount_timeout: Duration::from_secs(30),
+                stream_config: StreamConfig {
+                    sync_batch_size: 5,
+                    channel_capacity: 32,
+                    max_sync_threads: 1000,
+                },
+                ws_config: Arc::new(WsConfig {
+                    max_connections: 10000,
+                    channel_buffer_size: 100,
+                    heartbeat_interval: Duration::from_secs(5),
+                    client_timeout: Duration::from_secs(10),
+                    max_message_size: 1024 * 1024,
+                }),
+                global_cors_config: None,
+                trusted_proxies: Arc::new(TrustedProxies::parse(&[]).unwrap()),
+                static_files_config: None,
+                media_files_config: None,
+            },
+            global_compression_config: None,
+            rate_limit_scope: OWN_RATE_LIMIT_SCOPE | id,
+        };
+        registry().insert(id, Arc::new(RwLock::new(app)));
+        id
+    }
+
+    /// The collector can free an unclosed TestClient in any Python call. Its
+    /// finalizer then removes the app from the registry. A registration that
+    /// calls Python must not hold the registry lock, or the removal waits forever.
+    #[test]
+    fn a_finalizer_during_registration_can_remove_a_test_app() {
+        Python::initialize();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = Python::attach(|py| -> PyResult<bool> {
+                let app_id = insert_app(py);
+                let module = PyModule::from_code(
+                    py,
+                    c"class Rps:\n    def __init__(self, release):\n        self.release = release\n\n    def __index__(self):\n        self.release()\n        return 10\n",
+                    c"finalizer_during_registration.py",
+                    c"finalizer_during_registration",
+                )?;
+                // `release` does what the finalizer of an unclosed TestClient does.
+                let release = PyCFunction::new_closure(py, None, None, move |_args, _kwargs| {
+                    destroy_test_app(app_id)
+                })?;
+                let rate_limit = PyDict::new(py);
+                rate_limit.set_item("type", "rate_limit")?;
+                rate_limit.set_item("rps", module.getattr("Rps")?.call1((release,))?)?;
+                let meta = PyDict::new(py);
+                meta.set_item("middleware", vec![rate_limit])?;
+                register_test_middleware_metadata(py, app_id, vec![(0, meta.into_any().unbind())])?;
+                Ok(registry().contains_key(&app_id))
+            });
+            sender.send(result.map_err(|e| e.to_string())).unwrap();
+        });
+        let still_registered = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the registration waits for the registry lock that it holds")
+            .unwrap();
+        assert!(!still_registered, "the finalizer did not run");
+    }
 }

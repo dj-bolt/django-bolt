@@ -59,6 +59,14 @@ PREFLIGHT = {"Origin": "https://a.example", "Access-Control-Request-Method": "GE
 
 CASES = [
     ParityCase(
+        # The server sends the UTF-8 bytes of the value, and httpx decodes them.
+        id="a-utf8-header-value-reaches-the-client",
+        settings={},
+        method="GET",
+        path="/utf8-header",
+        expect_headers={"x-name": "日本"},
+    ),
+    ParityCase(
         id="upload-limit-defaults-to-one-megabyte",
         settings={},
         method="POST",

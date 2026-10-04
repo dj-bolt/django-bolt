@@ -133,9 +133,13 @@ clippy:
 fuzz target seconds="60":
     cd fuzz && cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}}
 
+# `uv run` builds PyO3 against the project environment. The fixed proptest
+# seed gives each run the same cases, as in CI, so two runs can be compared.
+# Each job builds in its own copy of the tree. The default is half the CPUs,
+# at most 8: cargo-mutants warns above 8. Set another count with `just mutants 2`.
 # Mutation-test the Rust files in .cargo/mutants.toml; results go to mutants.out/ (needs cargo-mutants)
-mutants:
-    cargo mutants --workspace
+mutants jobs=`n=$(getconf _NPROCESSORS_ONLN); echo $(( n > 16 ? 8 : (n > 1 ? n / 2 : 1) ))`:
+    PROPTEST_RNG_SEED=0 uv run cargo mutants --workspace --jobs {{jobs}}
 
 # Mutation-test the Python modules in [tool.mutmut] of pyproject.toml; results go to mutants-work/
 mutmut:
@@ -297,9 +301,11 @@ docs: docs-serve
 docs-serve:
     cd docs && uv run python build_llms_full.py && uv run --group docs zensical serve -a localhost:8080
 
-# Check the Python examples in docs/src: they parse, and their django_bolt imports exist
+# The script needs only the standard library, but Python 3.12 or later: it parses
+# the package source. `uv run` finds such a Python; a python3 on PATH can be older.
+# Check the Python examples in docs/src and the readmes: they parse, and their imports exist
 docs-check:
-    python3 scripts/check_doc_snippets.py
+    uv run --no-project --python ">=3.12" python scripts/check_doc_snippets.py
 
 # Build documentation (also regenerates llms-full.txt for AI crawlers)
 docs-build:
