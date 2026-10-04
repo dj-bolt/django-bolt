@@ -933,24 +933,21 @@ async fn handle_test_request_internal(
 
     // Auth and guards
     let auth_ctx = if let Some(ref meta) = route_meta {
-        match validate_auth_and_guards(&headers, &meta.auth_backends, &meta.guards) {
-            AuthGuardResult::Allow(ctx) => {
-                let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
-                if bolt_core::validation::cookie_csrf_blocks(
-                    method,
-                    &headers,
-                    requires_csrf,
-                    &conn_scheme,
-                ) {
-                    return responses::error_403();
-                }
-                ctx
-            }
+        let ctx = match validate_auth_and_guards(&headers, &meta.auth_backends, &meta.guards) {
+            AuthGuardResult::Allow(ctx) => ctx,
+            // The Python dispatch checks the guards against the Django user.
+            AuthGuardResult::Deferred(ctx) => Some(ctx),
             AuthGuardResult::Unauthorized => return responses::error_401(),
             AuthGuardResult::Forbidden(denial) => {
                 return responses::error_403_denial(denial.as_deref())
             }
+        };
+        let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
+        if bolt_core::validation::cookie_csrf_blocks(method, &headers, requires_csrf, &conn_scheme)
+        {
+            return responses::error_403();
         }
+        ctx
     } else {
         None
     };

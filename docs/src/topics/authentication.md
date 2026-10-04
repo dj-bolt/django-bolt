@@ -581,23 +581,55 @@ APIKeyAuthentication(
 
 ## Session authentication
 
-Django-Bolt integrates with Django's session-based authentication via middleware. This is ideal when you're already using Django's auth system or need browser-based authentication with cookies.
+`SessionAuthentication` uses Django's session framework. Use it for browser apps that log in with Django.
 
 ### Setup
 
-Enable Django middleware to use sessions:
+Put the backend on a route, as any other backend:
 
 ```python
-from django_bolt import BoltAPI
+from django_bolt import CurrentUser
+from django_bolt.auth import IsAuthenticated, Requires, SessionAuthentication
 
+@api.get("/me", auth=[SessionAuthentication()], guards=[IsAuthenticated()])
+async def me(user: CurrentUser):
+    return {"username": user.username}
+
+@api.get("/reports", auth=[SessionAuthentication()], guards=[Requires("is_staff", True)])
+async def reports():
+    return {"reports": []}
+```
+
+Django does the session work:
+
+1. Bolt adds Django's `SessionMiddleware` and `AuthenticationMiddleware` to each route that uses the backend. When the middleware of the API, router or route already has both, Bolt adds nothing. When it has only one of them, startup fails, because a second `SessionMiddleware` would load and save the session again.
+2. Rust rejects a request with no session cookie with 401. No Python runs.
+3. For a request with the cookie, Django loads the session and the user.
+4. Bolt checks the guards of the route against `request.user`, before the handler.
+
+A guard can read `is_staff`, `is_superuser` and `permissions` of the Django user. `Requires("permissions", "app.perm")` uses the permissions of the user and of its groups. A `Requires` on another claim rejects a session request with 403. A `none_of` guard on another claim is an error at startup, because it would let every session user in. Startup also fails when a guard reads a field that your user model does not have.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `login_url` | `None` | Redirect an anonymous user to this URL with Django's `redirect_to_login`. Without it, the request gets 401. |
+| `csrf` | `True` | Check the origin of each unsafe request to the route, also with no session cookie. This also protects a login route. See [Cross-site request forgery protection](#cross-site-request-forgery-protection). |
+
+With `csrf=True`, a client that is not a browser must send an `Origin` header that matches the host. Otherwise, use a token backend for that client, or set `csrf=False`.
+
+!!! note
+    - A route with the session backend runs Django middleware in Python. It does not get the sync fast path. When Bolt adds the middleware to the route, a sync handler runs on the thread pool, not on a request lane.
+    - For a session request, all Python middleware runs before Bolt checks the guards. For a token request, Rust checks the guards before any Python runs.
+    - A rate limit with `key="user"` counts a session request by its client IP.
+
+!!! tip "Performance"
+    Each session request runs two Django queries: one for the session and one for the user. Set Django's `SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"` to read the session from the cache. In our measurement, this gave 40% to 60% more requests per second. A sync handler on an API with `django_middleware` runs on a request lane, which is also faster than the thread pool.
+    - Session authentication works on HTTP routes only. A WebSocket route or an MCP mount with the backend in `auth` raises an error at startup. When the backend comes from `BOLT_AUTHENTICATION_CLASSES`, Bolt leaves it out there.
+
+You can also load the Django middleware on the whole API, with no backend. Then use Django's decorators, because Bolt guards do not see the session user:
+
+```python
 # Load session and auth middleware from Django settings
 api = BoltAPI(django_middleware=True)
-
-# Or explicitly specify middleware
-api = BoltAPI(django_middleware=[
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-])
 ```
 
 ### Login and logout
@@ -609,9 +641,10 @@ from typing import Annotated
 from django.contrib.auth import alogin, alogout
 from django.contrib.auth.models import User
 from django_bolt import Request
+from django_bolt.auth import AllowAny, SessionAuthentication
 from django_bolt.params import Form
 
-@api.post("/login")
+@api.post("/login", auth=[SessionAuthentication()], guards=[AllowAny()])
 async def login(
     request: Request,
     username: Annotated[str, Form()],
@@ -623,7 +656,7 @@ async def login(
         return {"status": "logged in", "username": user.username}
     return {"status": "invalid credentials"}
 
-@api.post("/logout")
+@api.post("/logout", auth=[SessionAuthentication()], guards=[AllowAny()])
 async def logout(request: Request):
     await alogout(request)
     return {"status": "logged out"}
@@ -759,7 +792,7 @@ async def get_data(request):
     return {"authenticated_via": backend}
 ```
 
-Django-Bolt tries each backend in order until one succeeds.
+Django-Bolt tries each backend in order until one succeeds. `SessionAuthentication` comes last in any order, because Rust can verify a token but not a session.
 
 ## Authentication context
 

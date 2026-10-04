@@ -164,8 +164,12 @@ def mount_mcp(
     # explicit list wins, otherwise the API-wide default authentication
     # classes apply (harmless context enrichment when no guards are set).
     from django_bolt.auth import get_default_authentication_classes  # noqa: PLC0415 — Django must be configured first
+    from django_bolt.auth.session import auth_without_session  # noqa: PLC0415 — Django must be configured first
 
-    backends = auth if auth is not None else (get_default_authentication_classes() or [])
+    # Django middleware does not run on a mount, so a session backend cannot work there.
+    backends = auth_without_session(auth, f"MCP mount {path}")
+    if backends is None:
+        backends = get_default_authentication_classes() or []
     auth_metadata = [b.to_metadata() for b in backends] or None
     mount_guards = [] if oauth_resource is not None else list(guards or [])
     guards_metadata = [g.to_metadata() for g in mount_guards]

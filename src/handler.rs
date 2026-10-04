@@ -937,26 +937,14 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         if let Some(route_meta) = route_metadata {
             let empty_headers = AHashMap::new();
             let headers_map = headers.as_ref().unwrap_or(&empty_headers);
-            match validate_auth_and_guards(
+            let ctx = match validate_auth_and_guards(
                 headers_map,
                 &route_meta.auth_backends,
                 &route_meta.guards,
             ) {
-                AuthGuardResult::Allow(ctx) => {
-                    let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
-                    if requires_csrf {
-                        let scheme = req.connection_info().scheme().to_owned();
-                        if bolt_core::validation::cookie_csrf_blocks(
-                            method,
-                            headers_map,
-                            true,
-                            &scheme,
-                        ) {
-                            return responses::error_403();
-                        }
-                    }
-                    ctx
-                }
+                AuthGuardResult::Allow(ctx) => ctx,
+                // The Python dispatch checks the guards against the Django user.
+                AuthGuardResult::Deferred(ctx) => Some(ctx),
                 AuthGuardResult::Unauthorized => {
                     // CORS headers will be added by CorsMiddleware
                     return responses::error_401();
@@ -965,7 +953,15 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                     // CORS headers will be added by CorsMiddleware
                     return responses::error_403_denial(denial.as_deref());
                 }
+            };
+            let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf);
+            if requires_csrf {
+                let scheme = req.connection_info().scheme().to_owned();
+                if bolt_core::validation::cookie_csrf_blocks(method, headers_map, true, &scheme) {
+                    return responses::error_403();
+                }
             }
+            ctx
         } else {
             None
         }

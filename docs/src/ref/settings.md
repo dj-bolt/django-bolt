@@ -419,9 +419,7 @@ api = BoltAPI(
         version="1.0.0",
         description="API description",
         enabled=True,
-        docs_url="/docs",
-        openapi_url="/openapi.json",
-        django_auth=False,
+        path="/docs",
     )
 )
 ```

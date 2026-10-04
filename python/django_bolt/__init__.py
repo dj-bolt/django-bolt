@@ -62,6 +62,7 @@ from .auth import (
     JWTAuthentication,
     OptionalCurrentUser,
     Requires,
+    SessionAuthentication,
     Token,
     create_jwt_for_user,
     extract_user_id_from_context,
@@ -225,6 +226,7 @@ __all__ = [
     # Auth - Authentication
     "JWTAuthentication",
     "APIKeyAuthentication",
+    "SessionAuthentication",
     "AuthContext",
     # Auth - Guards/Permissions
     "AllowAny",
