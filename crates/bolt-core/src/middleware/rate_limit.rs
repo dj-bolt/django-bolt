@@ -79,8 +79,9 @@ impl fmt::Display for KeySource<'_> {
 
 /// Per-key limiters. The quota is part of the identity: handler ids are reused
 /// after a reload or by the next test app, and a stale limiter must not keep
-/// an old quota alive.
-static LIMITERS: Lazy<DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>>> =
+/// an old quota alive. The scope of the `BoltAPI` keeps two test apps with the
+/// same handler ids apart.
+static LIMITERS: Lazy<DashMap<(u64, usize, u32, u32, LimiterKey), Arc<Limiter>>> =
     Lazy::new(DashMap::new);
 
 // Track total limiter count for cleanup
@@ -168,7 +169,7 @@ pub fn check_rate_limit(
 
     // Get or create rate limiter for this handler + key combination
     let limiter = LIMITERS
-        .entry((handler_id, rps, burst, source.bucket()))
+        .entry((config.scope, handler_id, rps, burst, source.bucket()))
         .or_insert_with(|| {
             // Increment counter
             LIMITER_COUNT.fetch_add(1, Ordering::Relaxed);

@@ -52,6 +52,7 @@ fn a_header_keyed_request_allocates_nothing() {
         rps: 1_000_000,
         burst: 1_000_000,
         key: RateLimitKey::Header("x-tenant".to_string()),
+        scope: 0,
     };
     let map = headers("acme");
 
@@ -79,6 +80,7 @@ fn a_long_header_value_allocates_nothing_either() {
         rps: 1_000_000,
         burst: 1_000_000,
         key: RateLimitKey::Header("x-tenant".to_string()),
+        scope: 0,
     };
     let map = headers(&"t".repeat(4096));
 

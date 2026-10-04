@@ -11,6 +11,7 @@ from __future__ import annotations
 from django.test import override_settings
 
 from django_bolt import BoltAPI
+from django_bolt.middleware import rate_limit
 from django_bolt.testing import TestClient
 
 
@@ -118,3 +119,25 @@ def test_an_untrusted_peer_is_the_client_address():
     with TestClient(_api()) as client:
         response = client.get("/remote", headers={"X-Forwarded-For": "203.0.113.9"})
     assert response.json() == {"remote": "127.0.0.1"}
+
+
+def _limited_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.get("/limited")
+    @rate_limit(rps=1, burst=1)
+    async def limited():
+        return {"ok": True}
+
+    return api
+
+
+def test_a_new_client_starts_with_empty_rate_limit_buckets():
+    """A new test client is a new server, so an earlier test cannot use up its limit."""
+    with TestClient(_limited_api()) as client:
+        assert client.get("/limited").status_code == 200
+        assert client.get("/limited").status_code == 429
+
+    # The same handler id, limit and client address as above.
+    with TestClient(_limited_api()) as client:
+        assert client.get("/limited").status_code == 200
