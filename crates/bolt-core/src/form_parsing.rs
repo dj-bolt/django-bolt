@@ -307,6 +307,10 @@ pub fn parse_urlencoded(
 ///     }
 /// });
 /// ```
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each limit is a separate setting, and the hot path passes them without a struct"
+)]
 pub async fn parse_multipart(
     mut payload: Multipart,
     type_hints: &HashMap<String, u8>,

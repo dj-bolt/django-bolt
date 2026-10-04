@@ -78,6 +78,7 @@ bolt-mcp = { workspace = true }
 
 [dependency-groups]
 dev = [
+    "pyjwt>=2.11", # pytest.ini ignores jwt.warnings.InsecureKeyLengthWarning, which 2.11 adds
     "pytest>=9.0", # pytest.ini uses `strict = true`
     "pytest-asyncio>=1.4.0", # 1.3 leaves an unclosed event loop on Python 3.12 and 3.13
     "pytest-django>=4.9.0",
@@ -148,8 +149,10 @@ extra-paths = ["python"]
 [tool.coverage.run]
 source = ["django_bolt", "bolt_mcp"]
 branch = true
-# Measure the runbolt servers that the integration tests start, too.
-patch = ["subprocess"]
+# Measure the runbolt servers that the integration tests start, too. The
+# workers of `runbolt --processes N` are forked and end with os._exit(), so
+# they need the fork and _exit patches to save their data.
+patch = ["subprocess", "fork", "_exit"]
 parallel = true
 
 [tool.coverage.paths]

@@ -81,6 +81,10 @@ impl fmt::Display for KeySource<'_> {
 /// after a reload or by the next test app, and a stale limiter must not keep
 /// an old quota alive. The scope of the `BoltAPI` keeps two test apps with the
 /// same handler ids apart.
+#[expect(
+    clippy::type_complexity,
+    reason = "the key is the limiter identity: app scope, handler id, quota and client key"
+)]
 static LIMITERS: Lazy<DashMap<(u64, usize, u32, u32, LimiterKey), Arc<Limiter>>> =
     Lazy::new(DashMap::new);
 

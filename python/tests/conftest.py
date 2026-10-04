@@ -25,10 +25,15 @@ def _gil_stays_disabled():
 
     CPython enables the GIL when it loads a C extension that does not declare
     free-threading support. The run then tests GIL behavior, not free threading.
+    A run with PYTHON_GIL=1 asks for the GIL, so the check skips it.
+    The bolt-mcp suite has a copy of this fixture.
     """
     yield
-    if sysconfig.get_config_var("Py_GIL_DISABLED") and sys._is_gil_enabled():
-        pytest.fail("An imported C extension enabled the GIL. The RuntimeWarning in the warnings summary names it.")
+    if sysconfig.get_config_var("Py_GIL_DISABLED") and sys.flags.gil is None and sys._is_gil_enabled():
+        pytest.fail(
+            "An imported C extension enabled the GIL. A RuntimeWarning names the module. "
+            "Find it in stderr at startup, or in the error of the test that imported it."
+        )
 
 
 def pytest_configure(config):
