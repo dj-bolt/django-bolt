@@ -165,6 +165,13 @@ where
         builder.insert_header(("content-encoding", "identity"));
     }
 
+    // 5. A 204 has no body (RFC 9110 §15.3.5). Actix drops the content-length
+    // header for it but writes the bytes it gets, so a body would corrupt the
+    // next response on a keep-alive connection.
+    if status == StatusCode::NO_CONTENT {
+        return builder.body(());
+    }
+
     builder.body(body)
 }
 
@@ -189,6 +196,20 @@ mod tests {
         };
         let response = build_response_from_meta(StatusCode::OK, &meta, b"{}".to_vec(), false);
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_build_response_from_meta_no_content_drops_the_body() {
+        let meta = ResponseMeta {
+            response_type: ResponseType::Json,
+            custom_content_type: None,
+            custom_headers: None,
+            cookies: None,
+        };
+        let response =
+            build_response_from_meta(StatusCode::NO_CONTENT, &meta, b"{}".to_vec(), false);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.body().size(), actix_web::body::BodySize::Sized(0));
     }
 
     #[test]

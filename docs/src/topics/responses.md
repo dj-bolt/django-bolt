@@ -449,6 +449,16 @@ async def get_user(user_id: int) -> User:
     return {"id": user_id, "username": "john", "email": "john@example.com"}
 ```
 
+The schema describes the body of the default status code of the route. Bolt validates a `JSON` or `Response` only when its status code is that default. A response with another status code, such as a 400 with a map of field errors, is encoded as-is. To document and validate other status codes, use the per-status-code form below.
+
+```python
+@api.post("/users", status_code=201)
+async def create_user(body: UserCreate) -> User:
+    if await username_taken(body.username):
+        return JSON({"username": ["Already taken."]}, status_code=400)  # not validated
+    return JSON(await create(body), status_code=201)  # validated as User
+```
+
 ### Per-status-code response schemas
 
 `response_model` also accepts a dict mapping status codes to types. Each code gets its own OpenAPI response entry. Bolt encodes the body as-is and does not validate it.
