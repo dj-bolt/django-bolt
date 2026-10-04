@@ -53,11 +53,6 @@ HANDSHAKE_HEADERS = frozenset(
     {b"sec-websocket-protocol", b"sec-websocket-accept", b"sec-websocket-extensions", b"upgrade", b"connection"}
 )
 
-try:
-    from django.conf import settings
-except ImportError:
-    settings = None  # type: ignore
-
 
 class WebSocketTestClient:
     """Async WebSocket test client for django-bolt.

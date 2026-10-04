@@ -88,6 +88,30 @@ CASES = [
         },
     ),
     ParityCase(
+        # With credentials, the preflight names the origin, not "*".
+        id="cors-preflight-reads-each-setting",
+        settings={
+            "CORS_ALLOW_ALL_ORIGINS": True,
+            "CORS_ALLOW_CREDENTIALS": True,
+            "CORS_ALLOW_METHODS": ["GET", "POST"],
+            "CORS_ALLOW_HEADERS": ["X-Custom", "Content-Type"],
+            "CORS_EXPOSE_HEADERS": ["X-Total"],
+            "CORS_PREFLIGHT_MAX_AGE": 600,
+        },
+        method="OPTIONS",
+        path="/plain",
+        headers=PREFLIGHT,
+        status=204,
+        expect_headers={
+            "access-control-allow-origin": "https://a.example",
+            "access-control-allow-credentials": "true",
+            "access-control-allow-methods": "GET, POST",
+            "access-control-allow-headers": "X-Custom, Content-Type",
+            "access-control-expose-headers": "X-Total",
+            "access-control-max-age": "600",
+        },
+    ),
+    ParityCase(
         id="cors-origin-regexes-alone",
         settings={"CORS_ALLOWED_ORIGIN_REGEXES": [r"^https://.*\.example$"]},
         method="GET",
