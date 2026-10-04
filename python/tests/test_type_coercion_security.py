@@ -160,49 +160,28 @@ class TestParameterLengthLimits:
         response = client.get(f"/int/{max_i64}")
         assert response.status_code == 200, f"Expected 200 for max i64, got {response.status_code}"
 
-    def test_typed_path_param_exceeds_limit_rejected(self, client):
+    @pytest.mark.parametrize(
+        ("method", "path", "kwargs", "where"),
+        [
+            ("GET", "/int/" + "1" * 8193, {}, "Path parameter 'value'"),
+            ("GET", "/query/int?value=" + "1" * 8193, {}, "Query parameter 'value'"),
+            ("POST", "/form/int", {"data": {"value": "1" * 8193}}, "Invalid value for field 'value'"),
+            ("GET", "/str/" + "a" * 8193, {}, "Path parameter 'value'"),
+        ],
+        ids=["typed-path", "typed-query", "typed-form", "string-path"],
+    )
+    def test_param_over_8kb_rejected(self, client, method, path, kwargs, where):
         """
-        Test that typed path parameter exceeding 8KB limit returns 422.
+        A parameter over 8 KB gets 422 in each source, typed or not.
 
         Security: Prevents memory exhaustion from oversized parameters.
-        Validated by: src/type_coercion.rs MAX_PARAM_LENGTH check in coerce_param()
+        Validated by: the MAX_PARAM_LENGTH check in the request pipeline.
         """
-        # Create 8193 byte string for an int field (will fail coercion AND length)
-        value = "1" * 8193
-        response = client.get(f"/int/{value}")
-        assert response.status_code == 422, f"Expected 422 for >8KB typed param, got {response.status_code}"
-
-    def test_typed_query_param_exceeds_limit_rejected(self, client):
-        """
-        Test that typed query parameter exceeding 8KB limit returns 422.
-
-        Security: Query parameters are also subject to the length limit.
-        """
-        value = "1" * 8193
-        response = client.get(f"/query/int?value={value}")
-        assert response.status_code == 422, f"Expected 422 for >8KB typed query param, got {response.status_code}"
-
-    def test_typed_form_field_exceeds_limit_rejected(self, client):
-        """
-        Test that typed form field exceeding 8KB limit returns 422.
-
-        Security: Form fields are also subject to the length limit.
-        """
-        value = "1" * 8193
-        response = client.post("/form/int", data={"value": value})
-        assert response.status_code == 422, f"Expected 422 for >8KB typed form field, got {response.status_code}"
-
-    def test_string_path_param_exceeds_limit_rejected(self, client):
-        """
-        Test that string path parameters are also subject to 8KB length limit.
-
-        Security: All parameters (including strings) are now validated for length
-        in the request pipeline before reaching the handler.
-        """
-        # String params over 8KB are rejected
-        value = "a" * 10000
-        response = client.get(f"/str/{value}")
-        assert response.status_code == 422, f"Expected 422 for large string param, got {response.status_code}"
+        response = client.request(method, path, **kwargs)
+        assert response.status_code == 422
+        detail = str(response.json()["detail"])
+        assert where in detail
+        assert "Parameter too long: 8193 bytes (max 8192 bytes)" in detail
 
 
 # =============================================================================
@@ -234,64 +213,41 @@ class TestIntegerBoundaries:
         data = response.json()
         assert data["value"] == min_i64
 
-    def test_int_overflow_rejected(self, client):
-        """
-        Test value exceeding i64 range returns 422.
+    @pytest.mark.parametrize(
+        ("path", "detail"),
+        [
+            # i64::MAX + 1 and i64::MIN - 1: no overflow can bypass validation.
+            (
+                "/int/9223372036854775808",
+                "Path parameter 'value': Invalid integer '9223372036854775808': number too large to fit in target type",
+            ),
+            (
+                "/int/-9223372036854775809",
+                "Path parameter 'value': Invalid integer '-9223372036854775809': "
+                "number too small to fit in target type",
+            ),
+            # No implicit truncation and no scientific notation.
+            ("/int/3.14", "Path parameter 'value': Invalid integer '3.14': invalid digit found in string"),
+            ("/int/1e10", "Path parameter 'value': Invalid integer '1e10': invalid digit found in string"),
+            (
+                "/query/int?value=",
+                "Query parameter 'value': Invalid integer '': cannot parse integer from empty string",
+            ),
+        ],
+        ids=["overflow", "underflow", "float", "scientific", "empty"],
+    )
+    def test_invalid_int_rejected(self, client, path, detail):
+        """Each value that is not an i64 gets 422 with the reason."""
+        response = client.get(path)
+        assert response.status_code == 422
+        assert response.json() == {"detail": detail}
 
-        Security: Prevents integer overflow attacks that could bypass validation.
-        """
-        overflow = 9223372036854775808  # i64::MAX + 1
-        response = client.get(f"/int/{overflow}")
-        assert response.status_code == 422, f"Expected 422 for i64 overflow, got {response.status_code}"
-
-    def test_int_underflow_rejected(self, client):
-        """
-        Test value below i64 range returns 422.
-
-        Security: Prevents integer underflow attacks.
-        """
-        underflow = -9223372036854775809  # i64::MIN - 1
-        response = client.get(f"/int/{underflow}")
-        assert response.status_code == 422, f"Expected 422 for i64 underflow, got {response.status_code}"
-
-    def test_int_with_float_value_rejected(self, client):
-        """
-        Test float value for int parameter returns 422.
-
-        Security: No implicit truncation - must be exact integer.
-        """
-        response = client.get("/int/3.14")
-        assert response.status_code == 422, f"Expected 422 for float in int field, got {response.status_code}"
-
-    def test_int_scientific_notation_rejected(self, client):
-        """
-        Test scientific notation for int parameter returns 422.
-
-        Security: Scientific notation could be used to bypass range checks.
-        """
-        response = client.get("/int/1e10")
-        assert response.status_code == 422, f"Expected 422 for scientific notation, got {response.status_code}"
-
-    def test_int_with_plus_sign_rejected(self, client):
-        """
-        Test integer with explicit plus sign returns 422.
-
-        Security: Only plain integers accepted, no prefix modifiers.
-        """
-        # Plus sign in integer (tests strict parsing). A bare `+` in a query is a space.
+    def test_int_with_plus_sign_accepted(self, client):
+        """An explicit plus sign is a valid integer, as for Python's int()."""
+        # A bare `+` in a query is a space, so the sign is encoded.
         response = client.get("/query/int?value=%2B123")
-        # Note: Rust's i64::parse may accept +123, so we document behavior
-        if response.status_code == 200:
-            # If accepted, verify the value is correct
-            data = response.json()
-            assert data["value"] == 123
-        else:
-            assert response.status_code == 422
-
-    def test_int_empty_string_rejected(self, client):
-        """Test empty string for int parameter returns 422."""
-        response = client.get("/query/int?value=")
-        assert response.status_code == 422, f"Expected 422 for empty int, got {response.status_code}"
+        assert response.status_code == 200
+        assert response.json() == {"value": 123, "type": "int"}
 
 
 # =============================================================================

@@ -41,6 +41,7 @@ from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteWrapper
 from django_bolt import BoltAPI, concurrency
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.testing import TestClient
+from tests.thread_pools import shutdown_closing_connections
 
 SECRET = "broken-connection-recovery-secret-key-32b"
 
@@ -71,8 +72,8 @@ def single_thread_pool(monkeypatch):
     orm_pool = _orm_pool(1)
     monkeypatch.setattr(concurrency, "_orm_executor", orm_pool)
     yield
-    pool.shutdown(wait=True)
-    orm_pool.shutdown(wait=True)
+    shutdown_closing_connections(pool)
+    shutdown_closing_connections(orm_pool)
 
 
 def _kill_then_query() -> None:
@@ -176,7 +177,7 @@ def test_sync_to_async_calls_of_different_requests_run_in_parallel(monkeypatch):
         started = time.perf_counter()
         responses = list(requests.map(lambda _: client.get("/slow"), range(4)))
         elapsed = time.perf_counter() - started
-    pool.shutdown(wait=True)
+    shutdown_closing_connections(pool)
 
     assert all(response.status_code == 200 for response in responses)
     # One shared thread takes 4 × 0.2 s. The pool runs the four calls at the same time.

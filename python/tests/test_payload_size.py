@@ -14,11 +14,9 @@ before ``TestClient(api)``.
 
 from __future__ import annotations
 
-import contextlib
-
 import msgspec
 import pytest
-from django.conf import settings
+from django.test import override_settings
 
 from django_bolt import BoltAPI, UploadFile
 from django_bolt.params import File
@@ -32,20 +30,9 @@ class Payload(msgspec.Struct):
     blob: str
 
 
-@contextlib.contextmanager
 def _max_payload(size: int):
-    """Temporarily set BOLT_MAX_UPLOAD_SIZE, restoring the prior state."""
-    had_attr = hasattr(settings, "BOLT_MAX_UPLOAD_SIZE")
-    prev = getattr(settings, "BOLT_MAX_UPLOAD_SIZE", None)
-    settings.BOLT_MAX_UPLOAD_SIZE = size
-    try:
-        yield
-    finally:
-        if had_attr:
-            settings.BOLT_MAX_UPLOAD_SIZE = prev
-        else:
-            with contextlib.suppress(AttributeError):
-                delattr(settings, "BOLT_MAX_UPLOAD_SIZE")
+    """Set BOLT_MAX_UPLOAD_SIZE in a `with` block, restoring the prior state."""
+    return override_settings(BOLT_MAX_UPLOAD_SIZE=size)
 
 
 @pytest.fixture

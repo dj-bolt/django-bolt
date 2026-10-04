@@ -368,7 +368,8 @@ class TestSyncPathParameters:
     def test_sync_path_parameter_invalid_type(self, client):
         """Sync handler should fail with invalid path parameter type."""
         response = client.get("/sync/users/invalid")
-        assert response.status_code != 200
+        assert response.status_code == 422
+        assert response.json()["detail"].startswith("Path parameter 'user_id': Invalid integer 'invalid'")
 
 
 class TestSyncPathAndQueryParameters:
@@ -413,7 +414,8 @@ class TestSyncQueryParameters:
     def test_sync_query_parameter_missing_required(self, client):
         """Sync handler should fail without required query parameter."""
         response = client.get("/sync/search")
-        assert response.status_code != 200
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Missing required query parameter: q"}
 
 
 class TestSyncHeaderParameters:
@@ -470,7 +472,9 @@ class TestSyncRequestBodyValidation:
             "/sync/users",
             json={"name": "John"},  # Missing email
         )
-        assert response.status_code != 200
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"] == ["body", "email"]
+        assert response.json()["detail"][0]["type"] == "missing_field"
 
 
 # ========================

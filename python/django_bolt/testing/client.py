@@ -10,11 +10,10 @@ This version uses async-native Rust testing infrastructure which provides:
 from __future__ import annotations
 
 import asyncio
-import builtins
-import contextlib
 import logging
 import threading
 import warnings
+import weakref
 from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urlsplit
@@ -345,6 +344,9 @@ class TestClient(httpx.Client):
             static_files_config,
             api._rust_compression_config(),
         )
+        # Release the native app at close, or when nobody closed the client and
+        # it is garbage. The native app holds the API, so a leak keeps it alive.
+        self._release_app = weakref.finalize(self, _core.destroy_test_app, self.app_id)
 
         # Register routes
         rust_routes = [
@@ -428,12 +430,16 @@ class TestClient(httpx.Client):
                 if self._db_share is not None:
                     self._db_share.uninstall()
             finally:
-                with contextlib.suppress(builtins.BaseException):
-                    _core.destroy_test_app(self.app_id)
+                self._release_app()
                 # A lane keeps its database connections open. An open connection
                 # blocks the drop of the test database at teardown.
                 _core.stop_idle_lanes()
         return super().__exit__(exc_type, exc_val, exc_tb)
+
+    def close(self) -> None:
+        """Close the client and release its native test app."""
+        super().close()
+        self._release_app()
 
     # Override HTTP methods to support stream=True
     def _add_streaming_methods(self, response: Response) -> Response:
@@ -645,6 +651,9 @@ class AsyncTestClient(httpx.AsyncClient):
             static_files_config,
             api._rust_compression_config(),
         )
+        # Release the native app at close, or when nobody closed the client and
+        # it is garbage. The native app holds the API, so a leak keeps it alive.
+        self._release_app = weakref.finalize(self, _core.destroy_test_app, self.app_id)
 
         # Register routes
         rust_routes = [
@@ -717,8 +726,12 @@ class AsyncTestClient(httpx.AsyncClient):
             if hasattr(self, "_lifespan_cm"):
                 await self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb)
         finally:
-            with contextlib.suppress(builtins.BaseException):
-                _core.destroy_test_app(self.app_id)
+            self._release_app()
             # As in TestClient.__exit__: close the database connections of the lanes.
             _core.stop_idle_lanes()
         return await super().__aexit__(exc_type, exc_val, exc_tb)
+
+    async def aclose(self) -> None:
+        """Close the client and release its native test app."""
+        await super().aclose()
+        self._release_app()

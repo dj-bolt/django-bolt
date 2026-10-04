@@ -6,6 +6,7 @@ from typing import Annotated
 
 import msgspec
 import pytest
+from django.test import override_settings
 
 from django_bolt import JSON, BoltAPI, Response, StreamingResponse
 from django_bolt.exceptions import HTTPException
@@ -758,17 +759,30 @@ def test_large_file_upload_rejected_by_default(api):
         assert response.status_code in (413, 422), f"Expected 413 or 422, got {response.status_code}: {response.text}"
 
 
-def test_large_file_upload_with_increased_limit(api):
-    """Test that file uploads within the limit work correctly.
+def _upload_api() -> BoltAPI:
+    upload_api = BoltAPI()
 
-    Note: Upload size limits are now compiled into route metadata at startup.
-    The default max_upload_size is 1MB, set in middleware/compiler.py.
-    Testing dynamic BOLT_MAX_UPLOAD_SIZE changes requires server restart.
+    @upload_api.post("/upload")
+    async def upload(files: Annotated[list[dict], FileParam(alias="file")]):
+        return {"size": files[0]["size"]}
+
+    return upload_api
+
+
+def test_large_file_upload_with_increased_limit():
+    """BOLT_MAX_UPLOAD_SIZE raises the upload limit of the routes registered under it.
+
+    The route compiles its limit at registration, so the API is built inside
+    the override.
     """
-    # This test is skipped because max_upload_size is now compiled at route registration time
-    # and cannot be changed dynamically. To test increased limits, need to configure
-    # max_upload_size in route metadata before server starts.
-    pytest.skip("Upload size limits are now compiled at route registration time (Rust implementation)")
+    payload = b"x" * (2 * 1024 * 1024)
+    with TestClient(_upload_api()) as client:
+        assert client.post("/upload", files={"file": ("a.bin", payload)}).status_code == 413
+
+    with override_settings(BOLT_MAX_UPLOAD_SIZE=3 * 1024 * 1024), TestClient(_upload_api()) as client:
+        response = client.post("/upload", files={"file": ("a.bin", payload)})
+    assert response.status_code == 200
+    assert response.json() == {"size": len(payload)}
 
 
 def test_error_responses_have_cors_headers(api):

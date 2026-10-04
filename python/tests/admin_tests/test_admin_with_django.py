@@ -15,8 +15,8 @@ def test_admin_root_redirect():
     """Test /admin/ returns content (redirect or login page) via TestClient."""
     from django_bolt.admin.admin_detection import should_enable_admin  # noqa: PLC0415
 
-    if not should_enable_admin():
-        pytest.skip("Django admin not enabled")
+    # The test settings enable the admin. A skip here would hide a broken detection.
+    assert should_enable_admin()
 
     api = BoltAPI()
     api._register_admin_routes("127.0.0.1", 8000)
@@ -26,8 +26,7 @@ def test_admin_root_redirect():
         return {"test": "ok"}
 
     # Check if admin mount was registered
-    if not api._admin_routes_registered:
-        pytest.skip("Admin mount was not registered")
+    assert api._admin_routes_registered
 
     with TestClient(api, use_http_layer=True) as client:
         response = client.get("/admin/")
@@ -52,8 +51,8 @@ def test_admin_login_page():
     """Test /admin/login/ returns HTML page (not empty body) via TestClient."""
     from django_bolt.admin.admin_detection import should_enable_admin  # noqa: PLC0415
 
-    if not should_enable_admin():
-        pytest.skip("Django admin not enabled")
+    # The test settings enable the admin. A skip here would hide a broken detection.
+    assert should_enable_admin()
 
     api = BoltAPI()
     api._register_admin_routes("127.0.0.1", 8000)
@@ -63,8 +62,7 @@ def test_admin_login_page():
         return {"test": "ok"}
 
     # Check if admin mount was registered
-    if not api._admin_routes_registered:
-        pytest.skip("Admin mount was not registered")
+    assert api._admin_routes_registered
 
     with TestClient(api, use_http_layer=True) as client:
         response = client.get("/admin/login/")

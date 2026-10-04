@@ -1,11 +1,16 @@
 """Tests for Django-Bolt health check system."""
 
 import asyncio
+import concurrent.futures
 import time
 
 import pytest
+from asgiref.sync import sync_to_async
+from django.contrib.auth.models import User
+from django.db import connection, connections
+from django.db.utils import OperationalError
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, concurrency
 from django_bolt.health import (
     HealthCheck,
     _health_check,
@@ -15,6 +20,7 @@ from django_bolt.health import (
     ready_handler,
     register_health_checks,
 )
+from tests.thread_pools import shutdown_closing_connections
 
 
 class TestHealthCheck:
@@ -97,32 +103,71 @@ class TestDatabaseCheck:
     """Test database health check."""
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
     async def test_check_database_success(self):
-        """Test database check succeeds with valid connection."""
-        # This test requires Django to be configured
+        """With database access, the check connects and reports success.
+
+        The check runs on another thread. It must use the connection of that
+        thread, not open the connection of the calling thread from there.
+        """
+        before = connection.connection
         try:
-            from django.conf import settings  # noqa: PLC0415
+            assert await check_database() == (True, "Database connection OK")
+            assert connection.connection is before
+        finally:
+            # The check connects on the thread of sync_to_async. Close it there:
+            # resolve `connection` on that thread, not on this one.
+            await sync_to_async(lambda: connection.close())()
 
-            if not settings.configured:
-                pytest.skip("Django not configured")
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    async def test_check_database_sees_a_database_that_went_away(self, monkeypatch):
+        """Each check connects, so the second check sees the lost database.
 
-            healthy, message = await check_database()
-            # Should either succeed or fail gracefully
-            assert isinstance(healthy, bool)
-            assert isinstance(message, str)
-        except ImportError:
-            pytest.skip("Django not available")
+        ensure_connection does nothing for an open connection. A check that
+        kept its connection open reported success after the database went away.
+        """
+        assert await check_database() == (True, "Database connection OK")
+
+        def refuse(*args, **kwargs):
+            raise OperationalError("the database went away")
+
+        monkeypatch.setattr(type(connections["default"]), "get_new_connection", refuse)
+
+        assert await check_database() == (False, "Database error: the database went away")
+
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    async def test_check_database_keeps_the_connection_of_its_thread(self, monkeypatch):
+        """The check must not close a connection that a query still reads from.
+
+        With one ORM thread, the check runs on the thread of the iterator. A
+        check that closed the connection of that thread broke the next chunk.
+        """
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, initializer=concurrency._mark_orm_thread)
+        monkeypatch.setattr(concurrency, "_orm_executor", pool)
+        try:
+            await User.objects.abulk_create([User(username=f"user{index}") for index in range(7)])
+            rows = User.objects.order_by("pk").values_list("username", flat=True).aiterator(chunk_size=3)
+            first = [await anext(rows) for _ in range(3)]
+
+            assert await check_database() == (True, "Database connection OK")
+
+            rest = [username async for username in rows]
+            assert first + rest == [f"user{index}" for index in range(7)]
+        finally:
+            shutdown_closing_connections(pool)
 
     @pytest.mark.asyncio
     async def test_check_database_handles_error(self):
-        """Test database check handles connection errors."""
-        # Even if database is not available, check should not raise
-        try:
-            healthy, message = await check_database()
-            assert isinstance(healthy, bool)
-            assert isinstance(message, str)
-        except Exception:
-            pytest.fail("check_database should not raise exceptions")
+        """A connection error gives (False, message), not an exception.
+
+        Without the django_db mark, pytest-django blocks database access, so
+        the connection attempt fails.
+        """
+        healthy, message = await check_database()
+        assert healthy is False
+        assert message.startswith("Database error:")
 
 
 class TestHealthHandlers:

@@ -256,11 +256,15 @@ def test_the_escape_hatch_serves_a_worker_that_iterates():
     served = threading.Event()
 
     def export():
-        for index, user in enumerate(User.objects.iterator(chunk_size=2)):
-            exported.append(user.username)
-            if index == 0:
-                holding.set()
-                served.wait(5)
+        try:
+            for index, user in enumerate(User.objects.iterator(chunk_size=2)):
+                exported.append(user.username)
+                if index == 0:
+                    holding.set()
+                    served.wait(5)
+        finally:
+            # The thread ends here. Close its connection, so it does not leak.
+            connections.close_all()
 
     with TestClient(_make_api(), share_db_connection=False) as client:
         worker = threading.Thread(target=export)

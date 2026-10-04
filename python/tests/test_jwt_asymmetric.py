@@ -110,6 +110,7 @@ class TestNonStringHeaderExtras:
         token = make_token("HS256", HS_SECRET, headers={"gty": ["authorization_code", "refresh_token"]})
         response = get(client, "/hs256", token)
         assert response.status_code == 200
+        assert response.json()["user_id"] == "user123"
 
     def test_integer_header_extra_rs256(self, client):
         # The full Clerk repro: RS256 + numeric header extension param.
@@ -147,6 +148,7 @@ class TestAsymmetricAlgorithms:
         token = make_token("ES256", EC_PRIVATE_PEM)
         response = get(client, "/es256", token)
         assert response.status_code == 200
+        assert response.json()["user_id"] == "user123"
 
     def test_hs256_token_rejected_on_rs256_route(self, client):
         # Algorithm-confusion attack: HMAC token signed with the public PEM

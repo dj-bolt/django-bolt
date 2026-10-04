@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from django.conf import settings
+from django.test import override_settings
 
 from django_bolt import WebSocket
 from django_bolt.api import BoltAPI as RealBoltAPI
@@ -32,15 +33,11 @@ def _preserve_settings_mutations():
     ``autodiscover_apis`` checks, which take an early-return path when
     ``BOLT_API`` is set.
     """
-    original_apps = list(settings.INSTALLED_APPS)
-    had_bolt_api = hasattr(settings, "BOLT_API")
-    original_bolt_api = list(settings.BOLT_API) if had_bolt_api else None
-    yield
-    settings.INSTALLED_APPS = original_apps
-    if had_bolt_api:
-        settings.BOLT_API = original_bolt_api
-    elif hasattr(settings, "BOLT_API"):
-        del settings.BOLT_API
+    # An empty override_settings() gives the test its own settings holder and
+    # discards it at exit: the writes of the test and of the plugin both go away.
+    # It sends no setting_changed signal, so the app registry is not reloaded.
+    with override_settings():
+        yield
 
 
 class TestBoltAPIInit:

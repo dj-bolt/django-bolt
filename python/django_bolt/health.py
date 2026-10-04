@@ -9,7 +9,7 @@ from typing import Any
 
 try:
     from asgiref.sync import sync_to_async
-    from django.db import connection
+    from django.db import DEFAULT_DB_ALIAS, DatabaseError, connection, connections
 except ImportError:
     sync_to_async = None
     connection = None
@@ -69,6 +69,20 @@ class HealthCheck:
 _health_check = HealthCheck()
 
 
+def _ensure_connection() -> None:
+    # Connect with a new connection, then close it. ensure_connection does
+    # nothing for an open connection, so each check must connect again to see
+    # a lost database. The check must not close the connection of its thread:
+    # a query on that thread can still read from it.
+    probe = connections.create_connection(DEFAULT_DB_ALIAS)
+    try:
+        probe.ensure_connection()
+        if not probe.is_usable():
+            raise DatabaseError("database connection is not usable")
+    finally:
+        probe.close()
+
+
 async def check_database() -> tuple[bool, str]:
     """Check database connectivity.
 
@@ -79,7 +93,7 @@ async def check_database() -> tuple[bool, str]:
         if sync_to_async is None or connection is None:
             return False, "Django not available"
 
-        await sync_to_async(connection.ensure_connection)()
+        await sync_to_async(_ensure_connection)()
 
         return True, "Database connection OK"
     except Exception as e:
