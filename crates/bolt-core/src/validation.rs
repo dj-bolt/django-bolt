@@ -213,6 +213,7 @@ pub fn validate_auth_and_guards(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::{ClaimKey, Guard, Quantifier};
     use proptest::prelude::*;
 
     proptest! {
@@ -287,7 +288,51 @@ mod tests {
     fn test_validate_auth_no_config() {
         let headers = AHashMap::new();
         let result = validate_auth_and_guards(&headers, &[], &GuardSet::default());
-        matches!(result, AuthGuardResult::Allow(None));
+        assert!(matches!(result, AuthGuardResult::Allow(None)));
+    }
+
+    fn api_key_backend() -> AuthBackend {
+        AuthBackend::APIKey {
+            api_keys: ["k1".to_string()].into(),
+            header: "x-api-key".to_string(),
+            key_permissions: [("k1".to_string(), vec!["read".to_string()])].into(),
+        }
+    }
+
+    fn permission_guard(permission: &str) -> GuardSet {
+        GuardSet::from_guards(vec![Guard::Requires {
+            claim: ClaimKey::Permissions,
+            values: vec![serde_json::Value::from(permission)],
+            quantifier: Quantifier::Any,
+            denial: None,
+        }])
+    }
+
+    #[test]
+    fn guards_run_without_a_backend() {
+        let guards = GuardSet::from_guards(vec![Guard::IsAuthenticated]);
+        let result = validate_auth_and_guards(&AHashMap::new(), &[], &guards);
+        assert!(matches!(result, AuthGuardResult::Unauthorized));
+    }
+
+    #[test]
+    fn a_backend_runs_without_guards() {
+        let headers = headers_with(&[("x-api-key", "k1")]);
+        let result = validate_auth_and_guards(&headers, &[api_key_backend()], &GuardSet::default());
+        assert!(matches!(result, AuthGuardResult::Allow(Some(_))));
+    }
+
+    #[test]
+    fn guards_see_the_context_of_the_backend() {
+        let backends = [api_key_backend()];
+        let headers = headers_with(&[("x-api-key", "k1")]);
+        let result = validate_auth_and_guards(&headers, &backends, &permission_guard("read"));
+        assert!(matches!(result, AuthGuardResult::Allow(Some(_))));
+        let result = validate_auth_and_guards(&headers, &backends, &permission_guard("write"));
+        assert!(matches!(result, AuthGuardResult::Forbidden(None)));
+        let result =
+            validate_auth_and_guards(&AHashMap::new(), &backends, &permission_guard("read"));
+        assert!(matches!(result, AuthGuardResult::Unauthorized));
     }
 
     fn headers_with(pairs: &[(&str, &str)]) -> AHashMap<String, String> {

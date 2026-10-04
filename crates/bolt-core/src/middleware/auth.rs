@@ -1257,6 +1257,87 @@ mod tests {
         .is_none());
     }
 
+    fn validate(token: &str, audience: Option<&str>, leeway: i64) -> Option<Claims> {
+        decode_and_validate(
+            token,
+            &hs256_key(),
+            &[Algorithm::HS256],
+            audience,
+            None,
+            leeway,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_single_audience_must_be_the_configured_one() {
+        let claims_json = format!(r#"{{"sub":"42","exp":{},"aud":"api"}}"#, future_exp());
+        let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
+        assert!(validate(&token, Some("api"), 60).is_some());
+        assert!(validate(&token, Some("web"), 60).is_none());
+    }
+
+    #[test]
+    fn leeway_also_applies_to_nbf() {
+        let now = get_current_timestamp() as i64;
+        let token_valid_from = |nbf: i64| {
+            let claims_json = format!(r#"{{"sub":"42","exp":{},"nbf":{nbf}}}"#, future_exp());
+            sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256)
+        };
+        // Valid 30s from now: accepted with 60s leeway, rejected with 0.
+        assert!(validate(&token_valid_from(now + 30), None, 60).is_some());
+        assert!(validate(&token_valid_from(now + 30), None, 0).is_none());
+        // Valid at the end of the leeway: accepted.
+        assert!(validate(&token_valid_from(now + 60), None, 60).is_some());
+    }
+
+    #[test]
+    fn a_cookie_value_is_read_as_request_cookies_reads_it() {
+        assert_eq!(
+            find_cookie_value(r#"a=1; tok=x; tok="y z""#, "tok").as_deref(),
+            Some("y z")
+        );
+        assert_eq!(find_cookie_value(" tok = x ", "tok").as_deref(), Some("x"));
+        assert_eq!(find_cookie_value("a=1; tokx=2; atok=3", "tok"), None);
+    }
+
+    #[test]
+    fn only_a_cookie_backend_enforces_cookie_csrf() {
+        let headers = bearer_headers(SECRET);
+        let token = headers["authorization"]
+            .strip_prefix("Bearer ")
+            .unwrap()
+            .to_string();
+        let backend = |cookie: Option<&str>| match hs256_backend(SECRET) {
+            AuthBackend::JWT {
+                keys,
+                algorithms,
+                header,
+                ..
+            } => AuthBackend::JWT {
+                keys,
+                algorithms,
+                header,
+                cookie: cookie.map(str::to_string),
+                audience: None,
+                issuer: None,
+                leeway: 0,
+                token_type: None,
+                require_jti: false,
+                cookie_csrf: true,
+            },
+            AuthBackend::APIKey { .. } => unreachable!("hs256_backend is a JWT backend"),
+        };
+
+        let ctx = authenticate(&headers, &[backend(None)]).unwrap();
+        assert!(!ctx.cookie_csrf);
+
+        let cookies =
+            AHashMap::from_iter([("cookie".to_string(), format!("theme=dark; access={token}"))]);
+        let ctx = authenticate(&cookies, &[backend(Some("access"))]).unwrap();
+        assert!(ctx.cookie_csrf);
+    }
+
     fn hs256_backend(secret: &str) -> AuthBackend {
         AuthBackend::JWT {
             keys: JwtKeySource::Static(DecodingKey::from_secret(secret.as_bytes())),
