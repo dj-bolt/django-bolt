@@ -130,6 +130,31 @@ def test_request_fails_loudly_when_server_process_died(make_server_project):
             server.get("/health")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Process groups are POSIX.")
+def test_terminate_process_stops_a_child_that_outlives_its_parent(tmp_path):
+    """A child that keeps the output pipes open must not hang the teardown.
+
+    The worker of ``runbolt --dev`` can outlive its supervisor in this way.
+    """
+    child = "import time; time.sleep(600)"
+    parent = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {child!r}])"
+    process = helpers._spawn_process([sys.executable, "-c", parent], cwd=tmp_path, env=dict(os.environ))
+    process.wait(timeout=10)  # The parent exits at once. Its child keeps the pipes.
+
+    done = threading.Event()
+
+    def terminate() -> None:
+        helpers._terminate_process(process, timeout=1.0)
+        done.set()
+
+    threading.Thread(target=terminate, daemon=True).start()
+    try:
+        assert done.wait(10), "_terminate_process waited for the pipes of the orphaned child"
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+
+
 def test_websocket_client_keeps_a_frame_sent_with_the_handshake():
     """A frame in the same read as the 101 response is not lost."""
     listener = socket.create_server(("127.0.0.1", 0))

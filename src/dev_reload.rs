@@ -347,6 +347,9 @@ fn run_dev_reloader_inner(
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_flag = shutdown.clone();
 
+    // SIGINT, SIGTERM and SIGHUP (the ctrlc `termination` feature) stop the
+    // worker first. If SIGTERM killed only the supervisor, the worker would
+    // keep the port.
     ctrlc::set_handler(move || {
         shutdown_flag.store(true, Ordering::SeqCst);
     })
