@@ -4,6 +4,7 @@ import msgspec
 
 from django_bolt import BoltAPI
 from django_bolt.decorators import action
+from django_bolt.responses import JSON, Response
 from django_bolt.testing import TestClient
 from django_bolt.views import APIView, ViewSet
 
@@ -121,3 +122,45 @@ def test_validate_response_view_and_viewset_inheritance():
         strict_action = client.get("/widgets/strict")
         assert strict_action.status_code == 500
         assert b"Response validation error" in strict_action.content
+
+
+def test_return_annotation_validates_only_the_default_status():
+    """The return annotation describes the body of the default status.
+
+    A ``JSON`` or ``Response`` with another status code carries a different
+    body, such as a field error map. Bolt encodes it as-is.
+    """
+    api = BoltAPI()
+
+    @api.post("/items", status_code=201)
+    async def create_item(flag: str = "ok") -> Item:
+        if flag == "bad":
+            return JSON({"price": ["Must be positive."]}, status_code=400)
+        if flag == "response":
+            return Response({"price": ["Must be positive."]}, status_code=422)
+        if flag == "wrong":
+            return JSON({"name": "no-price"}, status_code=201)
+        return JSON({"name": "x", "price": 1.0}, status_code=201)
+
+    @api.get("/sync-items")
+    def sync_item(flag: str = "ok") -> Item:
+        if flag == "bad":
+            return JSON({"price": ["Must be positive."]}, status_code=400)
+        return Response({"name": "x", "price": 1.0})
+
+    with TestClient(api) as client:
+        bad = client.post("/items?flag=bad")
+        assert bad.status_code == 400
+        assert bad.json() == {"price": ["Must be positive."]}
+
+        unprocessable = client.post("/items?flag=response")
+        assert unprocessable.status_code == 422
+        assert unprocessable.json() == {"price": ["Must be positive."]}
+
+        assert client.post("/items?flag=wrong").status_code == 500
+        assert client.post("/items").status_code == 201
+
+        sync_bad = client.get("/sync-items?flag=bad")
+        assert sync_bad.status_code == 400
+        assert sync_bad.json() == {"price": ["Must be positive."]}
+        assert client.get("/sync-items").status_code == 200

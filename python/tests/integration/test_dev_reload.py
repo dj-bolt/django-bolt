@@ -114,6 +114,31 @@ def test_runbolt_dev_reloads_when_new_module_created_in_project_root(make_server
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Reload integration runs only on Linux.")
+def test_runbolt_dev_reloads_when_a_directory_with_a_module_moves_in(make_server_project):
+    """A directory moved into the project with a .py file triggers a reload.
+
+    The move sends one rename event for the directory and no event for its
+    files. Before the fix, the watcher did not look in the directory, so no
+    reload occurred.
+    """
+    project = make_server_project(api_source=app_source("reload_state"))
+    staging = project.root.parent / f"{project.root.name}_staging"
+    (staging / "generated").mkdir(parents=True)
+    (staging / "generated" / "models.py").write_text("VALUE = 1\n")
+
+    with project.start(dev=True) as server:
+        initial = server.get("/reload-state").json()
+        assert initial["reload_count"] == 0
+
+        time.sleep(0.3)
+        (staging / "generated").rename(project.path("generated"))
+
+        after = server.wait_for_json("/reload-state", lambda body: body["reload_count"] == 1, timeout=30)
+
+    assert after["pid"] != initial["pid"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Reload integration runs only on Linux.")
 def test_runbolt_dev_reloads_for_reload_dir_entry(make_server_project):
     """A .py change inside a --reload-dir directory OUTSIDE the project root
     must trigger a reload even though the api module never imports it — the
@@ -311,6 +336,42 @@ def test_runbolt_dev_stops_its_worker_on_sigterm(make_server_project):
         assert server.process.wait(timeout=15) == 0
 
         # The spawn helper made the supervisor a process group leader.
+        deadline = time.monotonic() + 10
+        while _process_group_alive(server.process.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _process_group_alive(server.process.pid), "the dev worker outlived its supervisor"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Reload integration runs only on Linux.")
+def test_runbolt_dev_under_nohup_ignores_sighup(make_server_project):
+    """``nohup runbolt --dev`` keeps serving when the terminal closes.
+
+    ``nohup`` starts the process with SIGHUP ignored. The SIGTERM handler of the
+    supervisor also catches SIGHUP, so it must keep SIGHUP ignored. Then the
+    worker also starts with SIGHUP ignored.
+    """
+    project = make_server_project(api_source=app_source("reload_state"))
+
+    # Start as nohup does. The child keeps SIG_IGN across fork and exec.
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        server = project.start(dev=True)
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+    with server:
+        worker_pid = server.get("/reload-state").json()["pid"]
+
+        # A closed terminal sends SIGHUP to the process group.
+        os.killpg(server.process.pid, signal.SIGHUP)
+        time.sleep(2)
+
+        assert server.process.poll() is None, "SIGHUP stopped the dev supervisor"
+        assert server.get("/reload-state").json()["pid"] == worker_pid, "SIGHUP stopped the dev worker"
+
+        os.kill(server.process.pid, signal.SIGTERM)
+        assert server.process.wait(timeout=15) == 0
+
         deadline = time.monotonic() + 10
         while _process_group_alive(server.process.pid) and time.monotonic() < deadline:
             time.sleep(0.05)

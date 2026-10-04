@@ -154,13 +154,22 @@ fn has_relevant_extension(path: &Path) -> bool {
     )
 }
 
-fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> {
+/// The first relevant path in the event. An access is not a change.
+fn named_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> {
     if matches!(event.kind, EventKind::Access(_)) {
         return None;
     }
 
-    if let Some(path) = event.paths.iter().find(|path| filter.is_relevant(path)) {
-        return Some(path.clone());
+    event
+        .paths
+        .iter()
+        .find(|path| filter.is_relevant(path))
+        .cloned()
+}
+
+fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> {
+    if let Some(path) = named_relevant_path(event, filter) {
+        return Some(path);
     }
 
     // The watch on a new directory starts after its create event. A file
@@ -171,10 +180,13 @@ fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> 
         event.kind,
         EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
     ) {
+        // read_dir follows a symbolic link, so look only in a real directory.
         return event
             .paths
             .iter()
-            .filter(|path| !filter.is_ignored(path))
+            .filter(|path| {
+                !filter.is_ignored(path) && path.symlink_metadata().is_ok_and(|meta| meta.is_dir())
+            })
             .find_map(|path| first_relevant_file_in(path, filter));
     }
 
@@ -182,25 +194,9 @@ fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> 
 }
 
 /// The first relevant file in `dir` or its subdirectories. None when `dir` is
-/// not a directory. Symbolic links are not followed.
-///
-/// A directory that cannot be read can hold a relevant file, so it gives
-/// itself: a reload is better than a change that is never seen.
+/// not a directory. Symbolic links in `dir` are not followed.
 fn first_relevant_file_in(dir: &Path, filter: &ReloadFilter) -> Option<PathBuf> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        // A file, or the old path of a rename: there is no directory to scan.
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return None;
-        }
-        Err(_) => return Some(dir.to_path_buf()),
-    };
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
         if filter.is_ignored(&path) {
             continue;
@@ -274,6 +270,17 @@ fn wait_for_child_exit(
     }
 }
 
+/// True when the process ignores SIGHUP, as under `nohup`.
+#[cfg(unix)]
+fn sighup_is_ignored() -> bool {
+    // SAFETY: a null new action only reads the current action into `current`.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction == libc::SIG_IGN
+    }
+}
+
 fn stop_worker(worker: &mut Option<Child>, timeout: Duration) -> PyResult<()> {
     let Some(child) = worker.as_mut() else {
         return Ok(());
@@ -330,7 +337,9 @@ fn recv_change(
             while Instant::now() < deadline {
                 match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(Ok(next_event)) => {
-                        if let Some(next_path) = first_relevant_path(&next_event, filter) {
+                        // The reload is already due. This path is only for the
+                        // log, so do not look in a new directory again.
+                        if let Some(next_path) = named_relevant_path(&next_event, filter) {
                             changed_path = next_path;
                         }
                     }
@@ -401,6 +410,11 @@ fn run_dev_reloader_inner(
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_flag = shutdown.clone();
 
+    // `nohup` starts the process with SIGHUP ignored. The handler below
+    // replaces that setting, so read it first.
+    #[cfg(unix)]
+    let keep_sighup_ignored = sighup_is_ignored();
+
     // SIGINT, SIGTERM and SIGHUP (the ctrlc `termination` feature) stop the
     // worker first. If SIGTERM killed only the supervisor, the worker would
     // keep the port.
@@ -413,6 +427,19 @@ fn run_dev_reloader_inner(
             err
         ))
     })?;
+
+    // Ignore SIGHUP again. The worker keeps SIG_IGN across exec, so both
+    // processes continue when the terminal closes.
+    #[cfg(unix)]
+    if keep_sighup_ignored {
+        // SAFETY: SIG_IGN for a valid signal number installs no Rust code.
+        if unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) } == libc::SIG_ERR {
+            return Err(py_runtime_error(format!(
+                "Failed to keep SIGHUP ignored for dev reload: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
 
     let (tx, rx) = mpsc::channel();
 
@@ -727,51 +754,6 @@ mod tests {
     }
 
     #[test]
-    fn directory_renamed_within_the_tree_triggers_reload() {
-        // A rename inside the watched tree gives the old path, then the new one.
-        // The old path is gone, so only the new one has files to find.
-        let root = TempDir::new("renamed-dir");
-        let package = root.0.join("renamed");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("views.py"), "VALUE = 1\n").unwrap();
-        let filter = ReloadFilter::new(vec![], vec![]);
-        let event = Event {
-            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-            paths: vec![root.0.join("original"), package.clone()],
-            attrs: Default::default(),
-        };
-
-        assert_eq!(
-            first_relevant_path(&event, &filter),
-            Some(package.join("views.py"))
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn new_directory_that_cannot_be_read_triggers_reload() {
-        // A directory that cannot be scanned can hold a relevant file. Reload,
-        // and do not wait for an event that may never come.
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = TempDir::new("unreadable-dir");
-        let package = root.0.join("private");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("models.py"), "VALUE = 1\n").unwrap();
-        std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let filter = ReloadFilter::new(vec![], vec![]);
-
-        let found = first_relevant_path(&create_folder_event(package.clone()), &filter);
-        std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // root can read the directory, and then finds the file in it.
-        assert!(
-            matches!(&found, Some(path) if path.starts_with(&package)),
-            "{found:?}"
-        );
-    }
-
-    #[test]
     fn new_directory_without_a_relevant_file_does_not_trigger_reload() {
         let root = TempDir::new("no-relevant");
         let package = root.0.join("assets");
@@ -781,6 +763,27 @@ mod tests {
         let filter = ReloadFilter::new(vec!["__pycache__".to_string()], vec![]);
 
         assert!(first_relevant_path(&create_folder_event(package), &filter).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_symbolic_link_to_a_directory_does_not_trigger_reload() {
+        // The scan does not follow symbolic links, also not the new path itself.
+        let root = TempDir::new("symlink");
+        let outside = root.0.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("lib.py"), "VALUE = 1\n").unwrap();
+        let link = root.0.join("linked");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let filter = ReloadFilter::new(vec![], vec![]);
+        // inotify reports a new symbolic link as a new file.
+        let event = Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![link],
+            attrs: Default::default(),
+        };
+
+        assert!(first_relevant_path(&event, &filter).is_none());
     }
 
     #[test]
