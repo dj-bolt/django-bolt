@@ -23,13 +23,30 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
+import weakref
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from django_bolt import BoltAPI, _core
 from django_bolt.websocket import CloseCode, WebSocket
 from django_bolt.websocket.handlers import build_websocket_request, get_websocket_param_name
+
+# Each WebSocketTestClient is one connection with its own test app. The
+# connections to one API share its rate-limit buckets, as the connections to
+# one server do, so each API gets one scope. A counter, not id(): an id can
+# come back for a later API.
+_rate_limit_scopes: weakref.WeakKeyDictionary[BoltAPI, int] = weakref.WeakKeyDictionary()
+_next_rate_limit_scope = itertools.count(1)
+
+
+def _rate_limit_scope(api: BoltAPI) -> int:
+    scope = _rate_limit_scopes.get(api)
+    if scope is None:
+        scope = _rate_limit_scopes[api] = next(_next_rate_limit_scope)
+    return scope
+
 
 # Seconds the client waits for the handler to accept or refuse the handshake.
 HANDSHAKE_TIMEOUT = 5.0
@@ -129,6 +146,7 @@ class WebSocketTestClient:
             self._cors_allowed_origins,
             None,
             self.api._rust_compression_config(),
+            _rate_limit_scope(self.api),
         )
 
         # Register WebSocket routes with pre-compiled injectors (same as production)

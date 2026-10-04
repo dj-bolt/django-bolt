@@ -132,13 +132,8 @@ def compile_middleware_meta(
     global_middleware: list[Any],
     guards: list[Any] | None = None,
     auth: list[Any] | None = None,
-    rate_limit_scope: int = 0,
 ) -> dict[str, Any] | None:
-    """Compile middleware metadata for a handler, including guards and auth.
-
-    ``rate_limit_scope`` identifies the BoltAPI. Rust keys each rate-limit
-    bucket on it, so two APIs with the same handler ids never share a bucket.
-    """
+    """Compile middleware metadata for a handler, including guards and auth."""
     # Check for handler-specific middleware
     handler_middleware = []
     skip_middleware: set[str] = set()
@@ -156,9 +151,6 @@ def compile_middleware_meta(
     for mw in [*global_middleware, *handler_middleware]:
         mw_dict = middleware_to_dict(mw)
         if mw_dict and mw_dict.get("type") not in skip_middleware:
-            if mw_dict.get("type") == "rate_limit":
-                # A copy: the decorator dict is shared by each API that registers the handler.
-                mw_dict = {**mw_dict, "scope": rate_limit_scope}
             all_middleware.append(mw_dict)
 
     # Compile authentication backends

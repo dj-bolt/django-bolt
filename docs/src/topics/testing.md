@@ -397,7 +397,7 @@ def test_large_upload():
 
 Three `TestClient` arguments replace settings for one test:
 
-- `cors_allowed_origins=[...]` replaces the CORS settings. A `"*"` entry allows each origin.
+- `cors_allowed_origins=[...]` replaces the CORS settings. The other CORS values are the server defaults. A `"*"` entry allows each origin.
 - `static_files_config={...}` replaces the static settings.
 - `read_django_settings=False` turns off the CORS, static and media settings.
 
