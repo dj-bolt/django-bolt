@@ -145,6 +145,10 @@ impl Default for CorsConfig {
 
 impl CorsConfig {
     /// Create CorsConfig from Django settings (django-cors-headers compatible)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument for each django-cors-headers setting"
+    )]
     pub fn from_django_settings(
         origins: Vec<String>,
         origin_regexes: Vec<String>,

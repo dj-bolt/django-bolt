@@ -12,7 +12,7 @@ just test-rs               # Rust unit tests
 just test-example          # python/example: check, migrations, tests
 just docs-check            # Python blocks in docs/src parse; their django_bolt imports exist
 just clippy                # Rust lint, -D warnings (CI gate)
-just coverage              # Python + Rust coverage → coverage/ (needs cargo-llvm-cov; then `just build`)
+just coverage              # Python + Rust coverage → coverage/ (needs cargo-llvm-cov)
 just fuzz query_string 60  # cargo-fuzz one parser target (fuzz/; needs nightly + cargo-fuzz)
 just mutants               # cargo-mutants on .cargo/mutants.toml files → mutants.out/
 just mutmut                # mutmut on [tool.mutmut] modules (scripts/mutmut.sh) → mutants-work/

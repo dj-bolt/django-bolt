@@ -99,6 +99,10 @@ async def forward(gen, sender):
 #[pyclass]
 struct AsyncStreamSender {
     locals: TaskLocals,
+    #[expect(
+        clippy::type_complexity,
+        reason = "the Option lets close() drop the sender, which ends the stream"
+    )]
     tx: Arc<Mutex<Option<mpsc::Sender<Result<Bytes, std::io::Error>>>>>,
 }
 

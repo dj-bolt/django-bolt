@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import sysconfig
 import tempfile
 
 import django
@@ -63,3 +65,17 @@ def _allow_db_access(request):
         return
     with blocker.unblock():
         yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _gil_stays_disabled():
+    """Fail a free-threaded run when an import turns the GIL back on.
+
+    This is a copy of the fixture in ``python/tests/conftest.py``. This suite has its own conftest.
+    """
+    yield
+    if sysconfig.get_config_var("Py_GIL_DISABLED") and sys.flags.gil is None and sys._is_gil_enabled():
+        pytest.fail(
+            "An imported C extension enabled the GIL. A RuntimeWarning names the module. "
+            "Find it in stderr at startup, or in the error of the test that imported it."
+        )
