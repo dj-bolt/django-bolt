@@ -126,6 +126,14 @@ clippy:
 fuzz target seconds="60":
     cd fuzz && cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}}
 
+# Mutation-test the Rust files in .cargo/mutants.toml; results go to mutants.out/ (needs cargo-mutants)
+mutants:
+    cargo mutants --workspace
+
+# Mutation-test the Python modules in [tool.mutmut] of pyproject.toml; results go to mutants-work/
+mutmut:
+    ./scripts/mutmut.sh
+
 # Measure Python and Rust coverage; reports go to coverage/ (needs cargo-llvm-cov)
 coverage:
     ./scripts/coverage.sh

@@ -1,0 +1,21 @@
+# cargo-mutants configuration: https://mutants.rs
+# Run it with `just mutants`. Results go to mutants.out/.
+
+# The request parsers and the security checks. Rust unit tests cover these
+# files. Most other Rust code is tested through the Python suite, which
+# cargo-mutants does not run, so its results there would mean little.
+examine_globs = [
+    "crates/bolt-core/src/cookies.rs",
+    "crates/bolt-core/src/form_parsing.rs",
+    "crates/bolt-core/src/middleware/auth.rs",
+    "crates/bolt-core/src/middleware/client_ip.rs",
+    "crates/bolt-core/src/middleware/rate_limit.rs",
+    "crates/bolt-core/src/permissions.rs",
+    "crates/bolt-core/src/request_pipeline.rs",
+    "crates/bolt-core/src/router.rs",
+    "crates/bolt-core/src/type_coercion.rs",
+    "crates/bolt-core/src/validation.rs",
+]
+
+# A mutant in bolt-core is caught by the tests of bolt-core.
+test_workspace = false

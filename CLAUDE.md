@@ -12,6 +12,8 @@ just test-rs               # Rust unit tests
 just clippy                # Rust lint, -D warnings (CI gate)
 just coverage              # Python + Rust coverage → coverage/ (needs cargo-llvm-cov; then `just build`)
 just fuzz query_string 60  # cargo-fuzz one parser target (fuzz/; needs nightly + cargo-fuzz)
+just mutants               # cargo-mutants on .cargo/mutants.toml files → mutants.out/
+just mutmut                # mutmut on [tool.mutmut] modules (scripts/mutmut.sh) → mutants-work/
 uv run pytest python/tests/test_syntax.py::test_name -s -vv
 just lint                  # ruff on everything; `just lint-lib` must always pass
 just format

@@ -39,3 +39,7 @@ python/benchmark/BENCHMARK_DEV.md
 
 # Hypothesis example database (python/tests/test_properties.py)
 .hypothesis/
+
+# Mutation testing output (`just mutants`, `just mutmut`)
+/mutants.out*/
+/mutants-work/
