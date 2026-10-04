@@ -66,23 +66,10 @@ class WorkerLoop(asyncio.SelectorEventLoop):
         # handle must exist first.
         self._scheduler = scheduler
         super().__init__(selector=_NoSelector())
+        self._default_executor = _get_default_executor()
         # fd -> Handle, mirroring the stdlib selector's (reader, writer) data.
         self._readers = {}
         self._writers = {}
-
-    # The loop lives as long as the process, but the default pool can change:
-    # a test replaces it and shuts it down later. Thus `run_in_executor(None)`
-    # looks up the pool at each call. `set_default_executor` gives this loop a
-    # pool of its own.
-    _own_executor = None
-
-    @property
-    def _default_executor(self):
-        return self._own_executor or _get_default_executor()
-
-    @_default_executor.setter
-    def _default_executor(self, executor):
-        self._own_executor = executor
 
     def _make_self_pipe(self):
         # Rust wakes the pump; there is no thread to interrupt with a pipe.

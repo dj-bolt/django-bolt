@@ -210,6 +210,21 @@ pub fn close_test_worker_connections(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
+/// Give the loop of this test worker the default pool of now.
+///
+/// The loop lives as long as the process. A test can replace the default pool
+/// and shut it down later, so the loop must not keep the pool of an earlier
+/// test. `runbolt` never replaces the pool, so its loops keep their first pool.
+fn refresh_default_executor(py: Python<'_>) -> PyResult<()> {
+    let pool = py
+        .import("django_bolt.concurrency")?
+        .call_method0("_get_default_executor")?;
+    bolt_loop::current_loop(py)?
+        .loop_obj()
+        .bind(py)
+        .setattr("_default_executor", pool)
+}
+
 /// The peer address of each test request: a client on the loopback interface.
 const TEST_PEER_ADDR: std::net::SocketAddr =
     std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50000);
@@ -541,6 +556,8 @@ pub fn test_request(
         let job: TestJob = Box::new(move || {
             Box::pin(async move {
                 let result: PyResult<(u16, Vec<(String, Vec<u8>)>, Vec<u8>)> = async move {
+                    Python::attach(refresh_default_executor)?;
+
                     // Read test app state
                     let (
                         router,
