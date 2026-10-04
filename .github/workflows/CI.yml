@@ -251,6 +251,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The fuzz targets are not in the workspace, and the Fuzz workflow runs
+      # each week. Check here that they still build against bolt-core.
+      - name: Check the fuzz targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
+
       # A fixed proptest seed: a red check comes from the change, not from a
       # new random case. The Fuzz workflow runs many random cases each week.
       - name: Rust tests

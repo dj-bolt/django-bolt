@@ -506,7 +506,7 @@ pub fn register_test_middleware_metadata(
 /// - handle_request handler
 ///
 /// The calling thread releases the GIL and waits for the response. The
-/// result is `(status_code, headers, body)`.
+/// result is `(status_code, headers, body)`. Each header value is bytes.
 #[pyfunction]
 #[expect(
     clippy::type_complexity,
@@ -520,7 +520,7 @@ pub fn test_request(
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     query_string: Option<String>,
-) -> PyResult<(u16, Vec<(String, String)>, Vec<u8>)> {
+) -> PyResult<(u16, Vec<(String, Vec<u8>)>, Vec<u8>)> {
     py.detach(move || {
         // Ensure TASK_LOCALS is initialized for SSE/streaming support
         ensure_task_locals_initialized();
@@ -533,7 +533,7 @@ pub fn test_request(
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let job: TestJob = Box::new(move || {
             Box::pin(async move {
-                let result: PyResult<(u16, Vec<(String, String)>, Vec<u8>)> = async move {
+                let result: PyResult<(u16, Vec<(String, Vec<u8>)>, Vec<u8>)> = async move {
                     // Read test app state
                     let (
                         router,
@@ -663,12 +663,12 @@ pub fn test_request(
                     // Extract response
                     let status = response.status().as_u16();
 
-                    let resp_headers: Vec<(String, String)> = response
+                    // The bytes of each value, as a real client gets them. httpx
+                    // decodes them, also a value that is not ASCII.
+                    let resp_headers: Vec<(String, Vec<u8>)> = response
                         .headers()
                         .iter()
-                        .map(|(k, v)| {
-                            (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
-                        })
+                        .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
                         .collect();
 
                     // Use test::read_body which handles various body types including Encoder

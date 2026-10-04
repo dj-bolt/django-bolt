@@ -638,6 +638,13 @@ mod tests {
     }
 
     proptest! {
+        // A raw query is cheap to check. The hand-written test that these
+        // replace ran 20,000 queries, so each run checks at least that many.
+        #![proptest_config(ProptestConfig {
+            cases: ProptestConfig::default().cases.max(20_000),
+            ..ProptestConfig::default()
+        })]
+
         /// The parser gives the pairs of the WHATWG `application/x-www-form-urlencoded`
         /// parser (in `serde_urlencoded`), which gives what Django `QueryDict` gives.
         #[test]
@@ -654,6 +661,28 @@ mod tests {
             prop_assert_eq!(actual, expected);
         }
 
+        /// A sequence key gets each of its values, in order; the map gets the last one.
+        #[test]
+        fn sequences_and_the_map_agree_with_the_pairs(query in raw_query()) {
+            let map = parse_query_string(&query);
+            let pairs: Vec<(String, String)> = query_pairs(&query)
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            let keys: AHashSet<String> = pairs.iter().map(|(key, _)| key.clone()).collect();
+            for (key, values) in owned(collect_query_sequences(&query, &keys)) {
+                let expected: Vec<String> = pairs
+                    .iter()
+                    .filter(|(name, _)| *name == key)
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                let last = map.get(key.as_str()).map(|value| value.to_string());
+                prop_assert_eq!(values.last(), last.as_ref());
+                prop_assert_eq!(values, expected);
+            }
+        }
+    }
+
+    proptest! {
         #[test]
         fn an_encoded_component_decodes_to_its_text(text in any::<String>(), plus in any::<bool>()) {
             let encoded = form_encode(&text, plus);
@@ -680,26 +709,6 @@ mod tests {
                 .map(|(key, value)| (key.into_owned(), value.into_owned()))
                 .collect();
             prop_assert_eq!(decoded, pairs);
-        }
-
-        /// A sequence key gets each of its values, in order; the map gets the last one.
-        #[test]
-        fn sequences_and_the_map_agree_with_the_pairs(query in raw_query()) {
-            let map = parse_query_string(&query);
-            let pairs: Vec<(String, String)> = query_pairs(&query)
-                .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                .collect();
-            let keys: AHashSet<String> = pairs.iter().map(|(key, _)| key.clone()).collect();
-            for (key, values) in owned(collect_query_sequences(&query, &keys)) {
-                let expected: Vec<String> = pairs
-                    .iter()
-                    .filter(|(name, _)| *name == key)
-                    .map(|(_, value)| value.clone())
-                    .collect();
-                let last = map.get(key.as_str()).map(|value| value.to_string());
-                prop_assert_eq!(values.last(), last.as_ref());
-                prop_assert_eq!(values, expected);
-            }
         }
 
         /// A path param decodes `%XX` only. A `+` stays a `+`.
