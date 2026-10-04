@@ -28,6 +28,7 @@ use std::time::Duration;
 use actix_multipart::Multipart;
 use bolt_asgi::asgi_http;
 use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
+use bolt_core::cookies::cookie_pairs;
 use bolt_core::form_parsing::{
     parse_multipart, parse_urlencoded, FormParseResult, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT,
 };
@@ -1600,21 +1601,16 @@ pub fn handle_test_websocket(
     let cookies_dict = pyo3::types::PyDict::new(py);
     for (k, v) in headers.iter() {
         if k.to_lowercase() == "cookie" {
-            for pair in v.split(';') {
-                let pair = pair.trim();
-                if let Some(eq_pos) = pair.find('=') {
-                    let key = &pair[..eq_pos];
-                    let value = &pair[eq_pos + 1..];
-                    set_declared_item(
-                        py,
-                        &cookies_dict,
-                        key,
-                        value,
-                        cookie_types,
-                        max_param_length,
-                        "Cookie",
-                    )?;
-                }
+            for (key, value) in cookie_pairs(v) {
+                set_declared_item(
+                    py,
+                    &cookies_dict,
+                    key,
+                    &value,
+                    cookie_types,
+                    max_param_length,
+                    "Cookie",
+                )?;
             }
         }
     }

@@ -3,7 +3,8 @@
 //! Uses the battle-tested `cookie` crate instead of manual string building
 //! to ensure proper validation, escaping, and security.
 //!
-//! Cookie values are quoted as Django quotes them.
+//! Cookie values are quoted and read as Django quotes and reads them, so a
+//! cookie that Django sets reads back in Bolt, and the reverse.
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -173,6 +174,66 @@ pub fn quote_cookie_value(value: &str) -> Cow<'_, str> {
     Cow::Owned(quoted)
 }
 
+/// Remove the quotes of a cookie value as Django does (Python `http.cookies._unquote`).
+///
+/// A value in double quotes loses them, and its escapes are decoded:
+/// `\ooo` gives the character of that octal code, and `\c` gives `c`.
+/// Any other value stays as it is.
+pub fn unquote_cookie_value(value: &str) -> Cow<'_, str> {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return Cow::Borrowed(value);
+    };
+    if !inner.contains('\\') {
+        return Cow::Borrowed(inner);
+    }
+    let mut unquoted = String::with_capacity(inner.len());
+    let mut rest = inner;
+    while let Some(pos) = rest.find('\\') {
+        unquoted.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        match after.as_bytes() {
+            [high @ b'0'..=b'3', mid @ b'0'..=b'7', low @ b'0'..=b'7', ..] => {
+                let code = u32::from(high - b'0') << 6
+                    | u32::from(mid - b'0') << 3
+                    | u32::from(low - b'0');
+                unquoted.push(char::from_u32(code).expect("an octal escape is below 256"));
+                rest = &after[3..];
+            }
+            // Python matches any character after the backslash, except a newline.
+            _ => match after.chars().next().filter(|&c| c != '\n') {
+                Some(c) => {
+                    unquoted.push(c);
+                    rest = &after[c.len_utf8()..];
+                }
+                None => {
+                    unquoted.push('\\');
+                    rest = after;
+                }
+            },
+        }
+    }
+    unquoted.push_str(rest);
+    Cow::Owned(unquoted)
+}
+
+/// The (name, value) pairs of a `Cookie` header, in their order, as Django
+/// `parse_cookie` reads them.
+///
+/// Pairs are split at `;`, and each pair at its first `=`. A pair with no `=`
+/// is a value with an empty name. The name and the value lose their outer
+/// whitespace, and the value loses its quotes. A pair that is empty is skipped.
+/// A name can occur two times. Django keeps the last value.
+pub fn cookie_pairs(header: &str) -> impl Iterator<Item = (&str, Cow<'_, str>)> {
+    header.split(';').filter_map(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or(("", pair));
+        let (name, value) = (name.trim(), value.trim());
+        (!name.is_empty() || !value.is_empty()).then(|| (name, unquote_cookie_value(value)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +357,39 @@ mod tests {
             ("日本", r#""日本""#),
         ] {
             assert_eq!(quote_cookie_value(value), quoted, "{value}");
+            assert_eq!(unquote_cookie_value(quoted), value, "{quoted}");
         }
+    }
+
+    #[test]
+    fn unquote_keeps_what_python_keeps() {
+        for (value, unquoted) in [
+            (r#"""#, r#"""#),
+            (r#""abc"#, r#""abc"#),
+            (r#""a\"#, r#""a\"#),
+            (r#""\x""#, "x"),
+            (r#""\400""#, "400"),
+            ("\"a\\\nb\"", "a\\\nb"),
+        ] {
+            assert_eq!(unquote_cookie_value(value), unquoted, "{value}");
+        }
+    }
+
+    #[test]
+    fn cookie_pairs_follow_django_parse_cookie() {
+        let pairs: Vec<(&str, String)> = cookie_pairs(r#" a = 1 ;b="x y"; ;novalue; c=; =d"#)
+            .map(|(name, value)| (name, value.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("a", "1".to_string()),
+                ("b", "x y".to_string()),
+                ("", "novalue".to_string()),
+                ("c", String::new()),
+                ("", "d".to_string()),
+            ]
+        );
     }
 
     #[test]

@@ -302,6 +302,7 @@ async def login():
 
 Bolt writes the value as Django `set_cookie` writes it.
 A value with a space, a quote, `;` or another unsafe character gets double quotes and escapes.
+`request.cookies` and `Cookie()` remove them again, so a handler reads the value that you set.
 Bolt does not set a value that has a control character, and logs a warning.
 
 ### Cookie options

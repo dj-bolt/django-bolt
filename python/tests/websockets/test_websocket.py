@@ -737,6 +737,16 @@ async def test_websocket_typed_header_and_cookie(injection_api):
 
 
 @pytest.mark.asyncio
+async def test_websocket_cookie_is_read_as_django_reads_it(injection_api):
+    """Test a quoted cookie loses its quotes, and spaces around `=` do not count."""
+    for cookie in ['page="7"', "theme=dark;  page = 7"]:
+        headers = {"X-Count": "5", "Cookie": cookie}
+        async with WebSocketTestClient(injection_api, "/ws/inject/typed", headers=headers) as ws:
+            response = await ws.receive_json()
+            assert response["page"] == 7
+
+
+@pytest.mark.asyncio
 async def test_websocket_invalid_typed_header_rejects_upgrade(injection_api):
     """Test a bad typed header value rejects the upgrade and names the header."""
     with pytest.raises(ValueError, match="Header 'x-count'"):

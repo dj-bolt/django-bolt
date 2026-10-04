@@ -1,3 +1,4 @@
+use crate::cookies::cookie_pairs;
 use crate::middleware::auth::{authenticate, AuthBackend, AuthContext};
 use crate::permissions::{evaluate_guards, GuardDenial, GuardResult, GuardSet};
 use actix_web::http::uri::Authority;
@@ -7,30 +8,16 @@ use ahash::AHashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-/// Parse HTTP cookies from Cookie header
-/// Returns HashMap of cookie name -> cookie value
-///
-/// # Performance
-/// - Zero allocations if no cookies
-/// - Pre-allocated capacity for 8 cookies (typical case)
-/// - Inlined for zero-cost abstraction
+/// Parse the `Cookie` header into a map of name to value, as Django
+/// `request.COOKIES` does (see `cookies::cookie_pairs`).
 #[inline(always)]
 pub fn parse_cookies_inline(cookie_header: Option<&str>) -> AHashMap<String, String> {
     let mut cookies: AHashMap<String, String> = AHashMap::with_capacity(8);
-
     if let Some(raw_cookie) = cookie_header {
-        for pair in raw_cookie.split(';') {
-            let part = pair.trim();
-            if let Some(eq) = part.find('=') {
-                let (k, v) = part.split_at(eq);
-                let v2 = &v[1..]; // Skip '=' character
-                if !k.is_empty() {
-                    cookies.insert(k.to_string(), v2.to_string());
-                }
-            }
+        for (name, value) in cookie_pairs(raw_cookie) {
+            cookies.insert(name.to_owned(), value.into_owned());
         }
     }
-
     cookies
 }
 

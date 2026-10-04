@@ -7,10 +7,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::IntoPyObjectExt;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::cookies::cookie_pairs;
 use parking_lot::{Mutex, RwLock};
 use std::str::FromStr;
 
@@ -392,18 +394,13 @@ fn authenticate_with(
 }
 
 /// Find a cookie value by name in a raw Cookie header string.
-/// Zero-allocation scan — returns a slice into the header value.
-pub fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<&'a str> {
-    for pair in raw_cookie.split(';') {
-        let part = pair.trim();
-        if let Some(eq) = part.find('=') {
-            let (k, v) = part.split_at(eq);
-            if k == name {
-                return Some(&v[1..]); // Skip '=' character
-            }
-        }
-    }
-    None
+/// The header is read as `request.cookies` reads it, so the last value wins.
+/// The value borrows from the header unless it has quotes to remove.
+pub fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<Cow<'a, str>> {
+    cookie_pairs(raw_cookie)
+        .filter(|(cookie_name, _)| *cookie_name == name)
+        .last()
+        .map(|(_, value)| value)
 }
 
 /// Minimal JOSE header: only the field the validation loop acts on.
@@ -594,11 +591,11 @@ fn try_jwt_auth(
         Some(name) => headers
             .get("cookie")
             .and_then(|raw| find_cookie_value(raw, name))?,
-        None => headers.get(header_name)?.as_str(),
+        None => Cow::Borrowed(headers.get(header_name)?.as_str()),
     };
 
     // Remove "Bearer " prefix if present
-    let token = raw_token.strip_prefix("Bearer ").unwrap_or(raw_token);
+    let token = raw_token.strip_prefix("Bearer ").unwrap_or(&raw_token);
 
     let claims = decode_and_validate(
         token, keys, algorithms, audience, issuer, leeway, token_type,

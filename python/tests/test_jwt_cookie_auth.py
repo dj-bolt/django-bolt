@@ -68,6 +68,23 @@ class TestJWTCookieAuth:
             assert response.status_code == 200
             assert response.json()["user_id"] == "cookie-user"
 
+    def test_quoted_token_in_cookie(self, cookie_api):
+        """The JWT cookie is read as `request.cookies` reads it, so the quotes are removed."""
+        token = create_token(user_id="cookie-user")
+        with TestClient(cookie_api) as client:
+            response = client.get("/whoami", headers={"Cookie": f'access_token="{token}"'})
+            assert response.status_code == 200, response.text
+            assert response.json()["user_id"] == "cookie-user"
+
+    def test_last_token_cookie_wins(self, cookie_api):
+        """When the cookie name occurs two times, the last value is used, as Django does."""
+        first = create_token(user_id="first")
+        last = create_token(user_id="last")
+        with TestClient(cookie_api) as client:
+            response = client.get("/whoami", headers={"Cookie": f"access_token={first}; access_token={last}"})
+            assert response.status_code == 200, response.text
+            assert response.json()["user_id"] == "last"
+
     def test_missing_token_rejected(self, cookie_api):
         with TestClient(cookie_api) as client:
             response = client.get("/whoami")

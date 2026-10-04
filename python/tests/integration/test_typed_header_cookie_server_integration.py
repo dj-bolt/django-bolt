@@ -53,3 +53,18 @@ def test_websocket_typed_header_and_cookie(make_server_project):
         )
         assert "400" in status_line, f"status={status_line!r} body={body!r}"
         assert "Cookie 'page'" in body, f"body={body!r}"
+
+
+def test_a_cookie_is_read_as_django_reads_it(make_server_project):
+    """A quoted cookie loses its quotes, and spaces around `=` do not count."""
+    project = make_server_project(api_module=app_module("typed_header_cookie"))
+
+    with project.start() as server:
+        for cookie in ['page="7"', "theme=dark;  page = 7"]:
+            response = server.get("/typed/async", headers={"X-Count": "5", "Cookie": cookie})
+            assert response.status_code == 200, response.text
+            assert response.json()["page"] == 7
+
+            headers = {"X-Count": "5", "Cookie": cookie}
+            with SimpleWebSocketClient(server.host, server.port, "/ws/typed", headers=headers) as websocket:
+                assert websocket.receive_text() == "int:5 int:7"

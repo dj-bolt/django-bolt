@@ -12,6 +12,7 @@ from typing import Annotated
 
 import msgspec
 import pytest
+from django.http.cookie import parse_cookie
 
 from django_bolt import BoltAPI
 from django_bolt.params import Cookie, Header
@@ -104,6 +105,10 @@ def client():
     @api.get("/cookie/struct")
     async def cookie_struct(cookies: Annotated[TypedCookies, Cookie()]):
         return {"count": cookies.count, "flag": cookies.flag}
+
+    @api.get("/cookie/all")
+    async def cookie_all(request):
+        return dict(request.cookies)
 
     with TestClient(api) as test_client:
         yield test_client
@@ -242,3 +247,24 @@ class TestTypedCookies:
         response = client.get("/cookie/struct", cookies={"count": "2", "flag": "yes"})
         assert response.status_code == 200, response.text
         assert response.json() == {"count": 2, "flag": True}
+
+    def test_cookie_is_read_as_django_reads_it(self, client):
+        """A quoted value loses its quotes, and spaces around `=` do not count."""
+        for cookie in ['page="7"', "theme=dark;  page = 7", r'page="\067"']:
+            response = client.get("/cookie/optional", headers={"Cookie": cookie})
+            assert response.status_code == 200, response.text
+            assert response.json() == {"value": 7, "type": "int"}
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            r'a="x\073y"; b = 2 ;novalue; c=; =d',
+            r'k=first; k="say \"hi\""',
+            "theme=dark;  page = 7",
+        ],
+    )
+    def test_request_cookies_match_django_parse_cookie(self, client, raw):
+        """`request.cookies` gives what Django `parse_cookie` gives for the same header."""
+        response = client.get("/cookie/all", headers={"Cookie": raw})
+        assert response.status_code == 200, response.text
+        assert response.json() == parse_cookie(raw)
