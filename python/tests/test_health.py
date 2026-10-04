@@ -5,7 +5,8 @@ import time
 
 import pytest
 from asgiref.sync import sync_to_async
-from django.db import connection
+from django.db import connection, connections
+from django.db.utils import OperationalError
 
 from django_bolt import BoltAPI
 from django_bolt.health import (
@@ -114,6 +115,23 @@ class TestDatabaseCheck:
             # The check connects on the thread of sync_to_async. Close it there:
             # resolve `connection` on that thread, not on this one.
             await sync_to_async(lambda: connection.close())()
+
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    async def test_check_database_sees_a_database_that_went_away(self, monkeypatch):
+        """Each check connects, so the second check sees the lost database.
+
+        ensure_connection does nothing for an open connection. A check that
+        kept its connection open reported success after the database went away.
+        """
+        assert await check_database() == (True, "Database connection OK")
+
+        def refuse(*args, **kwargs):
+            raise OperationalError("the database went away")
+
+        monkeypatch.setattr(type(connections["default"]), "get_new_connection", refuse)
+
+        assert await check_database() == (False, "Database error: the database went away")
 
     @pytest.mark.asyncio
     async def test_check_database_handles_error(self):

@@ -25,6 +25,9 @@ def shutdown_closing_connections(pool: concurrent.futures.ThreadPoolExecutor) ->
         barrier.wait()
         connections.close_all()
 
-    for future in [pool.submit(close_on_this_thread) for _ in range(workers)]:
-        future.result()
-    pool.shutdown(wait=True)
+    try:
+        for future in [pool.submit(close_on_this_thread) for _ in range(workers)]:
+            future.result()
+    finally:
+        # A close error still shows, and the pool threads still stop.
+        pool.shutdown(wait=True)
