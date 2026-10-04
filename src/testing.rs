@@ -483,10 +483,15 @@ pub fn register_test_middleware_metadata(
         // Propagate parse failures so tests fail loudly instead of the route
         // silently losing its auth/middleware config.
         let mut route_meta = RouteMetadata::from_python(py_dict, py).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "Failed to parse route metadata for handler {}: {}",
-                handler_id, e
-            ))
+            // Keep the error type: a wrong value type stays a TypeError.
+            PyErr::from_type(
+                e.get_type(py),
+                format!(
+                    "Failed to parse route metadata for handler {}: {}",
+                    handler_id,
+                    e.value(py)
+                ),
+            )
         })?;
         // Inject global CORS config if route doesn't have explicit config
         if route_meta.cors_config.is_none() && !route_meta.plan.skip_cors() {

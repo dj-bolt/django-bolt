@@ -923,6 +923,8 @@ class BoltAPI:
             meta = self._compile_websocket_binder(fn, full_path)
             meta["is_async"] = True
             meta["is_websocket"] = True
+            # Rust reads this key for every route. A WebSocket route never uses it.
+            meta["default_status_code"] = 200
             self._apply_dependency_tree(meta, "WEBSOCKET", full_path)
 
             # URL-reverse identity, same scheme as HTTP routes (see _route_decorator).
@@ -1559,6 +1561,16 @@ class BoltAPI:
                     meta["needs_query"] = meta.get("needs_query", False) or handler_analysis.request_needs_query
                     meta["needs_headers"] = meta.get("needs_headers", False) or handler_analysis.request_needs_headers
                     meta["needs_cookies"] = meta.get("needs_cookies", False) or handler_analysis.request_needs_cookies
+            elif meta["mode"] == "request_only":
+                # The handler gets only the request and can read every part of it.
+                # Set the flags here, not in compile_binder: a dependency with
+                # no flags does not force its route to parse the request.
+                meta["needs_body"] = True
+                meta["needs_query"] = True
+                meta["needs_headers"] = True
+                meta["needs_cookies"] = True
+                meta["needs_path_params"] = True
+                meta["needs_form_parsing"] = False
 
             self._apply_dependency_tree(meta, method, full_path)
 
