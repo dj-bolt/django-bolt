@@ -53,6 +53,10 @@ All notable changes to this project will be documented in this file.
 - **`runbolt --dev` stops its worker on SIGTERM** - `kill` on the dev supervisor stopped only the supervisor. Its worker kept serving and held the port, so the next `runbolt --dev` failed with "address in use". The supervisor now stops the worker on SIGTERM and SIGHUP, as on Ctrl-C.
 - **`runbolt --dev` reloads for a file in a new directory** - The watcher starts to watch a new directory after it gets the event for that directory. A file written before then, for example by `git checkout` or a code generator, sent no event, so no reload occurred. A directory moved into the project had the same problem. Now, when a directory is created or moved in, the watcher looks in it for a `.py` or `.html` file.
 
+### Performance
+
+- **A client's next async request reuses its lane** - An async request on a route with Django middleware gave its lane back only after the response left. Thus the next request of the same client often started a new lane, with a new thread and a new database connection. The lane now goes back to the idle list before the response leaves. The lane still closes the previous request before it runs the next one.
+
 ## [0.12.0]
 
 ### Added
