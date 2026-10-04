@@ -114,6 +114,8 @@ jobs:
       interpreters: ${{ steps.extract.outputs.interpreters }}
       # Oldest, newest, and newest free-threaded: the server-integration matrix.
       integration-versions-json: ${{ steps.extract.outputs.integration-versions-json }}
+      # Newest GIL build and newest free-threaded build: the Rust job matrix.
+      rust-versions-json: ${{ steps.extract.outputs.rust-versions-json }}
       # Oldest and newest supported Python, for the jobs that need exactly one
       # interpreter rather than a matrix. Derived so no job hardcodes a version
       # that could fall out of the supported set unnoticed.
@@ -160,6 +162,7 @@ jobs:
           print(f"test-versions-json={json.dumps(versions + free_threaded)}")
           print(f"interpreters={' '.join(versions + free_threaded)}")
           print(f"integration-versions-json={json.dumps([versions[0], versions[-1], *free_threaded[-1:]])}")
+          print(f"rust-versions-json={json.dumps([versions[-1], *free_threaded[-1:]])}")
           print(f"oldest-version={versions[0]}")
           print(f"newest-version={versions[-1]}")
 
@@ -284,9 +287,15 @@ jobs:
         run: uv run --no-sync pytest python/bolt-mcp/tests -m "not server_integration and not artifact_smoke" -v
 
   rust:
-    name: Rust tests and clippy
+    name: Rust tests and clippy Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     needs: python-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        # A free-threaded interpreter compiles the #[cfg(Py_GIL_DISABLED)]
+        # code, and a GIL build compiles the rest. Lint and test both.
+        python-version: ${{ fromJSON(needs.python-versions.outputs.rust-versions-json) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -295,9 +304,17 @@ jobs:
 
       # The PyO3 crates link libpython in test builds.
       - name: Set up Python
+        id: setup-python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ needs.python-versions.outputs.newest-version }}
+          python-version: ${{ matrix.python-version }}
+
+      # PyO3 builds against PYO3_PYTHON. Set it, so that the build cannot pick
+      # another python3 from PATH.
+      - name: Select the interpreter for PyO3
+        env:
+          PYTHON_PATH: ${{ steps.setup-python.outputs.python-path }}
+        run: echo "PYO3_PYTHON=$PYTHON_PATH" >> "$GITHUB_ENV"
 
       - name: Install Rust
         # Toolchain (channel + rustfmt + clippy) comes from rust-toolchain.toml.
