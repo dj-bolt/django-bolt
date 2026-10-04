@@ -38,7 +38,7 @@ pub fn validate_and_sort_asgi_mounts(
     }
 
     // Longest-prefix match requires descending sort.
-    asgi_mounts.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+    asgi_mounts.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
 
     // Exact-duplicate prefixes are invalid.
     for idx in 1..asgi_mounts.len() {

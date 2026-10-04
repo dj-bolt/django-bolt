@@ -25,6 +25,12 @@ pub struct WebSocketRouter {
     dynamic_paths: Vec<String>,
 }
 
+impl Default for WebSocketRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebSocketRouter {
     pub fn new() -> Self {
         WebSocketRouter {

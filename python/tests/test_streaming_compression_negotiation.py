@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
-
 from django_bolt import BoltAPI
 from django_bolt.middleware import CompressionConfig
 from django_bolt.responses import StreamingResponse

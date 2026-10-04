@@ -21,8 +21,6 @@ import pytest
 
 from .apps import app_module
 
-pytest.importorskip("brotli", reason="brotli package required for httpx auto-decode")
-
 pytestmark = pytest.mark.server_integration
 
 

@@ -206,12 +206,12 @@ class TestTypedHeaders:
 
 class TestTypedCookies:
     def test_int_cookie_is_converted(self, client):
-        response = client.get("/cookie/int", cookies={"count": "5"})
+        response = client.get("/cookie/int", headers={"Cookie": "count=5"})
         assert response.status_code == 200, response.text
         assert response.json() == {"value": 5, "type": "int"}
 
     def test_invalid_int_cookie_gives_422_naming_the_cookie(self, client):
-        response = client.get("/cookie/int", cookies={"count": "abc"})
+        response = client.get("/cookie/int", headers={"Cookie": "count=abc"})
         assert response.status_code == 422, response.text
         detail = _detail(response)
         assert "count" in detail
@@ -219,26 +219,29 @@ class TestTypedCookies:
 
     def test_optional_cookie_with_default(self, client):
         assert client.get("/cookie/optional").json() == {"value": 1, "type": "int"}
-        assert client.get("/cookie/optional", cookies={"page": "3"}).json() == {"value": 3, "type": "int"}
-        assert client.get("/cookie/optional", cookies={"page": "last"}).status_code == 422
+        assert client.get("/cookie/optional", headers={"Cookie": "page=3"}).json() == {"value": 3, "type": "int"}
+        assert client.get("/cookie/optional", headers={"Cookie": "page=last"}).status_code == 422
 
     def test_bool_cookie(self, client):
-        assert client.get("/cookie/bool", cookies={"dark_mode": "true"}).json() == {"value": True, "type": "bool"}
-        assert client.get("/cookie/bool", cookies={"dark_mode": "0"}).json() == {"value": False, "type": "bool"}
-        assert client.get("/cookie/bool", cookies={"dark_mode": "maybe"}).status_code == 422
+        assert client.get("/cookie/bool", headers={"Cookie": "dark_mode=true"}).json() == {
+            "value": True,
+            "type": "bool",
+        }
+        assert client.get("/cookie/bool", headers={"Cookie": "dark_mode=0"}).json() == {"value": False, "type": "bool"}
+        assert client.get("/cookie/bool", headers={"Cookie": "dark_mode=maybe"}).status_code == 422
 
     def test_aliased_cookie(self, client):
-        response = client.get("/cookie/alias", cookies={"item-count": "8"})
+        response = client.get("/cookie/alias", headers={"Cookie": "item-count=8"})
         assert response.json() == {"value": 8, "type": "int"}
-        response = client.get("/cookie/alias", cookies={"item-count": "eight"})
+        response = client.get("/cookie/alias", headers={"Cookie": "item-count=eight"})
         assert response.status_code == 422, response.text
         assert "item-count" in _detail(response)
 
     def test_str_cookie_is_unchanged(self, client):
-        response = client.get("/cookie/str", cookies={"session": "42"})
+        response = client.get("/cookie/str", headers={"Cookie": "session=42"})
         assert response.json() == {"value": "42", "type": "str"}
 
     def test_struct_cookie(self, client):
-        response = client.get("/cookie/struct", cookies={"count": "2", "flag": "yes"})
+        response = client.get("/cookie/struct", headers={"Cookie": "count=2; flag=yes"})
         assert response.status_code == 200, response.text
         assert response.json() == {"count": 2, "flag": True}

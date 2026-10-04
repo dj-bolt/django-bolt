@@ -482,7 +482,7 @@ fn create_receive_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<
     }
 
     let receive_fn = ReceiveFn { state };
-    Ok(Py::new(py, receive_fn)?.into_any().into())
+    Ok(Py::new(py, receive_fn)?.into_any())
 }
 
 /// Create Python send function that sends to actor
@@ -615,7 +615,7 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
     }
 
     let send_fn = SendFn { state };
-    Ok(Py::new(py, send_fn)?.into_any().into())
+    Ok(Py::new(py, send_fn)?.into_any())
 }
 
 /// Validate WebSocket origin header against CORS allowed origins
@@ -1035,7 +1035,7 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
 
                             // Call handler with websocket + extracted args
                             let kwargs_dict = kwargs.bind(py).cast::<PyDict>()?;
-                            handler.call(py, args_tuple, Some(&kwargs_dict))?
+                            handler.call(py, args_tuple, Some(kwargs_dict))?
                         } else {
                             // No injector (simple handler) - just pass websocket
                             handler.call1(py, (&websocket,))?

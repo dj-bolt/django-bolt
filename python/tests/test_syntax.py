@@ -539,7 +539,7 @@ def test_header_and_cookie(client):
     response = client.get("/header", headers={"x-test": "val"})
     assert response.status_code == 200 and response.content == b"val"
     # set cookie via header
-    response = client.get("/cookie", cookies={"session": "abc"})
+    response = client.get("/cookie", headers={"Cookie": "session=abc"})
     assert response.status_code == 200 and response.content == b"abc"
 
 
@@ -1052,7 +1052,7 @@ def test_header_struct_missing_required(client):
 
 def test_cookie_struct(client):
     """Test Cookie() with Struct type parses cookies into struct."""
-    response = client.get("/cookie-struct", cookies={"session_id": "abc123", "theme": "dark"})
+    response = client.get("/cookie-struct", headers={"Cookie": "session_id=abc123; theme=dark"})
     assert response.status_code == 200
     data = response.json()
     assert data["session_id"] == "abc123"
@@ -1063,7 +1063,7 @@ def test_cookie_struct_with_defaults(client):
     """Test Cookie() with Struct uses default values."""
     response = client.get(
         "/cookie-struct",
-        cookies={"session_id": "xyz789"},  # theme not provided, uses default
+        headers={"Cookie": "session_id=xyz789"},  # theme not provided, uses default
     )
     assert response.status_code == 200
     data = response.json()

@@ -33,11 +33,9 @@ def api():
 @pytest.fixture
 def sample_articles(db):
     """Create sample articles in the database."""
-    from asgiref.sync import async_to_sync  # noqa: PLC0415
-
     articles = []
     for i in range(1, 4):
-        article = async_to_sync(Article.objects.acreate)(
+        article = Article.objects.create(
             title=f"Article {i}",
             content=f"Content {i}",
             author="Test Author",

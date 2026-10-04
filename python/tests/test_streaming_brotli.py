@@ -15,14 +15,13 @@ from __future__ import annotations
 
 import asyncio
 
+import brotlicffi as brotli
 import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import CompressionConfig, no_compress
 from django_bolt.responses import EventSourceResponse, StreamingResponse
 from django_bolt.testing import TestClient
-
-brotli = pytest.importorskip("brotli", reason="brotli or brotlicffi package not installed")
 
 
 def _make_text_api(chunks: list[str], *, compression=None) -> BoltAPI:
@@ -158,7 +157,6 @@ def test_streaming_no_negotiable_encoding_falls_back_to_identity():
 
 def test_streaming_zstd_when_configured():
     """`backend="zstd"` and the client accepts zstd → zstd-encoded stream."""
-    pytest.importorskip("zstandard", reason="zstandard package required for httpx auto-decode")
     api = _make_text_api(["zstd-", "compressed"], compression=CompressionConfig(backend="zstd"))
     with TestClient(api) as client:
         resp = client.get("/stream", headers={"Accept-Encoding": "zstd"})

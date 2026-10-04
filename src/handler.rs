@@ -831,14 +831,14 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     // All subsequent flag reads are direct bit-tests, avoiding repeated Option::map closures.
     let plan = route_metadata.map(|m| m.plan);
 
-    let needs_query = plan.map_or(true, |p| p.needs_query());
+    let needs_query = plan.is_none_or(|p| p.needs_query());
     // The map borrows its keys and values from the URI when they need no decode.
     let query_string = if needs_query { req.uri().query() } else { None };
     let query_params: Option<QueryParams<'_>> = query_string
         .map(parse_query_string)
         .filter(|parsed| !parsed.is_empty());
 
-    let needs_body = plan.map_or(true, |p| p.needs_body());
+    let needs_body = plan.is_none_or(|p| p.needs_body());
 
     // Max parameter length resolved once at startup; read the plain field here.
     let max_param_length = state.max_param_length;
@@ -871,21 +871,21 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         (Vec::new(), Vec::new())
     };
 
-    let needs_headers = plan.map_or(true, |p| p.needs_headers());
-    let needs_cookies = plan.map_or(true, |p| p.needs_cookies());
-    let needs_form_parsing = plan.map_or(false, |p| p.needs_form_parsing());
-    let has_route_auth_or_guards = plan.map_or(false, |p| p.has_auth_or_guards());
-    let has_route_rate_limit = plan.map_or(false, |p| p.has_rate_limit());
+    let needs_headers = plan.is_none_or(|p| p.needs_headers());
+    let needs_cookies = plan.is_none_or(|p| p.needs_cookies());
+    let needs_form_parsing = plan.is_some_and(|p| p.needs_form_parsing());
+    let has_route_auth_or_guards = plan.is_some_and(|p| p.has_auth_or_guards());
+    let has_route_rate_limit = plan.is_some_and(|p| p.has_rate_limit());
     let must_extract_headers = needs_headers
         || needs_cookies
         || needs_form_parsing
         || has_route_auth_or_guards
         || has_route_rate_limit;
-    let skip_cors = plan.map_or(false, |p| p.skip_cors());
-    let skip_compression = plan.map_or(false, |p| p.skip_compression());
-    let can_sync_dispatch = plan.map_or(false, |p| p.can_sync_dispatch());
-    let can_lane_dispatch = plan.map_or(false, |p| p.can_lane_dispatch());
-    let is_async_handler = plan.map_or(false, |p| p.is_async());
+    let skip_cors = plan.is_some_and(|p| p.skip_cors());
+    let skip_compression = plan.is_some_and(|p| p.skip_compression());
+    let can_sync_dispatch = plan.is_some_and(|p| p.can_sync_dispatch());
+    let can_lane_dispatch = plan.is_some_and(|p| p.can_lane_dispatch());
+    let is_async_handler = plan.is_some_and(|p| p.is_async());
 
     // Extract and validate headers
     let mut headers = if must_extract_headers {
@@ -921,8 +921,8 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 headers_map,
                 client_ip.as_ref(),
                 config,
-                &method,
-                &path,
+                method,
+                path,
             ) {
                 // CORS headers will be added by CorsMiddleware
                 return response;
@@ -981,8 +981,8 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                 client_ip.as_ref(),
                 auth_ctx.as_ref(),
                 config,
-                &method,
-                &path,
+                method,
+                path,
             ) {
                 // CORS headers will be added by CorsMiddleware
                 return response;

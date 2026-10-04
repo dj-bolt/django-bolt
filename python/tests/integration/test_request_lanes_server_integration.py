@@ -25,18 +25,24 @@ def test_thread_local_middleware_state_stays_with_its_request(make_server_projec
     with project.start() as server:
         # One client for each thread: a shared httpx.Client races on a free-threaded build.
         clients = threading.local()
+        opened: list[httpx.Client] = []
 
         def fetch(index: int) -> tuple[dict, dict]:
             if not hasattr(clients, "client"):
                 clients.client = httpx.Client(timeout=10)
+                opened.append(clients.client)
             tenant = f"t{index}"
             return (
                 clients.client.get(server.url(f"/sync/{tenant}")).json(),
                 clients.client.get(server.url(f"/async/{tenant}")).json(),
             )
 
-        with ThreadPoolExecutor(max_workers=32) as pool:
-            results = list(pool.map(fetch, range(200)))
+        try:
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                results = list(pool.map(fetch, range(200)))
+        finally:
+            for client in opened:
+                client.close()
 
     for sync_body, async_body in results:
         assert sync_body["actual"] == sync_body["expected"]

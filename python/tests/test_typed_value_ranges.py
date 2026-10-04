@@ -99,7 +99,7 @@ def test_header_value_python_rejects_is_422(client, kind, value, reason):
 
 @pytest.mark.parametrize(("kind", "value", "reason"), CASES)
 def test_cookie_value_python_rejects_is_422(client, kind, value, reason):
-    response = client.get(f"/{kind}", cookies={"c": value})
+    response = client.get(f"/{kind}", headers={"Cookie": f"c={value}"})
     assert response.status_code == 422, response.text
     assert response.json()["detail"].startswith("Cookie 'c'")
     assert reason in response.json()["detail"]

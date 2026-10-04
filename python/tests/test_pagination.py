@@ -20,7 +20,7 @@ from django_bolt import (
 )
 from django_bolt.testing import TestClient
 
-from .test_models import Article
+from .test_models import Article, Author, BlogPost
 
 # ============================================================================
 # Schemas
@@ -1011,25 +1011,28 @@ def test_pagination_with_query_optimization(sample_articles):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_pagination_with_select_related(sample_articles):
+def test_pagination_with_select_related():
     """Test pagination works with select_related"""
+    author = Author.objects.create(name="Ada", email="ada@example.com")
+    for i in range(12):
+        BlogPost.objects.create(title=f"Post {i}", content="body", author=author)
     api = BoltAPI()
 
     class SmallPagePagination(PageNumberPagination):
         page_size = 10
 
-    @api.get("/articles")
+    @api.get("/posts")
     @paginate(SmallPagePagination)
-    async def list_articles(request):
-        # Even though Article doesn't have FK in this test, this tests compatibility
-        return Article.objects.all().select_related()
+    async def list_posts(request):
+        return BlogPost.objects.select_related("author")
 
     with TestClient(api) as client:
-        response = client.get("/articles?page=1")
+        response = client.get("/posts?page=1")
         assert response.status_code == 200
 
         data = response.json()
         assert len(data["items"]) == 10
+        assert data["total"] == 12
 
 
 @pytest.mark.django_db(transaction=True)
