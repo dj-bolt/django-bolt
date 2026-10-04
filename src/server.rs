@@ -165,6 +165,10 @@ fn read_max_age_setting(
 }
 
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: Python passes each route as one tuple"
+)]
 pub fn register_routes(
     _py: Python<'_>,
     routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
@@ -180,6 +184,10 @@ pub fn register_routes(
 }
 
 #[pyfunction]
+#[expect(
+    clippy::type_complexity,
+    reason = "PyO3 wire format: Python passes each WebSocket route as one tuple"
+)]
 pub fn register_websocket_routes(
     _py: Python<'_>,
     routes: Vec<(String, usize, Py<PyAny>, Option<Py<PyAny>>)>,
@@ -354,6 +362,7 @@ pub fn start_server(
         .unwrap_or_else(|| Duration::from_secs(30)); // Default 30s
 
         // Read django-cors-headers compatible CORS settings
+        #[expect(clippy::type_complexity, reason = "the tuple holds the CORS settings until CorsConfig::from_django_settings takes them")]
         let cors_data = (|| -> PyResult<(Vec<String>, Vec<String>, bool, bool, Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>, Option<u32>)> {
             let django_conf = py.import("django.conf")?;
             let settings = django_conf.getattr("settings")?;

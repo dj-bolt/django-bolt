@@ -7,9 +7,6 @@ repository.workspace = true
 publish = false
 description = "ASGI sub-application mounting for django-bolt"
 
-[lints]
-workspace = true
-
 [dependencies]
 actix-web = { workspace = true }
 bytes = { workspace = true }

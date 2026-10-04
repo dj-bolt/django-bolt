@@ -80,6 +80,10 @@ impl fmt::Display for KeySource<'_> {
 /// Per-key limiters. The quota is part of the identity: handler ids are reused
 /// after a reload or by the next test app, and a stale limiter must not keep
 /// an old quota alive.
+#[expect(
+    clippy::type_complexity,
+    reason = "the key is the limiter identity: handler id, quota and client key"
+)]
 static LIMITERS: Lazy<DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>>> =
     Lazy::new(DashMap::new);
 
