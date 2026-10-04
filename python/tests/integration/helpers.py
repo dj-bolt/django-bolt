@@ -4,6 +4,7 @@ import base64
 import collections
 import contextlib
 import hashlib
+import itertools
 import os
 import platform
 import secrets
@@ -176,10 +177,46 @@ def generate_load(
     )
 
 
-def get_free_port(host: str = DEFAULT_HOST) -> int:
+# Under pytest-xdist, each worker takes server ports from its own block of this
+# range. The range is below the ephemeral ports (32768 and up on Linux, 49152 and
+# up on macOS and Windows), so no port from bind(0) falls into it.
+_WORKER_PORTS = range(20000, 32768)
+_port_offsets = itertools.count()
+
+
+def _port_is_free(host: str, port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((host, 0))
-        return int(sock.getsockname()[1])
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+        return True
+
+
+def get_free_port(host: str = DEFAULT_HOST) -> int:
+    """Return a free port for a test server.
+
+    A port from bind(0) is free only until its socket closes. A parallel
+    pytest-xdist worker can get the same port before the server binds it, so
+    each worker uses its own block of ``_WORKER_PORTS``. A serial run, or a run
+    without the worker count, lets the OS pick the port.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    worker_count = os.environ.get("PYTEST_XDIST_WORKER_COUNT")
+    if worker is None or worker_count is None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, 0))
+            return int(sock.getsockname()[1])
+
+    # A worker that xdist starts again after a crash gets a new id, such as gw4
+    # of 4. The modulo keeps its block in the range.
+    block_size = len(_WORKER_PORTS) // int(worker_count)
+    start = _WORKER_PORTS.start + (int(worker.removeprefix("gw")) % int(worker_count)) * block_size
+    for _ in range(block_size):
+        port = start + next(_port_offsets) % block_size
+        if _port_is_free(host, port):
+            return port
+    raise RuntimeError(f"pytest-xdist worker {worker} has no free port in {start}-{start + block_size - 1}")
 
 
 def _listening_inodes_for_port(port: int) -> set[str]:

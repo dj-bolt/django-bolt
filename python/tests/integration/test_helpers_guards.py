@@ -155,6 +155,48 @@ def test_terminate_process_stops_a_child_that_outlives_its_parent(tmp_path):
             os.killpg(process.pid, signal.SIGKILL)
 
 
+def test_parallel_workers_get_disjoint_ports_outside_the_ephemeral_range(monkeypatch):
+    """Each pytest-xdist worker hands out server ports from its own block.
+
+    A port from bind(0) is free only until its socket closes. Another worker can
+    get the same port before the server binds it. Disjoint blocks below the
+    ephemeral range (32768 and up) prevent that.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER_COUNT", "8")
+    seen = {}
+    for worker in ("gw0", "gw1", "gw7"):
+        monkeypatch.setenv("PYTEST_XDIST_WORKER", worker)
+        seen[worker] = {helpers.get_free_port() for _ in range(5)}
+
+    assert all(len(ports) == 5 for ports in seen.values())
+    assert all(port < 32768 for ports in seen.values() for port in ports)
+    assert not seen["gw0"] & seen["gw1"]
+    assert not seen["gw0"] & seen["gw7"]
+    assert not seen["gw1"] & seen["gw7"]
+
+
+def test_restarted_worker_gets_ports_outside_the_ephemeral_range(monkeypatch):
+    """A worker that pytest-xdist starts again after a crash gets the next id.
+
+    The id of such a worker, for example ``gw4`` of 4, can be the worker count
+    or more. Its ports must stay below the ephemeral range.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER_COUNT", "4")
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw4")
+
+    ports = {helpers.get_free_port() for _ in range(5)}
+
+    assert all(helpers._WORKER_PORTS.start <= port < 32768 for port in ports), ports
+
+
+def test_worker_without_a_worker_count_gets_a_port(monkeypatch):
+    """Without ``PYTEST_XDIST_WORKER_COUNT``, the OS picks the port."""
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw1")
+    monkeypatch.delenv("PYTEST_XDIST_WORKER_COUNT", raising=False)
+
+    assert helpers.get_free_port() > 0
+
+
 def test_websocket_client_keeps_a_frame_sent_with_the_handshake():
     """A frame in the same read as the 101 response is not lost."""
     listener = socket.create_server(("127.0.0.1", 0))

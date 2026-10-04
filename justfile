@@ -43,7 +43,7 @@ _require-ft:
 
 # Run Python tests on the free-threaded build
 test-ft: _require-ft
-    UV_PROJECT_ENVIRONMENT={{ft_env}} uv run --with pytest --with pytest-xdist pytest python/tests -s -vv -n auto
+    UV_PROJECT_ENVIRONMENT={{ft_env}} uv run pytest python/tests -s -vv -n auto
 
 # Run the example project on the free-threaded build (one process, all worker threads)
 run-dev-ft: _require-ft
@@ -112,7 +112,7 @@ run-dev:
 
 # Run Python tests (verbose)
 test-py:
-    uv run --with pytest --with pytest-xdist pytest python/tests -s -vv -n auto
+    uv run pytest python/tests -s -vv -n auto
 
 # Run the Rust unit tests (CI runs these). `uv run` makes PyO3 build against
 # the project venv, not an older python3 on PATH.
@@ -139,7 +139,7 @@ test-pg pg_port=pg_port:
     done
     docker exec "$name" pg_isready -U postgres
     DJANGO_BOLT_TEST_POSTGRES_DSN="postgresql://postgres:postgres@127.0.0.1:{{pg_port}}/postgres" \
-        uv run --with pytest pytest python/tests -m postgres -s -vv
+        uv run pytest python/tests -m postgres -s -vv
 
 # Run ruff linter (checks all code)
 lint:

@@ -10,7 +10,7 @@ just rebuild               # clean + build
 just test-py               # Python tests
 just test-rs               # Rust unit tests
 just clippy                # Rust lint, -D warnings (CI gate)
-uv run --with pytest pytest python/tests/test_syntax.py::test_name -s -vv
+uv run pytest python/tests/test_syntax.py::test_name -s -vv
 just lint                  # ruff on everything; `just lint-lib` must always pass
 just format
 just save-bench            # benchmarks → python/benchmark/BENCHMARK.md (needs bombardier)
