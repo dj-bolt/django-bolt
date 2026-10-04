@@ -104,6 +104,7 @@ dev = [
     "psycopg>=3.2", # PostgreSQL recovery tests (`just test-pg`)
     "django-tenants>=3.14", # request lane tests with real schemas (`just test-pg`)
     "django-allauth>=65.19", # session login through allauth, read by Bolt routes
+    "hypothesis>=6.140",
 ]
 docs = [
     "zensical",

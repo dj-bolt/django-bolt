@@ -4,7 +4,7 @@
 //! eliminating the need for Python's convert_primitive() function.
 //! Performance improvement: ~100-500µs per parameter.
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
 use pyo3::{IntoPyObject, Py, PyAny, PyResult, Python};
@@ -157,6 +157,22 @@ fn check_python_year(year: i32, kind: &str, value: &str) -> Result<(), String> {
     }
 }
 
+/// Check that Python can build a `time` or `datetime` for this second.
+///
+/// chrono parses a leap second (`23:59:60`). Python has no leap second, so
+/// pyo3 changes it to `23:59:59` and warns. Such a value must be a 422.
+fn check_python_second(time: NaiveTime, kind: &str, value: &str) -> Result<(), String> {
+    // chrono stores a leap second as a nanosecond value of one second or more.
+    if time.nanosecond() < 1_000_000_000 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid {} '{}': second 60 is out of range (0 to 59)",
+            kind, value
+        ))
+    }
+}
+
 /// Type hint constants (must match Python's get_type_hint_id() in compiler.py)
 pub const TYPE_INT: u8 = 1;
 pub const TYPE_FLOAT: u8 = 2;
@@ -304,12 +320,13 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
 
         TYPE_DATETIME => {
             let parsed = parse_datetime(value)?;
-            let year = match &parsed {
-                CoercedValue::DateTime(dt) => dt.year(),
-                CoercedValue::NaiveDateTime(ndt) => ndt.year(),
+            let (year, time) = match &parsed {
+                CoercedValue::DateTime(dt) => (dt.year(), dt.time()),
+                CoercedValue::NaiveDateTime(ndt) => (ndt.year(), ndt.time()),
                 _ => unreachable!("parse_datetime returns a datetime"),
             };
             check_python_year(year, "datetime", value)?;
+            check_python_second(time, "datetime", value)?;
             Ok(parsed)
         }
 
@@ -333,7 +350,11 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
             Ok(CoercedValue::Date(date))
         }
 
-        TYPE_TIME => parse_time(value),
+        TYPE_TIME => {
+            let time = parse_time(value)?;
+            check_python_second(time, "time", value)?;
+            Ok(CoercedValue::Time(time))
+        }
 
         _ => Ok(CoercedValue::String(value.to_string())),
     }
@@ -384,12 +405,12 @@ fn parse_datetime(value: &str) -> Result<CoercedValue, String> {
 }
 
 /// Parse time string supporting multiple formats
-fn parse_time(value: &str) -> Result<CoercedValue, String> {
+fn parse_time(value: &str) -> Result<NaiveTime, String> {
     let formats = ["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"];
 
     for fmt in &formats {
         if let Ok(time) = NaiveTime::parse_from_str(value, fmt) {
-            return Ok(CoercedValue::Time(time));
+            return Ok(time);
         }
     }
 
@@ -533,6 +554,104 @@ fn set_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// The decimal grammar of `is_valid_decimal_literal`, as a regex.
+    const DECIMAL_LITERAL: &str = r"[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?";
+
+    fn coerce(value: &str, type_hint: u8) -> Result<CoercedValue, CoerceError> {
+        coerce_param(value, type_hint, DEFAULT_MAX_PARAM_LENGTH)
+    }
+
+    proptest! {
+        #[test]
+        fn coercion_never_panics(value in any::<String>(), type_hint in 0u8..=10) {
+            let _ = coerce(&value, type_hint);
+        }
+
+        #[test]
+        fn a_value_over_the_limit_is_too_long(value in ".{9,40}", type_hint in 0u8..=10) {
+            let result = coerce_param(&value, type_hint, 8);
+            prop_assert!(matches!(result, Err(CoerceError::TooLong { max: 8, .. })), "{:?}", result);
+        }
+
+        #[test]
+        fn an_int_round_trips(value in any::<i64>()) {
+            prop_assert!(matches!(coerce(&value.to_string(), TYPE_INT), Ok(CoercedValue::Int(v)) if v == value));
+        }
+
+        #[test]
+        fn a_float_round_trips(value in any::<f64>()) {
+            let Ok(CoercedValue::Float(parsed)) = coerce(&value.to_string(), TYPE_FLOAT) else {
+                return Err(TestCaseError::fail(format!("{value} was refused")));
+            };
+            prop_assert!(parsed.to_bits() == value.to_bits() || (parsed.is_nan() && value.is_nan()));
+        }
+
+        #[test]
+        fn a_uuid_round_trips_in_each_form(bits in any::<u128>()) {
+            let value = Uuid::from_u128(bits);
+            for text in [
+                value.hyphenated().to_string(),
+                value.simple().to_string(),
+                value.urn().to_string(),
+                value.braced().to_string(),
+                value.hyphenated().to_string().to_uppercase(),
+            ] {
+                prop_assert!(matches!(coerce(&text, TYPE_UUID), Ok(CoercedValue::Uuid(v)) if v == value), "{}", text);
+            }
+        }
+
+        #[test]
+        fn a_date_round_trips_or_is_out_of_python_range(days in -800_000i32..4_500_000) {
+            let date = NaiveDate::from_num_days_from_ce_opt(days).unwrap();
+            let text = date.format("%Y-%m-%d").to_string();
+            match coerce(&text, TYPE_DATE) {
+                Ok(CoercedValue::Date(parsed)) => prop_assert_eq!(parsed, date),
+                Err(error) => prop_assert!(!(1..=9999).contains(&date.year()), "{}: {}", text, error),
+                Ok(other) => prop_assert!(false, "{:?}", other),
+            }
+        }
+
+        #[test]
+        fn a_time_round_trips(hour in 0u32..24, minute in 0u32..60, second in 0u32..60, micro in 0u32..1_000_000) {
+            let time = NaiveTime::from_hms_micro_opt(hour, minute, second, micro).unwrap();
+            let text = time.format("%H:%M:%S%.6f").to_string();
+            prop_assert!(matches!(coerce(&text, TYPE_TIME), Ok(CoercedValue::Time(v)) if v == time));
+        }
+
+        #[test]
+        fn a_naive_datetime_round_trips(
+            days in 365i32..3_652_000,
+            seconds in 0u32..86_400,
+            micro in 0u32..1_000_000,
+        ) {
+            let date = NaiveDate::from_num_days_from_ce_opt(days).unwrap();
+            let time = NaiveTime::from_num_seconds_from_midnight_opt(seconds, micro * 1000).unwrap();
+            let value = date.and_time(time);
+            let text = value.format("%Y-%m-%dT%H:%M:%S%.6f").to_string();
+            prop_assert!(matches!(coerce(&text, TYPE_DATETIME), Ok(CoercedValue::NaiveDateTime(v)) if v == value));
+        }
+
+        #[test]
+        fn a_literal_of_the_grammar_is_a_decimal(value in DECIMAL_LITERAL) {
+            let result = coerce(&value, TYPE_DECIMAL);
+            if decimal_exponent_fits(&value) {
+                prop_assert!(matches!(result, Ok(CoercedValue::Decimal(ref v)) if *v == value));
+            } else {
+                prop_assert!(result.is_err());
+            }
+        }
+
+        /// Python `Decimal` must accept each value that Bolt accepts.
+        #[test]
+        fn an_accepted_decimal_is_of_the_grammar(value in "[0-9eE+.-]{0,12}|.{0,12}") {
+            let grammar = regex::Regex::new(&format!("^(?:{DECIMAL_LITERAL})$")).unwrap();
+            if coerce(&value, TYPE_DECIMAL).is_ok() {
+                prop_assert!(grammar.is_match(&value), "{}", value);
+            }
+        }
+    }
 
     #[test]
     fn test_coerce_int() {
@@ -574,6 +693,21 @@ mod tests {
         }
         assert!(coerce_param("0001-01-01", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
         assert!(coerce_param("9999-12-31", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
+    }
+
+    #[test]
+    fn leap_seconds_are_refused() {
+        for (value, type_hint) in [
+            ("23:59:60", TYPE_TIME),
+            ("23:59:60.5", TYPE_TIME),
+            ("2016-12-31T23:59:60Z", TYPE_DATETIME),
+            ("2016-12-31T23:59:60+00:00", TYPE_DATETIME),
+            ("2016-12-31T23:59:60", TYPE_DATETIME),
+        ] {
+            let error = coerce_param(value, type_hint, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
+            assert!(error.to_string().contains("second 60"), "{value}: {error}");
+        }
+        assert!(coerce_param("23:59:59.999999", TYPE_TIME, DEFAULT_MAX_PARAM_LENGTH).is_ok());
     }
 
     #[test]

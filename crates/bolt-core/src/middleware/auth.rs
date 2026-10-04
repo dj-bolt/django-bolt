@@ -7,10 +7,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::IntoPyObjectExt;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::cookies::cookie_pairs;
 use parking_lot::{Mutex, RwLock};
 use std::str::FromStr;
 
@@ -391,19 +393,20 @@ fn authenticate_with(
     }
 }
 
-/// Find a cookie value by name in a raw Cookie header string.
-/// Zero-allocation scan — returns a slice into the header value.
-pub fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<&'a str> {
-    for pair in raw_cookie.split(';') {
-        let part = pair.trim();
-        if let Some(eq) = part.find('=') {
-            let (k, v) = part.split_at(eq);
-            if k == name {
-                return Some(&v[1..]); // Skip '=' character
-            }
-        }
+/// Find a cookie value by name in a raw Cookie header string, as
+/// `request.cookies` reads the header. A name that occurs two times gives
+/// None: a sibling subdomain can add a cookie with the same name, and the
+/// order of the two does not show which one the site set. A token must not
+/// come from such a choice. The value borrows from the header unless it has
+/// quotes to remove.
+pub fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<Cow<'a, str>> {
+    let mut values = cookie_pairs(raw_cookie)
+        .filter(|(cookie_name, _)| *cookie_name == name)
+        .map(|(_, value)| value);
+    match (values.next(), values.next()) {
+        (Some(value), None) => Some(value),
+        _ => None,
     }
-    None
 }
 
 /// Minimal JOSE header: only the field the validation loop acts on.
@@ -594,11 +597,11 @@ fn try_jwt_auth(
         Some(name) => headers
             .get("cookie")
             .and_then(|raw| find_cookie_value(raw, name))?,
-        None => headers.get(header_name)?.as_str(),
+        None => Cow::Borrowed(headers.get(header_name)?.as_str()),
     };
 
     // Remove "Bearer " prefix if present
-    let token = raw_token.strip_prefix("Bearer ").unwrap_or(raw_token);
+    let token = raw_token.strip_prefix("Bearer ").unwrap_or(&raw_token);
 
     let claims = decode_and_validate(
         token, keys, algorithms, audience, issuer, leeway, token_type,
@@ -733,6 +736,18 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cookie_name_that_occurs_two_times_gives_no_value() {
+        // A sibling subdomain can add a cookie with the same name, and the
+        // order of the two does not show which one the site set.
+        assert_eq!(find_cookie_value("tok=a; tok=b", "tok"), None);
+        assert_eq!(
+            find_cookie_value("tok=a; other=b", "tok").as_deref(),
+            Some("a")
+        );
+        assert_eq!(find_cookie_value("other=b", "tok"), None);
+    }
     use jsonwebtoken::EncodingKey;
 
     const SECRET: &str = "test-secret";

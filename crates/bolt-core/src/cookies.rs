@@ -2,6 +2,12 @@
 //!
 //! Uses the battle-tested `cookie` crate instead of manual string building
 //! to ensure proper validation, escaping, and security.
+//!
+//! Cookie values are quoted and read as Django quotes and reads them, so a
+//! cookie that Django sets reads back in Bolt, and the reverse.
+
+use std::borrow::Cow;
+use std::fmt::Write;
 
 use actix_web::cookie::{time, Cookie, SameSite};
 
@@ -11,8 +17,9 @@ use crate::response_meta::CookieData;
 ///
 /// Uses the `cookie` crate for RFC 6265 compliant serialization:
 /// - Validates cookie names (rejects invalid characters)
-/// - Properly escapes cookie values
-/// - Rejects control characters that could enable header injection
+/// - Rejects control characters in the value, as Django does
+/// - Rejects a value character above U+00FF, which Django cannot send
+/// - Quotes the value as Django does (see `quote_cookie_value`)
 ///
 /// Returns None if the cookie name or value is invalid, with a warning logged.
 #[inline]
@@ -27,7 +34,7 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
         return None;
     }
 
-    // Validate cookie value - reject control characters that could enable injection
+    // Reject control characters, as Python `http.cookies` does for Django.
     if contains_control_chars(&c.value) {
         eprintln!(
             "[django-bolt] WARNING: Cookie '{}' value contains control characters - rejected for security",
@@ -36,8 +43,19 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
         return None;
     }
 
+    // Reject a character above U+00FF. Django cannot send it, because it encodes
+    // a header as Latin-1. A browser that sends it back makes the `Cookie` header
+    // unreadable, so the request gets no cookies.
+    if c.value.chars().any(|ch| ch > '\u{ff}') {
+        eprintln!(
+            "[django-bolt] WARNING: Cookie '{}' value contains a character above U+00FF - rejected",
+            c.name
+        );
+        return None;
+    }
+
     // Build cookie using the cookie crate
-    let mut cookie = Cookie::build(&c.name, &c.value).path(&c.path);
+    let mut cookie = Cookie::build(&c.name, quote_cookie_value(&c.value)).path(&c.path);
 
     // Max-Age (validate non-negative)
     if let Some(max_age) = c.max_age {
@@ -134,9 +152,144 @@ fn contains_control_chars(value: &str) -> bool {
     value.bytes().any(|b| b < 32 || b == 127)
 }
 
+/// Characters that a cookie value can hold without quotes
+/// (Python `http.cookies._LegalChars`).
+#[inline]
+fn is_legal_cookie_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~:".contains(c)
+}
+
+/// Quote a cookie value as Django `set_cookie` does (Python `http.cookies._quote`).
+///
+/// A value of legal characters only stays as it is. Any other value is put in
+/// double quotes. In the quotes, `"` and `\` get a backslash, and a Latin-1
+/// character that is not safe becomes an octal escape (`;` gives `\073`).
+/// Thus a value cannot end the cookie or add an attribute.
+pub fn quote_cookie_value(value: &str) -> Cow<'_, str> {
+    if !value.is_empty() && value.chars().all(is_legal_cookie_char) {
+        return Cow::Borrowed(value);
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            c if is_legal_cookie_char(c) || " ()/<=>?@[]{}".contains(c) => quoted.push(c),
+            c if u32::from(c) < 256 => {
+                write!(quoted, "\\{:03o}", u32::from(c)).expect("a String write cannot fail");
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    Cow::Owned(quoted)
+}
+
+/// Remove the quotes of a cookie value as Django does (Python `http.cookies._unquote`).
+///
+/// A value in double quotes loses them, and its escapes are decoded:
+/// `\ooo` gives the character of that octal code, and `\c` gives `c`.
+/// Any other value stays as it is.
+pub fn unquote_cookie_value(value: &str) -> Cow<'_, str> {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return Cow::Borrowed(value);
+    };
+    if !inner.contains('\\') {
+        return Cow::Borrowed(inner);
+    }
+    let mut unquoted = String::with_capacity(inner.len());
+    let mut rest = inner;
+    while let Some(pos) = rest.find('\\') {
+        unquoted.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        match after.as_bytes() {
+            [high @ b'0'..=b'3', mid @ b'0'..=b'7', low @ b'0'..=b'7', ..] => {
+                let code = u32::from(high - b'0') << 6
+                    | u32::from(mid - b'0') << 3
+                    | u32::from(low - b'0');
+                unquoted.push(char::from_u32(code).expect("an octal escape is below 256"));
+                rest = &after[3..];
+            }
+            // Python matches any character after the backslash, except a newline.
+            _ => match after.chars().next().filter(|&c| c != '\n') {
+                Some(c) => {
+                    unquoted.push(c);
+                    rest = &after[c.len_utf8()..];
+                }
+                None => {
+                    unquoted.push('\\');
+                    rest = after;
+                }
+            },
+        }
+    }
+    unquoted.push_str(rest);
+    Cow::Owned(unquoted)
+}
+
+/// The (name, value) pairs of a `Cookie` header, in their order, as Django
+/// `parse_cookie` reads them.
+///
+/// Pairs are split at `;`, and each pair at its first `=`. A pair with no `=`
+/// is a value with an empty name. The name and the value lose their outer
+/// whitespace, and the value loses its quotes. A pair that is empty is skipped.
+/// A name can occur two times. Django keeps the last value.
+pub fn cookie_pairs(header: &str) -> impl Iterator<Item = (&str, Cow<'_, str>)> {
+    header.split(';').filter_map(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or(("", pair));
+        let (name, value) = (name.trim(), value.trim());
+        (!name.is_empty() || !value.is_empty()).then(|| (name, unquote_cookie_value(value)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// Latin-1 text with no control character: `format_cookie` refuses the rest.
+    const COOKIE_TEXT: &str = "[^\\x00-\\x1f\\x7f\\x{100}-\\x{10ffff}]*";
+    /// An RFC 6265 cookie name (a token).
+    const COOKIE_NAME: &str = "[!#$%&'*+.^_`|~0-9A-Za-z-]{1,12}";
+
+    proptest! {
+        #[test]
+        fn a_quoted_value_unquotes_to_itself(value in any::<String>()) {
+            let quoted = quote_cookie_value(&value);
+            prop_assert_eq!(unquote_cookie_value(&quoted), value.as_str());
+        }
+
+        /// A quoted value has no `;`, `,` or control character, so it cannot
+        /// end the cookie, and its only bare quotes are the outer two.
+        #[test]
+        fn a_quoted_value_stays_one_value(value in COOKIE_TEXT) {
+            let quoted = quote_cookie_value(&value);
+            // ASCII only, so the browser sends back a header that Bolt can read.
+            prop_assert!(quoted.is_ascii());
+            prop_assert!(!quoted.contains([';', ',']));
+            prop_assert!(!quoted.bytes().any(|byte| byte < 32 || byte == 127));
+            let inner = quoted.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(&quoted);
+            prop_assert!(!inner.replace("\\\\", "").replace("\\\"", "").contains('"'));
+        }
+
+        #[test]
+        fn set_cookies_read_back(cookies in prop::collection::vec((COOKIE_NAME, COOKIE_TEXT), 0..6)) {
+            let header = cookies
+                .iter()
+                .map(|(name, value)| format!("{name}={}", quote_cookie_value(value)))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let read: Vec<(String, String)> = cookie_pairs(&header)
+                .map(|(name, value)| (name.to_owned(), value.into_owned()))
+                .collect();
+            // Outer spaces of a value stay: they are in the quotes.
+            prop_assert_eq!(read, cookies);
+        }
+    }
 
     #[test]
     fn test_simple_cookie() {
@@ -214,11 +367,10 @@ mod tests {
         assert!(format_cookie(&c).is_none());
     }
 
-    #[test]
-    fn test_control_chars_rejected() {
-        let c = CookieData {
+    fn cookie_with_value(value: &str) -> CookieData {
+        CookieData {
             name: "session".to_string(),
-            value: "value\r\nSet-Cookie: evil=1".to_string(), // Header injection attempt
+            value: value.to_string(),
             path: "/".to_string(),
             max_age: None,
             expires: None,
@@ -226,8 +378,82 @@ mod tests {
             secure: false,
             httponly: false,
             samesite: None,
-        };
-        assert!(format_cookie(&c).is_none());
+        }
+    }
+
+    #[test]
+    fn test_control_chars_rejected() {
+        // Header injection attempt
+        assert!(format_cookie(&cookie_with_value("value\r\nSet-Cookie: evil=1")).is_none());
+        assert!(format_cookie(&cookie_with_value("del\x7f")).is_none());
+    }
+
+    /// Django cannot send a character above U+00FF in a header. A browser that
+    /// sends it back makes the `Cookie` header unreadable for each later request.
+    #[test]
+    fn a_value_above_latin1_is_rejected() {
+        assert!(format_cookie(&cookie_with_value("日本")).is_none());
+        assert!(format_cookie(&cookie_with_value("a\u{100}")).is_none());
+        assert_eq!(
+            format_cookie(&cookie_with_value("\u{ff}")).unwrap(),
+            r#"session="\377"; Path=/"#
+        );
+    }
+
+    #[test]
+    fn a_value_cannot_add_an_attribute() {
+        let result = format_cookie(&cookie_with_value("x; Domain=evil.example")).unwrap();
+        assert!(
+            result.starts_with(r#"session="x\073 Domain=evil.example"; "#),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn values_are_quoted_as_django_quotes_them() {
+        for (value, quoted) in [
+            ("abc123", "abc123"),
+            ("", r#""""#),
+            ("a b", r#""a b""#),
+            (r#"say "hi""#, r#""say \"hi\"""#),
+            (r"back\slash", r#""back\\slash""#),
+            ("café", r#""caf\351""#),
+            ("a,b", r#""a\054b""#),
+        ] {
+            assert_eq!(quote_cookie_value(value), quoted, "{value}");
+            assert_eq!(unquote_cookie_value(quoted), value, "{quoted}");
+        }
+    }
+
+    #[test]
+    fn unquote_keeps_what_python_keeps() {
+        for (value, unquoted) in [
+            (r#"""#, r#"""#),
+            (r#""abc"#, r#""abc"#),
+            (r#""a\"#, r#""a\"#),
+            (r#""\x""#, "x"),
+            (r#""\400""#, "400"),
+            ("\"a\\\nb\"", "a\\\nb"),
+        ] {
+            assert_eq!(unquote_cookie_value(value), unquoted, "{value}");
+        }
+    }
+
+    #[test]
+    fn cookie_pairs_follow_django_parse_cookie() {
+        let pairs: Vec<(&str, String)> = cookie_pairs(r#" a = 1 ;b="x y"; ;novalue; c=; =d"#)
+            .map(|(name, value)| (name, value.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("a", "1".to_string()),
+                ("b", "x y".to_string()),
+                ("", "novalue".to_string()),
+                ("c", String::new()),
+                ("", "d".to_string()),
+            ]
+        );
     }
 
     #[test]

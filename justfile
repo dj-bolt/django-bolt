@@ -123,6 +123,10 @@ test-rs:
 clippy:
     uv run cargo clippy --workspace --all-targets -- -D warnings
 
+# Fuzz one request parser; the targets are in fuzz/Cargo.toml (needs nightly and cargo-fuzz)
+fuzz target seconds="60":
+    cd fuzz && cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}}
+
 # The script puts back the extension build that it found.
 # Measure Python and Rust coverage; reports go to coverage/ (needs cargo-llvm-cov)
 coverage:

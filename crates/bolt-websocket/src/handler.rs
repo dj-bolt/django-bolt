@@ -9,6 +9,7 @@ use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_web_actors::ws;
 use ahash::AHashMap;
+use bolt_core::cookies::cookie_pairs;
 use futures_util::FutureExt;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
@@ -21,7 +22,8 @@ use bolt_core::metadata::{CorsConfig, RouteMetadata};
 use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::request_pipeline::{
-    query_sequences, set_declared_item, set_param_item, set_query_sequences, EMPTY_TYPES,
+    insert_header_line, query_sequences, set_declared_item, set_param_item, set_query_sequences,
+    EMPTY_TYPES,
 };
 use bolt_core::router::parse_query_string;
 use bolt_core::state::AppState;
@@ -119,9 +121,11 @@ pub fn requested_subprotocols<'a>(values: impl Iterator<Item = &'a str>) -> Vec<
 ///
 /// Parses and coerces query, path, header and cookie values to typed Python
 /// objects using the same type coercion as HTTP handlers.
+/// `headers` holds the request headers, with the `Cookie` lines joined.
 fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
+    headers: &AHashMap<String, String>,
     subprotocols: &[String],
     path_params: &AHashMap<String, String>,
     route_meta: Option<&RouteMetadata>,
@@ -167,21 +171,18 @@ fn build_scope(
     scope_dict.set_item("query_string", req.query_string().as_bytes())?;
 
     // Add headers as dict (FastAPI style)
-    // OPTIMIZATION: HeaderName::as_str() already returns lowercase (http crate canonical form)
     // A typed header with a bad value rejects the upgrade, as in HTTP.
     let headers_dict = PyDict::new(py);
-    for (key, value) in req.headers().iter() {
-        if let Ok(v) = value.to_str() {
-            set_declared_item(
-                py,
-                &headers_dict,
-                key.as_str(),
-                v,
-                header_types,
-                max_param_length,
-                "Header",
-            )?;
-        }
+    for (key, value) in headers {
+        set_declared_item(
+            py,
+            &headers_dict,
+            key,
+            value,
+            header_types,
+            max_param_length,
+            "Header",
+        )?;
     }
     scope_dict.set_item("headers", headers_dict)?;
 
@@ -202,24 +203,17 @@ fn build_scope(
 
     // Add cookies
     let cookies_dict = PyDict::new(py);
-    if let Some(cookie_header) = req.headers().get("cookie") {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                let pair = pair.trim();
-                if let Some(eq_pos) = pair.find('=') {
-                    let key = &pair[..eq_pos];
-                    let value = &pair[eq_pos + 1..];
-                    set_declared_item(
-                        py,
-                        &cookies_dict,
-                        key,
-                        value,
-                        cookie_types,
-                        max_param_length,
-                        "Cookie",
-                    )?;
-                }
-            }
+    if let Some(cookie_str) = headers.get("cookie") {
+        for (key, value) in cookie_pairs(cookie_str) {
+            set_declared_item(
+                py,
+                &cookies_dict,
+                key,
+                &value,
+                cookie_types,
+                max_param_length,
+                "Cookie",
+            )?;
         }
     }
     scope_dict.set_item("cookies", cookies_dict)?;
@@ -780,12 +774,12 @@ pub async fn handle_websocket_upgrade(
             .body(r#"{"detail":"Too many WebSocket connections"}"#));
     }
 
-    // Extract headers for rate limiting and auth
+    // Extract headers for rate limiting, auth and the scope
     // OPTIMIZATION: HeaderName::as_str() already returns lowercase (http crate canonical form)
     let mut headers: AHashMap<String, String> = AHashMap::new();
     for (key, value) in req.headers().iter() {
         if let Ok(v) = value.to_str() {
-            headers.insert(key.as_str().to_owned(), v.to_owned());
+            insert_header_line(&mut headers, key.as_str(), v);
         }
     }
 
@@ -898,6 +892,7 @@ pub async fn handle_websocket_upgrade(
             build_scope(
                 py,
                 &req,
+                &headers,
                 &subprotocols,
                 path_params,
                 route_meta,

@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
+use bolt_core::cookies::cookie_pairs;
 use bolt_core::metadata::{RateLimitKey, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
@@ -35,7 +36,8 @@ use bolt_websocket::WebSocketRouter;
 
 use crate::server::{configure_file_scopes, inject_global_cors, static_scope_prefix, ServerConfig};
 use bolt_core::request_pipeline::{
-    query_sequences, set_declared_item, set_param_item, set_query_sequences, EMPTY_TYPES,
+    insert_header_line, query_sequences, set_declared_item, set_param_item, set_query_sequences,
+    EMPTY_TYPES,
 };
 use bolt_core::type_coercion::TypeHints;
 
@@ -739,10 +741,10 @@ pub fn handle_test_websocket(
 
     let app = entry.read();
 
-    // Convert headers to map
+    // Convert headers to map, with the `Cookie` lines joined as in production
     let mut header_map: AHashMap<String, String> = AHashMap::with_capacity(headers.len());
     for (name, value) in headers.iter() {
-        header_map.insert(name.to_lowercase(), value.clone());
+        insert_header_line(&mut header_map, &name.to_lowercase(), value);
     }
 
     // Origin validation for WebSocket
@@ -970,11 +972,11 @@ pub fn handle_test_websocket(
 
     // A typed header with a bad value rejects the upgrade, as in production.
     let headers_dict = pyo3::types::PyDict::new(py);
-    for (k, v) in headers.iter() {
+    for (k, v) in header_map.iter() {
         set_declared_item(
             py,
             &headers_dict,
-            &k.to_lowercase(),
+            k,
             v,
             header_types,
             max_param_length,
@@ -993,24 +995,17 @@ pub fn handle_test_websocket(
 
     // Parse cookies
     let cookies_dict = pyo3::types::PyDict::new(py);
-    for (k, v) in headers.iter() {
-        if k.to_lowercase() == "cookie" {
-            for pair in v.split(';') {
-                let pair = pair.trim();
-                if let Some(eq_pos) = pair.find('=') {
-                    let key = &pair[..eq_pos];
-                    let value = &pair[eq_pos + 1..];
-                    set_declared_item(
-                        py,
-                        &cookies_dict,
-                        key,
-                        value,
-                        cookie_types,
-                        max_param_length,
-                        "Cookie",
-                    )?;
-                }
-            }
+    if let Some(cookie_str) = header_map.get("cookie") {
+        for (key, value) in cookie_pairs(cookie_str) {
+            set_declared_item(
+                py,
+                &cookies_dict,
+                key,
+                &value,
+                cookie_types,
+                max_param_length,
+                "Cookie",
+            )?;
         }
     }
     scope_dict.set_item("cookies", cookies_dict)?;

@@ -1,0 +1,56 @@
+# Fuzz targets for the request parsers. Run with nightly:
+#   cargo +nightly fuzz run query_string
+# See CONTRIBUTING.md. Not a member of the main workspace: cargo-fuzz builds
+# it with nightly and a sanitizer.
+[package]
+name = "django-bolt-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ahash = "0.8"
+bolt-core = { path = "../crates/bolt-core" }
+libfuzzer-sys = "0.4"
+serde_urlencoded = "0.7"
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "query_string"
+path = "fuzz_targets/query_string.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cookies"
+path = "fuzz_targets/cookies.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coerce_param"
+path = "fuzz_targets/coerce_param.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "urlencoded_form"
+path = "fuzz_targets/urlencoded_form.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cookie_csrf"
+path = "fuzz_targets/cookie_csrf.rs"
+test = false
+doc = false
+bench = false
