@@ -5,7 +5,6 @@ import contextlib
 import dis
 import functools
 import inspect
-import itertools
 import logging
 import os
 import sys
@@ -123,10 +122,6 @@ def _revocation_handlers(backends: list[Any]) -> tuple[tuple[Callable, bool] | N
 
 Response = ResponseWireV1
 
-
-# One rate-limit scope per BoltAPI. Rust keys each rate-limit bucket on it, so
-# two APIs that reuse handler ids (two test clients) never share a bucket.
-_RATE_LIMIT_SCOPES = itertools.count(1)
 
 # Opcodes that let an `async def` genuinely suspend. `await` emits
 # GET_AWAITABLE, but `async for` and async comprehensions emit only
@@ -432,7 +427,6 @@ class BoltAPI:
         self._handler_meta: dict[int, HandlerMetadata] = {}
         self._handler_middleware: dict[int, dict[str, Any]] = {}  # Middleware metadata per handler
         self._next_handler_id = 0
-        self._rate_limit_scope = next(_RATE_LIMIT_SCOPES)
         self.prefix = prefix.rstrip("/")  # Remove trailing slash from prefix
         self.trailing_slash = trailing_slash  # Mode: "strip", "append", or "keep"
         self.namespace = namespace  # Opt-in reverse namespace; see django_bolt.urls
@@ -956,7 +950,6 @@ class BoltAPI:
                 global_middleware=self._middleware,
                 guards=guards,
                 auth=auth,
-                rate_limit_scope=self._rate_limit_scope,
             )
 
             # Add optimization flags and param_types to middleware metadata
@@ -1755,7 +1748,6 @@ class BoltAPI:
                 [*self._middleware, *router_middleware],
                 guards=guards,
                 auth=auth,
-                rate_limit_scope=self._rate_limit_scope,
             )
 
             # Add optimization flags to middleware metadata
