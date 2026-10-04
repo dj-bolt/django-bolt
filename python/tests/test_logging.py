@@ -12,7 +12,7 @@ These tests validate the behavior documented in docs/LOGGING.md:
 import io
 import logging
 import time
-from contextlib import redirect_stderr, suppress
+from contextlib import redirect_stderr
 from logging.handlers import QueueHandler
 from queue import Queue
 from unittest.mock import Mock
@@ -891,25 +891,16 @@ class TestQueueBasedLogging:
         listener.stop()
         assert listener._thread is None, "listener thread should have stopped cleanly"
 
-    def test_queue_size_is_configurable_via_settings(self):
+    def test_queue_size_is_configurable_via_settings(self, settings):
         """BOLT_LOG_QUEUE_SIZE overrides the default 10000 bound."""
         config_module._QUEUE_LISTENER = None
         config_module._QUEUE = None
-        had_attr = hasattr(settings, "BOLT_LOG_QUEUE_SIZE")
-        prev = getattr(settings, "BOLT_LOG_QUEUE_SIZE", None)
         settings.BOLT_LOG_QUEUE_SIZE = 123
-        try:
-            _ensure_queue_logging("INFO")
-            assert config_module._QUEUE.maxsize == 123
-        finally:
-            if had_attr:
-                settings.BOLT_LOG_QUEUE_SIZE = prev
-            else:
-                with suppress(AttributeError):
-                    delattr(settings, "BOLT_LOG_QUEUE_SIZE")
+        _ensure_queue_logging("INFO")
+        assert config_module._QUEUE.maxsize == 123
 
     @pytest.mark.parametrize("bad_value", [0, -1, "10k"], ids=["zero", "negative", "non-int"])
-    def test_invalid_queue_size_falls_back_to_bounded_default_with_notice(self, bad_value):
+    def test_invalid_queue_size_falls_back_to_bounded_default_with_notice(self, bad_value, settings):
         """A bad BOLT_LOG_QUEUE_SIZE must not silently create an UNBOUNDED queue.
 
         Queue(maxsize<=0) is unbounded — the exact OOM risk the bound exists to
@@ -919,26 +910,17 @@ class TestQueueBasedLogging:
         """
         config_module._QUEUE_LISTENER = None
         config_module._QUEUE = None
-        had_attr = hasattr(settings, "BOLT_LOG_QUEUE_SIZE")
-        prev = getattr(settings, "BOLT_LOG_QUEUE_SIZE", None)
         settings.BOLT_LOG_QUEUE_SIZE = bad_value
-        try:
-            captured = io.StringIO()
-            with redirect_stderr(captured):
-                _ensure_queue_logging("INFO")
-            assert config_module._QUEUE.maxsize == 10000, (
-                f"BOLT_LOG_QUEUE_SIZE={bad_value!r} must fall back to the bounded default, "
-                f"got maxsize={config_module._QUEUE.maxsize} (<=0 means unbounded)"
-            )
-            assert "BOLT_LOG_QUEUE_SIZE" in captured.getvalue(), (
-                "misconfiguration must be surfaced on stderr, not silently ignored"
-            )
-        finally:
-            if had_attr:
-                settings.BOLT_LOG_QUEUE_SIZE = prev
-            else:
-                with suppress(AttributeError):
-                    delattr(settings, "BOLT_LOG_QUEUE_SIZE")
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            _ensure_queue_logging("INFO")
+        assert config_module._QUEUE.maxsize == 10000, (
+            f"BOLT_LOG_QUEUE_SIZE={bad_value!r} must fall back to the bounded default, "
+            f"got maxsize={config_module._QUEUE.maxsize} (<=0 means unbounded)"
+        )
+        assert "BOLT_LOG_QUEUE_SIZE" in captured.getvalue(), (
+            "misconfiguration must be surfaced on stderr, not silently ignored"
+        )
 
     def test_setup_django_logging_configures_queue_handlers(self):
         """setup_django_logging should configure queue handlers for django loggers."""

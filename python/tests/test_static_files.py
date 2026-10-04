@@ -17,9 +17,9 @@ import shutil
 import tempfile
 
 import pytest
-from django.conf import settings
 from django.contrib.staticfiles.finders import get_finder
 from django.core.exceptions import SuspiciousFileOperation
+from django.test import override_settings
 
 from django_bolt import BoltAPI
 from django_bolt.admin.static import find_static_file
@@ -147,7 +147,7 @@ with open(IMG_FILE, "wb") as f:
 class TestFindStaticFile:
     """Tests for the find_static_file function used by Django finders fallback."""
 
-    def test_find_file_in_static_root(self, monkeypatch):
+    def test_find_file_in_static_root(self, settings, monkeypatch):
         """Test that finder-only lookup does not search STATIC_ROOT."""
         original_root = getattr(settings, "STATIC_ROOT", None)
         original_dirs = getattr(settings, "STATICFILES_DIRS", None)
@@ -167,7 +167,7 @@ class TestFindStaticFile:
             elif hasattr(settings, "STATICFILES_DIRS"):
                 delattr(settings, "STATICFILES_DIRS")
 
-    def test_find_file_in_staticfiles_dirs(self, monkeypatch):
+    def test_find_file_in_staticfiles_dirs(self, settings, monkeypatch):
         """Test finding a file in STATICFILES_DIRS."""
         # Create a second static directory
         second_dir = tempfile.mkdtemp(prefix="django_bolt_static2_")
@@ -235,7 +235,7 @@ class TestStaticFileServing:
         }
         return TestClient(api_with_static, static_files_config=static_config)
 
-    def test_serve_css_file(self, client, monkeypatch):
+    def test_serve_css_file(self, settings, client, monkeypatch):
         """Test serving a CSS file."""
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATIC_URL = "/static/"
@@ -245,7 +245,7 @@ class TestStaticFileServing:
         assert "text/css" in response.headers.get("content-type", "")
         assert b"color: blue" in response.content
 
-    def test_serve_js_file(self, client, monkeypatch):
+    def test_serve_js_file(self, settings, client, monkeypatch):
         """Test serving a JavaScript file."""
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATIC_URL = "/static/"
@@ -256,7 +256,7 @@ class TestStaticFileServing:
         assert "javascript" in content_type or "application/javascript" in content_type
         assert b"console.log" in response.content
 
-    def test_serve_image_file(self, client, monkeypatch):
+    def test_serve_image_file(self, settings, client, monkeypatch):
         """Test serving an image file."""
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATIC_URL = "/static/"
@@ -307,7 +307,7 @@ class TestDjangoAdminStaticFiles:
 
 
 @pytest.mark.django_db
-def test_admin_static_served_via_native_finder_fallback():
+def test_admin_static_served_via_native_finder_fallback(settings):
     """Admin static is served by the native /static scope's finders fallback in
     DEBUG even when NO static directory is configured (`directories: []`).
 
@@ -344,17 +344,15 @@ class TestStaticTemplateTag:
     @pytest.fixture(scope="class")
     def api_with_template(self):
         """Create API with template that uses static tag."""
-        # Configure static settings
-        settings.STATIC_ROOT = TEST_STATIC_DIR
-        settings.STATIC_URL = "/static/"
+        # Configure static settings for the whole class, and restore them after it.
+        with override_settings(STATIC_ROOT=TEST_STATIC_DIR, STATIC_URL="/static/"):
+            api = BoltAPI()
 
-        api = BoltAPI()
+            @api.get("/page")
+            async def page(req):
+                return render(req, "test_static_page.html", {"title": "Static Test"})
 
-        @api.get("/page")
-        async def page(req):
-            return render(req, "test_static_page.html", {"title": "Static Test"})
-
-        return api
+            yield api
 
     @pytest.fixture(scope="class")
     def client(self, api_with_template):
@@ -372,7 +370,7 @@ class TestStaticTemplateTag:
 class TestMultipleDirectories:
     """Tests for serving from multiple static directories."""
 
-    def test_searches_directories_in_order(self, monkeypatch):
+    def test_searches_directories_in_order(self, settings, monkeypatch):
         """Test that directories are searched in priority order."""
         # Create two directories with same-named file
         dir1 = tempfile.mkdtemp(prefix="static_priority1_")
@@ -396,7 +394,7 @@ class TestMultipleDirectories:
         # STATICFILES_DIRS should preserve order
         assert content == "FROM_DIR1"
 
-    def test_fallback_to_second_directory(self, monkeypatch):
+    def test_fallback_to_second_directory(self, settings, monkeypatch):
         """Test falling back to second directory when file not in first."""
         # Create two directories, file only in second
         dir1 = tempfile.mkdtemp(prefix="static_fallback1_")
@@ -579,7 +577,7 @@ class TestSymlinkSecurity:
             os.unlink(outside_file_name)
             shutil.rmtree(test_dir)
 
-    def test_symlink_outside_directory_blocked(self, setup_symlink_test):
+    def test_symlink_outside_directory_blocked(self, settings, setup_symlink_test):
         """Test symlink security behavior.
 
         Note: The Python find_static_file (used in dev) follows symlinks for convenience.
@@ -608,7 +606,7 @@ class TestSymlinkSecurity:
             # so canonical should NOT start with dir_canonical
             assert not is_within_directory, "Symlink canonical path should not be within static directory"
 
-    def test_safe_file_still_accessible(self, setup_symlink_test):
+    def test_safe_file_still_accessible(self, settings, setup_symlink_test):
         """Test that regular files within the directory are still accessible."""
         settings.STATIC_ROOT = None
         settings.STATICFILES_DIRS = [setup_symlink_test["safe_dir"]]
@@ -619,7 +617,7 @@ class TestSymlinkSecurity:
         with open(result) as f:
             assert f.read() == "SAFE_CONTENT"
 
-    def test_symlink_within_directory_works(self, setup_symlink_test):
+    def test_symlink_within_directory_works(self, settings, setup_symlink_test):
         """Test that symlinks within the static directory still work."""
         if not setup_symlink_test["symlink_created"]:
             pytest.skip("Symlink creation not supported on this system")
@@ -651,7 +649,7 @@ class TestSymlinkSecurity:
 class TestContentSecurityPolicy:
     """Tests for Content-Security-Policy header on static files."""
 
-    def test_csp_header_applied_when_configured(self):
+    def test_csp_header_applied_when_configured(self, settings):
         """Test that CSP header is applied when BOLT_STATIC_CSP is set."""
         # Configure CSP
         settings.STATIC_ROOT = TEST_STATIC_DIR
@@ -669,7 +667,7 @@ class TestContentSecurityPolicy:
         # active in the test client. This test verifies the setting is read.
         # Full CSP testing requires integration tests with the actual server.
 
-    def test_no_csp_header_when_not_configured(self):
+    def test_no_csp_header_when_not_configured(self, settings):
         """Test that no CSP header is added when not configured."""
         settings.STATIC_ROOT = TEST_STATIC_DIR
         settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
@@ -688,7 +686,7 @@ class TestContentSecurityPolicy:
         # CSP header should not be present
         # (Note: test client may not fully replicate Actix behavior)
 
-    def test_csp_setting_formats(self):
+    def test_csp_setting_formats(self, settings):
         """Test various CSP setting formats are accepted."""
         # Test string format
         settings.BOLT_STATIC_CSP = "default-src 'self'"
@@ -723,16 +721,15 @@ class TestEdgeCases:
         function-scoped fixture would run after the class-scoped client was
         already built with whatever settings the previous test left behind.
         """
-        settings.STATIC_ROOT = TEST_STATIC_DIR
-        settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
-        settings.STATIC_URL = "/static/"
+        with override_settings(STATIC_ROOT=TEST_STATIC_DIR, STATICFILES_DIRS=[TEST_STATIC_DIR], STATIC_URL="/static/"):
+            yield
 
     @pytest.fixture(scope="class")
     def client(self, api_with_static, setup_static_dir):
         """Test client reading static config from the settings set above."""
         return TestClient(api_with_static, use_http_layer=True)
 
-    def test_file_with_spaces_in_name(self):
+    def test_file_with_spaces_in_name(self, settings):
         """Test finding files with spaces in the name."""
         settings.STATIC_ROOT = TEST_STATIC_DIR
 
@@ -750,7 +747,7 @@ class TestEdgeCases:
         finally:
             os.unlink(space_file)
 
-    def test_file_with_unicode_name(self):
+    def test_file_with_unicode_name(self, settings):
         """Test finding files with unicode characters in the name."""
         settings.STATIC_ROOT = TEST_STATIC_DIR
 
@@ -822,7 +819,7 @@ class TestDebugModeFinders:
     In production (DEBUG=False), only explicitly configured directories are served.
     """
 
-    def test_admin_static_found_in_debug_mode(self):
+    def test_admin_static_found_in_debug_mode(self, settings):
         """Test that Django admin static files are found when DEBUG=True."""
         original_debug = getattr(settings, "DEBUG", None)
         settings.DEBUG = True
@@ -837,7 +834,7 @@ class TestDebugModeFinders:
             if original_debug is not None:
                 settings.DEBUG = original_debug
 
-    def test_configured_dirs_work_regardless_of_debug(self):
+    def test_configured_dirs_work_regardless_of_debug(self, settings):
         """Test that explicitly configured directories always work."""
         settings.STATIC_ROOT = None
         settings.STATICFILES_DIRS = [TEST_STATIC_DIR]
@@ -851,7 +848,7 @@ class TestDebugModeFinders:
             assert result is not None, f"Configured static file should be found with DEBUG={debug_value}"
             assert "style.css" in result
 
-    def test_finders_fallback_disabled_in_production_mode(self):
+    def test_finders_fallback_disabled_in_production_mode(self, settings):
         """Test that Django finders fallback is disabled when DEBUG=False.
 
         This test verifies the security behavior: in production mode,
@@ -903,7 +900,7 @@ class TestDebugModeFinders:
             # Cleanup
             shutil.rmtree(empty_static_root, ignore_errors=True)
 
-    def test_rust_handler_debug_flag_integration(self):
+    def test_rust_handler_debug_flag_integration(self, settings):
         """Test that the Rust handler respects debug flag for finders fallback.
 
         This is an integration test that verifies the full flow:
