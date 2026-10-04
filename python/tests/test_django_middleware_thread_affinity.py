@@ -191,7 +191,9 @@ def test_the_next_request_takes_a_lane_that_still_finishes_a_call():
     request takes the same lane, and the lane runs its call after that call.
     """
     finish = threading.Event()
-    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
+    # A sync middleware hook would take the lane before the handler starts.
+    # That hook would wait for the abandoned call, so this middleware has no sync hook.
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_AsyncOnlyHeaderMiddleware])])
 
     def wait_for_finish() -> None:
         finish.wait(5)
@@ -208,7 +210,8 @@ def test_the_next_request_takes_a_lane_that_still_finishes_a_call():
 
     @api.get("/next")
     async def next_ident():
-        # The first step of the task submits its call, so it takes a lane.
+        # The request has no lane yet. The first step of the task submits
+        # this call, and the call takes a lane.
         call = asyncio.ensure_future(sync_to_thread(threading.get_ident))
         await asyncio.sleep(0)
         # Only now let the abandoned call end. Its lane must already be idle.
