@@ -122,6 +122,8 @@ def make_delete_cookie(name: str, path: str = "/", domain: str | None = None) ->
     Returns:
         Cookie configured to expire immediately
     """
+    # A browser ignores a `__Secure-` or `__Host-` cookie with no Secure flag.
+    # Django sets the flag on such a delete, so Bolt sets it too.
     return Cookie(
         name=name,
         value="",
@@ -129,4 +131,5 @@ def make_delete_cookie(name: str, path: str = "/", domain: str | None = None) ->
         expires="Thu, 01 Jan 1970 00:00:00 GMT",
         path=path,
         domain=domain,
+        secure=name.startswith(("__Secure-", "__Host-")),
     )

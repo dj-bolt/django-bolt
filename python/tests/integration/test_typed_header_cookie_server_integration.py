@@ -68,3 +68,19 @@ def test_a_cookie_is_read_as_django_reads_it(make_server_project):
             headers = {"X-Count": "5", "Cookie": cookie}
             with SimpleWebSocketClient(server.host, server.port, "/ws/typed", headers=headers) as websocket:
                 assert websocket.receive_text() == "int:5 int:7"
+
+
+def test_repeated_cookie_lines_are_read_as_django_reads_them(make_server_project):
+    """Django joins the `Cookie` lines of a request with "; ", so each line counts."""
+    project = make_server_project(api_module=app_module("typed_header_cookie"))
+    lines = ["theme=dark", "page=7", "lang=en"]
+
+    with project.start() as server:
+        response = server.get("/typed/async", headers=[("X-Count", "5"), *(("Cookie", line) for line in lines)])
+        assert response.status_code == 200, response.text
+        assert response.json()["page"] == 7
+
+        # Header names are not case-sensitive, so these three keys send three `Cookie` lines.
+        headers = {"X-Count": "5", "Cookie": lines[0], "cookie": lines[1], "COOKIE": lines[2]}
+        with SimpleWebSocketClient(server.host, server.port, "/ws/typed", headers=headers) as websocket:
+            assert websocket.receive_text() == "int:5 int:7"
