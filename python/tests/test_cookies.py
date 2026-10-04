@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from django.http import HttpResponse
 
 from django_bolt import JSON, BoltAPI, Cookie, Response, StreamingResponse
 from django_bolt.cookies import make_delete_cookie
@@ -524,3 +525,34 @@ class TestCookieSecurityValidation:
         assert "valid=" in set_cookie or "also_valid=" in set_cookie
         # Injection attempt should be blocked
         assert "injection" not in set_cookie
+
+    @pytest.mark.parametrize(
+        ("value", "written"),
+        [
+            ("abc123", "abc123"),
+            ("x; Domain=evil.example", r'"x\073 Domain=evil.example"'),
+            ("hello world", '"hello world"'),
+            ('say "hi"', r'"say \"hi\""'),
+            ("café", r'"caf\351"'),
+            ("", '""'),
+        ],
+    )
+    def test_value_is_quoted_as_django_quotes_it(self, value, written):
+        """Bolt writes a cookie value as Django `set_cookie` writes it.
+
+        A `;` in the value gets an escape in double quotes. Thus a value from a
+        user cannot add an attribute, such as Domain, to the cookie.
+        """
+        api = BoltAPI()
+
+        @api.get("/set")
+        async def set_value():
+            return Response({"ok": True}).set_cookie("k", value)
+
+        django_response = HttpResponse()
+        django_response.set_cookie("k", value)
+        assert django_response.cookies["k"].coded_value == written
+
+        response = TestClient(api).get("/set")
+        assert response.status_code == 200
+        assert response.headers.get_list("set-cookie") == [f"k={written}; SameSite=Lax; Path=/"]

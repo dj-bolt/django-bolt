@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- **`set_cookie` quotes the cookie value as Django does** - Bolt wrote the value into `Set-Cookie` as it was. A value with `;` could add an attribute, for example `Domain` or `Max-Age`. Thus a value from a user could change the scope of the cookie. Now Bolt quotes a value as Django `set_cookie` does: a value with a character that is not safe gets double quotes, and each such character gets an escape. For example, `a b` gives `"a b"`, and `;` gives `\073`. A value of letters, digits and the characters `` !#$%&'*+-.^_`|~: `` does not change.
+
 ### Fixed
 
 - **A 204 response has no body** - `Response(status_code=204)` has the default content `{}`, and Bolt wrote it after the headers. Actix drops the `content-length` header for a 204 but writes the bytes it gets. On a keep-alive connection, the next response then started with `{}`. A browser or an HTTP client that reuses connections failed the request after a delete. Rust now drops the body of each 204, for every response type a handler can return.

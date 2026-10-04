@@ -2,6 +2,11 @@
 //!
 //! Uses the battle-tested `cookie` crate instead of manual string building
 //! to ensure proper validation, escaping, and security.
+//!
+//! Cookie values are quoted as Django quotes them.
+
+use std::borrow::Cow;
+use std::fmt::Write;
 
 use actix_web::cookie::{time, Cookie, SameSite};
 
@@ -11,8 +16,8 @@ use crate::response_meta::CookieData;
 ///
 /// Uses the `cookie` crate for RFC 6265 compliant serialization:
 /// - Validates cookie names (rejects invalid characters)
-/// - Properly escapes cookie values
-/// - Rejects control characters that could enable header injection
+/// - Rejects control characters in the value, as Django does
+/// - Quotes the value as Django does (see `quote_cookie_value`)
 ///
 /// Returns None if the cookie name or value is invalid, with a warning logged.
 #[inline]
@@ -27,7 +32,7 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
         return None;
     }
 
-    // Validate cookie value - reject control characters that could enable injection
+    // Reject control characters, as Python `http.cookies` does for Django.
     if contains_control_chars(&c.value) {
         eprintln!(
             "[django-bolt] WARNING: Cookie '{}' value contains control characters - rejected for security",
@@ -37,7 +42,7 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
     }
 
     // Build cookie using the cookie crate
-    let mut cookie = Cookie::build(&c.name, &c.value).path(&c.path);
+    let mut cookie = Cookie::build(&c.name, quote_cookie_value(&c.value)).path(&c.path);
 
     // Max-Age (validate non-negative)
     if let Some(max_age) = c.max_age {
@@ -134,6 +139,40 @@ fn contains_control_chars(value: &str) -> bool {
     value.bytes().any(|b| b < 32 || b == 127)
 }
 
+/// Characters that a cookie value can hold without quotes
+/// (Python `http.cookies._LegalChars`).
+#[inline]
+fn is_legal_cookie_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~:".contains(c)
+}
+
+/// Quote a cookie value as Django `set_cookie` does (Python `http.cookies._quote`).
+///
+/// A value of legal characters only stays as it is. Any other value is put in
+/// double quotes. In the quotes, `"` and `\` get a backslash, and a Latin-1
+/// character that is not safe becomes an octal escape (`;` gives `\073`).
+/// Thus a value cannot end the cookie or add an attribute.
+pub fn quote_cookie_value(value: &str) -> Cow<'_, str> {
+    if !value.is_empty() && value.chars().all(is_legal_cookie_char) {
+        return Cow::Borrowed(value);
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            c if is_legal_cookie_char(c) || " ()/<=>?@[]{}".contains(c) => quoted.push(c),
+            c if u32::from(c) < 256 => {
+                write!(quoted, "\\{:03o}", u32::from(c)).expect("a String write cannot fail");
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    Cow::Owned(quoted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,11 +253,10 @@ mod tests {
         assert!(format_cookie(&c).is_none());
     }
 
-    #[test]
-    fn test_control_chars_rejected() {
-        let c = CookieData {
+    fn cookie_with_value(value: &str) -> CookieData {
+        CookieData {
             name: "session".to_string(),
-            value: "value\r\nSet-Cookie: evil=1".to_string(), // Header injection attempt
+            value: value.to_string(),
             path: "/".to_string(),
             max_age: None,
             expires: None,
@@ -226,8 +264,39 @@ mod tests {
             secure: false,
             httponly: false,
             samesite: None,
-        };
-        assert!(format_cookie(&c).is_none());
+        }
+    }
+
+    #[test]
+    fn test_control_chars_rejected() {
+        // Header injection attempt
+        assert!(format_cookie(&cookie_with_value("value\r\nSet-Cookie: evil=1")).is_none());
+        assert!(format_cookie(&cookie_with_value("del\x7f")).is_none());
+    }
+
+    #[test]
+    fn a_value_cannot_add_an_attribute() {
+        let result = format_cookie(&cookie_with_value("x; Domain=evil.example")).unwrap();
+        assert!(
+            result.starts_with(r#"session="x\073 Domain=evil.example"; "#),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn values_are_quoted_as_django_quotes_them() {
+        for (value, quoted) in [
+            ("abc123", "abc123"),
+            ("", r#""""#),
+            ("a b", r#""a b""#),
+            (r#"say "hi""#, r#""say \"hi\"""#),
+            (r"back\slash", r#""back\\slash""#),
+            ("café", r#""caf\351""#),
+            ("a,b", r#""a\054b""#),
+            ("日本", r#""日本""#),
+        ] {
+            assert_eq!(quote_cookie_value(value), quoted, "{value}");
+        }
     }
 
     #[test]

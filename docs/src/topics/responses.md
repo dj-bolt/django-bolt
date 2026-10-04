@@ -300,6 +300,10 @@ async def login():
     return Response({"logged_in": True}).set_cookie("session", "abc123")
 ```
 
+Bolt writes the value as Django `set_cookie` writes it.
+A value with a space, a quote, `;` or another unsafe character gets double quotes and escapes.
+Bolt does not set a value that has a control character, and logs a warning.
+
 ### Cookie options
 
 Pass additional options to control cookie behavior:
