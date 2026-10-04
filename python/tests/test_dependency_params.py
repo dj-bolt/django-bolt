@@ -552,6 +552,17 @@ def _escape_api() -> BoltAPI:
         holder.request = request
         return {"body": _read_body(holder.request).decode(), "user": user["id"]}
 
+    @api.post("/subscript")
+    async def subscript(request, user: Annotated[dict, Depends(_current_user)]):
+        # A key known only at run time: the analysis cannot tell the part.
+        key = "body"
+        return {"body": request[key].decode(), "user": user["id"]}
+
+    @api.post("/get-key")
+    async def get_key(request, user: Annotated[dict, Depends(_current_user)]):
+        key = "body"
+        return {"body": request.get(key).decode(), "user": user["id"]}
+
     @api.post("/path/{user_id}")
     async def path_param(request, user_id: int):
         req = request
@@ -569,7 +580,10 @@ def _escape_api() -> BoltAPI:
     return api
 
 
-@pytest.mark.parametrize("path", ["/positional", "/keyword", "/sync", "/alias", "/container", "/attribute", "/path/1"])
+@pytest.mark.parametrize(
+    "path",
+    ["/positional", "/keyword", "/sync", "/alias", "/container", "/attribute", "/subscript", "/get-key", "/path/1"],
+)
 def test_a_request_handed_on_keeps_its_body(path):
     with TestClient(_escape_api()) as client:
         response = client.post(path, content=b"payload")

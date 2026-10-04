@@ -300,6 +300,10 @@ class OrmVisitor(ast.NodeVisitor):
             self.analysis.request_needs_headers = True
             self.analysis.request_needs_query = True
 
+    def _mark_all_request_components(self) -> None:
+        for attr_name in ("body", "query", "headers", "cookies"):
+            self._mark_request_component_attr(attr_name)
+
     def _mark_request_component_key(self, key: str) -> None:
         if key in {"body", "query", "headers", "cookies", "META", "get_full_path", "build_absolute_uri"}:
             self._mark_request_component_attr(key)
@@ -377,8 +381,7 @@ class OrmVisitor(ast.NodeVisitor):
         attribute) can be read where this analysis does not look.
         """
         if isinstance(node.ctx, ast.Load) and node.id in self.request_param_names:
-            for attr_name in ("body", "query", "headers", "cookies"):
-                self._mark_request_component_attr(attr_name)
+            self._mark_all_request_components()
 
     def visit_Call(self, node: ast.Call) -> None:
         """Detect function calls that might be blocking."""
@@ -393,13 +396,13 @@ class OrmVisitor(ast.NodeVisitor):
         elif isinstance(node.func, ast.Attribute):
             if self._is_request_name(node.func.value):
                 self._mark_request_component_attr(node.func.attr)
-                if (
-                    node.func.attr == "get"
-                    and node.args
-                    and isinstance(node.args[0], ast.Constant)
-                    and isinstance(node.args[0].value, str)
-                ):
-                    self._mark_request_component_key(node.args[0].value)
+                if node.func.attr == "get" and node.args:
+                    key = node.args[0]
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        self._mark_request_component_key(key.value)
+                    else:
+                        # A key known only at run time can name any part.
+                        self._mark_all_request_components()
 
             # e.g., requests.get(), time.sleep()
             if isinstance(node.func.value, ast.Name):
@@ -417,6 +420,9 @@ class OrmVisitor(ast.NodeVisitor):
         if self._is_request_name(node.value):
             if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
                 self._mark_request_component_key(node.slice.value)
+            else:
+                # A key known only at run time can name any part.
+                self._mark_all_request_components()
             # A request receiver is a read, not a hand-on.
             self.visit(node.slice)
             return
