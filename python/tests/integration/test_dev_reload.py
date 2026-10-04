@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -284,3 +285,33 @@ def test_runbolt_dev_reloads_with_force_polling(make_server_project):
         payload = server.wait_for_json("/version", lambda body: body["version"] == "v2", timeout=30)
 
     assert payload == {"version": "v2"}
+
+
+def _process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="The test sends SIGTERM to one process, which is POSIX.")
+def test_runbolt_dev_stops_its_worker_on_sigterm(make_server_project):
+    """``kill <pid>`` on the supervisor stops its worker too.
+
+    Before, SIGTERM killed only the supervisor. Its worker kept serving and held
+    the port, so the next ``runbolt --dev`` failed with "address in use".
+    """
+    project = make_server_project(api_source=app_source("hello"))
+
+    with project.start(dev=True) as server:
+        assert server.get("/hello").status_code == 200
+
+        os.kill(server.process.pid, signal.SIGTERM)
+        assert server.process.wait(timeout=15) == 0
+
+        # The spawn helper made the supervisor a process group leader.
+        deadline = time.monotonic() + 10
+        while _process_group_alive(server.process.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _process_group_alive(server.process.pid), "the dev worker outlived its supervisor"
