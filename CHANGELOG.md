@@ -32,6 +32,7 @@ All notable changes to this project will be documented in this file.
 
   The `cors_allowed_origins`, `static_files_config` and `read_django_settings` arguments still work. An explicit `cors_allowed_origins` also gets the server defaults above, not the old test defaults (nine allowed headers and a max-age of 86400 seconds).
 - **`TestClient` runs the request handler of `runbolt`** - The test client had its own copy of the request pipeline. Now each test request goes through the handler of the server, on a test worker thread. A sync handler no longer runs on the thread of the test, so its context variables and thread-locals stay out of the test. At exit, the client closes the database connections of the test workers.
+- **An empty list in `SECURE_CSP` skips the directive** - The Bolt docs told you to use `[]` for `upgrade-insecure-requests` and `block-all-mixed-content`. Bolt then sent the directive with no value. Django skips a directive with an empty list, and now Bolt does the same. Thus such a directive is not sent. Use `True` in its place, for example `"upgrade-insecure-requests": True`.
 - **macOS wheels are per architecture** - PyPI gets a macOS arm64 wheel and a macOS x86_64 wheel in place of one universal2 wheel. pip selects the wheel for the Mac, so an install does not change.
 
 ### Security

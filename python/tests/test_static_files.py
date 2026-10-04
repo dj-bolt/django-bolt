@@ -633,9 +633,10 @@ class TestContentSecurityPolicy:
             return client.get("/static/css/style.css")
 
     def test_csp_header_follows_the_rules_of_django(self):
-        """Django skips None and False, and writes True as a directive with no value.
+        """Django skips None, False and an empty list, and writes True as a directive with no value.
 
         It sorts a set and reads one str as one value. The order of the dict stays.
+        Before, Bolt wrote an empty list for block-all-mixed-content as the directive.
         """
         response = self._get_css(
             SECURE_CSP={
@@ -644,6 +645,7 @@ class TestContentSecurityPolicy:
                 "script-src": "'self'",
                 "object-src": None,
                 "frame-src": False,
+                "block-all-mixed-content": [],
                 "upgrade-insecure-requests": True,
             }
         )
