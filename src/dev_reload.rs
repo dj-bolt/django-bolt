@@ -183,8 +183,24 @@ fn first_relevant_path(event: &Event, filter: &ReloadFilter) -> Option<PathBuf> 
 
 /// The first relevant file in `dir` or its subdirectories. None when `dir` is
 /// not a directory. Symbolic links are not followed.
+///
+/// A directory that cannot be read can hold a relevant file, so it gives
+/// itself: a reload is better than a change that is never seen.
 fn first_relevant_file_in(dir: &Path, filter: &ReloadFilter) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // A file, or the old path of a rename: there is no directory to scan.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return None;
+        }
+        Err(_) => return Some(dir.to_path_buf()),
+    };
+    for entry in entries.flatten() {
         let path = entry.path();
         if filter.is_ignored(&path) {
             continue;
@@ -707,6 +723,51 @@ mod tests {
         assert_eq!(
             first_relevant_path(&event, &filter),
             Some(package.join("models.py"))
+        );
+    }
+
+    #[test]
+    fn directory_renamed_within_the_tree_triggers_reload() {
+        // A rename inside the watched tree gives the old path, then the new one.
+        // The old path is gone, so only the new one has files to find.
+        let root = TempDir::new("renamed-dir");
+        let package = root.0.join("renamed");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("views.py"), "VALUE = 1\n").unwrap();
+        let filter = ReloadFilter::new(vec![], vec![]);
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            paths: vec![root.0.join("original"), package.clone()],
+            attrs: Default::default(),
+        };
+
+        assert_eq!(
+            first_relevant_path(&event, &filter),
+            Some(package.join("views.py"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_directory_that_cannot_be_read_triggers_reload() {
+        // A directory that cannot be scanned can hold a relevant file. Reload,
+        // and do not wait for an event that may never come.
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new("unreadable-dir");
+        let package = root.0.join("private");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("models.py"), "VALUE = 1\n").unwrap();
+        std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let filter = ReloadFilter::new(vec![], vec![]);
+
+        let found = first_relevant_path(&create_folder_event(package.clone()), &filter);
+        std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // root can read the directory, and then finds the file in it.
+        assert!(
+            matches!(&found, Some(path) if path.starts_with(&package)),
+            "{found:?}"
         );
     }
 
