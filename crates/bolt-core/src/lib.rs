@@ -19,6 +19,7 @@ pub mod response_builder;
 pub mod response_meta;
 pub mod responses;
 pub mod router;
+pub mod settings;
 pub mod state;
 pub mod static_files;
 pub mod streaming;

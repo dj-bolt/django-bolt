@@ -37,7 +37,7 @@ use bolt_core::response_meta::ResponseMeta;
 use bolt_core::responses;
 use bolt_core::router::{parse_query_string, QueryParams};
 use bolt_core::state::{find_asgi_mount, AppState};
-use bolt_core::streaming::{create_python_stream, create_sse_stream};
+use bolt_core::streaming::{create_python_stream, create_sse_stream, StreamConfig};
 use bolt_core::type_coercion::{
     coerced_value_to_py, string_map_to_py_dict, CoercedValue, TypeHints,
 };
@@ -425,6 +425,7 @@ async fn build_response_from_parsed(
     skip_cors: bool,
     is_head_request: bool,
     req: &HttpRequest,
+    stream_config: StreamConfig,
 ) -> HttpResponse {
     let meta_ref = parsed.meta.as_ref();
 
@@ -512,8 +513,13 @@ async fn build_response_from_parsed(
                     mark_skip_cors(&mut response, skip_cors);
                     return response;
                 }
-                let stream =
-                    create_sse_stream(content_obj, is_async_generator, ping_interval, codec);
+                let stream = create_sse_stream(
+                    content_obj,
+                    is_async_generator,
+                    ping_interval,
+                    codec,
+                    stream_config,
+                );
                 let mut response = response_builder::build_sse_response(
                     parsed.status,
                     headers,
@@ -550,7 +556,7 @@ async fn build_response_from_parsed(
                 mark_skip_cors(&mut response, skip_cors);
                 return response;
             }
-            let inner = create_python_stream(content_obj, is_async_generator);
+            let inner = create_python_stream(content_obj, is_async_generator, stream_config);
             let stream = bolt_core::streaming::maybe_wrap_codec(inner, codec);
             let mut response = builder.streaming(stream);
             mark_skip_cors(&mut response, skip_cors);
@@ -565,9 +571,18 @@ pub async fn response_from_wire_result(
     skip_cors: bool,
     is_head_request: bool,
     req: &HttpRequest,
+    stream_config: StreamConfig,
 ) -> PyResult<HttpResponse> {
     let parsed = Python::attach(|py| parse_response_wire(py, &result_obj))?;
-    Ok(build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request, req).await)
+    Ok(build_response_from_parsed(
+        parsed,
+        skip_compression,
+        skip_cors,
+        is_head_request,
+        req,
+        stream_config,
+    )
+    .await)
 }
 
 /// One request source as Rust holds it: the string map and its coerced values.
@@ -1390,8 +1405,15 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
         // Sync dispatch completed but body needs async post-processing (stream/file).
         // Already parsed — no duplicate GIL acquire or wire re-parse.
         Ok(DispatchOutcome::SyncResult(parsed)) => {
-            build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request, &req)
-                .await
+            build_response_from_parsed(
+                parsed,
+                skip_compression,
+                skip_cors,
+                is_head_request,
+                &req,
+                state.stream_config,
+            )
+            .await
         }
         Ok(DispatchOutcome::Pending(fut)) => match fut.await {
             Ok(result_obj) => {
@@ -1401,6 +1423,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                     skip_cors,
                     is_head_request,
                     &req,
+                    state.stream_config,
                 )
                 .await
                 {

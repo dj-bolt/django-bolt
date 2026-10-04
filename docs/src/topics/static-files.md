@@ -137,7 +137,10 @@ Django provides constants via `django.utils.csp.CSP`:
 
 - CSP configuration is read once at server startup
 - The header is pre-built for performance (no per-request overhead)
+- Bolt builds the header with the rules of Django. `True` gives a directive with no value, such as `"upgrade-insecure-requests": True`. `None`, `False` and an empty list skip the directive. A set is sorted, and one str is one value.
 - `CSP.NONCE` values are automatically filtered out (static files cannot inject nonces)
+- A `SECURE_CSP` that is not a dict, or that does not give a valid header, stops startup with `ImproperlyConfigured`
+- Media files get the same header
 
 !!! note "Nonces not supported"
     `CSP.NONCE` requires per-request nonce injection which isn't possible for static files. Use `CSP.NONCE` only for dynamic responses served by your Django views.
@@ -153,8 +156,8 @@ Django provides constants via `django.utils.csp.CSP`:
 | `font-src` | Font sources | `[CSP.SELF, "https://fonts.gstatic.com"]` |
 | `connect-src` | XHR/WebSocket destinations | `[CSP.SELF, "https://api.example.com"]` |
 | `frame-ancestors` | Who can embed this page | `[CSP.NONE]` |
-| `upgrade-insecure-requests` | Upgrade HTTP to HTTPS | `[]` (boolean directive) |
-| `block-all-mixed-content` | Block mixed HTTP/HTTPS | `[]` (boolean directive) |
+| `upgrade-insecure-requests` | Upgrade HTTP to HTTPS | `True` (directive with no value) |
+| `block-all-mixed-content` | Block mixed HTTP/HTTPS | `True` (directive with no value) |
 
 ## Using with templates
 

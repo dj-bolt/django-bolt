@@ -13,13 +13,13 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
-import logging
 import threading
 import time
 
 import pytest
 from asgiref.sync import async_to_sync
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured
 from django.db import connections
 
 from django_bolt import concurrency
@@ -470,15 +470,10 @@ def test_inline_reentry_runs_in_a_context_copy(fresh_orm_executor):
     )
 
 
-def test_invalid_orm_threads_value_is_reported(fresh_orm_executor, caplog):
-    """A bad DJANGO_BOLT_ORM_THREADS value is a deployment error — say so.
-
-    Falling back silently hides a misconfigured budget behind default
-    behavior; the fallback must be reported.
-    """
-    with caplog.at_level(logging.WARNING, logger="django_bolt.concurrency"):
-        fresh_orm_executor(workers="not-a-number")
-
-    assert any("DJANGO_BOLT_ORM_THREADS" in record.getMessage() for record in caplog.records), (
-        "invalid DJANGO_BOLT_ORM_THREADS fell back to the default without a warning"
-    )
+@pytest.mark.parametrize("workers", ["not-a-number", "0"])
+def test_invalid_orm_threads_value_stops_the_pool(fresh_orm_executor, workers):
+    """A bad DJANGO_BOLT_ORM_THREADS value is a deployment error, not a default."""
+    with pytest.raises(
+        ImproperlyConfigured, match=rf"^DJANGO_BOLT_ORM_THREADS must be an int of 1 or more, got '{workers}'\.$"
+    ):
+        fresh_orm_executor(workers=workers)

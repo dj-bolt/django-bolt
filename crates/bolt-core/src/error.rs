@@ -2,6 +2,8 @@ use actix_web::{http::StatusCode, HttpResponse};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::settings::DjangoSettings;
+
 /// Extract error information from a Python HTTPException
 #[expect(
     clippy::type_complexity,
@@ -129,13 +131,17 @@ pub fn handle_python_exception(
     method: &str,
     debug: bool,
 ) -> HttpResponse {
-    // Override debug flag with Django's DEBUG setting (for dynamic checking)
-    let debug = (|| -> PyResult<bool> {
-        let django_conf = py.import("django.conf")?;
-        let settings = django_conf.getattr("settings")?;
-        settings.getattr("DEBUG")?.extract::<bool>()
-    })()
-    .unwrap_or(debug);
+    // Override debug flag with Django's DEBUG setting (for dynamic checking).
+    // Startup rejects a DEBUG that is not a bool, but a test can change DEBUG
+    // later. Then report the error and keep the DEBUG value of startup.
+    let debug =
+        match DjangoSettings::load(py).and_then(|settings| settings.truth_flag("DEBUG", debug)) {
+            Ok(debug) => debug,
+            Err(err) => {
+                eprintln!("[django-bolt] Warning: {err} Using DEBUG={debug} from startup.");
+                debug
+            }
+        };
     // Check if it's an HTTPException
     if is_http_exception(py, exc) {
         if let Some((status_code, detail, headers, extra)) = extract_http_exception(py, exc) {

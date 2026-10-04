@@ -568,6 +568,7 @@ pub fn test_request(
                         max_payload_size,
                         max_param_length: config.max_param_length,
                         asgi_mount_timeout: config.asgi_mount_timeout,
+                        stream_config: config.stream_config,
                         global_cors_config: config.global_cors_config,
                         cors_origin_regexes,
                         global_compression_config: compression,
@@ -577,6 +578,7 @@ pub fn test_request(
                         asgi_mounts: asgi_mounts.clone(),
                         extensions: {
                             let mut ext = http::Extensions::new();
+                            ext.insert(config.ws_config);
                             ext.insert(mcp_mounts.clone());
                             ext
                         },
@@ -1019,6 +1021,8 @@ mod tests {
         ServerConfig, TestAppState, WebSocketRouter, OWN_RATE_LIMIT_SCOPE, TEST_ID_GEN,
     };
     use bolt_core::middleware::client_ip::TrustedProxies;
+    use bolt_core::streaming::StreamConfig;
+    use bolt_websocket::WsConfig;
     use parking_lot::RwLock;
     use pyo3::prelude::*;
     use pyo3::types::{PyCFunction, PyDict, PyModule};
@@ -1043,6 +1047,18 @@ mod tests {
                 max_payload_size: 1024 * 1024,
                 max_param_length: 1024,
                 asgi_mount_timeout: Duration::from_secs(30),
+                stream_config: StreamConfig {
+                    sync_batch_size: 5,
+                    channel_capacity: 32,
+                    max_sync_threads: 1000,
+                },
+                ws_config: Arc::new(WsConfig {
+                    max_connections: 10000,
+                    channel_buffer_size: 100,
+                    heartbeat_interval: Duration::from_secs(5),
+                    client_timeout: Duration::from_secs(10),
+                    max_message_size: 1024 * 1024,
+                }),
                 global_cors_config: None,
                 trusted_proxies: Arc::new(TrustedProxies::parse(&[]).unwrap()),
                 static_files_config: None,

@@ -6,13 +6,19 @@ import datetime
 import decimal
 import inspect
 import ipaddress
+import operator
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Annotated, Any, get_args, get_origin
 
 import msgspec
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
+
+try:
+    from django.utils.csp import build_policy
+except ImportError:  # Django 5.2 has no django.utils.csp
+    build_policy = None
 
 from ..auth.backends import get_default_authentication_classes
 from ..auth.guards import BasePermission, get_default_permission_classes
@@ -461,15 +467,93 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
             metadata["max_upload_size"] = max(max_sizes)
         else:
             # No per-field max_size, use global setting or default
-            metadata["max_upload_size"] = getattr(settings, "BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)
+            metadata["max_upload_size"] = read_size_setting("BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)
     else:
         # No file constraints at all, use global setting or default
-        metadata["max_upload_size"] = getattr(settings, "BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)
+        metadata["max_upload_size"] = read_size_setting("BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)
 
     # Memory spool threshold - when to spool files to disk (default 1MB)
-    metadata["memory_spool_threshold"] = getattr(settings, "BOLT_MEMORY_SPOOL_THRESHOLD", 1024 * 1024)
+    metadata["memory_spool_threshold"] = read_size_setting("BOLT_MEMORY_SPOOL_THRESHOLD", 1024 * 1024)
 
     return metadata
+
+
+def read_size_setting(name: str, default: int) -> int:
+    """
+    Read a size setting in bytes, such as `BOLT_MAX_UPLOAD_SIZE`.
+
+    A missing setting gives the default. Rust reads the server settings at
+    startup with the same rule.
+
+    Raises:
+        ImproperlyConfigured: The setting is not an int of 0 or more. A bool is
+            not a size.
+    """
+    value = getattr(settings, name, default)
+    if not isinstance(value, bool):
+        try:
+            size = operator.index(value)
+        except TypeError:
+            size = -1
+        if size >= 0:
+            return size
+    raise ImproperlyConfigured(f"{name} must be an int of 0 or more, got {type(value).__name__} {value!r}.")
+
+
+# The value of django.utils.csp.CSP.NONCE in Django 6.0+.
+_CSP_NONCE = "<CSP_NONCE_SENTINEL>"
+
+
+def _build_policy_without_nonce(config: Mapping[str, Any]) -> str:
+    """
+    Build a CSP value with the rules of `django.utils.csp.build_policy`.
+
+    Django 5.2 has no `django.utils.csp`, so this copy of the Django 6.0 rules
+    builds the value there. It removes `CSP.NONCE`.
+    """
+    policy = []
+    for directive, values in config.items():
+        if values in (None, False):
+            continue
+        if values is True:
+            rendered_value = ""
+        else:
+            if isinstance(values, set):
+                values = sorted(values)
+            elif not isinstance(values, list | tuple):
+                values = [values]
+            values = [value for value in values if value != _CSP_NONCE]
+            if not values:
+                continue
+            rendered_value = " ".join(values)
+        policy.append(f"{directive} {rendered_value}".rstrip())
+    return "; ".join(policy)
+
+
+def get_static_files_csp() -> str | None:
+    """
+    Build the Content-Security-Policy value of static and media files from `settings.SECURE_CSP`.
+
+    Django builds the value with `django.utils.csp.build_policy`. A file has no
+    nonce, so the policy has no `CSP.NONCE`.
+
+    Returns:
+        The header value, or None when SECURE_CSP is missing, None, or gives no directive.
+
+    Raises:
+        ImproperlyConfigured: SECURE_CSP is not a dict, or Django cannot build a
+            policy from it.
+    """
+    config = getattr(settings, "SECURE_CSP", None)
+    if config is None:
+        return None
+    if not isinstance(config, Mapping):
+        raise ImproperlyConfigured(f"SECURE_CSP must be a dict, got {type(config).__name__} {config!r}.")
+    try:
+        policy = build_policy(config) if build_policy is not None else _build_policy_without_nonce(config)
+    except TypeError as e:
+        raise ImproperlyConfigured(f"SECURE_CSP is not valid: {e}") from e
+    return policy or None
 
 
 def get_trusted_proxies() -> list[str]:

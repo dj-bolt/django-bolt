@@ -21,13 +21,18 @@ use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
+use bolt_core::settings::{
+    env_flag, env_non_negative_int, env_positive_int, env_var, improperly_configured,
+    DjangoSettings,
+};
 use bolt_core::state::{
     find_websocket_mount, AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
     ROUTE_METADATA_TEMP, TASK_LOCALS,
 };
 use bolt_core::static_files::handle_file;
+use bolt_core::streaming::StreamConfig;
 use bolt_websocket::{
-    handle_websocket_upgrade, is_websocket_upgrade, WebSocketRouter, WsTarget,
+    handle_websocket_upgrade, is_websocket_upgrade, WebSocketRouter, WsConfig, WsTarget,
     GLOBAL_WEBSOCKET_ROUTER,
 };
 
@@ -194,6 +199,8 @@ pub(crate) struct ServerConfig {
     pub max_payload_size: usize,
     pub max_param_length: usize,
     pub asgi_mount_timeout: Duration,
+    pub stream_config: StreamConfig,
+    pub ws_config: Arc<WsConfig>,
     pub global_cors_config: Option<CorsConfig>,
     pub trusted_proxies: Arc<TrustedProxies>,
     pub static_files_config: Option<Arc<ScopeConfig>>,
@@ -212,47 +219,30 @@ impl ServerConfig {
         // ImproperlyConfigured error for malformed settings.
         let trusted_proxies = Arc::new(TrustedProxies::from_django_settings(py)?);
 
-        let debug = (|| -> PyResult<bool> {
-            let django_conf = py.import("django.conf")?;
-            let settings = django_conf.getattr("settings")?;
-            settings.getattr("DEBUG")?.extract::<bool>()
-        })()
-        .unwrap_or(false);
-
-        let max_header_size = (|| -> PyResult<usize> {
-            let django_conf = py.import("django.conf")?;
-            let settings = django_conf.getattr("settings")?;
-            settings.getattr("BOLT_MAX_HEADER_SIZE")?.extract::<usize>()
-        })()
-        .unwrap_or(8192); // Default 8KB
-
-        let max_payload_size = (|| -> PyResult<usize> {
-            let django_conf = py.import("django.conf")?;
-            let settings = django_conf.getattr("settings")?;
-            settings.getattr("BOLT_MAX_UPLOAD_SIZE")?.extract::<usize>()
-        })()
-        .unwrap_or(1024 * 1024); // Default 1MB
-
-        let asgi_mount_timeout = (|| -> PyResult<f64> {
-            let django_conf = py.import("django.conf")?;
-            let settings = django_conf.getattr("settings")?;
-            settings
-                .getattr("BOLT_ASGI_MOUNT_TIMEOUT")?
-                .extract::<f64>()
-        })()
-        .ok()
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(Duration::from_secs_f64)
-        .unwrap_or_else(|| Duration::from_secs(30)); // Default 30s
+        // A missing setting gives the default. A present setting with the wrong
+        // type raises ImproperlyConfigured that names the setting.
+        let settings = DjangoSettings::load(py)?;
+        let debug = settings.truth_flag("DEBUG", false)?;
+        let max_header_size = settings.non_negative_int("BOLT_MAX_HEADER_SIZE", 8192)?; // Default 8KB
+        let max_payload_size = settings.non_negative_int("BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)?; // Default 1MB
+        let asgi_mount_timeout =
+            settings.positive_seconds("BOLT_ASGI_MOUNT_TIMEOUT", Duration::from_secs(30))?; // Default 30s
+        let stream_config = StreamConfig::read(&settings)?;
+        let ws_config = Arc::new(WsConfig::from_django_settings(&settings)?);
 
         let (global_cors_config, static_files_config, media_files_config) = if read_cors_and_files {
-            read_cors_and_file_scopes(py, debug)
+            read_cors_and_file_scopes(&settings, debug)?
         } else {
             (None, None, None)
         };
 
         // Resolve DJANGO_BOLT_MAX_PARAM_LENGTH once at startup, not per request.
-        let max_param_length = bolt_core::type_coercion::resolve_max_param_length();
+        let max_param_length = bolt_core::type_coercion::resolve_max_param_length(py)?;
+        // Lanes and the Python thread pools start later. Check their variables
+        // now, so an invalid value stops startup.
+        bolt_core::lane::configure_idle_time(py)?;
+        py.import("django_bolt.concurrency")?
+            .call_method0("check_pool_environment")?;
 
         Ok(Self {
             debug,
@@ -260,6 +250,8 @@ impl ServerConfig {
             max_payload_size,
             max_param_length,
             asgi_mount_timeout,
+            stream_config,
+            ws_config,
             global_cors_config,
             trusted_proxies,
             static_files_config,
@@ -303,73 +295,43 @@ impl ServerConfig {
     }
 }
 
-/// Read the CORS, static and media settings.
-fn read_cors_and_file_scopes(
-    py: Python<'_>,
-    debug: bool,
-) -> (
+/// The global CORS config, the static scope and the media scope.
+type CorsAndFileScopes = (
     Option<CorsConfig>,
     Option<Arc<ScopeConfig>>,
     Option<Arc<ScopeConfig>>,
-) {
+);
+
+/// Read the CORS, static and media settings. A setting with the wrong type
+/// raises `ImproperlyConfigured` that names the setting.
+fn read_cors_and_file_scopes(
+    settings: &DjangoSettings<'_>,
+    debug: bool,
+) -> PyResult<CorsAndFileScopes> {
+    let py = settings.py();
+
     // Read django-cors-headers compatible CORS settings
-    #[expect(clippy::type_complexity, reason = "the tuple holds the CORS settings until CorsConfig::from_django_settings takes them")]
-        let cors_data = (|| -> PyResult<(Vec<String>, Vec<String>, bool, bool, Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>, Option<u32>)> {
-                let django_conf = py.import("django.conf")?;
-                let settings = django_conf.getattr("settings")?;
-
-                let origins = settings.getattr("CORS_ALLOWED_ORIGINS")
-                    .and_then(|o| o.extract::<Vec<String>>())
-                    .unwrap_or_else(|_| vec![]);
-
-                let origin_regexes = settings.getattr("CORS_ALLOWED_ORIGIN_REGEXES")
-                    .and_then(|r| r.extract::<Vec<String>>())
-                    .unwrap_or_else(|_| vec![]);
-
-                let allow_all = settings.getattr("CORS_ALLOW_ALL_ORIGINS")
-                    .and_then(|a| a.extract::<bool>())
-                    .unwrap_or(false);
-
-                let credentials = settings.getattr("CORS_ALLOW_CREDENTIALS")
-                    .and_then(|c| c.extract::<bool>())
-                    .unwrap_or(false);
-
-                let methods = settings.getattr("CORS_ALLOW_METHODS")
-                    .and_then(|m| m.extract::<Vec<String>>())
-                    .ok();
-
-                let headers = settings.getattr("CORS_ALLOW_HEADERS")
-                    .and_then(|h| h.extract::<Vec<String>>())
-                    .ok();
-
-                let expose_headers = settings.getattr("CORS_EXPOSE_HEADERS")
-                    .and_then(|e| e.extract::<Vec<String>>())
-                    .ok();
-
-                let max_age = settings.getattr("CORS_PREFLIGHT_MAX_AGE")
-                    .and_then(|a| a.extract::<u32>())
-                    .ok();
-
-                Ok((origins, origin_regexes, allow_all, credentials, methods, headers, expose_headers, max_age))
-            })().unwrap_or_else(|_| (vec![], vec![], false, false, None, None, None, None));
+    let origins = settings
+        .str_list("CORS_ALLOWED_ORIGINS")?
+        .unwrap_or_default();
+    let origin_regex_patterns = settings
+        .str_list("CORS_ALLOWED_ORIGIN_REGEXES")?
+        .unwrap_or_default();
+    let allow_all = settings.bool("CORS_ALLOW_ALL_ORIGINS", false)?;
+    let credentials = settings.bool("CORS_ALLOW_CREDENTIALS", false)?;
+    let methods = settings.str_list("CORS_ALLOW_METHODS")?;
+    let headers = settings.str_list("CORS_ALLOW_HEADERS")?;
+    let expose_headers = settings.str_list("CORS_EXPOSE_HEADERS")?;
+    let max_age = settings.optional_u32("CORS_PREFLIGHT_MAX_AGE")?;
 
     // Read static files configuration from Django settings
     // STATIC_URL: URL prefix for static files (e.g., "/static/")
     // STATIC_ROOT: Directory where collectstatic gathers files
     // STATICFILES_DIRS: Additional directories to search for static files
     let static_data = (|| -> PyResult<Option<(String, Vec<String>)>> {
-        let django_conf = py.import("django.conf")?;
-        let settings = django_conf.getattr("settings")?;
-
         // Get STATIC_URL (required for static serving)
-        let static_url = match settings.getattr("STATIC_URL") {
-            Ok(url) => url.extract::<String>().ok(),
-            Err(_) => None,
-        };
-
-        let static_url = match static_url {
-            Some(url) => url,
-            None => return Ok(None), // No static URL configured
+        let Some(static_url) = settings.optional_str("STATIC_URL")? else {
+            return Ok(None); // No static URL configured
         };
 
         let Some(url_prefix) = static_scope_prefix(&static_url) else {
@@ -381,7 +343,7 @@ fn read_cors_and_file_scopes(
         // Get STATIC_ROOT (primary location for collected static files).
         // Defaults to None in Django when not configured -- skip None so we
         // don't push the literal string "None".
-        if let Ok(static_root) = settings.getattr("STATIC_ROOT") {
+        if let Some(static_root) = settings.get("STATIC_ROOT")? {
             if !static_root.is_none() {
                 if let Some(root_str) = settings_path_to_string(&static_root) {
                     if !root_str.is_empty() {
@@ -394,7 +356,7 @@ fn read_cors_and_file_scopes(
         // Get STATICFILES_DIRS (additional directories). Convert element-wise
         // rather than `extract::<Vec<String>>`, which would fail the whole
         // list on the first Path entry.
-        if let Ok(static_dirs) = settings.getattr("STATICFILES_DIRS") {
+        if let Some(static_dirs) = settings.get("STATICFILES_DIRS")? {
             if let Ok(iter) = static_dirs.try_iter() {
                 for entry in iter.flatten() {
                     if let Some(dir) = settings_path_to_string(&entry) {
@@ -411,131 +373,87 @@ fn read_cors_and_file_scopes(
         // serve admin/app static (mirrors Django runserver). The
         // register-or-not decision is made where DEBUG is known.
         Ok(Some((url_prefix, directories)))
-    })()
-    .unwrap_or(None);
+    })()?;
 
     // Read media files configuration from Django settings
     // MEDIA_URL: URL prefix for media files (e.g., "/media/")
     // MEDIA_ROOT: Local directory for user uploaded files
     let media_data = (|| -> PyResult<Option<(String, String)>> {
-                let django_conf = py.import("django.conf")?;
-                let settings = django_conf.getattr("settings")?;
+        // Get MEDIA_URL (required for media serving)
+        let Some(media_url) = settings.optional_str("MEDIA_URL")? else {
+            return Ok(None); // No media URL configured
+        };
 
-                // Get MEDIA_URL (required for media serving)
-                let media_url = match settings.getattr("MEDIA_URL") {
-                    Ok(url) => url.extract::<String>().ok(),
-                    Err(_) => None,
-                };
+        // MEDIA_URL must be a path-style prefix (e.g. "/media/") — CDN-style
+        // full URLs and missing leading slash produce malformed scope prefixes.
+        if !media_url.starts_with('/') {
+            eprintln!(
+                    "[django-bolt] Warning: MEDIA_URL must start with '/' for in-process serving (got {:?}); ignoring.",
+                    media_url
+                );
+            return Ok(None);
+        }
+        let url_prefix = media_url.trim_end_matches('/').to_string();
+        if url_prefix.is_empty() {
+            return Ok(None); // MEDIA_URL = "/"; would shadow every route
+        }
+        if !is_literal_prefix(&url_prefix) {
+            eprintln!(
+                "[django-bolt] Warning: MEDIA_URL contains scope-param chars \
+                     (got {:?}); refusing to mount. Use a literal prefix like \"/media/\".",
+                media_url
+            );
+            return Ok(None);
+        }
 
-                let media_url = match media_url {
-                    Some(url) => url,
-                    None => return Ok(None), // No media URL configured
-                };
+        // Get MEDIA_ROOT (local directory for uploaded files)
+        // MEDIA_ROOT can be a Path object, so convert via str()
+        // Skip if unset/None to avoid converting it to the string "None".
+        let media_root = match settings.get("MEDIA_ROOT")? {
+            Some(r) if !r.is_none() => r,
+            _ => return Ok(None),
+        };
 
-                // MEDIA_URL must be a path-style prefix (e.g. "/media/") — CDN-style
-                // full URLs and missing leading slash produce malformed scope prefixes.
-                if !media_url.starts_with('/') {
-                    eprintln!(
-                        "[django-bolt] Warning: MEDIA_URL must start with '/' for in-process serving (got {:?}); ignoring.",
-                        media_url
-                    );
-                    return Ok(None);
-                }
-                let url_prefix = media_url.trim_end_matches('/').to_string();
-                if url_prefix.is_empty() {
-                    return Ok(None); // MEDIA_URL = "/"; would shadow every route
-                }
-                if !is_literal_prefix(&url_prefix) {
-                    eprintln!(
-                        "[django-bolt] Warning: MEDIA_URL contains scope-param chars \
-                         (got {:?}); refusing to mount. Use a literal prefix like \"/media/\".",
-                        media_url
-                    );
-                    return Ok(None);
-                }
+        let root_str = match settings_path_to_string(&media_root) {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(None),
+        };
 
-                // Get MEDIA_ROOT (local directory for uploaded files)
-                // MEDIA_ROOT can be a Path object, so convert via str()
-                // Skip if unset/None to avoid converting it to the string "None".
-                let media_root = match settings.getattr("MEDIA_ROOT") {
-                    Ok(r) if !r.is_none() => r,
-                    _ => return Ok(None),
-                };
+        // MEDIA_ROOT must be an absolute path. A relative root (including
+        // Path('') which str()s to ".") would canonicalize to the server's
+        // CWD on every request — exposing source files at /media/*.
+        if !Path::new(&root_str).is_absolute() {
+            eprintln!(
+                "[django-bolt] Warning: MEDIA_ROOT must be an absolute path (got {:?}); ignoring.",
+                root_str
+            );
+            return Ok(None);
+        }
 
-                let root_str = match settings_path_to_string(&media_root) {
-                    Some(s) if !s.is_empty() => s,
-                    _ => return Ok(None),
-                };
-
-                // MEDIA_ROOT must be an absolute path. A relative root (including
-                // Path('') which str()s to ".") would canonicalize to the server's
-                // CWD on every request — exposing source files at /media/*.
-                if !Path::new(&root_str).is_absolute() {
-                    eprintln!(
-                        "[django-bolt] Warning: MEDIA_ROOT must be an absolute path (got {:?}); ignoring.",
-                        root_str
-                    );
-                    return Ok(None);
-                }
-
-                Ok(Some((url_prefix, root_str)))
-            })()
-            .unwrap_or(None);
+        Ok(Some((url_prefix, root_str)))
+    })()?;
 
     // Read CSP configuration from Django settings (Django 6.0+ SECURE_CSP).
+    // Python builds the policy with the rules of Django, without a nonce.
     // The header is built and *parsed into a HeaderValue once* at startup,
     // so the request hot path becomes a `clone()` (Bytes-backed, ~1ns)
     // rather than a fresh `HeaderValue::from_str` validation pass per
     // response. Same pattern as `BOLT_*_MAX_AGE` cache-control headers.
     // See: https://docs.djangoproject.com/en/6.0/ref/csp/
-    let csp_header: Option<HeaderValue> = (|| -> Option<HeaderValue> {
-        use std::collections::HashMap;
-
-        let django_conf = py.import("django.conf").ok()?;
-        let settings = django_conf.getattr("settings").ok()?;
-
-        let csp = settings.getattr("SECURE_CSP").ok()?;
-        if csp.is_none() {
-            return None;
-        }
-        let csp_directives: HashMap<String, Vec<String>> = csp.extract().ok()?;
-
-        // Build CSP header string from directives
-        let mut csp_parts: Vec<String> = Vec::new();
-
-        for (directive, sources) in csp_directives {
-            // Filter out CSP.NONCE sentinel values (can't inject nonces for static files)
-            let filtered_sources: Vec<String> = sources
-                .into_iter()
-                .filter(|s| !s.contains("CSP_NONCE_SENTINEL"))
-                .collect();
-
-            if !filtered_sources.is_empty() {
-                csp_parts.push(format!("{} {}", directive, filtered_sources.join(" ")));
-            } else if directive == "upgrade-insecure-requests"
-                || directive == "block-all-mixed-content"
-            {
-                // Boolean directives (no sources needed)
-                csp_parts.push(directive);
-            }
-        }
-
-        if csp_parts.is_empty() {
-            return None;
-        }
-        let csp_string = csp_parts.join("; ");
-        match HeaderValue::from_str(&csp_string) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!(
-                    "[django-bolt] Warning: SECURE_CSP produced an invalid \
-                             HTTP header value ({}); ignoring. CSP string was {:?}.",
-                    e, csp_string
-                );
-                None
-            }
-        }
-    })();
+    let csp_policy: Option<String> = py
+        .import("django_bolt.middleware.compiler")?
+        .getattr("get_static_files_csp")?
+        .call0()?
+        .extract()?;
+    let csp_header = match csp_policy {
+        None => None,
+        Some(policy) => Some(HeaderValue::from_str(&policy).map_err(|_| {
+            improperly_configured(
+                py,
+                format!("SECURE_CSP gives a value that is not valid in an HTTP header: {policy:?}"),
+            )
+        })?),
+    };
 
     // Read & validate cache-control max-age settings (integer seconds).
     // Built once here so the per-request hot path is a plain header insert.
@@ -552,17 +470,6 @@ fn read_cors_and_file_scopes(
         read_max_age_setting(py, "BOLT_STATIC_MAX_AGE", CacheVisibility::Public);
     let media_cache_control =
         read_max_age_setting(py, "BOLT_MEDIA_MAX_AGE", CacheVisibility::Private);
-
-    let (
-        origins,
-        origin_regex_patterns,
-        allow_all,
-        credentials,
-        methods,
-        headers,
-        expose_headers,
-        max_age,
-    ) = cors_data;
 
     // Validate CORS configuration: wildcard + credentials is invalid per spec
     if allow_all && credentials {
@@ -601,33 +508,33 @@ fn read_cors_and_file_scopes(
     // Directories are canonicalized ONCE here so the request hot path never
     // runs `canonicalize()` (a multi-syscall realpath) on the directory root.
     let static_files_config = static_data.and_then(|(url_prefix, directories)| {
-            let valid_dirs = canonicalize_serve_dirs(&directories, &url_prefix, "Static files");
-            // Register the scope when we have real directories to serve OR we're in
-            // DEBUG. In DEBUG the staticfiles-finders fallback resolves admin/app
-            // static (the dev equivalent of Django runserver), so an empty
-            // STATIC_ROOT is fine. In production with no valid dirs we do NOT
-            // register: finders are disabled there by design, so the scope would
-            // only 404 — run collectstatic to populate STATIC_ROOT.
-            if valid_dirs.is_empty() && !debug {
-                eprintln!(
-                    "[django-bolt] Warning: Static files: No valid directories found for {} \
-                     and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.",
-                    url_prefix
-                );
-                None
-            } else {
-                Some(Arc::new(ScopeConfig {
-                    url_prefix,
-                    directories: valid_dirs,
-                    csp_header: csp_header.clone(),
-                    cache_control: static_cache_control.clone(),
-                    mode: ServeMode::Static,
-                    // Finders only resolve STATICFILES_DIRS / app static dirs and
-                    // only in development; never used in production or for media.
-                    allow_django_finders: debug,
-                }))
-            }
-        });
+        let valid_dirs = canonicalize_serve_dirs(&directories, &url_prefix, "Static files");
+        // Register the scope when we have real directories to serve OR we're in
+        // DEBUG. In DEBUG the staticfiles-finders fallback resolves admin/app
+        // static (the dev equivalent of Django runserver), so an empty
+        // STATIC_ROOT is fine. In production with no valid dirs we do NOT
+        // register: finders are disabled there by design, so the scope would
+        // only 404 — run collectstatic to populate STATIC_ROOT.
+        if valid_dirs.is_empty() && !debug {
+            eprintln!(
+                "[django-bolt] Warning: Static files: No valid directories found for {} \
+                 and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.",
+                url_prefix
+            );
+            None
+        } else {
+            Some(Arc::new(ScopeConfig {
+                url_prefix,
+                directories: valid_dirs,
+                csp_header: csp_header.clone(),
+                cache_control: static_cache_control.clone(),
+                mode: ServeMode::Static,
+                // Finders only resolve STATICFILES_DIRS / app static dirs and
+                // only in development; never used in production or for media.
+                allow_django_finders: debug,
+            }))
+        }
+    });
 
     // Build media files configuration (single directory: MEDIA_ROOT).
     let media_files_config = media_data.and_then(|(url_prefix, directory)| {
@@ -648,7 +555,7 @@ fn read_cors_and_file_scopes(
         }
     });
 
-    (global_cors_config, static_files_config, media_files_config)
+    Ok((global_cors_config, static_files_config, media_files_config))
 }
 
 /// Read the `django.server` logger once. The access log is on when that
@@ -819,14 +726,31 @@ pub fn start_server(
         ));
     }
 
+    // Read the environment variables of the server process before anything
+    // starts. runbolt sets most of them from its options. An invalid value
+    // raises ImproperlyConfigured.
+    //
     // Configure tokio runtime with adequate blocking thread pool for concurrent streaming
     // Default is 512, but with concurrent SSE clients doing blocking operations (time.sleep),
     // we need enough threads to handle simultaneous blocking tasks
-    let blocking_threads = std::env::var("DJANGO_BOLT_BLOCKING_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(1024); // Increased default to 1024 for better concurrent streaming support
+    let blocking_threads = env_positive_int(py, "DJANGO_BOLT_BLOCKING_THREADS", 1024usize)?; // Increased default to 1024 for better concurrent streaming support
+    let workers = env_positive_int(py, "DJANGO_BOLT_WORKERS", 1usize)?;
+    // HTTP keep-alive in seconds; without the variable, the OS default applies
+    let keep_alive = match env_var(
+        py,
+        "DJANGO_BOLT_KEEP_ALIVE",
+        "an int of 0 or more",
+        |_: &u64| true,
+    )? {
+        Some(seconds) => KeepAlive::Timeout(Duration::from_secs(seconds)),
+        None => KeepAlive::Os,
+    };
+    // Graceful-shutdown window: how long in-flight connections get
+    // to finish after a shutdown signal before being force-closed.
+    // The runbolt supervisor sets this to --workers-kill-timeout.
+    let shutdown_timeout = env_non_negative_int(py, "DJANGO_BOLT_SHUTDOWN_TIMEOUT", 30u64)?;
+    let use_reuse_port = env_flag(py, "DJANGO_BOLT_REUSE_PORT", false)?;
+    let backlog = env_non_negative_int(py, "DJANGO_BOLT_BACKLOG", 1024i32)?;
 
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.max_blocking_threads(blocking_threads);
@@ -893,6 +817,7 @@ pub fn start_server(
         max_payload_size: config.max_payload_size,
         max_param_length: config.max_param_length,
         asgi_mount_timeout: config.asgi_mount_timeout,
+        stream_config: config.stream_config,
         global_cors_config: config.global_cors_config,
         cors_origin_regexes,
         global_compression_config: global_compression_config.clone(),
@@ -902,6 +827,7 @@ pub fn start_server(
         asgi_mounts: GLOBAL_ASGI_MOUNTS.get().cloned().unwrap_or_default(),
         extensions: {
             let mut extensions = http::Extensions::new();
+            extensions.insert(config.ws_config);
             if let Some(mounts) = bolt_mcp::GLOBAL_MCP_MOUNTS.get() {
                 extensions.insert(Arc::clone(mounts));
             }
@@ -915,27 +841,6 @@ pub fn start_server(
     py.detach(|| {
         aw::rt::System::new()
             .block_on(async move {
-                let workers: usize = std::env::var("DJANGO_BOLT_WORKERS")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .filter(|&w| w >= 1)
-                    .unwrap_or(1);
-
-                // Read HTTP keep-alive configuration from environment
-                let keep_alive = std::env::var("DJANGO_BOLT_KEEP_ALIVE")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .map(|seconds| KeepAlive::Timeout(std::time::Duration::from_secs(seconds)))
-                    .unwrap_or(KeepAlive::Os);
-
-                // Graceful-shutdown window: how long in-flight connections get
-                // to finish after a shutdown signal before being force-closed.
-                // The runbolt supervisor sets this to --workers-kill-timeout.
-                let shutdown_timeout: u64 = std::env::var("DJANGO_BOLT_SHUTDOWN_TIMEOUT")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(30);
-
                 {
                     let server = HttpServer::new(move || {
                         // Actix runs this factory once on every worker thread,
@@ -1023,16 +928,6 @@ pub fn start_server(
                     .disable_signals()
                     .shutdown_timeout(shutdown_timeout)
                     .workers(workers);
-
-                    let use_reuse_port = std::env::var("DJANGO_BOLT_REUSE_PORT")
-                        .ok()
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
-
-                    let backlog = std::env::var("DJANGO_BOLT_BACKLOG")
-                        .ok()
-                        .and_then(|s| s.parse::<i32>().ok())
-                        .unwrap_or(1024);
 
                     // Always use socket2 for consistent backlog control
                     let ip: IpAddr = host.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));

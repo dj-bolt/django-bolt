@@ -31,7 +31,7 @@ use bolt_core::type_coercion::TypeHints;
 use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 
 use super::actor::WebSocketActor;
-use super::config::WS_CONFIG;
+use super::config::WsConfig;
 use super::messages::{SendToClient, WsMessage};
 use super::{ConnectionSlot, ACTIVE_WS_CONNECTIONS};
 
@@ -738,8 +738,10 @@ pub async fn handle_websocket_upgrade(
         WsTarget::Route { handler_id, .. } => Some(*handler_id),
         WsTarget::AsgiMount { .. } => None,
     };
-    // Use cached config - no Python/GIL access
-    let config = &*WS_CONFIG;
+    // The server read the config at startup - no Python/GIL access
+    let Some(config) = state.extensions.get::<Arc<WsConfig>>().cloned() else {
+        return Ok(HttpResponse::InternalServerError().body("WebSocket config is not loaded"));
+    };
 
     // Validate request is actually a WebSocket upgrade
     if !is_websocket_upgrade(&req) {
@@ -926,7 +928,7 @@ pub async fn handle_websocket_upgrade(
             headers,
             ready,
         }) => {
-            let actor = WebSocketActor::new(to_python_tx, slot);
+            let actor = WebSocketActor::new(to_python_tx, slot, &config);
             // Set the header here: actix reads only the first header line of the client.
             let protocol = subprotocol
                 .map(|selected| {

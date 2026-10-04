@@ -1,13 +1,14 @@
-//! WebSocket configuration - cached at startup
+//! WebSocket configuration - read once at startup
 //!
-//! Settings are read once from environment variables and Django settings,
-//! then cached for the lifetime of the server to avoid per-request GIL overhead.
+//! Settings are read once from environment variables and Django settings.
+//! The app state holds the result, so a connection reads it without the GIL.
 
-use once_cell::sync::Lazy;
+use bolt_core::settings::{env_var, DjangoSettings};
 use pyo3::prelude::*;
 use std::time::Duration;
 
-/// Cached WebSocket configuration
+/// WebSocket configuration of one app
+#[derive(Debug)]
 pub struct WsConfig {
     /// Maximum allowed concurrent WebSocket connections
     pub max_connections: usize,
@@ -21,131 +22,66 @@ pub struct WsConfig {
     pub max_message_size: usize,
 }
 
-/// Global cached configuration - initialized once at first access
-pub static WS_CONFIG: Lazy<WsConfig> = Lazy::new(|| WsConfig {
-    max_connections: load_max_connections(),
-    channel_buffer_size: load_channel_buffer_size(),
-    heartbeat_interval: load_heartbeat_interval(),
-    client_timeout: load_client_timeout(),
-    max_message_size: load_max_message_size(),
-});
+impl WsConfig {
+    /// Read the WebSocket configuration.
+    ///
+    /// An environment variable comes first, then the Django setting, then the
+    /// default. An invalid variable or a Django setting with the wrong type
+    /// raises `ImproperlyConfigured`.
+    pub fn from_django_settings(settings: &DjangoSettings<'_>) -> PyResult<Self> {
+        let py = settings.py();
+        const NON_NEGATIVE: &str = "an int of 0 or more";
+        const POSITIVE: &str = "an int of 1 or more";
 
-/// Load max connections from env var or Django settings
-fn load_max_connections() -> usize {
-    // 1. Check environment variable (highest priority)
-    if let Ok(val) = std::env::var("DJANGO_BOLT_WS_MAX_CONNECTIONS") {
-        if let Ok(max) = val.parse::<usize>() {
-            return max;
-        }
+        let max_connections = match env_var(
+            py,
+            "DJANGO_BOLT_WS_MAX_CONNECTIONS",
+            NON_NEGATIVE,
+            |_: &usize| true,
+        )? {
+            Some(max) => max,
+            None => settings.non_negative_int("BOLT_WS_MAX_CONNECTIONS", 10000)?, // Default: 10k connections
+        };
+        let channel_buffer_size =
+            match env_var(py, "DJANGO_BOLT_WS_CHANNEL_SIZE", POSITIVE, |n: &usize| {
+                *n >= 1
+            })? {
+                Some(size) => size,
+                None => settings.positive_int("BOLT_WS_CHANNEL_SIZE", 100)?, // Default: 100 messages buffer
+            };
+        let heartbeat_secs = match env_var(
+            py,
+            "DJANGO_BOLT_WS_HEARTBEAT_INTERVAL",
+            POSITIVE,
+            |n: &u64| *n >= 1,
+        )? {
+            Some(secs) => secs,
+            None => settings.positive_int("BOLT_WS_HEARTBEAT_INTERVAL", 5u64)?, // Default: 5 seconds
+        };
+        let client_timeout_secs = match env_var(
+            py,
+            "DJANGO_BOLT_WS_CLIENT_TIMEOUT",
+            NON_NEGATIVE,
+            |_: &u64| true,
+        )? {
+            Some(secs) => secs,
+            None => settings.non_negative_int("BOLT_WS_CLIENT_TIMEOUT", 10u64)?, // Default: 10 seconds
+        };
+        let max_message_size = match env_var(
+            py,
+            "DJANGO_BOLT_WS_MAX_MESSAGE_SIZE",
+            NON_NEGATIVE,
+            |_: &usize| true,
+        )? {
+            Some(size) => size,
+            None => settings.non_negative_int("BOLT_WS_MAX_MESSAGE_SIZE", 1024 * 1024)?, // Default: 1MB
+        };
+        Ok(Self {
+            max_connections,
+            channel_buffer_size,
+            heartbeat_interval: Duration::from_secs(heartbeat_secs),
+            client_timeout: Duration::from_secs(client_timeout_secs),
+            max_message_size,
+        })
     }
-
-    // 2. Check Django settings
-    Python::attach(|py| {
-        if let Ok(django_conf) = py.import("django.conf") {
-            if let Ok(settings) = django_conf.getattr("settings") {
-                if let Ok(max) = settings.getattr("BOLT_WS_MAX_CONNECTIONS") {
-                    if let Ok(val) = max.extract::<usize>() {
-                        return val;
-                    }
-                }
-            }
-        }
-        10000 // Default: 10k connections
-    })
-}
-
-/// Load channel buffer size from env var or Django settings
-fn load_channel_buffer_size() -> usize {
-    // 1. Check environment variable
-    if let Ok(val) = std::env::var("DJANGO_BOLT_WS_CHANNEL_SIZE") {
-        if let Ok(size) = val.parse::<usize>() {
-            return size;
-        }
-    }
-
-    // 2. Check Django settings
-    Python::attach(|py| {
-        if let Ok(django_conf) = py.import("django.conf") {
-            if let Ok(settings) = django_conf.getattr("settings") {
-                if let Ok(size) = settings.getattr("BOLT_WS_CHANNEL_SIZE") {
-                    if let Ok(val) = size.extract::<usize>() {
-                        return val;
-                    }
-                }
-            }
-        }
-        100 // Default: 100 messages buffer
-    })
-}
-
-/// Load heartbeat interval from env var or Django settings
-fn load_heartbeat_interval() -> Duration {
-    // 1. Check environment variable
-    if let Ok(val) = std::env::var("DJANGO_BOLT_WS_HEARTBEAT_INTERVAL") {
-        if let Ok(secs) = val.parse::<u64>() {
-            return Duration::from_secs(secs);
-        }
-    }
-
-    // 2. Check Django settings
-    Python::attach(|py| {
-        if let Ok(django_conf) = py.import("django.conf") {
-            if let Ok(settings) = django_conf.getattr("settings") {
-                if let Ok(interval) = settings.getattr("BOLT_WS_HEARTBEAT_INTERVAL") {
-                    if let Ok(secs) = interval.extract::<u64>() {
-                        return Duration::from_secs(secs);
-                    }
-                }
-            }
-        }
-        Duration::from_secs(5) // Default: 5 seconds
-    })
-}
-
-/// Load client timeout from env var or Django settings
-fn load_client_timeout() -> Duration {
-    // 1. Check environment variable
-    if let Ok(val) = std::env::var("DJANGO_BOLT_WS_CLIENT_TIMEOUT") {
-        if let Ok(secs) = val.parse::<u64>() {
-            return Duration::from_secs(secs);
-        }
-    }
-
-    // 2. Check Django settings
-    Python::attach(|py| {
-        if let Ok(django_conf) = py.import("django.conf") {
-            if let Ok(settings) = django_conf.getattr("settings") {
-                if let Ok(timeout) = settings.getattr("BOLT_WS_CLIENT_TIMEOUT") {
-                    if let Ok(secs) = timeout.extract::<u64>() {
-                        return Duration::from_secs(secs);
-                    }
-                }
-            }
-        }
-        Duration::from_secs(10) // Default: 10 seconds
-    })
-}
-
-/// Load max message size from env var or Django settings
-fn load_max_message_size() -> usize {
-    // 1. Check environment variable
-    if let Ok(val) = std::env::var("DJANGO_BOLT_WS_MAX_MESSAGE_SIZE") {
-        if let Ok(size) = val.parse::<usize>() {
-            return size;
-        }
-    }
-
-    // 2. Check Django settings
-    Python::attach(|py| {
-        if let Ok(django_conf) = py.import("django.conf") {
-            if let Ok(settings) = django_conf.getattr("settings") {
-                if let Ok(size) = settings.getattr("BOLT_WS_MAX_MESSAGE_SIZE") {
-                    if let Ok(val) = size.extract::<usize>() {
-                        return val;
-                    }
-                }
-            }
-        }
-        1024 * 1024 // Default: 1MB
-    })
 }

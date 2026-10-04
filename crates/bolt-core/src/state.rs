@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
 use crate::middleware::client_ip::TrustedProxies;
 use crate::router::Router;
+use crate::streaming::StreamConfig;
 pub use bolt_loop::TASK_LOCALS;
 
 /// ASGI sub-application mount configuration.
@@ -107,6 +108,8 @@ pub struct AppState {
     /// `type_coercion::resolve_max_param_length`); read directly on the hot path.
     pub max_param_length: usize,
     pub asgi_mount_timeout: Duration,
+    /// Streaming limits, read once at startup (see `StreamConfig::read`).
+    pub stream_config: StreamConfig,
     pub global_cors_config: Option<CorsConfig>, // Global CORS configuration from Django settings
     pub cors_origin_regexes: Vec<Regex>,        // Compiled regex patterns for origin matching
     pub global_compression_config: Option<Arc<CompressionConfig>>, // Global compression configuration used by middleware
@@ -142,41 +145,6 @@ pub fn find_websocket_mount<'a>(state: &'a AppState, path: &str) -> Option<&'a A
 // Sync streaming thread limiting to prevent thread exhaustion DoS
 // Tracks number of active sync streaming threads (each uses an OS thread)
 pub static ACTIVE_SYNC_STREAMING_THREADS: AtomicU64 = AtomicU64::new(0);
-
-/// Get the configured maximum concurrent sync streaming threads
-/// Default: 1000 if not configured
-/// Reads from (in order of precedence):
-/// 1. Environment variable: DJANGO_BOLT_MAX_SYNC_STREAMING_THREADS
-/// 2. Django setting: BOLT_MAX_SYNC_STREAMING_THREADS
-/// 3. Default: 1000
-pub fn get_max_sync_streaming_threads() -> u64 {
-    // Check environment variable first
-    if let Ok(val) = std::env::var("DJANGO_BOLT_MAX_SYNC_STREAMING_THREADS") {
-        if let Ok(n) = val.parse::<u64>() {
-            if n > 0 {
-                return n;
-            }
-        }
-    }
-
-    // Check Django settings via Python
-    let limit = Python::attach(|py| {
-        if let Ok(django_module) = py.import("django.conf") {
-            if let Ok(settings) = django_module.getattr("settings") {
-                if let Ok(limit_obj) = settings.getattr("BOLT_MAX_SYNC_STREAMING_THREADS") {
-                    if let Ok(n) = limit_obj.extract::<u64>() {
-                        if n > 0 {
-                            return Some(n);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    });
-
-    limit.unwrap_or(1000) // Default to 1000
-}
 
 // ── Per-thread Python thread-state pinning ──────────────────────────────────
 //
