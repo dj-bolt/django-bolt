@@ -494,22 +494,18 @@ pub fn register_test_middleware_metadata(
     Ok(())
 }
 
-/// Handle a test request using Actix's native test infrastructure.
+/// Run one test request through the request pipeline of `runbolt`.
 ///
-/// This function:
-/// 1. Creates an Actix test service matching production configuration
-/// 2. Executes the request using a local tokio runtime
-/// 3. Returns the response as (status_code, headers, body)
-///
-/// The request flows through the exact same code path as production:
+/// The request goes to the test worker of the calling thread (see
+/// `test_workers`). There, an Actix test service with the production
+/// middleware runs it:
 /// - NormalizePath middleware
 /// - CorsMiddleware
 /// - CompressionMiddleware
 /// - handle_request handler
 ///
-/// Note: This is a synchronous function because Actix test utilities are !Send
-/// and cannot be used with pyo3_async_runtimes::future_into_py. We create
-/// a local tokio runtime for each request instead.
+/// The calling thread releases the GIL and waits for the response. The
+/// result is `(status_code, headers, body)`.
 #[pyfunction]
 #[expect(
     clippy::type_complexity,
