@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Check the Python examples in docs/src.
+"""Check the Python examples in docs/src and in the package readmes.
 
 Each ```python block must be valid Python, and each name that it imports from
-django_bolt must exist. Thus a renamed or removed API fails this check, not
-the code of a reader.
+django_bolt or bolt_mcp must exist. Thus a renamed or removed API fails this
+check, not the code of a reader.
 
-The check reads the source of python/django_bolt and imports nothing. Thus it
-needs only the standard library, and the docs CI job can run it without a
-build of the Rust extension.
+The check reads the source of the packages and imports nothing. Thus it needs
+only the standard library, and the docs CI job can run it without a build of
+the Rust extension. The package source uses Python 3.12 syntax, so the check
+needs Python 3.12 or later.
 
 A block that is not complete code, for example a signature, has the line
 ``<!-- fragment -->`` before it. Such a block is not checked.
@@ -27,7 +28,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs" / "src"
-PACKAGE_PARENT = ROOT / "python"
+# The README of each package is its PyPI page.
+READMES = (ROOT / "README.md", ROOT / "python" / "bolt-mcp" / "README.md")
+# The directory that holds each package of this repository.
+SOURCE_ROOTS = {
+    "django_bolt": ROOT / "python",
+    "bolt_mcp": ROOT / "python" / "bolt-mcp" / "src",
+}
 FRAGMENT_MARKER = "<!-- fragment -->"
 FENCE = re.compile(
     r"^(?P<indent>[ \t]*)```(?P<lang>python|py)\b[^\n]*\n(?P<body>.*?)^(?P=indent)```",
@@ -38,7 +45,7 @@ ANY_NAME = frozenset({"*"})
 
 
 def pages() -> list[Path]:
-    return sorted(DOCS.rglob("*.md"))
+    return [*sorted(DOCS.rglob("*.md")), *READMES]
 
 
 def python_blocks(text: str):
@@ -52,8 +59,15 @@ def python_blocks(text: str):
         yield text.count("\n", 0, match.start()) + 2, code
 
 
+def _is_ours(module: str) -> bool:
+    return module.split(".")[0] in SOURCE_ROOTS
+
+
 def _module_file(module: str) -> Path | None:
-    path = PACKAGE_PARENT.joinpath(*module.split("."))
+    root = SOURCE_ROOTS.get(module.split(".")[0])
+    if root is None:
+        return None
+    path = root.joinpath(*module.split("."))
     for candidate in (path.with_suffix(".py"), path / "__init__.py", path.with_suffix(".pyi")):
         if candidate.is_file():
             return candidate
@@ -84,7 +98,7 @@ def _target_names(target: ast.expr):
 
 @functools.cache
 def module_names(module: str) -> frozenset[str] | None:
-    """Give the names that a django_bolt module defines, or None if it does not exist."""
+    """Give the names that a module of this repository defines, or None if it does not exist."""
     path = _module_file(module)
     if path is None:
         return None
@@ -111,7 +125,7 @@ def module_names(module: str) -> frozenset[str] | None:
                 if node.level:
                     base = package.rsplit(".", node.level - 1)[0] if node.level > 1 else package
                     source = f"{base}.{source}" if source else base
-                star = module_names(source) if source.split(".")[0] == "django_bolt" else ANY_NAME
+                star = module_names(source) if _is_ours(source) else ANY_NAME
                 if star is None or star is ANY_NAME:
                     return ANY_NAME
                 names.update(star)
@@ -126,10 +140,10 @@ def _has_name(module: str, name: str) -> bool:
 
 
 def missing_imports(tree: ast.AST) -> list[tuple[int, str]]:
-    """Give (line, name) for each django_bolt import that does not exist."""
+    """Give (line, name) for each import from this repository that does not exist."""
     missing = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or "").split(".")[0] == "django_bolt":
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and _is_ours(node.module or ""):
             if module_names(node.module) is None:
                 missing.append((node.lineno, node.module))
                 continue
@@ -142,7 +156,7 @@ def missing_imports(tree: ast.AST) -> list[tuple[int, str]]:
             missing.extend(
                 (node.lineno, alias.name)
                 for alias in node.names
-                if alias.name.split(".")[0] == "django_bolt" and module_names(alias.name) is None
+                if _is_ours(alias.name) and module_names(alias.name) is None
             )
     return missing
 

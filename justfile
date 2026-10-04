@@ -301,9 +301,11 @@ docs: docs-serve
 docs-serve:
     cd docs && uv run python build_llms_full.py && uv run --group docs zensical serve -a localhost:8080
 
-# Check the Python examples in docs/src: they parse, and their django_bolt imports exist
+# The script needs only the standard library, but Python 3.12 or later: it parses
+# the package source. `uv run` finds such a Python; a python3 on PATH can be older.
+# Check the Python examples in docs/src and the readmes: they parse, and their imports exist
 docs-check:
-    python3 scripts/check_doc_snippets.py
+    uv run --no-project --python ">=3.12" python scripts/check_doc_snippets.py
 
 # Build documentation (also regenerates llms-full.txt for AI crawlers)
 docs-build:

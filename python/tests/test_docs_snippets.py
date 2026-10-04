@@ -26,7 +26,7 @@ def test_the_docs_have_python_examples():
     assert sum(len(list(check_doc_snippets.python_blocks(page.read_text()))) for page in PAGES) > 400
 
 
-@pytest.mark.parametrize("page", PAGES, ids=[str(page.relative_to(check_doc_snippets.DOCS)) for page in PAGES])
+@pytest.mark.parametrize("page", PAGES, ids=[str(page.relative_to(check_doc_snippets.ROOT)) for page in PAGES])
 def test_python_examples_parse_and_import_names_that_exist(page):
     problems = check_doc_snippets.check_page(page)
     assert not problems, "\n".join(problems)
@@ -36,3 +36,15 @@ def test_a_missing_name_is_found():
     """The check reads the source, so it must also see a name that is not there."""
     tree = check_doc_snippets.ast.parse("from django_bolt import BoltAPI, NoSuchName\nimport django_bolt.no_module")
     assert check_doc_snippets.missing_imports(tree) == [(1, "django_bolt.NoSuchName"), (2, "django_bolt.no_module")]
+
+
+def test_the_readmes_are_checked():
+    """README.md is the PyPI page of each package."""
+    assert check_doc_snippets.ROOT / "README.md" in PAGES
+    assert check_doc_snippets.ROOT / "python" / "bolt-mcp" / "README.md" in PAGES
+
+
+def test_a_missing_bolt_mcp_name_is_found():
+    """bolt_mcp is in this repository too, and the MCP pages import from it."""
+    tree = check_doc_snippets.ast.parse("from bolt_mcp import MCP, NoSuchName\nimport bolt_mcp.no_module")
+    assert check_doc_snippets.missing_imports(tree) == [(1, "bolt_mcp.NoSuchName"), (2, "bolt_mcp.no_module")]

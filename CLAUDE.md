@@ -10,7 +10,7 @@ just rebuild               # clean + build
 just test-py               # Python tests
 just test-rs               # Rust unit tests
 just test-example          # python/example: check, migrations, tests
-just docs-check            # Python blocks in docs/src parse; their django_bolt imports exist
+just docs-check            # Python blocks in docs/src and the readmes parse; their django_bolt/bolt_mcp imports exist
 just clippy                # Rust lint, -D warnings (CI gate)
 just coverage              # Python + Rust coverage → coverage/ (needs cargo-llvm-cov)
 just fuzz query_string 60  # cargo-fuzz one parser target (fuzz/; needs nightly + cargo-fuzz)

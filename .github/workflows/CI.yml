@@ -871,8 +871,9 @@ jobs:
 
       # --only-group installs the locked docs group and not the project, so
       # the Rust extension does not build. This matches `just docs-build`.
-      # Each ```python block parses, and each django_bolt name that it imports
-      # exists. The script reads the package source, so no build is needed.
+      # Each ```python block parses, and each django_bolt or bolt_mcp name that
+      # it imports exists. The script reads the package source, so no build is
+      # needed.
       - name: Check the Python examples
         run: uv run --locked --only-group docs python scripts/check_doc_snippets.py
 
