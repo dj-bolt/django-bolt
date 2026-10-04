@@ -223,10 +223,15 @@ pub fn register_middleware_metadata(
             ))
         })?;
         let parsed = RouteMetadata::from_python(py_dict, py).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "Failed to parse route metadata for handler {}: {}",
-                handler_id, e
-            ))
+            // Keep the error type: a wrong value type stays a TypeError.
+            PyErr::from_type(
+                e.get_type(py),
+                format!(
+                    "Failed to parse route metadata for handler {}: {}",
+                    handler_id,
+                    e.value(py)
+                ),
+            )
         })?;
         parsed_metadata_map.insert(handler_id, parsed);
     }

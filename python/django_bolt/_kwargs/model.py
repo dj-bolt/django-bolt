@@ -180,6 +180,8 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         "http_method": http_method,
         "path": path,
         "has_file_uploads": False,  # Default; overridden below if file params exist
+        # Static route detection: routes without path params can use O(1) lookup
+        "is_static_route": len(path_params) == 0,
     }
 
     # Quick path: single parameter that looks like request
@@ -263,9 +265,6 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
     meta["needs_cookies"] = any(f.source == "cookie" for f in field_definitions)
     meta["needs_path_params"] = any(f.source == "path" for f in field_definitions)
 
-    # Static route detection: routes without path params can use O(1) lookup
-    meta["is_static_route"] = len(path_params) == 0
-
     # Classify handler pattern for specialized injector selection
     meta["handler_pattern"] = classify_handler_pattern(field_definitions, meta, needs_form_parsing)
 
@@ -302,6 +301,7 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
         "http_method": "WEBSOCKET",
         "path": path,
         "has_file_uploads": False,  # WebSocket never has file uploads
+        "is_static_route": len(path_params) == 0,
     }
 
     params = list(sig.parameters.values())
@@ -382,7 +382,6 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
     meta["needs_headers"] = any(f.source == "header" for f in field_definitions)
     meta["needs_cookies"] = any(f.source == "cookie" for f in field_definitions)
     meta["needs_path_params"] = any(f.source == "path" for f in field_definitions)
-    meta["is_static_route"] = len(path_params) == 0
 
     # Classify pattern for injector optimization
     meta["handler_pattern"] = classify_handler_pattern(field_definitions, meta, False)

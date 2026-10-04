@@ -362,21 +362,22 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
         Updated metadata dict with optimization flags and param_types
     """
     if metadata is None:
-        metadata = {}
+        # Rust names the route in its registration errors.
+        metadata = {"method": handler_meta["http_method"], "path": handler_meta["path"]}
 
-    # Copy optimization flags from handler metadata to middleware metadata
-    # These will be parsed by Rust's RouteMetadata::from_python()
-    metadata["needs_body"] = handler_meta.get("needs_body", True)
-    metadata["needs_query"] = handler_meta.get("needs_query", True)
-    metadata["needs_headers"] = handler_meta.get("needs_headers", True)
-    metadata["needs_cookies"] = handler_meta.get("needs_cookies", True)
-    metadata["needs_path_params"] = handler_meta.get("needs_path_params", True)
-    metadata["is_static_route"] = handler_meta.get("is_static_route", False)
-    metadata["needs_form_parsing"] = handler_meta.get("needs_form_parsing", False)
+    # Copy optimization flags from handler metadata to middleware metadata.
+    # Route registration sets each key. Rust requires each key with its type.
+    metadata["needs_body"] = handler_meta["needs_body"]
+    metadata["needs_query"] = handler_meta["needs_query"]
+    metadata["needs_headers"] = handler_meta["needs_headers"]
+    metadata["needs_cookies"] = handler_meta["needs_cookies"]
+    metadata["needs_path_params"] = handler_meta["needs_path_params"]
+    metadata["is_static_route"] = handler_meta["is_static_route"]
+    metadata["needs_form_parsing"] = handler_meta["needs_form_parsing"]
     # Default success status for the bare-bytes response fast path: sync
     # executors may return just the encoded JSON body and Rust rebuilds the
     # (status, JSON meta) envelope from this value.
-    metadata["default_status_code"] = handler_meta.get("default_status_code", 200)
+    metadata["default_status_code"] = handler_meta["default_status_code"]
     # Compile a Rust-side argument binding plan for simple handlers.
     # Rust uses this to pre-bind args/kwargs so Python can skip injector work.
     rust_arg_bindings = _compile_rust_arg_bindings(handler_meta)
