@@ -149,8 +149,10 @@ extra-paths = ["python"]
 [tool.coverage.run]
 source = ["django_bolt", "bolt_mcp"]
 branch = true
-# Measure the runbolt servers that the integration tests start, too.
-patch = ["subprocess"]
+# Measure the runbolt servers that the integration tests start, too. The
+# workers of `runbolt --processes N` are forked and end with os._exit(), so
+# they need the fork and _exit patches to save their data.
+patch = ["subprocess", "fork", "_exit"]
 parallel = true
 
 [tool.coverage.paths]
