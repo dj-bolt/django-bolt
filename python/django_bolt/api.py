@@ -124,9 +124,6 @@ def _revocation_handlers(backends: list[Any]) -> tuple[tuple[Callable, bool] | N
 Response = ResponseWireV1
 
 
-# Global registry for BoltAPI instances (used by autodiscovery)
-_BOLT_API_REGISTRY = []
-
 # One rate-limit scope per BoltAPI. Rust keys each rate-limit bucket on it, so
 # two APIs that reuse handler ids (two test clients) never share a bucket.
 _RATE_LIMIT_SCOPES = itertools.count(1)
@@ -543,9 +540,6 @@ class BoltAPI:
         # Lifecycle: async context manager for startup/shutdown
         self._lifespan_context: Callable | None = lifespan
         self._source_lifespans: list[tuple[BoltAPI, Callable]] | None = None
-
-        # Register this instance globally for autodiscovery
-        _BOLT_API_REGISTRY.append(self)
 
         # Signal support: wrap _dispatch when enabled
         # This is done at init time (not per-request) for zero overhead when disabled
@@ -3219,10 +3213,6 @@ class BoltAPI:
             self._asgi_mounts.append((new_asgi_prefix, asgi_app))
 
         self._mcp_mounts.extend(child_mcp_mounts)
-
-        # Remove sub-app from global registry (parent handles its routes now)
-        if app in _BOLT_API_REGISTRY:
-            _BOLT_API_REGISTRY.remove(app)
 
     def mount_asgi(self, path: str, app: Callable[..., Any]) -> None:
         """Mount an ASGI app at a static prefix (evaluated after Bolt route miss)."""
