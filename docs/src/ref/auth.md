@@ -137,6 +137,8 @@ Allow any request.
 from django_bolt.auth import AllowAny
 
 @api.get("/public", guards=[AllowAny()])
+async def public():
+    return {"public": True}
 ```
 
 ### IsAuthenticated
@@ -147,6 +149,8 @@ Require valid authentication.
 from django_bolt.auth import IsAuthenticated
 
 @api.get("/private", guards=[IsAuthenticated()])
+async def private():
+    return {"private": True}
 ```
 
 Returns 401 if not authenticated.
@@ -168,6 +172,8 @@ Requires("role", none_of=["banned", "suspended"])                              #
 Requires("role", "client", message="Client accounts only")                     # custom 403 detail
 
 @api.get("/articles", guards=[Requires("permissions", "blog.view_article")])
+async def articles():
+    return []
 ```
 
 Name reusable checks by assignment:
@@ -176,6 +182,8 @@ Name reusable checks by assignment:
 IsClient = Requires("role", "client")
 
 @api.get("/orders", guards=[IsAuthenticated(), IsClient])
+async def orders():
+    return []
 ```
 
 Returns 401 if unauthenticated, 403 if the claim is missing or doesn't match — including for `none_of`, so an anonymous request can never satisfy an exclusion. `message=` replaces the 403 `detail` (never the 401's). The `permissions` claim reads the unified permission set, so it also covers `key_permissions` from `APIKeyAuthentication`; every other claim comes from the JWT payload. See [Permissions](../topics/permissions.md) for full matching semantics.

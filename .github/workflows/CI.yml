@@ -263,6 +263,53 @@ jobs:
           PROPTEST_RNG_SEED: "0"
         run: cargo test --workspace
 
+  # The example project in python/example: Django checks, migrations in step
+  # with the models, and its tests. test_docs_testing_guide.py runs each
+  # pattern of docs/src/topics/testing.md against the project.
+  example:
+    name: Example project
+    runs-on: ubuntu-latest
+    needs: [python-versions, linux-amd64]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: |
+          uv python install ${{ needs.python-versions.outputs.newest-version }}
+          uv venv --python ${{ needs.python-versions.outputs.newest-version }}
+
+      # --no-install-project: installing the project would build the Rust extension.
+      - name: Install dependencies
+        run: uv sync --all-extras --no-install-project
+
+      # No Rust build: install the release wheel of the linux-amd64 job.
+      - name: Install the built wheel
+        uses: ./.github/actions/install-built-wheel
+        with:
+          artifacts: wheels-linux-x86_64-*
+          wheel-pattern: ${{ fromJSON(needs.python-versions.outputs.wheel-patterns-json)[needs.python-versions.outputs.newest-version] }}
+
+      - name: Django system checks
+        working-directory: python/example
+        run: uv run --no-sync python manage.py check
+
+      - name: Migrations match the models
+        working-directory: python/example
+        run: uv run --no-sync python manage.py makemigrations --check --dry-run
+
+      # The apps keep their tests in tests.py, which the default pattern skips.
+      - name: Run the example tests
+        working-directory: python/example
+        run: uv run --no-sync pytest . -o python_files="test_*.py tests.py" -v
+
   server_smoke_linux:
     name: Server Smoke Linux
     if: github.event_name == 'pull_request' || github.event_name == 'push'
@@ -824,6 +871,12 @@ jobs:
 
       # --only-group installs the locked docs group and not the project, so
       # the Rust extension does not build. This matches `just docs-build`.
+      # Each ```python block parses, and each django_bolt or bolt_mcp name that
+      # it imports exists. The script reads the package source, so no build is
+      # needed.
+      - name: Check the Python examples
+        run: uv run --locked --only-group docs python scripts/check_doc_snippets.py
+
       - name: Build llms-full.txt
         run: uv run --locked --only-group docs python build_llms_full.py
         working-directory: docs
@@ -845,6 +898,7 @@ jobs:
       - python-versions
       - test
       - rust
+      - example
       - server_smoke_linux
       - server_integration_linux
       - platform_smoke

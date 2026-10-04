@@ -114,6 +114,12 @@ run-dev:
 test-py:
     uv run pytest python/tests -s -vv -n auto
 
+# Check and test the example project in python/example (CI runs these)
+test-example:
+    cd python/example && uv run python manage.py check
+    cd python/example && uv run python manage.py makemigrations --check --dry-run
+    cd python/example && uv run pytest . -o python_files="test_*.py tests.py"
+
 # Run the Rust unit tests (CI runs these). `uv run` makes PyO3 build against
 # the project venv, not an older python3 on PATH.
 test-rs:
@@ -294,6 +300,12 @@ docs: docs-serve
 # Serve documentation locally
 docs-serve:
     cd docs && uv run python build_llms_full.py && uv run --group docs zensical serve -a localhost:8080
+
+# The script needs only the standard library, but Python 3.12 or later: it parses
+# the package source. `uv run` finds such a Python; a python3 on PATH can be older.
+# Check the Python examples in docs/src and the readmes: they parse, and their imports exist
+docs-check:
+    uv run --no-project --python ">=3.12" python scripts/check_doc_snippets.py
 
 # Build documentation (also regenerates llms-full.txt for AI crawlers)
 docs-build:

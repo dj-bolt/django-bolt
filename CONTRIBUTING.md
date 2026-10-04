@@ -52,6 +52,8 @@ just lint-lib
 | `just clean` | Remove build artifacts |
 | `just test-py` | Run the Python test suite |
 | `just test-rs` | Run the Rust unit tests |
+| `just test-example` | Check and test the example project |
+| `just docs-check` | Check the Python examples in the docs and the readmes |
 | `just clippy` | Lint the Rust code (CI fails on any warning) |
 | `just coverage` | Measure Python and Rust coverage into `coverage/` (needs `cargo-llvm-cov`) |
 | `just fuzz TARGET [SECONDS]` | Fuzz one request parser (needs nightly Rust and `cargo-fuzz`) |
@@ -155,6 +157,10 @@ Always publish the conditions (processes, concurrency, request count, machine) n
 ## Documentation
 
 Docs live in `docs/src/` and are published at [bolt.farhana.li](https://bolt.farhana.li/). If your change adds or alters user-facing behavior, update the relevant topic guide in `docs/src/topics/` and, for notable changes, add an entry to `CHANGELOG.md`.
+
+CI checks each Python code block in the docs and in the package readmes: it must parse, and each name that it imports from `django_bolt` or `bolt_mcp` must exist. Run the check with `just docs-check`. A block that is not complete code, for example a signature, needs the line `<!-- fragment -->` directly before it.
+
+The example project in `python/example/` is checked too. CI runs its Django checks, checks that its migrations match its models, and runs its tests. `test_docs_testing_guide.py` runs each pattern of the testing guide. Run all of this with `just test-example`.
 
 ## Submitting a pull request
 

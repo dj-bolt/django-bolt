@@ -362,7 +362,10 @@ The default mode removes trailing slashes, which produces clean URLs:
 api = BoltAPI()  # trailing_slash="strip" is the default
 
 @api.get("/users/")   # Registered as /users
+async def list_users(): ...
+
 @api.get("/items")    # Registered as /items
+async def list_items(): ...
 
 # GET /users/  → 308 Redirect to /users
 # GET /users   → 200 OK
@@ -376,7 +379,10 @@ Use append mode to follow Django's URL convention where paths end with slashes:
 api = BoltAPI(trailing_slash="append")
 
 @api.get("/users")    # Registered as /users/
+async def list_users(): ...
+
 @api.get("/items/")   # Registered as /items/
+async def list_items(): ...
 
 # GET /users   → 308 Redirect to /users/
 # GET /users/  → 200 OK
@@ -390,7 +396,10 @@ Use keep mode when you need explicit control over each path:
 api = BoltAPI(trailing_slash="keep")
 
 @api.get("/users")    # Registered as /users
+async def list_users(): ...
+
 @api.get("/items/")   # Registered as /items/
+async def list_items(): ...
 
 # GET /users/  → 308 Redirect to /users (if /users exists)
 # GET /items   → 308 Redirect to /items/ (if /items/ exists)

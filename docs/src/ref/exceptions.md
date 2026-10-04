@@ -23,6 +23,7 @@ from django_bolt.exceptions import (
 
 Base class for all HTTP error responses.
 
+<!-- fragment -->
 ```python
 HTTPException(
     status_code: int = 500,
@@ -96,6 +97,7 @@ async def get_user(user_id: int):
 
 Raised when request data fails validation. Returns **422 Unprocessable Entity**.
 
+<!-- fragment -->
 ```python
 RequestValidationError(
     errors: list[dict],
@@ -137,6 +139,7 @@ except RequestValidationError as e:
 
 Raised when handler return value fails validation. Returns **500 Internal Server Error**.
 
+<!-- fragment -->
 ```python
 ResponseValidationError(
     errors: list[dict],
