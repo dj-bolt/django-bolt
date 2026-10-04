@@ -450,9 +450,9 @@ pub fn test_request(
                 cors_origin_regexes,
                 global_compression_config: compression,
                 trusted_proxies: config.trusted_proxies,
-                router: Some(router.clone()),
-                route_metadata: Some(route_metadata.clone()),
-                asgi_mounts: Some(asgi_mounts.clone()),
+                router: router.clone(),
+                route_metadata: route_metadata.clone(),
+                asgi_mounts: asgi_mounts.clone(),
                 extensions: {
                     let mut ext = http::Extensions::new();
                     ext.insert(mcp_mounts.clone());

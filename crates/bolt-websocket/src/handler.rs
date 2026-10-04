@@ -24,7 +24,7 @@ use bolt_core::request_pipeline::{
     query_sequences, set_declared_item, set_param_item, set_query_sequences, EMPTY_TYPES,
 };
 use bolt_core::router::parse_query_string;
-use bolt_core::state::{AppState, ROUTE_METADATA};
+use bolt_core::state::AppState;
 use bolt_core::type_coercion::TypeHints;
 use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 
@@ -793,7 +793,7 @@ pub async fn handle_websocket_upgrade(
     // Address and header keys run here; identity keys run after auth below.
     let mut client_ip = None;
     if let Some(handler_id) = route_handler_id {
-        if let Some(route_meta) = ROUTE_METADATA.get().and_then(|m| m.get(handler_id)) {
+        if let Some(route_meta) = state.route_metadata.get(handler_id) {
             if let Some(ref rate_config) = route_meta.rate_limit_config {
                 if !matches!(
                     rate_config.key,
@@ -829,7 +829,7 @@ pub async fn handle_websocket_upgrade(
 
     // Evaluate authentication and guards before upgrading
     if let Some(handler_id) = route_handler_id {
-        if let Some(route_meta) = ROUTE_METADATA.get().and_then(|m| m.get(handler_id)) {
+        if let Some(route_meta) = state.route_metadata.get(handler_id) {
             match validate_auth_and_guards(&headers, &route_meta.auth_backends, &route_meta.guards)
             {
                 AuthGuardResult::Allow(ctx) => {
@@ -892,7 +892,7 @@ pub async fn handle_websocket_upgrade(
             ..
         } => {
             // Route metadata holds the type hints and the sequence query keys
-            let route_meta = ROUTE_METADATA.get().and_then(|m| m.get(*handler_id));
+            let route_meta = state.route_metadata.get(*handler_id);
             build_scope(
                 py,
                 &req,

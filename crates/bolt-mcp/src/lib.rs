@@ -91,15 +91,13 @@ impl McpMount {
 /// Production mounts, registered once at startup.
 pub static GLOBAL_MCP_MOUNTS: OnceCell<Arc<Vec<McpMount>>> = OnceCell::new();
 
-/// Find the MCP mount for a path. Tests provide per-instance mounts via
-/// `AppState.extensions` (an `Arc<Vec<McpMount>>`); production uses `GLOBAL_MCP_MOUNTS`.
+/// Find the MCP mount for a path. Each app keeps its mounts in
+/// `AppState.extensions` as an `Arc<Vec<McpMount>>`.
 #[inline]
 pub fn find_mcp_mount<'a>(state: &'a AppState, path: &str) -> Option<&'a McpMount> {
-    if let Some(mounts) = state.extensions.get::<Arc<Vec<McpMount>>>() {
-        return mounts.iter().find(|m| m.matches_path(path));
-    }
-    GLOBAL_MCP_MOUNTS
-        .get()
+    state
+        .extensions
+        .get::<Arc<Vec<McpMount>>>()
         .and_then(|mounts| mounts.iter().find(|m| m.matches_path(path)))
 }
 

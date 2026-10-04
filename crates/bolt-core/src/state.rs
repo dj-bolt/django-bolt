@@ -112,10 +112,12 @@ pub struct AppState {
     pub global_compression_config: Option<Arc<CompressionConfig>>, // Global compression configuration used by middleware
     /// Deployment-wide forwarding-header trust policy.
     pub trusted_proxies: Arc<TrustedProxies>,
-    pub router: Option<Arc<Router>>, // Router (used by test infrastructure, optional in production)
-    pub route_metadata: Option<Arc<RouteMetadataStore>>, // Route metadata (used by test infrastructure)
-    pub asgi_mounts: Option<Arc<Vec<AsgiMount>>>, // ASGI mounts (tests). Production uses GLOBAL_ASGI_MOUNTS.
-    pub extensions: http::Extensions, // Per-instance state owned by higher-level crates (e.g. bolt-mcp test mounts). Production uses their globals.
+    /// The routes, their metadata and the ASGI mounts of this app. The server
+    /// and each test app own their own, so one request pipeline serves both.
+    pub router: Arc<Router>,
+    pub route_metadata: Arc<RouteMetadataStore>,
+    pub asgi_mounts: Arc<Vec<AsgiMount>>,
+    pub extensions: http::Extensions, // Per-app state owned by higher-level crates (e.g. bolt-mcp mounts).
     pub static_files_config: Option<Arc<ScopeConfig>>,
     pub media_files_config: Option<Arc<ScopeConfig>>,
     pub access_logger: Option<Py<PyAny>>, // Python logger instance for access logging (django.server). None when disabled.
@@ -123,34 +125,18 @@ pub struct AppState {
 
 pub static GLOBAL_ROUTER: OnceCell<Arc<Router>> = OnceCell::new();
 pub static GLOBAL_ASGI_MOUNTS: OnceCell<Arc<Vec<AsgiMount>>> = OnceCell::new();
-pub static ROUTE_METADATA: OnceCell<Arc<RouteMetadataStore>> = OnceCell::new();
 pub static ROUTE_METADATA_TEMP: OnceCell<AHashMap<usize, RouteMetadata>> = OnceCell::new(); // Temporary storage before CORS injection
 
 /// Find the mounted ASGI app for a path.
-///
-/// Test infrastructure can provide per-instance mounts via `AppState.asgi_mounts`.
-/// Production uses `GLOBAL_ASGI_MOUNTS`.
 #[inline]
 pub fn find_asgi_mount<'a>(state: &'a AppState, path: &str) -> Option<&'a AsgiMount> {
-    if let Some(ref mounts) = state.asgi_mounts {
-        return find_mount_in_slice(mounts.as_ref(), path);
-    }
-
-    GLOBAL_ASGI_MOUNTS
-        .get()
-        .and_then(|mounts| find_mount_in_slice(mounts.as_ref(), path))
+    find_mount_in_slice(state.asgi_mounts.as_ref(), path)
 }
 
 /// Find the mounted ASGI app for a WebSocket path, as `find_asgi_mount` does.
 #[inline]
 pub fn find_websocket_mount<'a>(state: &'a AppState, path: &str) -> Option<&'a AsgiMount> {
-    if let Some(ref mounts) = state.asgi_mounts {
-        return find_websocket_mount_in_slice(mounts.as_ref(), path);
-    }
-
-    GLOBAL_ASGI_MOUNTS
-        .get()
-        .and_then(|mounts| find_websocket_mount_in_slice(mounts.as_ref(), path))
+    find_websocket_mount_in_slice(state.asgi_mounts.as_ref(), path)
 }
 
 // Sync streaming thread limiting to prevent thread exhaustion DoS

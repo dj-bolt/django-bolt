@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::cors::{add_cors_headers_with_config, add_preflight_headers_with_config};
 use crate::metadata::CorsConfig;
-use crate::state::{AppState, GLOBAL_ROUTER, ROUTE_METADATA};
+use crate::state::AppState;
 
 /// CORS middleware factory
 pub struct CorsMiddleware;
@@ -169,13 +169,6 @@ fn find_cors_config<'a>(
     path: &str,
     state: &'a AppState,
 ) -> Option<CorsConfigRef<'a>> {
-    // Check router exists - use AppState router (tests) or global router (production)
-    let has_router = state.router.is_some() || GLOBAL_ROUTER.get().is_some();
-    if !has_router {
-        // No router available - fall back to global CORS config only
-        return state.global_cors_config.as_ref().map(CorsConfigRef::Global);
-    }
-
     // For OPTIONS, try multiple methods to find route config
     let methods_to_try: &[&str] = if method == Method::OPTIONS {
         &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "QUERY"]
@@ -202,26 +195,12 @@ fn find_cors_for_method<'a>(
     path: &str,
     state: &'a AppState,
 ) -> Option<CorsConfigRef<'a>> {
-    // Try AppState router first (tests), then global router (production)
-    let route_match = if let Some(ref router) = state.router {
-        router.find(method, path)
-    } else {
-        GLOBAL_ROUTER
-            .get()
-            .and_then(|router| router.find(method, path))
-    };
+    let route_match = state.router.find(method, path);
 
     if let Some(route_match) = route_match {
         let handler_id = route_match.handler_id();
 
-        // Try AppState metadata first (tests), then global metadata (production)
-        let meta = if let Some(ref meta_map) = state.route_metadata {
-            meta_map.get(handler_id)
-        } else {
-            ROUTE_METADATA
-                .get()
-                .and_then(|meta_map| meta_map.get(handler_id))
-        };
+        let meta = state.route_metadata.get(handler_id);
 
         if let Some(meta) = meta {
             // Check if CORS is skipped
