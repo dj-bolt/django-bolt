@@ -71,7 +71,8 @@ struct IdleLane {
 
 /// Idle lanes, most recently used last. LIFO keeps a small hot set of lanes
 /// busy and lets the others reach the idle time. A lane in this list has no
-/// owner, so no job can be in flight to it.
+/// owner. Only the `Release` of its last async request can be in flight to
+/// it, and the lane runs that `Release` before the jobs of its next owner.
 static IDLE_LANES: Mutex<Vec<IdleLane>> = Mutex::new(Vec::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -82,14 +83,14 @@ static FUTURE_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// Take an idle lane or start a new one. The caller owns the lane until the
 /// lane goes idle again.
-fn acquire() -> PyResult<Sender<Job>> {
+fn acquire() -> PyResult<IdleLane> {
     if let Some(lane) = IDLE_LANES.lock().pop() {
-        return Ok(lane.sender);
+        return Ok(lane);
     }
     spawn_lane()
 }
 
-fn spawn_lane() -> PyResult<Sender<Job>> {
+fn spawn_lane() -> PyResult<IdleLane> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (sender, receiver) = channel::<Job>();
     let lane_sender = sender.clone();
@@ -97,7 +98,7 @@ fn spawn_lane() -> PyResult<Sender<Job>> {
         .name(format!("bolt-lane-{id}"))
         .spawn(move || lane_main(id, lane_sender, receiver))
         .map_err(|err| PyRuntimeError::new_err(format!("could not start a request lane: {err}")))?;
-    Ok(sender)
+    Ok(IdleLane { id, sender })
 }
 
 fn lane_main(id: u64, sender: Sender<Job>, receiver: Receiver<Job>) {
@@ -168,11 +169,13 @@ fn lane_main(id: u64, sender: Sender<Job>, receiver: Receiver<Job>) {
                 run_call(py, func, args, kwargs, future);
             }),
             Job::Release => {
-                // A `Release` follows at least one `Call`.
+                // A `Release` follows at least one `Call`. `RequestLane::release`
+                // already put this lane in the idle list, so a next owner can
+                // have jobs queued after this one.
                 request_open = false;
                 call_concurrency("close_lane_request");
                 owned = false;
-                if !go_idle(id, &sender) {
+                if STOPPING.load(Ordering::Relaxed) {
                     break;
                 }
             }
@@ -244,6 +247,7 @@ fn submit_request(
     done: oneshot::Sender<PyResult<Py<PyAny>>>,
 ) -> PyResult<()> {
     acquire()?
+        .sender
         .send(Job::Request {
             callable,
             request,
@@ -283,8 +287,8 @@ pub fn shutdown() {
 /// The test clients call this at exit. If not, a lane connection stays open
 /// for the idle time, and it blocks the drop of the test database.
 ///
-/// A lane that just served an async request goes idle a moment after the
-/// response. Thus this waits for such lanes, up to `STOP_WAIT`. A lane that
+/// A lane can still run the last call of an async request after the
+/// response. Thus this waits for busy lanes, up to `STOP_WAIT`. A lane that
 /// a different client still uses stays alive after that time.
 #[pyfunction]
 pub fn stop_idle_lanes(py: Python<'_>) {
@@ -312,7 +316,7 @@ pub fn stop_idle_lanes(py: Python<'_>) {
 /// request with no sync work costs nothing. asgiref uses it as an executor.
 #[pyclass(module = "django_bolt._core")]
 pub struct RequestLane {
-    sender: Mutex<Option<Sender<Job>>>,
+    lane: Mutex<Option<IdleLane>>,
 }
 
 #[pymethods]
@@ -320,7 +324,7 @@ impl RequestLane {
     #[new]
     fn new() -> Self {
         Self {
-            sender: Mutex::new(None),
+            lane: Mutex::new(None),
         }
     }
 
@@ -340,13 +344,14 @@ impl RequestLane {
                     .map(Bound::unbind)
             })?
             .call0(py)?;
-        let mut sender = self.sender.lock();
-        let lane = match sender.take() {
+        let mut owned = self.lane.lock();
+        let lane = match owned.take() {
             Some(lane) => lane,
             None => acquire()?,
         };
-        sender
+        owned
             .insert(lane)
+            .sender
             .send(Job::Call {
                 func,
                 args,
@@ -357,11 +362,24 @@ impl RequestLane {
         Ok(future)
     }
 
-    /// Give the lane back. The request calls this at its end.
+    /// Give the lane back. The request calls this at its end, before the
+    /// response leaves.
+    ///
+    /// The lane goes into the idle list here, not when its thread runs the
+    /// `Release`. The next request of the client can then take this lane even
+    /// while the lane still runs a call of this request. The channel keeps the
+    /// order: the lane closes this request before it runs the next one.
     fn release(&self) {
-        if let Some(sender) = self.sender.lock().take() {
-            // A send fails only when the lane thread is gone. Then no release is necessary.
-            let _ = sender.send(Job::Release);
+        let Some(lane) = self.lane.lock().take() else {
+            return;
+        };
+        // A send fails only when the lane thread is gone. Then the lane is not reusable.
+        if lane.sender.send(Job::Release).is_err() {
+            return;
+        }
+        let mut idle = IDLE_LANES.lock();
+        if !STOPPING.load(Ordering::Relaxed) {
+            idle.push(lane);
         }
     }
 }
