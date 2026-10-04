@@ -75,9 +75,9 @@ def test_no_compress_decorator():
 
     client = TestClient(api, use_http_layer=True)
 
-    # Compressed route may have compression
     compressed_resp = client.get("/compressed", headers={"Accept-Encoding": "gzip"})
     assert compressed_resp.status_code == 200
+    assert compressed_resp.headers.get("content-encoding") == "gzip"
 
     # Uncompressed route should NOT have Content-Encoding header
     uncompressed_resp = client.get("/uncompressed", headers={"Accept-Encoding": "gzip"})
@@ -97,9 +97,8 @@ def test_compression_disabled():
     response = client.get("/data", headers={"Accept-Encoding": "gzip, br"})
 
     assert response.status_code == 200
-    # No compression should be applied when disabled
-    # Note: Compress middleware might still be active but respects config
-    assert response.status_code == 200
+    assert response.headers.get("content-encoding") is None
+    assert response.json() == {"data": "x" * 1000}
 
 
 def test_compression_custom_config():
@@ -127,10 +126,12 @@ def test_compression_custom_config():
     # Small data should not be compressed (below minimum_size)
     small_resp = client.get("/small", headers={"Accept-Encoding": "gzip"})
     assert small_resp.status_code == 200
+    assert small_resp.headers.get("content-encoding") is None
 
-    # Large data may be compressed
     large_resp = client.get("/large", headers={"Accept-Encoding": "gzip"})
     assert large_resp.status_code == 200
+    assert large_resp.headers.get("content-encoding") == "gzip"
+    assert large_resp.json() == {"data": "x" * 2000}
 
 
 def test_compression_brotli_config():
@@ -145,8 +146,8 @@ def test_compression_brotli_config():
     response = client.get("/data", headers={"Accept-Encoding": "br, gzip"})
 
     assert response.status_code == 200
-    # Should prefer brotli if client supports it
-    # Note: Actual compression depends on client headers
+    assert response.headers.get("content-encoding") == "br"
+    assert response.json() == {"data": "x" * 1000}
 
 
 def test_compression_zstd_config():
@@ -159,9 +160,17 @@ def test_compression_zstd_config():
 
     client = TestClient(api, use_http_layer=True)
 
-    # With zstd backend and gzip fallback
+    # The client accepts zstd: the configured backend is used.
+    response = client.get("/data", headers={"Accept-Encoding": "zstd, gzip"})
+    assert response.status_code == 200
+    assert response.headers.get("content-encoding") == "zstd"
+    assert response.json() == {"data": "x" * 1000}
+
+    # The client accepts only gzip: gzip_fallback applies.
     response = client.get("/data", headers={"Accept-Encoding": "gzip"})
     assert response.status_code == 200
+    assert response.headers.get("content-encoding") == "gzip"
+    assert response.json() == {"data": "x" * 1000}
 
 
 def test_compression_with_different_content_types():

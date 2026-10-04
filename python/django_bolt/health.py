@@ -69,6 +69,12 @@ class HealthCheck:
 _health_check = HealthCheck()
 
 
+def _ensure_connection() -> None:
+    # Resolve `connection` on the thread that runs this. A method bound on the
+    # calling thread would use the connection object of that thread.
+    connection.ensure_connection()
+
+
 async def check_database() -> tuple[bool, str]:
     """Check database connectivity.
 
@@ -79,7 +85,7 @@ async def check_database() -> tuple[bool, str]:
         if sync_to_async is None or connection is None:
             return False, "Django not available"
 
-        await sync_to_async(connection.ensure_connection)()
+        await sync_to_async(_ensure_connection)()
 
         return True, "Database connection OK"
     except Exception as e:

@@ -1114,12 +1114,12 @@ class TestRequestConversion:
 
         @api.get("/test")
         async def test_route(request):
-            # Cookies should be accessible
-            return {"has_cookies": bool(request.cookies)}
+            return {"cookies": dict(request.cookies)}
 
         with TestClient(api) as client:
             response = client.get("/test", headers={"Cookie": "test_cookie=value"})
             assert response.status_code == 200
+            assert response.json() == {"cookies": {"test_cookie": "value"}}
 
     def test_headers_available(self):
         """Test headers are available in handler."""
