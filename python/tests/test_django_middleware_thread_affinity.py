@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import threading
 import time
@@ -181,6 +182,37 @@ def test_async_requests_reuse_a_lane_thread():
         counts = [client.get("/count").json()["count"] for _ in range(3)]
 
     assert counts[-1] > 1
+
+
+def test_the_next_request_takes_a_lane_that_still_finishes_a_call():
+    """An async request gives its lane back at its end, before the response.
+
+    The lane still runs a call that the request stopped waiting for. The next
+    request takes the same lane, and the lane runs its call after that call.
+    """
+    finish = threading.Event()
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_TenantMixinMiddleware])])
+
+    def wait_for_finish() -> None:
+        finish.wait(5)
+
+    @api.get("/ident")
+    async def ident():
+        return {"ident": await sync_to_thread(threading.get_ident)}
+
+    @api.get("/abandon")
+    async def abandon():
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(sync_to_thread(wait_for_finish), 0.01)
+        return {}
+
+    with TestClient(api) as client:
+        lane = client.get("/ident").json()["ident"]
+        assert client.get("/abandon").status_code == 200
+        threading.Timer(0.2, finish.set).start()
+        next_lane = client.get("/ident").json()["ident"]
+
+    assert next_lane == lane
 
 
 async def _async_dependency() -> str:
