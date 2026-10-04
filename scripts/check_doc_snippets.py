@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Check the Python examples in docs/src and in the package readmes.
 
-Each ```python block must be valid Python, and each name that it imports from
-django_bolt or bolt_mcp must exist. Thus a renamed or removed API fails this
-check, not the code of a reader.
+Each ```python or ~~~python block must be valid Python. Each name that it
+imports from django_bolt or bolt_mcp must exist. Thus a renamed or removed API
+fails this check, not the code of a reader.
 
 The check reads the source of the packages and imports nothing. Thus it needs
 only the standard library, and the docs CI job can run it without a build of
@@ -36,8 +36,11 @@ SOURCE_ROOTS = {
     "bolt_mcp": ROOT / "python" / "bolt-mcp" / "src",
 }
 FRAGMENT_MARKER = "<!-- fragment -->"
+# A fence is 3 or more backticks or tildes. The closing fence has the same
+# character, and at least the length of the opening fence.
 FENCE = re.compile(
-    r"^(?P<indent>[ \t]*)```(?P<lang>python|py)\b[^\n]*\n(?P<body>.*?)^(?P=indent)```",
+    r"^(?P<indent>[ \t]*)(?P<fence>(?P<char>[`~])(?P=char){2,})(?P<lang>python|py)\b[^\n]*\n"
+    r"(?P<body>.*?)^(?P=indent)(?P=fence)(?P=char)*[ \t]*$",
     re.MULTILINE | re.DOTALL,
 )
 # A module that defines __getattr__ can give any name.
@@ -74,12 +77,22 @@ def _module_file(module: str) -> Path | None:
     return None
 
 
+def _is_type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
 def _top_level_statements(body: list[ast.stmt]):
-    """Give each statement that runs at import, also in if, try and with blocks."""
+    """Give each statement that runs at import, also in if, try and with blocks.
+
+    The body of `if TYPE_CHECKING:` does not run, so its statements are not given.
+    """
     for node in body:
         yield node
         if isinstance(node, ast.If):
-            yield from _top_level_statements(node.body)
+            if not _is_type_checking(node.test):
+                yield from _top_level_statements(node.body)
             yield from _top_level_statements(node.orelse)
         elif isinstance(node, ast.Try):
             for block in (node.body, node.orelse, node.finalbody, *(h.body for h in node.handlers)):
@@ -104,7 +117,7 @@ def module_names(module: str) -> frozenset[str] | None:
         return None
     names: set[str] = set()
     package = module if path.name == "__init__.py" else module.rpartition(".")[0]
-    for node in _top_level_statements(ast.parse(path.read_text(), str(path)).body):
+    for node in _top_level_statements(ast.parse(path.read_text(encoding="utf-8"), str(path)).body):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.name == "__getattr__":
                 return ANY_NAME
@@ -164,7 +177,7 @@ def missing_imports(tree: ast.AST) -> list[tuple[int, str]]:
 def check_page(page: Path) -> list[str]:
     """Give one message for each problem in the Python blocks of a page."""
     problems = []
-    for first_line, code in python_blocks(page.read_text()):
+    for first_line, code in python_blocks(page.read_text(encoding="utf-8")):
         try:
             tree = ast.parse(code)
         except SyntaxError as error:
@@ -181,7 +194,7 @@ def main() -> int:
     problems = [problem for page in pages() for problem in check_page(page)]
     for problem in problems:
         print(problem)
-    blocks = sum(len(list(python_blocks(page.read_text()))) for page in pages())
+    blocks = sum(len(list(python_blocks(page.read_text(encoding="utf-8")))) for page in pages())
     print(f"{len(problems)} problem(s) in {blocks} Python blocks on {len(pages())} pages.")
     return 1 if problems else 0
 
