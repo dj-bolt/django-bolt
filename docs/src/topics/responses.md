@@ -449,7 +449,7 @@ async def get_user(user_id: int) -> User:
     return {"id": user_id, "username": "john", "email": "john@example.com"}
 ```
 
-The schema describes the body of the default status code of the route. Bolt validates a `JSON` or `Response` only when its status code is that default. A response with another status code, such as a 400 with a map of field errors, is encoded as-is. To document and validate other status codes, use the per-status-code form below.
+The schema describes the body of the default status code of the route. Bolt validates a `JSON` or `Response` only when its status code is that default. A response with another status code, such as a 400 with a map of field errors, is encoded as-is. To document other status codes, use the per-status-code form below. It does not validate them either.
 
 ```python
 @api.post("/users", status_code=201)
