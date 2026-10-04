@@ -2,7 +2,8 @@
 # one version — no rustfmt drift between contributors and CI. rustup reads this
 # automatically for every cargo/rustfmt invocation in the repo. Renovate keeps
 # the channel current via its built-in rust-toolchain manager.
+# CI runs clippy with `-D warnings`, so clippy is pinned here too.
 [toolchain]
 channel = "1.98.1"
 profile = "minimal"
-components = ["rustfmt"]
+components = ["rustfmt", "clippy"]

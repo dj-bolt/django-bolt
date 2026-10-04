@@ -8,7 +8,6 @@ from .apps import app_module
 
 @pytest.mark.server_integration
 def test_merged_docs_debug_toolbar(make_server_project):
-    pytest.importorskip("debug_toolbar")
     module = app_module("docs_middleware").split(":")[0]
     project = make_server_project(
         api_module=f"{module}:api",

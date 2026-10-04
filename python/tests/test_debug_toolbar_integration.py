@@ -23,8 +23,6 @@ from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.shortcuts import render
 from django_bolt.testing import TestClient
 
-pytest.importorskip("debug_toolbar")
-
 pytestmark = pytest.mark.django_db(transaction=True)
 
 SECRET = "debug-toolbar-test-secret-longer-than-32-characters"

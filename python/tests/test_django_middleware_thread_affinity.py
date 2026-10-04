@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import threading
 import time
@@ -11,7 +12,7 @@ from typing import Annotated
 
 import jwt
 import pytest
-from asgiref.sync import async_to_sync, markcoroutinefunction, sync_to_async
+from asgiref.sync import SyncToAsync, async_to_sync, markcoroutinefunction, sync_to_async
 from django.contrib.auth import alogin
 from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.auth.models import User
@@ -181,6 +182,94 @@ def test_async_requests_reuse_a_lane_thread():
         counts = [client.get("/count").json()["count"] for _ in range(3)]
 
     assert counts[-1] > 1
+
+
+def _request_lane():
+    """Return the executor of the current async request, its ``RequestLane``."""
+    return SyncToAsync.context_to_thread_executor[SyncToAsync.thread_sensitive_context.get()]
+
+
+def _ident_after(start: threading.Event) -> int:
+    start.wait(5)
+    return threading.get_ident()
+
+
+def test_the_next_request_takes_the_lane_of_a_request_with_no_pending_call():
+    """An async request with no pending call gives its lane back before the response.
+
+    The lane thread can close the request late. The next request takes the
+    same lane all the same, and the lane runs its call after the close.
+    """
+    resume = threading.Event()
+    # A sync middleware hook would take a lane before the handler starts.
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_AsyncOnlyHeaderMiddleware])])
+
+    @api.get("/first")
+    async def first():
+        start = threading.Event()
+        call = _request_lane().submit(_ident_after, start)
+        result = asyncio.wrap_future(call)
+        # The lane thread runs this callback after it gives the result to the loop.
+        # Thus the lane thread stays busy until the next request sends its call.
+        call.add_done_callback(lambda _: resume.wait(5))
+        start.set()
+        return {"ident": await result}
+
+    @api.get("/next")
+    async def next_ident():
+        call = _request_lane().submit(threading.get_ident)
+        resume.set()
+        return {"ident": await asyncio.wrap_future(call)}
+
+    try:
+        with TestClient(api) as client:
+            lane = client.get("/first").json()["ident"]
+            next_lane = client.get("/next").json()["ident"]
+    finally:
+        resume.set()
+
+    assert next_lane == lane
+
+
+_ABANDONED_CALL_SECONDS = 5.0
+
+
+def test_a_lane_that_runs_an_abandoned_call_goes_to_no_other_request():
+    """A request can stop waiting for a sync call that its lane still runs.
+
+    That lane goes to no other request until the call ends. The next request
+    takes a different lane and does not wait for the call.
+    """
+    finish = threading.Event()
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_AsyncOnlyHeaderMiddleware])])
+
+    def wait_for_finish() -> None:
+        finish.wait(_ABANDONED_CALL_SECONDS)
+
+    @api.get("/abandon")
+    async def abandon():
+        ident = await sync_to_thread(threading.get_ident)
+        # The call cannot end before the timeout, because nothing sets finish.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(sync_to_thread(wait_for_finish), 0.01)
+        return {"ident": ident}
+
+    @api.get("/next")
+    async def next_ident():
+        return {"ident": await sync_to_thread(threading.get_ident)}
+
+    try:
+        with TestClient(api) as client:
+            busy_lane = client.get("/abandon").json()["ident"]
+            started = time.perf_counter()
+            next_lane = client.get("/next").json()["ident"]
+            waited = time.perf_counter() - started
+            finish.set()
+    finally:
+        finish.set()
+
+    assert next_lane != busy_lane
+    assert waited < _ABANDONED_CALL_SECONDS / 5
 
 
 async def _async_dependency() -> str:

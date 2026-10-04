@@ -435,7 +435,7 @@ class TestMiddlewareMetadata:
         meta["injector_is_async"] = False
 
         with TestClient(api, use_http_layer=True) as client:
-            response = client.get("/auth/7", headers={"x-token": "token-123"}, cookies={"session": "sess-abc"})
+            response = client.get("/auth/7", headers={"x-token": "token-123", "Cookie": "session=sess-abc"})
             assert response.status_code == 200
             data = response.json()
             assert data["item_id"] == 7

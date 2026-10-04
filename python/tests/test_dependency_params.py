@@ -127,8 +127,7 @@ def test_missing_optional_values_get_their_defaults(client, mode):
 def test_values_bind_by_header_name_alias_cookie_and_query(client, mode):
     response = client.get(
         f"/{mode}/values?page=3",
-        headers={"X-Session-Token": "abc", "X-Api-Token": "t-1", "X-Api-Version": "v2"},
-        cookies={"theme": "dark"},
+        headers={"X-Session-Token": "abc", "X-Api-Token": "t-1", "X-Api-Version": "v2", "Cookie": "theme=dark"},
     )
     assert response.status_code == 200, response.text
     assert response.json() == {"session": "abc", "token": "t-1", "version": "v2", "theme": "dark", "page": 3}

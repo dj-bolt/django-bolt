@@ -99,6 +99,10 @@ async def forward(gen, sender):
 #[pyclass]
 struct AsyncStreamSender {
     locals: TaskLocals,
+    #[expect(
+        clippy::type_complexity,
+        reason = "the Option lets close() drop the sender, which ends the stream"
+    )]
     tx: Arc<Mutex<Option<mpsc::Sender<Result<Bytes, std::io::Error>>>>>,
 }
 
@@ -106,7 +110,7 @@ struct AsyncStreamSender {
 impl AsyncStreamSender {
     fn send(&mut self, item: Py<PyAny>) -> PyResult<Py<PyAny>> {
         Python::attach(|py| {
-            let bytes = convert_python_chunk(&item.bind(py)).ok_or_else(|| {
+            let bytes = convert_python_chunk(item.bind(py)).ok_or_else(|| {
                 pyo3::exceptions::PyTypeError::new_err(
                     "StreamingResponse async iterator yielded an unsupported chunk type",
                 )
@@ -303,12 +307,9 @@ fn create_python_stream_with_config(
         drop(tx);
 
         let s = stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Some(item) => Some((item, rx)),
-                None => None,
-            }
+            rx.recv().await.map(|item| (item, rx))
         });
-        return Box::pin(s);
+        Box::pin(s)
     } else {
         let sync_batch = sync_batch_size;
 
@@ -339,10 +340,7 @@ fn create_python_stream_with_config(
             });
             drop(tx);
             let s = stream::unfold(rx, |mut rx| async move {
-                match rx.recv().await {
-                    Some(item) => Some((item, rx)),
-                    None => None,
-                }
+                rx.recv().await.map(|item| (item, rx))
             });
             return Box::pin(s);
         }
@@ -463,10 +461,7 @@ fn create_python_stream_with_config(
 
         // Create simple stream without error state in closure (keeps Stream trait bounds clean)
         let s = stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Some(item) => Some((item, rx)),
-                None => None,
-            }
+            rx.recv().await.map(|item| (item, rx))
         });
         Box::pin(s)
     }

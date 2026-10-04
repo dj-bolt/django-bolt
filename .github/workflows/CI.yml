@@ -114,6 +114,8 @@ jobs:
       interpreters: ${{ steps.extract.outputs.interpreters }}
       # Oldest, newest, and newest free-threaded: the server-integration matrix.
       integration-versions-json: ${{ steps.extract.outputs.integration-versions-json }}
+      # Newest GIL build and newest free-threaded build: the Rust job matrix.
+      rust-versions-json: ${{ steps.extract.outputs.rust-versions-json }}
       # Oldest and newest supported Python, for the jobs that need exactly one
       # interpreter rather than a matrix. Derived so no job hardcodes a version
       # that could fall out of the supported set unnoticed.
@@ -160,6 +162,7 @@ jobs:
           print(f"test-versions-json={json.dumps(versions + free_threaded)}")
           print(f"interpreters={' '.join(versions + free_threaded)}")
           print(f"integration-versions-json={json.dumps([versions[0], versions[-1], *free_threaded[-1:]])}")
+          print(f"rust-versions-json={json.dumps([versions[-1], *free_threaded[-1:]])}")
           print(f"oldest-version={versions[0]}")
           print(f"newest-version={versions[-1]}")
 
@@ -276,12 +279,56 @@ jobs:
         run: uv run --no-sync maturin develop --release
 
       - name: Run tests
-        run: uv run --no-sync --with pytest pytest python/tests -m "not server_integration and not artifact_smoke" -s -vv
+        run: uv run --no-sync pytest python/tests -m "not server_integration and not artifact_smoke" -v
 
       # Separate invocation: bolt-mcp's conftest configures Django (OAuth app,
       # file-backed sqlite) incompatibly with the main suite's settings.
       - name: Run bolt-mcp tests
-        run: uv run --no-sync --with pytest pytest python/bolt-mcp/tests -m "not server_integration and not artifact_smoke" -s -vv
+        run: uv run --no-sync pytest python/bolt-mcp/tests -m "not server_integration and not artifact_smoke" -v
+
+  rust:
+    name: Rust tests and clippy Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    needs: python-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        # A free-threaded interpreter compiles the #[cfg(Py_GIL_DISABLED)]
+        # code, and a GIL build compiles the rest. Lint and test both.
+        python-version: ${{ fromJSON(needs.python-versions.outputs.rust-versions-json) }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The PyO3 crates link libpython in test builds.
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # PyO3 builds against PYO3_PYTHON. Set it, so that the build cannot pick
+      # another python3 from PATH.
+      - name: Select the interpreter for PyO3
+        env:
+          PYTHON_PATH: ${{ steps.setup-python.outputs.python-path }}
+        run: echo "PYO3_PYTHON=$PYTHON_PATH" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        # Toolchain (channel + rustfmt + clippy) comes from rust-toolchain.toml.
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # Clippy below runs with `-D warnings`; the build itself keeps
+          # warnings as warnings, like the other jobs.
+          build-warnings: ""
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace
 
   server_smoke_linux:
     name: Server Smoke Linux
@@ -330,7 +377,7 @@ jobs:
         run: uv run maturin develop --release
 
       - name: Run platform smoke tests
-        run: uv run pytest python/tests/integration -m platform_smoke -s -vv
+        run: uv run pytest python/tests/integration -m platform_smoke -v
 
   server_integration_linux:
     name: Server Integration Linux Python ${{ matrix.python-version }}
@@ -399,14 +446,16 @@ jobs:
         run: uv run maturin develop --release
 
       - name: Run server integration tests
-        run: uv run pytest python/tests/integration -m "server_integration and not artifact_smoke" -s -vv
+        run: uv run pytest python/tests/integration -m "server_integration and not artifact_smoke" -v
 
       - name: Run bolt-mcp server integration tests
-        run: uv run pytest python/bolt-mcp/tests/integration -m "server_integration and not artifact_smoke" -s -vv
+        run: uv run pytest python/bolt-mcp/tests/integration -m "server_integration and not artifact_smoke" -v
 
   platform_smoke:
     name: Platform Smoke ${{ matrix.os }}
-    if: startsWith(github.ref, 'refs/tags/v')
+    # The release needs this job. Run the workflow by hand (workflow_dispatch)
+    # to test a change to it before a tag.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     needs: python-versions
     strategy:
@@ -467,7 +516,7 @@ jobs:
           uv run python -c "import psycopg; print('libpq', psycopg.pq.version())"
 
       - name: Run platform smoke tests
-        run: uv run pytest python/tests/integration -m platform_smoke -s -vv
+        run: uv run pytest python/tests/integration -m platform_smoke -v
 
   # Build wheels for Linux x86_64 (covers most Linux users including Arch)
   linux-amd64:
@@ -693,7 +742,9 @@ jobs:
 
   artifact_smoke:
     name: Artifact Smoke ${{ matrix.artifact-kind }} Python ${{ matrix.python-version }}
-    if: startsWith(github.ref, 'refs/tags/v')
+    # The release needs this job. Run the workflow by hand (workflow_dispatch)
+    # to test a change to it before a tag.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: [linux-amd64, sdist, python-versions]
     strategy:
@@ -773,7 +824,7 @@ jobs:
       - name: Run artifact smoke tests
         env:
           DJANGO_BOLT_ARTIFACT_PATH: ${{ steps.artifact.outputs.path }}
-        run: uv run pytest python/tests/integration/test_artifact_smoke.py -m artifact_smoke -s -vv
+        run: uv run pytest python/tests/integration/test_artifact_smoke.py -m artifact_smoke -v
 
   # Build the documentation site when a pull request changes docs/, uv.lock,
   # or pyproject.toml. This job only builds. The Documentation workflow
@@ -816,6 +867,7 @@ jobs:
       - changes
       - python-versions
       - test
+      - rust
       - server_smoke_linux
       - server_integration_linux
       - platform_smoke
@@ -847,7 +899,7 @@ jobs:
     name: Release to PyPI
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [test, validate, audit, server_smoke_linux, server_integration_linux, platform_smoke, artifact_smoke]
+    needs: [test, rust, validate, audit, server_smoke_linux, server_integration_linux, platform_smoke, artifact_smoke]
     environment:
       name: pypi
       url: https://pypi.org/project/django-bolt/

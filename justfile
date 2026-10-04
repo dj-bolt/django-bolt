@@ -114,6 +114,15 @@ run-dev:
 test-py:
     uv run --with pytest --with pytest-xdist pytest python/tests -s -vv -n auto
 
+# Run the Rust unit tests (CI runs these). `uv run` makes PyO3 build against
+# the project venv, not an older python3 on PATH.
+test-rs:
+    uv run cargo test --workspace
+
+# Lint the Rust code; CI fails on any warning
+clippy:
+    uv run cargo clippy --workspace --all-targets -- -D warnings
+
 # Run the tests that need PostgreSQL (`@pytest.mark.postgres`) against a
 # throwaway Docker server. These skip in `test-py` unless
 # DJANGO_BOLT_TEST_POSTGRES_DSN is set.
