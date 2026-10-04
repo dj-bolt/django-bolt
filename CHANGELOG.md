@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- **macOS wheels are per architecture** - PyPI gets a macOS arm64 wheel and a macOS x86_64 wheel in place of one universal2 wheel. pip selects the wheel for the Mac, so an install does not change.
+- **macOS wheels are per architecture** - PyPI gets a macOS arm64 wheel and a macOS x86_64 wheel in place of one universal2 wheel. pip selects the wheel for the Mac, so an install does not change. A build that needs one universal2 file (py2app or PyInstaller universal2 bundles, `pip download --platform ...universal2`) must now combine the two wheels or pick the per-architecture wheel.
 
 ### Performance
 
