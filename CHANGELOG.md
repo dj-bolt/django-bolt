@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- **A client's next async request reuses its lane** - An async request on a route with Django middleware gave its lane back only after the response left. Thus the next request of the same client often started a new lane, with a new thread and a new database connection. The lane now goes back to the idle list before the response leaves, when no sync call of the request still runs on it. The lane still closes the previous request before it runs the next one. A lane that still runs such a call, for example after `asyncio.wait_for` stopped waiting, goes to no other request until the call ends.
+
 ### Fixed
 
 - **A 204 response has no body** - `Response(status_code=204)` has the default content `{}`, and Bolt wrote it after the headers. Actix drops the `content-length` header for a 204 but writes the bytes it gets. On a keep-alive connection, the next response then started with `{}`. A browser or an HTTP client that reuses connections failed the request after a delete. Rust now drops the body of each 204, for every response type a handler can return.
