@@ -13,7 +13,7 @@ All notable changes to this project will be documented in this file.
   - `MEDIA_URL` is served, and `BOLT_STATIC_MAX_AGE` and `BOLT_MEDIA_MAX_AGE` add `Cache-Control`.
   - Each request comes from `127.0.0.1`, so `BOLT_TRUSTED_PROXIES` and `X-Forwarded-For` work as on a server.
 
-  The `cors_allowed_origins`, `static_files_config` and `read_django_settings` arguments still work.
+  The `cors_allowed_origins`, `static_files_config` and `read_django_settings` arguments still work. An explicit `cors_allowed_origins` also gets the server defaults above, not the old test defaults (nine allowed headers and a max-age of 86400 seconds).
 - **macOS wheels are per architecture** - PyPI gets a macOS arm64 wheel and a macOS x86_64 wheel in place of one universal2 wheel. pip selects the wheel for the Mac, so an install does not change.
 
 ### Fixed
