@@ -11,7 +11,9 @@ set -euo pipefail
 shopt -s nullglob
 
 out="${COVERAGE_DIR:-coverage}"
-rm -rf "$out" .coverage .coverage.*
+# Remove only the reports that this script writes. COVERAGE_DIR can name a
+# directory with other files, and those files stay.
+rm -rf .coverage .coverage.* "$out/python.md" "$out/python-html" "$out/rust.txt" "$out/rust-html"
 mkdir -p "$out"
 
 # maturin develop writes the extension into the source tree, and each
