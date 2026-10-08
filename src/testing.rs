@@ -833,6 +833,7 @@ async fn handle_test_request_internal(
                     state.debug,
                     state.max_payload_size,
                     state.asgi_mount_timeout,
+                    &state.trusted_proxies,
                 )
                 .await;
             }

@@ -99,6 +99,30 @@ def test_mount_asgi_scope_server_defaults_to_443_on_https():
     assert captured["server"][1] == 443
 
 
+def test_mount_asgi_client_ignores_forwarding_headers_from_an_untrusted_peer():
+    """Without BOLT_TRUSTED_PROXIES, a client cannot choose its own address."""
+    api = BoltAPI()
+    captured = {}
+
+    async def asgi_app(scope, receive, send):
+        captured["client"] = scope["client"]
+        await receive()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    api.mount_asgi("/mounted", asgi_app)
+
+    with TestClient(api) as client:
+        for header, value in [
+            ("X-Forwarded-For", "203.0.113.10"),
+            ("X-Real-IP", "203.0.113.10"),
+            ("Forwarded", "for=203.0.113.10"),
+        ]:
+            response = client.get("/mounted", headers={header: value})
+            assert response.status_code == 204
+            assert captured["client"][0] != "203.0.113.10", header
+
+
 def test_mount_asgi_longest_prefix_wins():
     api = BoltAPI()
 

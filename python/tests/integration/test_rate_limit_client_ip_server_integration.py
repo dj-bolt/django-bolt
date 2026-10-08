@@ -43,6 +43,13 @@ def _remote_addr(server, headers):
     return response.json()["remote_addr"]
 
 
+def _mounted_client(server, headers):
+    """The ``scope["client"]`` address that a mounted ASGI app receives."""
+    response = server.request("GET", "/mounted", headers=headers)
+    assert response.status_code == 200, response.text
+    return response.text
+
+
 # ---------------------------------------------------------------------------
 # Default: no trusted proxy
 # ---------------------------------------------------------------------------
@@ -56,6 +63,11 @@ def test_without_a_trusted_proxy_every_forwarding_header_is_ignored(make_server_
         # REMOTE_ADDR is the peer no matter what the headers say.
         assert _remote_addr(server, {"X-Forwarded-For": CALLER}) == PEER
         assert _remote_addr(server, {"X-Real-IP": CALLER}) == PEER
+
+        # A mounted app (Django, allauth) gets the same address.
+        assert _mounted_client(server, {"X-Forwarded-For": CALLER}) == PEER
+        assert _mounted_client(server, {"X-Real-IP": CALLER}) == PEER
+        assert _mounted_client(server, {"Forwarded": f"for={CALLER}"}) == PEER
 
         assert _exhaust(server, **{"X-Forwarded-For": CALLER}) == 429
 
@@ -169,6 +181,21 @@ def test_remote_addr_follows_the_forwarding_rules(make_server_project):
 
         # Whitespace around a comma does not matter.
         assert _remote_addr(server, {"X-Forwarded-For": f"{CALLER}  ,  127.0.0.9"}) == CALLER
+
+
+def test_a_mounted_app_gets_the_same_client_as_bolt_routes(make_server_project):
+    """``scope["client"]`` of a mount follows the rules of ``REMOTE_ADDR``."""
+    project = make_server_project(api_module=APP, settings_extra=TRUST_LOOPBACK)
+
+    with project.start() as server:
+        for headers in [
+            {"X-Forwarded-For": CALLER},
+            # The rightmost untrusted entry, not the leftmost one the client wrote.
+            {"X-Forwarded-For": f"{OTHER_CALLER}, {CALLER}, 127.0.0.7"},
+            {"X-Real-IP": CALLER},
+            {"X-Forwarded-For": f"{OTHER_CALLER}, not-an-ip, 127.0.0.1"},
+        ]:
+            assert _mounted_client(server, headers) == _remote_addr(server, headers), headers
 
 
 def test_duplicate_forwarded_for_headers_are_read_in_wire_order(make_server_project):

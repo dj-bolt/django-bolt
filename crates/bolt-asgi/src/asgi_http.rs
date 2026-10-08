@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 
 use bolt_core::error::handle_python_error;
+use bolt_core::middleware::client_ip::{self, TrustedProxies};
 use bolt_core::state::{AsgiMount, TASK_LOCALS};
 
 struct AsgiResponseStart {
@@ -345,7 +346,12 @@ fn mounted_subpath(request_path: &str, mount_prefix: &str) -> String {
     }
 }
 
-fn build_scope(py: Python<'_>, req: &HttpRequest, mount: &AsgiMount) -> PyResult<Py<PyDict>> {
+fn build_scope(
+    py: Python<'_>,
+    req: &HttpRequest,
+    mount: &AsgiMount,
+    trusted_proxies: &TrustedProxies,
+) -> PyResult<Py<PyDict>> {
     let scope = PyDict::new(py);
     let asgi_info = PyDict::new(py);
     asgi_info.set_item("version", "3.0")?;
@@ -403,10 +409,16 @@ fn build_scope(py: Python<'_>, req: &HttpRequest, mount: &AsgiMount) -> PyResult
     let (server_host, server_port) = parse_host_port(conn_info.host(), conn_info.scheme());
     scope.set_item("server", (server_host, server_port))?;
 
-    let client_host = conn_info
-        .realip_remote_addr()
-        .unwrap_or("127.0.0.1")
-        .to_string();
+    // Same rule as `REMOTE_ADDR` on Bolt routes: forwarding headers name the
+    // client only when the peer is in BOLT_TRUSTED_PROXIES. Actix's
+    // `realip_remote_addr()` believes them from any peer.
+    let client_host = client_ip::resolve_from_headers(
+        req.headers(),
+        req.peer_addr().map(|address| address.ip()),
+        trusted_proxies,
+    )
+    .map(|address| address.to_string())
+    .unwrap_or_else(|| "127.0.0.1".to_string());
     scope.set_item("client", (client_host, 0u16))?;
 
     scope.set_item("extensions", PyDict::new(py))?;
@@ -442,6 +454,7 @@ pub async fn handle_asgi_mount_request(
     debug: bool,
     max_payload_size: usize,
     asgi_mount_timeout: Duration,
+    trusted_proxies: &TrustedProxies,
 ) -> HttpResponse {
     // 1. Buffer request body.
     // NOTE: This read loop currently has no timeout. Slow-client request body timeouts
@@ -489,7 +502,7 @@ pub async fn handle_asgi_mount_request(
     };
 
     let py_future: Py<PyAny> = match Python::attach(|py| -> PyResult<Py<PyAny>> {
-        let scope = build_scope(py, &req, mount)?;
+        let scope = build_scope(py, &req, mount, trusted_proxies)?;
         let receive_obj = Py::new(
             py,
             AsgiReceive {
