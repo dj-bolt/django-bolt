@@ -795,6 +795,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
                     state.debug,
                     state.max_payload_size,
                     state.asgi_mount_timeout,
+                    &state.trusted_proxies,
                 )
                 .await;
             }
