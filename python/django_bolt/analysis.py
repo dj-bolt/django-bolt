@@ -195,7 +195,7 @@ BLOCKING_IO_FUNCTIONS = frozenset(
 BLOCKING_IO_MODULES = frozenset(
     {
         "requests",
-        "urllib",
+        "urllib.request",
         "urllib3",
         "httpx",  # sync client
         "socket",
@@ -258,6 +258,18 @@ class HandlerAnalysis:
 
 # Names that django.db exports for database connections.
 DB_CONNECTION_NAMES = frozenset(("connection", "connections"))
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    """Return ``a.b.c`` for a chain of attributes on a name, or None for other nodes."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
 
 
 class OrmVisitor(ast.NodeVisitor):
@@ -408,14 +420,11 @@ class OrmVisitor(ast.NodeVisitor):
             if self._is_request_name(node.func.value):
                 self._mark_request_component_attr(node.func.attr)
 
-            # e.g., requests.get(), time.sleep()
-            if isinstance(node.func.value, ast.Name):
-                module_name = node.func.value.id
-                method_name = node.func.attr
-
-                if module_name in BLOCKING_IO_MODULES:
-                    self.analysis.has_blocking_io = True
-                    self.analysis.blocking_operations.add(f"{module_name}.{method_name}")
+            # e.g., requests.get(), time.sleep(), urllib.request.urlopen()
+            module_name = _dotted_name(node.func.value)
+            if module_name in BLOCKING_IO_MODULES:
+                self.analysis.has_blocking_io = True
+                self.analysis.blocking_operations.add(f"{module_name}.{node.func.attr}")
 
         self.generic_visit(node)
 
@@ -470,17 +479,22 @@ def analyze_handler(
 
     Args:
         fn: The handler function to analyze
+        request_param_names: The parameters of ``fn`` that get the request
 
     Returns:
         HandlerAnalysis with detected patterns
     """
     analysis = HandlerAnalysis()
 
-    unwraped_source = inspect.unwrap(resolve_introspection_target(inspect.unwrap(fn)))
+    visitor = OrmVisitor(request_param_names=request_param_names)
+    target = _unwrap(resolve_introspection_target(_unwrap(fn, visitor)), visitor)
+    # A call of a class runs its __init__, which can come from a base class.
+    if inspect.isclass(target):
+        target = _unwrap(target.__init__, visitor)
 
     # Try to get source code
     try:
-        source = inspect.getsource(unwraped_source)
+        source = inspect.getsource(target)
     except (OSError, TypeError) as e:
         # Can't get source (e.g., built-in, C extension, or lambda)
         analysis.analysis_failed = True
@@ -498,18 +512,53 @@ def analyze_handler(
         analysis.failure_reason = f"Syntax error parsing source: {e}"
         return analysis
 
-    # Find the function definition and analyze only its body (not decorators)
-    # This prevents false positives from decorator names like @api.delete("/m")
-    visitor = OrmVisitor(request_param_names=request_param_names)
+    name = target.__code__.co_name
+    definition = _find_definition(tree, name)
+    if definition is None:
+        analysis.analysis_failed = True
+        analysis.failure_reason = f"Could not find one definition of {name} in its source"
+        return analysis
 
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # Only analyze the function body, not decorators
-            for stmt in node.body:
-                visitor.visit(stmt)
-            break  # Only analyze the first function found
+    # Analyze only the body, not the decorators. A decorator name such as
+    # @api.delete("/m") is not an ORM call.
+    if isinstance(definition, ast.Lambda):
+        visitor.visit(definition.body)
+    else:
+        for stmt in definition.body:
+            visitor.visit(stmt)
 
     return visitor.analysis
+
+
+def _unwrap(fn: Any, visitor: OrmVisitor) -> Any:
+    """Return the function under the wrappers of ``fn``.
+
+    A wrapper (a function with ``__wrapped__``) gets the request before the
+    function that it wraps. It can read any part, so mark every part.
+    """
+    target = inspect.unwrap(fn)
+    if target is not fn:
+        visitor._mark_all_request_components()
+    return target
+
+
+def _find_definition(tree: ast.AST, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | None:
+    """Return the definition named ``name`` in ``tree``.
+
+    The source of a lambda is its whole line, so it must hold one lambda only.
+    Otherwise this cannot tell which lambda the handler is, and returns None.
+    """
+    if name == "<lambda>":
+        lambdas = [node for node in ast.walk(tree) if isinstance(node, ast.Lambda)]
+        return lambdas[0] if len(lambdas) == 1 else None
+    return next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+        ),
+        None,
+    )
 
 
 _REQUEST_PARAM_NAMES = frozenset({"request", "req"})

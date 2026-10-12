@@ -1438,6 +1438,8 @@ class BoltAPI:
                     custom_action_handler.__name__ = f"{view_cls.__name__}.{name}"
                     custom_action_handler.__doc__ = unbound_fn.__doc__
                     custom_action_handler.__module__ = unbound_fn.__module__
+                    # The analysis reads the action method, not this wrapper.
+                    custom_action_handler.__wrapped__ = unbound_fn
 
                     # Merge class-level auth/guards with action-specific auth/guards
                     # Action-specific takes precedence if explicitly set

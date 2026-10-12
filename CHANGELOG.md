@@ -58,6 +58,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A dependency gets the request parts that it reads** - Bolt parses only the request parts that a route needs. It finds them in the source of the handler and of its dependencies. It did not find the reads of these dependencies, so they got an empty value:
+  - A lambda dependency. The analysis looked only for a `def`.
+  - A dependency with a `functools.wraps` decorator. Now its route parses every part.
+  - A class dependency. The analysis read the first method in the source of the class. Now it reads the `__init__` that the call runs. This `__init__` can come from a base class or have a decorator.
+
+  When the analysis cannot find the code, the route now parses every part. An example is a line with two lambdas.
+- **A sync ViewSet `@action` that uses the ORM runs in the thread pool** - The analysis read the generic action wrapper, not the action method. Thus the ORM work of a sync action ran on the server worker thread and blocked other requests. A call of `urllib.request.urlopen()` now counts as blocking I/O too.
 - **`runbolt --dev` reloads for a file in a new directory** - The watcher sends the event for a new directory before it watches the directory. A file written in that gap sent no event, so the reload did not occur. Now Bolt looks in the new directory again after the debounce time.
 - **Static and media files get the CSP header of every valid `SECURE_CSP`** - Bolt read `SECURE_CSP` only as a dict of str lists. Django also accepts `True`, `None`, `False`, a set and one str as a directive value. With such a value, for example `"upgrade-insecure-requests": True`, Bolt sent no `Content-Security-Policy` header at all, and gave no warning. Now Bolt builds the header with the rules of Django `build_policy`, in the order of the dict. A `SECURE_CSP` that is not a dict, or that does not give a valid header value, stops startup with `ImproperlyConfigured`.
 - **Cookies are read as Django reads them** - `request.cookies`, `Cookie()` parameters, the JWT cookie and the WebSocket scope now follow Django `parse_cookie`. A quoted value loses its quotes, and its escapes are decoded, so a cookie that Django or Bolt sets reads back unchanged. Spaces around the name and the value are removed. A pair with no `=` is a value with an empty name. When a name occurs two times, `request.cookies` and `Cookie()` use the last value. The JWT cookie is then not used, and the request is not authenticated by that backend: a sibling subdomain can add a cookie with the same name, and the order of the two does not show which one the site set.
