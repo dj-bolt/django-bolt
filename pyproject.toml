@@ -180,4 +180,14 @@ only_mutate = [
 process_isolation = "forkserver"
 forkserver_warmup = "none"
 # The integration tests run the code in a runbolt process, which mutmut does not reach.
-pytest_add_cli_args_test_selection = ["tests", "--ignore=tests/integration", "-m", "not postgres"]
+# Two tests read the repository layout (scripts/ and python/tests/), which the
+# work directory does not have. They test the docs and the test setup, not the
+# mutated modules.
+pytest_add_cli_args_test_selection = [
+    "tests",
+    "--ignore=tests/integration",
+    "--ignore=tests/test_docs_snippets.py",
+    "--ignore=tests/test_test_database_lifecycle.py",
+    "-m",
+    "not postgres",
+]
