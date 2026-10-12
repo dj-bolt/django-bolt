@@ -29,7 +29,20 @@ def _api_with_limited_route():
     return api
 
 
-@pytest.mark.parametrize("entry", ["not-an-ip", "10.0.0.0/nine", "10.0.0.0/33", "::1/129", 10, None])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "not-an-ip",
+        "10.0.0.0/nine",
+        "10.0.0.0/33",
+        "::1/129",
+        "fe80::1%eth0",
+        "fe80::%1/64",
+        "fe80::1%eth0/64",
+        10,
+        None,
+    ],
+)
 def test_an_invalid_entry_fails_at_startup(entry):
     """A typo stops startup instead of quietly widening a bucket."""
     with (
