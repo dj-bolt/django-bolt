@@ -18,7 +18,6 @@ use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::middleware::rate_limit::{DEFAULT_IPV6_PREFIX, RateLimiters};
-use bolt_core::router::Router;
 use bolt_core::settings::{
     DjangoSettings, env_flag, env_non_negative_int, env_positive_int, env_var,
     improperly_configured,
@@ -166,6 +165,7 @@ pub(crate) struct ServerConfig {
     pub max_payload_size: usize,
     pub max_param_length: usize,
     pub asgi_mount_timeout: Duration,
+    pub native_route_timeout: Duration,
     pub stream_config: StreamConfig,
     pub ws_config: Arc<WsConfig>,
     pub global_cors_config: Option<CorsConfig>,
@@ -196,6 +196,8 @@ impl ServerConfig {
         let max_payload_size = settings.non_negative_int("BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)?; // Default 1MB
         let asgi_mount_timeout =
             settings.positive_seconds("BOLT_ASGI_MOUNT_TIMEOUT", Duration::from_secs(30))?; // Default 30s
+        let native_route_timeout =
+            settings.positive_seconds("BOLT_NATIVE_ROUTE_TIMEOUT", Duration::from_secs(30))?;
         let stream_config = StreamConfig::read(&settings)?;
         let rate_limit_ipv6_prefix = read_rate_limit_ipv6_prefix(&settings)?;
         let ws_config = Arc::new(WsConfig::from_django_settings(&settings)?);
@@ -220,6 +222,7 @@ impl ServerConfig {
             max_payload_size,
             max_param_length,
             asgi_mount_timeout,
+            native_route_timeout,
             stream_config,
             ws_config,
             global_cors_config,
@@ -589,13 +592,11 @@ pub(crate) fn configure_file_scopes(cfg: &mut web::ServiceConfig, state: &AppSta
     reason = "PyO3 wire format: Python passes each route as one tuple"
 )]
 pub fn register_routes(
-    _py: Python<'_>,
+    py: Python<'_>,
     routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
+    native_routes: Vec<crate::native::NativeRouteSpec>,
 ) -> PyResult<()> {
-    let mut router = Router::new();
-    for (method, path, handler_id, handler, dispatch, dispatch_sync) in routes {
-        router.register(&method, &path, handler_id, handler, dispatch, dispatch_sync)?;
-    }
+    let router = crate::native::build_router(py, routes, native_routes)?;
     GLOBAL_ROUTER
         .set(Arc::new(router))
         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Router already initialized"))?;
@@ -790,6 +791,7 @@ pub fn start_server(
         max_payload_size: config.max_payload_size,
         max_param_length: config.max_param_length,
         asgi_mount_timeout: config.asgi_mount_timeout,
+        native_route_timeout: config.native_route_timeout,
         stream_config: config.stream_config,
         global_cors_config: config.global_cors_config,
         global_compression_config: global_compression_config.clone(),
