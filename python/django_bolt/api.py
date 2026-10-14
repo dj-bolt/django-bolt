@@ -168,8 +168,13 @@ def _normalize_mount_prefix(path: str) -> str:
     return mount_path
 
 
+def _routes_and_native_routes(api: BoltAPI) -> list[tuple[str, str]]:
+    """`(method, path)` of the HTTP routes and the native routes, for the mount checks."""
+    return [(route[0], route[1]) for route in (*api._routes, *api._native_routes)]
+
+
 def _validate_asgi_mount_conflicts(
-    routes: list[tuple[str, str, int, Any]],
+    routes: list[tuple[str, str, ...]],
     asgi_mounts: list[tuple[str, Any]],
     *,
     error_cls: type[Exception] = ValueError,
@@ -178,7 +183,7 @@ def _validate_asgi_mount_conflicts(
     if not asgi_mounts:
         return
 
-    route_paths = {path for _method, path, _handler_id, _handler in routes}
+    route_paths = {route[1] for route in routes}
     seen_mounts: set[str] = set()
 
     for mount_prefix, _mount_app in asgi_mounts:
@@ -193,15 +198,18 @@ def _validate_asgi_mount_conflicts(
             )
 
 
+_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY"})
+
+
 def _validate_mcp_mount_conflicts(
-    routes: list[tuple[str, str, int, Any]],
+    routes: list[tuple[str, str, ...]],
     asgi_mounts: list[tuple[str, Any]],
     mcp_mounts: list[dict[str, Any]],
     *,
     error_cls: type[Exception] = ValueError,
 ) -> None:
     """Reject MCP paths that duplicate or exactly collide with another endpoint."""
-    route_paths = {path for _method, path, _handler_id, _handler in routes}
+    route_paths = {route[1] for route in routes}
     asgi_paths = {path for path, _app in asgi_mounts}
     seen_mcp: set[str] = set()
 
@@ -517,6 +525,8 @@ class BoltAPI:
         # MCP mount definitions (dicts consumed by _core.register_mcp_mounts).
         # Populated by bolt_mcp.mount_mcp; empty for APIs without MCP.
         self._mcp_mounts: list[dict[str, Any]] = []
+        # (method, path, capsule) for routes served by another module's Rust handler.
+        self._native_routes: list[tuple[str, str, Any]] = []
         self._asgi_mount_prefixes: set[str] = set()
 
         # Middleware chain (built lazily on first request)
@@ -3105,6 +3115,24 @@ class BoltAPI:
                     registered.add(backend_type)
                     register_auth_backend(backend_type, backend_instance)
 
+    def native_route(self, method: str, path: str, capsule: Any) -> None:
+        """Serve ``method path`` with a Rust handler from another extension module.
+
+        Experimental. ``capsule`` is a ``django_bolt.native_handler.v1``
+        PyCapsule; the ``bolt-native-abi`` crate defines its contract. The
+        route matches as a Python route does. The request does not go into
+        Python, so Python middleware, authentication, guards, rate limits,
+        dependency injection and the access log do not run. Global CORS and
+        compression apply. A native route with the method and path of another
+        route stops startup.
+        """
+        method = method.upper()
+        if method not in _HTTP_METHODS:
+            raise ValueError(f"Unsupported HTTP method for a native route: {method}")
+        path = path or "/"
+        full_path = _normalize_path(f"{self.prefix}{path}" if self.prefix else path, self.trailing_slash)
+        self._native_routes.append((method, full_path, capsule))
+
     def mount(self, path: str, app: BoltAPI) -> None:
         """
         Mount a sub-application at a given path (FastAPI-style).
@@ -3198,6 +3226,10 @@ class BoltAPI:
             # Track which API owns this handler (for logging, etc.)
             # _handler_api_map is always initialized in __init__
             self._handler_api_map[new_handler_id] = app
+
+        for method, route_path, capsule in app._native_routes:
+            new_path = _normalize_path(mount_path + route_path, self.trailing_slash)
+            self._native_routes.append((method, new_path, capsule))
 
         # Copy WebSocket routes
         for ws_path, handler_id, handler in app._websocket_routes:
@@ -3397,7 +3429,7 @@ class BoltAPI:
             route_router_middleware = route_meta.pop("_router_middleware", [])
 
             # Register route with merged settings and preserved router middleware.
-            if method.upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY"}:
+            if method.upper() not in _HTTP_METHODS:
                 continue
 
             decorator = self._route_decorator(

@@ -695,6 +695,34 @@ pub(crate) fn content_length_exceeds_limit(
     matches!(content_length, Some(len) if len > max_payload_size)
 }
 
+/// Read the whole body. The total is bounded by `max_payload_size` while it
+/// streams, so a chunked request (no Content-Length) is bounded too.
+pub(crate) async fn read_body(
+    payload: &mut web::Payload,
+    max_payload_size: usize,
+) -> Result<Vec<u8>, HttpResponse> {
+    let mut body = Vec::new();
+    while let Some(chunk) = payload.next().await {
+        match chunk {
+            Ok(data) => {
+                if data.len() > max_payload_size - body.len() {
+                    return Err(responses::error_413());
+                }
+                body.extend_from_slice(&data);
+            }
+            Err(e) => {
+                return Err(HttpResponse::BadRequest()
+                    .content_type("application/json")
+                    .body(format!(
+                        "{{\"error\": \"Failed to read request body: {}\"}}",
+                        e
+                    )));
+            }
+        }
+    }
+    Ok(body)
+}
+
 pub async fn handle_request<const ACCESS_LOG: bool>(
     req: HttpRequest,
     mut payload: web::Payload,
@@ -812,6 +840,21 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             return responses::error_404();
         }
     };
+
+    // A native route goes to a Rust handler in another extension module. Auth,
+    // guards, rate limits, Python middleware and the access log do not run;
+    // Actix middleware such as CORS and compression does. The boxed future
+    // keeps the future of this function small for Python routes.
+    if let Some(native) = route.native {
+        return Box::pin(crate::native::dispatch(
+            &req,
+            payload,
+            native,
+            path_params,
+            &state,
+        ))
+        .await;
+    }
 
     // Method maps to a static str (known fixed set — no per-request alloc);
     // path is dynamic and must be owned for PyRequest.
@@ -1135,30 +1178,10 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
             // Read payload as bytes (for non-multipart requests).
             // The aggregate size is bounded against max_payload_size during
             // streaming so chunked requests (no Content-Length) are enforced too.
-            let mut body_vec = Vec::new();
-            let mut total_read: usize = 0;
-            while let Some(chunk) = payload.next().await {
-                match chunk {
-                    Ok(data) => {
-                        total_read = match total_read.checked_add(data.len()) {
-                            Some(v) => v,
-                            None => return responses::error_413(),
-                        };
-                        if total_read > state.max_payload_size {
-                            return responses::error_413();
-                        }
-                        body_vec.extend_from_slice(&data);
-                    }
-                    Err(e) => {
-                        return HttpResponse::BadRequest()
-                            .content_type("application/json")
-                            .body(format!(
-                                "{{\"error\": \"Failed to read request body: {}\"}}",
-                                e
-                            ));
-                    }
-                }
-            }
+            let body_vec = match read_body(&mut payload, state.max_payload_size).await {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
 
             // URL-encoded form parsing
             if needs_form_parsing && is_urlencoded {

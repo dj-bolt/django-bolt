@@ -1,0 +1,13 @@
+[package]
+name = "bolt-native-abi"
+# Versioned with the ABI, not with django-bolt. Published for handler authors.
+version = "0.1.0"
+rust-version = "1.81"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI between django-bolt and native route handlers in other extension modules"
+keywords = ["django-bolt", "ffi", "pyo3", "http"]
+categories = ["api-bindings", "web-programming::http-server"]
+
+[dependencies]

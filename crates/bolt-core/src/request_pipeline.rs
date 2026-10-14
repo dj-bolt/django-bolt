@@ -280,6 +280,9 @@ fn set_coerced_item(
     }
 }
 
+/// The most headers that a request can have.
+pub const MAX_HEADERS: usize = 100;
+
 /// Extract headers from request with validation
 /// OPTIMIZATION: HeaderName::as_str() already returns lowercase (http crate canonical form)
 /// so we skip the redundant to_ascii_lowercase() call (~50ns saved per header)
@@ -289,7 +292,6 @@ pub fn extract_headers(
     req: &HttpRequest,
     max_header_size: usize,
 ) -> Result<AHashMap<String, String>, HttpResponse> {
-    const MAX_HEADERS: usize = 100;
     let mut headers: AHashMap<String, String> = AHashMap::with_capacity(16);
     let mut header_count = 0;
 
@@ -309,6 +311,19 @@ pub fn extract_headers(
     Ok(headers)
 }
 
+/// Apply the header limits of `extract_headers` without a copy.
+pub fn check_headers(req: &HttpRequest, max_header_size: usize) -> Result<(), HttpResponse> {
+    for (index, (_name, value)) in req.headers().iter().enumerate() {
+        if index >= MAX_HEADERS {
+            return Err(responses::error_400_too_many_headers());
+        }
+        if value.len() > max_header_size {
+            return Err(responses::error_400_header_too_large(max_header_size));
+        }
+    }
+    Ok(())
+}
+
 /// Validate every header but copy only repeated Cookie lines.
 pub fn extract_cookie_header(
     req: &HttpRequest,
@@ -316,7 +331,7 @@ pub fn extract_cookie_header(
 ) -> Result<Option<Cow<'_, str>>, HttpResponse> {
     let mut cookie: Option<Cow<'_, str>> = None;
     for (index, (name, value)) in req.headers().iter().enumerate() {
-        if index >= 100 {
+        if index >= MAX_HEADERS {
             return Err(responses::error_400_too_many_headers());
         }
         if let Ok(value) = value.to_str() {

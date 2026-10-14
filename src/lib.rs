@@ -4,6 +4,7 @@ use bolt_core::request::PyRequest;
 
 mod dev_reload;
 mod handler;
+mod native;
 mod normalize;
 mod response_body;
 mod response_helpers;
@@ -94,6 +95,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::testing::register_test_mcp_mounts,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(crate::testing::native_test_capsule, m)?)?;
     m.add_function(wrap_pyfunction!(register_test_middleware_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(test_request, m)?)?;
     m.add_function(wrap_pyfunction!(handle_test_websocket, m)?)?;

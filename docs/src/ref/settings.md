@@ -149,6 +149,20 @@ BOLT_MAX_UPLOAD_SIZE = FileSize.MB_10
 
     This distinction is important for security and resource management. Always set `BOLT_MAX_UPLOAD_SIZE` to the maximum file size your server should ever accept, and use `File(max_size=...)` for endpoint-specific needs.
 
+## Native route settings
+
+### BOLT_NATIVE_ROUTE_TIMEOUT
+
+Maximum time (seconds) to wait for a native route handler to complete a request. At the limit, Bolt sends `504 Gateway Timeout`.
+
+```python
+BOLT_NATIVE_ROUTE_TIMEOUT = 30
+```
+
+**Default:** `30`
+
+The value must be more than 0. An int or a float is valid.
+
 ## ASGI mount settings
 
 ### BOLT_ASGI_MOUNT_TIMEOUT

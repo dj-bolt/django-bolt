@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Native routes (experimental)** - `api.native_route(method, path, capsule)` serves a route with a Rust handler from another extension module, without Python. See [Native Routes](docs/src/topics/native-routes.md).
+
 - **`SessionAuthentication`** - A route can use Django session auth as it uses a token backend: `auth=[SessionAuthentication()]`. Django does the session work. Bolt adds Django's `SessionMiddleware` and `AuthenticationMiddleware` to the route when its middleware has neither. When it has only one of them, startup fails. Rust rejects a request with no session cookie. For a request with the cookie, Django loads the user, and Bolt checks the guards of the route against `request.user`. A guard can read `is_staff`, `is_superuser` and `permissions` of the user. A `none_of` guard on another claim is an error at startup. `login_url` sends an anonymous user to a login page with Django's `redirect_to_login`. Each unsafe request to the route gets the CSRF origin check of a JWT cookie, also with no cookie, so a login route is protected too. `csrf=False` turns the check off. A token backend on the same route comes first. The backend works on HTTP routes only. A WebSocket route or an MCP mount with it in `auth` raises an error at startup. A session backend from `BOLT_AUTHENTICATION_CLASSES` is left out there. See [Session authentication](docs/src/topics/authentication.md#session-authentication).
 
 ### Changed
