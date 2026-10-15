@@ -37,6 +37,26 @@ class CustomTestMiddleware(Middleware):
         return await self.get_response(request)
 
 
+def _wrap_argument_injectors(api: BoltAPI, wrap) -> None:
+    """Give each route that registers after this call the injector ``wrap(injector)``.
+
+    The handler executor takes the injector when the route registers. Thus a
+    later change to ``meta["injector"]`` has no effect.
+    """
+    compile_injector = api._compile_argument_injector
+    api._compile_argument_injector = lambda meta: wrap(compile_injector(meta))
+
+
+def _counting(injector, calls: dict):
+    """Return an injector that counts its calls in ``calls["count"]``."""
+
+    def counting_injector(request):
+        calls["count"] += 1
+        return injector(request)
+
+    return counting_injector
+
+
 class TestMiddlewareDecorators:
     """Test middleware decorator functionality"""
 
@@ -382,24 +402,21 @@ class TestMiddlewareMetadata:
         """Simple path/query handlers should execute without calling Python injector."""
         api = BoltAPI()
 
-        @api.get("/items/{item_id}")
-        async def get_item(item_id: int, q: str):
-            return {"item_id": item_id, "q": q}
-
-        handler_id = 0
-        meta = api._handler_meta[handler_id]
-        middleware_meta = api._handler_middleware[handler_id]
-
-        # Ensure route is eligible for Rust-side prebinding.
-        assert "rust_arg_bindings" in middleware_meta
-        assert len(middleware_meta["rust_arg_bindings"]) == 2
-
         # If injector is called, this test must fail.
         def failing_injector(_request):
             raise AssertionError("Injector should be bypassed by Rust prebinding")
 
-        meta["injector"] = failing_injector
-        meta["injector_is_async"] = False
+        _wrap_argument_injectors(api, lambda _injector: failing_injector)
+
+        @api.get("/items/{item_id}")
+        async def get_item(item_id: int, q: str):
+            return {"item_id": item_id, "q": q}
+
+        middleware_meta = api._handler_middleware[0]
+
+        # Ensure route is eligible for Rust-side prebinding.
+        assert "rust_arg_bindings" in middleware_meta
+        assert len(middleware_meta["rust_arg_bindings"]) == 2
 
         with TestClient(api, use_http_layer=True) as client:
             response = client.get("/items/123?q=hello")
@@ -412,6 +429,11 @@ class TestMiddlewareMetadata:
         """Header/Cookie bindings should also bypass injector on no-middleware fast path."""
         api = BoltAPI()
 
+        def failing_injector(_request):
+            raise AssertionError("Injector should be bypassed by Rust prebinding")
+
+        _wrap_argument_injectors(api, lambda _injector: failing_injector)
+
         @api.get("/auth/{item_id}")
         async def get_auth_data(
             item_id: int,
@@ -420,19 +442,11 @@ class TestMiddlewareMetadata:
         ):
             return {"item_id": item_id, "token": token, "session_id": session_id}
 
-        handler_id = 0
-        meta = api._handler_meta[handler_id]
-        middleware_meta = api._handler_middleware[handler_id]
+        middleware_meta = api._handler_middleware[0]
 
         assert "rust_arg_bindings" in middleware_meta
         sources = {entry["source"] for entry in middleware_meta["rust_arg_bindings"]}
         assert sources == {"path", "header", "cookie"}
-
-        def failing_injector(_request):
-            raise AssertionError("Injector should be bypassed by Rust prebinding")
-
-        meta["injector"] = failing_injector
-        meta["injector_is_async"] = False
 
         with TestClient(api, use_http_layer=True) as client:
             response = client.get("/auth/7", headers={"x-token": "token-123", "Cookie": "session=sess-abc"})
@@ -443,34 +457,23 @@ class TestMiddlewareMetadata:
             assert data["session_id"] == "sess-abc"
 
     def test_rust_arg_prebinding_missing_value_falls_back_to_injector(self):
-        """Missing required prebound values now short-circuit with 422 in Rust."""
+        """A missing required value makes Rust fall back to the injector, and the injector gives the 422."""
         api = BoltAPI()
+        calls = {"count": 0}
+        _wrap_argument_injectors(api, lambda injector: _counting(injector, calls))
 
         @api.get("/requires-header")
         async def requires_header(api_key: Annotated[str, Header(alias="x-api-key")]):
             return {"api_key": api_key}
 
-        handler_id = 0
-        meta = api._handler_meta[handler_id]
-        middleware_meta = api._handler_middleware[handler_id]
-
-        assert "rust_arg_bindings" in middleware_meta
-        original_injector = meta["injector"]
-        calls = {"count": 0}
-
-        def counting_injector(request):
-            calls["count"] += 1
-            return original_injector(request)
-
-        meta["injector"] = counting_injector
-        meta["injector_is_async"] = False
+        assert "rust_arg_bindings" in api._handler_middleware[0]
 
         with TestClient(api, use_http_layer=True) as client:
             response = client.get("/requires-header")
             assert response.status_code == 422
             assert response.json()["detail"] == "Missing required header: x-api-key"
 
-        assert calls["count"] == 0
+        assert calls["count"] == 1
 
     def test_rust_arg_prebinding_keeps_injector_path_when_python_middleware_present(self):
         """Prebound args/kwargs are used even when Python middleware chain is active."""
@@ -483,24 +486,14 @@ class TestMiddlewareMetadata:
                 return await self.get_response(request)
 
         api = BoltAPI(middleware=[PassThroughMiddleware])
+        calls = {"count": 0}
+        _wrap_argument_injectors(api, lambda injector: _counting(injector, calls))
 
         @api.get("/items/{item_id}")
         async def get_item(item_id: int, q: str):
             return {"item_id": item_id, "q": q}
 
-        handler_id = 0
-        meta = api._handler_meta[handler_id]
-        middleware_meta = api._handler_middleware[handler_id]
-
-        assert "rust_arg_bindings" in middleware_meta
-        calls = {"count": 0}
-
-        def counting_injector(request):
-            calls["count"] += 1
-            return ([request["params"]["item_id"], request["query"]["q"]], {})
-
-        meta["injector"] = counting_injector
-        meta["injector_is_async"] = False
+        assert "rust_arg_bindings" in api._handler_middleware[0]
 
         with TestClient(api, use_http_layer=True) as client:
             response = client.get("/items/42?q=hello")
