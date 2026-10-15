@@ -14,6 +14,7 @@ from typing import Annotated
 import jwt
 import msgspec
 import pytest
+from django.test import override_settings
 
 from django_bolt import BoltAPI, Router
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
@@ -349,6 +350,46 @@ class TestMiddlewareMetadata:
         assert len(meta["middleware"]) == 1
         assert meta["middleware"][0]["type"] == "rate_limit"
         assert "cors" in meta["skip"]
+
+    def test_skip_all_skips_rate_limit_cors_and_compression(self):
+        """@skip_middleware("*") skips each middleware that Rust runs for the route."""
+        api = BoltAPI()
+
+        @api.get("/skip-all")
+        @skip_middleware("*")
+        @cors(origins=["https://example.com"])
+        @rate_limit(rps=1, burst=1)
+        async def skip_all_endpoint():
+            return {"data": "x" * 5000}
+
+        with TestClient(api) as client:
+            for _ in range(3):
+                response = client.get("/skip-all", headers={"Origin": "https://example.com", "Accept-Encoding": "gzip"})
+                assert response.status_code == 200
+                assert "Access-Control-Allow-Origin" not in response.headers
+                assert "Content-Encoding" not in response.headers
+
+    def test_skip_all_skips_the_global_cors_config(self):
+        """@skip_middleware("*") also skips the CORS config of the settings."""
+        with override_settings(CORS_ALLOWED_ORIGINS=["https://example.com"]):
+            api = BoltAPI()
+
+            @api.get("/skip-all")
+            @skip_middleware("*")
+            async def skip_all_endpoint():
+                return {}
+
+            @api.get("/plain")
+            async def plain_endpoint():
+                return {}
+
+            with TestClient(api) as client:
+                skipped = client.get("/skip-all", headers={"Origin": "https://example.com"})
+                plain = client.get("/plain", headers={"Origin": "https://example.com"})
+
+        assert skipped.status_code == 200
+        assert "Access-Control-Allow-Origin" not in skipped.headers
+        assert plain.headers.get("Access-Control-Allow-Origin") == "https://example.com"
 
     def test_skip_middleware_runtime_with_testclient(self):
         """Test that skip_middleware actually skips middleware at runtime using TestClient."""
