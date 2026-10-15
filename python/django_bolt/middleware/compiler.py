@@ -114,6 +114,10 @@ def _compile_guard(guard: Any, method: str, path: str) -> dict[str, Any]:
     return instance.to_metadata()
 
 
+# The middleware that Rust runs for a route. @skip_middleware("*") skips each one.
+_RUST_MIDDLEWARE = ("cors", "rate_limit", "compression")
+
+
 def route_auth_backends(auth: list[Any] | None) -> list[Any]:
     """Return the auth backends that Rust gets for a route, in Rust order.
 
@@ -143,6 +147,9 @@ def compile_middleware_meta(
 
     if hasattr(handler, "__bolt_skip_middleware__"):
         skip_middleware = handler.__bolt_skip_middleware__
+        # "*" skips each middleware that Rust runs.
+        if "*" in skip_middleware:
+            skip_middleware = {*skip_middleware, *_RUST_MIDDLEWARE}
 
     # Merge global and handler middleware
     all_middleware = []

@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Sequence
 from contextlib import suppress
 from typing import Any, get_origin, get_type_hints
 
@@ -102,6 +102,17 @@ from .views import APIView, ViewSet, _layer
 from .websocket import mark_websocket_handler
 
 logger = logging.getLogger(__name__)
+
+
+def _middleware_names(middleware: Any) -> frozenset[str]:
+    """The names that @skip_middleware can give for a middleware class or function.
+
+    The names are ``__name__`` and the dotted path. A Django middleware class
+    can also be a dotted path string.
+    """
+    if isinstance(middleware, str):
+        return frozenset({middleware, middleware.rpartition(".")[2]})
+    return frozenset({middleware.__name__, f"{middleware.__module__}.{middleware.__qualname__}"})
 
 
 def _revocation_handlers(backends: list[Any]) -> tuple[tuple[Callable, bool] | None, ...] | None:
@@ -524,6 +535,10 @@ class BoltAPI:
         self._middleware_chain = None  # Will be the outermost middleware instance
         self._middleware_chain_lock = threading.Lock()
         self._route_executor_cache: dict[Callable, Callable] = {}
+        # The global middleware chains of the routes that skip global middleware,
+        # by the id of the middleware tuple of each route. Routes that share a
+        # handler can have different skip lists.
+        self._route_global_chain_cache: dict[int, Callable] = {}
         self._route_executor_lock = threading.Lock()
 
         # Handler-to-API mapping for merged APIs (initialized here to avoid hasattr in hot path)
@@ -1578,6 +1593,15 @@ class BoltAPI:
 
             router_middleware = normalize_middleware_specs(_router_middleware, context="router")
 
+            # Remove the Python middleware that @skip_middleware names. The
+            # compiler removes the Rust middleware. None keeps the shared chain
+            # of the API.
+            skip = getattr(fn, "__bolt_skip_middleware__", ())
+            global_middleware = self._without_skipped_middleware(self._middleware, skip)
+            meta["_global_middleware"] = None if global_middleware is self._middleware else tuple(global_middleware)
+            router_middleware = self._without_skipped_middleware(router_middleware, skip)
+            route_middleware = self._without_skipped_middleware(route_middleware, skip)
+
             # Resolve the auth backends once (explicit > defaults), in the
             # order Rust gets them. A session backend needs Django's session
             # and auth middleware. Add the missing ones before the router middleware.
@@ -1585,7 +1609,7 @@ class BoltAPI:
             if uses_session(effective_auth_backends):
                 router_middleware = [
                     *session_middleware(
-                        [*self._middleware, *router_middleware, *route_middleware], f"{method} {full_path}"
+                        [*global_middleware, *router_middleware, *route_middleware], f"{method} {full_path}"
                     ),
                     *router_middleware,
                 ]
@@ -2699,6 +2723,50 @@ class BoltAPI:
         return not isinstance(middleware_spec, dict)
 
     @staticmethod
+    def _without_skipped_middleware(middleware_specs: list[Any], skip: Collection[str]) -> list[Any]:
+        """Return the middleware specs without the Python middleware that ``skip`` names.
+
+        The result is ``middleware_specs`` itself when ``skip`` names none of them.
+
+        ``skip`` holds the names of @skip_middleware. A name selects a middleware
+        class, a function middleware or a Django middleware class by its
+        ``__name__`` or its dotted path. "*" selects each Python middleware of Bolt,
+        but no Django middleware: a ``DjangoMiddleware`` or a class of a
+        ``DjangoMiddlewareStack`` runs until a name selects it. Thus "*" cannot
+        remove a CSRF check. Dict specs stay, because the compiler removes them.
+        """
+        if not skip:
+            return middleware_specs
+        skip = frozenset(skip)
+        skip_all = "*" in skip
+        kept: list[Any] = []
+        for spec in middleware_specs:
+            if isinstance(spec, dict):
+                kept.append(spec)
+            elif isinstance(spec, DjangoMiddleware):
+                if not _middleware_names(spec.middleware_class) & skip:
+                    kept.append(spec)
+            elif isinstance(spec, DjangoMiddlewareStack):
+                classes = [cls for cls in spec.middleware_classes if not _middleware_names(cls) & skip]
+                if len(classes) == len(spec.middleware_classes):
+                    kept.append(spec)
+                elif classes:
+                    kept.append(DjangoMiddlewareStack(classes))
+            elif not skip_all:
+                if isinstance(spec, FunctionMiddlewareSpec):
+                    target = spec.func
+                elif isinstance(spec, type):
+                    target = spec
+                else:
+                    target = type(spec)
+                if not _middleware_names(target) & skip:
+                    kept.append(spec)
+        # The same list tells the caller that the route skips none of these middleware.
+        if len(kept) == len(middleware_specs) and all(a is b for a, b in zip(kept, middleware_specs, strict=True)):
+            return middleware_specs
+        return kept
+
+    @staticmethod
     def _clone_wrapper_middleware_spec(middleware_spec: Any) -> Any:
         """Clone supported middleware wrapper instances for per-route chains."""
         clone = getattr(middleware_spec, "clone", None)
@@ -2751,12 +2819,14 @@ class BoltAPI:
             "Expected middleware class, middleware wrapper, or function middleware spec."
         )
 
-    def _build_middleware_chain(self, api: BoltAPI) -> Callable | None:
+    def _build_middleware_chain(self, middleware_specs: Sequence[Any], *, clone_wrapper: bool = False) -> Callable:
         """
-        Build the cached global middleware chain for an API instance.
+        Build a chain of the global middleware of an API.
 
         Args:
-            api: The BoltAPI instance to build chain for
+            middleware_specs: The global middleware specs of the API, or of one route
+            clone_wrapper: Give the chain its own wrapper instances. A route chain
+                must not share them with the chain of the API.
 
         Returns:
             The outermost middleware callable.
@@ -2768,10 +2838,29 @@ class BoltAPI:
             return await route_executor(req)
 
         chain = inner_handler
-        for middleware_spec in reversed(api._middleware):
+        for middleware_spec in reversed(middleware_specs):
             if not self._is_python_middleware_spec(middleware_spec):
                 continue
-            chain = self._wrap_middleware_spec(middleware_spec, chain)
+            chain = self._wrap_middleware_spec(middleware_spec, chain, clone_wrapper=clone_wrapper)
+
+        return chain
+
+    def _get_route_global_chain(self, api: BoltAPI, middleware_specs: tuple[Any, ...]) -> Callable:
+        """Get or build the global middleware chain of a route that skips global middleware.
+
+        ``middleware_specs`` is the tuple in the metadata of the route. The route
+        keeps it, so its id is stable and unique to the route.
+        """
+        key = id(middleware_specs)
+        chain = api._route_global_chain_cache.get(key)
+        if chain is not None:
+            return chain
+
+        with api._route_executor_lock:
+            chain = api._route_global_chain_cache.get(key)
+            if chain is None:
+                chain = self._build_middleware_chain(middleware_specs, clone_wrapper=True)
+                api._route_global_chain_cache[key] = chain
 
         return chain
 
@@ -2856,12 +2945,17 @@ class BoltAPI:
             api: The BoltAPI instance that owns this handler (may be sub-app)
             meta: Handler metadata
         """
-        # Build global middleware chain once per API and cache it.
-        if not api._middleware_chain_built:
-            with api._middleware_chain_lock:
-                if not api._middleware_chain_built:
-                    api._middleware_chain = self._build_middleware_chain(api)
-                    api._middleware_chain_built = True
+        global_middleware = meta["_global_middleware"]
+        if global_middleware is None:
+            # Build global middleware chain once per API and cache it.
+            if not api._middleware_chain_built:
+                with api._middleware_chain_lock:
+                    if not api._middleware_chain_built:
+                        api._middleware_chain = self._build_middleware_chain(api._middleware)
+                        api._middleware_chain_built = True
+            middleware_chain = api._middleware_chain
+        else:
+            middleware_chain = self._get_route_global_chain(api, global_middleware)
 
         request_state = request.setdefault("state", {})
 
@@ -2870,7 +2964,7 @@ class BoltAPI:
         request_state["_bolt_route_executor"] = self._get_route_executor(api, handler, meta)
 
         try:
-            middleware_response = await api._middleware_chain(request)
+            middleware_response = await middleware_chain(request)
             if isinstance(middleware_response, MiddlewareResponse):
                 return middleware_response.to_tuple()
             if isinstance(middleware_response, tuple):
