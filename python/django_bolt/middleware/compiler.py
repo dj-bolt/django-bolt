@@ -248,12 +248,10 @@ def _collect_seq_field_names(field: Any, target: set[str]) -> None:
     """
     unwrapped = unwrap_optional(field.annotation)
     if is_msgspec_struct(unwrapped):
+        # The struct extractor reads each field by its msgspec encoded name.
         for struct_field in msgspec.structs.fields(unwrapped):
             if _is_sequence_annotation(struct_field.type):
-                target.add(struct_field.name)
-                encoded_name = getattr(struct_field, "encode_name", struct_field.name)
-                if encoded_name != struct_field.name:
-                    target.add(encoded_name)
+                target.add(struct_field.encode_name)
     elif _is_sequence_annotation(field.annotation):
         target.add(field.alias or field.name)
 

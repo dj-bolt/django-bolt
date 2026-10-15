@@ -130,6 +130,33 @@ def test_the_request_query_holds_each_value_of_a_sequence_key():
     assert response.json() == {"query": ["1", "2"]}
 
 
+class _RenamedTags(msgspec.Struct):
+    tags: list[str] = msgspec.field(name="tag", default_factory=list)
+
+
+def test_a_renamed_sequence_struct_field_leaves_its_python_name_as_one_value():
+    """Only the wire name of a sequence struct field gives a list. A scalar
+    parameter with the Python name of that field keeps its one value."""
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(filters: Annotated[_RenamedTags, Query()], tags: str = "none"):
+        return {"filters": filters.tags, "tags": tags}
+
+    @api.post("/form")
+    async def form(filters: Annotated[_RenamedTags, Form()], tags: Annotated[str, Form()] = "none"):
+        return {"filters": filters.tags, "tags": tags}
+
+    with TestClient(api) as client:
+        query_response = client.get("/query?tag=a&tag=b&tags=solo")
+        form_response = client.post("/form", data={"tag": "a", "tags": "solo"})
+
+    assert query_response.status_code == 200, query_response.text
+    assert query_response.json() == {"filters": ["a", "b"], "tags": "solo"}
+    assert form_response.status_code == 200, form_response.text
+    assert form_response.json() == {"filters": ["a"], "tags": "solo"}
+
+
 # --- Sequences in a form, a header and a cookie --------------------------------------
 
 
