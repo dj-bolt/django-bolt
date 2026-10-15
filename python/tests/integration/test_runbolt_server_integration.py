@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 
 import pytest
 
 from .apps import app_bytes, app_module, app_source
-from .helpers import _terminate_process
+from .apps.loop_thread_probe import PROBE_MARKER
+from .helpers import DEFAULT_HOST, _terminate_process
 
 pytestmark = pytest.mark.server_integration
 
@@ -131,3 +133,31 @@ def test_runbolt_processes_two_shuts_down_cleanly(make_server_project):
     assert response.status_code == 200
     assert "pid" in response.json()
     assert server.process.returncode == 0, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+
+
+def test_runbolt_bind_failure_exits_before_the_loop_thread_starts(make_server_project):
+    """A port in use must stop startup before the event loop thread starts.
+
+    If the thread starts first, the process can finalize Python before the
+    thread attaches. The attach then panics, and the release build aborts with
+    SIGABRT instead of exit code 1. ``runbolt --dev`` reads a signal on the
+    first start as "keep watching", so the dev session did not exit.
+    """
+    project = make_server_project(api_module=app_module("loop_thread_probe"))
+
+    # Hold the port without SO_REUSEPORT, so the bind of the server fails.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as blocker:
+        blocker.bind((DEFAULT_HOST, 0))
+        blocker.listen(8)
+        port = int(blocker.getsockname()[1])
+
+        process, _ = project.spawn(port=port, env={"BOLT_TEST_PROBE_LOOP_THREAD": "1"})
+        try:
+            stdout, stderr = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = _terminate_process(process)
+            pytest.fail(f"runbolt kept running after the bind of port {port} failed\nstderr:\n{stderr}")
+
+    assert process.returncode == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    assert "Address already in use" in stderr, stderr
+    assert PROBE_MARKER not in stderr, stderr

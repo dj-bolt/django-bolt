@@ -710,6 +710,14 @@ pub fn start_server(
     let use_reuse_port = env_flag(py, "DJANGO_BOLT_REUSE_PORT", false)?;
     let backlog = env_non_negative_int(py, "DJANGO_BOLT_BACKLOG", 1024i32)?;
 
+    // Bind before the loop thread starts. If the bind fails after it starts,
+    // the process exits while that thread can still attach to Python. An
+    // attach after finalization panics, and the release build aborts. The
+    // `runbolt --dev` supervisor reads that abort as a signal, not as a
+    // failed first start, so it waits for changes and does not exit.
+    let listener = bind_listener(&host, port, use_reuse_port, backlog)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Server error: {}", e)))?;
+
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.max_blocking_threads(blocking_threads);
     // Pin a Python thread state to every tokio thread for its lifetime.
@@ -887,31 +895,6 @@ pub fn start_server(
                     .shutdown_timeout(shutdown_timeout)
                     .workers(workers);
 
-                    // Always use socket2 for consistent backlog control
-                    let ip: IpAddr = host.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
-                    let domain = match ip {
-                        IpAddr::V4(_) => Domain::IPV4,
-                        IpAddr::V6(_) => Domain::IPV6,
-                    };
-                    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-                        .map_err(std::io::Error::other)?;
-                    socket
-                        .set_reuse_address(true)
-                        .map_err(std::io::Error::other)?;
-
-                    // Only set SO_REUSEPORT when explicitly requested (multi-process mode)
-                    #[cfg(not(target_os = "windows"))]
-                    if use_reuse_port {
-                        socket.set_reuse_port(true).map_err(std::io::Error::other)?;
-                    }
-
-                    let addr = SocketAddr::new(ip, port);
-                    socket.bind(&addr.into()).map_err(std::io::Error::other)?;
-                    socket.listen(backlog).map_err(std::io::Error::other)?;
-                    let listener: std::net::TcpListener = socket.into();
-                    listener
-                        .set_nonblocking(true)
-                        .map_err(std::io::Error::other)?;
                     let server = server
                         .listen(listener)
                         .map_err(std::io::Error::other)?
@@ -960,6 +943,34 @@ pub fn start_server(
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Server error: {}", e)))?;
 
     Ok(())
+}
+
+/// Bind the non-blocking server listener. socket2 gives control of the backlog.
+fn bind_listener(
+    host: &str,
+    port: u16,
+    use_reuse_port: bool,
+    backlog: i32,
+) -> std::io::Result<std::net::TcpListener> {
+    let ip: IpAddr = host.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    let domain = match ip {
+        IpAddr::V4(_) => Domain::IPV4,
+        IpAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+
+    // Only set SO_REUSEPORT when explicitly requested (multi-process mode)
+    #[cfg(not(target_os = "windows"))]
+    if use_reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+
+    socket.bind(&SocketAddr::new(ip, port).into())?;
+    socket.listen(backlog)?;
+    let listener: std::net::TcpListener = socket.into();
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 /// Wait for a shutdown signal. Returns `true` for graceful shutdown (SIGTERM)
