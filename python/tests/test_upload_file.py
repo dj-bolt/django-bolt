@@ -7,6 +7,7 @@ from typing import Annotated
 
 import msgspec
 import pytest
+from django.core.exceptions import ImproperlyConfigured
 from django.core.files.base import File as DjangoFile
 
 from django_bolt import BoltAPI, UploadFile
@@ -55,6 +56,25 @@ class ProfileFormAnnotatedOptional(msgspec.Struct):
 class DocumentFormAnnotated(msgspec.Struct):
     title: str
     documents: Annotated[list[UploadFile], File(max_files=5)]
+
+
+class RenamedAvatarForm(msgspec.Struct):
+    """Struct whose optional file field has another name on the wire."""
+
+    avatar: Annotated[UploadFile, File(min_size=5)] | None = msgspec.field(name="picture", default=None)
+
+
+class LimitedFilesForm(msgspec.Struct):
+    """Struct whose file fields have small size and count limits."""
+
+    avatar: Annotated[UploadFile, File(max_size=10)]
+    docs: Annotated[list[UploadFile], File(max_files=2)]
+
+
+class PdfDocForm(msgspec.Struct):
+    """Struct whose file field accepts only PDF files."""
+
+    doc: Annotated[UploadFile, File(allowed_types=["application/pdf"])]
 
 
 class TestUploadFileClass:
@@ -406,6 +426,136 @@ class TestUploadFileValidation:
         )
         assert response.status_code == 200
         assert response.json()["has_file"] is True
+
+
+class TestFileConstraintsByPartName:
+    """Rust checks a file against the File() constraints of its multipart part name."""
+
+    def test_aliased_file_parameter_checks_its_constraints(self):
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(
+            doc: Annotated[
+                UploadFile, File(alias="document", min_size=10, allowed_types=["application/pdf"], max_files=1)
+            ],
+        ):
+            return {"content_type": doc.content_type}
+
+        client = TestClient(api)
+
+        response = client.post("/upload", files={"document": ("page.html", b"<html>body</html>", "text/html")})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_invalid_content_type"
+        assert response.json()["detail"][0]["loc"] == ["body", "document"]
+
+        response = client.post("/upload", files={"document": ("small.pdf", b"%PDF", "application/pdf")})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_too_small"
+
+        response = client.post(
+            "/upload",
+            files=[
+                ("document", ("a.pdf", b"%PDF-1.7 one", "application/pdf")),
+                ("document", ("b.pdf", b"%PDF-1.7 two", "application/pdf")),
+            ],
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_too_many"
+
+        response = client.post("/upload", files={"document": ("doc.pdf", b"%PDF-1.7 body", "application/pdf")})
+        assert response.status_code == 200
+        assert response.json() == {"content_type": "application/pdf"}
+
+    def test_form_struct_file_field_checks_its_constraints(self):
+        api = BoltAPI()
+
+        @api.post("/profile")
+        async def update_profile(data: Annotated[ProfileFormAnnotated, Form()]):
+            return {"name": data.name, "content_type": data.avatar.content_type}
+
+        client = TestClient(api)
+
+        response = client.post(
+            "/profile",
+            data={"name": "Jane"},
+            files={"avatar": ("page.html", b"<script>alert(1)</script>", "text/html")},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_invalid_content_type"
+        assert response.json()["detail"][0]["loc"] == ["body", "avatar"]
+
+        response = client.post(
+            "/profile",
+            data={"name": "Jane"},
+            files={"avatar": ("photo.png", b"\x89PNG", "image/png")},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"name": "Jane", "content_type": "image/png"}
+
+    def test_form_struct_file_field_uses_its_encoded_name(self):
+        api = BoltAPI()
+
+        @api.post("/profile")
+        async def update_profile(data: Annotated[RenamedAvatarForm, Form()]):
+            return {"size": data.avatar.size if data.avatar else None}
+
+        client = TestClient(api)
+
+        response = client.post("/profile", files={"picture": ("photo.png", b"xyz", "image/png")})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_too_small"
+        assert response.json()["detail"][0]["loc"] == ["body", "picture"]
+
+        response = client.post("/profile", files={"picture": ("photo.png", b"x" * 5, "image/png")})
+        assert response.status_code == 200
+        assert response.json() == {"size": 5}
+
+    def test_form_struct_file_fields_check_max_size_and_max_files(self):
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(data: Annotated[LimitedFilesForm, Form()]):
+            return {"docs": len(data.docs)}
+
+        client = TestClient(api)
+        small_docs = [
+            ("docs", ("a.txt", b"a", "text/plain")),
+            ("docs", ("b.txt", b"b", "text/plain")),
+        ]
+
+        response = client.post("/upload", files=[("avatar", ("big.png", b"x" * 11, "image/png")), *small_docs])
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_too_large"
+        assert response.json()["detail"][0]["loc"] == ["body", "avatar"]
+
+        response = client.post(
+            "/upload",
+            files=[
+                ("avatar", ("ok.png", b"x", "image/png")),
+                *small_docs,
+                ("docs", ("c.txt", b"c", "text/plain")),
+            ],
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_too_many"
+        assert response.json()["detail"][0]["loc"] == ["body", "docs"]
+
+        response = client.post("/upload", files=[("avatar", ("ok.png", b"x", "image/png")), *small_docs])
+        assert response.status_code == 200
+        assert response.json() == {"docs": 2}
+
+    def test_two_declarations_of_one_part_with_different_constraints_fail(self):
+        api = BoltAPI()
+
+        with pytest.raises(ImproperlyConfigured, match="'doc' has two File\\(\\) declarations"):
+
+            @api.post("/upload")
+            async def upload(
+                data: Annotated[PdfDocForm, Form()],
+                other: Annotated[UploadFile, File(alias="doc", max_size=1000)],
+            ):
+                return {}
 
 
 class TestUploadFileMultiple:

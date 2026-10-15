@@ -22,6 +22,7 @@ except ImportError:  # Django 5.2 has no django.utils.csp
 
 from ..auth.backends import get_default_authentication_classes
 from ..auth.guards import GUARD_TYPES, get_default_permission_classes
+from ..params import Param
 from ..typing import is_msgspec_struct, resolve_type_alias, unwrap_optional
 
 # Type hint constants - MUST match src/type_coercion.rs
@@ -258,6 +259,51 @@ def _collect_seq_field_names(field: Any, target: set[str]) -> None:
         target.add(field.alias or field.name)
 
 
+def _add_file_constraints(param: Param, part_name: str, target: dict[str, dict[str, Any]]) -> None:
+    """Record the File() constraints of one multipart part in ``target``, by the part name.
+
+    Rust checks each uploaded file against the constraints of its part name.
+    A File() with no constraints adds no entry. Two declarations of one part
+    with different constraints raise ImproperlyConfigured, so no constraint is lost.
+    """
+    constraints: dict[str, Any] = {}
+    if param.max_size is not None:
+        constraints["max_size"] = param.max_size
+    if param.min_size is not None:
+        constraints["min_size"] = param.min_size
+    if param.allowed_types is not None:
+        constraints["allowed_types"] = list(param.allowed_types)
+    if param.max_files is not None:
+        constraints["max_files"] = param.max_files
+    if not constraints:
+        return
+    existing = target.get(part_name)
+    if existing is not None and existing != constraints:
+        raise ImproperlyConfigured(
+            f"Multipart part {part_name!r} has two File() declarations with different constraints: "
+            f"{existing} and {constraints}. Declare the constraints of a part once."
+        )
+    target[part_name] = constraints
+
+
+def _collect_struct_file_constraints(field: Any, target: dict[str, dict[str, Any]]) -> None:
+    """Record the File() constraints of the upload fields of a form struct.
+
+    The part name of a struct field is its msgspec encoded name. The File()
+    marker is in the Annotated type of the field, also behind Optional.
+    """
+    unwrapped = unwrap_optional(field.annotation)
+    if not is_msgspec_struct(unwrapped):
+        return
+    for struct_field in msgspec.structs.fields(unwrapped):
+        annotation = unwrap_optional(struct_field.type)
+        if get_origin(annotation) is not Annotated:
+            continue
+        for extra in get_args(annotation)[1:]:
+            if isinstance(extra, Param) and extra.source == "file":
+                _add_file_constraints(extra, struct_field.encode_name, target)
+
+
 def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Build a Rust-side argument binding plan for simple non-body handlers.
 
@@ -407,22 +453,12 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
         elif field.source == "form":
             _extract_type_hints_from_field(field, form_claims)
             _collect_seq_field_names(field, form_seq_fields)
+            _collect_struct_file_constraints(field, file_constraints)
 
         # File fields - extract constraints for Rust-side validation
         elif field.source == "file":
-            constraints = {}
-            if field.param is not None:
-                # Extract constraints from ParamMetadata
-                if hasattr(field.param, "max_size") and field.param.max_size is not None:
-                    constraints["max_size"] = field.param.max_size
-                if hasattr(field.param, "min_size") and field.param.min_size is not None:
-                    constraints["min_size"] = field.param.min_size
-                if hasattr(field.param, "allowed_types") and field.param.allowed_types is not None:
-                    constraints["allowed_types"] = list(field.param.allowed_types)
-                if hasattr(field.param, "max_files") and field.param.max_files is not None:
-                    constraints["max_files"] = field.param.max_files
-            if constraints:
-                file_constraints[field.name] = constraints
+            # Rust finds the constraints by the name of the multipart part.
+            _add_file_constraints(field.param, field.alias or field.name, file_constraints)
 
     # Rust keeps string values as they are, so leave string keys out of these maps.
     for metadata_key, claims in (
