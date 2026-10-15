@@ -448,20 +448,18 @@ def add_optimization_flags_to_metadata(metadata: dict[str, Any] | None, handler_
     if file_constraints:
         metadata["file_constraints"] = file_constraints
 
-    # Max upload size priority:
-    # 1. Per-field max_size (route level) - highest priority
-    # 2. BOLT_MAX_UPLOAD_SIZE (Django settings) - global fallback
-    # 3. 1MB default
-    if file_constraints:
-        # Use largest per-field max_size if any field has it
-        max_sizes = [c.get("max_size") for c in file_constraints.values() if c.get("max_size")]
-        if max_sizes:
-            metadata["max_upload_size"] = max(max_sizes)
-        else:
-            # No per-field max_size, use global setting or default
-            metadata["max_upload_size"] = read_size_setting("BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)
+    # Rust reads each file part up to max_upload_size, then it stops. A
+    # File(max_size=...) sets the limit of its own part only. Thus the largest
+    # max_size is the limit only when each file part has a max_size. A part in
+    # a form struct, or a File() with no max_size, gets BOLT_MAX_UPLOAD_SIZE.
+    request_fields = (*handler_meta["fields"], *handler_meta["dependency_fields"])
+    file_max_sizes = [field.param.max_size for field in request_fields if field.source == "file"]
+    has_form_struct = any(
+        field.source == "form" and is_msgspec_struct(unwrap_optional(field.annotation)) for field in request_fields
+    )
+    if file_max_sizes and None not in file_max_sizes and not has_form_struct:
+        metadata["max_upload_size"] = max(file_max_sizes)
     else:
-        # No file constraints at all, use global setting or default
         metadata["max_upload_size"] = read_size_setting("BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)
 
     # Memory spool threshold - when to spool files to disk (default 1MB)
