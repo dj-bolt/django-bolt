@@ -25,6 +25,7 @@ from asgiref.sync import AsyncToSync, SyncToAsync, ThreadSensitiveContext, sync_
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connections
+from django.db.backends.signals import connection_created
 
 logger = logging.getLogger(__name__)
 
@@ -39,18 +40,32 @@ __all__ = ("LaneAffinityError", "in_orm_executor_thread", "run_in_orm_executor",
 # before each call so Django can age out and health-check connections.
 _check_before_call = False
 
+# The aliases whose DATABASES entry sets OPTIONS["pool"]. A pooled connection
+# goes back to its pool when the thread that holds it has no more work: a
+# worker of a Bolt executor when its queue is empty, a lane at the end of its
+# request, and another thread at the end of its outermost guarded call. A
+# thread that kept it would hold a pool slot while it is idle, and idle threads
+# and lanes can outnumber max_size. The pool checks its own connections, so the
+# check before a call leaves these aliases out.
+_pooled_aliases: frozenset[str] = frozenset()
+
 
 def configure_connection_checks() -> None:
-    """Enable the pre-call connection check when the database settings ask for it."""
-    global _check_before_call
+    """Read the database settings: the pooled aliases, and whether the pre-call check runs."""
+    global _check_before_call, _pooled_aliases
     from django.conf import settings  # noqa: PLC0415 — needs configured settings, resolved lazily
 
     if not settings.configured:
         return
-    for db in connections.settings.values():
-        if db["CONN_MAX_AGE"] or db["CONN_HEALTH_CHECKS"]:
-            _check_before_call = True
-            return
+    pooled = set()
+    check_before_call = False
+    for alias, db in connections.settings.items():
+        if db.get("OPTIONS", {}).get("pool"):
+            pooled.add(alias)
+        elif db["CONN_MAX_AGE"] or db["CONN_HEALTH_CHECKS"]:
+            check_before_call = True
+    _pooled_aliases = frozenset(pooled)
+    _check_before_call = check_before_call
 
 
 def _drop_broken_connections() -> None:
@@ -60,16 +75,191 @@ def _drop_broken_connections() -> None:
     state is off by design, and the block restores it on exit. Django's test
     client skips ``close_old_connections`` for the same reason.
     """
+    dead = []
     for conn in connections.all(initialized_only=True):
         if not conn.in_atomic_block:
-            conn.close_if_unusable_or_obsolete()
+            raw = _close_if_unusable_or_obsolete(conn)
+            if raw is not None:
+                dead.append((conn, raw))
+    if dead:
+        _connections_died(dead)
+
+
+def _close_if_unusable_or_obsolete(conn) -> object | None:
+    """Run ``conn.close_if_unusable_or_obsolete()``.
+
+    Returns:
+        The driver connection that it closed because it does not answer, or None.
+    """
+    raw = conn.connection
+    # Django closes a connection with the wrong autocommit before it tests the
+    # connection, so errors_occurred then says nothing about the connection.
+    tested = raw is not None and conn.errors_occurred and conn.get_autocommit() == conn.settings_dict["AUTOCOMMIT"]
+    conn.close_if_unusable_or_obsolete()
+    # Django clears errors_occurred when the connection still answers.
+    return raw if tested and conn.errors_occurred else None
+
+
+# A database restart or failover kills every connection to that database at
+# once, but each thread sees this only when it uses its own. The thread that
+# finds the first dead connection advances the generation of its alias. Each
+# connection carries the generation it opened in, and a thread closes its older
+# connections of that alias before its next call, so it reconnects instead of
+# failing a request of its own. Only a connection that opened in the current
+# generation advances it: the other threads that meet a dead connection of the
+# same event find an older one, so one event makes one reconnect wave.
+#
+# A pooled alias needs no wave, because its threads hold no connection between
+# units of work. The thread that finds a dead pooled connection drains the pool
+# instead (see ``_drain_pool``).
+#
+# ``_generation_epoch`` counts the advances of every alias. Each thread records
+# the last epoch that it checked, so the check before a call costs one
+# comparison until the next connection dies.
+_generations: dict[str, int] = {}
+_generation_epoch = 0
+_generation_lock = threading.Lock()
+_GENERATION_ATTR = "_django_bolt_connection_generation"
+_POOL_EPOCH_ATTR = "_django_bolt_pool_epoch"
+# alias -> number of drains of its pool. A driver connection records the value
+# at its first checkout.
+_pool_epochs: dict[str, int] = {}
+
+
+class _ThreadState(threading.local):
+    # Class defaults: a missing attribute of a thread-local costs an exception on each read.
+    epoch = 0
+    # The nesting depth of _call_guarded on this thread. Pooled connections go
+    # back to their pools when the outermost call ends.
+    depth = 0
+    # Set on a request lane. A lane runs its checks and gives back its pooled
+    # connections one time, at the start and the end of its request.
+    is_lane = False
+    active = False
+    # Set when this thread checks out a pooled connection. A call that used no
+    # pooled connection skips the release, which reads Django's connection
+    # handler through a lock.
+    holds_pooled = False
+    # Set on a worker of a Bolt executor. It gives its pooled connections back
+    # when its queue is empty (see _ReleasePooledConnectionsWhenIdle), not
+    # after each call, so calls that wait in its queue use the same connection.
+    releases_when_idle = False
+
+
+_thread_state = _ThreadState()
+
+
+def _stamp_connection_generation(sender: object, connection: object, **kwargs: object) -> None:
+    alias = connection.alias
+    setattr(connection, _GENERATION_ATTR, _generations.get(alias, 0))
+    if alias in _pooled_aliases:
+        # Django sends connection_created for each checkout from a pool, so the
+        # epoch goes on the driver connection, which keeps it while it is in the pool.
+        raw = connection.connection
+        if not hasattr(raw, _POOL_EPOCH_ATTR):
+            setattr(raw, _POOL_EPOCH_ATTR, _pool_epochs.get(alias, 0))
+        _thread_state.holds_pooled = True
+
+
+connection_created.connect(_stamp_connection_generation, dispatch_uid="django_bolt.connection_generation")
+
+
+def _connections_died(dead: list[tuple[object, object]]) -> None:
+    """Start a reconnect wave or drain a pool for each event that ``dead`` reports.
+
+    ``dead`` holds (Django connection, driver connection) pairs.
+    """
+    global _generation_epoch
+    for conn, raw in dead:
+        alias = conn.alias
+        if alias in _pooled_aliases:
+            _drain_pool(conn, raw)
+            continue
+        with _generation_lock:
+            generation = _generations.get(alias, 0)
+            if getattr(conn, _GENERATION_ATTR, -1) == generation:
+                _generations[alias] = generation + 1
+                _generation_epoch += 1
+
+
+def _drain_pool(conn: object, raw: object) -> None:
+    """Drain the pool of ``conn`` when ``raw`` is the first of its connections that the event ended.
+
+    The event that ended this connection usually ended the other connections
+    of its pool too. Without a check callback, the pool would give each dead
+    idle connection to a request that then fails. With one, getconn() tests
+    idle connections one at a time and sleeps after each one that fails: 0, 1,
+    2, 4 s and so on. drain() closes the idle connections with no network I/O,
+    so a partition cannot make this thread wait. The pool also drops each older
+    connection that a thread gives back. A driver connection from an earlier
+    drain is part of an event that a drain already handled, so it drains nothing.
+    """
+    pool = getattr(conn, "pool", None)
+    # psycopg_pool adds drain() in 3.3. An older pool keeps its idle
+    # connections; each fails one request (see check_pool_environment).
+    if pool is None or not hasattr(pool, "drain"):
+        return
+    alias = conn.alias
+    with _generation_lock:
+        epoch = _pool_epochs.get(alias, 0)
+        if getattr(raw, _POOL_EPOCH_ATTR, epoch) != epoch:
+            return
+        _pool_epochs[alias] = epoch + 1
+    pool.drain()
+
+
+def _close_connections_of_older_generations() -> None:
+    """Close the calling thread's connections that opened before their alias last advanced."""
+    epoch = _generation_epoch
+    if _thread_state.epoch == epoch:
+        return
+    closed_all = True
+    for conn in connections.all(initialized_only=True):
+        if conn.connection is None or getattr(conn, _GENERATION_ATTR, -1) >= _generations.get(conn.alias, 0):
+            continue
+        if conn.in_atomic_block:
+            # The block owns the connection. The next call after the block closes it.
+            closed_all = False
+        # The TestClient shares one connection between threads. Its owner closes it.
+        elif not getattr(conn, _SHARED_TEST_CONNECTION_ATTR, False):
+            conn.close()
+    if closed_all:
+        _thread_state.epoch = epoch
+
+
+def _check_before_pool_call() -> None:
+    stale = _thread_state.epoch != _generation_epoch
+    # A lane does these checks one time, at the start of its request.
+    if (stale or _check_before_call) and not _thread_state.is_lane:
+        if stale:
+            _close_connections_of_older_generations()
+        if _check_before_call:
+            _drop_broken_connections()
+
+
+def release_pooled_connections() -> None:
+    """Give the calling thread's pooled connections back to their pools.
+
+    A connection inside an open ``atomic`` block stays: the block owns it.
+    """
+    kept = False
+    for alias in _pooled_aliases:
+        conn = connections[alias]
+        if conn.connection is None or getattr(conn, _SHARED_TEST_CONNECTION_ATTR, False):
+            continue
+        if conn.in_atomic_block:
+            kept = True
+        else:
+            conn.close()
+    _thread_state.holds_pooled = kept
 
 
 def _call_guarded[T](fn: Callable[..., T], *args: object, **kwargs: object) -> T:
     """Call ``fn`` on the pool thread and drop dead connections when it raises."""
-    # A lane does this check one time, at the start of its request.
-    if _check_before_call and not _on_lane_thread():
-        _drop_broken_connections()
+    if (_generation_epoch and _thread_state.epoch != _generation_epoch) or _check_before_call:
+        _check_before_pool_call()
+    if _pooled_aliases:
+        return _call_guarded_pooled(fn, args, kwargs)
     try:
         return fn(*args, **kwargs)
     except Exception:
@@ -77,25 +267,102 @@ def _call_guarded[T](fn: Callable[..., T], *args: object, **kwargs: object) -> T
         raise
 
 
+def _call_guarded_pooled[T](fn: Callable[..., T], args: tuple[object, ...], kwargs: dict[str, object]) -> T:
+    """``_call_guarded`` when a database uses a pool: the outermost call also gives back its pooled connections."""
+    state = _thread_state
+    state.depth += 1
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        _drop_broken_connections()
+        raise
+    finally:
+        state.depth -= 1
+        # A lane gives its pooled connections back at the end of its request,
+        # and an executor worker when its queue is empty.
+        if state.holds_pooled and not state.depth and not (state.is_lane or state.releases_when_idle):
+            release_pooled_connections()
+
+
+class _ReleasePooledConnectionsWhenIdle:
+    """The idle semaphore of a Bolt executor. A worker that goes idle gives its pooled connections back.
+
+    A ``ThreadPoolExecutor`` worker calls ``release()`` on its own thread when
+    its queue is empty, just before it waits for the next item (CPython 3.12
+    to 3.14). While calls wait in the queue, the worker keeps its connection,
+    so a burst does not pay a pool checkout for each call. An idle worker
+    holds no pool slot.
+    """
+
+    __slots__ = ("_semaphore",)
+
+    def __init__(self, semaphore: threading.Semaphore) -> None:
+        self._semaphore = semaphore
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        return self._semaphore.acquire(blocking, timeout)
+
+    def release(self, n: int = 1) -> None:
+        if _thread_state.holds_pooled:
+            try:
+                release_pooled_connections()
+            except Exception:
+                # An exception here would end the worker thread, and the
+                # executor would not start a new one.
+                logger.exception("Could not give the pooled database connections of an idle worker back")
+        self._semaphore.release(n)
+
+
+# False when this Python's ThreadPoolExecutor has no idle semaphore. The
+# workers then give their pooled connections back after each call.
+_idle_release_available = True
+
+
+def _new_executor(
+    workers: int, thread_name_prefix: str, initializer: Callable[[], None] | None = None
+) -> concurrent.futures.ThreadPoolExecutor:
+    """Make a Bolt executor whose workers give their pooled connections back when they go idle.
+
+    ``initializer`` runs on each worker thread when it starts, as in ``ThreadPoolExecutor``.
+    """
+    global _idle_release_available
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix=thread_name_prefix,
+        initializer=partial(_mark_executor_thread, initializer),
+    )
+    semaphore = getattr(executor, "_idle_semaphore", None)
+    if semaphore is None:
+        _idle_release_available = False
+    else:
+        executor._idle_semaphore = _ReleasePooledConnectionsWhenIdle(semaphore)
+    return executor
+
+
+def _mark_executor_thread(initializer: Callable[[], None] | None) -> None:
+    _thread_state.releases_when_idle = _idle_release_available
+    if initializer is not None:
+        initializer()
+
+
 # Request lanes: see crates/bolt-core/src/lane.rs.
-_lane_state = threading.local()
 _SHARED_TEST_CONNECTION_ATTR = "_django_bolt_shared_test_connection"
 
 
 def mark_lane_thread() -> None:
     """Mark the calling thread as a lane. Rust calls this when a lane starts."""
-    _lane_state.is_lane = True
+    _thread_state.is_lane = True
     # A lane checks its own connections, so it must not depend on the start of a pool.
     configure_connection_checks()
 
 
 def _on_lane_thread() -> bool:
-    return getattr(_lane_state, "is_lane", False)
+    return _thread_state.is_lane
 
 
 def in_lane_mode() -> bool:
     """Whether the calling thread is a request lane that runs a complete request."""
-    return getattr(_lane_state, "active", False)
+    return _thread_state.active
 
 
 def run_on_request_lane[T](coro_fn: Callable[..., Coroutine[object, object, T]], *args: object) -> T:
@@ -113,14 +380,14 @@ def run_on_request_lane[T](coro_fn: Callable[..., Coroutine[object, object, T]],
 def _drive_in_lane_mode[T](coro_fn: Callable[..., Coroutine[object, object, T]], args: tuple[object, ...]) -> T:
     # Lane mode ends with the request. The next owner of this lane can be an
     # async request, whose coroutines do suspend.
-    _lane_state.active = True
+    _thread_state.active = True
     # ``async_to_sync`` in a sync handler runs its coroutine on a different
     # thread. With this context, its thread-sensitive work returns to the lane.
     SyncToAsync.thread_sensitive_context.set(ThreadSensitiveContext())
     try:
         return drive_on_lane(coro_fn(*args))
     finally:
-        _lane_state.active = False
+        _thread_state.active = False
         close_lane_request()
 
 
@@ -138,6 +405,7 @@ def drive_on_lane[T](coro: Coroutine[object, object, T]) -> T:
 
 def open_lane_request() -> None:
     """Start a request on a lane. Rust calls this before the first sync call of an async request."""
+    _close_connections_of_older_generations()
     if _check_before_call:
         _drop_broken_connections()
 
@@ -148,17 +416,40 @@ def close_lane_request() -> None:
     Bolt does not see a database error that user code handles, or one from a
     direct ``sync_to_async`` call. Django does this check on ``request_finished``.
     """
+    dead = []
     for conn in connections.all(initialized_only=True):
         if conn.errors_occurred and not conn.in_atomic_block:
-            conn.close_if_unusable_or_obsolete()
+            raw = _close_if_unusable_or_obsolete(conn)
+            if raw is not None:
+                dead.append((conn, raw))
+    if dead:
+        _connections_died(dead)
+    if _thread_state.holds_pooled:
+        release_pooled_connections()
 
 
-def close_lane_connections() -> None:
-    """Close the connections of a lane that stops. Rust calls this on the lane thread."""
+def _close_thread_connections() -> None:
+    """Close the calling thread's connections. A pooled connection goes back to its pool."""
     for conn in connections.all(initialized_only=True):
         # The TestClient shares one connection between threads. Its owner closes it.
         if not getattr(conn, _SHARED_TEST_CONNECTION_ATTR, False):
             conn.close()
+
+
+def close_lane_connections() -> None:
+    """Close the connections of a lane that stops. Rust calls this on the lane thread."""
+    _close_thread_connections()
+
+
+def close_stream_connections() -> None:
+    """Close the connections of a thread that iterated a sync streaming body. Rust calls this on that thread.
+
+    The thread exists for one response. A connection that it opened would
+    otherwise stay open until garbage collection, and a pooled one would never
+    go back to its pool: each such response would hold one pool slot for the
+    life of the process.
+    """
+    _close_thread_connections()
 
 
 # Shared default pool for generic blocking work. Passing an explicit executor
@@ -196,7 +487,7 @@ def _thread_count(name: str) -> int | None:
 
 def check_pool_environment() -> None:
     """
-    Check the thread counts of the pools at startup.
+    Check the thread counts of the pools and the connection pools at startup.
 
     The pools start at their first use. The server calls this function at
     startup, so an invalid value stops startup and not a later request.
@@ -207,6 +498,66 @@ def check_pool_environment() -> None:
     """
     _thread_count("DJANGO_BOLT_EXECUTOR_THREADS")
     _thread_count("DJANGO_BOLT_ORM_THREADS")
+    configure_connection_checks()
+    _check_connection_pools()
+
+
+def _check_connection_pools() -> None:
+    """Log a warning for each PostgreSQL connection pool that Bolt cannot fully support.
+
+    Bolt drains the pool of a connection that it finds dead. ``drain()`` is in
+    psycopg_pool 3.3 and later. Without it, the pool keeps its dead idle
+    connections after a restart, and each one fails one request.
+
+    A Bolt worker gives its pooled connection back when it goes idle, so a
+    pool ``check`` callback runs on each checkout after an idle time: one more
+    round trip for many ORM calls. ``CONN_HEALTH_CHECKS`` adds that callback.
+    The drain already removes the connections that a restart ends.
+    """
+    if not settings.configured:
+        return
+    for alias, db in connections.settings.items():
+        pool_options = db.get("OPTIONS", {}).get("pool")
+        # The vendor covers backends on top of PostgreSQL, such as PostGIS.
+        if not pool_options or connections[alias].vendor != "postgresql":
+            continue
+        # The `pool` extra installs psycopg_pool. Only a pooled PostgreSQL database needs it.
+        from psycopg_pool import ConnectionPool  # noqa: PLC0415
+
+        if not hasattr(ConnectionPool, "drain"):
+            logger.warning(
+                "DATABASES[%r] uses Django's connection pool with a psycopg_pool before 3.3. "
+                "After a database restart, each dead idle connection of the pool fails one request. "
+                'Install "django-bolt[pool]" for psycopg_pool 3.3 or later.',
+                alias,
+            )
+        has_check = isinstance(pool_options, dict) and pool_options.get("check") is not None
+        if has_check or db.get("CONN_HEALTH_CHECKS"):
+            logger.warning(
+                "DATABASES[%r] gives its connection pool a check callback%s. Bolt returns a pooled "
+                "connection when a worker goes idle, so the check adds a round trip to many calls. "
+                "Bolt drains the pool when it finds a dead connection, so the check is not necessary.",
+                alias,
+                "" if has_check else " through CONN_HEALTH_CHECKS",
+            )
+
+
+def close_connections_and_pools() -> None:
+    """Close the calling thread's connections and each connection pool of the process.
+
+    A forked child inherits the sockets of the open connections of its parent.
+    Two processes that use one socket read each other's query results. A pool
+    keeps its idle connections open after ``close()``, so the pool must close
+    too. ``runbolt`` calls this in its parent before each fork.
+    """
+    for conn in connections.all(initialized_only=True):
+        conn.close()
+    for alias, db in connections.settings.items():
+        if not db.get("OPTIONS", {}).get("pool"):
+            continue
+        close_pool = getattr(connections[alias], "close_pool", None)
+        if close_pool is not None:
+            close_pool()
 
 
 def _get_default_executor() -> concurrent.futures.ThreadPoolExecutor:
@@ -218,9 +569,7 @@ def _get_default_executor() -> concurrent.futures.ThreadPoolExecutor:
         if _default_executor is None:
             workers = _thread_count("DJANGO_BOLT_EXECUTOR_THREADS") or min(32, (os.cpu_count() or 1) + 4)
             configure_connection_checks()
-            _default_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="bolt_default"
-            )
+            _default_executor = _new_executor(workers, "bolt_default")
         return _default_executor
 
 
@@ -291,11 +640,7 @@ def _get_orm_executor() -> concurrent.futures.ThreadPoolExecutor:
         if _orm_executor is None:
             workers = _thread_count("DJANGO_BOLT_ORM_THREADS") or _default_orm_workers()
             configure_connection_checks()
-            _orm_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=workers,
-                thread_name_prefix="bolt_orm",
-                initializer=_mark_orm_thread,
-            )
+            _orm_executor = _new_executor(workers, "bolt_orm", _mark_orm_thread)
         return _orm_executor
 
 
@@ -427,7 +772,7 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     """
     loop = _get_running_loop()
     if loop is None:
-        if _thread_sensitive_context.get(None) is None or getattr(_lane_state, "is_lane", False):
+        if _thread_sensitive_context.get(None) is None or _thread_state.is_lane:
             return contextvars.copy_context().run(fn, *args)
         raise LaneAffinityError(_OFF_LANE_ORM_CALL)
     context = _thread_sensitive_context.get(None)

@@ -122,6 +122,8 @@ class WorkerSupervisor:
         self._shutdown_requested = False
         self._shutdown_signaled = False
         self._force_kill = False
+        # Set when a worker exits with an error and is not replaced.
+        self._unreplaced_failure = False
         # Interruptible sleep: request_shutdown() wakes the loop immediately
         # instead of waiting out the current check interval.
         self._wakeup = threading.Event()
@@ -135,18 +137,28 @@ class WorkerSupervisor:
         for slot in range(self.processes):
             self._spawn_slot(slot)
 
-    def run(self) -> None:
+    def run(self) -> int:
         """Supervise until all workers have exited.
 
         Without ``respawn_failed`` the loop also ends when every worker has
         died on its own (matching the historical runbolt behavior of the
         parent exiting once all children are gone).
+
+        Returns:
+            The exit status for the parent: 1 when the workers ended without a
+            shutdown request and at least one of them exited with an error,
+            else 0. A process manager then sees the failure, for example
+            ``Restart=on-failure`` in systemd.
         """
         self.start()
         while self._workers or self._draining:
             self._wakeup.wait(self.check_interval)
             self._wakeup.clear()
             self.tick()
+        if self._unreplaced_failure and not self._shutdown_requested:
+            self._log("Every worker has exited and at least one failed; stopping with exit status 1")
+            return 1
+        return 0
 
     def tick(self) -> None:
         """One supervision pass: reap, then recycle/terminate as needed."""
@@ -211,6 +223,8 @@ class WorkerSupervisor:
             self._log(f"Worker {pid} (slot {worker.slot}) exited unexpectedly (code {exit_code}); respawning")
             self._spawn_slot(worker.slot)
         else:
+            if exit_code != 0:
+                self._unreplaced_failure = True
             self._log(
                 f"Worker {pid} (slot {worker.slot}) exited unexpectedly (code {exit_code}); "
                 f"not respawning (enable with --respawn-failed-workers)"

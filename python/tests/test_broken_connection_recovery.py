@@ -5,11 +5,14 @@ Bolt keeps Django connections open across requests (no
 every later request on that thread must fail unless the framework drops it
 on the error path.
 
-Two tiers, both in ``concurrency._call_guarded``:
+Three tiers, all in ``concurrency._call_guarded``:
 
 - Always: a pool call that raises drops the unusable connections of its
   thread. The request that met the dead connection fails, the next one
   reconnects.
+- Always: when the dropped connection did not answer, every thread closes
+  its older connections before its next call (a lane, when its request
+  starts). A database restart then fails one call, not one on each thread.
 - With ``CONN_MAX_AGE`` or ``CONN_HEALTH_CHECKS`` set (the
   ``_check_before_call`` gate): the same check also runs before each call.
   Django's health check then finds a dead connection before the query, and
@@ -17,7 +20,7 @@ Two tiers, both in ``concurrency._call_guarded``:
 
 Django's async ORM API (``aget``, ``acount``, ``async for``) is
 ``sync_to_async(thread_sensitive=True)``. In a route without Django
-middleware, Bolt runs these calls on the ORM pool, so the same two tiers
+middleware, Bolt runs these calls on the ORM pool, so the same tiers
 apply to them.
 
 ``test_dead_connection_recovery_server_integration.py`` runs the user-loading
@@ -26,6 +29,7 @@ path against PostgreSQL on a real server.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import sqlite3
 import threading
@@ -35,7 +39,8 @@ import jwt
 import pytest
 from asgiref.sync import async_to_sync, sync_to_async
 from django.contrib.auth.models import User
-from django.db import connection, connections
+from django.db import DatabaseError, connection, connections
+from django.db.backends.signals import connection_created
 from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteWrapper
 
 from django_bolt import BoltAPI, concurrency
@@ -215,6 +220,188 @@ def test_nested_orm_handoff_inside_a_thread_sensitive_call_with_one_orm_thread(s
         assert not worker.is_alive(), "the request did not answer in 5 s: the nested hand-off waits for its own thread"
         assert result[0].status_code == 200
         assert result[0].json() == {"value": 1}
+
+
+# --- One dead connection retires the connections of every thread -----------
+
+
+def _isolate_generations(monkeypatch) -> None:
+    """A connection that dies in a test must not retire the connections of later tests."""
+    monkeypatch.setattr(concurrency, "_generations", dict(concurrency._generations))
+    monkeypatch.setattr(concurrency, "_generation_epoch", concurrency._generation_epoch)
+    monkeypatch.setattr(concurrency, "_pool_epochs", dict(concurrency._pool_epochs))
+
+
+@pytest.fixture
+def two_orm_threads(monkeypatch):
+    monkeypatch.setattr(SQLiteWrapper, "is_usable", _sqlite_is_usable)
+    # A connection that dies in a test must not retire the connections of later tests.
+    _isolate_generations(monkeypatch)
+    pool = _orm_pool(2)
+    monkeypatch.setattr(concurrency, "_orm_executor", pool)
+    yield
+    shutdown_closing_connections(pool)
+
+
+def _query_a_missing_table() -> None:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM bolt_no_such_table")
+
+
+def _query_a_missing_table_with_autocommit_off() -> None:
+    # The call ends with autocommit off, so Django closes the connection
+    # before it tests whether the connection answers.
+    connection.set_autocommit(False)
+    _query_a_missing_table()
+
+
+def _orm_threads_api() -> BoltAPI:
+    api = BoltAPI()
+    queries = {
+        "select": _select_one,
+        "kill": _kill_silently,
+        "missing-table": _query_a_missing_table,
+        "missing-table-no-autocommit": _query_a_missing_table_with_autocommit_off,
+    }
+
+    @api.get("/orm-threads/{query}")
+    async def orm_threads(query: str, count: int):
+        """Run ``query`` on ``count`` ORM pool threads at the same time.
+
+        The barrier holds each call until all of them run, so each call has a
+        thread of its own. Each result is ``"ok"`` or the name of the error.
+        """
+        barrier = threading.Barrier(count, timeout=5)
+
+        def run() -> str:
+            barrier.wait()
+            queries[query]()
+            return "ok"
+
+        results = await asyncio.gather(
+            *(concurrency.run_in_orm_executor(run) for _ in range(count)), return_exceptions=True
+        )
+        return [result if isinstance(result, str) else type(result).__name__ for result in results]
+
+    return api
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_dead_connection_retires_the_connections_of_every_thread(two_orm_threads):
+    """A database restart kills every connection, but each thread sees this only when it uses its own.
+
+    The first call that meets a dead connection fails. The calls after it
+    reconnect on every thread, not only on the thread of the failure. Without
+    that, each thread fails one call of its own.
+    """
+    with TestClient(_orm_threads_api()) as client:
+        assert client.get("/orm-threads/select?count=2").json() == ["ok", "ok"]
+        assert client.get("/orm-threads/kill?count=2").json() == ["ok", "ok"]
+
+        assert client.get("/orm-threads/select?count=1").json() == ["OperationalError"]
+        assert client.get("/orm-threads/select?count=2").json() == ["ok", "ok"]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("query", ["missing-table", "missing-table-no-autocommit"])
+def test_an_error_on_a_connection_that_still_answers_retires_nothing(two_orm_threads, query):
+    """A failed query is not a dead connection. The other thread keeps its connection.
+
+    The thread of the error drops its own connection as obsolete: the test
+    database has the default ``CONN_MAX_AGE`` of 0. Thus one thread reconnects.
+    """
+    opened: list[object] = []
+
+    def count(sender, connection, **kwargs) -> None:
+        opened.append(connection)
+
+    with TestClient(_orm_threads_api()) as client:
+        assert client.get("/orm-threads/select?count=2").json() == ["ok", "ok"]
+        connection_created.connect(count)
+        try:
+            assert client.get(f"/orm-threads/{query}?count=1").json() == ["OperationalError"]
+            assert client.get("/orm-threads/select?count=2").json() == ["ok", "ok"]
+        finally:
+            connection_created.disconnect(count)
+
+    assert len(opened) == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_lane_reconnects_when_a_request_starts_after_another_thread_met_a_dead_connection(monkeypatch):
+    """A lane runs its checks in ``open_lane_request``, not before each call."""
+    monkeypatch.setattr(SQLiteWrapper, "is_usable", _sqlite_is_usable)
+    _isolate_generations(monkeypatch)
+    lane, pool = _orm_pool(1), _orm_pool(1)
+    monkeypatch.setattr(concurrency, "_orm_executor", pool)
+    try:
+        lane.submit(_kill_silently).result()
+        with TestClient(_orm_threads_api()) as client:
+            assert client.get("/orm-threads/kill?count=1").json() == ["ok"]
+            assert client.get("/orm-threads/select?count=1").json() == ["OperationalError"]
+
+        lane.submit(concurrency.open_lane_request).result()
+
+        assert lane.submit(_select_one).result() == 1
+    finally:
+        shutdown_closing_connections(lane)
+        shutdown_closing_connections(pool)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_one_event_makes_one_reconnect_wave(monkeypatch):
+    """A thread that meets a dead connection of an event that already advanced the generation advances nothing.
+
+    Thread A finds the first dead connection, and thread C reconnects before
+    its next call. Thread B started its call before the advance, so it meets
+    its dead connection later. Without the check, B advances the generation a
+    second time, and C closes the connection that it has just opened.
+    """
+    monkeypatch.setattr(SQLiteWrapper, "is_usable", _sqlite_is_usable)
+    _isolate_generations(monkeypatch)
+    a, b, c = _orm_pool(1), _orm_pool(1), _orm_pool(1)
+    b_in_call = threading.Event()
+    b_may_query = threading.Event()
+
+    def wait_then_select() -> int:
+        # The check before the call has run: B keeps its dead connection.
+        b_in_call.set()
+        b_may_query.wait(5)
+        return _select_one()
+
+    opened_on_c: list[object] = []
+
+    def count_on_c(sender, connection, **kwargs) -> None:
+        if threading.get_ident() == c_thread:
+            opened_on_c.append(connection)
+
+    try:
+        for pool in (a, b, c):
+            assert pool.submit(concurrency._call_guarded, _select_one).result() == 1
+        c_thread = c.submit(threading.get_ident).result()
+        for pool in (a, b, c):
+            pool.submit(_kill_silently).result()
+
+        late = b.submit(concurrency._call_guarded, wait_then_select)
+        assert b_in_call.wait(5), "thread B did not start its call"
+        with pytest.raises(DatabaseError):
+            a.submit(concurrency._call_guarded, _select_one).result()
+
+        connection_created.connect(count_on_c)
+        try:
+            assert c.submit(concurrency._call_guarded, _select_one).result() == 1
+            b_may_query.set()
+            with pytest.raises(DatabaseError):
+                late.result(5)
+            assert c.submit(concurrency._call_guarded, _select_one).result() == 1
+        finally:
+            connection_created.disconnect(count_on_c)
+    finally:
+        b_may_query.set()
+        for pool in (a, b, c):
+            shutdown_closing_connections(pool)
+
+    assert len(opened_on_c) == 1, "thread C reconnected again after the second report of the same event"
 
 
 # --- The user-loading path and the _check_before_call gate ------------------

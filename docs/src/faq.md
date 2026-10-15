@@ -31,7 +31,7 @@ The performance comes from *where* work runs (routing, auth, guards, CORS, rate 
 
 ## Do I need gunicorn or uvicorn?
 
-**No.** `runbolt` *is* the production server. It runs multiple processes with `SO_REUSEPORT` kernel load balancing, recycles workers by RSS or lifetime, respawns on crash, and drains WebSockets on shutdown. See [Deployment](getting-started/deployment.md).
+**No.** `runbolt` *is* the production server. It runs multiple processes with `SO_REUSEPORT` kernel load balancing on Linux, recycles workers by RSS or lifetime, respawns on crash, and drains WebSockets on shutdown. See [Deployment](getting-started/deployment.md).
 
 ```bash
 python manage.py runbolt --host 0.0.0.0 --port 8000 --processes 4
@@ -71,9 +71,9 @@ Python 3.12, 3.13, 3.14 (CPython and PyPy), and the free-threaded build of CPyth
 
 ## Why does `runbolt` hang on macOS when it connects to PostgreSQL?
 
-This affects local development on macOS with libpq (psycopg). A forked `runbolt` worker can hang when it opens a PostgreSQL connection. Workers fork with `--processes 2` or more, and with a worker recycling option (`--max-rss`, `--workers-lifetime`, `--respawn-failed-workers`). When libpq is built with GSSAPI support, the libpq option `gssencmode` is `prefer` by default. With `prefer`, libpq calls the macOS Kerberos (GSS) framework on each TCP connection. That framework is not safe to use after `fork()`. A libpq build without GSSAPI support does not call the framework, so this cause does not apply to it.
+This affects local development on macOS with libpq (psycopg). A forked `runbolt` worker can hang, or stop with a segmentation fault, when it opens a PostgreSQL connection. This occurs with and without Django's connection pool. Workers fork with `--processes 2` or more, and with a worker recycling option (`--max-rss`, `--workers-lifetime`, `--respawn-failed-workers`). When libpq is built with GSSAPI support, the libpq option `gssencmode` is `prefer` by default. With `prefer`, libpq calls the macOS Kerberos (GSS) framework on each TCP connection. That framework is not safe to use after `fork()`. A libpq build without GSSAPI support does not call the framework, so this cause does not apply to it.
 
-To prevent the hang, disable GSSAPI encryption. Set the environment variable before you start the server:
+To prevent this, disable GSSAPI encryption. Set the environment variable before you start the server:
 
 ```bash
 PGGSSENCMODE=disable python manage.py runbolt --processes 2
@@ -124,7 +124,7 @@ This setting turns off GSSAPI encryption only. If the connection must be encrypt
    "name": "Do I need gunicorn or uvicorn?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "No. runbolt is the production server. It runs multiple processes with SO_REUSEPORT kernel load balancing, recycles workers by RSS or lifetime, respawns on crash, and drains WebSockets on shutdown. See Deployment."
+    "text": "No. runbolt is the production server. It runs multiple processes with SO_REUSEPORT kernel load balancing on Linux, recycles workers by RSS or lifetime, respawns on crash, and drains WebSockets on shutdown. See Deployment."
    }
   },
   {
@@ -196,7 +196,7 @@ This setting turns off GSSAPI encryption only. If the connection must be encrypt
    "name": "Why does runbolt hang on macOS when it connects to PostgreSQL?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "This affects local development on macOS with libpq (psycopg). A forked runbolt worker can hang when it opens a PostgreSQL connection. Workers fork with --processes 2 or more, and with a worker recycling option. When libpq is built with GSSAPI support, gssencmode is prefer by default, so libpq calls the macOS Kerberos (GSS) framework, which is not safe to use after fork(). Set PGGSSENCMODE=disable, or set \"gssencmode\": \"disable\" in DATABASES[\"default\"][\"OPTIONS\"]. This turns off GSSAPI encryption only; use TLS with sslmode if the connection must be encrypted. Linux does not need this setting."
+    "text": "This affects local development on macOS with libpq (psycopg). A forked runbolt worker can hang, or stop with a segmentation fault, when it opens a PostgreSQL connection. This occurs with and without Django's connection pool. Workers fork with --processes 2 or more, and with a worker recycling option. When libpq is built with GSSAPI support, gssencmode is prefer by default. Then libpq calls the macOS Kerberos (GSS) framework, which is not safe to use after fork(). Set PGGSSENCMODE=disable, or set \"gssencmode\": \"disable\" in DATABASES[\"default\"][\"OPTIONS\"]. This turns off GSSAPI encryption only; use TLS with sslmode if the connection must be encrypted. Linux does not need this setting."
    }
   }
  ]

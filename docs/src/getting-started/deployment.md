@@ -15,7 +15,7 @@ Use `--processes` to scale your API. Each process runs a separate Python interpr
 python manage.py runbolt --processes 4
 ```
 
-Under the hood, Django-Bolt uses `SO_REUSEPORT` so the kernel load-balances incoming connections across all processes.
+Under the hood, Django-Bolt uses `SO_REUSEPORT` so the kernel load-balances incoming connections across all processes. Linux does this. macOS accepts `SO_REUSEPORT` but sends each connection to one process, so more processes add no throughput in local development on a Mac.
 
 **Rule of thumb:** Set `--processes` to the number of CPU cores available.
 
@@ -167,7 +167,7 @@ BOLT_EMIT_SIGNALS = False
 
 With signals disabled, don't rely on request-signal-driven connection recycling.
 
-Bolt keeps each thread's connection open between requests. It drops the connection when a query on it raises. A connection that the database closed therefore costs one failed request per thread, not a process restart. To serve every request through a database failover, set `CONN_HEALTH_CHECKS = True`. Bolt then runs Django's connection check before each executor call. The health check replaces a dead connection before the query. Add a positive `CONN_MAX_AGE` to keep connections between calls. Neither setting is on by default. See [Database Connection Management](../topics/signals.md#database-connection-management).
+Without a connection pool, Bolt keeps each thread's connection open between requests. It drops the connection when a query on it raises. When that connection does not answer, every thread reconnects to that database before its next call. Connections to other databases stay open. A database restart therefore costs the request that meets the first dead connection, and requests that run at that time can fail too. It does not need a process restart. To serve every request through a database failover, set `CONN_HEALTH_CHECKS = True`. Bolt then runs Django's connection check before each executor call. The health check replaces a dead connection before the query. Add a positive `CONN_MAX_AGE` to keep connections between calls. Neither setting is on by default. With a connection pool, read the next section instead. See [Database Connection Management](../topics/signals.md#database-connection-management).
 
 For ASGI deployments, keep persistent connections disabled (`CONN_MAX_AGE = 0`) and use pooling. See [Persistent connections](https://docs.djangoproject.com/en/6.0/ref/databases/#persistent-connections).
 
@@ -195,7 +195,34 @@ DATABASES = {
 }
 ```
 
-Requires `psycopg[pool]` (`pip install "psycopg[pool]"`). With psycopg2, Django raises `ImproperlyConfigured` if `OPTIONS["pool"]` is set.
+Install the `pool` extra: `pip install "django-bolt[pool]"`. It installs psycopg with psycopg_pool 3.3 or later. The extra does not install libpq, which psycopg needs at run time. Install libpq on the host, or install `psycopg[binary]`. On free-threaded Python, `psycopg[binary]` has no wheel, so install libpq. With psycopg2, Django raises `ImproperlyConfigured` if `OPTIONS["pool"]` is set.
+
+With a pool, a thread of Bolt holds a connection only while it has work. A worker of the ORM or executor thread pool gives the connection back when its queue is empty. Calls that wait in its queue use the same connection. A request lane gives it back at the end of its request. A thread that your code starts keeps its connection until it closes the connection. Thus `max_size` limits the queries in flight in one process, not the threads. Set `max_size` to the number of calls that can query at the same time in one process. Count the ORM threads, the executor threads, and the concurrent requests on routes with Django middleware. A request that waits for a connection longer than the pool `timeout` (30 s by default) fails.
+
+`runbolt --processes N` closes the connections and the pools of its parent before it starts each worker. Each worker opens its own pool.
+
+On macOS, a forked worker can hang or crash when it opens a PostgreSQL connection. Set `PGGSSENCMODE=disable` for local development. See [the FAQ](../faq.md#why-does-runbolt-hang-on-macos-when-it-connects-to-postgresql).
+
+Leave `CONN_HEALTH_CHECKS` off for a pooled database, and do not set `check` in `OPTIONS["pool"]`. The pool runs a check on each checkout, and a worker checks out a connection again after each idle time. Thus many ORM calls get one more round trip. Bolt logs a warning at startup when a pool has a check.
+
+After a database restart, Bolt drains the pool when it finds the first dead connection. The pool closes its idle connections, and it drops each older connection that a thread gives back. This needs psycopg_pool 3.3 or later, which the `pool` extra installs. With an older version, Bolt logs a warning at startup and does not drain the pool. Then each dead idle connection of the pool fails one request. See [Database Connection Management](../topics/signals.md#database-connection-management).
+
+### Network partitions
+
+During a network partition, a query gets no answer and no error. The request waits until TCP closes the connection. With the default settings of Linux, that takes 15 minutes or more. A new connection waits without limit. Set TCP timeouts in `OPTIONS`. Django passes them to libpq:
+
+```python
+# settings.py
+DATABASES["default"]["OPTIONS"] |= {
+    "connect_timeout": 5,  # seconds for a new connection
+    "keepalives_idle": 5,  # seconds idle before the first keepalive
+    "keepalives_interval": 2,  # seconds between unanswered keepalives
+    "keepalives_count": 3,  # unanswered keepalives before the connection is dead
+    "tcp_user_timeout": 10000,  # milliseconds that sent data may stay unacknowledged
+}
+```
+
+With these values, TCP closes a connection that gets no answer after about 10 s: 10 s for sent data with no acknowledgement, or 5 + 3 × 2 s for a connection that waits for a result. The request then fails, and Bolt drops the connection. `keepalives_*` and `tcp_user_timeout` need support from the operating system. Linux has it. See [libpq connection parameters](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-PARAMKEYWORDS). A `statement_timeout` does not help here, because the server cannot send its error.
 
 ### Option 2: PgBouncer (external pooler)
 

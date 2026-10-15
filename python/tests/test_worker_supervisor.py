@@ -271,3 +271,67 @@ def test_get_rss_bytes_returns_none_for_dead_pid():
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait()
     assert get_rss_bytes(child.pid) is None
+
+
+def _spawn_then_exit(env: FakeWorkerEnv, status: int):
+    def spawn(slot: int) -> int:
+        pid = env.spawn(slot)
+        env.exit(pid, status)
+        return pid
+
+    return spawn
+
+
+def test_run_fails_when_every_worker_exits_with_an_error():
+    """A process manager must see the failure, for example ``Restart=on-failure`` in systemd."""
+    env = FakeWorkerEnv()
+    exit_code_1 = 1 << 8  # the wait status of a process that called exit(1)
+    supervisor = make_supervisor(env, processes=2, spawn=_spawn_then_exit(env, exit_code_1), check_interval=0.01)
+
+    assert supervisor.run() == 1
+
+
+def test_run_succeeds_when_the_workers_exit_cleanly_on_their_own():
+    env = FakeWorkerEnv()
+    supervisor = make_supervisor(env, processes=2, spawn=_spawn_then_exit(env, 0), check_interval=0.01)
+
+    assert supervisor.run() == 0
+
+
+def test_run_succeeds_after_a_requested_shutdown():
+    env = FakeWorkerEnv()
+
+    def kill_then_exit(pid: int, signum: int) -> None:
+        env.kill(pid, signum)
+        env.exit(pid, 1 << 8)
+
+    supervisor = make_supervisor(env, processes=2, kill=kill_then_exit, check_interval=0.01)
+    supervisor.request_shutdown()
+
+    assert supervisor.run() == 0
+
+
+def test_run_succeeds_when_a_shutdown_follows_a_worker_failure():
+    """A stop request after a worker failed is a clean stop, for example ``systemctl stop``."""
+    env = FakeWorkerEnv()
+    exit_code_1 = 1 << 8
+    supervisor: WorkerSupervisor | None = None
+
+    def spawn(slot: int) -> int:
+        pid = env.spawn(slot)
+        if slot == 0:
+            env.exit(pid, exit_code_1)
+        return pid
+
+    def kill_then_exit(pid: int, signum: int) -> None:
+        env.kill(pid, signum)
+        env.exit(pid, 0)
+
+    def log(message: str) -> None:
+        # The supervisor logs the failure of slot 0, then the stop request arrives.
+        if "exited unexpectedly" in message:
+            supervisor.request_shutdown()
+
+    supervisor = make_supervisor(env, processes=2, spawn=spawn, kill=kill_then_exit, log=log, check_interval=0.01)
+
+    assert supervisor.run() == 0

@@ -49,7 +49,7 @@ Only the last two boxes touch Python. Everything above them runs in Rust, so a r
 | Routing | [matchit](https://github.com/ibraheemdev/matchit) | Radix-tree router, no allocation per match |
 | Python bridge | [PyO3](https://pyo3.rs/) | Calls handlers, converts arguments, receives the response tuple |
 | Serialization | [msgspec](https://jcristharif.com/msgspec/) | Request validation and response encoding, 5–10× faster than `json` |
-| Process model | `SO_REUSEPORT` | N independent processes, kernel load-balanced; each has its own interpreter and Django |
+| Process model | `SO_REUSEPORT` | N independent processes, kernel load-balanced on Linux; each has its own interpreter and Django |
 | Supervisor | `runbolt` | Spawns processes, recycles by RSS/lifetime, respawns on crash, drains WebSockets on shutdown |
 
 ## Where Django fits

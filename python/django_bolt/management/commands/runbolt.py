@@ -24,6 +24,7 @@ from django.utils.autoreload import iter_all_python_module_files
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
 from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts, _validate_mcp_mount_conflicts, serve_with_lifespan
+from django_bolt.concurrency import close_connections_and_pools
 from django_bolt.workers import MIB, WorkerSupervisor
 
 try:
@@ -724,6 +725,20 @@ class Command(BaseCommand):
         # before escalating to SIGKILL (user-set env takes precedence).
         os.environ.setdefault("DJANGO_BOLT_SHUTDOWN_TIMEOUT", str(kill_timeout))
 
+        # A forked worker inherits the sockets of the parent's open database
+        # connections, and a connection pool keeps its idle connections open
+        # after close(). Two processes that use one socket read each other's
+        # query results. The parent opened connections for the migration check
+        # and can open more later, so it closes them and its pools before each
+        # fork. A worker inherits this hook, so the hook acts in this process only.
+        supervisor_pid = os.getpid()
+
+        def close_database_connections_before_fork() -> None:
+            if os.getpid() == supervisor_pid:
+                close_connections_and_pools()
+
+        os.register_at_fork(before=close_database_connections_before_fork)
+
         def spawn_worker(slot: int) -> int:
             pid = os.fork()
             if pid != 0:
@@ -763,7 +778,9 @@ class Command(BaseCommand):
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        supervisor.run()
+        exit_code = supervisor.run()
+        if exit_code:
+            sys.exit(exit_code)
 
     def _print_multiprocess_banner(self, options):
         """Perform a dry-run of autodiscovery to collect route/feature info,

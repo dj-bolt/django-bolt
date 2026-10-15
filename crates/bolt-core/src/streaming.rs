@@ -385,6 +385,10 @@ fn create_python_stream_with_config(
         match std::thread::Builder::new()
             .name("sync-sse-generator".to_string())
             .spawn(move || {
+            // One Python thread state for the life of the thread. Without it,
+            // each attach below gets a new state, and thread-local Python state
+            // (Django's connections) does not survive from one batch to the next.
+            crate::state::pin_python_thread_state();
             let mut iterator: Option<Py<PyAny>> = None;
             let mut batch_buffer = Vec::with_capacity(sync_batch);
             let mut exhausted = false;
@@ -469,6 +473,18 @@ fn create_python_stream_with_config(
                     }
                 });
             }
+            // This thread exists for one response. A database connection that
+            // the body opened would stay open until garbage collection, and a
+            // pooled one would hold a pool slot for the life of the process.
+            Python::attach(|py| {
+                let closed = py
+                    .import(pyo3::intern!(py, "django_bolt.concurrency"))
+                    .and_then(|module| module.call_method0(pyo3::intern!(py, "close_stream_connections")));
+                if let Err(e) = closed {
+                    eprintln!("[SSE WARNING] Error closing the database connections of a sync streaming thread: {}", e);
+                }
+            });
+            crate::state::unpin_python_thread_state();
             // Decrement thread counter when thread finishes
             ACTIVE_SYNC_STREAMING_THREADS.fetch_sub(1, Ordering::Relaxed);
         }) {

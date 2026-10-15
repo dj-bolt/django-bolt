@@ -53,6 +53,9 @@ nanodjango = ["nanodjango>=0.16"]
 # also works. tool.uv.sources keeps local dev on the workspace copy.
 mcp = ["bolt-mcp>=0.1.0"]
 bolt-mcp = ["bolt-mcp>=0.1.0"]
+# Django's connection pool (OPTIONS["pool"]). Bolt drains the pool of a dead
+# connection, and drain() is in psycopg_pool 3.3 and later.
+pool = ["psycopg[pool]>=3.3", "psycopg-pool>=3.3"]
 
 [project.urls]
 Homepage = "https://github.com/dj-bolt/django-bolt"
@@ -102,7 +105,8 @@ dev = [
     "bolt-mcp", # workspace member: MCP server support (editable)
     "django-debug-toolbar>=7.1.1",
     # Pure-Python wheel (no cp314t build of psycopg-binary exists); needs libpq at run time.
-    "psycopg>=3.2", # PostgreSQL recovery tests (`just test-pg`)
+    "psycopg>=3.3", # PostgreSQL recovery tests (`just test-pg`)
+    "psycopg-pool>=3.3", # the `pool` extra: recovery through the connection pool of Django (`just test-pg`)
     "django-tenants>=3.14", # request lane tests with real schemas (`just test-pg`)
     "django-allauth>=65.19", # session login through allauth, read by Bolt routes
     "hypothesis>=6.140",

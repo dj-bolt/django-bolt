@@ -212,7 +212,7 @@ export DJANGO_BOLT_ORM_THREADS=8
 
 **Default:** `1` when every database is SQLite, otherwise `4`.
 
-Each thread holds one database connection. Increase the value when one free-threaded process runs many worker threads. See [Size the database thread pools](../getting-started/deployment.md#size-the-database-thread-pools). The value must be an int of `1` or more.
+Without a connection pool, each thread holds one database connection. With a pool, a thread holds a connection only while it has work. Increase the value when one free-threaded process runs many worker threads. See [Size the database thread pools](../getting-started/deployment.md#size-the-database-thread-pools). The value must be an int of `1` or more.
 
 ### DJANGO_BOLT_LANE_IDLE_SECONDS
 
@@ -360,7 +360,7 @@ Django-Bolt disables signals by default for maximum performance. Enable this set
 - Using third-party packages that depend on request signals (e.g. django-debug-toolbar)
 - Implementing custom signal receivers for request lifecycle events
 
-`CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` do not need signals. Bolt runs Django's connection check on the executor thread before each call when a database sets a positive `CONN_MAX_AGE` or `CONN_HEALTH_CHECKS`. With neither set, Bolt runs the check only after a call raises. A connection that the database closed then fails one request, and the next one reconnects. See [Database Connection Management](../topics/signals.md#database-connection-management).
+`CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` do not need signals. Bolt runs Django's connection check on the executor thread before each call when a database sets a positive `CONN_MAX_AGE` or `CONN_HEALTH_CHECKS`. With neither set, Bolt runs the check only after a call raises. A connection that the database closed then fails one request. The next request reconnects, and the other threads reconnect before their next call. See [Database Connection Management](../topics/signals.md#database-connection-management).
 
 See [Django Signals](../topics/signals.md) for detailed documentation.
 
