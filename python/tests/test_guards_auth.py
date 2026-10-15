@@ -10,6 +10,8 @@ import django
 import jwt
 import pytest
 from django.conf import settings  # noqa: PLC0415
+from django.core.exceptions import ImproperlyConfigured
+from django.test import override_settings
 
 from django_bolt import BoltAPI
 from django_bolt.auth import (
@@ -354,6 +356,36 @@ class TestEdgeCases:
         guard = Requires("permissions", "myapp.custom_permission.delete")
         metadata = guard.to_metadata()
         assert metadata["values"] == ["myapp.custom_permission.delete"]
+
+
+class TestAuthBackendEntries:
+    """An auth entry that is not a backend stops registration. Bolt does not drop it."""
+
+    @pytest.mark.parametrize(
+        "entry",
+        ["django_bolt.auth.JWTAuthentication", JWTAuthentication, object()],
+        ids=["dotted-path", "class", "object"],
+    )
+    def test_route_auth_entry_that_is_not_a_backend_fails_loudly(self, entry):
+        api = BoltAPI()
+
+        with pytest.raises(ImproperlyConfigured, match="not an authentication backend"):
+
+            @api.get("/me", auth=[entry], guards=[IsAuthenticated()])
+            async def me():
+                return {"ok": True}
+
+    def test_default_auth_entry_that_is_not_a_backend_fails_loudly(self):
+        api = BoltAPI()
+
+        with (
+            override_settings(BOLT_AUTHENTICATION_CLASSES=["django_bolt.auth.JWTAuthentication"]),
+            pytest.raises(ImproperlyConfigured, match="not an authentication backend"),
+        ):
+
+            @api.get("/me", guards=[IsAuthenticated()])
+            async def me():
+                return {"ok": True}
 
 
 if __name__ == "__main__":

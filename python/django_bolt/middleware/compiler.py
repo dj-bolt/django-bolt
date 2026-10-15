@@ -20,7 +20,7 @@ try:
 except ImportError:  # Django 5.2 has no django.utils.csp
     build_policy = None
 
-from ..auth.backends import get_default_authentication_classes
+from ..auth.backends import BaseAuthentication, get_default_authentication_classes
 from ..auth.guards import GUARD_TYPES, get_default_permission_classes
 from ..typing import is_msgspec_struct, resolve_type_alias, unwrap_optional
 
@@ -122,7 +122,14 @@ def route_auth_backends(auth: list[Any] | None) -> list[Any]:
     scheme name, so Python must not find a backend by its scheme name.
     """
     backends = auth if auth is not None else get_default_authentication_classes()
-    return [backend for backend in backends if hasattr(backend, "to_metadata")]
+    # A dropped entry would leave the route with no backend while it looks authenticated.
+    for backend in backends:
+        if not isinstance(backend, BaseAuthentication):
+            raise ImproperlyConfigured(
+                f"Auth entry {backend!r} is not an authentication backend. Give an instance, "
+                f"for example auth=[JWTAuthentication()] or BOLT_AUTHENTICATION_CLASSES = [JWTAuthentication()]."
+            )
+    return list(backends)
 
 
 def compile_middleware_meta(
