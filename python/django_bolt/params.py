@@ -6,7 +6,7 @@ Provides explicit parameter source annotations and validation metadata.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -329,7 +329,7 @@ def File(
     description: str | None = None,
     max_size: int | None = None,
     min_size: int | None = None,
-    allowed_types: Sequence[str] | None = None,
+    allowed_types: Iterable[str] | None = None,
     max_files: int | None = None,
 ) -> Any:
     """
@@ -341,7 +341,8 @@ def File(
         description: Parameter description
         max_size: Maximum file size in bytes (e.g., 2_000_000 for 2MB)
         min_size: Minimum file size in bytes
-        allowed_types: Allowed MIME types (e.g., ["image/*", "application/pdf"])
+        allowed_types: Allowed MIME types, as a list, a tuple or another iterable of str
+            (e.g., ["image/*", "application/pdf"]). A str raises TypeError.
         max_files: Maximum number of files for list[UploadFile] parameters
 
     Returns:
@@ -354,6 +355,19 @@ def File(
         ):
             content = await avatar.read()
     """
+    if allowed_types is not None:
+        # A str is a sequence of characters. "image/*" would give "*", and "*" allows each type.
+        # Make the tuple before the item check, so that a generator is read only one time.
+        given = allowed_types
+        is_collection = isinstance(given, Iterable) and not isinstance(given, (str, bytes))
+        allowed_types = tuple(given) if is_collection else ()
+        if not is_collection or not all(isinstance(value, str) for value in allowed_types):
+            raise TypeError(
+                f"File(allowed_types=...) takes an iterable of MIME type strings, for example ['image/*'], got {given!r}."
+            )
+        # A route that allows no file type can take no upload. That is a mistake, so stop here.
+        if not allowed_types:
+            raise ValueError("File(allowed_types=[]) allows no file type. Remove allowed_types to allow each type.")
     return Param(
         source="file",
         default=default,
@@ -361,7 +375,7 @@ def File(
         description=description,
         max_size=max_size,
         min_size=min_size,
-        allowed_types=tuple(allowed_types) if allowed_types else None,
+        allowed_types=allowed_types,
         max_files=max_files,
     )
 

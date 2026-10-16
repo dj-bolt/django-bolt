@@ -190,6 +190,38 @@ class TestUploadFileClass:
 class TestUploadFileValidation:
     """Test file upload validation with File() constraints."""
 
+    @pytest.mark.parametrize(
+        "allowed_types", ["image/*", b"image/*", ["image/*", 3], 3], ids=["str", "bytes", "int-item", "int"]
+    )
+    def test_allowed_types_that_is_not_a_list_of_str_fails_loudly(self, allowed_types):
+        """A str is a sequence of characters. "image/*" gave "*", and "*" allowed each type."""
+        with pytest.raises(TypeError, match="takes an iterable of MIME type strings"):
+            File(allowed_types=allowed_types)
+
+    def test_allowed_types_from_a_generator_checks_each_type(self):
+        """A generator of types is read one time. Each of its types applies."""
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(file: Annotated[UploadFile, File(allowed_types=(t for t in ["application/pdf"]))]):
+            return {"content_type": file.content_type}
+
+        client = TestClient(api)
+
+        response = client.post("/upload", files={"file": ("page.html", b"<html></html>", "text/html")})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_invalid_content_type"
+
+        response = client.post("/upload", files={"file": ("doc.pdf", b"%PDF-1.7", "application/pdf")})
+        assert response.status_code == 200
+        assert response.json() == {"content_type": "application/pdf"}
+
+    @pytest.mark.parametrize("allowed_types", [[], ()], ids=["list", "tuple"])
+    def test_empty_allowed_types_fails_loudly(self, allowed_types):
+        """An empty list allowed each type. A list with no type must not do that."""
+        with pytest.raises(ValueError, match="allows no file type"):
+            File(allowed_types=allowed_types)
+
     def test_max_size_validation_pass(self):
         """Test that file within max size passes."""
         api = BoltAPI()
