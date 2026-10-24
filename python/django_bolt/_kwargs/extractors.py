@@ -26,7 +26,6 @@ from ..typing import (
 )
 
 __all__ = [
-    "create_extractor",
     "create_extractor_for_field",
     "create_path_extractor",
     "create_query_extractor",
@@ -846,54 +845,6 @@ def create_extractor_for_field(field: FieldDefinition) -> Callable | None:
         if default is not inspect.Parameter.empty:
             return lambda *_args, **_kwargs: default
         return None
-
-
-def create_extractor(field: dict[str, Any]) -> Callable:
-    """
-    Create an optimized extractor function for a parameter field.
-
-    This is a factory that returns a specialized extractor based on the
-    parameter source. The returned function is optimized to avoid runtime
-    type checking.
-
-    Args:
-        field: Field metadata dictionary
-
-    Returns:
-        Extractor function that takes request data and returns parameter value
-    """
-    source = field["source"]
-    name = field["name"]
-    annotation = field["annotation"]
-    default = field["default"]
-    alias = field.get("alias")
-
-    # Return appropriate extractor based on source
-    if source == "path":
-        return create_path_extractor(name, annotation, alias)
-    elif source == "query":
-        return create_query_extractor(name, annotation, default, alias)
-    elif source == "header":
-        return create_header_extractor(name, annotation, default, alias)
-    elif source == "cookie":
-        return create_cookie_extractor(name, annotation, default, alias)
-    elif source == "form":
-        return create_form_extractor(name, annotation, default, alias)
-    elif source == "file":
-        return create_file_extractor(name, annotation, default, alias)
-    elif source == "body":
-        return create_body_extractor(name, annotation)
-    elif source == "request":
-        # Request object is passed through directly
-        return lambda request: request
-    else:
-        # Fallback for unknown sources
-        def extract(*args, **kwargs):
-            if default is not inspect.Parameter.empty:
-                return default
-            raise ValueError(f"Cannot extract parameter {name} with source {source}")
-
-        return extract
 
 
 def compile_response_coercer(annotation: Any) -> tuple[Callable[[Any], Any], Callable[[Any], Any]]:
