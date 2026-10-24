@@ -27,8 +27,9 @@ exclude_re = [
     # A max_age of 0 takes the warning path and stays 0.
     'cookies\.rs:\d+:\d+: replace < with <= in format_cookie',
     # The fallback spool limit of a route with no metadata. It selects memory
-    # or disk for a file, and the handler gets the same bytes.
-    'form_parsing\.rs:15:\d+: replace \* with [+/]',
+    # or disk for a file, and the handler gets the same bytes. The `$` keeps
+    # this to the constant: a mutant in a function ends with its name.
+    'form_parsing\.rs:\d+:\d+: replace \* with [+/]$',
     # The type count only selects which map to walk. Both loops check the
     # same values.
     'replace < with (==|>|<=) in validate_and_cache_source',
@@ -46,4 +47,11 @@ exclude_re = [
     'replace TrustedProxies::is_empty -> bool with false',
     # The Debug text of a JWKS or a static key.
     'Debug for (RefreshingJwks|StaticKey)',
+    # The prebuilt HMAC key of a static secret is a fast path. Without it,
+    # `select` gives the same static key for any kid, and `crypto::verify`
+    # checks the signature.
+    'delete match arm JwtKeySource::Static\(key\) in decode_and_validate',
+    # The unknown-kid cooldown compares two durations, which are not equal
+    # in practice.
+    'replace < with <= in RefreshingJwks::select',
 ]
