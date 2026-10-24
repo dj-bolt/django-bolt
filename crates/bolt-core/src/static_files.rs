@@ -287,6 +287,22 @@ mod tests {
     }
 
     #[test]
+    fn test_find_in_directories_rejects_dot_dot_and_absolute_paths_inside_the_root() {
+        // These paths name a real file inside the root, so the canonical
+        // root check alone would serve them. The path check must reject them.
+        let temp_dir = TempDir::new().unwrap();
+        let root = canon(temp_dir.path());
+        fs::create_dir(root.join("css")).unwrap();
+        File::create(root.join("app.js")).unwrap();
+        let directories = vec![root.clone()];
+
+        assert!(find_in_directories("app.js", &directories).is_some());
+        assert!(find_in_directories("css/../app.js", &directories).is_none());
+        let absolute = root.join("app.js");
+        assert!(find_in_directories(absolute.to_str().unwrap(), &directories).is_none());
+    }
+
+    #[test]
     fn test_find_in_multiple_directories() {
         let dir1 = TempDir::new().unwrap();
         let dir2 = TempDir::new().unwrap();
