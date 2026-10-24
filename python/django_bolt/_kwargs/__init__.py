@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from .extractors import (
     compile_response_coercer,
+    compile_struct_row_readers,
     create_body_extractor,
     create_cookie_extractor,
     create_extractor_for_field,
@@ -35,6 +36,7 @@ from .runtime import extract_parameter_value, extract_path_params
 __all__ = [
     # extractors.py
     "compile_response_coercer",
+    "compile_struct_row_readers",
     "create_body_extractor",
     "create_cookie_extractor",
     "create_extractor_for_field",

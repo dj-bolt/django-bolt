@@ -35,6 +35,7 @@ __all__ = [
     "create_file_extractor",
     "create_body_extractor",
     "compile_response_coercer",
+    "compile_struct_row_readers",
     "get_msgspec_decoder",
 ]
 
@@ -889,23 +890,57 @@ def _compile_list_coercer(annotation: Any) -> tuple[Callable[[Any], Any], Callab
 
     # A QuerySet loads only the fields of the Struct, with .values(). A list of
     # Bolt Serializers does not get here: its own response handlers run.
-    field_names: tuple[str, ...] = item_type.__struct_fields__ if is_msgspec_struct(item_type) else ()
+    if not is_msgspec_struct(item_type):
 
-    async def coerce_async(value: Any) -> Any:
-        if field_names and isinstance(value, QuerySet):
-            items = await run_in_orm_executor(list, value.values(*field_names))
-            return msgspec.convert(items, annotation)
-        return coerce(value)
+        async def coerce_async(value: Any) -> Any:
+            return coerce(value)
 
-    if not field_names:
         return coerce, coerce_async
+
+    load_rows, _ = compile_struct_row_readers(item_type)
 
     def coerce_with_queryset(value: Any) -> Any:
         if isinstance(value, QuerySet):
-            return msgspec.convert(list(value.values(*field_names)), annotation)
+            return msgspec.convert(load_rows(value), annotation)
         return coerce(value)
 
-    return coerce_with_queryset, coerce_async
+    async def coerce_with_queryset_async(value: Any) -> Any:
+        if isinstance(value, QuerySet):
+            return msgspec.convert(await run_in_orm_executor(load_rows, value), annotation)
+        return coerce(value)
+
+    return coerce_with_queryset, coerce_with_queryset_async
+
+
+def compile_struct_row_readers(
+    item_type: type,
+) -> tuple[Callable[[QuerySet], list[dict[str, Any]]], Callable[[list[Any]], list[dict[str, Any]]]]:
+    """Build the row readers for a ``list[Struct]`` response, once per route.
+
+    The first reader loads a QuerySet with ``.values()``, which reads only the
+    fields of the Struct. The second reads objects, such as model instances,
+    by attribute. Each row is keyed by the wire name of its field, so a field
+    with ``rename=`` or ``msgspec.field(name=...)`` gets the name the Struct
+    declares.
+    """
+    names = item_type.__struct_fields__
+    wire_names = item_type.__struct_encode_fields__
+    pairs = tuple(zip(names, wire_names, strict=True))
+
+    if names == wire_names:
+
+        def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
+            return list(queryset.values(*names))
+
+    else:
+
+        def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
+            return [{wire: row[name] for name, wire in pairs} for row in queryset.values(*names)]
+
+    def project(items: list[Any]) -> list[dict[str, Any]]:
+        return [{wire: getattr(item, name, None) for name, wire in pairs} for item in items]
+
+    return load_rows, project
 
 
 def _compile_struct_coercer(annotation: type) -> Callable[[Any], Any]:

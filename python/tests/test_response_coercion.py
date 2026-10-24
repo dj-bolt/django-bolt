@@ -43,6 +43,11 @@ class ArticleOut(msgspec.Struct):
     title: str
 
 
+class ArticleCamel(msgspec.Struct, rename="camel"):
+    id: int
+    is_published: bool
+
+
 def _validation_message(response) -> str:
     assert response.status_code == 500, response.text
     body = response.json()
@@ -136,6 +141,32 @@ def client():
     def articles_sync() -> list[ArticleOut]:
         return JSON(Article.objects.order_by("id"))
 
+    @api.get("/camel/queryset")
+    async def camel_queryset() -> list[ArticleCamel]:
+        return Article.objects.order_by("id")
+
+    @api.get("/camel/queryset-sync")
+    def camel_queryset_sync() -> list[ArticleCamel]:
+        return Article.objects.order_by("id")
+
+    @api.get("/camel/json-queryset")
+    async def camel_json_queryset() -> list[ArticleCamel]:
+        return JSON(Article.objects.order_by("id"))
+
+    @api.get("/camel/json-queryset-sync")
+    def camel_json_queryset_sync() -> list[ArticleCamel]:
+        return JSON(Article.objects.order_by("id"))
+
+    @api.get("/camel/queryset-unvalidated", validate_response=False)
+    async def camel_queryset_unvalidated() -> list[ArticleCamel]:
+        return Article.objects.order_by("id")
+
+    # The request parameter sends the result through serialize_response, which
+    # projects objects when no validator runs.
+    @api.get("/camel/objects-unvalidated", validate_response=False)
+    async def camel_objects_unvalidated(request) -> list[ArticleCamel]:
+        return [Obj(id=5, is_published=True), Obj(id=6)]
+
     return TestClient(api)
 
 
@@ -218,4 +249,32 @@ def test_queryset_in_json_loads_the_declared_fields(client, path):
     assert client.get(path).json() == [
         {"id": first.id, "title": "One"},
         {"id": second.id, "title": "Two"},
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/camel/queryset",
+        "/camel/queryset-sync",
+        "/camel/json-queryset",
+        "/camel/json-queryset-sync",
+        "/camel/queryset-unvalidated",
+    ],
+)
+def test_queryset_rows_use_the_wire_names_of_a_renamed_struct(client, path):
+    article = Article.objects.create(title="One", content="c", author="a", is_published=True)
+
+    response = client.get(path)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [{"id": article.id, "isPublished": True}]
+
+
+def test_unvalidated_objects_use_the_wire_names_of_a_renamed_struct(client):
+    # Without validation, a missing attribute is null.
+    assert client.get("/camel/objects-unvalidated").json() == [
+        {"id": 5, "isPublished": True},
+        {"id": 6, "isPublished": None},
     ]

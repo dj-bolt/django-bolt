@@ -34,7 +34,7 @@ from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 
 from . import _json
-from ._kwargs import compile_response_coercer
+from ._kwargs import compile_response_coercer, compile_struct_row_readers
 from .concurrency import run_in_orm_executor
 from .cookies import Cookie
 from .exceptions import ResponseValidationError, UnloadedRelationError
@@ -540,40 +540,45 @@ def _compile_stream_item_validators(meta: HandlerMetadata | dict[str, Any]) -> t
     return compile_response_coercer(item_type)
 
 
-def _compile_queryset_serializers(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
-    field_names = meta.get("response_field_names")
-    if not field_names:
-        return None, None
+def _compile_row_readers(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any] | None:
+    """The row readers of a ``list[Struct]`` response type, or None.
 
-    def serialize_sync(queryset: QuerySet) -> list[Any]:
-        return list(queryset.values(*field_names))
+    ``response_field_names`` marks such a type, where the Struct is not a Bolt
+    Serializer. A paginated route has the envelope as its response type, and
+    the paginator reads its QuerySet itself.
+    """
+    response_type = meta.get("response_type")
+    if not meta.get("response_field_names") or get_origin(response_type) is not list:
+        return None
+    return compile_struct_row_readers(get_args(response_type)[0])
+
+
+def _compile_queryset_serializers(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
+    readers = _compile_row_readers(meta)
+    if readers is None:
+        return None, None
+    load_rows, _ = readers
 
     async def serialize_async(queryset: QuerySet) -> list[Any]:
-        values_qs = queryset.values(*field_names)
         # Bounded ORM pool: parallel (unlike sync_to_async's thread_sensitive
         # single thread) but capped so DB connection count stays small.
-        return await run_in_orm_executor(list, values_qs)
+        return await run_in_orm_executor(load_rows, queryset)
 
-    return serialize_sync, serialize_async
+    return load_rows, serialize_async
 
 
 def _compile_model_projector(meta: HandlerMetadata | dict[str, Any]) -> Any:
-    """Compile a function that projects model instances to dicts using response field names.
+    """Compile a function that projects model instances to dicts of the declared fields.
 
     When validate_response=False and the handler returns a list of Django model
-    instances (not dicts/Structs), we still need to extract the declared fields
-    to produce JSON-serializable dicts. This is compiled once at registration time.
+    instances (not dicts/Structs), the JSON encoder still needs dicts of the
+    declared fields, keyed by their wire names. This is compiled once at
+    registration time.
 
-    Returns None if no response_field_names are available (no list[Struct] annotation).
+    Returns None when the response type is not ``list[Struct]``.
     """
-    field_names = meta.get("response_field_names")
-    if not field_names:
-        return None
-
-    def project(items: list[Any]) -> list[dict[str, Any]]:
-        return [{name: getattr(item, name, None) for name in field_names} for item in items]
-
-    return project
+    readers = _compile_row_readers(meta)
+    return None if readers is None else readers[1]
 
 
 def _extract_stream_item_type(annotation: Any) -> tuple[bool, Any | None]:
