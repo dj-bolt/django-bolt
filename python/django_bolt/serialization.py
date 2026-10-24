@@ -34,7 +34,7 @@ from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 
 from . import _json
-from ._kwargs import coerce_to_response_type, coerce_to_response_type_async
+from ._kwargs import compile_response_coercer
 from .concurrency import run_in_orm_executor
 from .cookies import Cookie
 from .exceptions import ResponseValidationError, UnloadedRelationError
@@ -523,13 +523,7 @@ def _compile_response_validator(meta: HandlerMetadata | dict[str, Any]) -> tuple
     if not meta.get("validate_response", True):
         return None, None
 
-    def validate_sync(value: Any) -> Any:
-        return coerce_to_response_type(value, response_type, meta=meta)
-
-    async def validate_async(value: Any) -> Any:
-        return await coerce_to_response_type_async(value, response_type, meta=meta)
-
-    return validate_sync, validate_async
+    return compile_response_coercer(response_type)
 
 
 def _compile_stream_item_validators(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
@@ -543,13 +537,7 @@ def _compile_stream_item_validators(meta: HandlerMetadata | dict[str, Any]) -> t
     ):
         return None, None
 
-    def validate_sync(value: Any) -> Any:
-        return coerce_to_response_type(value, item_type, meta=meta)
-
-    async def validate_async(value: Any) -> Any:
-        return await coerce_to_response_type_async(value, item_type, meta=meta)
-
-    return validate_sync, validate_async
+    return compile_response_coercer(item_type)
 
 
 def _compile_queryset_serializers(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
@@ -886,7 +874,14 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if is_serializer_response:
             return result
         result = _convert_serializers(result)
-        if model_projector is not None and result and not isinstance(result[0], (dict, msgspec.Struct)):
+        # The validator reads model instances by attribute. Without one, the
+        # projector gives the JSON encoder dicts of the declared fields.
+        if (
+            model_projector is not None
+            and validator_sync is None
+            and result
+            and not isinstance(result[0], (dict, msgspec.Struct))
+        ):
             return model_projector(result)
         return result
 

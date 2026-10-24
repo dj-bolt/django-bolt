@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A model instance or other object converts to a response Struct by attribute** - A handler can return an object, such as a Django model instance, for a `Struct` or `list[Struct]` response type. Bolt read each declared field with `getattr(obj, name, None)` and validated the dict. Thus a missing attribute became `None` and replaced the field default, and a renamed field (`rename="camel"` or `msgspec.field(name=...)`) failed with "missing required field". Both gave a 500. Now msgspec reads the object by attribute (`from_attributes=True`), so defaults and renamed fields work. An object for an `Item | None` response type now converts too. A QuerySet still loads the declared fields with `.values()`.
+
+### Changed
+
+- **Response validation is compiled once per route** - Bolt classified the response type on each response. Now it builds the validation for the type when the route registers. Validation of a dict to a `Struct` takes about 285 ns, from 500 ns. A list of 20 model instances takes about 1.8 µs, from 4.2 µs.
+
 ## [0.13.0]
 
 ### Added

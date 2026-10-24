@@ -10,8 +10,7 @@ This module handles building kwargs for handler functions:
 from __future__ import annotations
 
 from .extractors import (
-    coerce_to_response_type,
-    coerce_to_response_type_async,
+    compile_response_coercer,
     create_body_extractor,
     create_cookie_extractor,
     create_extractor,
@@ -36,8 +35,7 @@ from .runtime import extract_parameter_value, extract_path_params
 
 __all__ = [
     # extractors.py
-    "coerce_to_response_type",
-    "coerce_to_response_type_async",
+    "compile_response_coercer",
     "create_body_extractor",
     "create_cookie_extractor",
     "create_extractor",
