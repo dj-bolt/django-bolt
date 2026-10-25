@@ -14,7 +14,7 @@
 use actix_files::NamedFile;
 use actix_web::{http::header, web, HttpRequest, HttpResponse};
 use pyo3::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::state::{ScopeConfig, ServeMode};
@@ -65,8 +65,9 @@ fn has_dotfile_component(relative_path: &str) -> bool {
 /// runs only on the resolved file path, where it must (to follow symlinks
 /// in the user-supplied portion).
 fn find_in_directories(relative_path: &str, directories: &[PathBuf]) -> Option<PathBuf> {
-    // Security: prevent directory traversal
-    if relative_path.contains("..") || relative_path.starts_with('/') {
+    // Security: prevent directory traversal. A path of plain names only: no
+    // `..`, no root (`/etc`) and, on Windows, no drive or UNC prefix (`C:\`).
+    if relative_path.contains("..") || !is_plain_relative(relative_path) {
         return None;
     }
 
@@ -83,6 +84,14 @@ fn find_in_directories(relative_path: &str, directories: &[PathBuf]) -> Option<P
         }
     }
     None
+}
+
+/// True when every part of `path` is a plain name or `.`. A root, a parent
+/// and a Windows prefix are not, so `join` cannot leave the static directory.
+fn is_plain_relative(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
 }
 
 /// Find a static file using Django's staticfiles finders (for app-level static files)
@@ -300,6 +309,25 @@ mod tests {
         assert!(find_in_directories("css/../app.js", &directories).is_none());
         let absolute = root.join("app.js");
         assert!(find_in_directories(absolute.to_str().unwrap(), &directories).is_none());
+    }
+
+    #[test]
+    fn test_is_plain_relative() {
+        assert!(is_plain_relative("css/app.js"));
+        assert!(is_plain_relative("./app.js"));
+        assert!(!is_plain_relative("/etc/passwd"));
+        assert!(!is_plain_relative("css/../app.js"));
+    }
+
+    /// A drive or UNC prefix replaces the root in `join` on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn test_is_plain_relative_rejects_windows_prefixes() {
+        assert!(!is_plain_relative(r"C:\Windows\win.ini"));
+        assert!(!is_plain_relative("C:/Windows/win.ini"));
+        assert!(!is_plain_relative("C:win.ini"));
+        assert!(!is_plain_relative(r"\\server\share\file"));
+        assert!(!is_plain_relative(r"\Windows\win.ini"));
     }
 
     #[test]
