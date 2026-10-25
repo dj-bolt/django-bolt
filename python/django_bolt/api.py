@@ -2349,7 +2349,7 @@ class BoltAPI:
             # When the handler returns an instance that already matches the
             # declared type we encode it directly via the module msgspec
             # encoder, skipping the serialize_response → data_handler →
-            # validator → coerce_to_response_type chain. Anything else
+            # validator chain. Anything else
             # (Response objects, QuerySets, generators, dicts, None,
             # Serializers, response_class overrides, ...) is delegated to
             # serialize_response so the slow path handles every edge case
@@ -2496,7 +2496,7 @@ class BoltAPI:
                         result = await handler()
                         if type(result) is list:
                             # Attr-bag elements (e.g. Django models) need the
-                            # slow path's response_field_names projection;
+                            # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
                             if result and not isinstance(result[0], (dict, msgspec.Struct)):
                                 return await serialize_response(result, meta)
@@ -2515,7 +2515,7 @@ class BoltAPI:
                         result = await handler(*args, **kwargs)
                         if type(result) is list:
                             # Attr-bag elements (e.g. Django models) need the
-                            # slow path's response_field_names projection;
+                            # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
                             if result and not isinstance(result[0], (dict, msgspec.Struct)):
                                 return await serialize_response(result, meta)
@@ -2730,7 +2730,7 @@ class BoltAPI:
                         result = handler()
                         if type(result) is list:
                             # Attr-bag elements (e.g. Django models) need the
-                            # slow path's response_field_names projection;
+                            # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
                             if result and not isinstance(result[0], (dict, msgspec.Struct)):
                                 return serialize_response_sync(result, meta)
@@ -2749,7 +2749,7 @@ class BoltAPI:
                         result = handler(*args, **kwargs)
                         if type(result) is list:
                             # Attr-bag elements (e.g. Django models) need the
-                            # slow path's response_field_names projection;
+                            # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
                             if result and not isinstance(result[0], (dict, msgspec.Struct)):
                                 return serialize_response_sync(result, meta)
@@ -2770,7 +2770,7 @@ class BoltAPI:
                         result = handler()
                         if type(result) is list:
                             # Attr-bag elements (e.g. Django models) need the
-                            # slow path's response_field_names projection;
+                            # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
                             if result and not isinstance(result[0], (dict, msgspec.Struct)):
                                 return serialize_response_sync(result, meta)
@@ -2791,7 +2791,7 @@ class BoltAPI:
                         result = handler(*args, **kwargs)
                         if type(result) is list:
                             # Attr-bag elements (e.g. Django models) need the
-                            # slow path's response_field_names projection;
+                            # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
                             if result and not isinstance(result[0], (dict, msgspec.Struct)):
                                 return serialize_response_sync(result, meta)
