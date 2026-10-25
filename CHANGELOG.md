@@ -6,7 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A model instance or other object converts to a response Struct by attribute** - A handler can return an object, such as a Django model instance, for a `Struct` or `list[Struct]` response type. Bolt read each declared field with `getattr(obj, name, None)` and validated the dict. Thus a missing attribute became `None` and replaced the field default, and a renamed field (`rename="camel"` or `msgspec.field(name=...)`) failed with "missing required field". Both gave a 500. Now msgspec reads the object by attribute (`from_attributes=True`), so defaults and renamed fields work. An object for an `Item | None` response type now converts too.
+- **A QuerySet for a renamed `list[Struct]` response works** - Bolt loads a QuerySet with `.values()` of the declared fields. The rows had the Python field names, so a Struct with `rename=` or `msgspec.field(name=...)` failed validation with a 500. Without validation, the JSON had the Python names. Now each row has the wire names of the Struct. This also applies to model instances that Bolt projects when `validate_response=False`.
 - **A struct parameter error names its source as a scalar parameter error does** - A 422 error for a field of a struct parameter had `"query parameter"` or `"form field"` as the first item of `loc`. A scalar parameter has `"query"` or `"body"` there. Now a struct with `Query()` gives `["query", ...]`, and a struct with `Form()` gives `["body", ...]` for a missing field too. `Cookie()` keeps `["cookie", ...]`. A missing field with `msgspec.field(name=...)` now gives its wire name in `loc` and `msg`, as an invalid field does.
+
+### Changed
+
+- **Response validation is compiled once per route** - Bolt classified the response type on each response. Now it builds the validation for the type when the route registers. Validation of a dict to a `Struct` takes about 285 ns, from 500 ns. A list of 20 model instances takes about 1.8 µs, from 4.2 µs.
 
 ## [0.13.0]
 
