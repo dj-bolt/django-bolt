@@ -16,6 +16,11 @@ from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentic
 from django_bolt.middleware import Middleware, cors, rate_limit
 from django_bolt.testing import TestClient
 
+# One token a second: BURST + 1 requests must take a second before a refilled
+# token turns the 429 into a 200.
+RATE_LIMIT_RPS = 1
+RATE_LIMIT_BURST = 3
+
 
 @pytest.fixture(scope="module")
 def api():
@@ -47,7 +52,7 @@ def api():
         return {"message": "Hello, middleware!"}
 
     @api.get("/rate-limited")
-    @rate_limit(rps=5, burst=10)
+    @rate_limit(rps=RATE_LIMIT_RPS, burst=RATE_LIMIT_BURST)
     async def rate_limited_endpoint():
         return {"message": "This endpoint is rate limited", "timestamp": time.time()}
 
@@ -155,10 +160,8 @@ def test_compression_http_layer(http_client):
 
 
 def test_rate_limiting(http_client):
-    """Test rate limiting"""
-    # The rate limit is 5 rps with burst of 10
-    # First 10 requests should succeed (burst)
-    for i in range(10):
+    """The burst passes, and the next request gets 429."""
+    for i in range(RATE_LIMIT_BURST):
         response = http_client.get("/rate-limited")
         assert response.status_code == 200, f"Request {i + 1} failed"
 
