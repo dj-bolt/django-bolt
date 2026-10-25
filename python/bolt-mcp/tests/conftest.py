@@ -67,6 +67,22 @@ def _allow_db_access(request):
         yield
 
 
+def pytest_collection_modifyitems(items):
+    """Reject the ``django_db`` marker in this suite.
+
+    The tests use the migrated file database above. A ``django_db`` test makes
+    pytest-django create a test database and move the connections to it for the
+    rest of the session. An ORM thread that has a connection already keeps the
+    file database, so a later request reads data that the test did not write.
+    """
+    marked = [item.nodeid for item in items if item.get_closest_marker("django_db")]
+    if marked:
+        raise pytest.UsageError(
+            "bolt-mcp tests use the file database of conftest.py; remove @pytest.mark.django_db from: "
+            + ", ".join(marked)
+        )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _gil_stays_disabled():
     """Fail a free-threaded run when an import turns the GIL back on.
