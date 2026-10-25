@@ -6,6 +6,7 @@ import os
 import sys
 import sysconfig
 import tempfile
+from pathlib import Path
 
 import django
 import pytest
@@ -17,6 +18,7 @@ from django.core.management import call_command
 # its own SQLite connection. ``:memory:`` is per-connection, so that connection would see
 # an empty database; a file is shared across connections/threads in the process.
 _DB_PATH = os.path.join(tempfile.gettempdir(), "bolt_mcp_test.sqlite3")
+_TESTS_DIR = Path(__file__).resolve().parent
 
 if not settings.configured:
     if os.path.exists(_DB_PATH):
@@ -67,6 +69,7 @@ def _allow_db_access(request):
         yield
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(items):
     """Reject the ``django_db`` marker in this suite.
 
@@ -74,8 +77,11 @@ def pytest_collection_modifyitems(items):
     pytest-django create a test database and move the connections to it for the
     rest of the session. An ORM thread that has a connection already keeps the
     file database, so a later request reads data that the test did not write.
+
+    The hook runs last, so it checks only the selected tests. It gets the tests
+    of every collected directory, so it checks only the tests below this one.
     """
-    marked = [item.nodeid for item in items if item.get_closest_marker("django_db")]
+    marked = [item.nodeid for item in items if _TESTS_DIR in item.path.parents and item.get_closest_marker("django_db")]
     if marked:
         raise pytest.UsageError(
             "bolt-mcp tests use the file database of conftest.py; remove @pytest.mark.django_db from: "
