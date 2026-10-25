@@ -56,8 +56,8 @@ _SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
 _META_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "pattern", "min_length", "max_length", "tz")
 # These sources give one value. A query key can give more than one.
 _SINGLE_VALUE_SOURCES = ("path", "header", "cookie")
-# The `loc` source of a struct parameter error, by the name of its source in messages.
-# A scalar parameter of the same source uses the same `loc` source.
+# This map gives the `loc` source of a struct parameter error for each source name in messages.
+# A scalar parameter from the same source has the same `loc` source.
 _STRUCT_ERROR_SOURCES = {"query parameter": "query", "cookie": "cookie", "form field": "body"}
 
 
@@ -363,7 +363,7 @@ def _collect_struct_errors(
     """
     Collect validation errors for every field of a msgspec struct from the provided input mapping.
 
-    Validate each field of `struct_type` against `data` and return a list of error objects describing either per-field validation failures or missing required fields/files. The `loc` of each error names the source as a scalar parameter does ("query", "cookie" or "body"). When `has_files` is True, upload-file decoding is enabled for validation.
+    Validate each field of `struct_type` against `data` and return a list of error objects describing either per-field validation failures or missing required fields/files. The `loc` of each error names the source as a scalar parameter does ("query", "cookie" or "body"). When `has_files` is True, the function decodes upload files for validation.
 
     Parameters:
         struct_type (type): The msgspec struct/serializer type whose fields to validate.
