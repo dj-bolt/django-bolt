@@ -121,6 +121,30 @@ async def add(a: int, b: int) -> dict:
 
 **Accessing the request.** Declare a `request` (or `req`) parameter to receive the Django-Bolt `Request` — injected automatically and excluded from the tool's input schema. Read the authenticated principal with `bolt_mcp.principal(request)`, which returns `{user_id, is_staff, is_superuser, permissions, auth_claims}` and works under **every** auth tier (Tier 1 fills `request.context`; the OAuth tiers stash it on `request.state` — `principal()` reads both, so prefer it over `request.context` directly).
 
+### Tool middleware
+
+`@mcp.tool_middleware` registers an async function that runs around every `tools/call`. It gets a `ToolCall` with the tool `name`, the raw `arguments`, the request `meta` (the `_meta` the client sent) and the `principal`, and `call_next()` runs the tool. MCP calls do not pass through Django or Bolt HTTP middleware, so this is where per-call logging, metrics and tracing go.
+
+```python
+from opentelemetry import propagate, trace
+from bolt_mcp import ToolCall
+
+tracer = trace.get_tracer("my-server")
+
+@mcp.tool_middleware
+async def trace_tool(call: ToolCall, call_next) -> dict:
+    parent = propagate.extract({k: v for k, v in call.meta.items() if isinstance(v, str)})
+    with tracer.start_as_current_span(f"tools/call {call.name}", context=parent) as span:
+        result = await call_next()
+        if result.get("isError"):
+            span.set_status(trace.Status(trace.StatusCode.ERROR))
+        return result
+```
+
+`call_next()` returns the `CallToolResult` dict, and a tool exception or an argument error is already an `isError` result there. The middleware returns that dict or another one. The first registered middleware runs outermost. Register middleware before the server is mounted.
+
+The request `_meta` reaches Python only inside a tool `Context`, so with any middleware registered every tool call gets a `Context` object, whether or not the tool declares one. When a tool asks a 2026-07-28 client for input (elicitation or sampling), the request passes up through the middleware as a `BaseException`. Let it propagate.
+
 ## Resources
 
 Resources expose readable data addressed by URI. The handler returns the resource's text.

@@ -15,7 +15,7 @@ JSON as ``bytes`` — or a tagged envelope:
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
@@ -27,6 +27,7 @@ from django_bolt._json import encode as json_encode
 
 from ._execute import RESULT_TYPE_COMPLETE, error_result, execute_tool
 from .context import Context, _InputRequired
+from .registry import ToolCall
 
 if TYPE_CHECKING:
     from .registry import ResourceDef, ResourceTemplateDef, ToolDef
@@ -51,12 +52,11 @@ class McpRequest:
         self.state: dict[str, Any] = {}
 
 
-async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
-    raw = json_decode(payload["arguments_json"])
+async def _call_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any], raw: Any) -> dict[str, Any]:
     try:
         args = msgspec.convert(raw or {}, tool.args_struct)
     except msgspec.ValidationError as exc:
-        return json_encode(error_result(f"Invalid arguments: {exc}"))
+        return error_result(f"Invalid arguments: {exc}")
     kwargs = msgspec.structs.asdict(args)
     if tool.injects_request:
         kwargs["request"] = McpRequest(payload["auth"])
@@ -66,8 +66,40 @@ async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
             request=McpRequest(payload["auth"]),
             resolver=partial(_resolve_resource, mcp),
         )
+    return await execute_tool(tool, kwargs)
+
+
+def _request_meta(ctx: Any) -> dict[str, Any]:
+    raw = ctx.meta_json if ctx is not None else None
+    meta = json_decode(raw) if raw else {}
+    return meta if isinstance(meta, dict) else {}
+
+
+async def _call_through_middleware(
+    middleware: list[Any], call: ToolCall, call_tool: Callable[[], Awaitable[dict[str, Any]]]
+) -> dict[str, Any]:
+    async def call_next(index: int) -> dict[str, Any]:
+        if index == len(middleware):
+            return await call_tool()
+        return await middleware[index](call, partial(call_next, index + 1))
+
+    return await call_next(0)
+
+
+async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
+    raw = json_decode(payload["arguments_json"])
+    call_tool = partial(_call_tool, tool, mcp, payload, raw)
     try:
-        result = await execute_tool(tool, kwargs)
+        if mcp._tool_middleware:
+            call = ToolCall(
+                name=tool.name,
+                arguments=raw,
+                meta=_request_meta(payload["ctx"]),
+                principal=payload["auth"] or {},
+            )
+            result = await _call_through_middleware(mcp._tool_middleware, call, call_tool)
+        else:
+            result = await call_tool()
     except _InputRequired as pending:
         return json_encode(
             {
@@ -87,7 +119,8 @@ def tool_entry(mcp: MCP, tool: ToolDef) -> dict[str, Any]:
     """The per-tool config dict Rust stores in its registry."""
     return {
         "dispatch": partial(_run_tool, tool, mcp),
-        "needs_context": tool.ctx_param is not None,
+        # Rust passes the request `_meta` only inside a Context, and tool middleware reads it.
+        "needs_context": tool.ctx_param is not None or bool(mcp._tool_middleware),
         "guards": [g.to_metadata() for g in tool.guards],
     }
 
