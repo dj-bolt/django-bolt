@@ -108,6 +108,26 @@ async def test_websocket_origin_wildcard_allows_all():
 
 
 @pytest.mark.asyncio
+async def test_websocket_non_ascii_origin_is_denied_with_wildcard():
+    """The test client runs the Origin check of runbolt, which denies an Origin that is not ASCII."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/echo")
+    async def echo_handler(websocket: WebSocket):
+        await websocket.accept()
+
+    with pytest.raises(PermissionError, match="Origin not allowed"):
+        async with WebSocketTestClient(
+            api,
+            "/ws/echo",
+            headers={"Origin": "https://é.example"},
+            cors_allowed_origins=["*"],
+            read_django_settings=False,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_websocket_no_cors_config_denies_cross_origin():
     """Test WebSocket without CORS config denies cross-origin requests (fail-secure)."""
     api = BoltAPI()

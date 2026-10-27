@@ -2,8 +2,8 @@
 
 use actix::Addr;
 use actix_web::http::header::{
-    HeaderMap, HeaderName, HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS,
-    SEC_WEBSOCKET_PROTOCOL, UPGRADE,
+    HeaderMap, HeaderName, HeaderValue, CONNECTION, ORIGIN, SEC_WEBSOCKET_ACCEPT,
+    SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
 };
 use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 
-use bolt_core::metadata::{CorsConfig, RouteMetadata};
+use bolt_core::metadata::RouteMetadata;
 use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
 use bolt_core::middleware::client_ip::{resolve_scheme, TrustedProxies};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
@@ -34,6 +34,7 @@ use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
 use super::actor::WebSocketActor;
 use super::config::WsConfig;
 use super::messages::{SendToClient, WsMessage};
+use super::origin;
 use super::{ConnectionSlot, ACTIVE_WS_CONNECTIONS};
 
 /// Cached Python imports - loaded once at first WebSocket connection
@@ -624,80 +625,6 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
     Ok(Py::new(py, send_fn)?.into_any())
 }
 
-/// Validate WebSocket origin header against CORS allowed origins
-/// Uses the same CORS configuration as HTTP requests (like FastAPI)
-///
-/// Security behavior:
-/// - If CORS is configured with allow_all_origins=true: allow all origins
-/// - If CORS is configured with specific origins: only allow those origins
-/// - If NO CORS is configured: DENY all cross-origin requests (fail-secure)
-/// - Same-origin requests (no Origin header) are always allowed
-fn validate_origin(req: &HttpRequest, state: &AppState) -> bool {
-    // Get origin header from request
-    let origin = match req.headers().get("origin") {
-        Some(v) => match v.to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("[django-bolt] WebSocket: Invalid Origin header encoding");
-                return false;
-            }
-        },
-        None => {
-            // No origin header - allow for same-origin requests
-            // (browsers don't send Origin for same-origin WebSocket connections)
-            return true;
-        }
-    };
-
-    // Check global CORS config (same as HTTP)
-    if let Some(ref cors_config) = state.global_cors_config {
-        return is_origin_allowed(origin, cors_config, &state.cors_origin_regexes);
-    }
-
-    // SECURITY: No CORS configured = deny all cross-origin requests
-    // This is a fail-secure default (unlike the old allow-all default)
-    eprintln!(
-        "[django-bolt] WebSocket: Rejecting cross-origin request from '{}' - no CORS configured. \
-        Set CORS_ALLOWED_ORIGINS in Django settings to allow WebSocket connections.",
-        origin
-    );
-    false
-}
-
-/// Check if an origin is allowed by the CORS configuration
-/// Reuses the same logic as HTTP CORS validation. The test client calls it too.
-pub fn is_origin_allowed(
-    origin: &str,
-    cors_config: &CorsConfig,
-    global_regexes: &[regex::Regex],
-) -> bool {
-    // Allow all origins if configured
-    if cors_config.allow_all_origins {
-        return true;
-    }
-
-    // O(1) exact match using HashSet
-    if cors_config.origin_set.contains(origin) {
-        return true;
-    }
-
-    // Check route-level regex patterns
-    if cors_config
-        .compiled_origin_regexes
-        .iter()
-        .any(|re| re.is_match(origin))
-    {
-        return true;
-    }
-
-    // Check global regex patterns
-    if global_regexes.iter().any(|re| re.is_match(origin)) {
-        return true;
-    }
-
-    false
-}
-
 /// What a WebSocket upgrade dispatches to.
 pub enum WsTarget {
     /// A route registered with `@api.websocket`. Runs auth, guards, and rate
@@ -830,7 +757,7 @@ pub async fn handle_websocket_upgrade(
 
     // Validate origin header (CORS-like protection for WebSocket)
     // Uses same CORS config as HTTP requests
-    if !validate_origin(&req, &state) {
+    if !origin::validate_origin(req.headers().get(ORIGIN), state.global_cors_config.as_ref()) {
         return Ok(HttpResponse::Forbidden()
             .content_type("application/json")
             .body(r#"{"detail":"Origin not allowed"}"#));

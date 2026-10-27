@@ -777,15 +777,13 @@ pub fn handle_test_websocket(
     // Origin validation for WebSocket
     let origin = header_map.get("origin");
     if let Some(origin_value) = origin {
-        // The production check. No CORS config denies a cross-origin connection.
-        let origin_allowed = match app.config.global_cors_config {
-            Some(ref cors_config) => bolt_websocket::handler::is_origin_allowed(
-                origin_value,
-                cors_config,
-                &app.config.cors_origin_regexes(),
-            ),
-            None => false,
-        };
+        // The production check. A value that no header can hold is denied too.
+        let origin_allowed = HeaderValue::from_str(origin_value).is_ok_and(|origin_header| {
+            bolt_websocket::origin::validate_origin(
+                Some(&origin_header),
+                app.config.global_cors_config.as_ref(),
+            )
+        });
 
         if !origin_allowed {
             return Err(pyo3::exceptions::PyPermissionError::new_err(format!(

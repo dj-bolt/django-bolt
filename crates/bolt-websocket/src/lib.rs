@@ -11,11 +11,13 @@
 //! - `actor` - Actix WebSocket actor implementation
 //! - `router` - WebSocket route matching
 //! - `handler` - HTTP upgrade handler
+//! - `origin` - Origin check of the handshake
 
 pub mod actor;
 pub mod config;
 pub mod handler;
 pub mod messages;
+pub mod origin;
 pub mod router;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

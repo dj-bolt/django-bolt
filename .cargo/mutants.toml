@@ -7,6 +7,7 @@
 # Python suite also catches some mutants that this run lists as missed.
 examine_globs = [
     "crates/bolt-core/src/cookies.rs",
+    "crates/bolt-core/src/cors.rs",
     "crates/bolt-core/src/form_parsing.rs",
     "crates/bolt-core/src/middleware/auth.rs",
     "crates/bolt-core/src/middleware/client_ip.rs",
@@ -16,9 +17,10 @@ examine_globs = [
     "crates/bolt-core/src/router.rs",
     "crates/bolt-core/src/type_coercion.rs",
     "crates/bolt-core/src/validation.rs",
+    "crates/bolt-websocket/src/origin.rs",
 ]
 
-# A mutant in bolt-core is caught by the tests of bolt-core.
+# A mutant in a crate is caught by the tests of that crate.
 test_workspace = false
 
 # Mutants that do not change what the code does. No Rust or Python test can

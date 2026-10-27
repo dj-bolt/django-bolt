@@ -137,7 +137,8 @@ where
                         res.headers_mut(),
                         origin.as_deref(),
                         cors_cfg,
-                        state_ref,
+                        state_ref.global_cors_config.as_ref(),
+                        &state_ref.cors_origin_regexes,
                     );
                     if method == Method::OPTIONS && origin_allowed {
                         add_preflight_headers_with_config(res.headers_mut(), cors_cfg);
@@ -148,7 +149,8 @@ where
                         res.headers_mut(),
                         origin.as_deref(),
                         cors_cfg,
-                        state_ref,
+                        state_ref.global_cors_config.as_ref(),
+                        &state_ref.cors_origin_regexes,
                     );
                     if method == Method::OPTIONS && origin_allowed {
                         add_preflight_headers_with_config(res.headers_mut(), cors_cfg);
