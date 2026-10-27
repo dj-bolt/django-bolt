@@ -440,6 +440,7 @@ def cors(
     headers: list[str] = None,
     credentials: bool = False,
     max_age: int = 3600,
+    origin_regexes: list[str] | None = None,
 ):
     """
     CORS configuration decorator (Rust-accelerated).
@@ -447,9 +448,15 @@ def cors(
     This middleware is handled in Rust for maximum performance.
     CORS preflight requests are handled without Python overhead.
 
+    The origins and origin_regexes of the route are its complete allow list. The route does
+    not use CORS_ALLOWED_ORIGINS or CORS_ALLOWED_ORIGIN_REGEXES.
+
     Args:
-        origins: Allowed origins (REQUIRED). Use ["*"] for all origins, or specific origins
-                 like ["https://example.com"]. For global config, use Django settings instead.
+        origins: Allowed origins (REQUIRED unless origin_regexes is given). Use ["*"] for all
+                 origins, or specific origins like ["https://example.com"]. For global config,
+                 use Django settings instead.
+        origin_regexes: Patterns for allowed origins, as in CORS_ALLOWED_ORIGIN_REGEXES. Start
+                 each pattern with ^ and end it with $.
         methods: Allowed methods (default: GET, POST, PUT, PATCH, DELETE, OPTIONS)
         headers: Allowed headers
         credentials: Allow credentials (cannot be combined with wildcard "*")
@@ -465,17 +472,21 @@ def cors(
         @cors(origins=["https://app.example.com"], credentials=True)
         async def with_cookies(): ...
 
+        @cors(origin_regexes=[r"^https://[a-z]+\\.example\\.com$"])
+        async def tenant_endpoint(): ...
+
     Raises:
-        ValueError: If origins is not specified (empty @cors() is not allowed)
+        ValueError: If neither origins nor origin_regexes is specified (empty @cors() is not allowed)
     """
 
     def decorator(func):
         # SECURITY: Require explicit origins - empty @cors() is a common mistake
-        if origins is None:
+        if origins is None and origin_regexes is None:
             raise ValueError(
                 "@cors() requires 'origins' argument. Examples:\n"
                 "  @cors(origins=['https://example.com'])  # Specific origin\n"
                 "  @cors(origins=['*'])  # Allow all origins\n"
+                "  @cors(origin_regexes=[r'^https://\\w+\\.example\\.com$'])  # Origin patterns\n"
                 "\n"
                 "If you want to use global CORS settings from Django (CORS_ALLOWED_ORIGINS),\n"
                 "simply remove the @cors decorator - global config applies automatically."
@@ -485,7 +496,7 @@ def cors(
             func.__bolt_middleware__ = []
 
         # Parse origins
-        origin_list = origins if isinstance(origins, list) else [origins]
+        origin_list = [origins] if isinstance(origins, str) else list(origins or [])
 
         # SECURITY: Validate wildcard + credentials
         if "*" in origin_list and credentials:
@@ -500,6 +511,7 @@ def cors(
             {
                 "type": "cors",
                 "origins": origin_list,
+                "origin_regexes": list(origin_regexes or []),
                 "methods": methods or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"],
                 "headers": headers,
                 "credentials": credentials,

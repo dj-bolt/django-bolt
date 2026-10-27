@@ -36,6 +36,17 @@ async def get_data():
     return {"data": "value"}
 ```
 
+The `origins` and `origin_regexes` of a route are its complete allow list. The route does not use `CORS_ALLOWED_ORIGINS` or `CORS_ALLOWED_ORIGIN_REGEXES`. Thus a route can allow fewer origins than the global settings. Use `origin_regexes` to allow a pattern of origins on one route:
+
+```python
+@api.get("/api/tenant")
+@cors(origin_regexes=[r"^https://[a-z]+\.tenant\.example\.com$"], credentials=True)
+async def tenant_data():
+    return {"data": "value"}
+```
+
+A pattern can match a part of the origin, so start it with `^` and end it with `$`. Bolt ignores an invalid pattern and writes a warning at startup.
+
 ### Global CORS
 
 Configure CORS for all endpoints in `settings.py`:

@@ -4,12 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`@cors(origin_regexes=[...])`** - A route can allow the origins that match a pattern, as `CORS_ALLOWED_ORIGIN_REGEXES` does for all routes. `@cors` needs `origins` or `origin_regexes`.
+
 ### Fixed
 
 - **A model instance or other object converts to a response Struct by attribute** - A handler can return an object, such as a Django model instance, for a `Struct` or `list[Struct]` response type. Bolt read each declared field with `getattr(obj, name, None)` and validated the dict. Thus a missing attribute became `None` and replaced the field default, and a renamed field (`rename="camel"` or `msgspec.field(name=...)`) failed with "missing required field". Both gave a 500. Now msgspec reads the object by attribute (`from_attributes=True`), so defaults and renamed fields work. An object for an `Item | None` response type now converts too.
 - **A QuerySet for a renamed `list[Struct]` response works** - Bolt loads a QuerySet with `.values()` of the declared fields. The rows had the Python field names, so a Struct with `rename=` or `msgspec.field(name=...)` failed validation with a 500. Without validation, the JSON had the Python names. Now each row has the wire names of the Struct. This also applies to model instances that Bolt projects when `validate_response=False`.
 - **A struct parameter error names its source as a scalar parameter error does** - A 422 error for a field of a struct parameter had `"query parameter"` or `"form field"` as the first item of `loc`. A scalar parameter has `"query"` or `"body"` there. Now a struct with `Query()` gives `["query", ...]`, and a struct with `Form()` gives `["body", ...]` for a missing field too. `Cookie()` keeps `["cookie", ...]`. A missing field with `msgspec.field(name=...)` now gives its wire name in `loc` and `msg`, as an invalid field does.
 - **`WebSocketTestClient` uses the Origin check of `runbolt`** - The test client had its own copy of the WebSocket Origin check, and the copy accepted an `Origin` value that is not ASCII. Now `WebSocketTestClient` and `runbolt` use the same check. For an `Origin` value that is not ASCII, the test client raises `PermissionError`, and `runbolt` answers HTTP 403.
+- **A route-level `@cors` allows only its own origins** - A route with `@cors(origins=[...])` did not use `CORS_ALLOWED_ORIGINS`, but it still allowed each origin that matched `CORS_ALLOWED_ORIGIN_REGEXES`. With `credentials=True`, such an origin got credentialed CORS on a route that did not list it. Now the origins of a route are its complete allow list. A route that used the global patterns must list them in `origin_regexes`.
 
 ### Changed
 
