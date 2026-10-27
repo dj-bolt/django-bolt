@@ -143,7 +143,30 @@ async def trace_tool(call: ToolCall, call_next) -> dict:
 
 `call_next()` returns the `CallToolResult` dict, and a tool exception or an argument error is already an `isError` result there. The middleware returns that dict or another one. The first registered middleware runs outermost. Register middleware before the server is mounted.
 
-The request `_meta` reaches Python only inside a tool `Context`, so with any middleware registered every tool call gets a `Context` object, whether or not the tool declares one. When a tool asks a 2026-07-28 client for input (elicitation or sampling), the request passes up through the middleware as a `BaseException`. Let it propagate.
+When a tool asks a 2026-07-28 client for input (elicitation or sampling), the request passes up through the middleware as a `BaseException`. Let it propagate.
+
+### Resource and prompt middleware
+
+`@mcp.resource_middleware` runs around every `resources/read` and gets a `ResourceRead` with the `uri`, `meta` and `principal`. `@mcp.prompt_middleware` runs around every `prompts/get` and gets a `PromptGet` with the prompt `name`, the raw `arguments`, `meta` and `principal`. `call_next()` returns the `ReadResourceResult` or `GetPromptResult` dict.
+
+```python
+from bolt_mcp import PromptGet, ResourceRead
+
+@mcp.resource_middleware
+async def trace_resource(read: ResourceRead, call_next) -> dict:
+    parent = propagate.extract({k: v for k, v in read.meta.items() if isinstance(v, str)})
+    with tracer.start_as_current_span("resources/read", context=parent) as span:
+        span.set_attribute("mcp.resource.uri", read.uri)
+        return await call_next()
+
+@mcp.prompt_middleware
+async def trace_prompt(get: PromptGet, call_next) -> dict:
+    parent = propagate.extract({k: v for k, v in get.meta.items() if isinstance(v, str)})
+    with tracer.start_as_current_span(f"prompts/get {get.name}", context=parent):
+        return await call_next()
+```
+
+Unlike a tool, a failed read or prompt is a JSON-RPC error, not a result. An unknown URI or prompt, invalid arguments, or an exception in the handler raises out of `call_next()`. Let it propagate so the client gets the error.
 
 ## Resources
 

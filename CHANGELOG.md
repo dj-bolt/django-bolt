@@ -6,7 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **bolt-mcp: `@mcp.tool_middleware`** - An async function runs around every `tools/call`. It gets a `ToolCall` with the tool name, the raw arguments, the request `_meta` and the principal, and `call_next()` returns the `CallToolResult` dict. MCP calls do not pass through HTTP middleware, so this is the place for per-call logging, metrics and tracing, with trace context from `_meta` (`traceparent`). Before, a tool read `_meta` only through a `Context` parameter. Resources and prompts have no middleware yet, because Rust does not pass their `_meta` to Python. (#491)
+- **bolt-mcp: `@mcp.tool_middleware`** - An async function runs around every `tools/call`. It gets a `ToolCall` with the tool name, the raw arguments, the request `_meta` and the principal, and `call_next()` returns the `CallToolResult` dict. MCP calls do not pass through HTTP middleware, so this is the place for per-call logging, metrics and tracing, with trace context from `_meta` (`traceparent`). Before, a tool read `_meta` only through a `Context` parameter. (#491)
+- **bolt-mcp: `@mcp.resource_middleware` and `@mcp.prompt_middleware`** - The same kind of middleware runs around every `resources/read` and `prompts/get`. It gets a `ResourceRead` (URI) or `PromptGet` (prompt name and raw arguments), each with the request `_meta` and the principal. Before, Rust passed only the URI, or the name and arguments, to Python for these requests, so a resource or prompt could not see the trace context or the caller. Now Rust passes `_meta` and the principal to Python for every `resources/read`, `prompts/get` and `tools/call`. (#491)
 
 ### Fixed
 

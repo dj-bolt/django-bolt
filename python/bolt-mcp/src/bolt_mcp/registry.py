@@ -33,6 +33,42 @@ class ToolCall:
 ToolMiddleware = Callable[[ToolCall, Callable[[], Awaitable[dict[str, Any]]]], Awaitable[dict[str, Any]]]
 
 
+@dataclass(frozen=True)
+class ResourceRead:
+    """What a resource middleware sees of one ``resources/read``.
+
+    ``meta`` and ``principal`` are the same as on ``ToolCall``.
+    """
+
+    uri: str
+    meta: dict[str, Any]
+    principal: dict[str, Any]
+
+
+# ``async def middleware(read: ResourceRead, call_next) -> dict`` where ``await call_next()``
+# returns the ReadResourceResult dict.
+ResourceMiddleware = Callable[[ResourceRead, Callable[[], Awaitable[dict[str, Any]]]], Awaitable[dict[str, Any]]]
+
+
+@dataclass(frozen=True)
+class PromptGet:
+    """What a prompt middleware sees of one ``prompts/get``.
+
+    ``arguments`` are the decoded arguments as the client sent them, before
+    validation. ``meta`` and ``principal`` are the same as on ``ToolCall``.
+    """
+
+    name: str
+    arguments: Any
+    meta: dict[str, Any]
+    principal: dict[str, Any]
+
+
+# ``async def middleware(get: PromptGet, call_next) -> dict`` where ``await call_next()``
+# returns the GetPromptResult dict.
+PromptMiddleware = Callable[[PromptGet, Callable[[], Awaitable[dict[str, Any]]]], Awaitable[dict[str, Any]]]
+
+
 @dataclass
 class ToolDef:
     name: str

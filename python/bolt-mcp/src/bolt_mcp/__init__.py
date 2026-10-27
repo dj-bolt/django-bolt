@@ -22,7 +22,7 @@ from .autoexpose import expose_as_tool, expose_routes
 from .context import Context
 from .mount import ProtectedResource, mount_mcp
 from .oauth import AuthorizationServer
-from .registry import ToolCall
+from .registry import PromptGet, ResourceRead, ToolCall
 from .server import MCP, principal
 
 __all__ = [
@@ -34,5 +34,7 @@ __all__ = [
     "expose_routes",
     "expose_as_tool",
     "Context",
+    "PromptGet",
+    "ResourceRead",
     "ToolCall",
 ]
