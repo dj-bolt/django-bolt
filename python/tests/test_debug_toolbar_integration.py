@@ -16,12 +16,13 @@ import pytest
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.test import override_settings
-from django.urls import include, path
 
 from django_bolt import BoltAPI, CurrentUser, Request
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.shortcuts import render
 from django_bolt.testing import TestClient
+
+from .debug_toolbar_urls import toolbar_urlpatterns
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -58,9 +59,7 @@ def toolbar_settings(monkeypatch):
         DEBUG_TOOLBAR_CONFIG={"SHOW_TOOLBAR_CALLBACK": lambda _request: True},
     ):
         # The toolbar URLs import its models, so the app must be installed first.
-        monkeypatch.setattr(
-            sys.modules[__name__], "urlpatterns", [path("__debug__/", include("debug_toolbar.urls"))], raising=False
-        )
+        monkeypatch.setattr(sys.modules[__name__], "urlpatterns", toolbar_urlpatterns(), raising=False)
         yield
 
 
