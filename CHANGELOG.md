@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **bolt-mcp: `@mcp.tool(meta=...)`** - The dict is sent as the tool's `_meta` in `tools/list`. MCP Apps read the tool's UI from it (`ui.resourceUri`), and `ui.visibility` hides a tool from the model. Before, a tool had no `_meta`. (#488)
+
 ### Fixed
 
 - **A model instance or other object converts to a response Struct by attribute** - A handler can return an object, such as a Django model instance, for a `Struct` or `list[Struct]` response type. Bolt read each declared field with `getattr(obj, name, None)` and validated the dict. Thus a missing attribute became `None` and replaced the field default, and a renamed field (`rename="camel"` or `msgspec.field(name=...)`) failed with "missing required field". Both gave a 500. Now msgspec reads the object by attribute (`from_attributes=True`), so defaults and renamed fields work. An object for an `Item | None` response type now converts too.
