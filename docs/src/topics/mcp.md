@@ -133,6 +133,18 @@ async def example_config() -> str:
     return msgspec.json.encode({"app": "demo", "env": "dev"}).decode()
 ```
 
+`meta` is sent as `_meta` on the `resources/read` contents. [MCP Apps](https://modelcontextprotocol.io/extensions/apps) read the iframe settings of an app from it, such as its content security policy:
+
+```python
+@mcp.resource(
+    "ui://weather/view.html",
+    mime_type="text/html;profile=mcp-app",
+    meta={"ui": {"csp": {"connectDomains": ["https://api.example.com"]}}},
+)
+async def weather_view() -> str:
+    return WEATHER_HTML
+```
+
 ### Resource templates
 
 A URI containing `{var}` placeholders registers a **resource template** — a parameterized resource. Reading a concrete URI extracts the variables, coerces them to the handler's annotated types, and calls the handler. The handler's parameters must match the placeholders exactly.
