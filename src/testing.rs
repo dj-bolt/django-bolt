@@ -782,7 +782,6 @@ pub fn handle_test_websocket(
             bolt_websocket::origin::validate_origin(
                 Some(&origin_header),
                 app.config.global_cors_config.as_ref(),
-                &app.config.cors_origin_regexes(),
             )
         });
 

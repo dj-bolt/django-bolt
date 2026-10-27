@@ -757,11 +757,7 @@ pub async fn handle_websocket_upgrade(
 
     // Validate origin header (CORS-like protection for WebSocket)
     // Uses same CORS config as HTTP requests
-    if !origin::validate_origin(
-        req.headers().get(ORIGIN),
-        state.global_cors_config.as_ref(),
-        &state.cors_origin_regexes,
-    ) {
+    if !origin::validate_origin(req.headers().get(ORIGIN), state.global_cors_config.as_ref()) {
         return Ok(HttpResponse::Forbidden()
             .content_type("application/json")
             .body(r#"{"detail":"Origin not allowed"}"#));

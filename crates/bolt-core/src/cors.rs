@@ -297,7 +297,6 @@ mod tests {
             false,
             false,
         );
-        let route_without_regexes = cors(&["https://r.example"], &[], false, false);
 
         let mut headers = HeaderMap::new();
         assert!(add_cors_headers_with_config(
@@ -314,19 +313,33 @@ mod tests {
             None,
             &global_regexes,
         ));
+    }
+
+    #[test]
+    fn route_with_no_origins_uses_the_global_regexes() {
+        let route = cors(&[], &[], false, false);
+        let global = cors(
+            &["https://g.example"],
+            &[r"^https://[a-z]+\.global\.example$"],
+            false,
+            false,
+        );
+        // AppState holds a copy of the compiled regexes of the global config.
+        let global_regexes = &global.compiled_origin_regexes;
+
         assert!(add_cors_headers_with_config(
             &mut HeaderMap::new(),
             Some("https://app.global.example"),
-            &route_without_regexes,
-            None,
-            &global_regexes,
+            &route,
+            Some(&global),
+            global_regexes,
         ));
         assert!(!add_cors_headers_with_config(
             &mut HeaderMap::new(),
-            Some("https://app.global.example"),
-            &route_without_regexes,
-            None,
-            &[],
+            Some("https://app.other.example"),
+            &route,
+            Some(&global),
+            global_regexes,
         ));
     }
 
