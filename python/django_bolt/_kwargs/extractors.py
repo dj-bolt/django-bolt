@@ -560,6 +560,41 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
         return extract
 
 
+def _collect_header_struct_errors(
+    header_fields: tuple[tuple[str, str, Any, bool], ...], data: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return one error for each missing or invalid field of a header struct.
+
+    ``header_fields`` holds the header name, the encoded name, the type and the
+    required flag of each field. ``data`` maps encoded names to header values.
+    The ``loc`` of each error is ``("header", header name)``, as for a scalar header.
+    """
+    errors: list[dict[str, Any]] = []
+    for header_name, encoded_name, field_type, required in header_fields:
+        if encoded_name in data:
+            try:
+                msgspec.convert(data[encoded_name], type=field_type)
+            except msgspec.ValidationError as e:
+                errors.append(
+                    {
+                        "type": "validation_error",
+                        "loc": ("header", header_name),
+                        "msg": str(e),
+                        "input": data[encoded_name],
+                    }
+                )
+        elif required:
+            errors.append(
+                {
+                    "type": "missing_field",
+                    "loc": ("header", header_name),
+                    "msg": f"Missing required header: {header_name}",
+                    "input": None,
+                }
+            )
+    return errors
+
+
 def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable:
     """Create an extractor that builds a Struct/Serializer from HTTP headers.
 
@@ -568,7 +603,8 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     aliases (field(name=...)) and rename strategies.
 
     Note: Rust converts the typed struct fields before this runs (see
-    ``create_header_extractor``), so msgspec gets typed values.
+    ``create_header_extractor``), so msgspec gets typed values. A missing or
+    invalid field gives a RequestValidationError with one error for each field.
 
     Args:
         struct_type: The msgspec.Struct or Serializer class
@@ -582,23 +618,27 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     # Pre-compute header name mapping at registration time
     # Maps kebab-case header name → encoded field name (for msgspec alias support)
     header_to_encoded: list[tuple[str, str]] = []
-    required_headers: set[str] = set()
+    header_fields: list[tuple[str, str, Any, bool]] = []
     for field in msgspec.structs.fields(struct_type):
         encoded_name = getattr(field, "encode_name", field.name)
         header_name = encoded_name.lower().replace("_", "-")
         header_to_encoded.append((header_name, encoded_name))
-        if field.required:
-            required_headers.add(header_name)
+        header_fields.append((header_name, encoded_name, field.type, field.required))
+    error_fields = tuple(header_fields)
 
     def extract(headers_map: dict[str, str]) -> Any:
         converted = {}
         for header_name, encoded_name in header_to_encoded:
             if header_name in headers_map:
                 converted[encoded_name] = headers_map[header_name]
-            elif header_name in required_headers:
-                raise HTTPException(status_code=422, detail=f"Missing required header: {header_name}")
 
-        return msgspec.convert(converted, struct_type)
+        try:
+            return msgspec.convert(converted, struct_type)
+        except msgspec.ValidationError as e:
+            errors = _collect_header_struct_errors(error_fields, converted)
+            if errors:
+                raise RequestValidationError(errors=errors) from e
+            raise
 
     return extract
 

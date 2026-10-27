@@ -3,7 +3,7 @@
 Rust coerces scalar values. Python validates a msgspec struct parameter, a
 sequence parameter, and a parameter with ``msgspec.Meta`` constraints. Each
 error names the source in ``loc`` as a scalar parameter does: ``query``,
-``cookie`` or ``body``.
+``header``, ``cookie`` or ``body``.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import msgspec
 import pytest
 
 from django_bolt import BoltAPI
-from django_bolt.params import Cookie, Form, Query
+from django_bolt.params import Cookie, Form, Header, Query
 from django_bolt.testing import TestClient
 
 
@@ -23,6 +23,12 @@ class Filters(msgspec.Struct):
     ids: list[int] = []
     size: Annotated[int, msgspec.Meta(ge=1)] = 10
     tag: Annotated[str, msgspec.Meta(min_length=2)] = msgspec.field(name="t", default="ok")
+
+
+class Headers(msgspec.Struct):
+    x_api_key: str
+    x_count: Annotated[int, msgspec.Meta(ge=1)] = 1
+    label: Annotated[str, msgspec.Meta(min_length=2)] = msgspec.field(name="x_label", default="ok")
 
 
 @pytest.fixture(scope="module")
@@ -40,6 +46,10 @@ def client():
     @api.post("/form-struct")
     async def form_struct(filters: Annotated[Filters, Form()]):
         return {"page": filters.page}
+
+    @api.get("/header-struct")
+    async def header_struct(headers: Annotated[Headers, Header()]):
+        return {"key": headers.x_api_key}
 
     @api.get("/sequence")
     async def sequence(ids: Annotated[list[int], Query()]):
@@ -89,6 +99,38 @@ def test_missing_renamed_field_uses_its_wire_name():
 
     assert response.status_code == 422
     assert response.json()["detail"] == [_missing("query", "query parameter", "pageNumber")]
+
+
+def test_missing_header_struct_field_names_the_header(client):
+    response = client.get("/header-struct")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == [_missing("header", "header", "x-api-key")]
+
+
+def test_invalid_header_struct_fields_name_the_headers(client):
+    response = client.get("/header-struct", headers={"X-Api-Key": "k", "X-Count": "0", "X-Label": "x"})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == [
+        {"type": "validation_error", "loc": ["header", "x-count"], "msg": "Expected `int` >= 1", "input": 0},
+        {
+            "type": "validation_error",
+            "loc": ["header", "x-label"],
+            "msg": "Expected `str` of length >= 2",
+            "input": "x",
+        },
+    ]
+
+
+def test_header_struct_reports_a_missing_and_an_invalid_field_together(client):
+    response = client.get("/header-struct", headers={"X-Count": "0"})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == [
+        _missing("header", "header", "x-api-key"),
+        {"type": "validation_error", "loc": ["header", "x-count"], "msg": "Expected `int` >= 1", "input": 0},
+    ]
 
 
 @pytest.mark.parametrize(
