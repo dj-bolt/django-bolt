@@ -358,6 +358,7 @@ def _collect_struct_errors(
     struct_type: type,
     data: dict[str, Any],
     param_type: str,
+    source: str,
     has_files: bool = False,
 ) -> list[dict[str, Any]]:
     """
@@ -368,7 +369,8 @@ def _collect_struct_errors(
     Parameters:
         struct_type (type): The msgspec struct/serializer type whose fields to validate.
         data (dict[str, Any]): The input mapping of encoded field names to values.
-        param_type (str): The parameter source name used in error locations (e.g., "query", "cookie", "form field").
+        param_type (str): The source name in a missing-field message ("query parameter", "cookie" or "form field").
+        source (str): The source in `loc` ("query", "cookie" or "body").
         has_files (bool): Enable upload-file decoding hooks when True.
 
     Returns:
@@ -379,7 +381,6 @@ def _collect_struct_errors(
             - "input": the offending input value or None for missing fields/files.
     """
     dec_hook = _upload_file_dec_hook if has_files else None
-    source = _STRUCT_ERROR_SOURCES[param_type]
     errors: list[dict[str, Any]] = []
     for field in msgspec.structs.fields(struct_type):
         encoded_name = getattr(field, "encode_name", field.name)
@@ -455,11 +456,13 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
     Parameters:
         struct_type (type): msgspec struct/serializer type to produce.
         default (Any): Reserved for optional-struct support; not used by the extractor itself.
-        param_type (str): Human-readable parameter source name used in error locations (e.g., "query parameter", "form field", "cookie").
+        param_type (str): The source name in error messages ("query parameter", "form field" or "cookie"). It also selects the source in `loc`.
 
     Returns:
         Callable: An extractor function that produces a validated instance of `struct_type` from incoming parameter data and raises RequestValidationError on validation errors.
     """
+    # An unknown source fails here, when the route registers.
+    source = _STRUCT_ERROR_SOURCES[param_type]
     # Check at registration time if any fields need file handling
     has_upload_file_fields = any(is_upload_file_type(f.type) for f in msgspec.structs.fields(struct_type))
     # Pre-compute sequence field names — empty tuple means zero runtime overhead.
@@ -499,7 +502,7 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
             try:
                 result = msgspec.convert(merged, struct_type, strict=False, dec_hook=_upload_file_dec_hook)
             except msgspec.ValidationError as e:
-                errors = _collect_struct_errors(struct_type, merged, param_type, has_files=True)
+                errors = _collect_struct_errors(struct_type, merged, param_type, source, has_files=True)
                 if errors:
                     raise RequestValidationError(errors=errors) from e
                 raise
@@ -548,7 +551,7 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
             try:
                 return msgspec.convert(param_map, struct_type, strict=False)
             except msgspec.ValidationError as e:
-                errors = _collect_struct_errors(struct_type, param_map, param_type)
+                errors = _collect_struct_errors(struct_type, param_map, param_type, source)
                 if errors:
                     raise RequestValidationError(errors=errors) from e
                 raise

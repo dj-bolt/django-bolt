@@ -49,7 +49,8 @@ def client():
     async def constrained(n: Annotated[int, msgspec.Meta(ge=1), Query()]):
         return {"n": n}
 
-    return TestClient(api)
+    with TestClient(api) as client:
+        yield client
 
 
 def _missing(source: str, noun: str, name: str) -> dict:
@@ -83,7 +84,8 @@ def test_missing_renamed_field_uses_its_wire_name():
     async def renamed(filters: Annotated[Renamed, Query()]):
         return {"page": filters.page_number}
 
-    response = TestClient(api).get("/renamed")
+    with TestClient(api) as client:
+        response = client.get("/renamed")
 
     assert response.status_code == 422
     assert response.json()["detail"] == [_missing("query", "query parameter", "pageNumber")]
