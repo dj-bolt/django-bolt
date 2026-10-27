@@ -116,6 +116,23 @@ async def add(a: int, b: int) -> dict:
 | `str` | `content` text |
 | `dict` | `content` text **and** `structuredContent` |
 | other (Struct, dataclass, list, …) | serialized to text + `structuredContent` |
+| `ToolResult` | its `content` as the content, `structured` as `structuredContent`, `meta` as `_meta` |
+
+By default the text content is the JSON of the structured content. Return a `ToolResult` to set the text apart from it, for example a short summary for the model while an [MCP App](https://modelcontextprotocol.io/extensions/apps) renders the full data:
+
+```python
+from bolt_mcp import ToolResult
+
+@mcp.tool(output_schema={"type": "object", "properties": {"days": {"type": "array"}}})
+async def forecast(city: str) -> ToolResult:
+    days = await weather.forecast(city)
+    return ToolResult(
+        content=f"{len(days)} days of forecast for {city}.",
+        structured={"days": days},
+    )
+```
+
+`content` is a string or a list of MCP content blocks (text, image, resource link). `structured` is optional, and a value that is not an object is sent as `{"result": ...}`. `output_schema="auto"` cannot read a schema from `-> ToolResult` and raises `TypeError`, so pass the schema of `structured` as a dict.
 
 **Errors are in-band.** A `raise` inside a tool becomes a `CallToolResult` with `isError: true` (the MCP convention), not a transport-level error — so the client sees a normal tool failure it can reason about.
 

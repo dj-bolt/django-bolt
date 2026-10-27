@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **bolt-mcp: `ToolResult`** - A tool can return `ToolResult(content=..., structured=..., meta=...)` to set its text content apart from its `structuredContent`. `content` is a string or a list of MCP content blocks, and `meta` becomes the result's `_meta`. Other return values map as before, with the JSON of the structured content as the text. `output_schema="auto"` on a tool that returns `ToolResult` raises `TypeError`. (#490)
+
 ### Fixed
 
 - **A model instance or other object converts to a response Struct by attribute** - A handler can return an object, such as a Django model instance, for a `Struct` or `list[Struct]` response type. Bolt read each declared field with `getattr(obj, name, None)` and validated the dict. Thus a missing attribute became `None` and replaced the field default, and a renamed field (`rename="camel"` or `msgspec.field(name=...)`) failed with "missing required field". Both gave a 500. Now msgspec reads the object by attribute (`from_attributes=True`), so defaults and renamed fields work. An object for an `Item | None` response type now converts too.
