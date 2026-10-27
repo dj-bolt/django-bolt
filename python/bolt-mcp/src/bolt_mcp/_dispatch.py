@@ -67,7 +67,7 @@ async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
             resolver=partial(_resolve_resource, mcp),
         )
     try:
-        result = await execute_tool(tool, kwargs)
+        result = await execute_tool(tool, kwargs, mask_error_details=mcp.mask_error_details)
     except _InputRequired as pending:
         return json_encode(
             {
@@ -121,6 +121,14 @@ def _error(kind: str, message: str) -> bytes:
     return json_encode({"__error__": {"kind": kind, "message": message}})
 
 
+def _handler_failed(mcp: MCP, what: str, exc: Exception) -> bytes:
+    """Log a resource or prompt handler's exception and build its JSON-RPC internal error."""
+    logger.exception("MCP %s failed", what)
+    if mcp.mask_error_details:
+        return _error("internal_error", f"{what[0].upper()}{what[1:]} failed.")
+    return _error("internal_error", f"MCP dispatch failed: {type(exc).__name__}: {exc}")
+
+
 async def _read_resource(mcp: MCP, payload: dict[str, Any]) -> bytes:
     uri = payload["uri"]
     try:
@@ -129,6 +137,8 @@ async def _read_resource(mcp: MCP, payload: dict[str, Any]) -> bytes:
         return _error("resource_not_found", f"Unknown resource: {uri!r}")
     except msgspec.ValidationError as exc:
         return _error("invalid_params", f"Invalid resource URI {uri!r}: {exc}")
+    except Exception as exc:
+        return _handler_failed(mcp, f"resource {uri!r}", exc)
     return json_encode(
         {"contents": [{"uri": uri, "mimeType": mime_type, "text": text}], "resultType": RESULT_TYPE_COMPLETE}
     )
@@ -149,7 +159,10 @@ async def _get_prompt(mcp: MCP, payload: dict[str, Any]) -> bytes:
     except msgspec.ValidationError as exc:
         return _error("invalid_params", f"Invalid arguments: {exc}")
     kwargs = msgspec.structs.asdict(args)
-    rendered = await _invoke(prompt.fn, prompt.is_async, **kwargs)
+    try:
+        rendered = await _invoke(prompt.fn, prompt.is_async, **kwargs)
+    except Exception as exc:
+        return _handler_failed(mcp, f"prompt {name!r}", exc)
     if isinstance(rendered, str):
         messages = [{"role": "user", "content": {"type": "text", "text": rendered}}]
     else:
