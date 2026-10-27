@@ -138,6 +138,7 @@ class MCP:
         output_schema: dict[str, Any] | str | None = None,
         annotations: dict[str, Any] | None = None,
         icons: list[dict[str, Any]] | None = None,
+        meta: dict[str, Any] | None = None,
         guards: list[Any] | None = None,
     ):
         """Register a tool.
@@ -145,7 +146,8 @@ class MCP:
         ``output_schema`` is a JSON Schema dict, or the string ``"auto"`` to
         derive it from the return annotation (msgspec-representable types
         only). ``annotations`` is an MCP ToolAnnotations dict (``readOnlyHint``
-        etc.). ``guards`` are evaluated natively in Rust, both for
+        etc.). ``meta`` is sent as the tool's ``_meta`` in ``tools/list``, for
+        example MCP Apps' ``{"ui": {"resourceUri": ...}}``. ``guards`` are evaluated natively in Rust, both for
         ``tools/call`` denial and per-principal ``tools/list`` filtering.
         """
         if isinstance(output_schema, str) and output_schema != "auto":
@@ -172,6 +174,7 @@ class MCP:
                 output_schema=resolved_output,
                 annotations=annotations,
                 icons=icons,
+                meta=meta,
                 guards=list(guards or []),
                 args_struct=args_struct,
                 input_schema=schema.input_schema_for(args_struct),
