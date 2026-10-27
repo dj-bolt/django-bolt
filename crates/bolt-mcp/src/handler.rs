@@ -172,6 +172,13 @@ fn build_payload(py: Python<'_>, fields: &[(&str, Py<PyAny>)]) -> PyResult<Py<Py
     Ok(dict.into_any().unbind())
 }
 
+fn meta_py(py: Python<'_>, meta_json: Option<&str>) -> Py<PyAny> {
+    match meta_json {
+        Some(meta) => PyString::new(py, meta).into_any().unbind(),
+        None => py.None(),
+    }
+}
+
 fn auth_dict(py: Python<'_>, auth: Option<&AuthContext>) -> PyResult<Py<PyAny>> {
     match auth {
         Some(ctx) => {
@@ -185,6 +192,9 @@ fn auth_dict(py: Python<'_>, auth: Option<&AuthContext>) -> PyResult<Py<PyAny>> 
 
 impl McpHandler {
     /// Forward one execution request to Python and parse its result.
+    ///
+    /// Besides `fields`, the payload always carries the request `_meta` as
+    /// `meta_json` and the principal as `auth`, the same as a tool call.
     async fn dispatch_simple<T: serde::de::DeserializeOwned>(
         &self,
         dispatch: &Py<PyAny>,
@@ -192,11 +202,15 @@ impl McpHandler {
         ctx: &RequestContext<RoleServer>,
     ) -> Result<T, McpError> {
         let mode = protocol_mode(ctx);
+        let auth = auth_from_ctx(ctx);
+        let meta_json = serde_json::to_string(&ctx.meta).ok();
         let (callable, payload) = Python::attach(|py| {
-            let fields: Vec<(&str, Py<PyAny>)> = fields
+            let mut fields: Vec<(&str, Py<PyAny>)> = fields
                 .iter()
                 .map(|(k, v)| (*k, PyString::new(py, v).into_any().unbind()))
                 .collect();
+            fields.push(("meta_json", meta_py(py, meta_json.as_deref())));
+            fields.push(("auth", auth_dict(py, auth.as_deref())?));
             let payload = build_payload(py, &fields)?;
             Ok::<_, PyErr>((dispatch.clone_ref(py), payload))
         })
@@ -307,6 +321,7 @@ impl McpHandler {
                     ),
                     ("ctx", ctx_obj),
                     ("auth", auth_dict(py, auth.as_deref())?),
+                    ("meta_json", meta_py(py, meta_json.as_deref())),
                 ],
             )?;
             Ok::<_, PyErr>((entry.dispatch.clone_ref(py), payload))
