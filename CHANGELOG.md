@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **bolt-mcp: `@mcp.tool_middleware`** - An async function runs around every `tools/call`. It gets a `ToolCall` with the tool name, the raw arguments, the request `_meta` and the principal, and `call_next()` returns the `CallToolResult` dict. MCP calls do not pass through HTTP middleware, so this is the place for per-call logging, metrics and tracing, with trace context from `_meta` (`traceparent`). Before, a tool read `_meta` only through a `Context` parameter. Resources and prompts have no middleware yet, because Rust does not pass their `_meta` to Python. (#491)
+
 ### Fixed
 
 - **A model instance or other object converts to a response Struct by attribute** - A handler can return an object, such as a Django model instance, for a `Struct` or `list[Struct]` response type. Bolt read each declared field with `getattr(obj, name, None)` and validated the dict. Thus a missing attribute became `None` and replaced the field default, and a renamed field (`rename="camel"` or `msgspec.field(name=...)`) failed with "missing required field". Both gave a 500. Now msgspec reads the object by attribute (`from_attributes=True`), so defaults and renamed fields work. An object for an `Item | None` response type now converts too.

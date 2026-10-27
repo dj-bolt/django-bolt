@@ -16,7 +16,7 @@ from typing import Any, get_type_hints
 
 from . import schema
 from .context import Context
-from .registry import PromptDef, ResourceDef, ResourceTemplateDef, ToolDef
+from .registry import PromptDef, ResourceDef, ResourceTemplateDef, ToolDef, ToolMiddleware
 
 _TEMPLATE_VAR = re.compile(r"\{(\w+)\}")
 
@@ -126,6 +126,7 @@ class MCP:
         self._resources: dict[str, ResourceDef] = {}
         self._resource_templates: dict[str, ResourceTemplateDef] = {}
         self._prompts: dict[str, PromptDef] = {}
+        self._tool_middleware: list[ToolMiddleware] = []
 
     # ── Registration decorators ──────────────────────────────────────────────
     def tool(
@@ -186,6 +187,25 @@ class MCP:
         if isinstance(name_or_fn, str):
             name = name_or_fn
         return register
+
+    def tool_middleware(self, fn: ToolMiddleware) -> ToolMiddleware:
+        """Register an async middleware that runs around every ``tools/call``.
+
+        ``async def middleware(call: ToolCall, call_next) -> dict``: ``call`` has the
+        tool name, the raw arguments, the request ``_meta`` and the principal, and
+        ``await call_next()`` runs the tool and returns its CallToolResult dict
+        (an exception in the tool is already an ``isError`` result). The middleware
+        returns that dict or another one. The first registered middleware runs
+        outermost. Register middleware before the server is mounted.
+
+        When a tool asks a 2026-07-28 client for input (elicitation or sampling), the
+        request passes up through the middleware as a ``BaseException``. Let it
+        propagate.
+        """
+        if not inspect.iscoroutinefunction(fn):
+            raise TypeError(f"Tool middleware {getattr(fn, '__name__', fn)!r} must be an async function")
+        self._tool_middleware.append(fn)
+        return fn
 
     def add_tool(self, tool: ToolDef) -> None:
         """Register a pre-built ToolDef (used by the auto-expose path)."""

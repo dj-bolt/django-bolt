@@ -7,9 +7,30 @@ server.py.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """What a tool middleware sees of one ``tools/call``.
+
+    ``arguments`` are the decoded arguments as the client sent them, before
+    validation. ``meta`` is the request ``_meta`` ({} when absent), including
+    ``traceparent``/``tracestate`` when the client sends trace context.
+    ``principal`` is the same dict ``bolt_mcp.principal`` returns.
+    """
+
+    name: str
+    arguments: Any
+    meta: dict[str, Any]
+    principal: dict[str, Any]
+
+
+# ``async def middleware(call: ToolCall, call_next) -> dict`` where ``await call_next()``
+# returns the CallToolResult dict.
+ToolMiddleware = Callable[[ToolCall, Callable[[], Awaitable[dict[str, Any]]]], Awaitable[dict[str, Any]]]
 
 
 @dataclass
