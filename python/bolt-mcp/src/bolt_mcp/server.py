@@ -198,10 +198,14 @@ class MCP:
         name: str | None = None,
         mime_type: str = "text/plain",
         description: str | None = None,
+        meta: dict[str, Any] | None = None,
     ):
         """Register a resource. A ``uri`` containing ``{var}`` placeholders registers a
         *resource template*: the handler's parameters must match the placeholders, and a
-        ``resources/read`` for any matching concrete URI extracts + type-coerces them."""
+        ``resources/read`` for any matching concrete URI extracts + type-coerces them.
+
+        ``meta`` is sent as ``_meta`` on the ``resources/read`` contents, for example
+        MCP Apps' ``{"ui": {"csp": {...}}}``."""
 
         def register(fn: Callable) -> Callable:
             pattern, var_names = _compile_uri_template(uri)
@@ -220,6 +224,7 @@ class MCP:
                     name=res_name,
                     description=res_desc,
                     mime_type=mime_type,
+                    meta=meta,
                     param_names=var_names,
                     is_async=inspect.iscoroutinefunction(fn),
                     pattern=pattern,
@@ -232,6 +237,7 @@ class MCP:
                     name=res_name,
                     description=res_desc,
                     mime_type=mime_type,
+                    meta=meta,
                     is_async=inspect.iscoroutinefunction(fn),
                 )
             return fn
