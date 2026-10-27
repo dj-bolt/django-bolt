@@ -119,6 +119,21 @@ async def add(a: int, b: int) -> dict:
 
 **Errors are in-band.** A `raise` inside a tool becomes a `CallToolResult` with `isError: true` (the MCP convention), not a transport-level error — so the client sees a normal tool failure it can reason about.
 
+Raise `ToolError` for a message the client and the model may read. Any other exception is logged with its traceback on the `bolt_mcp._execute` logger, and by default its text is sent to the client. With `MCP(mask_error_details=True)` the client gets `Tool 'name' failed.` instead, so database errors, host names and file paths stay on the server. A resource or prompt handler that raises gives a JSON-RPC internal error, logged and masked the same way.
+
+```python
+from bolt_mcp import MCP, ToolError
+
+mcp = MCP("billing", mask_error_details=True)
+
+@mcp.tool
+async def pay_invoice(invoice_id: int) -> dict:
+    invoice = await Invoice.objects.filter(pk=invoice_id).afirst()
+    if invoice is None:
+        raise ToolError(f"No invoice {invoice_id}.")   # sent to the client
+    return await payments.pay(invoice)                  # any error here is logged and masked
+```
+
 **Accessing the request.** Declare a `request` (or `req`) parameter to receive the Django-Bolt `Request` — injected automatically and excluded from the tool's input schema. Read the authenticated principal with `bolt_mcp.principal(request)`, which returns `{user_id, is_staff, is_superuser, permissions, auth_claims}` and works under **every** auth tier (Tier 1 fills `request.context`; the OAuth tiers stash it on `request.state` — `principal()` reads both, so prefer it over `request.context` directly).
 
 ## Resources

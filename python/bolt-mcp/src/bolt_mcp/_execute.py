@@ -7,6 +7,7 @@ Calls sync/async tool functions and maps their return value into an MCP
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import msgspec
@@ -14,7 +15,18 @@ import msgspec
 from django_bolt._json import default_serializer
 from django_bolt._json import encode as json_encode
 
+from .context import McpClientError
 from .registry import ToolDef
+
+logger = logging.getLogger(__name__)
+
+
+class ToolError(Exception):
+    """Raise in a tool to send this message to the client as the error result.
+
+    The message always reaches the client, with or without ``MCP(mask_error_details=True)``,
+    and is not logged as a failure.
+    """
 
 
 def _text_content(text: str) -> dict[str, Any]:
@@ -61,13 +73,18 @@ async def run_tool(tool: ToolDef, kwargs: dict[str, Any]) -> Any:
     return await asyncio.to_thread(tool.fn, **kwargs)
 
 
-async def execute_tool(tool: ToolDef, kwargs: dict[str, Any]) -> dict[str, Any]:
+async def execute_tool(tool: ToolDef, kwargs: dict[str, Any], *, mask_error_details: bool = False) -> dict[str, Any]:
     """Run a tool and map its return value (or exception) to a CallToolResult dict.
 
     A raised exception becomes an in-band error result, per MCP tool semantics —
-    shared by the non-streaming and streaming call paths.
+    shared by the non-streaming and streaming call paths. ``ToolError`` and
+    ``McpClientError`` send their message. Any other exception is logged with its
+    traceback, and its text is replaced when ``mask_error_details`` is set.
     """
     try:
         return to_call_tool_result(await run_tool(tool, kwargs))
-    except Exception as exc:
+    except (ToolError, McpClientError) as exc:
         return error_result(str(exc))
+    except Exception as exc:
+        logger.exception("MCP tool %r failed", tool.name)
+        return error_result(f"Tool {tool.name!r} failed." if mask_error_details else str(exc))

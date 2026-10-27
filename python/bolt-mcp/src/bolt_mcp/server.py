@@ -96,6 +96,7 @@ class MCP:
         json_response: bool = False,
         list_ttl_ms: int = 0,
         list_cache_scope: str = "private",
+        mask_error_details: bool = False,
     ) -> None:
         """Declare an MCP server.
 
@@ -107,6 +108,11 @@ class MCP:
 
         ``list_ttl_ms``/``list_cache_scope`` are the SEP-2549 caching hints
         stamped on every list result (``0``/``"private"`` = no caching).
+
+        ``mask_error_details=True`` replaces the text of an exception from a tool,
+        resource or prompt with a fixed message, so it never reaches the client.
+        ``ToolError`` messages are sent either way. Every such exception is logged
+        with its traceback.
         """
         if list_cache_scope not in _CACHE_SCOPES:
             raise ValueError(f"list_cache_scope must be 'public' or 'private', got {list_cache_scope!r}")
@@ -122,6 +128,7 @@ class MCP:
         self.json_response = json_response
         self.list_ttl_ms = list_ttl_ms
         self.list_cache_scope = list_cache_scope
+        self.mask_error_details = mask_error_details
         self._tools: dict[str, ToolDef] = {}
         self._resources: dict[str, ResourceDef] = {}
         self._resource_templates: dict[str, ResourceTemplateDef] = {}

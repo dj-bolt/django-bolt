@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **bolt-mcp: `ToolError` and `MCP(mask_error_details=...)`** - A tool raises `ToolError` for a message the client may read. Any other exception from a tool, resource or prompt is now logged with its traceback. Before, a tool exception was not logged, and a resource or prompt exception was logged by Rust without a traceback. With `mask_error_details=True`, the client gets a fixed message in place of the exception text. The default is `False`, so the text that reaches the client does not change. (#492)
+
 ### Fixed
 
 - **A model instance or other object converts to a response Struct by attribute** - A handler can return an object, such as a Django model instance, for a `Struct` or `list[Struct]` response type. Bolt read each declared field with `getattr(obj, name, None)` and validated the dict. Thus a missing attribute became `None` and replaced the field default, and a renamed field (`rename="camel"` or `msgspec.field(name=...)`) failed with "missing required field". Both gave a 500. Now msgspec reads the object by attribute (`from_attributes=True`), so defaults and renamed fields work. An object for an `Item | None` response type now converts too.
