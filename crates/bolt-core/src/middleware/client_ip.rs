@@ -658,6 +658,24 @@ mod tests {
     }
 
     #[test]
+    fn scheme_follows_forwarded_http_from_a_trusted_peer_on_tls() {
+        // The proxy reached Bolt over TLS, but the client used plain HTTP.
+        let trusted = proxies(&["10.0.0.0/8"]);
+        for value in ["http", " HTTP "] {
+            assert_eq!(
+                resolve_scheme(
+                    &headers(&[("x-forwarded-proto", value)]),
+                    parse_ip("10.0.0.1"),
+                    true,
+                    &trusted,
+                ),
+                "http",
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn scheme_reads_the_rightmost_forwarded_proto() {
         let trusted = ["10.0.0.0/8"];
         // A client sent `https`, and the proxy appended the real scheme.

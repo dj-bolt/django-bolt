@@ -446,6 +446,23 @@ mod tests {
             let value = HeaderValue::from_bytes(&bytes).unwrap();
             prop_assert_eq!(header_str(&value), value.to_str().ok());
         }
+
+        // Random high bytes are almost never valid UTF-8, so the test above
+        // seldom gives a value that `from_utf8` accepts. This one sends whole
+        // characters, also non-ASCII ones.
+        #[test]
+        fn header_str_rejects_non_ascii_text(text in "[ -~\t\u{80}-\u{10FFFF}]{0,40}") {
+            let value = HeaderValue::from_bytes(text.as_bytes()).unwrap();
+            prop_assert_eq!(header_str(&value), value.to_str().ok());
+        }
+    }
+
+    #[test]
+    fn header_str_rejects_utf8_text_that_is_not_ascii() {
+        let value = HeaderValue::from_bytes("café".as_bytes()).unwrap();
+        assert_eq!(header_str(&value), None);
+        let value = HeaderValue::from_static("cafe\tbar");
+        assert_eq!(header_str(&value), Some("cafe\tbar"));
     }
 
     #[test]

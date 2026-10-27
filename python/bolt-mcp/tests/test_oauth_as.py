@@ -693,7 +693,6 @@ def test_registration_rejects_invalid_application_type():
     assert r.json()["error"] == "invalid_client_metadata"
 
 
-@pytest.mark.django_db(transaction=True)
 def test_oauth_routes_are_public_under_global_default_guards(settings):
     """#296: BOLT_DEFAULT_PERMISSION_CLASSES / BOLT_AUTHENTICATION_CLASSES must not
     gate discovery or the OAuth endpoints — a client has no token before the flow."""

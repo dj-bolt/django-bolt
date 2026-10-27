@@ -710,6 +710,34 @@ class TestUploadFileMultiple:
         assert response.status_code == 200
         assert response.json()["count"] == 1
 
+    def test_optional_list_gets_every_file(self):
+        """An optional list[UploadFile] gets all files, one file as a list, or the default."""
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(docs: Annotated[list[UploadFile] | None, File()] = None):
+            if docs is None:
+                return {"docs": None}
+            return {"docs": [d.filename for d in docs]}
+
+        client = TestClient(api)
+        several = client.post(
+            "/upload",
+            files=[
+                ("docs", ("doc1.pdf", b"content1", "application/pdf")),
+                ("docs", ("doc2.pdf", b"content2", "application/pdf")),
+            ],
+        )
+        one = client.post("/upload", files={"docs": ("single.pdf", b"content", "application/pdf")})
+        none = client.post("/upload", files={"other": ("other.pdf", b"content", "application/pdf")})
+
+        assert several.status_code == 200
+        assert sorted(several.json()["docs"]) == ["doc1.pdf", "doc2.pdf"]
+        assert one.status_code == 200
+        assert one.json()["docs"] == ["single.pdf"]
+        assert none.status_code == 200
+        assert none.json()["docs"] is None
+
 
 class TestFormStructWithUploadFile:
     """Test Form() struct with UploadFile fields."""

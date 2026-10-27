@@ -8,8 +8,6 @@ to one bucket per client address. Tokens are minted with the public
 
 from __future__ import annotations
 
-import itertools
-
 import pytest
 from django.contrib.auth import get_user_model
 
@@ -21,11 +19,10 @@ from django_bolt.testing import TestClient, WebSocketTestClient
 SECRET = "rate-limit-identity-secret"
 BURST = 3
 
-# Limiters live in one process-wide map keyed by (handler id, quota, bucket).
-# Every `BoltAPI` numbers handlers from 0, so a fresh app with the same quota
-# would inherit the last test's buckets. A distinct `rps` per app keeps the
-# same `BURST` and isolates the tests.
-_rps = itertools.count(1)
+# Each HTTP test client starts with empty buckets, so the tests do not share
+# them. One token a second keeps the refill out of a test: BURST + 1 requests
+# must take a second before a refilled token turns the 429 into a 200.
+RPS = 1
 
 
 def bearer(user) -> dict[str, str]:
@@ -36,7 +33,7 @@ def _make_api(key: str, auth, guards=()):
     api = BoltAPI()
 
     @api.get("/limited", auth=auth, guards=list(guards))
-    @rate_limit(rps=next(_rps), burst=BURST, key=key)
+    @rate_limit(rps=RPS, burst=BURST, key=key)
     async def limited():
         return {"ok": True}
 
@@ -56,9 +53,10 @@ def users(db):
 @pytest.mark.django_db
 def test_user_key_gives_each_user_its_own_bucket(users):
     with TestClient(_make_api("user", [JWTAuthentication(secret=SECRET)])) as client:
+        # Each bucket gets its burst and the 429 in a row, so a refill cannot
+        # come between them.
         for user in users:
-            assert _statuses(client, BURST, headers=bearer(user)) == [200] * BURST
-        assert client.get("/limited", headers=bearer(users[0])).status_code == 429
+            assert _statuses(client, BURST + 1, headers=bearer(user)) == [200] * BURST + [429]
 
 
 @pytest.mark.django_db
@@ -95,9 +93,8 @@ def test_guard_rejects_before_counting_on_the_shared_bucket(users):
 def test_api_key_gives_each_key_its_own_bucket():
     auth = [APIKeyAuthentication(api_keys={"key-a", "key-b"}, header="x-api-key")]
     with TestClient(_make_api("api_key", auth)) as client:
-        assert _statuses(client, BURST, headers={"X-API-Key": "key-a"}) == [200] * BURST
-        assert _statuses(client, BURST, headers={"X-API-Key": "key-b"}) == [200] * BURST
-        assert client.get("/limited", headers={"X-API-Key": "key-a"}).status_code == 429
+        for key in ("key-a", "key-b"):
+            assert _statuses(client, BURST + 1, headers={"X-API-Key": key}) == [200] * BURST + [429]
 
 
 def test_api_key_unknown_key_falls_back_to_ip_bucket():
@@ -140,7 +137,7 @@ async def test_websocket_guard_rejects_before_counting_on_the_shared_bucket(user
     api = BoltAPI()
 
     @api.websocket("/ws/limited", auth=[JWTAuthentication(secret=SECRET)], guards=[IsAuthenticated()])
-    @rate_limit(rps=next(_rps), burst=BURST, key="api_key")
+    @rate_limit(rps=RPS, burst=BURST, key="api_key")
     async def limited(websocket: WebSocket):
         await websocket.accept()
         await websocket.send_text("connected")

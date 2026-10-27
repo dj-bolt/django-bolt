@@ -5,7 +5,6 @@ import sys
 import pytest
 from django.conf import settings
 from django.test import override_settings
-from django.urls import include, path
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import (
@@ -16,6 +15,8 @@ from django_bolt.openapi import (
     YamlRenderPlugin,
 )
 from django_bolt.testing import TestClient
+
+from .debug_toolbar_urls import toolbar_urlpatterns
 
 
 @pytest.mark.parametrize("plugin_path", ["/openapi.json", "/schema.json"])
@@ -56,7 +57,7 @@ def test_debug_toolbar_in_docs(plugin, monkeypatch):
         monkeypatch.setattr(
             sys.modules[__name__],
             "urlpatterns",
-            [path("__debug__/", include("debug_toolbar.urls"))],
+            toolbar_urlpatterns(),
             raising=False,
         )
         api = BoltAPI(

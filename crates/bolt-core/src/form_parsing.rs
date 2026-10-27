@@ -1161,6 +1161,28 @@ mod tests {
     }
 
     #[test]
+    fn multipart_files_count_toward_the_total_size() {
+        let limits = Limits {
+            max_total_size: 6,
+            ..Limits::default()
+        };
+        let at_limit = [
+            file_part("a", "text/plain", b"abc"),
+            file_part("b", "text/plain", b"abc"),
+        ];
+        let over_limit = [
+            file_part("a", "text/plain", b"abc"),
+            file_part("b", "text/plain", b"abcd"),
+        ];
+
+        assert!(parse_parts(&at_limit, &HashMap::new(), &limits).is_ok());
+        assert_eq!(
+            error_type(parse_parts(&over_limit, &HashMap::new(), &limits)),
+            ERROR_TYPE_PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
     fn multipart_file_of_max_upload_size_is_accepted_and_one_more_byte_is_rejected() {
         let limits = Limits {
             max_upload_size: 4,
