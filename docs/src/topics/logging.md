@@ -229,10 +229,12 @@ try:
 except Exception as e:
     middleware.log_exception(
         request={"method": "GET", "path": "/api/error"},
-        exception=e,
+        exc=e,
         exc_info=True,  # Include traceback
     )
 ```
+
+Bolt calls `log_exception` for an exception that a handler does not handle, but only when the error response is a 5xx. A 4xx, such as a validation error or `PermissionDenied`, is the fault of the client. The access log records it at `WARNING`, as Django's `log_response` does. An `HTTPException` is a planned response, so Bolt does not call `log_exception` for it.
 
 ### Custom exception handler
 
@@ -247,6 +249,8 @@ config = LoggingConfig(
     exception_logging_handler=my_exception_handler
 )
 ```
+
+Bolt calls the handler only for a 5xx, as it does `log_exception`.
 
 ## Client IP extraction
 

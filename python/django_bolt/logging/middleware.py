@@ -7,8 +7,6 @@ import logging
 import random
 from typing import Any
 
-from django.core.exceptions import SuspiciousOperation
-
 from .config import LoggingConfig, get_default_logging_config
 
 
@@ -263,11 +261,6 @@ class LoggingMiddleware:
             exc: Exception instance
             exc_info: Whether to include exception traceback
         """
-        # handle_exception() logs it once to django.security.<class name>, as
-        # Django does. A client can cause one on each request, for example with a
-        # bad Host, so a second record with a traceback here only fills the log.
-        if isinstance(exc, SuspiciousOperation):
-            return
         path = request.get("path", "")
 
         data = {

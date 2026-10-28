@@ -2914,11 +2914,19 @@ class BoltAPI:
             )
 
     def _handle_generic_exception(self, e: Exception, request: Any) -> Response:
-        """Handle generic exception using error_handlers module."""
+        """Return the error response for an unhandled exception. Log the exception for a 5xx response.
+
+        A 4xx is the fault of the client, and the access log records it at
+        WARNING. Django's ``log_response`` uses the same rule.
+        """
         # Without a formatter, the handler reads the Django DEBUG setting.
         if self._error_formatter is None:
-            return _wire_from_error_parts(*handle_exception(e, debug=None, request=request))
-        return _wire_from_error_parts(*handle_exception_with_formatter(self._error_formatter, e, request))
+            response = _wire_from_error_parts(*handle_exception(e, debug=None, request=request))
+        else:
+            response = _wire_from_error_parts(*handle_exception_with_formatter(self._error_formatter, e, request))
+        if response[0] >= 500 and self._logging_middleware:
+            self._logging_middleware.log_exception(request, e, exc_info=True)
+        return response
 
     @staticmethod
     def _is_python_middleware_spec(middleware_spec: Any) -> bool:
@@ -3303,9 +3311,6 @@ class BoltAPI:
         except Exception as e:
             if isinstance(e, LaneAffinityError):
                 self._describe_lane_affinity_error(e, handler, handler_id)
-            # BlackSheep pattern: only log unhandled exceptions (rare path)
-            if self._logging_middleware:
-                self._logging_middleware.log_exception(request, e, exc_info=True)
             # A handler that ran the ORM inline on this thread may have left
             # a dead connection behind; drop it so the next request reconnects.
             _drop_broken_connections()
@@ -3362,9 +3367,6 @@ class BoltAPI:
         except HTTPException as he:
             return self._handle_http_exception(he, request)
         except Exception as e:
-            # BlackSheep pattern: only log unhandled exceptions (rare path)
-            if self._logging_middleware:
-                self._logging_middleware.log_exception(request, e, exc_info=True)
             # A handler that ran the ORM inline on this thread may have left
             # a dead connection behind; drop it so the next request reconnects.
             _drop_broken_connections()
@@ -3388,8 +3390,6 @@ class BoltAPI:
         except HTTPException as he:
             return self._handle_http_exception(he, request)
         except Exception as e:
-            if self._logging_middleware:
-                self._logging_middleware.log_exception(request, e, exc_info=True)
             return self._handle_generic_exception(e, request=request)
 
     def _register_openapi_routes(self, *, middleware: list[Any] | None = None) -> None:

@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Only a 5xx writes an exception record** - Bolt wrote an ERROR record with a traceback to `django.server` for each exception that a handler did not handle. It also called `exception_logging_handler`. It did this also when the response was a 4xx, such as a 422 for a struct parameter or a JSON body, or a 403 for `PermissionDenied`. A client could cause one on each request. Now Bolt writes the record and calls the handler only when the error response is a 5xx, as Django's `log_response` does. The access log records a 4xx at `WARNING`. The status of the `error_formatter` response decides. `LoggingMiddleware.log_exception` no longer skips a `SuspiciousOperation`, because Bolt does not call it for the 400.
 - **Response validation is compiled once per route** - Bolt classified the response type on each response. Now it builds the validation for the type when the route registers. Validation of a dict to a `Struct` takes about 285 ns, from 500 ns. A list of 20 model instances takes about 1.8 µs, from 4.2 µs.
 
 ## [0.13.0]
