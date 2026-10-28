@@ -8,6 +8,9 @@ on macOS and Windows, and the test jobs run them on Linux.
 
 from __future__ import annotations
 
+import errno
+import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -83,3 +86,28 @@ def test_the_status_of_a_path_with_file_dotdot_does_not_show_whether_the_file_ex
     (outside / "secret.txt").write_text("secret")
 
     assert _status(path) == without_file
+
+
+def test_a_path_that_names_the_allowed_dir_in_another_case_gets_the_statuses_of_the_file_system(tree):
+    # macOS and Windows ignore case by default, so PUBLIC names the allowed dir there. Linux does not.
+    public, _ = tree
+    other = public.parent / public.name.upper()
+    expected = (200, 404) if other.exists() else (403, 403)
+
+    assert (_status(other / "known.txt"), _status(other / "missing.txt")) == expected
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows removes '..' from the text before it follows a link")
+@pytest.mark.parametrize("links", [31, 32, 33, 40, 41])
+def test_a_lookup_follows_as_many_links_as_the_os_does(tree, tmp_path, links):
+    # Each "hop/../.." follows one link and comes back. The OS stops at its link limit, out of the allowed dir.
+    public, _ = tree
+    (tmp_path / "deep" / "er").mkdir(parents=True)
+    (tmp_path / "hop").symlink_to(tmp_path / "deep" / "er", target_is_directory=True)
+    path = f"{public}/.." + "/hop/../.." * links + f"/{public.name}/missing.txt"
+    try:
+        os.stat(path)
+    except OSError as error:
+        expected = 403 if error.errno == errno.ELOOP else 404
+
+    assert _status(Path(path)) == expected
