@@ -629,8 +629,9 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     def extract(headers_map: dict[str, str]) -> Any:
         converted = {}
         for header_name, encoded_name in header_to_encoded:
-            if header_name in headers_map:
-                converted[encoded_name] = headers_map[header_name]
+            value = headers_map.get(header_name)
+            if value is not None:
+                converted[encoded_name] = value
 
         try:
             return msgspec.convert(converted, struct_type)

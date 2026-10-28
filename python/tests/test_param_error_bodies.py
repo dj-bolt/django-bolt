@@ -14,6 +14,7 @@ import msgspec
 import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.middleware import ErrorHandlerMiddleware
 from django_bolt.params import Cookie, Form, Header, Query
 from django_bolt.testing import TestClient
 
@@ -208,3 +209,63 @@ def test_constrained_scalar_error_has_no_holder_path(client):
     assert response.json()["detail"] == [
         {"type": "validation_error", "loc": ["query", "n"], "msg": "Expected `int` >= 1", "input": 0}
     ]
+
+
+class Range(msgspec.Struct):
+    x_low: int
+    x_high: int
+
+    def __post_init__(self):
+        if self.x_low > self.x_high:
+            raise ValueError("x_low must be <= x_high")
+
+
+def test_a_header_struct_check_across_fields_keeps_its_message():
+    # No field fails alone, so the error list of the fields is empty. The error of the struct must stay.
+    api = BoltAPI()
+
+    @api.get("/range")
+    async def range_route(bounds: Annotated[Range, Header()]):
+        return {"low": bounds.x_low}
+
+    with TestClient(api) as client:
+        response = client.get("/range", headers={"X-Low": "5", "X-High": "1"})
+
+    assert response.status_code == 422
+    assert [error["msg"] for error in response.json()["detail"]] == ["x_low must be <= x_high"]
+
+
+@pytest.mark.parametrize(
+    ("send", "status"),
+    [
+        (lambda c: c.get("/header-struct"), 422),
+        (lambda c: c.get("/query-struct"), 422),
+        (lambda c: c.post("/body-struct", json={"page": "x"}), 422),
+        (lambda c: c.get("/crash"), 500),
+    ],
+    ids=["header-struct", "query-struct", "body-struct", "server-error"],
+)
+def test_error_handler_middleware_keeps_a_validation_error_a_422(send, status):
+    # The middleware turns other exceptions into a 500. A validation error is the fault of the client.
+    api = BoltAPI(middleware=[ErrorHandlerMiddleware])
+
+    @api.get("/header-struct")
+    async def header_struct(headers: Annotated[Headers, Header()]):
+        return {"key": headers.x_api_key}
+
+    @api.get("/query-struct")
+    async def query_struct(filters: Annotated[Filters, Query()]):
+        return {"page": filters.page}
+
+    @api.post("/body-struct")
+    async def body_struct(filters: Filters):
+        return {"page": filters.page}
+
+    @api.get("/crash")
+    async def crash():
+        raise RuntimeError("server fault")
+
+    with TestClient(api) as client:
+        response = send(client)
+
+    assert response.status_code == status
