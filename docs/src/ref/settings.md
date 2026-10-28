@@ -36,7 +36,7 @@ CORS_ALLOWED_ORIGINS = [
 
 ### CORS_ALLOWED_ORIGIN_REGEXES
 
-List of regular expressions for allowed origins. An origin is allowed when it is in `CORS_ALLOWED_ORIGINS` or when a pattern matches it. A pattern can match a part of the origin, so start each pattern with `^` and end it with `$`. Bolt ignores an invalid pattern and writes a warning at startup.
+List of regular expressions for allowed origins. An origin is allowed when it is in `CORS_ALLOWED_ORIGINS` or when a pattern matches it. A pattern can match a part of the origin, so start each pattern with `^` and end it with `$`. Bolt ignores an invalid pattern and writes a warning at startup. A route with `@cors` uses its own origins and patterns in place of `CORS_ALLOWED_ORIGINS` and these patterns.
 
 ```python
 CORS_ALLOWED_ORIGIN_REGEXES = [

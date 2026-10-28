@@ -683,7 +683,7 @@ impl RouteMetadata {
                             // Parse CORS config separately for fast access. The list is
                             // API, router, then route: the last (most specific) config wins.
                             if type_str == "cors" {
-                                cors_config = parse_cors_config(&mw_dict, py);
+                                cors_config = Some(parse_cors_config(&mw_dict, py)?);
                             }
 
                             // Parse rate_limit config separately for fast access
@@ -887,33 +887,49 @@ impl RouteMetadata {
     }
 }
 
+/// Read a list of str from a CORS config. A present key that holds another
+/// type stops startup: the route would else use the global allow list.
+fn cors_str_list(
+    dict: &HashMap<String, Py<PyAny>>,
+    py: Python,
+    key: &str,
+) -> PyResult<Option<Vec<String>>> {
+    match dict.get(key) {
+        Some(value) if !value.is_none(py) => value
+            .extract::<Vec<String>>(py)
+            .map(Some)
+            .map_err(|_| PyTypeError::new_err(format!("cors {key} must be a list of str"))),
+        _ => Ok(None),
+    }
+}
+
 /// Parse CORS configuration from middleware dict
-fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<CorsConfig> {
+fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<CorsConfig> {
     let mut config = CorsConfig::default();
 
     // Parse origins and build origin set for O(1) lookups
-    if let Some(origins_py) = dict.get("origins") {
-        if let Ok(origins) = origins_py.extract::<Vec<String>>(py) {
-            // Detect wildcard origin
-            config.allow_all_origins = origins.iter().any(|o| o == "*");
-            config.origin_set = origins.iter().cloned().collect();
-            config.origins = origins;
-        }
+    if let Some(origins) = cors_str_list(dict, py, "origins")? {
+        // Detect wildcard origin
+        config.allow_all_origins = origins.iter().any(|o| o == "*");
+        config.origin_set = origins.iter().cloned().collect();
+        config.origins = origins;
     }
 
     // Parse origin_regexes and compile them at startup
-    if let Some(regexes_py) = dict.get("origin_regexes") {
-        if let Ok(regex_patterns) = regexes_py.extract::<Vec<String>>(py) {
-            config.origin_regexes = regex_patterns.clone();
-            config.compiled_origin_regexes = regex_patterns.iter()
-                .filter_map(|pattern| {
-                    Regex::new(pattern).ok().or_else(|| {
-                        eprintln!("[django-bolt] Warning: Invalid route-level CORS origin regex pattern: {}", pattern);
-                        None
-                    })
+    if let Some(regex_patterns) = cors_str_list(dict, py, "origin_regexes")? {
+        config.origin_regexes = regex_patterns.clone();
+        config.compiled_origin_regexes = regex_patterns
+            .iter()
+            .filter_map(|pattern| {
+                Regex::new(pattern).ok().or_else(|| {
+                    eprintln!(
+                        "[django-bolt] Warning: Invalid route-level CORS origin regex pattern: {}",
+                        pattern
+                    );
+                    None
                 })
-                .collect();
-        }
+            })
+            .collect();
     }
 
     // Parse credentials
@@ -963,7 +979,7 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> Option<Co
         }
     }
 
-    Some(config)
+    Ok(config)
 }
 
 /// Parse rate limiting configuration from middleware dict

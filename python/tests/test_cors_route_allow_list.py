@@ -6,9 +6,11 @@ A route with its own origins or origin regexes does not take the global
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Router
 from django_bolt.middleware import cors
 from django_bolt.testing import TestClient
 
@@ -140,6 +142,64 @@ def test_route_cors_wins_over_the_cors_of_the_api():
         assert _origin_headers(client, "/route", "https://route.test")[0] == "https://route.test"
         assert _origin_headers(client, "/route", "https://api.test")[0] is None
         assert _origin_headers(client, "/plain", "https://api.test")[0] == "https://api.test"
+
+
+def test_the_most_specific_cors_config_wins():
+    api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://api.test"]}])
+    router = Router(middleware=[{"type": "cors", "origins": ["https://router.test"]}])
+
+    @router.get("/router-only")
+    async def router_only():
+        return {}
+
+    @router.get("/route")
+    @cors(origins=["https://route.test"])
+    async def route():
+        return {}
+
+    api.include_router(router)
+
+    with TestClient(api, use_http_layer=True, read_django_settings=False) as client:
+        assert _origin_headers(client, "/router-only", "https://router.test")[0] == "https://router.test"
+        assert _origin_headers(client, "/router-only", "https://api.test")[0] is None
+        assert _origin_headers(client, "/route", "https://route.test")[0] == "https://route.test"
+        assert _origin_headers(client, "/route", "https://router.test")[0] is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"origin_regexes": [re.compile(r"^https://[a-z]+\.tenant\.test$")]},
+        {"origin_regexes": [b"^https://a\\.test$"]},
+        {"origins": [None]},
+        {"origins": ["https://a.test", 1]},
+        {"origins": b"https://a.test"},
+    ],
+)
+def test_cors_rejects_an_origin_or_a_pattern_that_is_not_a_str(kwargs):
+    # Rust would drop the whole list, and the route would then use the global list.
+    with pytest.raises(TypeError, match="str"):
+        cors(credentials=True, **kwargs)(lambda: None)
+
+
+def test_a_cors_config_that_is_not_a_list_of_str_stops_startup():
+    api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://a.test", 1], "credentials": True}])
+
+    @api.get("/route")
+    async def route():
+        return {}
+
+    with pytest.raises(TypeError, match="origins"), TestClient(api, read_django_settings=False):
+        pass
+
+
+def test_a_route_takes_one_cors_decorator():
+    with pytest.raises(ValueError, match="one @cors"):
+
+        @cors(origins=["https://outer.test"])
+        @cors(origins=["https://inner.test"])
+        async def route():
+            return {}
 
 
 @pytest.mark.parametrize(

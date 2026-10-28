@@ -45,9 +45,11 @@ async def tenant_data():
     return {"data": "value"}
 ```
 
-A pattern can match a part of the origin, so start it with `^` and end it with `$`. Patterns use the syntax of the Rust `regex` crate, which has no look-around and no back-references. Bolt ignores an invalid pattern and writes a warning at startup. The route then does not use the global settings either.
+A pattern can match a part of the origin, so start it with `^` and end it with `$`. Patterns use the syntax of the Rust `regex` crate, which has no look-around and no back-references. Bolt ignores an invalid pattern and writes a warning at startup. The route then does not use the global settings either. `@cors` rejects only an empty pattern. A pattern such as `.*` allows every origin.
 
-A route-level `@cors` takes precedence over a `cors` config of the router or the API. `@cors` raises `ValueError` when it gets no origin and no pattern.
+The most specific `cors` config applies. A route-level `@cors` takes precedence over the router, and the router takes precedence over the API. A route takes one `@cors`, and a second `@cors` raises `ValueError`. `@cors` raises `ValueError` when it gets no origin and no pattern. It raises `TypeError` when an origin or a pattern is not a `str`.
+
+A WebSocket route does not use `@cors`. The WebSocket handshake checks the `Origin` header against the global settings only.
 
 ### Global CORS
 

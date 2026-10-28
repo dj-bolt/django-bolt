@@ -434,6 +434,25 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     return decorator
 
 
+def _cors_str_list(name: str, value: Any) -> list[str]:
+    """Return a str or a sequence of str as a list of str.
+
+    Rust drops a list that holds an item of another type, and the route then
+    uses the global allow list. Thus any other type raises TypeError here.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        raise TypeError(f"@cors() {name} must be a str or a list of str, not {type(value).__name__}")
+    items = list(value)
+    for item in items:
+        if not isinstance(item, str):
+            raise TypeError(f"@cors() {name} must hold only str, not {type(item).__name__}")
+    return items
+
+
 def cors(
     origins: list[str] | str = None,
     methods: list[str] = None,
@@ -477,13 +496,15 @@ def cors(
         async def tenant_endpoint(): ...
 
     Raises:
-        ValueError: If origins and origin_regexes are both missing or empty (empty @cors() is not allowed)
+        ValueError: If origins and origin_regexes are both missing or empty (empty @cors() is not allowed),
+            if a pattern is empty, or if the route already has a @cors
+        TypeError: If origins or origin_regexes holds a value that is not a str
     """
 
     def decorator(func):
         # A str is one origin or one pattern, not a sequence of characters.
-        origin_list = [origins] if isinstance(origins, str) else list(origins or [])
-        regex_list = [origin_regexes] if isinstance(origin_regexes, str) else list(origin_regexes or [])
+        origin_list = _cors_str_list("origins", origins)
+        regex_list = _cors_str_list("origin_regexes", origin_regexes)
 
         # SECURITY: Require explicit origins - empty @cors() is a common mistake.
         # An empty list would use the global settings, which the route replaces.
@@ -504,6 +525,9 @@ def cors(
 
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
+        # Two @cors on one route have no clear order, so allow one only.
+        if any(isinstance(mw, dict) and mw.get("type") == "cors" for mw in func.__bolt_middleware__):
+            raise ValueError("A route takes one @cors. Merge the origins into one @cors.")
 
         # SECURITY: Validate wildcard + credentials
         if "*" in origin_list and credentials:
