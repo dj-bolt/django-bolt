@@ -32,7 +32,9 @@ from typing import (
     runtime_checkable,
 )
 
-from ..exceptions import HTTPException
+import msgspec
+
+from ..exceptions import HTTPException, ValidationException
 
 if TYPE_CHECKING:
     from ..request import Request
@@ -736,8 +738,9 @@ class ErrorHandlerMiddleware(BaseMiddleware):
     async def process_request(self, request: Request) -> Response:
         try:
             return await self.get_response(request)
-        except HTTPException:
-            raise  # Let HTTP exceptions pass through
+        except (HTTPException, ValidationException, msgspec.ValidationError):
+            # An HTTP exception or a validation error is not a server fault. Bolt answers it.
+            raise
         except Exception as e:
             self.logger.exception(f"Unhandled exception: {e}")
 
