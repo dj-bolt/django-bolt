@@ -8,6 +8,7 @@ error names the source in ``loc`` as a scalar parameter does: ``query``,
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 import msgspec
@@ -131,6 +132,35 @@ def test_header_struct_reports_a_missing_and_an_invalid_field_together(client):
         _missing("header", "header", "x-api-key"),
         {"type": "validation_error", "loc": ["header", "x-count"], "msg": "Expected `int` >= 1", "input": 0},
     ]
+
+
+class AuthHeaders(msgspec.Struct):
+    token: str = msgspec.field(name="X-Api-Key")
+
+
+def test_missing_renamed_header_field_names_the_header():
+    api = BoltAPI()
+
+    @api.get("/auth")
+    async def auth(headers: Annotated[AuthHeaders, Header()]):
+        return {"token": headers.token}
+
+    with TestClient(api) as client:
+        assert client.get("/auth", headers={"X-Api-Key": "k"}).json() == {"token": "k"}
+        response = client.get("/auth")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == [_missing("header", "header", "x-api-key")]
+
+
+@pytest.mark.parametrize("path", ["/header-struct", "/query-struct"])
+def test_a_struct_validation_error_is_not_logged_as_a_server_error(client, caplog, path):
+    # A client can send a bad request on each call. The access log keeps the 422.
+    with caplog.at_level(logging.ERROR, logger="django.server"):
+        response = client.get(path)
+
+    assert response.status_code == 422
+    assert [record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR] == []
 
 
 @pytest.mark.parametrize(
