@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **`@cors(origin_regexes=[...])`** - A route can allow the origins that match a pattern, as `CORS_ALLOWED_ORIGIN_REGEXES` does for all routes. `@cors` needs `origins` or `origin_regexes`.
+- **`@cors(origin_regexes=[...])`** - A route can allow the origins that match a pattern, as `CORS_ALLOWED_ORIGIN_REGEXES` does for all routes. `@cors` needs `origins` or `origin_regexes`. An empty pattern raises `ValueError`, because it matches every origin.
 
 ### Fixed
 

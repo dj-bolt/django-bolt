@@ -498,6 +498,10 @@ def cors(
                 "simply remove the @cors decorator - global config applies automatically."
             )
 
+        # SECURITY: An empty pattern matches every origin.
+        if any(not pattern for pattern in regex_list):
+            raise ValueError("@cors() origin_regexes holds an empty pattern, which matches every origin.")
+
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
 

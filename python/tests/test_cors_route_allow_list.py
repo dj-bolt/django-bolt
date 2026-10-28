@@ -149,3 +149,10 @@ def test_route_cors_wins_over_the_cors_of_the_api():
 def test_cors_needs_an_origin_or_a_pattern(kwargs):
     with pytest.raises(ValueError, match="requires an 'origins' or 'origin_regexes' argument"):
         cors(**kwargs)(lambda: None)
+
+
+@pytest.mark.parametrize("origin_regexes", ["", ["^https://a\\.test$", ""]])
+def test_cors_rejects_an_empty_pattern(origin_regexes):
+    # An empty pattern matches every origin.
+    with pytest.raises(ValueError, match="empty pattern"):
+        cors(origin_regexes=origin_regexes, credentials=True)(lambda: None)
