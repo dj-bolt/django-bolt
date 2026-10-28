@@ -380,6 +380,8 @@ def middleware(*args, **kwargs):
     def decorator(handler: Callable) -> Callable:
         normalized = normalize_middleware_specs(args, context="route", allow_function_middleware=True)
         for spec in normalized:
+            if isinstance(spec, dict) and spec.get("type") == "cors":
+                _reject_second_cors(handler)
             attach_middleware(handler, spec)
 
         # Support dict-style middleware metadata (e.g. @middleware(type="cors", ...))

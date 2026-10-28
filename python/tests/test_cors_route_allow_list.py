@@ -247,6 +247,15 @@ def test_a_route_takes_one_cors_config_from_either_decorator(outer):
         outer_decorator(inner_decorator(route))
 
 
+def test_a_route_takes_one_positional_cors_dict():
+    async def route():
+        return {}
+
+    first = middleware({"type": "cors", "origins": ["https://a.test"]})(route)
+    with pytest.raises(ValueError, match="already has a @cors"):
+        middleware({"type": "cors", "origins": ["https://b.test"]})(first)
+
+
 def test_a_function_with_the_cors_of_another_route_gets_a_clear_error():
     # The cors config stays on the function, so a second route cannot give it other origins.
     api = BoltAPI()

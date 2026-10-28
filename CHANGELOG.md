@@ -18,7 +18,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- **`@cors` with no origin and no pattern raises `ValueError`** - `@cors(origins=[])` used the global CORS settings. Now `@cors` raises `ValueError` when `origins` and `origin_regexes` are both empty. A second cors config on one route also raises `ValueError`, from `@cors` or from `@middleware(type="cors")`. Before, Bolt used only one of them. A `cors` dict of an API or a router with an `origins` or `origin_regexes` value that is not a `str` or a collection of `str` now stops startup with `TypeError`. Before, Bolt ignored the value, and the routes used the global settings. An empty pattern in the dict stops startup with `ValueError`.
+- **`@cors` with no origin and no pattern raises `ValueError`** - `@cors(origins=[])` used the global CORS settings. Now `@cors` raises `ValueError` when `origins` and `origin_regexes` are both empty. A second cors config on one route also raises `ValueError`, from `@cors` or from `@middleware(type="cors")`. Before, Bolt used only one of them. In a `cors` dict of an API or a router, `origins` and `origin_regexes` take a `str` or a collection of `str`. Another type now stops startup with `TypeError`. Before, Bolt ignored the value, and the routes used the global settings. An empty pattern in the dict stops startup with `ValueError`.
 - **Response validation is compiled once per route** - Bolt classified the response type on each response. Now it builds the validation for the type when the route registers. Validation of a dict to a `Struct` takes about 285 ns, from 500 ns. A list of 20 model instances takes about 1.8 µs, from 4.2 µs.
 
 ## [0.13.0]
