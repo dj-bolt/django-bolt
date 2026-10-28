@@ -383,12 +383,12 @@ api = BoltAPI(error_formatter=format_error)
 | `bad_request` | 400 | Too many headers, a header that is too large, a body that Bolt cannot read, or a Django `SuspiciousOperation`, such as `DisallowedHost` |
 | `not_authenticated` | 401 | A guard, or an `HTTPException(401)` |
 | `forbidden` | 403 | A guard, the CSRF origin check of Bolt, `PermissionDenied`, a `FileResponse` outside `BOLT_ALLOWED_FILE_PATHS` or an `HTTPException(403)` |
-| `not_found` | 404 | No route, a `FileResponse` for a file that does not exist, or an `HTTPException(404)` |
+| `not_found` | 404 | No route, a `FileResponse` or a `File` whose path names no regular file, or an `HTTPException(404)` |
 | `payload_too_large` | 413 | A body over `BOLT_MAX_UPLOAD_SIZE` |
 | `validation` | 422 | A value that fails validation, in Rust or in Python |
 | `rate_limited` | 429 | A rate limit |
 | `response_validation` | 500 | A handler return value that fails validation |
-| `internal_error` | 500 | An unhandled exception, also a `FileNotFoundError` or `PermissionError` of handler code, or a failure in the Rust core, for example a file that Rust cannot read |
+| `internal_error` | 500 | An unhandled exception, also a `FileNotFoundError` or `PermissionError` of handler code, a file in `BOLT_ALLOWED_FILE_PATHS` that the server cannot read, or a failure in the Rust core |
 
 An `HTTPException` gets its kind from its status, for example `conflict` for 409. A status with no name gives `http_error`.
 

@@ -149,12 +149,12 @@ ResponseValidationError(
 
 ## FileResponse errors
 
-`FileResponse` raises these errors when it gets the path of the file. `File` raises `ResponseFileNotFound` when it reads a file that does not exist. Only these errors give a 404 or a 403, and these responses do not show the path. A `FileNotFoundError` or a `PermissionError` of other code gives a 500.
+`FileResponse` raises these errors when it gets the path of the file. `File` raises `ResponseFileNotFound` when it reads the file. Only these errors give a 404 or a 403, and the 404 and 403 responses do not show the path. A `FileNotFoundError` or a `PermissionError` of other code gives a 500. To answer 404 or 403 from handler code, raise `NotFound` or `Forbidden`.
 
 | Exception | Subclass of | Status | When raised |
 |-----------|-------------|--------|-------------|
 | `ResponseFileNotFound` | `FileNotFoundError` | 404 | The path names no regular file: it does not exist, it is a directory, or it is not valid |
-| `ResponseFileNotAllowed` | `PermissionError` | 403 | The file is outside `BOLT_ALLOWED_FILE_PATHS`, or the server may not read the path |
+| `ResponseFileNotAllowed` | `PermissionError` | 403 | The path is outside `BOLT_ALLOWED_FILE_PATHS`, also when the server cannot read it |
 
 ## Validation Layers
 

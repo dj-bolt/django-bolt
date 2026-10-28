@@ -10,16 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Annotated
 
 import msgspec
 import pytest
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import DisallowedHost, PermissionDenied
+from django.db import DatabaseError, connection
 from django.db.models import QuerySet
 
 from django_bolt import BoltAPI, responses
-from django_bolt.exceptions import RequestValidationError, ResponseValidationError
-from django_bolt.logging import LoggingConfig
+from django_bolt.exceptions import HTTPException, RequestValidationError, ResponseValidationError
+from django_bolt.logging import LoggingConfig, LoggingMiddleware
 from django_bolt.params import Query
 from django_bolt.responses import JSON, File, FileResponse
 from django_bolt.testing import TestClient
@@ -135,6 +137,7 @@ def test_the_exception_logging_handler_gets_only_5xx_exceptions():
 _ERRORS = {
     "runtime": (lambda: RuntimeError("server fault"), 500),
     "os-error": (lambda: FileNotFoundError("config.json"), 500),
+    "permission-error": (lambda: PermissionError("key.pem"), 500),
     "response-validation": (
         lambda: ResponseValidationError([{"loc": ["response"], "msg": "bad", "type": "value_error"}]),
         500,
@@ -191,6 +194,61 @@ def test_an_error_while_bolt_builds_the_error_response_is_logged(server_errors):
 
     assert response.status_code == 500
     assert [message.split(":")[:2] for message in server_errors()] == [["Exception in GET /unencodable", " TypeError"]]
+
+
+def test_an_error_while_bolt_builds_an_http_exception_response_is_logged(server_errors):
+    api = BoltAPI()
+
+    @api.get("/unencodable")
+    async def unencodable():
+        await asyncio.sleep(0)
+        raise HTTPException(400, "bad", extra={"value": object()})
+
+    with TestClient(api) as client:
+        response = client.get("/unencodable")
+
+    assert response.status_code == 500
+    assert [message.split(":")[:2] for message in server_errors()] == [["Exception in GET /unencodable", " TypeError"]]
+
+
+def _break_the_connection_close() -> None:
+    """Make the close of this thread's connection fail one time, after it closes."""
+    connection.ensure_connection()
+    close = connection.close
+
+    def close_then_fail():
+        del connection.close
+        close()
+        raise DatabaseError("close failed")
+
+    connection.close = close_then_fail
+    # The connection is obsolete, so the error path closes it.
+    connection.close_at = time.monotonic() - 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_failure_to_drop_the_connections_does_not_replace_the_error(server_errors):
+    # A close can fail, for example when a pooled connection goes back to its pool.
+    # The handler calls a helper, so it runs inline on the thread of the dispatch.
+    api = BoltAPI()
+
+    @api.get("/db")
+    def db():
+        _break_the_connection_close()
+        raise RuntimeError("database is down")
+
+    with TestClient(api) as client:
+        response = client.get("/db")
+
+    assert response.status_code == 500
+    assert server_errors() == ["Exception in GET /db: RuntimeError: database is down"]
+
+
+def test_log_exception_logs_each_exception_that_it_gets(server_errors):
+    # Dispatch decides what to log. A direct call logs, also for a SuspiciousOperation.
+    LoggingMiddleware(LoggingConfig()).log_exception({"method": "GET", "path": "/x"}, DisallowedHost("bad"), False)
+
+    assert server_errors() == ["Exception in GET /x: DisallowedHost: bad"]
 
 
 class DeniedArticles(QuerySet):
@@ -296,8 +354,9 @@ def test_a_file_response_error_is_a_4xx_without_the_path(server_errors, settings
     assert server_errors() == []
 
 
+@pytest.mark.parametrize("response_type", [FileResponse, File], ids=["file-response", "file"])
 @pytest.mark.parametrize("kind", ["directory", "below-a-file", "long-name", "nul-byte", "symlink-loop"])
-def test_a_file_response_path_that_names_no_file_is_a_404(server_errors, allowed_dir, kind):
+def test_a_file_response_path_that_names_no_file_is_a_404(server_errors, allowed_dir, kind, response_type):
     # The path of a FileResponse often comes from the request. A client must not get a 500 for it.
     (allowed_dir / "report.txt").write_text("data")
     loop = allowed_dir / "loop"
@@ -313,10 +372,65 @@ def test_a_file_response_path_that_names_no_file_is_a_404(server_errors, allowed
 
     @api.get("/file")
     def file():
-        return FileResponse(paths[kind])
+        return response_type(paths[kind])
 
     with TestClient(api) as client:
         response = client.get("/file")
 
     assert (response.status_code, response.json()["detail"]) == (404, "File not found")
+    assert server_errors() == []
+
+
+@pytest.fixture
+def locked_dir(tmp_path):
+    """Return a function that makes a directory with a file that this process cannot reach."""
+    locked: list = []
+
+    def make(path):
+        path.mkdir()
+        (path / "data.txt").write_text("data")
+        path.chmod(0)
+        locked.append(path)
+        try:
+            (path / "data.txt").read_text()
+        except PermissionError:
+            return path
+        pytest.skip("this process reads files with no permission bits, for example as root")
+
+    yield make
+    for path in locked:
+        path.chmod(0o700)
+
+
+def test_a_file_that_the_server_cannot_read_in_an_allowed_dir_is_a_logged_500(server_errors, allowed_dir, locked_dir):
+    # A deploy fault: the worker user cannot read the files that it serves.
+    private = locked_dir(allowed_dir / "private")
+    api = BoltAPI()
+
+    @api.get("/file")
+    def file():
+        return FileResponse(str(private / "data.txt"))
+
+    with TestClient(api) as client:
+        response = client.get("/file")
+
+    assert response.status_code == 500
+    assert [message.split(":")[:2] for message in server_errors()] == [["Exception in GET /file", " PermissionError"]]
+
+
+def test_a_path_out_of_the_allowed_dirs_that_the_server_cannot_read_is_a_403(
+    server_errors, allowed_dir, locked_dir, tmp_path
+):
+    # A client that walks out of the allowed dirs gets a 403, also into a dir that the server cannot read.
+    locked_dir(tmp_path / "locked")
+    api = BoltAPI()
+
+    @api.get("/file")
+    def file():
+        return FileResponse(f"{allowed_dir}/../locked/data.txt")
+
+    with TestClient(api) as client:
+        response = client.get("/file")
+
+    assert (response.status_code, response.json()["detail"]) == (403, "Permission denied")
     assert server_errors() == []

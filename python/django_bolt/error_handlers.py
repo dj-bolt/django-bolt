@@ -324,12 +324,12 @@ _CLIENT_ERROR_TYPES: tuple[type[BaseException], ...] = tuple(
 )
 
 
-def is_server_error(exc: BaseException) -> bool:
+def is_server_exception(exc: BaseException) -> bool:
     """Return True when ``handle_exception`` answers ``exc`` with a 5xx.
 
     The exception log uses this answer. An ``error_formatter`` can change the
     status of the response, but not this answer. Thus a formatter cannot hide a
-    server error from the log, and a client cannot fill the log.
+    server error from the log.
     """
     if isinstance(exc, HTTPException):
         return exc.status_code >= 500

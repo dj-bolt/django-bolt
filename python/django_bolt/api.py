@@ -60,7 +60,7 @@ from .error_handlers import (
     handle_exception,
     handle_exception_with_formatter,
     http_exception_handler,
-    is_server_error,
+    is_server_exception,
     render_core_error,
 )
 from .exceptions import HTTPException
@@ -2870,11 +2870,23 @@ class BoltAPI:
 
     def _handle_http_exception(self, he: HTTPException, request: Any) -> Response:
         """Handle HTTPException and return response."""
-        # Without a formatter, go straight to the handler: handle_exception
-        # first reads the Django DEBUG setting, which an HTTPException does not use.
-        if self._error_formatter is None:
-            return _wire_from_error_parts(*http_exception_handler(he))
-        return _wire_from_error_parts(*handle_exception_with_formatter(self._error_formatter, he, request))
+        try:
+            # Without a formatter, go straight to the handler: handle_exception
+            # first reads the Django DEBUG setting, which an HTTPException does not use.
+            if self._error_formatter is None:
+                return _wire_from_error_parts(*http_exception_handler(he))
+            return _wire_from_error_parts(*handle_exception_with_formatter(self._error_formatter, he, request))
+        except Exception as error:
+            self._log_error_response_failure(request, error)
+            raise
+
+    def _log_error_response_failure(self, request: Any, error: Exception) -> None:
+        """Log an error that Bolt meets while it builds an error response.
+
+        The error then reaches Rust, which sends its own 500 response.
+        """
+        if self._logging_middleware:
+            self._logging_middleware.log_exception(request, error, exc_info=True)
 
     def _rust_error_renderer(self) -> Callable | None:
         """Return the callable that formats the errors of the Rust core, or None.
@@ -2921,18 +2933,15 @@ class BoltAPI:
         is the fault of the client, and the access log records it at WARNING.
         The ``error_formatter`` can change the response, but not this choice.
         """
-        logging_middleware = self._logging_middleware
-        if logging_middleware and is_server_error(e):
-            logging_middleware.log_exception(request, e, exc_info=True)
+        if self._logging_middleware and is_server_exception(e):
+            self._logging_middleware.log_exception(request, e, exc_info=True)
         try:
             # Without a formatter, the handler reads the Django DEBUG setting.
             if self._error_formatter is None:
                 return _wire_from_error_parts(*handle_exception(e, debug=None, request=request))
             return _wire_from_error_parts(*handle_exception_with_formatter(self._error_formatter, e, request))
         except Exception as error:
-            # Rust answers 500 for an error that escapes here, and Rust does not log it.
-            if logging_middleware:
-                logging_middleware.log_exception(request, error, exc_info=True)
+            self._log_error_response_failure(request, error)
             raise
 
     @staticmethod
