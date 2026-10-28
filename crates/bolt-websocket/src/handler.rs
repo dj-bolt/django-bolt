@@ -958,7 +958,7 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
 
                         // Call handler with proper parameter injection
                         // Injector is pre-compiled at route registration and passed from router
-                        if let Some(ref inj) = injector {
+                        if let Some(inj) = injector {
                             // Use pre-compiled injector to extract parameters
                             // Sync injector - call directly
                             // Note: WebSocket handlers don't support async injectors (dependencies)
