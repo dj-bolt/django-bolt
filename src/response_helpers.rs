@@ -75,7 +75,9 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
     if !names_no_file && error.kind() != ErrorKind::PermissionDenied {
         return PyErr::from(error);
     }
-    if allowed.is_some_and(|roots| !within(&lookup_stop(path, MAX_LINKS), roots)) {
+    // The OS looks up no part of an empty path, so it names no file anywhere.
+    let looked_up = !path.as_os_str().is_empty();
+    if looked_up && allowed.is_some_and(|roots| !within(&lookup_stop(path), roots)) {
         return not_allowed(path);
     }
     if names_no_file {
@@ -85,33 +87,79 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
     }
 }
 
-/// The maximum number of links that `lookup_stop` follows, as on Linux.
+/// The maximum number of links in one lookup, as on Linux.
 const MAX_LINKS: u32 = 40;
+
+/// A part of a path that `lookup_stop` has yet to resolve.
+enum Part {
+    Root(PathBuf),
+    Parent,
+    Name(OsString),
+}
+
+/// Return the parts of `path` in reverse order, so that `pop` gives the first part.
+fn parts_of(path: &Path) -> Vec<Part> {
+    let mut root = PathBuf::new();
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => root.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => parts.push(Part::Parent),
+            Component::Normal(name) => parts.push(Part::Name(name.to_os_string())),
+        }
+    }
+    if !root.as_os_str().is_empty() {
+        parts.insert(0, Part::Root(root));
+    }
+    parts.reverse();
+    parts
+}
 
 /// Return the real path at which the OS lookup of `path` stops.
 ///
 /// The OS resolves the parts of a path in sequence, and it follows a link
-/// before it applies a later `..`. Thus resolve the parts one at a time.
-/// The lookup of a link to a missing target stops in that target, so walk the target too.
-fn lookup_stop(path: &Path, links_left: u32) -> PathBuf {
+/// before it applies a later `..`. Thus resolve each part with one `lstat`.
+/// Put the parts of a link target in front of the remaining parts.
+/// The path that the walk reached has no links, so `..` removes its last part.
+fn lookup_stop(path: &Path) -> PathBuf {
     let mut reached = PathBuf::new();
     let Ok(absolute) = std::path::absolute(path) else {
         return reached;
     };
-    for component in absolute.components() {
-        let next = reached.join(component);
-        if matches!(component, Component::Prefix(_) | Component::RootDir) {
-            reached = next;
-            continue;
-        }
-        match std::fs::canonicalize(&next) {
-            Ok(resolved) => reached = resolved,
-            Err(_) => match std::fs::read_link(&next) {
-                Ok(target) if links_left > 0 => {
-                    return lookup_stop(&reached.join(target), links_left - 1);
+    let mut pending = parts_of(&absolute);
+    let mut is_dir = true;
+    let mut links = 0;
+    while let Some(part) = pending.pop() {
+        match part {
+            Part::Root(root) => {
+                reached = root;
+                is_dir = true;
+            }
+            // The OS cannot look up a part below a file.
+            _ if !is_dir => break,
+            Part::Parent => {
+                reached.pop();
+            }
+            Part::Name(name) => {
+                let next = reached.join(name);
+                let Ok(metadata) = next.symlink_metadata() else {
+                    break;
+                };
+                if !metadata.file_type().is_symlink() {
+                    is_dir = metadata.is_dir();
+                    reached = next;
+                    continue;
                 }
-                _ => break,
-            },
+                links += 1;
+                if links > MAX_LINKS {
+                    break;
+                }
+                let Ok(target) = std::fs::read_link(&next) else {
+                    break;
+                };
+                pending.extend(parts_of(&target));
+            }
         }
     }
     reached

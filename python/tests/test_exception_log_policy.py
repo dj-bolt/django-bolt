@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from typing import Annotated
 
@@ -364,7 +365,7 @@ def test_a_file_response_error_is_a_4xx_without_the_path(server_errors, settings
 
 @pytest.mark.parametrize("response_type", [FileResponse, File], ids=["file-response", "file"])
 @pytest.mark.parametrize(
-    "kind", ["directory", "below-a-file", "long-name", "nul-byte", "symlink-loop", "link-to-a-missing-file"]
+    "kind", ["empty", "directory", "below-a-file", "long-name", "nul-byte", "symlink-loop", "link-to-a-missing-file"]
 )
 def test_a_file_response_path_that_names_no_file_is_a_404(server_errors, allowed_dir, kind, response_type):
     # The path of a FileResponse often comes from the request. A client must not get a 500 for it.
@@ -373,6 +374,7 @@ def test_a_file_response_path_that_names_no_file_is_a_404(server_errors, allowed
     loop.symlink_to(loop)
     (allowed_dir / "broken").symlink_to("missing.txt")
     paths = {
+        "empty": "",
         "directory": str(allowed_dir),
         "below-a-file": str(allowed_dir / "report.txt" / "x"),
         "long-name": str(allowed_dir / ("a" * 300)),
@@ -502,16 +504,13 @@ def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server
     assert server_errors() == []
 
 
-@pytest.mark.parametrize("configured", ["link", "real-dir"])
-def test_a_missing_file_in_an_allowed_dir_named_through_a_link_is_a_404(
-    server_errors, settings, monkeypatch, tmp_path, configured
-):
-    # The lookup stops in the allowed dir, also when the path names it through a link.
+def test_a_missing_file_in_an_allowed_dir_named_through_a_link_is_a_404(server_errors, settings, monkeypatch, tmp_path):
+    # The lookup stops in the allowed dir, also when the path names it through a link from out of it.
     real = tmp_path / "releases" / "42"
     real.mkdir(parents=True)
     current = tmp_path / "current"
     current.symlink_to(real, target_is_directory=True)
-    _allow_file_paths(settings, monkeypatch, current if configured == "link" else real)
+    _allow_file_paths(settings, monkeypatch, real)
     api = BoltAPI()
 
     @api.get("/file")
@@ -522,6 +521,28 @@ def test_a_missing_file_in_an_allowed_dir_named_through_a_link_is_a_404(
         response = client.get("/file")
 
     assert (response.status_code, response.json()["detail"]) == (404, "File not found")
+    assert server_errors() == []
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux follows at most 40 links in one lookup; other systems differ"
+)
+@pytest.mark.parametrize(("links", "status"), [(40, 404), (41, 403)])
+def test_a_lookup_stops_after_40_links_as_on_linux(server_errors, allowed_dir, tmp_path, links, status):
+    # Each "hop/../.." follows one link and comes back to tmp_path. Linux stops at the 41st link, out of the allowed dir.
+    (tmp_path / "deep" / "er").mkdir(parents=True)
+    (tmp_path / "hop").symlink_to(tmp_path / "deep" / "er", target_is_directory=True)
+    path = f"{allowed_dir}/.." + "/hop/../.." * links + f"/{allowed_dir.name}/missing.txt"
+    api = BoltAPI()
+
+    @api.get("/file")
+    def file():
+        return FileResponse(path)
+
+    with TestClient(api) as client:
+        response = client.get("/file")
+
+    assert response.status_code == status
     assert server_errors() == []
 
 
