@@ -461,6 +461,52 @@ def test_a_parent_of_the_allowed_dir_that_the_server_cannot_search(
     assert [message.split(":")[:2] for message in server_errors()] == records
 
 
+@pytest.mark.parametrize("probe", ["missing", "file"])
+def test_a_path_that_comes_back_into_the_allowed_dir_gives_the_same_status_whether_or_not_a_file_out_of_it_exists(
+    server_errors, allowed_dir, tmp_path, probe
+):
+    # The lookup stops at secret.txt. The later parts name nothing, so Bolt completes the path as text.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if probe == "file":
+        (outside / "secret.txt").write_text("secret")
+    path = allowed_dir / ".." / "outside" / "secret.txt" / ".." / ".." / allowed_dir.name / "missing.txt"
+    api = BoltAPI()
+
+    @api.get("/file")
+    def file():
+        return FileResponse(str(path))
+
+    with TestClient(api) as client:
+        response = client.get("/file")
+
+    assert (response.status_code, response.json()["detail"]) == (404, "File not found")
+    assert server_errors() == []
+
+
+@pytest.mark.parametrize("data", ["missing", "file"])
+def test_a_parent_of_a_missing_allowed_dir_is_out_of_the_allowed_dirs(
+    server_errors, settings, monkeypatch, tmp_path, data
+):
+    # The allowed dir data/media does not exist yet. data and data/x are not in it, also when data is a file.
+    public = tmp_path / "public"
+    public.mkdir()
+    if data == "file":
+        (tmp_path / "data").write_text("data")
+    _allow_file_paths(settings, monkeypatch, public, tmp_path / "data" / "media")
+    api = BoltAPI()
+
+    @api.get("/file/{name:path}")
+    def file(name: str):
+        return FileResponse(f"{public}/../{name}")
+
+    with TestClient(api) as client:
+        statuses = [client.get(f"/file/{name}").status_code for name in ["data", "data/x", "data/media/a.png"]]
+
+    assert statuses == [403, 403, 404]
+    assert server_errors() == []
+
+
 @pytest.mark.parametrize("root", ["media", "site/media"])
 def test_a_file_in_an_allowed_dir_that_does_not_exist_yet_is_a_404(
     server_errors, settings, monkeypatch, tmp_path, root
@@ -516,7 +562,6 @@ def test_a_path_out_of_the_allowed_dirs_that_the_server_cannot_read_is_a_403(
         "through-a-link",
         "back-out-of-a-link",
         "link-to-a-missing-file",
-        "file-and-back",
     ],
 )
 def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server_errors, allowed_dir, tmp_path, kind):
@@ -537,8 +582,6 @@ def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server
         "below-a-file": outside / "secret.txt" / "x",
         "symlink-loop": loop,
         "walk-out": allowed_dir / ".." / "outside" / "missing.txt",
-        # A file has no parent dir: the lookup of file/.. stops at the file, whether or not it exists.
-        "file-and-back": allowed_dir / ".." / "outside" / "secret.txt" / ".." / ".." / allowed_dir.name / "missing.txt",
         "through-a-link": allowed_dir / "escape" / "missing.txt",
         "back-out-of-a-link": allowed_dir / "link" / ".." / "missing.txt",
         "link-to-a-missing-file": allowed_dir / "dangling",

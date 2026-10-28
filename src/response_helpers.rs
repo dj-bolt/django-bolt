@@ -63,13 +63,13 @@ const SYMLINK_LOOP: i32 = libc::ELOOP;
 /// it. A path that names no regular file is a 404, as in Django's `serve`.
 /// Only Bolt raises these errors, so the error handler maps only them to 404 and 403.
 ///
-/// When the lookup stops out of the allowed directories, the path is a 403.
-/// This is also true when the server cannot search a directory there. A 404
-/// there would tell a client which files exist. A server that cannot reach a
-/// file in the allowed directories has a fault: a logged 500. This is also
-/// true with no allowed directories, and for a directory that the server
-/// cannot search on the way to an allowed directory. An allowed directory that
-/// does not exist yet names no file, so a path in it is a 404.
+/// When the lookup fails, `lookup_stop` finds where it stops and completes
+/// the path from there as text. When that path is out of the allowed
+/// directories, the answer is a 403, also when the server cannot search a
+/// directory there. A 404 there would tell a client which files exist. A server
+/// that cannot reach a file in the allowed directories has a fault: a logged
+/// 500. This is also true with no allowed directories. An allowed directory
+/// that does not exist yet names no file, so a path in it is a 404.
 fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathBuf]>) -> PyErr {
     let names_no_file = matches!(
         error.kind(),
@@ -83,17 +83,9 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
         return PyErr::from(error);
     }
     // The OS looks up no part of an empty path, so it names no file anywhere.
-    if let Some(roots) = allowed.filter(|_| !path.as_os_str().is_empty()) {
-        let stop = lookup_stop(path);
-        // The lookup failed on the way to an allowed directory: the directory is missing or the server cannot search it.
-        let blocks_a_root = stop.blocked.is_some_and(|blocked| {
-            roots
-                .iter()
-                .any(|root| comparable(root).starts_with(&blocked))
-        });
-        if !within(&stop.reached, roots) && !blocks_a_root {
-            return not_allowed(path);
-        }
+    let looked_up = !path.as_os_str().is_empty();
+    if looked_up && allowed.is_some_and(|roots| !within(&lookup_stop(path).target, roots)) {
+        return not_allowed(path);
     }
     if names_no_file {
         file_not_found(path)
@@ -108,7 +100,7 @@ const MAX_LINKS: u32 = 32;
 #[cfg(not(target_os = "macos"))]
 const MAX_LINKS: u32 = 40;
 
-/// A part of a path that `lookup_stop` has yet to resolve.
+/// A part of a path that `walk` has yet to resolve.
 enum Part {
     Root(PathBuf),
     Parent,
@@ -136,34 +128,34 @@ fn parts_of(path: &Path) -> Vec<Part> {
 
 /// Where the lookup of a path stopped.
 struct Stop {
-    /// The real path that the lookup reached.
-    reached: PathBuf,
-    /// The path in `reached` that the lookup could not `lstat`.
-    blocked: Option<PathBuf>,
+    /// The real path at which the lookup stopped, with the parts after the stop applied as text.
+    target: PathBuf,
     /// True when the lookup resolved each part of the path.
     finished: bool,
 }
 
 /// Return where the lookup of `path` stops, with the real names of the parts that it reached.
 ///
-/// The walk keeps the spelling of the path, such as an 8.3 short name or another case.
-/// The allowed roots have the real names, so give the path that the walk reached its real name too.
+/// Nothing exists below the stop, so the parts after it name nothing. They go
+/// on the path as text. Thus the result is the same for a missing part and a file.
+/// The walk keeps the spelling of the path, such as an 8.3 short name or another
+/// case. The allowed roots have the real names, so the reached path gets its real
+/// name before the parts after the stop go on it.
 fn lookup_stop(path: &Path) -> Stop {
-    let stop = walk(path);
-    let Ok(real) = std::fs::canonicalize(&stop.reached) else {
-        return stop;
-    };
-    let reached = comparable(&real).into_owned();
-    let blocked = stop
-        .blocked
-        .as_deref()
-        .and_then(Path::file_name)
-        .map(|name| reached.join(name));
-    Stop {
-        reached,
-        blocked,
-        finished: stop.finished,
+    let (reached, mut pending, finished) = walk(path);
+    let mut target = std::fs::canonicalize(&reached)
+        .map(|real| comparable(&real).into_owned())
+        .unwrap_or(reached);
+    while let Some(part) = pending.pop() {
+        match part {
+            Part::Root(root) => target = root,
+            Part::Parent => {
+                target.pop();
+            }
+            Part::Name(name) => target.push(name),
+        }
     }
+    Stop { target, finished }
 }
 
 /// Walk the parts of `path` in sequence, as `realpath` does on Linux.
@@ -171,15 +163,12 @@ fn lookup_stop(path: &Path) -> Stop {
 /// The walk follows a link before it applies a later `..`, and it stops below
 /// a file. Each part costs one `lstat`, and a link also costs one `readlink`.
 /// The parts of a link target go in front of the remaining parts. The path that
-/// the walk reached has no links, so `..` removes its last part.
-fn walk(path: &Path) -> Stop {
-    let mut stop = Stop {
-        reached: PathBuf::new(),
-        blocked: None,
-        finished: false,
-    };
+/// the walk reached has no links, so `..` removes its last part. Return the
+/// reached path, the parts after the stop, and true when no part is left.
+fn walk(path: &Path) -> (PathBuf, Vec<Part>, bool) {
+    let mut reached = PathBuf::new();
     let Ok(absolute) = std::path::absolute(path) else {
-        return stop;
+        return (reached, Vec::new(), false);
     };
     let mut pending = parts_of(&absolute);
     let mut is_dir = true;
@@ -187,38 +176,40 @@ fn walk(path: &Path) -> Stop {
     while let Some(part) = pending.pop() {
         match part {
             Part::Root(root) => {
-                stop.reached = root;
+                reached = root;
                 is_dir = true;
             }
             // A file has no parts below it.
-            _ if !is_dir => return stop,
+            part if !is_dir => {
+                pending.push(part);
+                return (reached, pending, false);
+            }
             Part::Parent => {
-                stop.reached.pop();
+                reached.pop();
             }
             Part::Name(name) => {
-                let next = stop.reached.join(name);
+                let next = reached.join(&name);
                 let Ok(metadata) = next.symlink_metadata() else {
-                    stop.blocked = Some(next);
-                    return stop;
+                    pending.push(Part::Name(name));
+                    return (reached, pending, false);
                 };
                 if !metadata.file_type().is_symlink() {
                     is_dir = metadata.is_dir();
-                    stop.reached = next;
+                    reached = next;
                     continue;
                 }
                 links += 1;
-                if links > MAX_LINKS {
-                    return stop;
+                match std::fs::read_link(&next) {
+                    Ok(target) if links <= MAX_LINKS => pending.extend(parts_of(&target)),
+                    _ => {
+                        pending.push(Part::Name(name));
+                        return (reached, pending, false);
+                    }
                 }
-                let Ok(target) = std::fs::read_link(&next) else {
-                    return stop;
-                };
-                pending.extend(parts_of(&target));
             }
         }
     }
-    stop.finished = true;
-    stop
+    (reached, pending, true)
 }
 
 /// Return `path` in the form of the allowed roots.
@@ -281,7 +272,7 @@ pub fn resolve_response_file(path: PathBuf, allowed: Option<Vec<PathBuf>>) -> Py
         if path.components().any(|part| part == Component::ParentDir) {
             let stop = lookup_stop(&path);
             if !stop.finished {
-                return Err(if within(&stop.reached, roots) {
+                return Err(if within(&stop.target, roots) {
                     file_not_found(&path)
                 } else {
                     not_allowed(&path)
