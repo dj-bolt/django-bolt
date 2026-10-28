@@ -21,7 +21,7 @@ use crate::form_parsing::ValidationError;
 use crate::responses;
 use crate::router::{QueryParams, QuerySequences};
 use crate::type_coercion::{
-    coerce_param, coerced_value_to_py, CoercedValue, CoercedValues, TypeHints, TYPE_STRING,
+    CoercedValue, CoercedValues, TYPE_STRING, TypeHints, coerce_param, coerced_value_to_py,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -481,9 +481,11 @@ mod tests {
             "Query parameter 'tag': Parameter too long: 4 bytes (max 3 bytes)"
         );
         assert!(query_sequences(None, &keys, 3).unwrap().is_empty());
-        assert!(query_sequences(Some("tag=abcd"), &Default::default(), 3)
-            .unwrap()
-            .is_empty());
+        assert!(
+            query_sequences(Some("tag=abcd"), &Default::default(), 3)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn values(pairs: &[(&str, &str)]) -> AHashMap<String, String> {
@@ -583,12 +585,16 @@ mod tests {
     #[test]
     fn declared_value_skips_string_and_unknown_names() {
         let hints = types(&[("x-name", TYPE_STRING)]);
-        assert!(coerce_declared_value("x-name", "1", &hints, 64, "Header")
-            .unwrap()
-            .is_none());
-        assert!(coerce_declared_value("other", "1", &hints, 64, "Header")
-            .unwrap()
-            .is_none());
+        assert!(
+            coerce_declared_value("x-name", "1", &hints, 64, "Header")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            coerce_declared_value("other", "1", &hints, 64, "Header")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

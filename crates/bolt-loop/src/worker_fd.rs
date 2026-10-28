@@ -29,8 +29,8 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
-use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 use crate::WorkerLoopCommand;
 

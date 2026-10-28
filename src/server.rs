@@ -1,6 +1,6 @@
 use actix_http::KeepAlive;
 use actix_web::{
-    self as aw, http::header::HeaderValue, web, App, HttpRequest, HttpResponse, HttpServer,
+    self as aw, App, HttpRequest, HttpResponse, HttpServer, http::header::HeaderValue, web,
 };
 use ahash::AHashMap;
 use pyo3::prelude::*;
@@ -19,18 +19,18 @@ use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::router::Router;
 use bolt_core::settings::{
-    env_flag, env_non_negative_int, env_positive_int, env_var, improperly_configured,
-    DjangoSettings,
+    DjangoSettings, env_flag, env_non_negative_int, env_positive_int, env_var,
+    improperly_configured,
 };
 use bolt_core::state::{
-    find_websocket_mount, AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
-    ROUTE_METADATA_TEMP, TASK_LOCALS,
+    AppState, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, ROUTE_METADATA_TEMP, ScopeConfig, ServeMode,
+    TASK_LOCALS, find_websocket_mount,
 };
 use bolt_core::static_files::handle_file;
 use bolt_core::streaming::StreamConfig;
 use bolt_websocket::{
-    handle_websocket_upgrade, is_websocket_upgrade, WebSocketRouter, WsConfig, WsTarget,
-    GLOBAL_WEBSOCKET_ROUTER,
+    GLOBAL_WEBSOCKET_ROUTER, WebSocketRouter, WsConfig, WsTarget, handle_websocket_upgrade,
+    is_websocket_upgrade,
 };
 
 /// Reject URL prefixes containing actix scope path-param syntax.
@@ -338,9 +338,9 @@ fn read_cors_and_file_scopes(
         // full URLs and missing leading slash produce malformed scope prefixes.
         if !media_url.starts_with('/') {
             eprintln!(
-                    "[django-bolt] Warning: MEDIA_URL must start with '/' for in-process serving (got {:?}); ignoring.",
-                    media_url
-                );
+                "[django-bolt] Warning: MEDIA_URL must start with '/' for in-process serving (got {:?}); ignoring.",
+                media_url
+            );
             return Ok(None);
         }
         let url_prefix = media_url.trim_end_matches('/').to_string();
@@ -422,7 +422,9 @@ fn read_cors_and_file_scopes(
 
     // Validate CORS configuration: wildcard + credentials is invalid per spec
     if allow_all && credentials {
-        eprintln!("[django-bolt] Warning: CORS_ALLOW_ALL_ORIGINS=True with CORS_ALLOW_CREDENTIALS=True is invalid.");
+        eprintln!(
+            "[django-bolt] Warning: CORS_ALLOW_ALL_ORIGINS=True with CORS_ALLOW_CREDENTIALS=True is invalid."
+        );
         eprintln!(
             "[django-bolt] Per CORS spec, wildcard origin (*) cannot be used with credentials."
         );
@@ -975,7 +977,7 @@ fn bind_listener(
 /// actix-server's default per-signal semantics.
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> bool {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     // If a handler cannot be installed, log it and never resolve that arm:
     // the remaining signals still work, and the OS default disposition was

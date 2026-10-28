@@ -1,6 +1,6 @@
 use crate::cookies::cookie_pairs;
-use crate::middleware::auth::{authenticate, session_context, AuthBackend, AuthContext};
-use crate::permissions::{evaluate_guards, GuardDenial, GuardResult, GuardSet};
+use crate::middleware::auth::{AuthBackend, AuthContext, authenticate, session_context};
+use crate::permissions::{GuardDenial, GuardResult, GuardSet, evaluate_guards};
 use actix_web::http::uri::Authority;
 /// Shared validation logic used by both production handler and test handler
 /// All functions marked #[inline(always)] for zero-cost abstraction

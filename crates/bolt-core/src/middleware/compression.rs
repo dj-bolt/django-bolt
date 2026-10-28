@@ -7,13 +7,13 @@ use actix_http::encoding::Encoder;
 /// it removes the header and returns the response uncompressed.
 /// Otherwise, it applies compression based on CompressionConfig and Accept-Encoding.
 use actix_web::{
-    body::{BodySize, MessageBody},
-    dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    http::header::{ContentEncoding, ACCEPT_ENCODING, CONTENT_ENCODING, VARY},
     Error,
+    body::{BodySize, MessageBody},
+    dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
+    http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding, VARY},
 };
 use futures_util::future::LocalBoxFuture;
-use std::future::{ready, Ready};
+use std::future::{Ready, ready};
 use std::sync::Arc;
 
 use crate::metadata::CompressionConfig;
@@ -165,7 +165,7 @@ mod bypass_tests {
     use super::*;
     use actix_web::http::header::{HeaderName, HeaderValue};
     use actix_web::test::{self, TestRequest};
-    use actix_web::{web, App, HttpResponse};
+    use actix_web::{App, HttpResponse, web};
 
     async fn assert_encoding_preserved(pre_set_encoding: &'static str) {
         // The body must be >= minimum_size (default 500 bytes) to trigger the

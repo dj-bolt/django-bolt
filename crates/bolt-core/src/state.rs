@@ -3,8 +3,8 @@ use ahash::AHashMap;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use crate::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};

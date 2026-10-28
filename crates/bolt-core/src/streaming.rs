@@ -1,10 +1,10 @@
 use actix_web::web::Bytes;
-use futures_util::{stream, Stream, StreamExt};
+use futures_util::{Stream, StreamExt, stream};
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyDict, PyMemoryView, PyModule, PyString};
-use pyo3::IntoPyObjectExt;
 use pyo3_async_runtimes::TaskLocals;
 use std::ffi::CString;
 use std::pin::Pin;
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
-use crate::settings::{env_positive_int, env_var, DjangoSettings};
+use crate::settings::{DjangoSettings, env_positive_int, env_var};
 use crate::state::ACTIVE_SYNC_STREAMING_THREADS;
 // Streaming uses direct_stream only in higher-level handler; not directly here
 

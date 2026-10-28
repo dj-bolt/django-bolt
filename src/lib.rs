@@ -16,8 +16,8 @@ mod testing;
 pub mod bench_support {
     pub use bolt_core::router::{convert_path, parse_query_string};
     pub use bolt_core::type_coercion::{
-        coerce_param, CoercedValue, DEFAULT_MAX_PARAM_LENGTH, TYPE_BOOL, TYPE_DATETIME,
-        TYPE_DECIMAL, TYPE_INT, TYPE_STRING, TYPE_UUID,
+        CoercedValue, DEFAULT_MAX_PARAM_LENGTH, TYPE_BOOL, TYPE_DATETIME, TYPE_DECIMAL, TYPE_INT,
+        TYPE_STRING, TYPE_UUID, coerce_param,
     };
     pub use bolt_core::validation::parse_cookies_inline;
 }
@@ -60,9 +60,9 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         register_websocket_routes, start_server,
     };
     use crate::testing::{
-        close_test_worker_connections, create_test_app, destroy_test_app, handle_test_websocket,
-        register_test_asgi_mounts, register_test_middleware_metadata, register_test_routes,
-        register_test_websocket_routes, test_request, TestRateLimiters,
+        TestRateLimiters, close_test_worker_connections, create_test_app, destroy_test_app,
+        handle_test_websocket, register_test_asgi_mounts, register_test_middleware_metadata,
+        register_test_routes, register_test_websocket_routes, test_request,
     };
 
     // Class

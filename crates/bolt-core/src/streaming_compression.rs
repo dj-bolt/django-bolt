@@ -10,9 +10,9 @@
 //! preferred backend if the client accepts it, otherwise gzip fallback (if
 //! enabled), otherwise no compression.
 
+use actix_web::HttpRequest;
 use actix_web::http::header::ACCEPT_ENCODING;
 use actix_web::web::Bytes;
-use actix_web::HttpRequest;
 use brotli::CompressorWriter;
 use futures_util::Stream;
 use std::io::Write;
@@ -389,8 +389,8 @@ mod tests {
     use super::*;
     use brotli::Decompressor;
     use flate2::read::GzDecoder;
-    use futures_util::stream;
     use futures_util::StreamExt;
+    use futures_util::stream;
     use std::io::Read;
 
     async fn collect_compressed(codec: StreamCodec, events: Vec<&'static [u8]>) -> Vec<Bytes> {

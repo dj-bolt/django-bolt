@@ -178,7 +178,7 @@ impl McpPyContext {
             other => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "unknown server request kind '{other}'"
-                )))
+                )));
             }
         };
         self.tx

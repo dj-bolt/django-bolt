@@ -3,7 +3,7 @@
 //! Settings are read once from environment variables and Django settings.
 //! The app state holds the result, so a connection reads it without the GIL.
 
-use bolt_core::settings::{env_var, DjangoSettings};
+use bolt_core::settings::{DjangoSettings, env_var};
 use pyo3::prelude::*;
 use std::time::Duration;
 

@@ -1,4 +1,4 @@
-use actix_web::{http::StatusCode, HttpResponse};
+use actix_web::{HttpResponse, http::StatusCode};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::borrow::Cow;
@@ -129,10 +129,10 @@ pub fn extract_http_exception(
         })
         .unwrap_or_else(Vec::new);
 
-    let extra: Option<Py<PyAny>> =
-        exc.getattr("extra")
-            .ok()
-            .and_then(|e| if e.is_none() { None } else { Some(e.unbind()) });
+    let extra: Option<Py<PyAny>> = exc
+        .getattr("extra")
+        .ok()
+        .and_then(|e| if e.is_none() { None } else { Some(e.unbind()) });
 
     Some((status_code, detail, headers, extra))
 }

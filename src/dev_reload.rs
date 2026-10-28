@@ -5,9 +5,9 @@ use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -620,12 +620,12 @@ pub fn run_dev_reloader(
 #[cfg(test)]
 mod tests {
     use super::{
-        first_relevant_path, is_temporary_path, recv_change, terminal_worker_exit_code,
-        ReloadFilter,
+        ReloadFilter, first_relevant_path, is_temporary_path, recv_change,
+        terminal_worker_exit_code,
     };
     use notify::{
-        event::{CreateKind, ModifyKind, RenameMode},
         Event, EventKind,
+        event::{CreateKind, ModifyKind, RenameMode},
     };
     use std::path::PathBuf;
     use std::process::{Command, ExitStatus};

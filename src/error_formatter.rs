@@ -6,8 +6,8 @@
 //! more. A response with no `ErrorInfo` comes from a handler, and stays as it is.
 //! This code runs on error paths only.
 
-use actix_web::http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use actix_web::http::StatusCode;
+use actix_web::http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use actix_web::{HttpRequest, HttpResponse};
 use ahash::AHashMap;
 use pyo3::exceptions::PyValueError;

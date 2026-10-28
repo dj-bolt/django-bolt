@@ -12,7 +12,7 @@
 //! 2. Django's staticfiles finders (for app static files like admin)
 
 use actix_files::NamedFile;
-use actix_web::{http::header, web, HttpRequest, HttpResponse};
+use actix_web::{HttpRequest, HttpResponse, http::header, web};
 use pyo3::prelude::*;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;

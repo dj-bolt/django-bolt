@@ -180,7 +180,7 @@ impl McpRegistry {
             Some(other) => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid MCP listCacheScope '{other}': expected 'public' or 'private'"
-                )))
+                )));
             }
         };
 

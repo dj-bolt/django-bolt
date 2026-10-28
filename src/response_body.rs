@@ -40,8 +40,8 @@ mod tests {
     use pyo3::types::PyModule;
     #[cfg(Py_GIL_DISABLED)]
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
 
     #[cfg(Py_GIL_DISABLED)]

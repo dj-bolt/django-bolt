@@ -9,13 +9,13 @@
 /// The middleware runs AFTER the handler, so it catches all responses including
 /// errors from authentication, rate limiting, and Python exceptions.
 use actix_web::{
-    dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    http::header::{ACCESS_CONTROL_REQUEST_METHOD, ORIGIN},
-    http::Method,
     Error,
+    dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
+    http::Method,
+    http::header::{ACCESS_CONTROL_REQUEST_METHOD, ORIGIN},
 };
 use futures_util::future::LocalBoxFuture;
-use std::future::{ready, Ready};
+use std::future::{Ready, ready};
 use std::sync::Arc;
 
 use crate::cors::{add_cors_headers_with_config, add_preflight_headers_with_config};

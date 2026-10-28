@@ -1,10 +1,10 @@
 use actix_multipart::Multipart;
 use actix_web::http::header::{HeaderName, HeaderValue};
-use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
+use actix_web::{HttpRequest, HttpResponse, http::StatusCode, web};
 use ahash::AHashMap;
 use bytes::Bytes;
-use futures_util::stream;
 use futures_util::StreamExt;
+use futures_util::stream;
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::sync::PyOnceLock;
@@ -20,29 +20,30 @@ use tokio::io::AsyncReadExt;
 use bolt_asgi::asgi_http;
 use bolt_core::error::{self, handle_python_error};
 use bolt_core::form_parsing::{
-    parse_multipart, parse_urlencoded, FileContent, FileFieldConstraints, FileInfo,
-    FormParseResult, FormValue, LimitedPayload, DEFAULT_MAX_FIELDS, DEFAULT_MAX_PARTS,
-    DEFAULT_MEMORY_LIMIT, ERROR_TYPE_PAYLOAD_TOO_LARGE,
+    DEFAULT_MAX_FIELDS, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT, ERROR_TYPE_PAYLOAD_TOO_LARGE,
+    FileContent, FileFieldConstraints, FileInfo, FormParseResult, FormValue, LimitedPayload,
+    parse_multipart, parse_urlencoded,
 };
 use bolt_core::metadata::{RustArgBinding, RustArgSource};
 use bolt_core::middleware;
 use bolt_core::middleware::auth::populate_auth_context;
 use bolt_core::request::PyRequest;
 use bolt_core::request_pipeline::{
-    build_validation_error_response, extract_cookie_header, extract_headers, query_sequences,
-    set_query_sequences, validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
+    EMPTY_TYPES, build_validation_error_response, extract_cookie_header, extract_headers,
+    query_sequences, set_query_sequences, validate_and_cache_source,
+    validate_and_cache_typed_params,
 };
 use bolt_core::response_builder;
 use bolt_core::response_meta::ResponseMeta;
 use bolt_core::responses;
-use bolt_core::router::{parse_query_string, QueryParams};
-use bolt_core::state::{find_asgi_mount, AppState};
-use bolt_core::streaming::{create_python_stream, create_sse_stream, StreamConfig};
+use bolt_core::router::{QueryParams, parse_query_string};
+use bolt_core::state::{AppState, find_asgi_mount};
+use bolt_core::streaming::{StreamConfig, create_python_stream, create_sse_stream};
 use bolt_core::type_coercion::{
-    coerced_value_to_py, string_map_to_py_dict, CoercedValue, TypeHints,
+    CoercedValue, TypeHints, coerced_value_to_py, string_map_to_py_dict,
 };
 use bolt_core::validation::{
-    parse_cookies_inline, parse_selected_cookies, validate_auth_and_guards, AuthGuardResult,
+    AuthGuardResult, parse_cookies_inline, parse_selected_cookies, validate_auth_and_guards,
 };
 
 use std::future::Future;
@@ -358,7 +359,7 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Unknown response meta tag: {}",
                     tag
-                )))
+                )));
             }
         }
     } else {
@@ -419,7 +420,7 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Unsupported response body kind: {}",
                 other
-            )))
+            )));
         }
     };
 

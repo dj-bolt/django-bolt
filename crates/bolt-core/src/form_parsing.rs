@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use tempfile::NamedTempFile;
 
-use crate::type_coercion::{coerce_param, CoerceError, CoercedValue, TYPE_STRING};
+use crate::type_coercion::{CoerceError, CoercedValue, TYPE_STRING, coerce_param};
 
 /// Memory limit for in-memory file storage (1MB default)
 pub const DEFAULT_MEMORY_LIMIT: usize = 1024 * 1024;
@@ -889,10 +889,10 @@ mod tests {
     /// test fails for that (vulnerable) behavior.
     #[test]
     fn test_multipart_rejects_oversized_field_before_buffering() {
-        use actix_web::http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+        use actix_web::http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
         use std::collections::VecDeque;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let boundary = "TESTBOUNDARY";
         let chunk_size = 1000usize;
@@ -1011,7 +1011,7 @@ mod tests {
         file_constraints: &HashMap<String, FileFieldConstraints>,
         limits: &Limits,
     ) -> Result<FormParseResult, ValidationError> {
-        use actix_web::http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+        use actix_web::http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
         let mut body = parts.concat();
         body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
@@ -1098,7 +1098,7 @@ mod tests {
 
     #[test]
     fn multipart_text_field_stops_at_the_first_chunk_over_max_param_length() {
-        use actix_web::http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+        use actix_web::http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
         use std::collections::VecDeque;
 
         // One byte for each chunk, so the field grows by one byte at a time.
@@ -1257,10 +1257,10 @@ mod tests {
 
     #[test]
     fn a_limited_payload_stops_a_part_header_that_never_ends() {
-        use actix_web::http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+        use actix_web::http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
         use std::collections::VecDeque;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let mut chunks: VecDeque<Bytes> = VecDeque::new();
         chunks.push_back(Bytes::from(format!(

@@ -187,7 +187,7 @@ impl Router {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Unsupported method: {}",
                     method
-                )))
+                )));
             }
         };
 

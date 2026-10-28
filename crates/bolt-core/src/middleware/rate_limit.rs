@@ -8,8 +8,8 @@ use once_cell::sync::Lazy;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::metadata::{RateLimitConfig, RateLimitKey};
 use crate::middleware::auth::AuthContext;

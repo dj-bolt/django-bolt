@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub use actor::WebSocketActor;
 pub use config::WsConfig;
 pub use handler::{
-    handle_websocket_upgrade, is_websocket_upgrade, requested_subprotocols, WsTarget,
+    WsTarget, handle_websocket_upgrade, is_websocket_upgrade, requested_subprotocols,
 };
 #[allow(unused_imports)] // Re-exported for external use
 pub use messages::{SendToClient, WsMessage};

@@ -13,11 +13,11 @@ use std::sync::Arc;
 
 use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
-    build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm, AuthBackend, AuthContext,
-    Claims, JwtKeySource, RefreshingJwks, StaticKey,
+    AuthBackend, AuthContext, Claims, JwtKeySource, RefreshingJwks, StaticKey,
+    build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm,
 };
 use crate::permissions::{
-    evaluate_guards, ClaimKey, Guard, GuardDenial, GuardResult, GuardSet, Quantifier,
+    ClaimKey, Guard, GuardDenial, GuardResult, GuardSet, Quantifier, evaluate_guards,
 };
 use crate::responses::{ERROR_BODY_401, ERROR_BODY_403};
 use crate::type_coercion::TypeHints;
@@ -1324,7 +1324,7 @@ pub fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<Gu
                     return Err(PyValueError::new_err(format!(
                         "requires guard '{}' has unknown quantifier {}",
                         claim, other
-                    )))
+                    )));
                 }
             };
             // Always present (may be None). Serialized to response bytes here,

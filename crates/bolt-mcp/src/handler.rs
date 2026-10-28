@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
+use rmcp::RoleServer;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
     ErrorCode, ErrorData as McpError, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
@@ -24,15 +25,14 @@ use rmcp::model::{
     ResultType, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
-use rmcp::RoleServer;
 use serde_json::Value;
 
+use crate::McpAuthExt;
 use crate::context::{CtxEvent, McpPyContext, ProtocolMode};
 use crate::registry::{McpRegistry, McpToolEntry};
 use crate::state_codec;
-use crate::McpAuthExt;
-use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
-use bolt_core::permissions::{evaluate_guards, GuardResult};
+use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
+use bolt_core::permissions::{GuardResult, evaluate_guards};
 use bolt_loop as worker_loop;
 
 #[derive(Clone)]
@@ -106,7 +106,7 @@ fn parse_py_result<T: serde::de::DeserializeOwned>(raw: &str, mode: ProtocolMode
                         return PyOutcome::Error(McpError::internal_error(
                             format!("invalid __inputRequired__ envelope: {e}"),
                             None,
-                        ))
+                        ));
                     }
                 }
             }
@@ -117,7 +117,7 @@ fn parse_py_result<T: serde::de::DeserializeOwned>(raw: &str, mode: ProtocolMode
                         return PyOutcome::Error(McpError::internal_error(
                             format!("invalid __error__ envelope: {e}"),
                             None,
-                        ))
+                        ));
                     }
                 }
             }

@@ -1,12 +1,12 @@
 //! WebSocket upgrade handler with full Python integration
 
 use actix::Addr;
+use actix_web::http::StatusCode;
 use actix_web::http::header::{
-    HeaderMap, HeaderName, HeaderValue, CONNECTION, ORIGIN, SEC_WEBSOCKET_ACCEPT,
+    CONNECTION, HeaderMap, HeaderName, HeaderValue, ORIGIN, SEC_WEBSOCKET_ACCEPT,
     SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
 };
-use actix_web::http::StatusCode;
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{HttpRequest, HttpResponse, web};
 use actix_web_actors::ws;
 use ahash::AHashMap;
 use bolt_core::cookies::cookie_pairs;
@@ -19,23 +19,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 
 use bolt_core::metadata::RouteMetadata;
-use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
-use bolt_core::middleware::client_ip::{resolve_scheme, TrustedProxies};
+use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
+use bolt_core::middleware::client_ip::{TrustedProxies, resolve_scheme};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::request_pipeline::{
-    header_str, insert_header_line, query_sequences, set_declared_item, set_param_item,
-    set_query_sequences, EMPTY_TYPES,
+    EMPTY_TYPES, header_str, insert_header_line, query_sequences, set_declared_item,
+    set_param_item, set_query_sequences,
 };
 use bolt_core::router::parse_query_string;
 use bolt_core::state::AppState;
 use bolt_core::type_coercion::TypeHints;
-use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
+use bolt_core::validation::{AuthGuardResult, validate_auth_and_guards};
 
 use super::actor::WebSocketActor;
 use super::config::WsConfig;
 use super::messages::{SendToClient, WsMessage};
 use super::origin;
-use super::{ConnectionSlot, ACTIVE_WS_CONNECTIONS};
+use super::{ACTIVE_WS_CONNECTIONS, ConnectionSlot};
 
 /// Cached Python imports - loaded once at first WebSocket connection
 static WS_CLASS: OnceCell<Py<PyAny>> = OnceCell::new();

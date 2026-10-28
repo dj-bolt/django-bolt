@@ -4,7 +4,7 @@
 /// by batching operations and pre-allocating capacity.
 use actix_web::body::MessageBody;
 use actix_web::http::header::{HeaderName, HeaderValue};
-use actix_web::{http::StatusCode, HttpResponse, HttpResponseBuilder};
+use actix_web::{HttpResponse, HttpResponseBuilder, http::StatusCode};
 
 use crate::cookies::format_cookie;
 use crate::response_meta::ResponseMeta;

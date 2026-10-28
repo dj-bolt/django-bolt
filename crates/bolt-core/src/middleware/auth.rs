@@ -1,17 +1,17 @@
 use ahash::AHashMap;
 use aws_lc_rs::hmac;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use jsonwebtoken::{crypto, get_current_timestamp, Algorithm, AlgorithmFamily, DecodingKey};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, crypto, get_current_timestamp};
+use pyo3::IntoPyObjectExt;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use pyo3::IntoPyObjectExt;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
@@ -1041,16 +1041,18 @@ mod tests {
             format!("{}A", &token[..token.len() - 1])
         };
 
-        assert!(decode_and_validate(
-            &tampered,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &tampered,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1116,32 +1118,36 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn rejects_missing_exp() {
         let token = sign_token(r#"{"alg":"HS256"}"#, r#"{"sub":"42"}"#, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1153,16 +1159,18 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1173,26 +1181,30 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            Some("api"),
-            None,
-            60,
-            None
-        )
-        .is_some());
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            Some("mobile"),
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                Some("api"),
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                Some("mobile"),
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1202,16 +1214,18 @@ mod tests {
         let claims_json = format!(r#"{{"sub":"42","exp":{},"aud":"api"}}"#, future_exp());
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_some());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1222,40 +1236,46 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &with_iss, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            Some("https://issuer.example"),
-            60,
-            None
-        )
-        .is_some());
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            Some("https://other.example"),
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                Some("https://issuer.example"),
+                60,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                Some("https://other.example"),
+                60,
+                None
+            )
+            .is_none()
+        );
 
         // Missing iss is rejected when an issuer is configured.
         let without_iss = format!(r#"{{"sub":"42","exp":{}}}"#, future_exp());
         let token = sign_token(r#"{"alg":"HS256"}"#, &without_iss, Algorithm::HS256);
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            Some("https://issuer.example"),
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                Some("https://issuer.example"),
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1328,16 +1348,18 @@ mod tests {
         // Keycloak access tokens carry typ Bearer.
         let json = format!(r#"{{"sub":"42","exp":{},"typ":"Bearer"}}"#, future_exp());
         let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_some());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1392,32 +1414,36 @@ mod tests {
             future_exp()
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            Some("refresh")
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                Some("refresh")
+            )
+            .is_none()
+        );
         // An expected type still needs `typ`: another type claim alone is not enough.
         let json = format!(
             r#"{{"sub":"42","exp":{},"token_type":"refresh"}}"#,
             future_exp()
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            Some("refresh")
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                Some("refresh")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1428,27 +1454,31 @@ mod tests {
         let access = sign_token(r#"{"alg":"HS256"}"#, &access_json, Algorithm::HS256);
 
         // A rotation endpoint expecting "refresh" accepts refresh tokens...
-        assert!(decode_and_validate(
-            &refresh,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            Some("refresh")
-        )
-        .is_some());
+        assert!(
+            decode_and_validate(
+                &refresh,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                Some("refresh")
+            )
+            .is_some()
+        );
         // ...and rejects access tokens (no typ at all).
-        assert!(decode_and_validate(
-            &access,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            Some("refresh")
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &access,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                Some("refresh")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1457,16 +1487,18 @@ mod tests {
         let claims_json = format!(r#"{{"sub":"42","exp":{},"typ":"access"}}"#, future_exp());
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_some());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1509,26 +1541,30 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_some());
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            0,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                0,
+                None
+            )
+            .is_none()
+        );
     }
 
     fn validate(token: &str, audience: Option<&str>, leeway: i64) -> Option<Claims> {
