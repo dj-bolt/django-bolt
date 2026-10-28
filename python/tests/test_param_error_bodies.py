@@ -154,8 +154,13 @@ def test_missing_renamed_header_field_names_the_header():
 
 
 @pytest.mark.parametrize("path", ["/header-struct", "/query-struct"])
-def test_a_struct_validation_error_is_not_logged_as_a_server_error(client, caplog, path):
+def test_a_struct_validation_error_is_not_logged_as_a_server_error(client, caplog, monkeypatch, path):
     # A client can send a bad request on each call. The access log keeps the 422.
+    # Django's LOGGING stops django.server records from propagating to the root
+    # logger, so put the capture handler on django.server itself.
+    server_logger = logging.getLogger("django.server")
+    monkeypatch.setattr(server_logger, "disabled", False)
+    monkeypatch.setattr(server_logger, "handlers", [*server_logger.handlers, caplog.handler])
     with caplog.at_level(logging.ERROR, logger="django.server"):
         response = client.get(path)
 
