@@ -401,7 +401,7 @@ def handle_exception(
     elif DjangoHttp404 is not None and isinstance(exc, DjangoHttp404):
         # Django answers 404. It shows the message only in debug mode, because
         # the message of get_object_or_404 names the model.
-        return format_error_response(status_code=404, detail=str(exc) if debug else "Not Found")
+        return format_error_response(status_code=404, detail=(str(exc) or "Not Found") if debug else "Not Found")
     else:
         # Generic exception
         return generic_exception_handler(exc, debug=debug, request=request)

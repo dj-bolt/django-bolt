@@ -244,6 +244,7 @@ status, headers, body = generic_exception_handler(exc, debug=True)
 The main entry point that routes to appropriate handlers. It maps some Django exceptions as Django does:
 
 - `PermissionDenied` gives 403.
+- `Http404`, also from `get_object_or_404`, gives 404. With `DEBUG=False`, the detail is `Not Found`.
 - `SuspiciousOperation`, for example `DisallowedHost`, gives 400. Bolt logs it to the `django.security.<class name>` logger, as Django does. With `DEBUG=False`, the detail is `Bad Request`.
 
 ```python

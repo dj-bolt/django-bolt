@@ -499,3 +499,17 @@ def test_the_formatter_gets_http404_as_not_found():
 
     assert response.status_code == 404
     assert response.json() == {"kind": "not_found", "detail": "Not Found", "exception": "Http404"}
+
+
+def test_an_http404_with_no_message_gives_not_found_with_debug(settings):
+    settings.DEBUG = True
+    api = BoltAPI()
+
+    @api.get("/item")
+    async def item():
+        raise Http404
+
+    with TestClient(api) as client:
+        response = client.get("/item")
+
+    assert (response.status_code, response.json()["detail"]) == (404, "Not Found")
