@@ -234,7 +234,7 @@ except Exception as e:
     )
 ```
 
-Bolt calls `log_exception` for an exception that a handler does not handle, but only when Bolt answers it with a 5xx. A 4xx, such as a validation error or `PermissionDenied`, is the fault of the client. The access log of `runbolt` records it at `WARNING`. This also applies to a validation error that handler code raises, because Bolt answers it with a 422. An `error_formatter` can change the status of the response, but not this choice. Thus a formatter cannot hide a server error from the log. An `HTTPException` is a planned response, so Bolt does not call `log_exception` for it. When Bolt cannot build the error response, it logs that error too.
+Bolt calls `log_exception` for an exception that a handler does not handle, but only when the default response for the exception is a 5xx. A 4xx, such as a validation error or `PermissionDenied`, is the fault of the client. The access log of `runbolt` records it at `WARNING`. This also applies to a validation error that handler code raises, because Bolt answers it with a 422. An `error_formatter` can change the status of the response, but not this choice. Thus a formatter cannot hide a server error from the log. An `HTTPException` is a planned response, so Bolt does not call `log_exception` for it. When Bolt cannot build the error response, it logs that error too.
 
 ### Custom exception handler
 
@@ -250,7 +250,7 @@ config = LoggingConfig(
 )
 ```
 
-Bolt calls the handler only for a 5xx, as it does `log_exception`.
+Bolt calls the handler only when the default response for the exception is a 5xx, as it does `log_exception`.
 
 ## Client IP extraction
 
