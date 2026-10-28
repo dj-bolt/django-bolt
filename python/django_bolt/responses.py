@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -105,15 +104,8 @@ def initialize_file_response_settings():
     try:
         if django_settings and hasattr(django_settings, "BOLT_ALLOWED_FILE_PATHS"):
             allowed_paths = django_settings.BOLT_ALLOWED_FILE_PATHS
-            # Resolve all paths once at startup. Keep each path as configured too,
-            # with "." and ".." removed: the path of a FileResponse can name a root
-            # through a link, and a missing file there must stay a 404.
-            roots: list[Path] = []
-            for allowed_path in allowed_paths or ():
-                for root in (Path(allowed_path).resolve(), Path(os.path.abspath(allowed_path))):
-                    if root not in roots:
-                        roots.append(root)
-            _ALLOWED_FILE_PATHS_CACHE = roots or None
+            # Resolve all paths once at startup
+            _ALLOWED_FILE_PATHS_CACHE = [Path(p).resolve() for p in allowed_paths] if allowed_paths else None
         else:
             _ALLOWED_FILE_PATHS_CACHE = None
     except ImportError:

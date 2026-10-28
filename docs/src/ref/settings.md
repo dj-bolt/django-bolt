@@ -258,7 +258,7 @@ BOLT_ALLOWED_FILE_PATHS = [
 ]
 ```
 
-When set, `FileResponse` only serves files within these directories. For a path outside them, it raises `ResponseFileNotAllowed`, and Bolt answers 403. This is also true when the path names no file, so a client cannot learn which paths exist there.
+When set, `FileResponse` only serves files within these directories. For a path outside them, it raises `ResponseFileNotAllowed`, and Bolt answers 403. Bolt follows the links of the path, as the OS does, to find where its lookup stops. A path that names no file also gives a 403 when its lookup stops outside them. Thus a client cannot learn which files exist there.
 
 ## Static and media file serving
 

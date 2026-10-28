@@ -60,10 +60,10 @@ const SYMLINK_LOOP: i32 = libc::ELOOP;
 /// it. A path that names no regular file is a 404, as in Django's `serve`.
 /// Only Bolt raises these errors, so the error handler maps only them to 404 and 403.
 ///
-/// Out of the allowed directories, each such path is a 403, also when the
-/// server may not read it. A 404 there would tell a client which paths exist.
-/// A path in the allowed directories that the server may not read, or any such
-/// path with no allowed directories, is a server fault: a logged 500.
+/// When the lookup stops out of the allowed directories, the path is a 403.
+/// This is also true when the server may not read it. A 404 there would tell
+/// a client which paths exist. A server that may not read a path in the allowed
+/// directories has a fault: a logged 500. This is also true with no allowed directories.
 fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathBuf]>) -> PyErr {
     let names_no_file = matches!(
         error.kind(),
@@ -72,8 +72,10 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
             | ErrorKind::InvalidInput
             | ErrorKind::InvalidFilename
     ) || error.raw_os_error() == Some(SYMLINK_LOOP);
-    let denied = error.kind() == ErrorKind::PermissionDenied;
-    if (names_no_file || denied) && allowed.is_some_and(|roots| !lexically_within(path, roots)) {
+    if !names_no_file && error.kind() != ErrorKind::PermissionDenied {
+        return PyErr::from(error);
+    }
+    if allowed.is_some_and(|roots| !within(&lookup_stop(path), roots)) {
         return not_allowed(path);
     }
     if names_no_file {
@@ -83,22 +85,31 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
     }
 }
 
-/// Return true when the path lies in one of the roots, with `.` and `..` removed and links not resolved.
-fn lexically_within(path: &Path, roots: &[PathBuf]) -> bool {
+/// Return the real path at which the OS lookup of `path` stops.
+///
+/// The OS resolves the parts of a path in sequence, and it follows a link
+/// before it applies a later `..`. Thus resolve the parts one at a time.
+fn lookup_stop(path: &Path) -> PathBuf {
+    let mut reached = PathBuf::new();
     let Ok(absolute) = std::path::absolute(path) else {
-        return false;
+        return reached;
     };
-    let mut normal = PathBuf::new();
     for component in absolute.components() {
-        match component {
-            Component::ParentDir => {
-                normal.pop();
-            }
-            Component::CurDir => {}
-            other => normal.push(other.as_os_str()),
+        let next = reached.join(component);
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            reached = next;
+            continue;
+        }
+        match std::fs::canonicalize(&next) {
+            Ok(resolved) => reached = resolved,
+            Err(_) => break,
         }
     }
-    roots.iter().any(|root| normal.starts_with(root))
+    reached
+}
+
+fn within(resolved: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| resolved.starts_with(root))
 }
 
 fn file_not_found(path: &Path) -> PyErr {
@@ -119,7 +130,7 @@ pub fn resolve_response_file(path: PathBuf, allowed: Option<Vec<PathBuf>>) -> Py
     let resolved =
         std::fs::canonicalize(&path).map_err(|error| file_lookup_error(error, &path, roots))?;
     // Check the roots before the type, so a directory out of them is a 403 as a file is.
-    if roots.is_some_and(|roots| !roots.iter().any(|root| resolved.starts_with(root))) {
+    if roots.is_some_and(|roots| !within(&resolved, roots)) {
         return Err(not_allowed(&path));
     }
     let metadata = resolved

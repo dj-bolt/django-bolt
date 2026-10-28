@@ -306,15 +306,20 @@ def test_an_os_error_of_handler_code_is_a_logged_500_without_the_path(server_err
     ]
 
 
-@pytest.fixture
-def allowed_dir(settings, monkeypatch, tmp_path):
-    """Allow FileResponse paths in one directory, as runbolt does at startup."""
-    public = tmp_path / "public"
-    public.mkdir()
-    settings.BOLT_ALLOWED_FILE_PATHS = [str(public)]
+def _allow_file_paths(settings, monkeypatch, *paths) -> None:
+    """Set BOLT_ALLOWED_FILE_PATHS and load it, as runbolt does at startup."""
+    settings.BOLT_ALLOWED_FILE_PATHS = [str(path) for path in paths]
     monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
     monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
     responses.initialize_file_response_settings()
+
+
+@pytest.fixture
+def allowed_dir(settings, monkeypatch, tmp_path):
+    """Allow FileResponse paths in one directory."""
+    public = tmp_path / "public"
+    public.mkdir()
+    _allow_file_paths(settings, monkeypatch, public)
     return public
 
 
@@ -418,16 +423,22 @@ def test_a_file_that_the_server_cannot_read_in_an_allowed_dir_is_a_logged_500(se
     assert [message.split(":")[:2] for message in server_errors()] == [["Exception in GET /file", " PermissionError"]]
 
 
+@pytest.mark.parametrize("route", ["walk-out", "through-a-link"])
 def test_a_path_out_of_the_allowed_dirs_that_the_server_cannot_read_is_a_403(
-    server_errors, allowed_dir, locked_dir, tmp_path
+    server_errors, allowed_dir, locked_dir, tmp_path, route
 ):
     # A client that walks out of the allowed dirs gets a 403, also into a dir that the server cannot read.
     locked_dir(tmp_path / "locked")
+    (allowed_dir / "escape").symlink_to(tmp_path, target_is_directory=True)
+    path = {
+        "walk-out": f"{allowed_dir}/../locked/data.txt",
+        "through-a-link": f"{allowed_dir}/escape/locked/data.txt",
+    }[route]
     api = BoltAPI()
 
     @api.get("/file")
     def file():
-        return FileResponse(f"{allowed_dir}/../locked/data.txt")
+        return FileResponse(path)
 
     with TestClient(api) as client:
         response = client.get("/file")
@@ -436,21 +447,27 @@ def test_a_path_out_of_the_allowed_dirs_that_the_server_cannot_read_is_a_403(
     assert server_errors() == []
 
 
-@pytest.mark.parametrize("kind", ["existing", "missing", "directory", "below-a-file", "symlink-loop", "walk-out"])
+@pytest.mark.parametrize(
+    "kind", ["missing", "directory", "below-a-file", "symlink-loop", "walk-out", "through-a-link", "back-out-of-a-link"]
+)
 def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server_errors, allowed_dir, tmp_path, kind):
     # A 404 for a missing path and a 403 for a file would tell a client which paths exist out of the allowed dirs.
     outside = tmp_path / "outside"
-    outside.mkdir()
+    (outside / "sub").mkdir(parents=True)
     (outside / "secret.txt").write_text("secret")
     loop = outside / "loop"
     loop.symlink_to(loop)
+    (allowed_dir / "escape").symlink_to(outside, target_is_directory=True)
+    # The OS follows a link before it applies "..", so link/.. is the outside dir.
+    (allowed_dir / "link").symlink_to(outside / "sub", target_is_directory=True)
     paths = {
-        "existing": outside / "secret.txt",
         "missing": outside / "missing.txt",
         "directory": outside,
         "below-a-file": outside / "secret.txt" / "x",
         "symlink-loop": loop,
         "walk-out": allowed_dir / ".." / "outside" / "missing.txt",
+        "through-a-link": allowed_dir / "escape" / "missing.txt",
+        "back-out-of-a-link": allowed_dir / "link" / ".." / "missing.txt",
     }
     api = BoltAPI()
 
@@ -465,24 +482,53 @@ def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server
     assert server_errors() == []
 
 
-def test_a_missing_file_in_an_allowed_dir_named_through_a_link_is_a_404(server_errors, settings, monkeypatch, tmp_path):
-    # Bolt resolves the links of BOLT_ALLOWED_FILE_PATHS, but the path of a FileResponse can keep them.
-    real = tmp_path / "real"
-    real.mkdir()
-    alias = tmp_path / "alias"
-    alias.symlink_to(real, target_is_directory=True)
-    settings.BOLT_ALLOWED_FILE_PATHS = [str(alias)]
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
-    responses.initialize_file_response_settings()
+@pytest.mark.parametrize("configured", ["link", "real-dir"])
+def test_a_missing_file_in_an_allowed_dir_named_through_a_link_is_a_404(
+    server_errors, settings, monkeypatch, tmp_path, configured
+):
+    # The lookup stops in the allowed dir, also when the path names it through a link.
+    real = tmp_path / "releases" / "42"
+    real.mkdir(parents=True)
+    current = tmp_path / "current"
+    current.symlink_to(real, target_is_directory=True)
+    _allow_file_paths(settings, monkeypatch, current if configured == "link" else real)
     api = BoltAPI()
 
     @api.get("/file")
     def file():
-        return FileResponse(str(alias / "missing.txt"))
+        return FileResponse(str(current / "missing.txt"))
 
     with TestClient(api) as client:
         response = client.get("/file")
 
     assert (response.status_code, response.json()["detail"]) == (404, "File not found")
+    assert server_errors() == []
+
+
+def test_an_allowed_dir_is_the_dir_that_the_os_resolves(server_errors, settings, monkeypatch, tmp_path):
+    # The OS follows "link" before it applies "..", so link/../public is deep/public and not tmp_path/public.
+    (tmp_path / "deep" / "sub").mkdir(parents=True)
+    (tmp_path / "deep" / "public").mkdir()
+    (tmp_path / "deep" / "public" / "page.txt").write_text("page")
+    (tmp_path / "link").symlink_to(tmp_path / "deep" / "sub", target_is_directory=True)
+    (tmp_path / "public").mkdir()
+    (tmp_path / "public" / "secret.txt").write_text("secret")
+    _allow_file_paths(settings, monkeypatch, f"{tmp_path}/link/../public")
+    api = BoltAPI()
+
+    @api.get("/page")
+    def page():
+        return FileResponse(str(tmp_path / "deep" / "public" / "page.txt"))
+
+    @api.get("/secret")
+    def secret():
+        return FileResponse(str(tmp_path / "public" / "secret.txt"))
+
+    with TestClient(api) as client:
+        page_response = client.get("/page")
+        secret_response = client.get("/secret")
+
+    assert (page_response.status_code, page_response.content) == (200, b"page")
+    assert secret_response.status_code == 403
+    assert secret_response.json()["detail"] == "Permission denied"
     assert server_errors() == []
