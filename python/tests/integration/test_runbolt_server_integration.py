@@ -88,6 +88,19 @@ def test_runbolt_skip_checks_suppresses_system_checks(make_server_project):
     assert "unapplied migration" in stdout, stdout
 
 
+def test_runbolt_with_a_str_bolt_allowed_file_paths_stops_startup(make_server_project):
+    # A str is a sequence of one-character paths, so "/" was an allowed dir, and FileResponse served any file.
+    project = make_server_project(
+        api_module=app_module("hello"), settings_extra='BOLT_ALLOWED_FILE_PATHS = "/srv/media"\n'
+    )
+
+    with pytest.raises(AssertionError) as excinfo, project.start():
+        pass
+
+    assert "runbolt exited before the server became ready" in str(excinfo.value)
+    assert "BOLT_ALLOWED_FILE_PATHS must be a list of paths, got str '/srv/media'." in str(excinfo.value)
+
+
 def test_runbolt_failing_system_check_stops_startup(make_server_project):
     project = make_server_project(
         installed_apps=["badapp.apps.BadAppConfig"],

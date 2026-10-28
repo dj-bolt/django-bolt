@@ -258,6 +258,8 @@ BOLT_ALLOWED_FILE_PATHS = [
 ]
 ```
 
+The setting is a list or a tuple of paths. Each path is a str or a `Path`. One str is not a list, so it stops startup with `ImproperlyConfigured`. `None` or an empty list sets no limit.
+
 When set, `FileResponse` only serves files within these directories. For a path outside them, it raises `ResponseFileNotAllowed`, and Bolt answers 403. Bolt follows the links of the path, as `realpath` does, to find where its lookup stops. A path that names no file also gives a 403 when its lookup stops outside them. On Linux, a client thus cannot learn which regular files exist there. A path can leave these directories with `..` and come back into them. Such a path can still show whether a directory, or a link into these directories, exists outside them.
 
 ## Static and media file serving
@@ -511,7 +513,7 @@ api = BoltAPI(
 | `CORS_PREFLIGHT_MAX_AGE` | `int` | `3600` | Preflight cache (seconds) |
 | `BOLT_MAX_UPLOAD_SIZE` | `int` | `1048576` | Max upload size (bytes) |
 | `BOLT_MEMORY_SPOOL_THRESHOLD` | `int` | `1048576` | Memory threshold before disk spooling (bytes) |
-| `BOLT_ALLOWED_FILE_PATHS` | `list[str]` | `None` | File serving whitelist |
+| `BOLT_ALLOWED_FILE_PATHS` | `list[str \| Path]` | `None` | File serving whitelist |
 | `BOLT_STATIC_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for static (`public`) |
 | `BOLT_MEDIA_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for media (`private`) |
 | `BOLT_LOG_QUEUE_SIZE` | `int` | `10000` | Max depth of the non-blocking log queue (records dropped when full) |
