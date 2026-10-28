@@ -610,7 +610,6 @@ pub fn test_request(
 
                     // Build AppState matching production
                     // Include router and route_metadata so CorsMiddleware can find route-level CORS config
-                    let cors_origin_regexes = config.cors_origin_regexes();
                     let app_state_arc = Arc::new(AppState {
                         dispatch,
                         debug: config.debug,
@@ -620,7 +619,6 @@ pub fn test_request(
                         asgi_mount_timeout: config.asgi_mount_timeout,
                         stream_config: config.stream_config,
                         global_cors_config: config.global_cors_config,
-                        cors_origin_regexes,
                         global_compression_config: compression,
                         trusted_proxies: config.trusted_proxies,
                         rate_limiters,
