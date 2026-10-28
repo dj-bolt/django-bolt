@@ -224,6 +224,8 @@ BOLT_ALLOWED_FILE_PATHS = [
 
 When configured, `FileResponse` only serves files within these directories, preventing path traversal attacks.
 
+A `FileResponse` for a file outside these directories raises `ResponseFileNotAllowed`, and Bolt answers 403. A `FileResponse` for a file that does not exist raises `ResponseFileNotFound`, and Bolt answers 404. They subclass `PermissionError` and `FileNotFoundError`. The response does not show the path. Bolt answers 500 for a `FileNotFoundError` or a `PermissionError` of other code, because it is a server fault.
+
 ## Streaming responses
 
 Stream data incrementally using generators:

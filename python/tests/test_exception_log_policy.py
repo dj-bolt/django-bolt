@@ -15,10 +15,10 @@ import msgspec
 import pytest
 from django.core.exceptions import PermissionDenied
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, responses
 from django_bolt.logging import LoggingConfig
 from django_bolt.params import Query
-from django_bolt.responses import JSON
+from django_bolt.responses import JSON, FileResponse
 from django_bolt.testing import TestClient
 
 
@@ -134,3 +134,67 @@ def test_the_status_of_the_formatter_response_decides(server_errors):
 
     assert response.status_code == 503
     assert server_errors() == ["Exception in GET /async/denied: PermissionDenied: no access"]
+
+
+def test_an_os_error_of_handler_code_is_a_logged_500_without_the_path(server_errors, settings, tmp_path):
+    # Only a FileResponse error is a 404 or a 403. An OSError of handler code is a server fault.
+    settings.DEBUG = False
+    missing = tmp_path / "secrets" / "config.json"
+    api = BoltAPI()
+
+    @api.get("/config")
+    def config():
+        return {"size": len(missing.read_bytes())}
+
+    @api.get("/key")
+    def key():
+        raise PermissionError(f"[Errno 13] Permission denied: '{missing}'")
+
+    with TestClient(api) as client:
+        config_response = client.get("/config")
+        key_response = client.get("/key")
+
+    assert (config_response.status_code, key_response.status_code) == (500, 500)
+    assert str(tmp_path) not in config_response.text + key_response.text
+    assert [message.split(":")[0] for message in server_errors()] == [
+        "Exception in GET /config",
+        "Exception in GET /key",
+    ]
+
+
+@pytest.fixture
+def allowed_dir(settings, monkeypatch, tmp_path):
+    """Allow FileResponse paths in one directory, as runbolt does at startup."""
+    public = tmp_path / "public"
+    public.mkdir()
+    settings.BOLT_ALLOWED_FILE_PATHS = [str(public)]
+    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
+    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
+    responses.initialize_file_response_settings()
+    return public
+
+
+def test_a_file_response_error_is_a_4xx_without_the_path(server_errors, settings, allowed_dir, tmp_path):
+    settings.DEBUG = False
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret")
+    api = BoltAPI()
+
+    @api.get("/missing")
+    def missing():
+        return FileResponse(str(allowed_dir / "missing.txt"))
+
+    @api.get("/outside")
+    def outside_file():
+        return FileResponse(str(outside))
+
+    with TestClient(api) as client:
+        missing_response = client.get("/missing")
+        outside_response = client.get("/outside")
+
+    assert (missing_response.status_code, outside_response.status_code) == (404, 403)
+    assert (missing_response.json()["detail"], outside_response.json()["detail"]) == (
+        "File not found",
+        "Permission denied",
+    )
+    assert server_errors() == []

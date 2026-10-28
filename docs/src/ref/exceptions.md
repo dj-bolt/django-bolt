@@ -147,6 +147,15 @@ ResponseValidationError(
 )
 ```
 
+## FileResponse errors
+
+`FileResponse` raises these errors when it gets the path of the file. Only these errors give a 404 or a 403. A `FileNotFoundError` or a `PermissionError` of other code gives a 500. The response does not show the path.
+
+| Exception | Subclass of | Status | When raised |
+|-----------|-------------|--------|-------------|
+| `ResponseFileNotFound` | `FileNotFoundError` | 404 | The file does not exist |
+| `ResponseFileNotAllowed` | `PermissionError` | 403 | The file is outside `BOLT_ALLOWED_FILE_PATHS` |
+
 ## Validation Layers
 
 Django-Bolt's Serializer has two validation layers:
@@ -315,7 +324,7 @@ raise BadRequest(
 | 400 | `BadRequest` | Explicit raise only |
 | 401 | `Unauthorized` | Authentication failed |
 | 403 | `Forbidden` | Guard/permission denied |
-| 404 | `NotFound` | Resource not found, `FileNotFoundError` |
+| 404 | `NotFound` | Resource not found, `ResponseFileNotFound` from `FileResponse` |
 | 405 | `MethodNotAllowed` | Wrong HTTP method |
 | 406 | `NotAcceptable` | Cannot produce requested format |
 | 409 | `Conflict` | State conflict |

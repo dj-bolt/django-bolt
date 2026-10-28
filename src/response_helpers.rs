@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use actix_web::cookie::time::{Date, Month};
-use pyo3::exceptions::{PyFileNotFoundError, PyPermissionError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDateTime, PyDict, PyTuple};
 
@@ -44,12 +44,35 @@ pub fn format_cookie_date(value: &Bound<'_, PyDateTime>) -> PyResult<String> {
     ))
 }
 
+/// Make the exception `name` of `django_bolt.exceptions` with `message`.
+///
+/// The FileResponse errors subclass `FileNotFoundError` and `PermissionError`.
+/// Only Bolt raises them, so the error handler maps only them to 404 and 403.
+fn file_response_error(py: Python<'_>, name: &str, message: String) -> PyErr {
+    match py
+        .import("django_bolt.exceptions")
+        .and_then(|module| module.getattr(name))
+        .and_then(|class| class.call1((message,)))
+    {
+        Ok(error) => PyErr::from_value(error),
+        Err(error) => error,
+    }
+}
+
 /// Resolve the path and check its type with one metadata lookup.
 #[pyfunction]
-pub fn resolve_response_file(path: PathBuf, allowed: Option<Vec<PathBuf>>) -> PyResult<OsString> {
+pub fn resolve_response_file(
+    py: Python<'_>,
+    path: PathBuf,
+    allowed: Option<Vec<PathBuf>>,
+) -> PyResult<OsString> {
     let resolved = std::fs::canonicalize(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            PyFileNotFoundError::new_err(format!("File not found: {}", path.display()))
+            file_response_error(
+                py,
+                "ResponseFileNotFound",
+                format!("File not found: {}", path.display()),
+            )
         } else if error.kind() == std::io::ErrorKind::InvalidInput
             || error.raw_os_error() == Some(libc::ELOOP)
         {
@@ -65,10 +88,14 @@ pub fn resolve_response_file(path: PathBuf, allowed: Option<Vec<PathBuf>>) -> Py
         )));
     }
     if allowed.is_some_and(|roots| !roots.iter().any(|root| resolved.starts_with(root))) {
-        return Err(PyPermissionError::new_err(format!(
-            "File path '{}' is not within allowed directories. Configure BOLT_ALLOWED_FILE_PATHS in Django settings.",
-            path.display()
-        )));
+        return Err(file_response_error(
+            py,
+            "ResponseFileNotAllowed",
+            format!(
+                "File path '{}' is not within allowed directories. Configure BOLT_ALLOWED_FILE_PATHS in Django settings.",
+                path.display()
+            ),
+        ));
     }
     Ok(resolved.into_os_string())
 }

@@ -258,7 +258,7 @@ BOLT_ALLOWED_FILE_PATHS = [
 ]
 ```
 
-When set, `FileResponse` only serves files within these directories.
+When set, `FileResponse` only serves files within these directories. For a file outside them, it raises `ResponseFileNotAllowed`, and Bolt answers 403.
 
 ## Static and media file serving
 

@@ -19,6 +19,8 @@ from . import _json
 from .exceptions import (
     HTTPException,
     RequestValidationError,
+    ResponseFileNotAllowed,
+    ResponseFileNotFound,
     ResponseValidationError,
     ValidationException,
 )
@@ -347,18 +349,11 @@ def handle_exception(
             status_code=422,
             detail=errors,
         )
-    elif isinstance(exc, FileNotFoundError):
-        # FileNotFoundError from FileResponse - return 404
-        return format_error_response(
-            status_code=404,
-            detail=str(exc) or "File not found",
-        )
-    elif isinstance(exc, PermissionError):
-        # PermissionError from FileResponse path validation - return 403
-        return format_error_response(
-            status_code=403,
-            detail=str(exc) or "Permission denied",
-        )
+    elif isinstance(exc, ResponseFileNotFound):
+        # The text of the error has the path of the file. The client must not get it.
+        return format_error_response(status_code=404, detail="File not found")
+    elif isinstance(exc, ResponseFileNotAllowed):
+        return format_error_response(status_code=403, detail="Permission denied")
     elif DjangoSuspiciousOperation is not None and isinstance(exc, DjangoSuspiciousOperation):
         # Django answers 400 and logs the exception to django.security.
         _log_suspicious_operation(exc)
@@ -545,10 +540,10 @@ def bolt_error_from_exception(exc: BaseException) -> BoltError:
         errors = _format_validation_errors(exc.errors(), "body")
     elif isinstance(exc, msgspec.ValidationError):
         errors = msgspec_validation_error_to_dict(exc)
-    elif isinstance(exc, FileNotFoundError):
-        # The text of an OSError has the path of the file. The client must not get it.
+    elif isinstance(exc, ResponseFileNotFound):
+        # The text of the error has the path of the file. The client must not get it.
         return BoltError(status=404, kind="not_found", detail="File not found", exception=exc)
-    elif isinstance(exc, PermissionError):
+    elif isinstance(exc, ResponseFileNotAllowed):
         return BoltError(status=403, kind="forbidden", detail="Permission denied", exception=exc)
     elif DjangoPermissionDenied is not None and isinstance(exc, DjangoPermissionDenied):
         return BoltError(status=403, kind="forbidden", detail=str(exc) or "Permission denied", exception=exc)

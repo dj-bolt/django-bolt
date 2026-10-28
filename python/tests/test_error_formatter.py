@@ -434,7 +434,8 @@ def test_file_response_errors_reach_the_formatter(tmp_path):
 
     assert missing_response.status_code == 404
     assert missing_response.json()["kind"] == "not_found"
-    assert missing_response.json()["exception"] == "FileNotFoundError"
+    # A subclass of FileNotFoundError, so only a FileResponse error gives a 404.
+    assert missing_response.json()["exception"] == "ResponseFileNotFound"
     # The exception text has the path of the file. The detail for the client does not.
     assert missing_response.json()["detail"] == "File not found"
     assert gone_response.status_code == 404
