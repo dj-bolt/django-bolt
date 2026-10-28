@@ -63,7 +63,7 @@ const SYMLINK_LOOP: i32 = libc::ELOOP;
 /// it. A path that names no regular file is a 404, as in Django's `serve`.
 /// Only Bolt raises these errors, so the error handler maps only them to 404 and 403.
 ///
-/// When the lookup fails, `lookup_stop` finds where it stops and completes
+/// When the lookup fails, `lookup_target` finds where it stops and completes
 /// the path from there as text. When that path is out of the allowed
 /// directories, the answer is a 403, also when the server cannot search a
 /// directory there. A 404 there would tell a client which files exist. A server
@@ -84,7 +84,7 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
     }
     // The OS looks up no part of an empty path, so it names no file anywhere.
     let looked_up = !path.as_os_str().is_empty();
-    if looked_up && allowed.is_some_and(|roots| !within(&lookup_stop(path).target, roots)) {
+    if looked_up && allowed.is_some_and(|roots| !within(&lookup_target(path), roots)) {
         return not_allowed(path);
     }
     if names_no_file {
@@ -126,26 +126,18 @@ fn parts_of(path: &Path) -> Vec<Part> {
     parts
 }
 
-/// Where the lookup of a path stopped.
-struct Stop {
-    /// The real path at which the lookup stopped, with the parts after the stop applied as text.
-    target: PathBuf,
-    /// True when the lookup resolved each part of the path.
-    finished: bool,
+/// Return where the lookup of `path` stops, with the parts after the stop applied as text.
+fn lookup_target(path: &Path) -> PathBuf {
+    let (reached, pending, _) = walk(path);
+    complete(reached, pending)
 }
 
-/// Return where the lookup of `path` stops, with the real names of the parts that it reached.
+/// Apply the parts after the stop to the reached path as text.
 ///
 /// Nothing exists below the stop, so the parts after it name nothing. They go
 /// on the path as text. Thus the result is the same for a missing part and a file.
-/// The walk keeps the spelling of the path, such as an 8.3 short name or another
-/// case. The allowed roots have the real names, so the reached path gets its real
-/// name before the parts after the stop go on it.
-fn lookup_stop(path: &Path) -> Stop {
-    let (reached, mut pending, finished) = walk(path);
-    let mut target = std::fs::canonicalize(&reached)
-        .map(|real| comparable(&real).into_owned())
-        .unwrap_or(reached);
+fn complete(reached: PathBuf, mut pending: Vec<Part>) -> PathBuf {
+    let mut target = real_names(reached);
     while let Some(part) = pending.pop() {
         match part {
             Part::Root(root) => target = root,
@@ -155,7 +147,24 @@ fn lookup_stop(path: &Path) -> Stop {
             Part::Name(name) => target.push(name),
         }
     }
-    Stop { target, finished }
+    target
+}
+
+/// Return the reached path with the real names, which the allowed roots have.
+///
+/// The walk keeps the spelling of the path. On Linux, `realpath` keeps it too,
+/// and the reached path has no links. So the reached path is already real there.
+#[cfg(target_os = "linux")]
+fn real_names(reached: PathBuf) -> PathBuf {
+    reached
+}
+
+/// On macOS and Windows, a real name can differ in case, and an 8.3 short name has a long form.
+#[cfg(not(target_os = "linux"))]
+fn real_names(reached: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&reached)
+        .map(|real| comparable(&real).into_owned())
+        .unwrap_or(reached)
 }
 
 /// Walk the parts of `path` in sequence, as `realpath` does on Linux.
@@ -270,9 +279,9 @@ pub fn resolve_response_file(path: PathBuf, allowed: Option<Vec<PathBuf>>) -> Py
         // macOS `realpath` accepts `..` after a file, where the lookup on Linux fails.
         // Walk such a path as on Linux, so that its status cannot show whether the file exists.
         if path.components().any(|part| part == Component::ParentDir) {
-            let stop = lookup_stop(&path);
-            if !stop.finished {
-                return Err(if within(&stop.target, roots) {
+            let (reached, pending, finished) = walk(&path);
+            if !finished {
+                return Err(if within(&complete(reached, pending), roots) {
                     file_not_found(&path)
                 } else {
                     not_allowed(&path)
