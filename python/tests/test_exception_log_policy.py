@@ -433,16 +433,20 @@ def test_a_file_that_the_server_cannot_read_in_an_allowed_dir_is_a_logged_500(se
 
 
 @pytest.mark.parametrize(
-    ("target", "status", "records"),
-    [("public/data.txt", 500, [["Exception in GET /file", " PermissionError"]]), ("other/data.txt", 403, [])],
+    ("root", "target", "status", "records"),
+    [
+        ("public", "public/data.txt", 500, [["Exception in GET /file", " PermissionError"]]),
+        ("site/public", "site/public/data.txt", 500, [["Exception in GET /file", " PermissionError"]]),
+        ("public", "other/data.txt", 403, []),
+    ],
 )
 def test_a_parent_of_the_allowed_dir_that_the_server_cannot_search(
-    server_errors, settings, monkeypatch, locked_dir, tmp_path, target, status, records
+    server_errors, settings, monkeypatch, locked_dir, tmp_path, root, target, status, records
 ):
     # A deploy fault: the server cannot reach a file in the allowed dir. A path to another dir there stays a 403.
     home = tmp_path / "home"
-    (home / "public").mkdir(parents=True)
-    _allow_file_paths(settings, monkeypatch, home / "public")
+    (home / root).mkdir(parents=True)
+    _allow_file_paths(settings, monkeypatch, home / root)
     locked_dir(home)
     api = BoltAPI()
 
@@ -455,6 +459,26 @@ def test_a_parent_of_the_allowed_dir_that_the_server_cannot_search(
 
     assert response.status_code == status
     assert [message.split(":")[:2] for message in server_errors()] == records
+
+
+@pytest.mark.parametrize("root", ["media", "site/media"])
+def test_a_file_in_an_allowed_dir_that_does_not_exist_yet_is_a_404(
+    server_errors, settings, monkeypatch, tmp_path, root
+):
+    # Django makes MEDIA_ROOT at the first upload, so an allowed dir can be missing at first.
+    media = tmp_path / root
+    _allow_file_paths(settings, monkeypatch, media)
+    api = BoltAPI()
+
+    @api.get("/file")
+    def file():
+        return FileResponse(str(media / "avatar.png"))
+
+    with TestClient(api) as client:
+        response = client.get("/file")
+
+    assert (response.status_code, response.json()["detail"]) == (404, "File not found")
+    assert server_errors() == []
 
 
 @pytest.mark.parametrize("route", ["walk-out", "through-a-link"])
