@@ -76,10 +76,10 @@ pub fn select_stream_encoding(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    if let Some(codec) = codec_for_backend(&cfg.backend, cfg) {
-        if accepts_encoding(ae, codec.header_name()) {
-            return Some(codec);
-        }
+    if let Some(codec) = codec_for_backend(&cfg.backend, cfg)
+        && accepts_encoding(ae, codec.header_name())
+    {
+        return Some(codec);
     }
     if cfg.gzip_fallback && accepts_encoding(ae, "gzip") {
         return Some(StreamCodec::Gzip {

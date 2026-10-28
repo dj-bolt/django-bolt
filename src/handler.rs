@@ -110,10 +110,10 @@ pub async fn build_file_response(
                     Ok(_) => {
                         let mut builder = HttpResponse::build(status);
                         for (k, v) in headers {
-                            if let Ok(name) = HeaderName::try_from(k) {
-                                if let Ok(val) = HeaderValue::try_from(v) {
-                                    builder.append_header((name, val));
-                                }
+                            if let Ok(name) = HeaderName::try_from(k)
+                                && let Ok(val) = HeaderValue::try_from(v)
+                            {
+                                builder.append_header((name, val));
                             }
                         }
                         if skip_compression {
@@ -135,10 +135,10 @@ pub async fn build_file_response(
                 // For large files, use streaming
                 let mut builder = HttpResponse::build(status);
                 for (k, v) in headers {
-                    if let Ok(name) = HeaderName::try_from(k) {
-                        if let Ok(val) = HeaderValue::try_from(v) {
-                            builder.append_header((name, val));
-                        }
+                    if let Ok(name) = HeaderName::try_from(k)
+                        && let Ok(val) = HeaderValue::try_from(v)
+                    {
+                        builder.append_header((name, val));
                     }
                 }
                 if skip_compression {
@@ -1023,22 +1023,21 @@ async fn route_request<const ACCESS_LOG: bool>(
         None
     };
 
-    if let Some(config) = rate_config {
-        if let Some(headers_map) = headers.as_ref() {
-            if let Some(response) = middleware::rate_limit::check_after_auth(
-                &state.rate_limiters,
-                handler_id,
-                headers_map,
-                client_ip.as_ref(),
-                auth_ctx.as_ref(),
-                config,
-                method,
-                path,
-            ) {
-                // CORS headers will be added by CorsMiddleware
-                return response;
-            }
-        }
+    if let Some(config) = rate_config
+        && let Some(headers_map) = headers.as_ref()
+        && let Some(response) = middleware::rate_limit::check_after_auth(
+            &state.rate_limiters,
+            handler_id,
+            headers_map,
+            client_ip.as_ref(),
+            auth_ctx.as_ref(),
+            config,
+            method,
+            path,
+        )
+    {
+        // CORS headers will be added by CorsMiddleware
+        return response;
     }
 
     // Optimization: Only parse cookies if handler needs them

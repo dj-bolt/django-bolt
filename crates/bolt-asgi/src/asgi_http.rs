@@ -192,13 +192,14 @@ impl AsgiSend {
                 };
 
                 return pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                    if let Some(tx) = tx {
-                        if !body.is_empty() && tx.send(Bytes::from(body)).await.is_err() {
-                            log::debug!(
-                                "ASGI mount: body chunk dropped — receiver already closed \
+                    if let Some(tx) = tx
+                        && !body.is_empty()
+                        && tx.send(Bytes::from(body)).await.is_err()
+                    {
+                        log::debug!(
+                            "ASGI mount: body chunk dropped — receiver already closed \
                                      (request may have timed out or been cancelled)"
-                            );
-                        }
+                        );
                     }
                     Ok(())
                 });
@@ -308,18 +309,19 @@ fn parse_host_port(host: &str, scheme: &str) -> (String, u16) {
     };
 
     if let Some(bracket_end) = host.find(']') {
-        if host.len() > bracket_end + 2 && host.as_bytes()[bracket_end + 1] == b':' {
-            if let Ok(port) = host[bracket_end + 2..].parse::<u16>() {
-                return (host[..bracket_end + 1].to_string(), port);
-            }
+        if host.len() > bracket_end + 2
+            && host.as_bytes()[bracket_end + 1] == b':'
+            && let Ok(port) = host[bracket_end + 2..].parse::<u16>()
+        {
+            return (host[..bracket_end + 1].to_string(), port);
         }
         return (host[..bracket_end + 1].to_string(), default_port);
     }
 
-    if let Some((name, port)) = host.rsplit_once(':') {
-        if let Ok(parsed_port) = port.parse::<u16>() {
-            return (name.to_string(), parsed_port);
-        }
+    if let Some((name, port)) = host.rsplit_once(':')
+        && let Ok(parsed_port) = port.parse::<u16>()
+    {
+        return (name.to_string(), parsed_port);
     }
 
     (host.to_string(), default_port)

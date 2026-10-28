@@ -55,15 +55,14 @@ impl IpCidr {
 
         // `::ffff:a.b.c.d/n` with n >= 96 is an IPv4 block. Peers are
         // normalized to IPv4, so store it as one or it never matches.
-        if let IpAddr::V6(v6) = network {
-            if prefix_len >= 96 {
-                if let Some(v4) = v6.to_ipv4_mapped() {
-                    return Ok(IpCidr {
-                        network: IpAddr::V4(v4),
-                        prefix_len: prefix_len - 96,
-                    });
-                }
-            }
+        if let IpAddr::V6(v6) = network
+            && prefix_len >= 96
+            && let Some(v4) = v6.to_ipv4_mapped()
+        {
+            return Ok(IpCidr {
+                network: IpAddr::V4(v4),
+                prefix_len: prefix_len - 96,
+            });
         }
 
         Ok(IpCidr {

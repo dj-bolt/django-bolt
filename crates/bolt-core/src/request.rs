@@ -19,10 +19,11 @@ fn parse_host_port<'a>(host: &'a str, scheme: &str) -> (&'a str, u16) {
     // IPv6 with brackets: [::1]:8080 or [::1]
     if let Some(bracket_end) = host.find(']') {
         // Check for port after closing bracket
-        if host.len() > bracket_end + 2 && host.as_bytes()[bracket_end + 1] == b':' {
-            if let Ok(port) = host[bracket_end + 2..].parse::<u16>() {
-                return (&host[..bracket_end + 1], port);
-            }
+        if host.len() > bracket_end + 2
+            && host.as_bytes()[bracket_end + 1] == b':'
+            && let Ok(port) = host[bracket_end + 2..].parse::<u16>()
+        {
+            return (&host[..bracket_end + 1], port);
         }
         return (&host[..bracket_end + 1], default_port);
     }
@@ -290,12 +291,12 @@ impl PyRequest {
         // This keeps template-time CSRF token generation aligned with middleware validation.
         let state_py = self.get_or_init_state(py);
         let state_dict = state_py.bind(py);
-        if let Some(state_meta) = state_dict.get_item("META")? {
-            if let Ok(state_meta_dict) = state_meta.cast::<PyDict>() {
-                let meta_unbind = state_meta_dict.clone().unbind();
-                let _ = self.meta_cache.set(meta_unbind.clone_ref(py));
-                return Ok(meta_unbind);
-            }
+        if let Some(state_meta) = state_dict.get_item("META")?
+            && let Ok(state_meta_dict) = state_meta.cast::<PyDict>()
+        {
+            let meta_unbind = state_meta_dict.clone().unbind();
+            let _ = self.meta_cache.set(meta_unbind.clone_ref(py));
+            return Ok(meta_unbind);
         }
 
         // Return cached if already built (zero-overhead check)

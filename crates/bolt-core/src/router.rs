@@ -319,10 +319,10 @@ impl Router {
 #[inline]
 pub fn decode_path_params(params: &mut AHashMap<String, String>) {
     for v in params.values_mut() {
-        if memchr::memchr(b'%', v.as_bytes()).is_some() {
-            if let Ok(Cow::Owned(s)) = urlencoding::decode(v) {
-                *v = s;
-            }
+        if memchr::memchr(b'%', v.as_bytes()).is_some()
+            && let Ok(Cow::Owned(s)) = urlencoding::decode(v)
+        {
+            *v = s;
         }
     }
 }

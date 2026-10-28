@@ -97,28 +97,28 @@ enum PyOutcome<T> {
 fn parse_py_result<T: serde::de::DeserializeOwned>(raw: &str, mode: ProtocolMode) -> PyOutcome<T> {
     // Cheap envelope sniff before typed parsing: envelopes are single-key
     // objects produced by our own dispatch layer.
-    if raw.contains("\"__inputRequired__\"") || raw.contains("\"__error__\"") {
-        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw) {
-            if let Some(items) = map.get("__inputRequired__") {
-                match serde_json::from_value::<Vec<PyInputRequired>>(items.clone()) {
-                    Ok(items) => return PyOutcome::InputRequired(items),
-                    Err(e) => {
-                        return PyOutcome::Error(McpError::internal_error(
-                            format!("invalid __inputRequired__ envelope: {e}"),
-                            None,
-                        ));
-                    }
+    if (raw.contains("\"__inputRequired__\"") || raw.contains("\"__error__\""))
+        && let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw)
+    {
+        if let Some(items) = map.get("__inputRequired__") {
+            match serde_json::from_value::<Vec<PyInputRequired>>(items.clone()) {
+                Ok(items) => return PyOutcome::InputRequired(items),
+                Err(e) => {
+                    return PyOutcome::Error(McpError::internal_error(
+                        format!("invalid __inputRequired__ envelope: {e}"),
+                        None,
+                    ));
                 }
             }
-            if let Some(err) = map.get("__error__") {
-                match serde_json::from_value::<PyErrorEnvelope>(err.clone()) {
-                    Ok(env) => return PyOutcome::Error(map_py_error(&env.kind, env.message, mode)),
-                    Err(e) => {
-                        return PyOutcome::Error(McpError::internal_error(
-                            format!("invalid __error__ envelope: {e}"),
-                            None,
-                        ));
-                    }
+        }
+        if let Some(err) = map.get("__error__") {
+            match serde_json::from_value::<PyErrorEnvelope>(err.clone()) {
+                Ok(env) => return PyOutcome::Error(map_py_error(&env.kind, env.message, mode)),
+                Err(e) => {
+                    return PyOutcome::Error(McpError::internal_error(
+                        format!("invalid __error__ envelope: {e}"),
+                        None,
+                    ));
                 }
             }
         }

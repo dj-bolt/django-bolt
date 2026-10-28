@@ -39,23 +39,20 @@ pub fn convert_python_chunk(value: &Bound<'_, PyAny>) -> Option<Bytes> {
         let s = py_str.to_string_lossy().into_owned();
         return Some(Bytes::from(s.into_bytes()));
     }
-    if let Ok(memory_view) = value.cast::<PyMemoryView>() {
-        if let Ok(bytes_obj) = memory_view.call_method0("tobytes") {
-            if let Ok(backed) = bytes_obj.extract::<PyBackedBytes>() {
-                return Some(Bytes::from_owner(backed));
-            }
-        }
+    if let Ok(memory_view) = value.cast::<PyMemoryView>()
+        && let Ok(bytes_obj) = memory_view.call_method0("tobytes")
+        && let Ok(backed) = bytes_obj.extract::<PyBackedBytes>()
+    {
+        return Some(Bytes::from_owner(backed));
     }
     let py = value.py();
     if value
         .hasattr(pyo3::intern!(py, "__bytes__"))
         .unwrap_or(false)
+        && let Ok(buffer) = value.call_method0(pyo3::intern!(py, "__bytes__"))
+        && let Ok(backed) = buffer.extract::<PyBackedBytes>()
     {
-        if let Ok(buffer) = value.call_method0(pyo3::intern!(py, "__bytes__")) {
-            if let Ok(backed) = buffer.extract::<PyBackedBytes>() {
-                return Some(Bytes::from_owner(backed));
-            }
-        }
+        return Some(Bytes::from_owner(backed));
     }
     if let Ok(py_str) = value.str() {
         let s = py_str.to_string_lossy().into_owned();

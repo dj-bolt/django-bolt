@@ -457,16 +457,16 @@ pub async fn parse_multipart(
                 .push(file_info);
 
             // Validate max_files constraint
-            if let Some(constraints) = file_constraints.get(&field_name) {
-                if let Some(max_files) = constraints.max_files {
-                    let count = files_map.get(&field_name).map(|v| v.len()).unwrap_or(0);
-                    if count > max_files {
-                        return Err(ValidationError::too_many_files(
-                            &field_name,
-                            max_files,
-                            count,
-                        ));
-                    }
+            if let Some(constraints) = file_constraints.get(&field_name)
+                && let Some(max_files) = constraints.max_files
+            {
+                let count = files_map.get(&field_name).map(|v| v.len()).unwrap_or(0);
+                if count > max_files {
+                    return Err(ValidationError::too_many_files(
+                        &field_name,
+                        max_files,
+                        count,
+                    ));
                 }
             }
         } else {
@@ -617,32 +617,32 @@ fn validate_file(
     constraints: &FileFieldConstraints,
 ) -> Result<(), ValidationError> {
     // Check max_size
-    if let Some(max_size) = constraints.max_size {
-        if file.size > max_size {
-            return Err(ValidationError::file_too_large(
-                field_name, max_size, file.size,
-            ));
-        }
+    if let Some(max_size) = constraints.max_size
+        && file.size > max_size
+    {
+        return Err(ValidationError::file_too_large(
+            field_name, max_size, file.size,
+        ));
     }
 
     // Check min_size
-    if let Some(min_size) = constraints.min_size {
-        if file.size < min_size {
-            return Err(ValidationError::file_too_small(
-                field_name, min_size, file.size,
-            ));
-        }
+    if let Some(min_size) = constraints.min_size
+        && file.size < min_size
+    {
+        return Err(ValidationError::file_too_small(
+            field_name, min_size, file.size,
+        ));
     }
 
     // Check allowed_types with wildcard matching
-    if let Some(ref allowed_types) = constraints.allowed_types {
-        if !is_content_type_allowed(&file.content_type, allowed_types) {
-            return Err(ValidationError::invalid_content_type(
-                field_name,
-                allowed_types,
-                &file.content_type,
-            ));
-        }
+    if let Some(ref allowed_types) = constraints.allowed_types
+        && !is_content_type_allowed(&file.content_type, allowed_types)
+    {
+        return Err(ValidationError::invalid_content_type(
+            field_name,
+            allowed_types,
+            &file.content_type,
+        ));
     }
 
     Ok(())

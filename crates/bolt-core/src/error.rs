@@ -239,10 +239,10 @@ fn default_exception_response(
             }
         };
     // Check if it's an HTTPException
-    if is_http_exception(py, exc) {
-        if let Some((status_code, detail, headers, extra)) = extract_http_exception(py, exc) {
-            return build_error_response(py, status_code, detail, headers, extra, debug);
-        }
+    if is_http_exception(py, exc)
+        && let Some((status_code, detail, headers, extra)) = extract_http_exception(py, exc)
+    {
+        return build_error_response(py, status_code, detail, headers, extra, debug);
     }
 
     // Check if it's a validation error

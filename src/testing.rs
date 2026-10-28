@@ -843,38 +843,38 @@ pub fn handle_test_websocket(
     // Rate limiting for WebSocket: address and header keys before auth,
     // identity keys after it.
     let mut client_ip = None;
-    if let Some(route_meta) = app.route_metadata.get(handler_id) {
-        if let Some(ref rate_config) = route_meta.rate_limit_config {
-            client_ip = (!matches!(rate_config.key, RateLimitKey::Header(_)))
-                .then(|| {
-                    bolt_core::middleware::client_ip::resolve(
-                        header_map
-                            .get("x-forwarded-for")
-                            .into_iter()
-                            .map(|value| Some(value.as_str())),
-                        header_map
-                            .get("x-real-ip")
-                            .map(|value| Some(value.as_str())),
-                        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-                        &app.config.trusted_proxies,
-                    )
-                })
-                .flatten();
-            if bolt_core::middleware::rate_limit::check_before_auth(
-                &app.rate_limiters,
-                handler_id,
-                &header_map,
-                client_ip.as_ref(),
-                rate_config,
-                "GET",
-                &path,
-            )
-            .is_some()
-            {
-                return Err(pyo3::exceptions::PyPermissionError::new_err(
-                    "Rate limit exceeded",
-                ));
-            }
+    if let Some(route_meta) = app.route_metadata.get(handler_id)
+        && let Some(ref rate_config) = route_meta.rate_limit_config
+    {
+        client_ip = (!matches!(rate_config.key, RateLimitKey::Header(_)))
+            .then(|| {
+                bolt_core::middleware::client_ip::resolve(
+                    header_map
+                        .get("x-forwarded-for")
+                        .into_iter()
+                        .map(|value| Some(value.as_str())),
+                    header_map
+                        .get("x-real-ip")
+                        .map(|value| Some(value.as_str())),
+                    Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                    &app.config.trusted_proxies,
+                )
+            })
+            .flatten();
+        if bolt_core::middleware::rate_limit::check_before_auth(
+            &app.rate_limiters,
+            handler_id,
+            &header_map,
+            client_ip.as_ref(),
+            rate_config,
+            "GET",
+            &path,
+        )
+        .is_some()
+        {
+            return Err(pyo3::exceptions::PyPermissionError::new_err(
+                "Rate limit exceeded",
+            ));
         }
     }
 
@@ -918,8 +918,8 @@ pub fn handle_test_websocket(
 
         // After guards, mirroring the production upgrade path: a rejected
         // upgrade must not spend the bucket it would have been counted in.
-        if let Some(rate_config) = route_meta.rate_limit_config.as_ref() {
-            if bolt_core::middleware::rate_limit::check_after_auth(
+        if let Some(rate_config) = route_meta.rate_limit_config.as_ref()
+            && bolt_core::middleware::rate_limit::check_after_auth(
                 &app.rate_limiters,
                 handler_id,
                 &header_map,
@@ -930,11 +930,10 @@ pub fn handle_test_websocket(
                 &path,
             )
             .is_some()
-            {
-                return Err(pyo3::exceptions::PyPermissionError::new_err(
-                    "Rate limit exceeded",
-                ));
-            }
+        {
+            return Err(pyo3::exceptions::PyPermissionError::new_err(
+                "Rate limit exceeded",
+            ));
         }
     }
 

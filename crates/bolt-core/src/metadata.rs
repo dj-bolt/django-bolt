@@ -584,10 +584,10 @@ fn optional_size(py_meta: &Bound<'_, PyDict>, key: &str, default: usize) -> PyRe
     let Some(value) = py_meta.get_item(key)? else {
         return Ok(default);
     };
-    if !value.is_instance_of::<PyBool>() {
-        if let Ok(size) = value.extract::<usize>() {
-            return Ok(size);
-        }
+    if !value.is_instance_of::<PyBool>()
+        && let Ok(size) = value.extract::<usize>()
+    {
+        return Ok(size);
     }
     Err(PyTypeError::new_err(format!(
         "Route metadata '{}' must be an int of 0 or more, got {}",
@@ -675,37 +675,36 @@ impl RouteMetadata {
         let mut cors_config: Option<CorsConfig> = None;
         let mut rate_limit_config: Option<RateLimitConfig> = None;
 
-        if let Ok(Some(mw_list)) = py_meta.get_item("middleware") {
-            if let Ok(py_list) = mw_list.extract::<Vec<HashMap<String, Py<PyAny>>>>() {
-                for mw_dict in py_list {
-                    if let Some(mw_type) = mw_dict.get("type") {
-                        if let Ok(type_str) = mw_type.extract::<String>(py) {
-                            // Parse CORS config separately for fast access. The list is
-                            // API, router, then route: the last (most specific) config wins.
-                            // A config with no origins and no patterns keeps the allow
-                            // list of the outer config, so it cannot widen it to the
-                            // global settings.
-                            if type_str == "cors" {
-                                let mut config = parse_cors_config(&mw_dict, py)?;
-                                if let Some(outer) = cors_config.take() {
-                                    if config.origins.is_empty() && config.origin_regexes.is_empty()
-                                    {
-                                        config.origins = outer.origins;
-                                        config.origin_set = outer.origin_set;
-                                        config.allow_all_origins = outer.allow_all_origins;
-                                        config.origin_regexes = outer.origin_regexes;
-                                        config.compiled_origin_regexes =
-                                            outer.compiled_origin_regexes;
-                                    }
-                                }
-                                cors_config = Some(config);
-                            }
-
-                            // Parse rate_limit config separately for fast access
-                            if type_str == "rate_limit" && rate_limit_config.is_none() {
-                                rate_limit_config = parse_rate_limit_config(&mw_dict, py);
-                            }
+        if let Ok(Some(mw_list)) = py_meta.get_item("middleware")
+            && let Ok(py_list) = mw_list.extract::<Vec<HashMap<String, Py<PyAny>>>>()
+        {
+            for mw_dict in py_list {
+                if let Some(mw_type) = mw_dict.get("type")
+                    && let Ok(type_str) = mw_type.extract::<String>(py)
+                {
+                    // Parse CORS config separately for fast access. The list is
+                    // API, router, then route: the last (most specific) config wins.
+                    // A config with no origins and no patterns keeps the allow
+                    // list of the outer config, so it cannot widen it to the
+                    // global settings.
+                    if type_str == "cors" {
+                        let mut config = parse_cors_config(&mw_dict, py)?;
+                        if let Some(outer) = cors_config.take()
+                            && config.origins.is_empty()
+                            && config.origin_regexes.is_empty()
+                        {
+                            config.origins = outer.origins;
+                            config.origin_set = outer.origin_set;
+                            config.allow_all_origins = outer.allow_all_origins;
+                            config.origin_regexes = outer.origin_regexes;
+                            config.compiled_origin_regexes = outer.compiled_origin_regexes;
                         }
+                        cors_config = Some(config);
+                    }
+
+                    // Parse rate_limit config separately for fast access
+                    if type_str == "rate_limit" && rate_limit_config.is_none() {
+                        rate_limit_config = parse_rate_limit_config(&mw_dict, py);
                     }
                 }
             }
@@ -713,40 +712,36 @@ impl RouteMetadata {
 
         // Parse auth backends. Failures propagate: metadata that fails to
         // extract must abort startup, not leave the route unauthenticated.
-        if let Some(auth_list) = py_meta.get_item("auth_backends")? {
-            if !auth_list.is_none() {
-                let py_backends: Vec<HashMap<String, Py<PyAny>>> =
-                    auth_list.extract().map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "Invalid 'auth_backends' route metadata: {}",
-                            e
-                        ))
-                    })?;
-                for backend_dict in py_backends {
-                    auth_backends.push(parse_auth_backend(&backend_dict, py)?);
-                }
+        if let Some(auth_list) = py_meta.get_item("auth_backends")?
+            && !auth_list.is_none()
+        {
+            let py_backends: Vec<HashMap<String, Py<PyAny>>> =
+                auth_list.extract().map_err(|e| {
+                    PyValueError::new_err(format!("Invalid 'auth_backends' route metadata: {}", e))
+                })?;
+            for backend_dict in py_backends {
+                auth_backends.push(parse_auth_backend(&backend_dict, py)?);
             }
         }
 
         // Parse guards
-        if let Some(guard_list) = py_meta.get_item("guards")? {
-            if !guard_list.is_none() {
-                let py_guards: Vec<HashMap<String, Py<PyAny>>> =
-                    guard_list.extract().map_err(|e| {
-                        PyValueError::new_err(format!("Invalid 'guards' route metadata: {}", e))
-                    })?;
-                for guard_dict in py_guards {
-                    guards.push(parse_guard(&guard_dict, py)?);
-                }
+        if let Some(guard_list) = py_meta.get_item("guards")?
+            && !guard_list.is_none()
+        {
+            let py_guards: Vec<HashMap<String, Py<PyAny>>> = guard_list.extract().map_err(|e| {
+                PyValueError::new_err(format!("Invalid 'guards' route metadata: {}", e))
+            })?;
+            for guard_dict in py_guards {
+                guards.push(parse_guard(&guard_dict, py)?);
             }
         }
 
         // Parse skip list (e.g., ["compression", "cors"]) into a set
-        if let Ok(Some(skip_list)) = py_meta.get_item("skip") {
-            if let Ok(names) = skip_list.extract::<Vec<String>>() {
-                for name in names {
-                    skip.insert(name.to_lowercase());
-                }
+        if let Ok(Some(skip_list)) = py_meta.get_item("skip")
+            && let Ok(names) = skip_list.extract::<Vec<String>>()
+        {
+            for name in names {
+                skip.insert(name.to_lowercase());
             }
         }
 
@@ -779,17 +774,18 @@ impl RouteMetadata {
         let has_rate_limit = rate_limit_config.is_some();
         // An identity key with no backend can never see an identity. Every
         // caller would share the address bucket, so refuse to start.
-        if let Some(config) = &rate_limit_config {
-            if config.key.needs_identity() && auth_backends.is_empty() {
-                let key = match config.key {
-                    RateLimitKey::User => "user",
-                    _ => "api_key",
-                };
-                return Err(PyValueError::new_err(format!(
-                    "@rate_limit(key=\"{key}\") needs an auth backend on the route or the API; \
+        if let Some(config) = &rate_limit_config
+            && config.key.needs_identity()
+            && auth_backends.is_empty()
+        {
+            let key = match config.key {
+                RateLimitKey::User => "user",
+                _ => "api_key",
+            };
+            return Err(PyValueError::new_err(format!(
+                "@rate_limit(key=\"{key}\") needs an auth backend on the route or the API; \
                      without one there is no identity to count per. Use key=\"ip\" or a header name."
-                )));
-            }
+            )));
         }
         let can_sync_dispatch = py_meta
             .get_item("can_sync_dispatch")
@@ -968,50 +964,50 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<
     }
 
     // Parse credentials
-    if let Some(cred_py) = dict.get("credentials") {
-        if let Ok(cred) = cred_py.extract::<bool>(py) {
-            config.credentials = cred;
-        }
+    if let Some(cred_py) = dict.get("credentials")
+        && let Ok(cred) = cred_py.extract::<bool>(py)
+    {
+        config.credentials = cred;
     }
 
     // Parse methods (optional, has defaults)
-    if let Some(methods_py) = dict.get("methods") {
-        if let Ok(methods) = methods_py.extract::<Vec<String>>(py) {
-            config.methods_str = methods.join(", ");
-            config.methods_header = HeaderValue::from_str(&config.methods_str).ok();
-            config.methods = methods;
-        }
+    if let Some(methods_py) = dict.get("methods")
+        && let Ok(methods) = methods_py.extract::<Vec<String>>(py)
+    {
+        config.methods_str = methods.join(", ");
+        config.methods_header = HeaderValue::from_str(&config.methods_str).ok();
+        config.methods = methods;
     }
 
     // Parse headers (optional, has defaults)
-    if let Some(headers_py) = dict.get("headers") {
-        if let Ok(headers) = headers_py.extract::<Vec<String>>(py) {
-            config.headers_str = headers.join(", ");
-            config.headers_header = HeaderValue::from_str(&config.headers_str).ok();
-            config.headers = headers;
-        }
+    if let Some(headers_py) = dict.get("headers")
+        && let Ok(headers) = headers_py.extract::<Vec<String>>(py)
+    {
+        config.headers_str = headers.join(", ");
+        config.headers_header = HeaderValue::from_str(&config.headers_str).ok();
+        config.headers = headers;
     }
 
     // Parse expose_headers (optional)
-    if let Some(expose_py) = dict.get("expose_headers") {
-        if let Ok(expose) = expose_py.extract::<Vec<String>>(py) {
-            config.expose_headers_str = expose.join(", ");
-            config.expose_headers_header = if !expose.is_empty() {
-                HeaderValue::from_str(&config.expose_headers_str).ok()
-            } else {
-                None
-            };
-            config.expose_headers = expose;
-        }
+    if let Some(expose_py) = dict.get("expose_headers")
+        && let Ok(expose) = expose_py.extract::<Vec<String>>(py)
+    {
+        config.expose_headers_str = expose.join(", ");
+        config.expose_headers_header = if !expose.is_empty() {
+            HeaderValue::from_str(&config.expose_headers_str).ok()
+        } else {
+            None
+        };
+        config.expose_headers = expose;
     }
 
     // Parse max_age (optional)
-    if let Some(age_py) = dict.get("max_age") {
-        if let Ok(age) = age_py.extract::<u32>(py) {
-            config.max_age_str = age.to_string();
-            config.max_age_header = HeaderValue::from_str(&config.max_age_str).ok();
-            config.max_age = age;
-        }
+    if let Some(age_py) = dict.get("max_age")
+        && let Ok(age) = age_py.extract::<u32>(py)
+    {
+        config.max_age_str = age.to_string();
+        config.max_age_header = HeaderValue::from_str(&config.max_age_str).ok();
+        config.max_age = age;
     }
 
     Ok(config)
@@ -1025,10 +1021,10 @@ fn parse_rate_limit_config(
     let mut config = RateLimitConfig::default();
 
     // Parse rps (required)
-    if let Some(rps_py) = dict.get("rps") {
-        if let Ok(rps) = rps_py.extract::<u32>(py) {
-            config.rps = rps;
-        }
+    if let Some(rps_py) = dict.get("rps")
+        && let Ok(rps) = rps_py.extract::<u32>(py)
+    {
+        config.rps = rps;
     }
 
     // Parse burst (optional, defaults to 2x rps)
@@ -1044,15 +1040,15 @@ fn parse_rate_limit_config(
     // Parse key_type (optional, defaults to "ip").
     // Custom header keys are lowercased ONCE here so the per-request rate-limit
     // check can look them up directly (headers are stored lowercase).
-    if let Some(key_py) = dict.get("key") {
-        if let Ok(key_type) = key_py.extract::<String>(py) {
-            config.key = match key_type.to_lowercase().as_str() {
-                "ip" => RateLimitKey::Ip,
-                "user" => RateLimitKey::User,
-                "api_key" => RateLimitKey::ApiKey,
-                header => RateLimitKey::Header(header.to_owned()),
-            };
-        }
+    if let Some(key_py) = dict.get("key")
+        && let Ok(key_type) = key_py.extract::<String>(py)
+    {
+        config.key = match key_type.to_lowercase().as_str() {
+            "ip" => RateLimitKey::Ip,
+            "user" => RateLimitKey::User,
+            "api_key" => RateLimitKey::ApiKey,
+            header => RateLimitKey::Header(header.to_owned()),
+        };
     }
 
     Some(config)
@@ -1387,39 +1383,38 @@ fn parse_file_constraints(
 ) -> HashMap<String, FileFieldConstraints> {
     let mut result = HashMap::new();
 
-    if let Ok(Some(constraints_dict)) = py_meta.get_item("file_constraints") {
-        if let Ok(constraints_map) =
+    if let Ok(Some(constraints_dict)) = py_meta.get_item("file_constraints")
+        && let Ok(constraints_map) =
             constraints_dict.extract::<HashMap<String, HashMap<String, Py<PyAny>>>>()
-        {
-            for (field_name, field_constraints) in constraints_map {
-                let mut constraints = FileFieldConstraints::default();
+    {
+        for (field_name, field_constraints) in constraints_map {
+            let mut constraints = FileFieldConstraints::default();
 
-                if let Some(max_size_py) = field_constraints.get("max_size") {
-                    if let Ok(max_size) = max_size_py.extract::<usize>(py) {
-                        constraints.max_size = Some(max_size);
-                    }
-                }
-
-                if let Some(min_size_py) = field_constraints.get("min_size") {
-                    if let Ok(min_size) = min_size_py.extract::<usize>(py) {
-                        constraints.min_size = Some(min_size);
-                    }
-                }
-
-                if let Some(allowed_types_py) = field_constraints.get("allowed_types") {
-                    if let Ok(allowed_types) = allowed_types_py.extract::<Vec<String>>(py) {
-                        constraints.allowed_types = Some(allowed_types);
-                    }
-                }
-
-                if let Some(max_files_py) = field_constraints.get("max_files") {
-                    if let Ok(max_files) = max_files_py.extract::<usize>(py) {
-                        constraints.max_files = Some(max_files);
-                    }
-                }
-
-                result.insert(field_name, constraints);
+            if let Some(max_size_py) = field_constraints.get("max_size")
+                && let Ok(max_size) = max_size_py.extract::<usize>(py)
+            {
+                constraints.max_size = Some(max_size);
             }
+
+            if let Some(min_size_py) = field_constraints.get("min_size")
+                && let Ok(min_size) = min_size_py.extract::<usize>(py)
+            {
+                constraints.min_size = Some(min_size);
+            }
+
+            if let Some(allowed_types_py) = field_constraints.get("allowed_types")
+                && let Ok(allowed_types) = allowed_types_py.extract::<Vec<String>>(py)
+            {
+                constraints.allowed_types = Some(allowed_types);
+            }
+
+            if let Some(max_files_py) = field_constraints.get("max_files")
+                && let Ok(max_files) = max_files_py.extract::<usize>(py)
+            {
+                constraints.max_files = Some(max_files);
+            }
+
+            result.insert(field_name, constraints);
         }
     }
 

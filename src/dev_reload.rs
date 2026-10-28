@@ -539,31 +539,30 @@ fn run_dev_reloader_inner(
             return Ok(0);
         }
 
-        if let Some(child) = worker.as_mut() {
-            if let Some(status) = child
+        if let Some(child) = worker.as_mut()
+            && let Some(status) = child
                 .try_wait()
                 .map_err(|err| py_runtime_error(format!("Failed to poll dev worker: {}", err)))?
+        {
+            let exit_detail = format_exit_status(status);
+            worker = None;
+
+            if !shutdown.load(Ordering::SeqCst)
+                && let Some(code) = terminal_worker_exit_code(status, reload_count)
             {
-                let exit_detail = format_exit_status(status);
-                worker = None;
-
-                if !shutdown.load(Ordering::SeqCst) {
-                    if let Some(code) = terminal_worker_exit_code(status, reload_count) {
-                        paint.log(&paint.red(&format!(
-                            "server failed to start ({}); a startup failure cannot be \
+                paint.log(&paint.red(&format!(
+                    "server failed to start ({}); a startup failure cannot be \
                              fixed by editing a file, exiting",
-                            exit_detail
-                        )));
-                        return Ok(code);
-                    }
-                }
-
-                paint.log(&paint.yellow(&format!(
-                    "server exited with {}. Waiting for changes...",
                     exit_detail
                 )));
-                worker_exited = true;
+                return Ok(code);
             }
+
+            paint.log(&paint.yellow(&format!(
+                "server exited with {}. Waiting for changes...",
+                exit_detail
+            )));
+            worker_exited = true;
         }
 
         match recv_change(&rx, &filter, debounce, recv_timeout) {

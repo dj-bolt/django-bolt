@@ -142,10 +142,10 @@ where
     if let Some(ref headers) = meta.custom_headers {
         for (k, v) in headers {
             // Lowercase here instead of in Python (best practice from Robyn)
-            if let Ok(name) = HeaderName::try_from(k.to_ascii_lowercase()) {
-                if let Ok(val) = HeaderValue::try_from(v.as_str()) {
-                    builder.append_header((name, val));
-                }
+            if let Ok(name) = HeaderName::try_from(k.to_ascii_lowercase())
+                && let Ok(val) = HeaderValue::try_from(v.as_str())
+            {
+                builder.append_header((name, val));
             }
         }
     }

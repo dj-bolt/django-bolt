@@ -349,10 +349,10 @@ impl RefreshingJwks {
                 .flatten()
         });
         *self.last_refresh.lock() = Instant::now();
-        if let Some(document) = result {
-            if let Ok(JwtKeySource::Jwks(keys)) = build_jwks_key_source(&document) {
-                *self.keys.write() = keys;
-            }
+        if let Some(document) = result
+            && let Ok(JwtKeySource::Jwks(keys)) = build_jwks_key_source(&document)
+        {
+            *self.keys.write() = keys;
         }
     }
 }
@@ -747,11 +747,11 @@ fn decode_and_validate(
             return None;
         }
     }
-    if let Some(nbf) = claims.nbf {
-        if nbf > now + leeway {
-            log::debug!("JWT rejected: token not yet valid (nbf)");
-            return None;
-        }
+    if let Some(nbf) = claims.nbf
+        && nbf > now + leeway
+    {
+        log::debug!("JWT rejected: token not yet valid (nbf)");
+        return None;
     }
     // aud is only validated when an audience is configured; a token merely
     // carrying an aud claim is not rejected (unlike jsonwebtoken's default).

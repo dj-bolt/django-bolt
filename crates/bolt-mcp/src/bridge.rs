@@ -188,12 +188,11 @@ pub async fn handle_mcp_request(
     );
     let mut is_sse = false;
     for (name, value) in &parts.headers {
-        if name == http::header::CONTENT_TYPE {
-            if let Ok(v) = value.to_str() {
-                if v.starts_with("text/event-stream") {
-                    is_sse = true;
-                }
-            }
+        if name == http::header::CONTENT_TYPE
+            && let Ok(v) = value.to_str()
+            && v.starts_with("text/event-stream")
+        {
+            is_sse = true;
         }
         if let Ok(value) = value.to_str() {
             builder.append_header((name.as_str(), value));
