@@ -401,7 +401,7 @@ def locked_dir(tmp_path):
     locked: list = []
 
     def make(path):
-        path.mkdir()
+        path.mkdir(exist_ok=True)
         (path / "data.txt").write_text("data")
         path.chmod(0)
         locked.append(path)
@@ -430,6 +430,31 @@ def test_a_file_that_the_server_cannot_read_in_an_allowed_dir_is_a_logged_500(se
 
     assert response.status_code == 500
     assert [message.split(":")[:2] for message in server_errors()] == [["Exception in GET /file", " PermissionError"]]
+
+
+@pytest.mark.parametrize(
+    ("target", "status", "records"),
+    [("public/data.txt", 500, [["Exception in GET /file", " PermissionError"]]), ("other/data.txt", 403, [])],
+)
+def test_a_parent_of_the_allowed_dir_that_the_server_cannot_search(
+    server_errors, settings, monkeypatch, locked_dir, tmp_path, target, status, records
+):
+    # A deploy fault: the server cannot reach a file in the allowed dir. A path to another dir there stays a 403.
+    home = tmp_path / "home"
+    (home / "public").mkdir(parents=True)
+    _allow_file_paths(settings, monkeypatch, home / "public")
+    locked_dir(home)
+    api = BoltAPI()
+
+    @api.get("/file")
+    def file():
+        return FileResponse(str(home / target))
+
+    with TestClient(api) as client:
+        response = client.get("/file")
+
+    assert response.status_code == status
+    assert [message.split(":")[:2] for message in server_errors()] == records
 
 
 @pytest.mark.parametrize("route", ["walk-out", "through-a-link"])
@@ -467,6 +492,7 @@ def test_a_path_out_of_the_allowed_dirs_that_the_server_cannot_read_is_a_403(
         "through-a-link",
         "back-out-of-a-link",
         "link-to-a-missing-file",
+        "file-and-back",
     ],
 )
 def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server_errors, allowed_dir, tmp_path, kind):
@@ -487,6 +513,8 @@ def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server
         "below-a-file": outside / "secret.txt" / "x",
         "symlink-loop": loop,
         "walk-out": allowed_dir / ".." / "outside" / "missing.txt",
+        # A file has no parent dir: the lookup of file/.. stops at the file, whether or not it exists.
+        "file-and-back": allowed_dir / ".." / "outside" / "secret.txt" / ".." / ".." / allowed_dir.name / "missing.txt",
         "through-a-link": allowed_dir / "escape" / "missing.txt",
         "back-out-of-a-link": allowed_dir / "link" / ".." / "missing.txt",
         "link-to-a-missing-file": allowed_dir / "dangling",
