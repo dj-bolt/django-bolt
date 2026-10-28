@@ -16,6 +16,7 @@ import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.params import Cookie, Form, Header, Query
+from django_bolt.serializers import Serializer, field_validator
 from django_bolt.testing import TestClient
 
 
@@ -30,6 +31,16 @@ class Headers(msgspec.Struct):
     x_api_key: str
     x_count: Annotated[int, msgspec.Meta(ge=1)] = 1
     label: Annotated[str, msgspec.Meta(min_length=2)] = msgspec.field(name="x_label", default="ok")
+
+
+class Author(Serializer):
+    name: str
+
+    @field_validator("name")
+    def name_is_not_blank(cls, value):
+        if not value.strip():
+            raise ValueError("name must not be blank")
+        return value
 
 
 @pytest.fixture(scope="module")
@@ -59,6 +70,23 @@ def client():
     @api.get("/constrained")
     async def constrained(n: Annotated[int, msgspec.Meta(ge=1), Query()]):
         return {"n": n}
+
+    @api.post("/body-struct")
+    async def body_struct(filters: Filters):
+        return {"page": filters.page}
+
+    @api.get("/serializer-query")
+    async def serializer_query(author: Annotated[Author, Query()]):
+        return {"name": author.name}
+
+    @api.get("/server-serializer")
+    async def server_serializer():
+        # The server builds the Serializer from its own data, not from the request.
+        return {"name": Author(name="   ").name}
+
+    @api.get("/server-error")
+    async def server_error():
+        raise RuntimeError("server fault")
 
     with TestClient(api) as client:
         yield client
@@ -153,19 +181,55 @@ def test_missing_renamed_header_field_names_the_header():
     assert response.json()["detail"] == [_missing("header", "header", "x-api-key")]
 
 
-@pytest.mark.parametrize("path", ["/header-struct", "/query-struct"])
-def test_a_struct_validation_error_is_not_logged_as_a_server_error(client, caplog, monkeypatch, path):
+@pytest.fixture
+def server_errors(caplog, monkeypatch):
+    """Return a function that gives the ERROR records of ``django.server``."""
+    # dictConfig() disables each existing logger that its config does not name. Thus a
+    # logging test can leave django.server disabled. The tests that expect a record
+    # show that the capture works.
+    monkeypatch.setattr(logging.getLogger("django.server"), "disabled", False)
+    caplog.set_level(logging.ERROR, logger="django.server")
+
+    def records() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.name == "django.server" and r.levelno >= logging.ERROR]
+
+    return records
+
+
+@pytest.mark.parametrize(
+    "send",
+    [
+        lambda c: c.get("/header-struct"),
+        lambda c: c.get("/query-struct"),
+        lambda c: c.get("/sequence?ids=x"),
+        lambda c: c.post("/body-struct", json={"page": "x"}),
+        lambda c: c.post("/body-struct", content=b"{", headers={"Content-Type": "application/json"}),
+        lambda c: c.get("/serializer-query", params={"name": " "}),
+    ],
+    ids=["header", "query", "sequence", "body", "malformed-body", "serializer-query"],
+)
+def test_a_request_validation_error_is_not_logged_as_a_server_error(client, server_errors, send):
     # A client can send a bad request on each call. The access log keeps the 422.
-    # Django's LOGGING stops django.server records from propagating to the root
-    # logger, so put the capture handler on django.server itself.
-    server_logger = logging.getLogger("django.server")
-    monkeypatch.setattr(server_logger, "disabled", False)
-    monkeypatch.setattr(server_logger, "handlers", [*server_logger.handlers, caplog.handler])
-    with caplog.at_level(logging.ERROR, logger="django.server"):
-        response = client.get(path)
+    response = send(client)
 
     assert response.status_code == 422
-    assert [record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR] == []
+    assert server_errors() == []
+
+
+def test_a_validation_error_of_server_data_is_logged(client, server_errors):
+    response = client.get("/server-serializer")
+
+    assert response.status_code == 422
+    assert server_errors() == [
+        "Exception in GET /server-serializer: RequestValidationError: body.name: name must not be blank"
+    ]
+
+
+def test_an_unhandled_exception_is_logged(client, server_errors):
+    response = client.get("/server-error")
+
+    assert response.status_code == 500
+    assert server_errors() == ["Exception in GET /server-error: RuntimeError: server fault"]
 
 
 @pytest.mark.parametrize(

@@ -229,10 +229,12 @@ try:
 except Exception as e:
     middleware.log_exception(
         request={"method": "GET", "path": "/api/error"},
-        exception=e,
+        exc=e,
         exc_info=True,  # Include traceback
     )
 ```
+
+Bolt calls `log_exception` for each exception that a request handler does not handle. It does not call it for an `HTTPException`. `log_exception` skips two kinds of exception, and it does not call `exception_logging_handler` for them. The first kind is a `SuspiciousOperation`, which Bolt logs to `django.security` as Django does. The second kind is a validation error of a parameter or of the request body. The client causes such an error, and the access log records the 422. A `RequestValidationError` from handler code is not skipped.
 
 ### Custom exception handler
 
