@@ -234,7 +234,7 @@ except Exception as e:
     )
 ```
 
-Bolt calls `log_exception` for an exception that a handler does not handle, but only when the error response is a 5xx. A 4xx, such as a validation error or `PermissionDenied`, is the fault of the client. The access log records it at `WARNING`, as Django's `log_response` does. An `HTTPException` is a planned response, so Bolt does not call `log_exception` for it.
+Bolt calls `log_exception` for an exception that a handler does not handle, but only when Bolt answers it with a 5xx. A 4xx, such as a validation error or `PermissionDenied`, is the fault of the client. The access log of `runbolt` records it at `WARNING`. An `error_formatter` can change the status of the response, but not this choice. Thus a formatter cannot hide a server error from the log. An `HTTPException` is a planned response, so Bolt does not call `log_exception` for it. When Bolt cannot build the error response, it logs that error too.
 
 ### Custom exception handler
 

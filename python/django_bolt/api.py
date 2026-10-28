@@ -48,7 +48,7 @@ from .auth.user_loader import (
 )
 from .concurrency import (
     LaneAffinityError,
-    _drop_broken_connections,
+    _drop_broken_connections_after_error,
     run_in_orm_executor,
     run_on_request_lane,
     sync_to_thread,
@@ -60,6 +60,7 @@ from .error_handlers import (
     handle_exception,
     handle_exception_with_formatter,
     http_exception_handler,
+    is_server_error,
     render_core_error,
 )
 from .exceptions import HTTPException
@@ -2914,19 +2915,25 @@ class BoltAPI:
             )
 
     def _handle_generic_exception(self, e: Exception, request: Any) -> Response:
-        """Return the error response for an unhandled exception. Log the exception for a 5xx response.
+        """Return the error response for an unhandled exception, and log a server error.
 
-        A 4xx is the fault of the client, and the access log records it at
-        WARNING. Django's ``log_response`` uses the same rule.
+        Bolt logs the exception when it answers it with a 5xx by default. A 4xx
+        is the fault of the client, and the access log records it at WARNING.
+        The ``error_formatter`` can change the response, but not this choice.
         """
-        # Without a formatter, the handler reads the Django DEBUG setting.
-        if self._error_formatter is None:
-            response = _wire_from_error_parts(*handle_exception(e, debug=None, request=request))
-        else:
-            response = _wire_from_error_parts(*handle_exception_with_formatter(self._error_formatter, e, request))
-        if response[0] >= 500 and self._logging_middleware:
-            self._logging_middleware.log_exception(request, e, exc_info=True)
-        return response
+        logging_middleware = self._logging_middleware
+        if logging_middleware and is_server_error(e):
+            logging_middleware.log_exception(request, e, exc_info=True)
+        try:
+            # Without a formatter, the handler reads the Django DEBUG setting.
+            if self._error_formatter is None:
+                return _wire_from_error_parts(*handle_exception(e, debug=None, request=request))
+            return _wire_from_error_parts(*handle_exception_with_formatter(self._error_formatter, e, request))
+        except Exception as error:
+            # Rust answers 500 for an error that escapes here, and Rust does not log it.
+            if logging_middleware:
+                logging_middleware.log_exception(request, error, exc_info=True)
+            raise
 
     @staticmethod
     def _is_python_middleware_spec(middleware_spec: Any) -> bool:
@@ -3313,7 +3320,7 @@ class BoltAPI:
                 self._describe_lane_affinity_error(e, handler, handler_id)
             # A handler that ran the ORM inline on this thread may have left
             # a dead connection behind; drop it so the next request reconnects.
-            _drop_broken_connections()
+            _drop_broken_connections_after_error()
             return self._handle_generic_exception(e, request=request)
         finally:
             # Auto-cleanup UploadFiles to prevent resource leaks
@@ -3369,7 +3376,7 @@ class BoltAPI:
         except Exception as e:
             # A handler that ran the ORM inline on this thread may have left
             # a dead connection behind; drop it so the next request reconnects.
-            _drop_broken_connections()
+            _drop_broken_connections_after_error()
             return self._handle_generic_exception(e, request=request)
         finally:
             if meta["has_file_uploads"]:

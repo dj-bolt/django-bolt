@@ -310,6 +310,34 @@ def generic_exception_handler(
     )
 
 
+_CLIENT_ERROR_TYPES: tuple[type[BaseException], ...] = tuple(
+    error_type
+    for error_type in (
+        ValidationException,
+        msgspec.ValidationError,
+        ResponseFileNotFound,
+        ResponseFileNotAllowed,
+        DjangoPermissionDenied,
+        DjangoSuspiciousOperation,
+    )
+    if error_type is not None
+)
+
+
+def is_server_error(exc: BaseException) -> bool:
+    """Return True when ``handle_exception`` answers ``exc`` with a 5xx.
+
+    The exception log uses this answer. An ``error_formatter`` can change the
+    status of the response, but not this answer. Thus a formatter cannot hide a
+    server error from the log, and a client cannot fill the log.
+    """
+    if isinstance(exc, HTTPException):
+        return exc.status_code >= 500
+    if isinstance(exc, ResponseValidationError):
+        return True
+    return not isinstance(exc, _CLIENT_ERROR_TYPES)
+
+
 def handle_exception(
     exc: Exception,
     debug: bool | None = None,

@@ -16,6 +16,7 @@ except ImportError:
 from . import _json
 from ._core import resolve_response_file
 from .cookies import Cookie, make_delete_cookie
+from .exceptions import ResponseFileNotFound
 
 if TYPE_CHECKING:
     from .cookies import SameSitePolicy
@@ -224,8 +225,11 @@ class File(CookieMixin):
         self.headers = headers or {}
 
     def read_bytes(self) -> bytes:
-        with open(self.path, "rb") as f:
-            return f.read()
+        try:
+            with open(self.path, "rb") as f:
+                return f.read()
+        except FileNotFoundError as error:
+            raise ResponseFileNotFound(f"File not found: {self.path}") from error
 
 
 class UploadFile:

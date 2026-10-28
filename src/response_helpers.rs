@@ -1,7 +1,8 @@
 //! Native operations used while constructing Python responses.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use actix_web::cookie::time::{Date, Month};
 use pyo3::exceptions::PyValueError;
@@ -44,58 +45,48 @@ pub fn format_cookie_date(value: &Bound<'_, PyDateTime>) -> PyResult<String> {
     ))
 }
 
-/// Make the exception `name` of `django_bolt.exceptions` with `message`.
+pyo3::import_exception!(django_bolt.exceptions, ResponseFileNotFound);
+pyo3::import_exception!(django_bolt.exceptions, ResponseFileNotAllowed);
+
+/// Map an error of the path lookup to the FileResponse error that Bolt answers.
 ///
-/// The FileResponse errors subclass `FileNotFoundError` and `PermissionError`.
-/// Only Bolt raises them, so the error handler maps only them to 404 and 403.
-fn file_response_error(py: Python<'_>, name: &str, message: String) -> PyErr {
-    match py
-        .import("django_bolt.exceptions")
-        .and_then(|module| module.getattr(name))
-        .and_then(|class| class.call1((message,)))
-    {
-        Ok(error) => PyErr::from_value(error),
-        Err(error) => error,
+/// The path often comes from the request, so a client must not get a 500 for
+/// it. A path that names no regular file is a 404, as in Django's `serve`. A
+/// path that the server may not read is a 403, as when Rust opens the file.
+/// Only Bolt raises these errors, so the error handler maps only them to 404 and 403.
+fn file_lookup_error(error: std::io::Error, path: &Path) -> PyErr {
+    match error.kind() {
+        ErrorKind::PermissionDenied => {
+            ResponseFileNotAllowed::new_err(format!("Permission denied: {}", path.display()))
+        }
+        ErrorKind::NotFound
+        | ErrorKind::NotADirectory
+        | ErrorKind::InvalidInput
+        | ErrorKind::InvalidFilename => file_not_found(path),
+        _ if error.raw_os_error() == Some(libc::ELOOP) => file_not_found(path),
+        _ => PyErr::from(error),
     }
+}
+
+fn file_not_found(path: &Path) -> PyErr {
+    ResponseFileNotFound::new_err(format!("File not found: {}", path.display()))
 }
 
 /// Resolve the path and check its type with one metadata lookup.
 #[pyfunction]
-pub fn resolve_response_file(
-    py: Python<'_>,
-    path: PathBuf,
-    allowed: Option<Vec<PathBuf>>,
-) -> PyResult<OsString> {
-    let resolved = std::fs::canonicalize(&path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            file_response_error(
-                py,
-                "ResponseFileNotFound",
-                format!("File not found: {}", path.display()),
-            )
-        } else if error.kind() == std::io::ErrorKind::InvalidInput
-            || error.raw_os_error() == Some(libc::ELOOP)
-        {
-            PyValueError::new_err(format!("Invalid file path: {error}"))
-        } else {
-            PyErr::from(error)
-        }
-    })?;
-    if !resolved.metadata()?.is_file() {
-        return Err(PyValueError::new_err(format!(
-            "Path is not a regular file: {}",
-            path.display()
-        )));
+pub fn resolve_response_file(path: PathBuf, allowed: Option<Vec<PathBuf>>) -> PyResult<OsString> {
+    let resolved = std::fs::canonicalize(&path).map_err(|error| file_lookup_error(error, &path))?;
+    let metadata = resolved
+        .metadata()
+        .map_err(|error| file_lookup_error(error, &path))?;
+    if !metadata.is_file() {
+        return Err(file_not_found(&path));
     }
     if allowed.is_some_and(|roots| !roots.iter().any(|root| resolved.starts_with(root))) {
-        return Err(file_response_error(
-            py,
-            "ResponseFileNotAllowed",
-            format!(
-                "File path '{}' is not within allowed directories. Configure BOLT_ALLOWED_FILE_PATHS in Django settings.",
-                path.display()
-            ),
-        ));
+        return Err(ResponseFileNotAllowed::new_err(format!(
+            "File path '{}' is not within allowed directories. Configure BOLT_ALLOWED_FILE_PATHS in Django settings.",
+            path.display()
+        )));
     }
     Ok(resolved.into_os_string())
 }

@@ -8,6 +8,7 @@ from http.cookies import CookieError, SimpleCookie
 import pytest
 
 from django_bolt import _core
+from django_bolt.exceptions import ResponseFileNotAllowed, ResponseFileNotFound
 
 
 @pytest.mark.parametrize("tz", [None, UTC, timezone(timedelta(hours=5))])
@@ -22,11 +23,12 @@ def test_native_file_resolution(tmp_path):
     link = tmp_path / "link"
     link.symlink_to(target)
     assert _core.resolve_response_file(link, [tmp_path]) == str(target)
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ResponseFileNotFound):
         _core.resolve_response_file(tmp_path / "missing", None)
-    with pytest.raises(ValueError, match="regular file"):
+    # A path that names no regular file is a 404, as a missing file is.
+    with pytest.raises(ResponseFileNotFound):
         _core.resolve_response_file(tmp_path, None)
-    with pytest.raises(PermissionError):
+    with pytest.raises(ResponseFileNotAllowed):
         _core.resolve_response_file(target, [tmp_path / "other"])
 
 
@@ -37,13 +39,13 @@ def test_native_file_resolution_checks_symlink_targets(tmp_path):
     outside.write_text("private")
     link = allowed / "link"
     link.symlink_to(outside)
-    with pytest.raises(PermissionError):
+    with pytest.raises(ResponseFileNotAllowed):
         _core.resolve_response_file(link, [allowed])
     cycle = tmp_path / "cycle"
     cycle.symlink_to(cycle)
-    with pytest.raises(ValueError, match="Invalid file path"):
+    with pytest.raises(ResponseFileNotFound):
         _core.resolve_response_file(cycle, None)
-    with pytest.raises(ValueError):
+    with pytest.raises(ResponseFileNotFound):
         _core.resolve_response_file("bad\0path", None)
 
 
