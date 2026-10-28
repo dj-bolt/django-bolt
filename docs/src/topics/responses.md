@@ -224,7 +224,7 @@ BOLT_ALLOWED_FILE_PATHS = [
 
 When configured, `FileResponse` only serves files within these directories, preventing path traversal attacks.
 
-A `FileResponse` for a path outside these directories raises `ResponseFileNotAllowed`, and Bolt answers 403, also when the path names no file. Bolt follows the links of the path, as `realpath` does, to find where its lookup stops. A `FileResponse` for a path that names no regular file raises `ResponseFileNotFound`, and Bolt answers 404. Examples are a missing file, a directory and a path that is too long. The path often comes from the request, so a client does not get a 500 for it. The errors subclass `PermissionError` and `FileNotFoundError`. The 404 and 403 responses do not show the path. Bolt answers 500 for a `FileNotFoundError` or a `PermissionError` of other code, because it is a server fault.
+A `FileResponse` for a path outside these directories raises `ResponseFileNotAllowed`, and Bolt answers 403, also when the path names no file. When the lookup fails, Bolt follows the links of the path, as `realpath` does, to where the lookup stops. Then it completes the path from there as text. A `FileResponse` for a path that names no regular file raises `ResponseFileNotFound`, and Bolt answers 404. Examples are a missing file, a directory and a path that is too long. The path often comes from the request, so a client does not get a 500 for it. The errors subclass `PermissionError` and `FileNotFoundError`. The 404 and 403 responses do not show the path. Bolt answers 500 for a `FileNotFoundError` or a `PermissionError` of other code, because it is a server fault.
 
 ## Streaming responses
 

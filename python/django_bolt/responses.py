@@ -119,19 +119,20 @@ def _resolve_allowed_file_paths(value: object) -> list[Path] | None:
     """Resolve each directory of BOLT_ALLOWED_FILE_PATHS once. None or an empty list sets no limit.
 
     A str is a sequence of one-character paths, so "/" would become an allowed directory.
+    A relative path, such as "" or ".", depends on the working directory.
     """
     if value is not None and not isinstance(value, (list, tuple)):
         raise ImproperlyConfigured(
-            f"BOLT_ALLOWED_FILE_PATHS must be a list of paths, got {type(value).__name__} {value!r}."
+            f"BOLT_ALLOWED_FILE_PATHS must be a list of absolute paths, got {type(value).__name__} {value!r}."
         )
     if not value:
         return None
     roots = []
     for item in value:
         path = os.fspath(item) if isinstance(item, (str, os.PathLike)) else None
-        if not isinstance(path, str) or not path:
+        if not isinstance(path, str) or not os.path.isabs(path) or "\x00" in path:
             raise ImproperlyConfigured(
-                f"BOLT_ALLOWED_FILE_PATHS must be a list of paths, got {type(item).__name__} {item!r} in it."
+                f"BOLT_ALLOWED_FILE_PATHS must be a list of absolute paths, got {type(item).__name__} {item!r} in it."
             )
         roots.append(Path(path).resolve())
     return roots

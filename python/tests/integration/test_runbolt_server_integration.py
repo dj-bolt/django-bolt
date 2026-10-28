@@ -98,7 +98,7 @@ def test_runbolt_with_a_str_bolt_allowed_file_paths_stops_startup(make_server_pr
         pass
 
     assert "runbolt exited before the server became ready" in str(excinfo.value)
-    assert "BOLT_ALLOWED_FILE_PATHS must be a list of paths, got str '/srv/media'." in str(excinfo.value)
+    assert "BOLT_ALLOWED_FILE_PATHS must be a list of absolute paths, got str '/srv/media'." in str(excinfo.value)
 
 
 def test_runbolt_failing_system_check_stops_startup(make_server_project):

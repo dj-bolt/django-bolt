@@ -23,6 +23,8 @@ from django_bolt.responses import FileResponse
 from django_bolt.testing import TestClient
 
 TWO_MB = 2 * 1024 * 1024
+# An absolute path on each OS.
+MEDIA = str(Path("/srv/media").resolve())
 
 
 def _upload_api() -> BoltAPI:
@@ -277,11 +279,27 @@ def test_an_int_debug_is_read_as_django_reads_it(capfd, value, detail):
         (b"/srv/media", b"/srv/media"),
         (Path("/srv/media"), Path("/srv/media")),
         ({"/srv/media"}, {"/srv/media"}),
-        (["/srv/media", ""], ""),
-        (["/srv/media", None], None),
+        ([MEDIA, ""], ""),
+        ([MEDIA, Path("")], Path("")),
+        ([MEDIA, "media"], "media"),
+        ([MEDIA, "~/media"], "~/media"),
+        ([MEDIA, f"{MEDIA}/a\x00b"], f"{MEDIA}/a\x00b"),
+        ([MEDIA, None], None),
         ([b"/srv/media"], b"/srv/media"),
     ],
-    ids=["str", "bytes", "path", "set", "empty-item", "none-item", "bytes-item"],
+    ids=[
+        "str",
+        "bytes",
+        "path",
+        "set",
+        "empty-item",
+        "empty-path",
+        "relative",
+        "home",
+        "nul",
+        "none-item",
+        "bytes-item",
+    ],
 )
 def test_wrong_type_of_bolt_allowed_file_paths_stops_startup(monkeypatch, value, wrong):
     # runbolt reads the setting at startup. A str is a sequence of one-character paths, so "/" was an allowed dir.
@@ -292,7 +310,7 @@ def test_wrong_type_of_bolt_allowed_file_paths_stops_startup(monkeypatch, value,
         responses.initialize_file_response_settings()
 
     assert str(excinfo.value).startswith(
-        f"BOLT_ALLOWED_FILE_PATHS must be a list of paths, got {type(wrong).__name__} {wrong!r}"
+        f"BOLT_ALLOWED_FILE_PATHS must be a list of absolute paths, got {type(wrong).__name__} {wrong!r}"
     )
 
 
@@ -316,3 +334,22 @@ def test_bolt_allowed_file_paths_takes_a_list_of_str_and_path(monkeypatch, tmp_p
             statuses = (client.get("/file/public%2Fknown.txt").status_code, client.get("/file/secret.txt").status_code)
 
     assert statuses == (200, 403)
+
+
+@pytest.mark.parametrize("value", [None, [], ()], ids=["none", "empty-list", "empty-tuple"])
+def test_no_bolt_allowed_file_paths_sets_no_limit(monkeypatch, tmp_path, value):
+    (tmp_path / "data.txt").write_text("data")
+    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
+    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
+    api = BoltAPI()
+
+    @api.get("/file")
+    def file():
+        return FileResponse(str(tmp_path / "data.txt"))
+
+    with override_settings(BOLT_ALLOWED_FILE_PATHS=value):
+        responses.initialize_file_response_settings()
+        with TestClient(api) as client:
+            response = client.get("/file")
+
+    assert (response.status_code, response.content) == (200, b"data")
