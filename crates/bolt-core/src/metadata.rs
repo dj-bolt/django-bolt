@@ -682,8 +682,23 @@ impl RouteMetadata {
                         if let Ok(type_str) = mw_type.extract::<String>(py) {
                             // Parse CORS config separately for fast access. The list is
                             // API, router, then route: the last (most specific) config wins.
+                            // A config with no origins and no patterns keeps the allow
+                            // list of the outer config, so it cannot widen it to the
+                            // global settings.
                             if type_str == "cors" {
-                                cors_config = Some(parse_cors_config(&mw_dict, py)?);
+                                let mut config = parse_cors_config(&mw_dict, py)?;
+                                if let Some(outer) = cors_config.take() {
+                                    if config.origins.is_empty() && config.origin_regexes.is_empty()
+                                    {
+                                        config.origins = outer.origins;
+                                        config.origin_set = outer.origin_set;
+                                        config.allow_all_origins = outer.allow_all_origins;
+                                        config.origin_regexes = outer.origin_regexes;
+                                        config.compiled_origin_regexes =
+                                            outer.compiled_origin_regexes;
+                                    }
+                                }
+                                cors_config = Some(config);
                             }
 
                             // Parse rate_limit config separately for fast access
@@ -894,13 +909,27 @@ fn cors_str_list(
     py: Python,
     key: &str,
 ) -> PyResult<Option<Vec<String>>> {
-    match dict.get(key) {
-        Some(value) if !value.is_none(py) => value
-            .extract::<Vec<String>>(py)
-            .map(Some)
-            .map_err(|_| PyTypeError::new_err(format!("cors {key} must be a list of str"))),
-        _ => Ok(None),
+    let Some(value) = dict.get(key).map(|value| value.bind(py)) else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
     }
+    // A str is one item, as for @cors.
+    if let Ok(item) = value.extract::<String>() {
+        return Ok(Some(vec![item]));
+    }
+    let type_error =
+        || PyTypeError::new_err(format!("cors {key} must be a str or a collection of str"));
+    value
+        .try_iter()
+        .map_err(|_| type_error())?
+        .map(|item| {
+            item.and_then(|item| item.extract::<String>())
+                .map_err(|_| type_error())
+        })
+        .collect::<PyResult<Vec<String>>>()
+        .map(Some)
 }
 
 /// Parse CORS configuration from middleware dict
@@ -917,6 +946,12 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<
 
     // Parse origin_regexes and compile them at startup
     if let Some(regex_patterns) = cors_str_list(dict, py, "origin_regexes")? {
+        // An empty pattern matches every origin.
+        if regex_patterns.iter().any(String::is_empty) {
+            return Err(PyValueError::new_err(
+                "cors origin_regexes holds an empty pattern, which matches every origin",
+            ));
+        }
         config.origin_regexes = regex_patterns.clone();
         config.compiled_origin_regexes = regex_patterns
             .iter()

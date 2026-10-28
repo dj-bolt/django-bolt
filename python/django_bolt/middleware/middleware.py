@@ -384,6 +384,8 @@ def middleware(*args, **kwargs):
 
         # Support dict-style middleware metadata (e.g. @middleware(type="cors", ...))
         if kwargs:
+            if kwargs.get("type") == "cors":
+                _reject_second_cors(handler)
             attach_middleware(handler, kwargs)
 
         return handler
@@ -434,11 +436,22 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     return decorator
 
 
+def _reject_second_cors(handler: Callable) -> None:
+    """Raise ValueError when the handler already has a cors config.
+
+    Two cors configs on one route have no clear order. The config stays on the
+    function, so one function cannot serve two routes with different origins.
+    """
+    if any(isinstance(mw, dict) and mw.get("type") == "cors" for mw in getattr(handler, "__bolt_middleware__", ())):
+        raise ValueError(
+            "The function already has a @cors. Merge the origins into one @cors, or give each route its own function."
+        )
+
+
 def _cors_str_list(name: str, value: Any) -> list[str]:
     """Return a str or a sequence of str as a list of str.
 
-    Rust drops a list that holds an item of another type, and the route then
-    uses the global allow list. Thus any other type raises TypeError here.
+    Any other type raises TypeError here, at decoration, with the name of the argument.
     """
     if value is None:
         return []
@@ -523,11 +536,9 @@ def cors(
         if any(not pattern for pattern in regex_list):
             raise ValueError("@cors() origin_regexes holds an empty pattern, which matches every origin.")
 
+        _reject_second_cors(func)
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
-        # Two @cors on one route have no clear order, so allow one only.
-        if any(isinstance(mw, dict) and mw.get("type") == "cors" for mw in func.__bolt_middleware__):
-            raise ValueError("A route takes one @cors. Merge the origins into one @cors.")
 
         # SECURITY: Validate wildcard + credentials
         if "*" in origin_list and credentials:
