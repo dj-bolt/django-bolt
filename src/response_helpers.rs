@@ -1,7 +1,10 @@
 //! Native operations used while constructing Python responses.
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::ErrorKind;
+#[cfg(windows)]
+use std::path::Prefix;
 use std::path::{Component, Path, PathBuf};
 
 use actix_web::cookie::time::{Date, Month};
@@ -79,11 +82,15 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
     }
     // The OS looks up no part of an empty path, so it names no file anywhere.
     if let Some(roots) = allowed.filter(|_| !path.as_os_str().is_empty()) {
-        let (reached, blocked) = lookup_stop(path);
+        let stop = lookup_stop(path);
         // A directory on the way to an allowed directory that the server cannot search is a deploy fault.
         let blocks_a_root = denied
-            && blocked.is_some_and(|blocked| roots.iter().any(|root| root.starts_with(&blocked)));
-        if !within(&reached, roots) && !blocks_a_root {
+            && stop.blocked.is_some_and(|blocked| {
+                roots
+                    .iter()
+                    .any(|root| comparable(root).starts_with(&blocked))
+            });
+        if !within(&stop.reached, roots) && !blocks_a_root {
             return not_allowed(path);
         }
     }
@@ -94,7 +101,10 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
     }
 }
 
-/// The maximum number of links in one lookup, as on Linux.
+/// The maximum number of links in one lookup, as the kernel allows.
+#[cfg(target_os = "macos")]
+const MAX_LINKS: u32 = 32;
+#[cfg(not(target_os = "macos"))]
 const MAX_LINKS: u32 = 40;
 
 /// A part of a path that `lookup_stop` has yet to resolve.
@@ -123,17 +133,52 @@ fn parts_of(path: &Path) -> Vec<Part> {
     parts
 }
 
-/// Return the real path at which the lookup of `path` stops, and the path that it could not look up.
+/// Where the lookup of a path stopped.
+struct Stop {
+    /// The real path that the lookup reached.
+    reached: PathBuf,
+    /// The path in `reached` that the lookup could not `lstat`.
+    blocked: Option<PathBuf>,
+    /// True when the lookup resolved each part of the path.
+    finished: bool,
+}
+
+/// Return where the lookup of `path` stops, with the real names of the parts that it reached.
 ///
-/// The walk resolves the parts of `path` in sequence, as `realpath` does. It
-/// follows a link before it applies a later `..`, and it stops below a file.
-/// Each part costs one `lstat`, and a link also costs one `readlink`. The parts
-/// of a link target go in front of the remaining parts. The path that the walk
-/// reached has no links, so `..` removes its last part.
-fn lookup_stop(path: &Path) -> (PathBuf, Option<PathBuf>) {
-    let mut reached = PathBuf::new();
+/// The walk keeps the spelling of the path, such as an 8.3 short name or another case.
+/// The allowed roots have the real names, so give the path that the walk reached its real name too.
+fn lookup_stop(path: &Path) -> Stop {
+    let stop = walk(path);
+    let Ok(real) = std::fs::canonicalize(&stop.reached) else {
+        return stop;
+    };
+    let reached = comparable(&real).into_owned();
+    let blocked = stop
+        .blocked
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(|name| reached.join(name));
+    Stop {
+        reached,
+        blocked,
+        finished: stop.finished,
+    }
+}
+
+/// Walk the parts of `path` in sequence, as `realpath` does on Linux.
+///
+/// The walk follows a link before it applies a later `..`, and it stops below
+/// a file. Each part costs one `lstat`, and a link also costs one `readlink`.
+/// The parts of a link target go in front of the remaining parts. The path that
+/// the walk reached has no links, so `..` removes its last part.
+fn walk(path: &Path) -> Stop {
+    let mut stop = Stop {
+        reached: PathBuf::new(),
+        blocked: None,
+        finished: false,
+    };
     let Ok(absolute) = std::path::absolute(path) else {
-        return (reached, None);
+        return stop;
     };
     let mut pending = parts_of(&absolute);
     let mut is_dir = true;
@@ -141,40 +186,75 @@ fn lookup_stop(path: &Path) -> (PathBuf, Option<PathBuf>) {
     while let Some(part) = pending.pop() {
         match part {
             Part::Root(root) => {
-                reached = root;
+                stop.reached = root;
                 is_dir = true;
             }
             // A file has no parts below it.
-            _ if !is_dir => break,
+            _ if !is_dir => return stop,
             Part::Parent => {
-                reached.pop();
+                stop.reached.pop();
             }
             Part::Name(name) => {
-                let next = reached.join(name);
+                let next = stop.reached.join(name);
                 let Ok(metadata) = next.symlink_metadata() else {
-                    return (reached, Some(next));
+                    stop.blocked = Some(next);
+                    return stop;
                 };
                 if !metadata.file_type().is_symlink() {
                     is_dir = metadata.is_dir();
-                    reached = next;
+                    stop.reached = next;
                     continue;
                 }
                 links += 1;
                 if links > MAX_LINKS {
-                    break;
+                    return stop;
                 }
                 let Ok(target) = std::fs::read_link(&next) else {
-                    break;
+                    return stop;
                 };
                 pending.extend(parts_of(&target));
             }
         }
     }
-    (reached, None)
+    stop.finished = true;
+    stop
+}
+
+/// Return `path` in the form of the allowed roots.
+///
+/// On Windows, `canonicalize` gives an extended-length path such as `\\?\C:\srv`.
+/// Python gives `C:\srv` for the same directory, so remove the `\\?\` part.
+#[cfg(windows)]
+fn comparable(path: &Path) -> Cow<'_, Path> {
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Cow::Borrowed(path);
+    };
+    let plain = match prefix.kind() {
+        Prefix::VerbatimDisk(disk) => OsString::from(format!("{}:", char::from(disk))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut unc = OsString::from(r"\\");
+            unc.push(server);
+            unc.push(r"\");
+            unc.push(share);
+            unc
+        }
+        _ => return Cow::Borrowed(path),
+    };
+    let mut plain = PathBuf::from(plain);
+    plain.extend(components);
+    Cow::Owned(plain)
+}
+
+#[cfg(not(windows))]
+fn comparable(path: &Path) -> Cow<'_, Path> {
+    Cow::Borrowed(path)
 }
 
 fn within(resolved: &Path, roots: &[PathBuf]) -> bool {
-    roots.iter().any(|root| resolved.starts_with(root))
+    roots
+        .iter()
+        .any(|root| resolved.starts_with(comparable(root)))
 }
 
 fn file_not_found(path: &Path) -> PyErr {
@@ -194,9 +274,23 @@ pub fn resolve_response_file(path: PathBuf, allowed: Option<Vec<PathBuf>>) -> Py
     let roots = allowed.as_deref();
     let resolved =
         std::fs::canonicalize(&path).map_err(|error| file_lookup_error(error, &path, roots))?;
-    // Check the roots before the type, so a directory out of them is a 403 as a file is.
-    if roots.is_some_and(|roots| !within(&resolved, roots)) {
-        return Err(not_allowed(&path));
+    if let Some(roots) = roots {
+        // macOS `realpath` accepts `..` after a file, where the lookup on Linux fails.
+        // Walk such a path as on Linux, so that its status cannot show whether the file exists.
+        if path.components().any(|part| part == Component::ParentDir) {
+            let stop = lookup_stop(&path);
+            if !stop.finished {
+                return Err(if within(&stop.reached, roots) {
+                    file_not_found(&path)
+                } else {
+                    not_allowed(&path)
+                });
+            }
+        }
+        // Check the roots before the type, so a directory out of them is a 403 as a file is.
+        if !within(&comparable(&resolved), roots) {
+            return Err(not_allowed(&path));
+        }
     }
     let metadata = resolved
         .metadata()
