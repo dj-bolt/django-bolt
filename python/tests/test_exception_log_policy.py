@@ -360,18 +360,22 @@ def test_a_file_response_error_is_a_4xx_without_the_path(server_errors, settings
 
 
 @pytest.mark.parametrize("response_type", [FileResponse, File], ids=["file-response", "file"])
-@pytest.mark.parametrize("kind", ["directory", "below-a-file", "long-name", "nul-byte", "symlink-loop"])
+@pytest.mark.parametrize(
+    "kind", ["directory", "below-a-file", "long-name", "nul-byte", "symlink-loop", "link-to-a-missing-file"]
+)
 def test_a_file_response_path_that_names_no_file_is_a_404(server_errors, allowed_dir, kind, response_type):
     # The path of a FileResponse often comes from the request. A client must not get a 500 for it.
     (allowed_dir / "report.txt").write_text("data")
     loop = allowed_dir / "loop"
     loop.symlink_to(loop)
+    (allowed_dir / "broken").symlink_to("missing.txt")
     paths = {
         "directory": str(allowed_dir),
         "below-a-file": str(allowed_dir / "report.txt" / "x"),
         "long-name": str(allowed_dir / ("a" * 300)),
         "nul-byte": f"{allowed_dir}/a\x00b",
         "symlink-loop": str(loop),
+        "link-to-a-missing-file": str(allowed_dir / "broken"),
     }
     api = BoltAPI()
 
@@ -448,7 +452,17 @@ def test_a_path_out_of_the_allowed_dirs_that_the_server_cannot_read_is_a_403(
 
 
 @pytest.mark.parametrize(
-    "kind", ["missing", "directory", "below-a-file", "symlink-loop", "walk-out", "through-a-link", "back-out-of-a-link"]
+    "kind",
+    [
+        "missing",
+        "directory",
+        "below-a-file",
+        "symlink-loop",
+        "walk-out",
+        "through-a-link",
+        "back-out-of-a-link",
+        "link-to-a-missing-file",
+    ],
 )
 def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server_errors, allowed_dir, tmp_path, kind):
     # A 404 for a missing path and a 403 for a file would tell a client which paths exist out of the allowed dirs.
@@ -460,6 +474,8 @@ def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server
     (allowed_dir / "escape").symlink_to(outside, target_is_directory=True)
     # The OS follows a link before it applies "..", so link/.. is the outside dir.
     (allowed_dir / "link").symlink_to(outside / "sub", target_is_directory=True)
+    # A link to a missing file out of the allowed dir must give a 403, as a link to a file there does.
+    (allowed_dir / "dangling").symlink_to("../outside/missing.txt")
     paths = {
         "missing": outside / "missing.txt",
         "directory": outside,
@@ -468,6 +484,7 @@ def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server
         "walk-out": allowed_dir / ".." / "outside" / "missing.txt",
         "through-a-link": allowed_dir / "escape" / "missing.txt",
         "back-out-of-a-link": allowed_dir / "link" / ".." / "missing.txt",
+        "link-to-a-missing-file": allowed_dir / "dangling",
     }
     api = BoltAPI()
 

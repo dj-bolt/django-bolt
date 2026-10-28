@@ -75,7 +75,7 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
     if !names_no_file && error.kind() != ErrorKind::PermissionDenied {
         return PyErr::from(error);
     }
-    if allowed.is_some_and(|roots| !within(&lookup_stop(path), roots)) {
+    if allowed.is_some_and(|roots| !within(&lookup_stop(path, MAX_LINKS), roots)) {
         return not_allowed(path);
     }
     if names_no_file {
@@ -85,11 +85,15 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
     }
 }
 
+/// The maximum number of links that `lookup_stop` follows, as on Linux.
+const MAX_LINKS: u32 = 40;
+
 /// Return the real path at which the OS lookup of `path` stops.
 ///
 /// The OS resolves the parts of a path in sequence, and it follows a link
 /// before it applies a later `..`. Thus resolve the parts one at a time.
-fn lookup_stop(path: &Path) -> PathBuf {
+/// The lookup of a link to a missing target stops in that target, so walk the target too.
+fn lookup_stop(path: &Path, links_left: u32) -> PathBuf {
     let mut reached = PathBuf::new();
     let Ok(absolute) = std::path::absolute(path) else {
         return reached;
@@ -102,7 +106,12 @@ fn lookup_stop(path: &Path) -> PathBuf {
         }
         match std::fs::canonicalize(&next) {
             Ok(resolved) => reached = resolved,
-            Err(_) => break,
+            Err(_) => match std::fs::read_link(&next) {
+                Ok(target) if links_left > 0 => {
+                    return lookup_stop(&reached.join(target), links_left - 1);
+                }
+                _ => break,
+            },
         }
     }
     reached
