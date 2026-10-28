@@ -8,7 +8,7 @@ import pytest
 
 from .apps import app_bytes, app_module, app_source
 from .apps.loop_thread_probe import PROBE_MARKER
-from .helpers import DEFAULT_HOST, _terminate_process
+from .helpers import DEFAULT_HOST, _terminate_process, get_free_port
 
 pytestmark = pytest.mark.server_integration
 
@@ -174,3 +174,24 @@ def test_runbolt_bind_failure_exits_before_the_loop_thread_starts(make_server_pr
     assert process.returncode == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
     assert "Address already in use" in stderr, stderr
     assert PROBE_MARKER not in stderr, stderr
+
+
+def test_runbolt_stops_when_the_host_has_no_address(make_server_project):
+    """A --host that does not resolve must stop startup.
+
+    Before, the server bound 0.0.0.0 for each host that was not an IP address.
+    Thus it answered on all interfaces with no error.
+    """
+    project = make_server_project(api_module=app_module("hello"))
+
+    # RFC 6761: a name under .invalid never resolves.
+    host = "bolt-test.invalid"
+    process, port = project.spawn(host=host, port=get_free_port())
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _terminate_process(process)
+        pytest.fail(f"runbolt kept running with --host {host} on port {port}\nstderr:\n{stderr}")
+
+    assert process.returncode == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    assert f'cannot resolve host "{host}"' in stderr, stderr

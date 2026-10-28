@@ -4,6 +4,7 @@
 //! shared server state, routing, parameter coercion, auth/guards, the
 //! Rust-side middleware pipeline, response building and streaming.
 
+pub mod bind_addr;
 pub mod cookies;
 pub mod cors;
 pub mod error;

@@ -6,13 +6,13 @@ use ahash::AHashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::handler::handle_request;
 use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
+use bolt_core::bind_addr::resolve_bind_addr;
 use bolt_core::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
@@ -953,12 +953,8 @@ fn bind_listener(
     use_reuse_port: bool,
     backlog: i32,
 ) -> std::io::Result<std::net::TcpListener> {
-    let ip: IpAddr = host.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
-    let domain = match ip {
-        IpAddr::V4(_) => Domain::IPV4,
-        IpAddr::V6(_) => Domain::IPV6,
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    let addr = resolve_bind_addr(host, port)?;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
 
     // Only set SO_REUSEPORT when explicitly requested (multi-process mode)
@@ -967,7 +963,7 @@ fn bind_listener(
         socket.set_reuse_port(true)?;
     }
 
-    socket.bind(&SocketAddr::new(ip, port).into())?;
+    socket.bind(&addr.into())?;
     socket.listen(backlog)?;
     let listener: std::net::TcpListener = socket.into();
     listener.set_nonblocking(true)?;
@@ -1155,4 +1151,39 @@ async fn websocket_not_found_handler(
     }
 
     actix_web_actors::ws::start(WebSocketNotFoundActor, &req, stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn bound_ip(host: &str) -> std::io::Result<IpAddr> {
+        Ok(bind_listener(host, 0, false, 8)?.local_addr()?.ip())
+    }
+
+    #[test]
+    fn bind_listener_binds_an_ip_address() {
+        assert_eq!(bound_ip("127.0.0.1").unwrap(), IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn bind_listener_binds_an_ipv6_address_in_brackets() {
+        assert_eq!(
+            bound_ip("[::1]").unwrap(),
+            IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn bind_listener_binds_the_ipv4_loopback_for_localhost() {
+        assert_eq!(bound_ip("localhost").unwrap(), IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn bind_listener_fails_for_a_host_with_no_address() {
+        // RFC 6761: a name under .invalid never resolves.
+        let err = bound_ip("bolt-test.invalid").unwrap_err();
+        assert!(err.to_string().contains("bolt-test.invalid"), "{err}");
+    }
 }

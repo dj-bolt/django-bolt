@@ -6,6 +6,7 @@
 # cargo-mutants does not run, so its results there would mean little. The
 # Python suite also catches some mutants that this run lists as missed.
 examine_globs = [
+    "crates/bolt-core/src/bind_addr.rs",
     "crates/bolt-core/src/cookies.rs",
     "crates/bolt-core/src/cors.rs",
     "crates/bolt-core/src/form_parsing.rs",

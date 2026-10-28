@@ -418,7 +418,7 @@ The `runbolt` management command accepts these options:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--host` | `0.0.0.0` | Bind address |
+| `--host` | `0.0.0.0` | Bind address: an IP address, an IPv6 address in brackets, or a host name. A host name binds its first IPv4 address, so `localhost` binds `127.0.0.1`. A host name that does not resolve stops startup. |
 | `--port` | `8000` | Bind port |
 | `--workers` | `1`, or the CPU count on free-threaded Python | Actix worker threads per process. Each thread runs Python handlers. |
 | `--processes` | `1` | Number of processes |

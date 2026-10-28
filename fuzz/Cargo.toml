@@ -1,4 +1,4 @@
-# Fuzz targets for the request parsers. Run with nightly:
+# Fuzz targets for the request parsers and the --host address. Run with nightly:
 #   cargo +nightly fuzz run query_string
 # See CONTRIBUTING.md. Not a member of the main workspace: cargo-fuzz builds
 # it with nightly and a sanitizer.
@@ -51,6 +51,13 @@ bench = false
 [[bin]]
 name = "cookie_csrf"
 path = "fuzz_targets/cookie_csrf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bind_addr"
+path = "fuzz_targets/bind_addr.rs"
 test = false
 doc = false
 bench = false
