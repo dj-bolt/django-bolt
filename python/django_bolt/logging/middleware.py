@@ -9,7 +9,6 @@ from typing import Any
 
 from django.core.exceptions import SuspiciousOperation
 
-from ..exceptions import is_request_error
 from .config import LoggingConfig, get_default_logging_config
 
 
@@ -267,10 +266,7 @@ class LoggingMiddleware:
         # handle_exception() logs it once to django.security.<class name>, as
         # Django does. A client can cause one on each request, for example with a
         # bad Host, so a second record with a traceback here only fills the log.
-        # A parameter or body that failed validation is a 422 for the client, and
-        # the access log records it. The extractors mark such an error. The same
-        # error type from handler code is a server fault, so the log keeps it.
-        if isinstance(exc, SuspiciousOperation) or is_request_error(exc):
+        if isinstance(exc, SuspiciousOperation):
             return
         path = request.get("path", "")
 

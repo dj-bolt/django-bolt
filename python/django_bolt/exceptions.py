@@ -278,22 +278,6 @@ class GatewayTimeout(ServerException):
     status_code = 504
 
 
-def mark_request_error(error: Exception) -> Exception:
-    """Mark an error that the data of the request caused, and return it.
-
-    The parameter and body extractors mark their validation errors. The
-    exception log skips a marked error, because the client caused it. The same
-    error type from handler code is not marked, so the log keeps it.
-    """
-    error._bolt_request_error = True  # type: ignore[attr-defined]
-    return error
-
-
-def is_request_error(error: BaseException) -> bool:
-    """Return True for an error that ``mark_request_error`` marked."""
-    return getattr(error, "_bolt_request_error", False)
-
-
 # Helper functions for better error messages
 
 

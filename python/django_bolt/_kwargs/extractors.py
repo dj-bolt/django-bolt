@@ -16,7 +16,7 @@ from django.db.models import QuerySet
 
 from ..concurrency import run_in_orm_executor
 from ..datastructures import UploadFile
-from ..exceptions import HTTPException, RequestValidationError, mark_request_error, parse_msgspec_decode_error
+from ..exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
 from ..typing import (
     FieldDefinition,
     is_msgspec_struct,
@@ -112,10 +112,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
         except msgspec.ValidationError as error:
             # Remove the position of the value in the holder from the error path.
             msg = str(error).replace(" - at `$[0]`", "").replace("`$[0]", "`$")
-            raise mark_request_error(
-                RequestValidationError(
-                    errors=[{"type": "validation_error", "loc": (loc, key), "msg": msg, "input": value}]
-                )
+            raise RequestValidationError(
+                errors=[{"type": "validation_error", "loc": (loc, key), "msg": msg, "input": value}]
             ) from None
 
     return convert
@@ -506,8 +504,7 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
             except msgspec.ValidationError as e:
                 errors = _collect_struct_errors(struct_type, merged, param_type, source, has_files=True)
                 if errors:
-                    raise mark_request_error(RequestValidationError(errors=errors)) from e
-                mark_request_error(e)
+                    raise RequestValidationError(errors=errors) from e
                 raise
 
             # Track UploadFile instances for auto-cleanup
@@ -556,8 +553,7 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
             except msgspec.ValidationError as e:
                 errors = _collect_struct_errors(struct_type, param_map, param_type, source)
                 if errors:
-                    raise mark_request_error(RequestValidationError(errors=errors)) from e
-                mark_request_error(e)
+                    raise RequestValidationError(errors=errors) from e
                 raise
 
         extract.needs_files_map = False  # type: ignore[attr-defined]
@@ -641,8 +637,7 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
         except msgspec.ValidationError as e:
             errors = _collect_header_struct_errors(error_fields, converted)
             if errors:
-                raise mark_request_error(RequestValidationError(errors=errors)) from e
-            mark_request_error(e)
+                raise RequestValidationError(errors=errors) from e
             raise
 
     return extract
@@ -731,17 +726,15 @@ def create_file_extractor(
 
         def extract_required(files_map: dict[str, Any]) -> Any:
             if key not in files_map:
-                raise mark_request_error(
-                    RequestValidationError(
-                        errors=[
-                            {
-                                "type": "file_missing",
-                                "loc": ("body", key),
-                                "msg": "Missing required file",
-                                "input": None,
-                            }
-                        ]
-                    )
+                raise RequestValidationError(
+                    errors=[
+                        {
+                            "type": "file_missing",
+                            "loc": ("body", key),
+                            "msg": "Missing required file",
+                            "input": None,
+                        }
+                    ]
                 )
 
             file_info = files_map[key]
@@ -800,29 +793,33 @@ def _build_body_extractor(annotation: Any) -> Callable:
         def extract(body_bytes: bytes) -> Any:
             try:
                 return decoder.decode(body_bytes)
-            except msgspec.ValidationError as e:
+            except msgspec.ValidationError:
                 # Re-raise ValidationError as-is (field validation errors handled by error_handlers.py)
                 # IMPORTANT: Must catch ValidationError BEFORE DecodeError since ValidationError subclasses DecodeError
-                mark_request_error(e)
                 raise
             except msgspec.DecodeError as e:
                 # JSON parsing error (malformed JSON) - return 422 with error details including line/column
                 error_detail = parse_msgspec_decode_error(e, body_bytes)
-                raise mark_request_error(RequestValidationError(errors=[error_detail], body=body_bytes)) from e
+                raise RequestValidationError(
+                    errors=[error_detail],
+                    body=body_bytes,
+                ) from e
     else:
         # Fallback to generic msgspec decode
         def extract(body_bytes: bytes) -> Any:
             try:
                 return msgspec.json.decode(body_bytes, type=annotation)
-            except msgspec.ValidationError as e:
+            except msgspec.ValidationError:
                 # Re-raise ValidationError as-is (field validation errors handled by error_handlers.py)
                 # IMPORTANT: Must catch ValidationError BEFORE DecodeError since ValidationError subclasses DecodeError
-                mark_request_error(e)
                 raise
             except msgspec.DecodeError as e:
                 # JSON parsing error (malformed JSON) - return 422 with error details including line/column
                 error_detail = parse_msgspec_decode_error(e, body_bytes)
-                raise mark_request_error(RequestValidationError(errors=[error_detail], body=body_bytes)) from e
+                raise RequestValidationError(
+                    errors=[error_detail],
+                    body=body_bytes,
+                ) from e
 
     return extract
 

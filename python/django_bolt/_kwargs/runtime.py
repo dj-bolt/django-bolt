@@ -16,7 +16,7 @@ from typing import Any
 
 import msgspec
 
-from ..exceptions import HTTPException, RequestValidationError, mark_request_error, parse_msgspec_decode_error
+from ..exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
 from ..typing import FieldDefinition, HandlerMetadata, is_msgspec_struct
 from .extractors import get_msgspec_decoder
 
@@ -150,27 +150,31 @@ def extract_parameter_value(
                     decoder = get_msgspec_decoder(meta["body_struct_type"])
                     try:
                         value = decoder.decode(body_bytes)
-                    except msgspec.ValidationError as e:
+                    except msgspec.ValidationError:
                         # Re-raise ValidationError as-is (field validation errors handled by error_handlers.py)
                         # IMPORTANT: Must catch ValidationError BEFORE DecodeError since ValidationError subclasses DecodeError
-                        mark_request_error(e)
                         raise
                     except msgspec.DecodeError as e:
                         # JSON parsing error (malformed JSON) - return 422 with error details including line/column
                         error_detail = parse_msgspec_decode_error(e, body_bytes)
-                        raise mark_request_error(RequestValidationError(errors=[error_detail], body=body_bytes)) from e
+                        raise RequestValidationError(
+                            errors=[error_detail],
+                            body=body_bytes,
+                        ) from e
                 else:
                     try:
                         value = msgspec.json.decode(body_bytes, type=meta["body_struct_type"])
-                    except msgspec.ValidationError as e:
+                    except msgspec.ValidationError:
                         # Re-raise ValidationError as-is (field validation errors handled by error_handlers.py)
                         # IMPORTANT: Must catch ValidationError BEFORE DecodeError since ValidationError subclasses DecodeError
-                        mark_request_error(e)
                         raise
                     except msgspec.DecodeError as e:
                         # JSON parsing error (malformed JSON) - return 422 with error details including line/column
                         error_detail = parse_msgspec_decode_error(e, body_bytes)
-                        raise mark_request_error(RequestValidationError(errors=[error_detail], body=body_bytes)) from e
+                        raise RequestValidationError(
+                            errors=[error_detail],
+                            body=body_bytes,
+                        ) from e
                 return value, value, True
             else:
                 return body_obj, body_obj, body_loaded
