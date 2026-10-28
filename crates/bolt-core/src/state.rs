@@ -2,7 +2,6 @@ use actix_web::http::header::HeaderValue;
 use ahash::AHashMap;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
-use regex::Regex;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -112,7 +111,6 @@ pub struct AppState {
     /// Streaming limits, read once at startup (see `StreamConfig::read`).
     pub stream_config: StreamConfig,
     pub global_cors_config: Option<CorsConfig>, // Global CORS configuration from Django settings
-    pub cors_origin_regexes: Vec<Regex>,        // Compiled regex patterns for origin matching
     pub global_compression_config: Option<Arc<CompressionConfig>>, // Global compression configuration used by middleware
     /// Deployment-wide forwarding-header trust policy.
     pub trusted_proxies: Arc<TrustedProxies>,

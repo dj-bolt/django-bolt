@@ -36,6 +36,21 @@ async def get_data():
     return {"data": "value"}
 ```
 
+The `origins` and `origin_regexes` of a route are its complete allow list. The route does not use `CORS_ALLOWED_ORIGINS` or `CORS_ALLOWED_ORIGIN_REGEXES`. Thus a route can allow fewer origins than the global settings. Use `origin_regexes` to allow a pattern of origins on one route:
+
+```python
+@api.get("/api/tenant")
+@cors(origin_regexes=[r"^https://[a-z]+\.tenant\.example\.com$"], credentials=True)
+async def tenant_data():
+    return {"data": "value"}
+```
+
+A pattern can match a part of the origin, so start it with `^` and end it with `$`. Patterns use the syntax of the Rust `regex` crate, which has no look-around and no back-references. Bolt ignores an invalid pattern and writes a warning at startup. The route then does not use the global settings either. Bolt rejects only an empty pattern. A pattern such as `.*` or `^` allows every origin.
+
+The most specific `cors` config applies. A route-level `@cors` takes precedence over the router, and the router takes precedence over the API. A config with no origins and no patterns, such as a router config that sets only `credentials`, keeps the allow list of the outer config. A route takes one cors config. A second `@cors`, or a `@cors` together with `@middleware(type="cors")`, raises `ValueError`. The config stays on the function, so give each route with `@cors` its own function. `@cors` raises `ValueError` when it gets no origin and no pattern. It raises `TypeError` when an origin or a pattern is not a `str`.
+
+A WebSocket route does not use `@cors`. The WebSocket handshake checks the `Origin` header against the global settings only.
+
 ### Global CORS
 
 Configure CORS for all endpoints in `settings.py`:
@@ -294,6 +309,8 @@ api.include_router(admin_router)
 - Dict middleware configs for Rust-handled middleware (`cors`, `rate_limit`)
 
 Passing plain middleware instances in these lists fails fast with `TypeError` (`pass class, not instance`).
+
+In a `cors` dict, `origins` and `origin_regexes` take a `str` or a collection of `str`. Another type, or an empty pattern, stops startup with `TypeError` or `ValueError`.
 
 Router middleware is inherited parent-to-child and executes in declared order.
 

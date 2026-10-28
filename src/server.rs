@@ -243,15 +243,6 @@ impl ServerConfig {
             ))
         };
     }
-
-    /// The compiled `CORS_ALLOWED_ORIGIN_REGEXES` of the global CORS config,
-    /// for `AppState`. The global config compiles them once at startup.
-    pub(crate) fn cors_origin_regexes(&self) -> Vec<regex::Regex> {
-        self.global_cors_config
-            .as_ref()
-            .map(|cors| cors.compiled_origin_regexes.clone())
-            .unwrap_or_default()
-    }
 }
 
 /// The global CORS config, the static scope and the media scope.
@@ -778,7 +769,6 @@ pub fn start_server(
         None => None,
     };
 
-    let cors_origin_regexes = config.cors_origin_regexes();
     let app_state = Arc::new(AppState {
         dispatch,
         debug: config.debug,
@@ -788,7 +778,6 @@ pub fn start_server(
         asgi_mount_timeout: config.asgi_mount_timeout,
         stream_config: config.stream_config,
         global_cors_config: config.global_cors_config,
-        cors_origin_regexes,
         global_compression_config: global_compression_config.clone(),
         trusted_proxies: config.trusted_proxies,
         rate_limiters: Arc::default(),

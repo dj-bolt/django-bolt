@@ -10,8 +10,6 @@ use actix_web::http::header::{
     ACCESS_CONTROL_MAX_AGE, VARY,
 };
 
-use regex::Regex;
-
 use crate::metadata::CorsConfig;
 
 /// Add CORS headers to a HeaderMap using CorsConfig (supports regex patterns)
@@ -22,7 +20,6 @@ pub fn add_cors_headers_with_config(
     request_origin: Option<&str>,
     cors_config: &CorsConfig,
     global_cors_config: Option<&CorsConfig>,
-    global_regexes: &[Regex],
 ) -> bool {
     // Check if CORS_ALLOW_ALL_ORIGINS is True with credentials (invalid per spec)
     if cors_config.allow_all_origins && cors_config.credentials {
@@ -60,29 +57,27 @@ pub fn add_cors_headers_with_config(
         None => return false,
     };
 
-    // Use route-level origin_set first (O(1) lookup), then fall back to global
-    let origin_set = if !cors_config.origin_set.is_empty() {
-        &cors_config.origin_set
+    // A config with its own origins or patterns is the complete allow list.
+    // A config with neither uses the origins and regexes of the global config.
+    // Check the pattern strings: a pattern that does not compile must not widen
+    // the route to the global list.
+    let allow_list = if !cors_config.origin_set.is_empty() || !cors_config.origin_regexes.is_empty()
+    {
+        cors_config
     } else if let Some(global_config) = global_cors_config {
-        &global_config.origin_set
+        global_config
     } else {
         return false;
     };
 
-    // Check exact match using O(1) hash set lookup
-    let exact_match = origin_set.contains(req_origin);
-
-    // Check regex match using route-level regexes, then global regexes
-    let regex_match = if !cors_config.compiled_origin_regexes.is_empty() {
-        cors_config
+    // O(1) exact match, then the compiled regexes
+    let allowed = allow_list.origin_set.contains(req_origin)
+        || allow_list
             .compiled_origin_regexes
             .iter()
-            .any(|re| re.is_match(req_origin))
-    } else {
-        global_regexes.iter().any(|re| re.is_match(req_origin))
-    };
+            .any(|re| re.is_match(req_origin));
 
-    if !exact_match && !regex_match {
+    if !allowed {
         return false;
     }
 
@@ -160,10 +155,10 @@ mod tests {
         headers.get(name).map(|v| v.to_str().unwrap())
     }
 
-    /// Run the check of `config` with no global config and no global regexes.
+    /// Run the check of `config` with no global config.
     fn check(config: &CorsConfig, origin: Option<&str>) -> (bool, HeaderMap) {
         let mut headers = HeaderMap::new();
-        let allowed = add_cors_headers_with_config(&mut headers, origin, config, None, &[]);
+        let allowed = add_cors_headers_with_config(&mut headers, origin, config, None);
         (allowed, headers)
     }
 
@@ -260,7 +255,6 @@ mod tests {
             Some("https://g.example"),
             &route,
             Some(&global),
-            &[],
         ));
         assert_eq!(
             header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN),
@@ -283,36 +277,68 @@ mod tests {
             Some("https://g.example"),
             &route,
             Some(&global),
-            &[],
         ));
         assert!(headers.is_empty());
     }
 
+    /// Run the check of a route config against a global config.
+    fn check_route(route: &CorsConfig, global: &CorsConfig, origin: &str) -> bool {
+        add_cors_headers_with_config(&mut HeaderMap::new(), Some(origin), route, Some(global))
+    }
+
     #[test]
     fn route_regexes_replace_the_global_regexes() {
-        let global_regexes = [Regex::new(r"^https://[a-z]+\.global\.example$").unwrap()];
+        let global = cors(&[], &[r"^https://[a-z]+\.global\.example$"], false, false);
         let route = cors(
             &["https://r.example"],
             &[r"^https://[a-z]+\.route\.example$"],
             false,
             false,
         );
+        assert!(check_route(&route, &global, "https://app.route.example"));
+        assert!(!check_route(&route, &global, "https://app.global.example"));
+    }
 
-        let mut headers = HeaderMap::new();
-        assert!(add_cors_headers_with_config(
-            &mut headers,
-            Some("https://app.route.example"),
-            &route,
-            None,
-            &global_regexes,
-        ));
-        assert!(!add_cors_headers_with_config(
-            &mut HeaderMap::new(),
-            Some("https://app.global.example"),
-            &route,
-            None,
-            &global_regexes,
-        ));
+    #[test]
+    fn route_origins_replace_the_global_regexes() {
+        // A route with its own origins is the complete allow list.
+        let global = cors(
+            &["https://g.example"],
+            &[r"^https://[a-z]+\.global\.example$"],
+            false,
+            false,
+        );
+        let route = cors(&["https://r.example"], &[], false, true);
+        assert!(check_route(&route, &global, "https://r.example"));
+        assert!(!check_route(&route, &global, "https://app.global.example"));
+    }
+
+    #[test]
+    fn route_regexes_replace_the_global_origins() {
+        let global = cors(&["https://g.example"], &[], false, false);
+        let route = cors(&[], &[r"^https://[a-z]+\.route\.example$"], false, false);
+        assert!(check_route(&route, &global, "https://app.route.example"));
+        assert!(!check_route(&route, &global, "https://g.example"));
+    }
+
+    #[test]
+    fn route_with_only_invalid_regexes_does_not_take_the_global_list() {
+        // The regex crate has no look-around, so this pattern does not compile.
+        let route = cors(
+            &[],
+            &[r"^https://(?!evil)[a-z]+\.route\.example$"],
+            false,
+            true,
+        );
+        assert!(route.compiled_origin_regexes.is_empty());
+        let global = cors(
+            &["https://g.example"],
+            &[r"^https://[a-z]+\.global\.example$"],
+            false,
+            false,
+        );
+        assert!(!check_route(&route, &global, "https://g.example"));
+        assert!(!check_route(&route, &global, "https://app.global.example"));
     }
 
     #[test]
@@ -324,23 +350,8 @@ mod tests {
             false,
             false,
         );
-        // AppState holds a copy of the compiled regexes of the global config.
-        let global_regexes = &global.compiled_origin_regexes;
-
-        assert!(add_cors_headers_with_config(
-            &mut HeaderMap::new(),
-            Some("https://app.global.example"),
-            &route,
-            Some(&global),
-            global_regexes,
-        ));
-        assert!(!add_cors_headers_with_config(
-            &mut HeaderMap::new(),
-            Some("https://app.other.example"),
-            &route,
-            Some(&global),
-            global_regexes,
-        ));
+        assert!(check_route(&route, &global, "https://app.global.example"));
+        assert!(!check_route(&route, &global, "https://app.other.example"));
     }
 
     #[test]
