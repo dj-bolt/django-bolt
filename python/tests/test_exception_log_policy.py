@@ -18,6 +18,8 @@ import pytest
 from django.core.exceptions import DisallowedHost, PermissionDenied
 from django.db import DatabaseError, connection
 from django.db.models import QuerySet
+from django.http import Http404
+from django.shortcuts import get_object_or_404
 
 from django_bolt import BoltAPI, responses
 from django_bolt.exceptions import HTTPException, RequestValidationError, ResponseValidationError
@@ -143,6 +145,7 @@ _ERRORS = {
         500,
     ),
     "denied": (lambda: PermissionDenied("no access"), 403),
+    "http404": (lambda: Http404("No item 7"), 404),
     "request-validation": (
         lambda: RequestValidationError([{"loc": ["query", "q"], "msg": "bad", "type": "value_error"}]),
         422,
@@ -549,3 +552,79 @@ def test_an_allowed_dir_is_the_dir_that_the_os_resolves(server_errors, settings,
     assert secret_response.status_code == 403
     assert secret_response.json()["detail"] == "Permission denied"
     assert server_errors() == []
+
+
+@pytest.mark.parametrize(("debug", "detail"), [(False, "Not Found"), (True, "No item 7")])
+@pytest.mark.parametrize("dispatch", ["async", "sync"])
+def test_http404_gives_a_404(server_errors, settings, debug, detail, dispatch):
+    # Django shows the message of Http404 only with DEBUG=True. It can name a model.
+    settings.DEBUG = debug
+    api = BoltAPI()
+
+    if dispatch == "async":
+
+        @api.get("/item")
+        async def item():
+            await asyncio.sleep(0)
+            raise Http404("No item 7")
+
+    else:
+
+        @api.get("/item")
+        def item():
+            raise Http404("No item 7")
+
+    with TestClient(api) as client:
+        response = client.get("/item")
+
+    assert (response.status_code, response.json()["detail"]) == (404, detail)
+    assert server_errors() == []
+
+
+@pytest.mark.django_db
+def test_get_object_or_404_gives_a_404(server_errors):
+    api = BoltAPI()
+
+    @api.get("/articles/{article_id}")
+    def article(article_id: int):
+        return {"title": get_object_or_404(Article, pk=article_id).title}
+
+    with TestClient(api) as client:
+        response = client.get("/articles/999999")
+
+    assert response.status_code == 404
+    assert server_errors() == []
+
+
+def test_the_formatter_gets_http404_as_not_found():
+    def describe(error, request) -> JSON:
+        return JSON(
+            {"kind": error.kind, "detail": error.detail, "exception": type(error.exception).__name__},
+            status_code=error.status,
+        )
+
+    api = BoltAPI(error_formatter=describe)
+
+    @api.get("/item")
+    async def item():
+        raise Http404("No item 7")
+
+    with TestClient(api) as client:
+        response = client.get("/item")
+
+    assert response.status_code == 404
+    assert response.json() == {"kind": "not_found", "detail": "Not Found", "exception": "Http404"}
+
+
+def test_an_http404_with_no_message_gives_not_found_with_debug(settings):
+    settings.DEBUG = True
+    api = BoltAPI()
+
+    @api.get("/item")
+    async def item():
+        raise Http404
+
+    with TestClient(api) as client:
+        response = client.get("/item")
+
+    assert (response.status_code, response.json()["detail"]) == (404, "Not Found")

@@ -37,12 +37,14 @@ try:
     from django.conf import settings as django_settings
     from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
     from django.core.exceptions import SuspiciousOperation as DjangoSuspiciousOperation
+    from django.http import Http404 as DjangoHttp404
     from django.http import HttpResponse as DjangoHttpResponse
     from django.views.debug import ExceptionReporter
 except ImportError:
     django_settings = None
     DjangoPermissionDenied = None
     DjangoSuspiciousOperation = None
+    DjangoHttp404 = None
     DjangoHttpResponse = None
     ExceptionReporter = None
 
@@ -319,6 +321,7 @@ _CLIENT_ERROR_TYPES: tuple[type[BaseException], ...] = tuple(
         ResponseFileNotAllowed,
         DjangoPermissionDenied,
         DjangoSuspiciousOperation,
+        DjangoHttp404,
     )
     if error_type is not None
 )
@@ -395,6 +398,10 @@ def handle_exception(
             status_code=403,
             detail=str(exc) or "Permission denied",
         )
+    elif DjangoHttp404 is not None and isinstance(exc, DjangoHttp404):
+        # Django answers 404. It shows the message only in debug mode, because
+        # the message of get_object_or_404 names the model.
+        return format_error_response(status_code=404, detail=(str(exc) or "Not Found") if debug else "Not Found")
     else:
         # Generic exception
         return generic_exception_handler(exc, debug=debug, request=request)
@@ -577,6 +584,8 @@ def bolt_error_from_exception(exc: BaseException) -> BoltError:
         return BoltError(status=403, kind="forbidden", detail=str(exc) or "Permission denied", exception=exc)
     elif DjangoSuspiciousOperation is not None and isinstance(exc, DjangoSuspiciousOperation):
         return BoltError(status=400, kind="bad_request", detail="Bad Request", exception=exc)
+    elif DjangoHttp404 is not None and isinstance(exc, DjangoHttp404):
+        return BoltError(status=404, kind="not_found", detail="Not Found", exception=exc)
     else:
         return BoltError(status=500, kind="internal_error", detail="Internal Server Error", exception=exc)
     return BoltError(status=422, kind="validation", detail=_VALIDATION_DETAIL, errors=errors, exception=exc)

@@ -244,6 +244,7 @@ status, headers, body = generic_exception_handler(exc, debug=True)
 The main entry point that routes to appropriate handlers. It maps some Django exceptions as Django does:
 
 - `PermissionDenied` gives 403.
+- `Http404`, also from `get_object_or_404`, gives 404. With `DEBUG=False`, the detail is `Not Found`.
 - `SuspiciousOperation`, for example `DisallowedHost`, gives 400. Bolt logs it to the `django.security.<class name>` logger, as Django does. With `DEBUG=False`, the detail is `Bad Request`.
 
 ```python
@@ -383,7 +384,7 @@ api = BoltAPI(error_formatter=format_error)
 | `bad_request` | 400 | Too many headers, a header that is too large, a body that Bolt cannot read, or a Django `SuspiciousOperation`, such as `DisallowedHost` |
 | `not_authenticated` | 401 | A guard, or an `HTTPException(401)` |
 | `forbidden` | 403 | A guard, the CSRF origin check of Bolt, `PermissionDenied`, a `FileResponse` outside `BOLT_ALLOWED_FILE_PATHS` or an `HTTPException(403)` |
-| `not_found` | 404 | No route, a `FileResponse` or a `File` whose path names no regular file, or an `HTTPException(404)` |
+| `not_found` | 404 | No route, Django's `Http404` (also from `get_object_or_404`), a `FileResponse` or a `File` whose path names no regular file, or an `HTTPException(404)` |
 | `payload_too_large` | 413 | A body over `BOLT_MAX_UPLOAD_SIZE` |
 | `validation` | 422 | A value that fails validation, in Rust or in Python |
 | `rate_limited` | 429 | A rate limit |
