@@ -324,7 +324,7 @@ raise BadRequest(
 | 400 | `BadRequest` | Explicit raise only |
 | 401 | `Unauthorized` | Authentication failed |
 | 403 | `Forbidden` | Guard/permission denied |
-| 404 | `NotFound` | Resource not found, `ResponseFileNotFound` from `FileResponse` |
+| 404 | `NotFound` | Resource not found, Django's `Http404`, `ResponseFileNotFound` from `FileResponse` |
 | 405 | `MethodNotAllowed` | Wrong HTTP method |
 | 406 | `NotAcceptable` | Cannot produce requested format |
 | 409 | `Conflict` | State conflict |
