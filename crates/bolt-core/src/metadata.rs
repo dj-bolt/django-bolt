@@ -680,8 +680,9 @@ impl RouteMetadata {
                 for mw_dict in py_list {
                     if let Some(mw_type) = mw_dict.get("type") {
                         if let Ok(type_str) = mw_type.extract::<String>(py) {
-                            // Parse CORS config separately for fast access
-                            if type_str == "cors" && cors_config.is_none() {
+                            // Parse CORS config separately for fast access. The list is
+                            // API, router, then route: the last (most specific) config wins.
+                            if type_str == "cors" {
                                 cors_config = parse_cors_config(&mw_dict, py);
                             }
 

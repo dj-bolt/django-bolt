@@ -57,16 +57,18 @@ pub fn add_cors_headers_with_config(
         None => return false,
     };
 
-    // A config with its own origins or regexes is the complete allow list.
+    // A config with its own origins or patterns is the complete allow list.
     // A config with neither uses the origins and regexes of the global config.
-    let allow_list =
-        if !cors_config.origin_set.is_empty() || !cors_config.compiled_origin_regexes.is_empty() {
-            cors_config
-        } else if let Some(global_config) = global_cors_config {
-            global_config
-        } else {
-            return false;
-        };
+    // Check the pattern strings: a pattern that does not compile must not widen
+    // the route to the global list.
+    let allow_list = if !cors_config.origin_set.is_empty() || !cors_config.origin_regexes.is_empty()
+    {
+        cors_config
+    } else if let Some(global_config) = global_cors_config {
+        global_config
+    } else {
+        return false;
+    };
 
     // O(1) exact match, then the compiled regexes
     let allowed = allow_list.origin_set.contains(req_origin)
@@ -317,6 +319,26 @@ mod tests {
         let route = cors(&[], &[r"^https://[a-z]+\.route\.example$"], false, false);
         assert!(check_route(&route, &global, "https://app.route.example"));
         assert!(!check_route(&route, &global, "https://g.example"));
+    }
+
+    #[test]
+    fn route_with_only_invalid_regexes_does_not_take_the_global_list() {
+        // The regex crate has no look-around, so this pattern does not compile.
+        let route = cors(
+            &[],
+            &[r"^https://(?!evil)[a-z]+\.route\.example$"],
+            false,
+            true,
+        );
+        assert!(route.compiled_origin_regexes.is_empty());
+        let global = cors(
+            &["https://g.example"],
+            &[r"^https://[a-z]+\.global\.example$"],
+            false,
+            false,
+        );
+        assert!(!check_route(&route, &global, "https://g.example"));
+        assert!(!check_route(&route, &global, "https://app.global.example"));
     }
 
     #[test]

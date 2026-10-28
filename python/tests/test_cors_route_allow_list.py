@@ -84,6 +84,68 @@ def test_route_origin_regexes_without_origins(global_cors):
         assert _origin_headers(client, "/tenant", "https://global.test")[0] is None
 
 
-def test_cors_needs_origins_or_origin_regexes():
-    with pytest.raises(ValueError, match="requires 'origins'"):
-        cors()(lambda: None)
+def test_route_origin_regexes_without_global_cors():
+    api = BoltAPI()
+
+    @api.get("/tenant")
+    @cors(origin_regexes=[r"^https://[a-z]+\.tenant\.test$"])
+    async def tenant():
+        return {}
+
+    with TestClient(api, use_http_layer=True, read_django_settings=False) as client:
+        assert _origin_headers(client, "/tenant", "https://acme.tenant.test")[0] == "https://acme.tenant.test"
+        assert _origin_headers(client, "/tenant", "https://other.test")[0] is None
+
+
+def test_a_string_origin_regexes_is_one_pattern(global_cors):
+    api = BoltAPI()
+
+    @api.get("/tenant")
+    @cors(origin_regexes=r"^https://[a-z]+\.tenant\.test$", credentials=True)
+    async def tenant():
+        return {}
+
+    with TestClient(api, use_http_layer=True) as client:
+        assert _origin_headers(client, "/tenant", "https://acme.tenant.test")[0] == "https://acme.tenant.test"
+        assert _origin_headers(client, "/tenant", "https://attacker.evil") == (None, None)
+
+
+def test_route_with_only_invalid_patterns_does_not_take_the_global_list(global_cors):
+    api = BoltAPI()
+
+    # The Rust regex crate has no look-around, so this pattern does not compile.
+    @api.get("/tenant")
+    @cors(origin_regexes=[r"^https://(?!evil)[a-z]+\.tenant\.test$"], credentials=True)
+    async def tenant():
+        return {}
+
+    with TestClient(api, use_http_layer=True) as client:
+        assert _origin_headers(client, "/tenant", "https://global.test") == (None, None)
+        assert _origin_headers(client, "/tenant", "https://shop.example.com") == (None, None)
+
+
+def test_route_cors_wins_over_the_cors_of_the_api():
+    api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://api.test"]}])
+
+    @api.get("/route")
+    @cors(origins=["https://route.test"])
+    async def route():
+        return {}
+
+    @api.get("/plain")
+    async def plain():
+        return {}
+
+    with TestClient(api, use_http_layer=True, read_django_settings=False) as client:
+        assert _origin_headers(client, "/route", "https://route.test")[0] == "https://route.test"
+        assert _origin_headers(client, "/route", "https://api.test")[0] is None
+        assert _origin_headers(client, "/plain", "https://api.test")[0] == "https://api.test"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"origins": []}, {"origin_regexes": []}, {"origins": [], "origin_regexes": []}],
+)
+def test_cors_needs_an_origin_or_a_pattern(kwargs):
+    with pytest.raises(ValueError, match="requires an 'origins' or 'origin_regexes' argument"):
+        cors(**kwargs)(lambda: None)
