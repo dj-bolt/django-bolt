@@ -154,7 +154,7 @@ ResponseValidationError(
 | Exception | Subclass of | Status | When raised |
 |-----------|-------------|--------|-------------|
 | `ResponseFileNotFound` | `FileNotFoundError` | 404 | The path names no regular file: it does not exist, it is a directory, or it is not valid |
-| `ResponseFileNotAllowed` | `PermissionError` | 403 | The path is outside `BOLT_ALLOWED_FILE_PATHS`, also when the server cannot read it |
+| `ResponseFileNotAllowed` | `PermissionError` | 403 | The path is outside `BOLT_ALLOWED_FILE_PATHS`, also when it names no file or the server cannot read it |
 
 ## Validation Layers
 

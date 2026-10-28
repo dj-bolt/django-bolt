@@ -434,3 +434,55 @@ def test_a_path_out_of_the_allowed_dirs_that_the_server_cannot_read_is_a_403(
 
     assert (response.status_code, response.json()["detail"]) == (403, "Permission denied")
     assert server_errors() == []
+
+
+@pytest.mark.parametrize("kind", ["existing", "missing", "directory", "below-a-file", "symlink-loop", "walk-out"])
+def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server_errors, allowed_dir, tmp_path, kind):
+    # A 404 for a missing path and a 403 for a file would tell a client which paths exist out of the allowed dirs.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret")
+    loop = outside / "loop"
+    loop.symlink_to(loop)
+    paths = {
+        "existing": outside / "secret.txt",
+        "missing": outside / "missing.txt",
+        "directory": outside,
+        "below-a-file": outside / "secret.txt" / "x",
+        "symlink-loop": loop,
+        "walk-out": allowed_dir / ".." / "outside" / "missing.txt",
+    }
+    api = BoltAPI()
+
+    @api.get("/file")
+    def file():
+        return FileResponse(str(paths[kind]))
+
+    with TestClient(api) as client:
+        response = client.get("/file")
+
+    assert (response.status_code, response.json()["detail"]) == (403, "Permission denied")
+    assert server_errors() == []
+
+
+def test_a_missing_file_in_an_allowed_dir_named_through_a_link_is_a_404(server_errors, settings, monkeypatch, tmp_path):
+    # Bolt resolves the links of BOLT_ALLOWED_FILE_PATHS, but the path of a FileResponse can keep them.
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    settings.BOLT_ALLOWED_FILE_PATHS = [str(alias)]
+    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
+    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
+    responses.initialize_file_response_settings()
+    api = BoltAPI()
+
+    @api.get("/file")
+    def file():
+        return FileResponse(str(alias / "missing.txt"))
+
+    with TestClient(api) as client:
+        response = client.get("/file")
+
+    assert (response.status_code, response.json()["detail"]) == (404, "File not found")
+    assert server_errors() == []

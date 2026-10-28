@@ -60,21 +60,26 @@ const SYMLINK_LOOP: i32 = libc::ELOOP;
 /// it. A path that names no regular file is a 404, as in Django's `serve`.
 /// Only Bolt raises these errors, so the error handler maps only them to 404 and 403.
 ///
-/// A path that the server may not read is a 403 when it is outside the allowed
-/// directories, because the client walked out of them. Inside them, or with no
-/// allowed directories, it is a server fault: a plain `PermissionError` and a logged 500.
+/// Out of the allowed directories, each such path is a 403, also when the
+/// server may not read it. A 404 there would tell a client which paths exist.
+/// A path in the allowed directories that the server may not read, or any such
+/// path with no allowed directories, is a server fault: a logged 500.
 fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathBuf]>) -> PyErr {
-    match error.kind() {
-        ErrorKind::PermissionDenied => match allowed {
-            Some(roots) if !lexically_within(path, roots) => not_allowed(path),
-            _ => PyErr::from(error),
-        },
+    let names_no_file = matches!(
+        error.kind(),
         ErrorKind::NotFound
-        | ErrorKind::NotADirectory
-        | ErrorKind::InvalidInput
-        | ErrorKind::InvalidFilename => file_not_found(path),
-        _ if error.raw_os_error() == Some(SYMLINK_LOOP) => file_not_found(path),
-        _ => PyErr::from(error),
+            | ErrorKind::NotADirectory
+            | ErrorKind::InvalidInput
+            | ErrorKind::InvalidFilename
+    ) || error.raw_os_error() == Some(SYMLINK_LOOP);
+    let denied = error.kind() == ErrorKind::PermissionDenied;
+    if (names_no_file || denied) && allowed.is_some_and(|roots| !lexically_within(path, roots)) {
+        return not_allowed(path);
+    }
+    if names_no_file {
+        file_not_found(path)
+    } else {
+        PyErr::from(error)
     }
 }
 
@@ -113,14 +118,15 @@ pub fn resolve_response_file(path: PathBuf, allowed: Option<Vec<PathBuf>>) -> Py
     let roots = allowed.as_deref();
     let resolved =
         std::fs::canonicalize(&path).map_err(|error| file_lookup_error(error, &path, roots))?;
+    // Check the roots before the type, so a directory out of them is a 403 as a file is.
+    if roots.is_some_and(|roots| !roots.iter().any(|root| resolved.starts_with(root))) {
+        return Err(not_allowed(&path));
+    }
     let metadata = resolved
         .metadata()
         .map_err(|error| file_lookup_error(error, &path, roots))?;
     if !metadata.is_file() {
         return Err(file_not_found(&path));
-    }
-    if roots.is_some_and(|roots| !roots.iter().any(|root| resolved.starts_with(root))) {
-        return Err(not_allowed(&path));
     }
     Ok(resolved.into_os_string())
 }
