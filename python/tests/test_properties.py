@@ -425,6 +425,8 @@ def file_client(tmp_path_factory):
 @example(parts=["..", "outside", "probe", "..", "..", "public", "known.txt"])
 @example(parts=["escape", "probe", "..", "back", "known.txt"])
 @example(parts=["dangling"])
+@example(parts=["dangling", "..", "back"])
+@example(parts=["escape", "..", "outside", "probe"])
 def test_a_file_response_status_does_not_show_whether_a_file_out_of_the_allowed_dir_exists(file_client, parts):
     client, probe = file_client
     path = "/".join(parts)

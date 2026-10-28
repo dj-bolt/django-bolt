@@ -389,7 +389,7 @@ api = BoltAPI(error_formatter=format_error)
 | `validation` | 422 | A value that fails validation, in Rust or in Python |
 | `rate_limited` | 429 | A rate limit |
 | `response_validation` | 500 | A handler return value that fails validation |
-| `internal_error` | 500 | An unhandled exception, also a `FileNotFoundError` or `PermissionError` of handler code, a file in `BOLT_ALLOWED_FILE_PATHS` that the server cannot read, or a failure in the Rust core |
+| `internal_error` | 500 | An unhandled exception, also a `FileNotFoundError` or `PermissionError` of handler code, a file in `BOLT_ALLOWED_FILE_PATHS` that the server cannot read, a directory on the way to them that the server cannot search, or a failure in the Rust core |
 
 An `HTTPException` gets its kind from its status, for example `conflict` for 409. A status with no name gives `http_error`.
 

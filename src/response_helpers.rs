@@ -67,7 +67,9 @@ const SYMLINK_LOOP: i32 = libc::ELOOP;
 /// This is also true when the server cannot search a directory there. A 404
 /// there would tell a client which files exist. A server that cannot reach a
 /// file in the allowed directories has a fault: a logged 500. This is also
-/// true with no allowed directories.
+/// true with no allowed directories, and for a directory that the server
+/// cannot search on the way to an allowed directory. An allowed directory that
+/// does not exist yet names no file, so a path in it is a 404.
 fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathBuf]>) -> PyErr {
     let names_no_file = matches!(
         error.kind(),
@@ -83,13 +85,12 @@ fn file_lookup_error(error: std::io::Error, path: &Path, allowed: Option<&[PathB
     // The OS looks up no part of an empty path, so it names no file anywhere.
     if let Some(roots) = allowed.filter(|_| !path.as_os_str().is_empty()) {
         let stop = lookup_stop(path);
-        // A directory on the way to an allowed directory that the server cannot search is a deploy fault.
-        let blocks_a_root = denied
-            && stop.blocked.is_some_and(|blocked| {
-                roots
-                    .iter()
-                    .any(|root| comparable(root).starts_with(&blocked))
-            });
+        // The lookup failed on the way to an allowed directory: the directory is missing or the server cannot search it.
+        let blocks_a_root = stop.blocked.is_some_and(|blocked| {
+            roots
+                .iter()
+                .any(|root| comparable(root).starts_with(&blocked))
+        });
         if !within(&stop.reached, roots) && !blocks_a_root {
             return not_allowed(path);
         }
