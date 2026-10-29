@@ -391,6 +391,7 @@ mod tests {
     use flate2::read::GzDecoder;
     use futures_util::StreamExt;
     use futures_util::stream;
+    use proptest::prelude::*;
     use std::io::Read;
 
     async fn collect_compressed(codec: StreamCodec, events: Vec<&'static [u8]>) -> Vec<Bytes> {
@@ -468,6 +469,41 @@ mod tests {
             .read_to_end(&mut decoded)
             .unwrap();
         assert!(decoded.is_empty());
+    }
+
+    // ─── Stream adapter ───────────────────────────────────────────────
+
+    /// An encoder that copies each chunk and has no tail.
+    struct CopyEncoder;
+
+    impl PerChunkEncoder for CopyEncoder {
+        fn write_chunk(&mut self, input: &[u8]) -> std::io::Result<Vec<u8>> {
+            Ok(input.to_vec())
+        }
+
+        fn finish(self: Box<Self>) -> std::io::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stream_yields_no_empty_chunk() {
+        // An empty output chunk and an empty tail give no item.
+        let items: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"a")),
+            Ok(Bytes::new()),
+            Ok(Bytes::from_static(b"b")),
+        ];
+        let mut wrapped = EncoderStream {
+            inner: stream::iter(items),
+            encoder: Some(Box::new(CopyEncoder)),
+            init_error: None,
+        };
+        let mut out = Vec::new();
+        while let Some(chunk) = wrapped.next().await {
+            out.push(chunk.expect("chunk"));
+        }
+        assert_eq!(out, [Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
     }
 
     // ─── Gzip ─────────────────────────────────────────────────────────
@@ -603,6 +639,90 @@ mod tests {
         assert!(accepts_encoding("br ;  q=0.5", "br"));
     }
 
+    /// One `Accept-Encoding` entry: the coding, its weight in thousandths
+    /// (`None` for no `q`), and how the header writes it.
+    #[derive(Debug, Clone)]
+    struct AcceptEntry {
+        coding: &'static str,
+        q: Option<u16>,
+        upper: bool,
+        spaces: bool,
+    }
+
+    impl AcceptEntry {
+        fn render(&self) -> String {
+            let coding = if self.upper {
+                self.coding.to_ascii_uppercase()
+            } else {
+                self.coding.to_string()
+            };
+            let Some(q) = self.q else {
+                return coding;
+            };
+            let sp = if self.spaces { " " } else { "" };
+            let q_name = if self.upper { "Q" } else { "q" };
+            format!(
+                "{coding}{sp};{sp}{q_name}{sp}={sp}{}.{:03}",
+                q / 1000,
+                q % 1000
+            )
+        }
+    }
+
+    fn accept_entry() -> impl Strategy<Value = AcceptEntry> {
+        // Only a weight of 0 rejects, so give the bounds a high share.
+        let q = prop_oneof![Just(0u16), Just(1000u16), 0u16..=1000];
+        (
+            prop::sample::select(&["br", "gzip", "zstd", "deflate", "identity", "*"][..]),
+            prop::option::of(q),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(coding, q, upper, spaces)| AcceptEntry {
+                coding,
+                q,
+                upper,
+                spaces,
+            })
+    }
+
+    proptest! {
+        /// The last entry that names the coding gives its weight. With no such
+        /// entry, the last `*` entry gives it. A weight of 0 rejects the coding.
+        #[test]
+        fn accepts_encoding_follows_the_weights(
+            entries in prop::collection::vec(accept_entry(), 0..8),
+            name in prop::sample::select(&["br", "gzip", "zstd"][..]),
+        ) {
+            let header = entries
+                .iter()
+                .map(AcceptEntry::render)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let weight = |coding: &str| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.coding == coding)
+                    .map(|entry| entry.q.unwrap_or(1000))
+            };
+            let expected = weight(name).or_else(|| weight("*")).is_some_and(|q| q > 0);
+            prop_assert_eq!(accepts_encoding(&header, name), expected);
+        }
+
+        /// The coding names, the `q` name and the `q` value ignore case.
+        #[test]
+        fn accepts_encoding_ignores_case(
+            header in "((br|gzip|zstd|\\*|[a-z]{1,4})( ?; ?(q|[a-z]{1,2}) ?= ?(0|1|0\\.[0-9]|nan|inf|infinity|[a-z0-9.]{1,4}))?, ?){0,4}",
+            name in prop::sample::select(&["br", "gzip", "zstd"][..]),
+        ) {
+            prop_assert_eq!(
+                accepts_encoding(&header, name),
+                accepts_encoding(&header.to_ascii_uppercase(), name)
+            );
+        }
+    }
+
     // ─── select_stream_encoding ────────────────────────────────────────
 
     fn req_with_ae(ae: &str) -> HttpRequest {
@@ -652,6 +772,22 @@ mod tests {
         };
         let r = req_with_ae("gzip");
         assert!(select_stream_encoding(&r, Some(&cfg), false).is_none());
+    }
+
+    #[test]
+    fn select_picks_gzip_backend_without_the_fallback() {
+        // The gzip backend is the preferred codec. It does not need the fallback.
+        let cfg = CompressionConfig {
+            backend: "gzip".to_string(),
+            gzip_fallback: false,
+            gzip_level: 4,
+            ..Default::default()
+        };
+        let r = req_with_ae("gzip");
+        match select_stream_encoding(&r, Some(&cfg), false).unwrap() {
+            StreamCodec::Gzip { level: 4 } => {}
+            other => panic!("expected Gzip level 4, got {:?}", other),
+        }
     }
 
     #[test]
