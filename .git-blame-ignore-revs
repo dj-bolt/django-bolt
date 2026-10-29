@@ -1,0 +1,7 @@
+# Commits that git blame skips. Each commit here changes only the form of
+# the code. GitHub reads this file. To use it in a local clone, run:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# chore: move the Rust crates to edition 2024 (#506)
+# rustfmt 2024 style edition, and nested if-lets collapsed into let chains.
+3fcabb95dc1a2e4fcb5ccd16eabd8498cfa09cb5
