@@ -10,7 +10,7 @@ use actix_web::{
     Error,
     body::{BodySize, MessageBody},
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
-    http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding, VARY},
+    http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding},
 };
 use futures_util::future::LocalBoxFuture;
 use std::future::{Ready, ready};
@@ -113,7 +113,7 @@ where
             }
 
             // Apply compression based on CompressionConfig and Accept-Encoding
-            let (req, mut response) = res.into_parts();
+            let (req, response) = res.into_parts();
 
             // Select encoding based on config and client support
             let encoding =
@@ -135,14 +135,8 @@ where
             };
 
             if should_compress {
-                // Add Vary header to indicate content varies by Accept-Encoding
-                // Use append (not insert) to preserve existing Vary headers like CORS's Vary: Origin
-                response.headers_mut().append(
-                    VARY,
-                    actix_web::http::header::HeaderValue::from_static("accept-encoding"),
-                );
-
-                // Create encoder with selected encoding
+                // When the encoder compresses the body, it sets Content-Encoding
+                // and appends `Vary: accept-encoding` after a Vary of the handler.
                 Ok(ServiceResponse::new(
                     req,
                     response.map_body(|head, body| Encoder::response(encoding, head, body)),
