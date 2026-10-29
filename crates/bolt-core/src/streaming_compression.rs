@@ -109,6 +109,9 @@ fn codec_for_backend(backend: &str, cfg: &CompressionConfig) -> Option<StreamCod
 /// Treats `*` as accepting any unmentioned coding (but `*;q=0` rejects
 /// unmentioned codings). Case-insensitive on the coding name.
 ///
+/// The header comes from `HeaderValue::to_str`, which accepts only visible
+/// ASCII, spaces and tabs. Thus ASCII trimming removes all OWS.
+///
 /// Per RFC 7231 §5.3.4: weight defaults to 1.0; q=0 means "not acceptable."
 /// Non-finite parsed weights (NaN/Inf) and out-of-range values are clamped
 /// to the [0.0, 1.0] range, then values <= 0.0 reject the coding.
@@ -116,35 +119,33 @@ pub fn accepts_encoding(header: &str, name: &str) -> bool {
     let mut star_q: Option<f32> = None;
     let mut explicit_q: Option<f32> = None;
     for entry in header.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
+        let mut pieces = entry.split(';');
+        let coding = pieces.next().unwrap_or("").trim_ascii();
+        let is_name = coding.eq_ignore_ascii_case(name);
+        // Only the named coding and `*` change the result, so the
+        // parameters of other codings are not parsed.
+        if !is_name && coding != "*" {
             continue;
         }
-        let mut pieces = entry.split(';');
-        let coding = pieces.next().unwrap_or("").trim();
         let mut q: f32 = 1.0;
         for piece in pieces {
             // Tolerate OWS around `=` per RFC 7230 §3.2.3 (e.g. `q = 0.5`).
-            let piece = piece.trim();
-            let lower_piece = piece.to_ascii_lowercase();
-            if let Some(rest) = lower_piece.strip_prefix("q") {
-                let rest = rest.trim_start();
-                if let Some(value) = rest.strip_prefix('=') {
-                    let value = value.trim();
-                    if let Ok(parsed) = value.parse::<f32>() {
-                        // Reject NaN; clamp to [0, 1] per RFC 7231 §5.3.1.
-                        if parsed.is_nan() {
-                            q = 0.0;
-                        } else {
-                            q = parsed.clamp(0.0, 1.0);
-                        }
-                    }
-                }
+            // f32 parses `nan` and `inf` in any case.
+            if let Some(rest) = piece.trim_ascii().strip_prefix(['q', 'Q'])
+                && let Some(value) = rest.trim_ascii_start().strip_prefix('=')
+                && let Ok(parsed) = value.trim_ascii().parse::<f32>()
+            {
+                // Reject NaN; clamp to [0, 1] per RFC 7231 §5.3.1.
+                q = if parsed.is_nan() {
+                    0.0
+                } else {
+                    parsed.clamp(0.0, 1.0)
+                };
             }
         }
-        if coding.eq_ignore_ascii_case(name) {
+        if is_name {
             explicit_q = Some(q);
-        } else if coding == "*" {
+        } else {
             star_q = Some(q);
         }
     }
