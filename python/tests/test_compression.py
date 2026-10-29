@@ -134,6 +134,37 @@ def test_compression_custom_config():
     assert large_resp.json() == {"data": "x" * 2000}
 
 
+def test_compressed_response_has_one_vary_accept_encoding():
+    """A compressed response names Accept-Encoding in Vary once, after the Vary of the handler."""
+    api = BoltAPI(compression=CompressionConfig(backend="brotli", minimum_size=500))
+
+    @api.get("/data")
+    async def get_data():
+        return {"data": "x" * 1000}
+
+    @api.get("/origin")
+    async def get_origin():
+        return Response({"data": "x" * 1000}, headers={"Vary": "Origin"})
+
+    @api.get("/small")
+    async def get_small():
+        return {"data": "x"}
+
+    with TestClient(api, use_http_layer=True) as client:
+        response = client.get("/data", headers={"Accept-Encoding": "br"})
+        assert response.headers.get("content-encoding") == "br"
+        assert response.headers.get_list("vary") == ["accept-encoding"]
+
+        response = client.get("/origin", headers={"Accept-Encoding": "br"})
+        assert response.headers.get("content-encoding") == "br"
+        assert response.headers.get_list("vary") == ["Origin", "accept-encoding"]
+
+        # A response under minimum_size is not compressed, so it has no Vary.
+        response = client.get("/small", headers={"Accept-Encoding": "br"})
+        assert response.headers.get("content-encoding") is None
+        assert response.headers.get_list("vary") == []
+
+
 def test_compression_brotli_config():
     """Test brotli compression configuration."""
     api = BoltAPI(compression=CompressionConfig(backend="brotli", minimum_size=500))

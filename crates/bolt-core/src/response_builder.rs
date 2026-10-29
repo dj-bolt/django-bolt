@@ -3,11 +3,14 @@
 /// Reduces the number of mutations on HttpResponse::Builder
 /// by batching operations and pre-allocating capacity.
 use actix_web::body::MessageBody;
-use actix_web::http::header::{HeaderName, HeaderValue};
+use actix_web::http::header::{self, HeaderName, HeaderValue};
 use actix_web::{HttpResponse, HttpResponseBuilder, http::StatusCode};
 
 use crate::cookies::format_cookie;
 use crate::response_meta::ResponseMeta;
+
+/// The `Content-Encoding` marker that tells the compression middleware to skip.
+const IDENTITY: HeaderValue = HeaderValue::from_static("identity");
 
 /// Build a streaming response with SSE headers.
 /// Pre-bundles common SSE headers to avoid multiple mutations.
@@ -128,21 +131,26 @@ where
 {
     let mut builder = HttpResponse::build(status);
 
-    // 1. Content-Type: use custom or derive from response_type
-    let content_type = meta
-        .custom_content_type
-        .as_deref()
-        .unwrap_or_else(|| meta.response_type.content_type());
-
-    if !content_type.is_empty() {
-        builder.insert_header(("content-type", content_type));
+    // 1. Content-Type: use custom or derive from response_type. The header
+    // name is a constant, and a static type needs no copy of its value.
+    match meta.custom_content_type.as_deref() {
+        Some(content_type) => {
+            if !content_type.is_empty() {
+                builder.insert_header((header::CONTENT_TYPE, content_type));
+            }
+        }
+        None => {
+            if let Some(value) = meta.response_type.content_type_header() {
+                builder.insert_header((header::CONTENT_TYPE, value));
+            }
+        }
     }
 
-    // 2. Custom headers (lowercase keys in Rust - single location)
+    // 2. Custom headers. `HeaderName::from_bytes` gives a lower-case name,
+    // so the key needs no lower-case copy.
     if let Some(ref headers) = meta.custom_headers {
         for (k, v) in headers {
-            // Lowercase here instead of in Python (best practice from Robyn)
-            if let Ok(name) = HeaderName::try_from(k.to_ascii_lowercase())
+            if let Ok(name) = HeaderName::from_bytes(k.as_bytes())
                 && let Ok(val) = HeaderValue::try_from(v.as_str())
             {
                 builder.append_header((name, val));
@@ -154,7 +162,7 @@ where
     if let Some(ref cookies) = meta.cookies {
         for cookie in cookies {
             if let Some(header_value) = format_cookie(cookie) {
-                builder.append_header(("set-cookie", header_value));
+                builder.append_header((header::SET_COOKIE, header_value));
             }
             // Invalid cookies are logged and skipped by format_cookie
         }
@@ -162,7 +170,7 @@ where
 
     // 4. Compression skip if needed
     if skip_compression {
-        builder.insert_header(("content-encoding", "identity"));
+        builder.insert_header((header::CONTENT_ENCODING, IDENTITY));
     }
 
     // 5. A 204 has no body (RFC 9110 §15.3.5). Actix drops the content-length
@@ -180,34 +188,167 @@ mod tests {
     use super::*;
     use crate::response_meta::{CookieData, ResponseType};
 
+    fn meta(response_type: ResponseType) -> ResponseMeta {
+        ResponseMeta {
+            response_type,
+            custom_content_type: None,
+            custom_headers: None,
+            cookies: None,
+        }
+    }
+
+    fn session_cookie() -> CookieData {
+        CookieData {
+            name: "session".to_string(),
+            value: "abc123".to_string(),
+            path: "/".to_string(),
+            max_age: Some(3600),
+            expires: None,
+            domain: None,
+            secure: true,
+            httponly: true,
+            samesite: Some("Lax".to_string()),
+        }
+    }
+
+    /// A cookie that `format_cookie` rejects: a space is not valid in a name.
+    fn invalid_cookie() -> CookieData {
+        CookieData {
+            name: "bad name".to_string(),
+            ..session_cookie()
+        }
+    }
+
+    /// The values of each header `name` in the response, in order.
+    fn values(response: &HttpResponse, name: &str) -> Vec<String> {
+        response
+            .headers()
+            .get_all(name)
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_build_sse_response_sets_the_encoding_and_appends_vary() {
+        let headers = vec![
+            ("vary".to_string(), "Origin".to_string()),
+            ("x-trace".to_string(), "1".to_string()),
+        ];
+        let response = build_sse_response(StatusCode::OK, headers, "br", false).finish();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(values(&response, "content-type"), ["text/event-stream"]);
+        assert_eq!(values(&response, "content-encoding"), ["br"]);
+        assert_eq!(values(&response, "vary"), ["Origin", "Accept-Encoding"]);
+        assert_eq!(values(&response, "x-trace"), ["1"]);
+        assert_eq!(values(&response, "x-accel-buffering"), ["no"]);
+        assert_eq!(
+            values(&response, "cache-control"),
+            ["no-cache, no-store, must-revalidate"]
+        );
+        assert_eq!(values(&response, "pragma"), ["no-cache"]);
+        assert_eq!(values(&response, "expires"), ["0"]);
+    }
+
+    #[test]
+    fn test_build_sse_response_keeps_a_user_set_encoding() {
+        let headers = vec![("content-encoding".to_string(), "gzip".to_string())];
+        let response = build_sse_response(StatusCode::OK, headers, "identity", true).finish();
+        assert_eq!(values(&response, "content-encoding"), ["gzip"]);
+        assert!(values(&response, "vary").is_empty());
+    }
+
     #[test]
     fn test_build_rate_limit_response() {
         let response = build_rate_limit_response(60, 100, 200, b"{}".to_vec());
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(values(&response, "retry-after"), ["60"]);
+        assert_eq!(values(&response, "x-ratelimit-limit"), ["100"]);
+        assert_eq!(values(&response, "x-ratelimit-burst"), ["200"]);
+        assert_eq!(values(&response, "content-type"), ["application/json"]);
+    }
+
+    #[test]
+    fn test_meta_to_headers_gives_each_header_in_order() {
+        let meta = ResponseMeta {
+            custom_headers: Some(vec![("X-Custom".to_string(), "Value".to_string())]),
+            cookies: Some(vec![invalid_cookie(), session_cookie()]),
+            ..meta(ResponseType::Json)
+        };
+        let cookie = format_cookie(&session_cookie()).unwrap();
+        assert_eq!(
+            meta_to_headers(&meta),
+            [
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-custom".to_string(), "Value".to_string()),
+                ("set-cookie".to_string(), cookie),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_meta_to_headers_prefers_the_custom_content_type() {
+        let meta = ResponseMeta {
+            custom_content_type: Some("application/vnd.api+json".to_string()),
+            ..meta(ResponseType::Json)
+        };
+        assert_eq!(
+            meta_to_headers(&meta),
+            [(
+                "content-type".to_string(),
+                "application/vnd.api+json".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_meta_to_headers_has_no_content_type_for_an_empty_response() {
+        assert!(meta_to_headers(&meta(ResponseType::Empty)).is_empty());
     }
 
     #[test]
     fn test_build_response_from_meta_json() {
-        let meta = ResponseMeta {
-            response_type: ResponseType::Json,
-            custom_content_type: None,
-            custom_headers: None,
-            cookies: None,
-        };
-        let response = build_response_from_meta(StatusCode::OK, &meta, b"{}".to_vec(), false);
+        let response = build_response_from_meta(
+            StatusCode::OK,
+            &meta(ResponseType::Json),
+            b"{}".to_vec(),
+            false,
+        );
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(values(&response, "content-type"), ["application/json"]);
+        assert!(values(&response, "content-encoding").is_empty());
+        assert_eq!(response.body().size(), actix_web::body::BodySize::Sized(2));
+    }
+
+    #[test]
+    fn test_build_response_from_meta_empty_has_no_content_type() {
+        let response = build_response_from_meta(
+            StatusCode::OK,
+            &meta(ResponseType::Empty),
+            Vec::new(),
+            false,
+        );
+        assert!(values(&response, "content-type").is_empty());
+    }
+
+    #[test]
+    fn test_build_response_from_meta_skip_compression_sets_identity() {
+        let response = build_response_from_meta(
+            StatusCode::OK,
+            &meta(ResponseType::Json),
+            b"{}".to_vec(),
+            true,
+        );
+        assert_eq!(values(&response, "content-encoding"), ["identity"]);
     }
 
     #[test]
     fn test_build_response_from_meta_no_content_drops_the_body() {
-        let meta = ResponseMeta {
-            response_type: ResponseType::Json,
-            custom_content_type: None,
-            custom_headers: None,
-            cookies: None,
-        };
-        let response =
-            build_response_from_meta(StatusCode::NO_CONTENT, &meta, b"{}".to_vec(), false);
+        let response = build_response_from_meta(
+            StatusCode::NO_CONTENT,
+            &meta(ResponseType::Json),
+            b"{}".to_vec(),
+            false,
+        );
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(response.body().size(), actix_web::body::BodySize::Sized(0));
     }
@@ -215,75 +356,75 @@ mod tests {
     #[test]
     fn test_build_response_from_meta_with_custom_content_type() {
         let meta = ResponseMeta {
-            response_type: ResponseType::Json,
             custom_content_type: Some("application/vnd.api+json".to_string()),
-            custom_headers: None,
-            cookies: None,
+            ..meta(ResponseType::Json)
         };
         let response = build_response_from_meta(StatusCode::OK, &meta, b"{}".to_vec(), false);
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            values(&response, "content-type"),
+            ["application/vnd.api+json"]
+        );
     }
 
     #[test]
     fn test_build_response_from_meta_with_headers() {
+        // An invalid name or value drops that header only.
         let meta = ResponseMeta {
-            response_type: ResponseType::Json,
-            custom_content_type: None,
             custom_headers: Some(vec![
                 ("X-Custom".to_string(), "value".to_string()),
+                ("X-Custom".to_string(), "second".to_string()),
+                ("bad name".to_string(), "dropped".to_string()),
+                ("X-Bad-Value".to_string(), "line\nbreak".to_string()),
                 ("X-Another".to_string(), "test".to_string()),
             ]),
-            cookies: None,
+            ..meta(ResponseType::Json)
         };
         let response = build_response_from_meta(StatusCode::OK, &meta, b"{}".to_vec(), false);
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(values(&response, "x-custom"), ["value", "second"]);
+        assert_eq!(values(&response, "x-another"), ["test"]);
+        assert!(values(&response, "x-bad-value").is_empty());
+        // Content-Type, two X-Custom values and X-Another.
+        assert_eq!(response.headers().len(), 4);
     }
 
     #[test]
     fn test_build_response_from_meta_with_cookies() {
         let meta = ResponseMeta {
-            response_type: ResponseType::Json,
-            custom_content_type: None,
-            custom_headers: None,
-            cookies: Some(vec![CookieData {
-                name: "session".to_string(),
-                value: "abc123".to_string(),
-                path: "/".to_string(),
-                max_age: Some(3600),
-                expires: None,
-                domain: None,
-                secure: true,
-                httponly: true,
-                samesite: Some("Lax".to_string()),
-            }]),
+            cookies: Some(vec![invalid_cookie(), session_cookie()]),
+            ..meta(ResponseType::Json)
         };
         let response = build_response_from_meta(StatusCode::OK, &meta, b"{}".to_vec(), false);
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            values(&response, "set-cookie"),
+            [format_cookie(&session_cookie()).unwrap()]
+        );
     }
 
     #[test]
     fn test_build_response_from_meta_html() {
-        let meta = ResponseMeta {
-            response_type: ResponseType::Html,
-            custom_content_type: None,
-            custom_headers: None,
-            cookies: None,
-        };
-        let response =
-            build_response_from_meta(StatusCode::OK, &meta, b"<html></html>".to_vec(), false);
-        assert_eq!(response.status(), StatusCode::OK);
+        let response = build_response_from_meta(
+            StatusCode::OK,
+            &meta(ResponseType::Html),
+            b"<html></html>".to_vec(),
+            false,
+        );
+        assert_eq!(
+            values(&response, "content-type"),
+            ["text/html; charset=utf-8"]
+        );
     }
 
     #[test]
     fn test_build_response_from_meta_plaintext() {
-        let meta = ResponseMeta {
-            response_type: ResponseType::PlainText,
-            custom_content_type: None,
-            custom_headers: None,
-            cookies: None,
-        };
-        let response =
-            build_response_from_meta(StatusCode::OK, &meta, b"Hello, World!".to_vec(), false);
-        assert_eq!(response.status(), StatusCode::OK);
+        let response = build_response_from_meta(
+            StatusCode::OK,
+            &meta(ResponseType::PlainText),
+            b"Hello, World!".to_vec(),
+            false,
+        );
+        assert_eq!(
+            values(&response, "content-type"),
+            ["text/plain; charset=utf-8"]
+        );
     }
 }
