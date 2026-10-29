@@ -1230,6 +1230,77 @@ mod tests {
     }
 
     #[test]
+    fn multipart_file_of_its_min_size_is_accepted_and_one_less_byte_is_rejected() {
+        let constraints = HashMap::from([(
+            "doc".to_string(),
+            FileFieldConstraints {
+                min_size: Some(4),
+                ..FileFieldConstraints::default()
+            },
+        )]);
+
+        let accepted = parse_parts(
+            &[file_part("doc", "text/plain", b"abcd")],
+            &constraints,
+            &Limits::default(),
+        );
+        assert_eq!(accepted.unwrap().files_map["doc"][0].size, 4);
+
+        let rejected = parse_parts(
+            &[file_part("doc", "text/plain", b"abc")],
+            &constraints,
+            &Limits::default(),
+        );
+        assert_eq!(error_type(rejected), "file_too_small");
+    }
+
+    #[test]
+    fn multipart_field_with_its_max_files_is_accepted_and_one_more_file_is_rejected() {
+        let constraints = HashMap::from([(
+            "doc".to_string(),
+            FileFieldConstraints {
+                max_files: Some(2),
+                ..FileFieldConstraints::default()
+            },
+        )]);
+        let file = || file_part("doc", "text/plain", b"abc");
+
+        let accepted = parse_parts(&[file(), file()], &constraints, &Limits::default());
+        assert_eq!(accepted.unwrap().files_map["doc"].len(), 2);
+
+        let rejected = parse_parts(&[file(), file(), file()], &constraints, &Limits::default());
+        assert_eq!(error_type(rejected), "file_too_many");
+    }
+
+    #[test]
+    fn multipart_file_of_an_allowed_type_is_accepted_and_another_type_is_rejected() {
+        let constraints = HashMap::from([(
+            "doc".to_string(),
+            FileFieldConstraints {
+                allowed_types: Some(vec!["image/*".to_string()]),
+                ..FileFieldConstraints::default()
+            },
+        )]);
+
+        let accepted = parse_parts(
+            &[file_part("doc", "image/png", b"abc")],
+            &constraints,
+            &Limits::default(),
+        );
+        assert_eq!(
+            accepted.unwrap().files_map["doc"][0].content_type,
+            "image/png"
+        );
+
+        let rejected = parse_parts(
+            &[file_part("doc", "text/plain", b"abc")],
+            &constraints,
+            &Limits::default(),
+        );
+        assert_eq!(error_type(rejected), "file_invalid_content_type");
+    }
+
+    #[test]
     fn a_coercion_error_names_the_expected_type() {
         use crate::type_coercion::*;
 
