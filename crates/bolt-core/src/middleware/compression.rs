@@ -12,7 +12,7 @@ use actix_web::{
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
     http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding},
 };
-use futures_util::future::LocalBoxFuture;
+use futures_util::future::{FutureExt, Map};
 use std::future::{Ready, ready};
 use std::sync::Arc;
 
@@ -56,6 +56,9 @@ pub struct CompressionMiddlewareService<S> {
     service: S,
 }
 
+/// The result of the inner service, and of this middleware.
+type Outcome<B> = Result<ServiceResponse<B>, Error>;
+
 impl<S, B> Service<ServiceRequest> for CompressionMiddlewareService<S>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
@@ -64,68 +67,64 @@ where
 {
     type Response = ServiceResponse<Encoder<B>>;
     type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+    // A named future: the request needs no box, and it copies nothing.
+    type Future = Map<S::Future, fn(Outcome<B>) -> Outcome<Encoder<B>>>;
 
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        // Store Accept-Encoding header from request for later use
-        let accept_encoding = req
-            .headers()
-            .get(ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        // Get compression config from app state
-        let compression_config = req
-            .app_data::<actix_web::web::Data<Arc<AppState>>>()
-            .and_then(|state| state.global_compression_config.clone());
-
-        let fut = self.service.call(req);
-
-        Box::pin(async move {
-            let res = fut.await?;
-
-            // If the response already declares a Content-Encoding, the handler
-            // owns the encoding (e.g. per-chunk SSE compression). Pass it
-            // through without re-wrapping.
-            //
-            // Special case: `identity` is our internal "skip compression"
-            // marker — strip it so clients don't see it. Any other value
-            // (br, gzip, zstd) is preserved as-is.
-            let pre_set = res
-                .headers()
-                .get(CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok());
-
-            if let Some(encoding) = pre_set {
-                let is_identity = encoding.eq_ignore_ascii_case("identity");
-                let (req, mut response) = res.into_parts();
-                if is_identity {
-                    response.headers_mut().remove(CONTENT_ENCODING);
-                }
-                return Ok(ServiceResponse::new(
-                    req,
-                    response.map_body(|head, body| {
-                        Encoder::response(ContentEncoding::Identity, head, body)
-                    }),
-                ));
-            }
-
-            // When the encoder compresses the body, it sets Content-Encoding
-            // and appends `Vary: accept-encoding` after a Vary of the handler.
-            let (req, response) = res.into_parts();
-            let encoding = response_encoding(
-                accept_encoding.as_deref(),
-                compression_config.as_deref(),
-                response.body().size(),
-            );
-            Ok(ServiceResponse::new(
-                req,
-                response.map_body(|head, body| Encoder::response(encoding, head, body)),
-            ))
-        })
+        self.service.call(req).map(encode_response::<B>)
     }
+}
+
+/// Wrap the body of a response in the encoder that the response gets. The
+/// response holds its request, so the Accept-Encoding value and the config
+/// are read in place.
+fn encode_response<B: MessageBody>(res: Outcome<B>) -> Outcome<Encoder<B>> {
+    let res = res?;
+
+    // If the response already declares a Content-Encoding, the handler
+    // owns the encoding (e.g. per-chunk SSE compression). Pass it
+    // through without re-wrapping.
+    //
+    // Special case: `identity` is our internal "skip compression"
+    // marker — strip it so clients don't see it. Any other value
+    // (br, gzip, zstd) is preserved as-is.
+    let pre_set = res
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(encoding) = pre_set {
+        let is_identity = encoding.eq_ignore_ascii_case("identity");
+        let (req, mut response) = res.into_parts();
+        if is_identity {
+            response.headers_mut().remove(CONTENT_ENCODING);
+        }
+        return Ok(ServiceResponse::new(
+            req,
+            response
+                .map_body(|head, body| Encoder::response(ContentEncoding::Identity, head, body)),
+        ));
+    }
+
+    let request = res.request();
+    let accept_encoding = request
+        .headers()
+        .get(ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let config = request
+        .app_data::<actix_web::web::Data<Arc<AppState>>>()
+        .and_then(|state| state.global_compression_config.as_deref());
+    let encoding = response_encoding(accept_encoding, config, res.response().body().size());
+
+    // When the encoder compresses the body, it sets Content-Encoding
+    // and appends `Vary: accept-encoding` after a Vary of the handler.
+    let (req, response) = res.into_parts();
+    Ok(ServiceResponse::new(
+        req,
+        response.map_body(|head, body| Encoder::response(encoding, head, body)),
+    ))
 }
 
 #[cfg(test)]
