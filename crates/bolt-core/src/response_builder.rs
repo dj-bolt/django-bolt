@@ -3,11 +3,14 @@
 /// Reduces the number of mutations on HttpResponse::Builder
 /// by batching operations and pre-allocating capacity.
 use actix_web::body::MessageBody;
-use actix_web::http::header::{HeaderName, HeaderValue};
+use actix_web::http::header::{self, HeaderName, HeaderValue};
 use actix_web::{HttpResponse, HttpResponseBuilder, http::StatusCode};
 
 use crate::cookies::format_cookie;
 use crate::response_meta::ResponseMeta;
+
+/// The `Content-Encoding` marker that tells the compression middleware to skip.
+const IDENTITY: HeaderValue = HeaderValue::from_static("identity");
 
 /// Build a streaming response with SSE headers.
 /// Pre-bundles common SSE headers to avoid multiple mutations.
@@ -128,21 +131,26 @@ where
 {
     let mut builder = HttpResponse::build(status);
 
-    // 1. Content-Type: use custom or derive from response_type
-    let content_type = meta
-        .custom_content_type
-        .as_deref()
-        .unwrap_or_else(|| meta.response_type.content_type());
-
-    if !content_type.is_empty() {
-        builder.insert_header(("content-type", content_type));
+    // 1. Content-Type: use custom or derive from response_type. The header
+    // name is a constant, and a static type needs no copy of its value.
+    match meta.custom_content_type.as_deref() {
+        Some(content_type) => {
+            if !content_type.is_empty() {
+                builder.insert_header((header::CONTENT_TYPE, content_type));
+            }
+        }
+        None => {
+            if let Some(value) = meta.response_type.content_type_header() {
+                builder.insert_header((header::CONTENT_TYPE, value));
+            }
+        }
     }
 
-    // 2. Custom headers (lowercase keys in Rust - single location)
+    // 2. Custom headers. `HeaderName::from_bytes` gives a lower-case name,
+    // so the key needs no lower-case copy.
     if let Some(ref headers) = meta.custom_headers {
         for (k, v) in headers {
-            // Lowercase here instead of in Python (best practice from Robyn)
-            if let Ok(name) = HeaderName::try_from(k.to_ascii_lowercase())
+            if let Ok(name) = HeaderName::from_bytes(k.as_bytes())
                 && let Ok(val) = HeaderValue::try_from(v.as_str())
             {
                 builder.append_header((name, val));
@@ -154,7 +162,7 @@ where
     if let Some(ref cookies) = meta.cookies {
         for cookie in cookies {
             if let Some(header_value) = format_cookie(cookie) {
-                builder.append_header(("set-cookie", header_value));
+                builder.append_header((header::SET_COOKIE, header_value));
             }
             // Invalid cookies are logged and skipped by format_cookie
         }
@@ -162,7 +170,7 @@ where
 
     // 4. Compression skip if needed
     if skip_compression {
-        builder.insert_header(("content-encoding", "identity"));
+        builder.insert_header((header::CONTENT_ENCODING, IDENTITY));
     }
 
     // 5. A 204 has no body (RFC 9110 §15.3.5). Actix drops the content-length
