@@ -382,7 +382,11 @@ impl ApiKeys {
 
 impl FromIterator<String> for ApiKeys {
     fn from_iter<I: IntoIterator<Item = String>>(keys: I) -> Self {
-        Self(keys.into_iter().collect())
+        let mut keys: Vec<String> = keys.into_iter().collect();
+        // A repeated key would add a comparison to each check.
+        keys.sort_unstable();
+        keys.dedup();
+        Self(keys)
     }
 }
 
@@ -1744,6 +1748,9 @@ mod tests {
             assert_eq!(keys.find(candidate), None, "{candidate:?}");
         }
         assert_eq!(ApiKeys::default().find(""), None);
+
+        let repeated: ApiKeys = ["b", "a", "b"].into_iter().map(str::to_string).collect();
+        assert_eq!(repeated.0, ["a", "b"]);
     }
 
     #[test]
