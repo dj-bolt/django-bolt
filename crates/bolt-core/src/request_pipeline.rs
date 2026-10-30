@@ -739,4 +739,39 @@ mod tests {
             );
         }
     }
+    /// The JSON body of a response.
+    fn json_body(response: HttpResponse) -> serde_json::Value {
+        let bytes = response.into_body().try_into_bytes().unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_param_error_gives_a_422_that_names_its_source_and_value() {
+        let error = ParamError {
+            label: "Query parameter",
+            name: "page".to_string(),
+            msg: "Expected an integer".to_string(),
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), 422);
+        assert_eq!(
+            json_body(response),
+            serde_json::json!({"detail": "Query parameter 'page': Expected an integer"})
+        );
+    }
+
+    #[test]
+    fn a_validation_error_gives_a_422_with_the_error_in_a_list() {
+        let error = ValidationError::file_too_large("upload", 10, 20);
+        let response = build_validation_error_response(&error);
+        assert_eq!(response.status(), 422);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            json_body(response),
+            serde_json::json!({"detail": [error.to_json()]})
+        );
+    }
 }
