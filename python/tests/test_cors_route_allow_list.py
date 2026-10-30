@@ -66,6 +66,12 @@ def test_a_path_with_repeated_slashes_keeps_the_route_origins(global_cors):
             "true",
         )
         assert _origin_headers(client, "/api//admin", "https://global.test") == (None, None)
+        preflight = client.options(
+            "/api//admin",
+            headers={"Origin": "https://admin.example.com", "Access-Control-Request-Method": "GET"},
+        )
+        assert preflight.headers.get(ALLOW_ORIGIN) == "https://admin.example.com"
+        assert preflight.headers.get(ALLOW_CREDENTIALS) == "true"
 
 
 def test_route_origin_regexes_allow_matching_origins(global_cors):
