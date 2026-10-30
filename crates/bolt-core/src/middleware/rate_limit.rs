@@ -430,4 +430,132 @@ mod tests {
         assert_eq!(limiters.limiters.len(), expected);
         assert_eq!(limiters.count.load(Ordering::Relaxed), expected);
     }
+
+    /// The context of a request that `backend` authenticated as `user_id`.
+    fn identity(backend: &'static str, user_id: &str) -> AuthContext {
+        AuthContext {
+            user_id: Some(user_id.to_string()),
+            is_staff: false,
+            is_superuser: false,
+            backend: std::borrow::Cow::Borrowed(backend),
+            backend_index: Some(0),
+            claims: None,
+            permissions: std::collections::HashSet::new(),
+            cookie_csrf: false,
+        }
+    }
+
+    /// One request from `address` through both checks of a route that allows
+    /// one request, as the handler runs them. Returns the rejection.
+    fn request(
+        limiters: &RateLimiters,
+        key: &RateLimitKey,
+        address: &str,
+        auth_ctx: Option<&AuthContext>,
+    ) -> Option<HttpResponse> {
+        let config = RateLimitConfig {
+            rps: 1,
+            burst: 1,
+            key: key.clone(),
+        };
+        let headers = AHashMap::new();
+        let address = ip(address);
+        check_before_auth(limiters, 0, &headers, Some(&address), &config, "GET", "/").or_else(
+            || {
+                check_after_auth(
+                    limiters,
+                    0,
+                    &headers,
+                    Some(&address),
+                    auth_ctx,
+                    &config,
+                    "GET",
+                    "/",
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn a_user_key_limits_each_identity_after_auth() {
+        let limiters = RateLimiters::default();
+        let alice = identity("jwt", "7");
+        let bob = identity("jwt", "8");
+        let key = RateLimitKey::User;
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&alice)).is_none());
+
+        let rejected = request(&limiters, &key, "203.0.113.7", Some(&alice))
+            .expect("the second request of one identity is limited");
+        assert_eq!(rejected.status(), 429);
+        for (name, value) in [
+            ("retry-after", "1"),
+            ("x-ratelimit-limit", "1"),
+            ("x-ratelimit-burst", "1"),
+        ] {
+            assert_eq!(rejected.headers().get(name).unwrap(), value, "{name}");
+        }
+
+        // Another identity from the same address has its own bucket.
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&bob)).is_none());
+        // With no identity, the address is the key.
+        assert!(request(&limiters, &key, "203.0.113.9", None).is_none());
+        assert!(request(&limiters, &key, "203.0.113.9", None).is_some());
+    }
+
+    #[test]
+    fn each_check_runs_only_its_own_keys() {
+        let limiters = RateLimiters::default();
+        let config = |key| RateLimitConfig {
+            rps: 1,
+            burst: 1,
+            key,
+        };
+        let headers = AHashMap::new();
+        let address = ip("203.0.113.7");
+        let alice = identity("jwt", "7");
+        for _ in 0..3 {
+            // An address key runs before authentication, so the check after
+            // it never counts the request a second time.
+            let by_address = config(RateLimitKey::Ip);
+            assert!(
+                check_after_auth(
+                    &limiters,
+                    0,
+                    &headers,
+                    Some(&address),
+                    Some(&alice),
+                    &by_address,
+                    "GET",
+                    "/"
+                )
+                .is_none()
+            );
+            // An identity key needs the context, so the check before
+            // authentication leaves it alone.
+            let by_user = config(RateLimitKey::User);
+            assert!(
+                check_before_auth(&limiters, 1, &headers, Some(&address), &by_user, "GET", "/")
+                    .is_none()
+            );
+        }
+        assert_eq!(limiters.limiters.len(), 0);
+    }
+
+    #[test]
+    fn an_api_key_route_counts_only_api_key_identities() {
+        let limiters = RateLimiters::default();
+        let key = RateLimitKey::ApiKey;
+        // Two keys from one address have two buckets.
+        let first = identity("api_key", "apikey:aaa");
+        let second = identity("api_key", "apikey:bbb");
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&first)).is_none());
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&second)).is_none());
+
+        // A JWT is not an API key. Two JWT users from one address share the
+        // bucket of that address.
+        let alice = identity("jwt", "7");
+        let bob = identity("jwt", "8");
+        assert!(request(&limiters, &key, "203.0.113.9", Some(&alice)).is_none());
+        assert!(request(&limiters, &key, "203.0.113.9", Some(&bob)).is_some());
+    }
 }
