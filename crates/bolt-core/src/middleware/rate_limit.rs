@@ -1,7 +1,7 @@
 use actix_web::HttpResponse;
 use ahash::{AHashMap, RandomState};
 use dashmap::DashMap;
-use governor::clock::{Clock, DefaultClock};
+use governor::clock::{Clock, DefaultClock, Reference};
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use once_cell::sync::Lazy;
@@ -9,7 +9,7 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::metadata::{RateLimitConfig, RateLimitKey};
@@ -18,6 +18,71 @@ use crate::response_builder;
 use crate::responses;
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+type Instant = <DefaultClock as Clock>::Instant;
+
+/// One bucket: its limiter, and the state of its 429 log line.
+struct Bucket {
+    limiter: Limiter,
+    /// When the bucket was made. The log counts its seconds from here.
+    created: Instant,
+    /// The second of the last log line, or `u64::MAX` before the first line.
+    logged_second: AtomicU64,
+    /// The rejections since that line that wrote no line.
+    unlogged: AtomicU64,
+}
+
+/// A rejected request: the wait for the next request, and whether to log it.
+struct Rejection {
+    wait: Duration,
+    /// The number of rejections that wrote no line since the last line, or
+    /// `None` when this rejection writes no line.
+    log: Option<u64>,
+}
+
+impl Bucket {
+    fn new(quota: Quota) -> Self {
+        let limiter = RateLimiter::direct(quota);
+        let created = limiter.clock().now();
+        Self {
+            limiter,
+            created,
+            logged_second: AtomicU64::new(u64::MAX),
+            unlogged: AtomicU64::new(0),
+        }
+    }
+
+    /// Take one request. The limiter reads its own clock, because a new clock
+    /// runs `cpuid` to select its source, and a virtual machine traps that
+    /// instruction.
+    #[inline]
+    fn take(&self) -> Result<(), Rejection> {
+        self.limiter.check().map_err(|not_until| {
+            let now = self.limiter.clock().now();
+            Rejection {
+                wait: not_until.wait_time_from(now),
+                log: self.log_at(now),
+            }
+        })
+    }
+
+    /// Decide if a rejection at `now` writes a log line. The first rejection
+    /// of each second does, so a flood writes one line per second for each
+    /// bucket. The line counts the rejections before it that wrote none.
+    fn log_at(&self, now: Instant) -> Option<u64> {
+        let second = u64::from(now.duration_since(self.created)) / 1_000_000_000;
+        let last = self.logged_second.load(Ordering::Relaxed);
+        if last != second
+            && self
+                .logged_second
+                .compare_exchange(last, second, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            return Some(self.unlogged.swap(0, Ordering::Relaxed));
+        }
+        self.unlogged.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
 
 /// Seeds the bucket hash once per process. A caller must not be able to pick
 /// a key that lands in another caller's bucket, so the map from key material
@@ -91,7 +156,7 @@ impl fmt::Display for KeySource<'_> {
 pub struct RateLimiters {
     /// Keyed on handler id, quota and client key. The client key is already
     /// a seeded hash, so the map hashes with ahash, not SipHash.
-    limiters: DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>, RandomState>,
+    limiters: DashMap<(usize, u32, u32, LimiterKey), Arc<Bucket>, RandomState>,
     /// The number of limiters, for cleanup.
     count: AtomicUsize,
     /// The prefix length of the network that an IPv6 client keys on, and its
@@ -200,14 +265,14 @@ pub fn check_rate_limit(
     // line of a rejection.
     let key = (handler_id, rps, burst, source.bucket());
     let outcome = match limiters.limiters.get(&key) {
-        Some(limiter) => take(&limiter),
+        Some(bucket) => bucket.take(),
         None => {
             // SECURITY: Check if we've exceeded max limiters (prevent memory exhaustion)
             if limiters.count.load(Ordering::Relaxed) >= MAX_LIMITERS {
                 // Trigger cleanup of old limiters (simple LRU-style)
                 limiters.cleanup_old_limiters();
             }
-            let limiter = limiters.limiters.entry(key).or_insert_with(|| {
+            let bucket = limiters.limiters.entry(key).or_insert_with(|| {
                 // Increment counter
                 limiters.count.fetch_add(1, Ordering::Relaxed);
 
@@ -215,24 +280,26 @@ pub fn check_rate_limit(
                 let rps_nonzero = std::num::NonZeroU32::new(rps.max(1)).unwrap();
                 let burst_nonzero = std::num::NonZeroU32::new(burst.max(1)).unwrap();
                 let quota = Quota::per_second(rps_nonzero).allow_burst(burst_nonzero);
-                Arc::new(RateLimiter::direct(quota))
+                Arc::new(Bucket::new(quota))
             });
-            take(&limiter)
+            bucket.take()
         }
     };
 
     // Check rate limit
     match outcome {
         Ok(_) => None, // Request allowed
-        Err(wait_time) => {
+        Err(rejection) => {
             // Calculate retry after in seconds
-            let retry_after = wait_time.as_secs().max(1);
+            let retry_after = rejection.wait.as_secs().max(1);
 
-            // Log rate limit exceeded
-            eprintln!(
-                "[django-bolt] Rate limit exceeded: {} {} | key: {} | limit: {} rps (burst: {}) | retry after: {}s",
-                method, path, source, rps, burst, retry_after
-            );
+            // Log the first rejection of each second for this bucket.
+            if let Some(unlogged) = rejection.log {
+                eprintln!(
+                    "[django-bolt] Rate limit exceeded: {} {} | key: {} | limit: {} rps (burst: {}) | retry after: {}s | suppressed: {}",
+                    method, path, source, rps, burst, retry_after, unlogged
+                );
+            }
 
             let response = response_builder::build_rate_limit_response(
                 retry_after,
@@ -252,16 +319,6 @@ pub fn check_rate_limit(
             }))
         }
     }
-}
-
-/// Take one request from `limiter`. A rejection gives the wait for the next
-/// request. The limiter reads its own clock, because a new clock runs `cpuid`
-/// to select its source, and a virtual machine traps that instruction.
-#[inline]
-fn take(limiter: &Limiter) -> Result<(), Duration> {
-    limiter
-        .check()
-        .map_err(|not_until| not_until.wait_time_from(limiter.clock().now()))
 }
 
 /// The authenticated identity when `accept` admits the backend.
@@ -444,6 +501,26 @@ mod tests {
     }
 
     #[test]
+    fn a_bucket_logs_the_first_rejection_of_each_second() {
+        use governor::nanos::Nanos;
+
+        let quota = Quota::per_second(std::num::NonZeroU32::new(1).unwrap());
+        let bucket = Bucket::new(quota);
+        let at = |nanos: u64| bucket.created + Nanos::from(nanos);
+        assert_eq!(bucket.log_at(at(5_200_000_000)), Some(0));
+        assert_eq!(bucket.log_at(at(5_700_000_000)), None);
+        assert_eq!(bucket.log_at(at(5_900_000_000)), None);
+        // The next second logs, and counts the two rejections before it.
+        assert_eq!(bucket.log_at(at(6_100_000_000)), Some(2));
+        assert_eq!(bucket.log_at(at(6_200_000_000)), None);
+        assert_eq!(bucket.log_at(at(8_000_000_000)), Some(1));
+        // The first second of a new bucket logs too.
+        let fresh = Bucket::new(quota);
+        assert_eq!(fresh.log_at(fresh.created), Some(0));
+        assert_eq!(fresh.log_at(fresh.created), None);
+    }
+
+    #[test]
     fn a_full_map_drops_a_fifth_of_its_limiters() {
         let limiters = RateLimiters::default();
         let config = RateLimitConfig {
@@ -453,7 +530,7 @@ mod tests {
         };
         // Fill the map. The entries share one limiter, so the fill stays fast.
         let quota = Quota::per_second(std::num::NonZeroU32::new(100).unwrap());
-        let shared = Arc::new(RateLimiter::direct(quota));
+        let shared = Arc::new(Bucket::new(quota));
         for n in 0..MAX_LIMITERS as u64 {
             limiters
                 .limiters
