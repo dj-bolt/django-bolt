@@ -23,6 +23,7 @@ examine_globs = [
     "crates/bolt-core/src/type_coercion.rs",
     "crates/bolt-core/src/validation.rs",
     "crates/bolt-websocket/src/origin.rs",
+    "src/dev_reload.rs",
 ]
 
 # A mutant in a crate is caught by the tests of that crate.
@@ -61,4 +62,6 @@ exclude_re = [
     # The unknown-kid cooldown compares two durations, which are not equal
     # in practice.
     'replace < with <= in RefreshingJwks::select',
+    # The debounce loop also stops on the receive timeout at the deadline.
+    'replace < with <= in recv_change',
 ]
