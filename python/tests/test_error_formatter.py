@@ -545,6 +545,26 @@ def test_exception_that_reaches_rust_reaches_the_formatter(caplog):
     assert any(record.name == "django_bolt.error_handlers" for record in caplog.records)
 
 
+def test_debug_body_of_an_exception_that_reaches_rust_escapes_control_characters(settings):
+    """The DEBUG body holds the message. A control character in it stays valid JSON."""
+    settings.DEBUG = True
+    api = BoltAPI()
+    message = "bell\x07 escape\x1b[31m nul\x00 form\x0c"
+
+    @api.get("/escape")
+    def escape() -> dict:
+        raise _Escapes(message)
+
+    with TestClient(api) as client:
+        response = client.get("/escape")
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["detail"] == f"_Escapes: {message}"
+    assert body["extra"]["exception"] == message
+    assert message in body["extra"]["traceback"]
+
+
 class ArchivedQuerySet(QuerySet):
     """Raise an HTTPException when the rows load."""
 

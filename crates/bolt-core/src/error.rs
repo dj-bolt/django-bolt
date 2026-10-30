@@ -177,13 +177,11 @@ fn default_exception_response(
         .body(body)
 }
 
-/// Escape JSON string
+/// Escape a string for the inside of a JSON string. Each control character is
+/// escaped, so the body stays valid JSON.
 fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let quoted = serde_json::to_string(s).expect("a str always serializes to JSON");
+    quoted[1..quoted.len() - 1].to_owned()
 }
 
 /// Handle Python errors and convert to HTTP response
@@ -239,5 +237,14 @@ mod tests {
         assert_eq!(escape_json(r#"Hello "World""#), r#"Hello \"World\""#);
         assert_eq!(escape_json("Line1\nLine2"), "Line1\\nLine2");
         assert_eq!(escape_json("Tab\there"), "Tab\\there");
+        assert_eq!(escape_json(r"C:\temp"), r"C:\\temp");
+        assert_eq!(escape_json("bell\x07 nul\x00"), "bell\\u0007 nul\\u0000");
+    }
+
+    #[test]
+    fn escape_json_gives_a_valid_json_string_for_each_control_character() {
+        let text: String = (0u8..0x20).map(char::from).chain("\"\\é".chars()).collect();
+        let quoted = format!("\"{}\"", escape_json(&text));
+        assert_eq!(serde_json::from_str::<String>(&quoted).unwrap(), text);
     }
 }
