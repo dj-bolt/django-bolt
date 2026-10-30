@@ -334,7 +334,10 @@ pub fn header_str(value: &HeaderValue) -> Option<&str> {
     if invalid {
         return None;
     }
-    std::str::from_utf8(bytes).ok()
+    // SAFETY: each byte is a tab or in 32..127, so the bytes are ASCII, and
+    // ASCII is valid UTF-8. A second UTF-8 check cost about 100 instructions
+    // for each header of a request.
+    Some(unsafe { std::str::from_utf8_unchecked(bytes) })
 }
 
 /// Extract headers from request with validation
