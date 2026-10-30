@@ -467,6 +467,10 @@ mod tests {
     async fn a_skipped_route_or_the_skip_marker_gets_no_cors_headers() {
         let state = state(&[("GET", "/skip", RouteCors::Skip)]);
         assert_eq!(call(&state, get("/skip", GLOBAL)).await, NONE);
+        assert_eq!(
+            call(&state, options("/skip", GLOBAL, Some("GET"))).await,
+            NONE
+        );
         assert_eq!(call(&state, get("/marker", GLOBAL)).await, NONE);
     }
 }
