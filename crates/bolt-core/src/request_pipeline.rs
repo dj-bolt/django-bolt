@@ -19,7 +19,7 @@ use std::hash::Hash;
 
 use crate::form_parsing::ValidationError;
 use crate::responses;
-use crate::router::{QueryParams, QuerySequences};
+use crate::router::{PathParams, QueryParams, QuerySequences};
 use crate::type_coercion::{
     CoercedValue, CoercedValues, TYPE_STRING, TypeHints, coerce_param, coerced_value_to_py,
 };
@@ -35,7 +35,7 @@ pub static EMPTY_TYPES: std::sync::LazyLock<TypeHints> = std::sync::LazyLock::ne
 /// typed path parameter keeps its string. Returns the pre-coerced non-string
 /// values of each source. String parameters are validated for length but left as-is.
 pub fn validate_and_cache_typed_params<'t>(
-    path_params: Option<&AHashMap<String, String>>,
+    path_params: Option<&PathParams<'_>>,
     query_params: Option<&QueryParams<'_>>,
     path_types: &'t TypeHints,
     query_types: &'t TypeHints,
@@ -495,6 +495,10 @@ mod tests {
             .collect()
     }
 
+    fn path_values<'a>(pairs: &[(&'a str, &'a str)]) -> PathParams<'a> {
+        pairs.iter().map(|(k, v)| (*k, Cow::Borrowed(*v))).collect()
+    }
+
     fn types(pairs: &[(&str, u8)]) -> TypeHints {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
@@ -637,7 +641,7 @@ mod tests {
     fn path_and_query_keep_their_labels() {
         let hints = types(&[("id", TYPE_INT)]);
         let none = types(&[]);
-        let bad = values(&[("id", "x")]);
+        let bad = path_values(&[("id", "x")]);
         let response =
             validate_and_cache_typed_params(Some(&bad), None, &hints, &none, 64).unwrap_err();
         assert!(detail(response).contains("Path parameter 'id'"));
@@ -651,7 +655,7 @@ mod tests {
     fn a_query_key_with_the_name_of_a_typed_path_parameter_keeps_its_string() {
         let path_hints = types(&[("id", TYPE_INT)]);
         let query_hints = types(&[]);
-        let path = values(&[("id", "5")]);
+        let path = path_values(&[("id", "5")]);
         let query = crate::router::parse_query_string("id=x");
         let (path_coerced, query_coerced) = validate_and_cache_typed_params(
             Some(&path),

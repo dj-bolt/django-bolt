@@ -1,20 +1,25 @@
 use ahash::{AHashMap, AHashSet};
-use matchit::{Match, Router as MatchRouter};
+use matchit::{Match, Params, Router as MatchRouter};
 use pyo3::prelude::*;
 use std::borrow::Cow;
 
+/// The path params of a match. Each name borrows from the router. Each value
+/// borrows from the path, unless it has a `%` escape.
+pub type PathParams<'a> = AHashMap<&'a str, Cow<'a, str>>;
+
 /// Lookup result type that indicates whether path params exist
 /// For static routes, params is always None (avoiding allocation)
-/// For dynamic routes, params contains the extracted path parameters
-pub enum RouteMatch<'a> {
-    Static(&'a Route),
-    Dynamic(&'a Route, AHashMap<String, String>),
+/// For dynamic routes, params holds the params of the radix tree. They borrow
+/// from the router and the path, so a lookup does not allocate.
+pub enum RouteMatch<'r, 'p> {
+    Static(&'r Route),
+    Dynamic(&'r Route, Params<'r, 'p>),
 }
 
-impl<'a> RouteMatch<'a> {
+impl<'r, 'p> RouteMatch<'r, 'p> {
     /// Get the route handler
     #[inline]
-    pub fn route(&self) -> &Route {
+    pub fn route(&self) -> &'r Route {
         match self {
             RouteMatch::Static(r) => r,
             RouteMatch::Dynamic(r, _) => r,
@@ -22,14 +27,23 @@ impl<'a> RouteMatch<'a> {
     }
 
     /// Decompose into the route reference (with the router's lifetime — 'static
-    /// for the global router) and owned path params. Lets the request handler
+    /// for the global router) and the decoded path params. Lets the request handler
     /// defer the handler `clone_ref` into the main GIL block instead of paying
     /// an extra `Python::attach` per request.
     #[inline]
-    pub fn into_parts(self) -> (&'a Route, Option<AHashMap<String, String>>) {
+    pub fn into_parts(self) -> (&'r Route, Option<PathParams<'p>>)
+    where
+        'r: 'p,
+    {
         match self {
             RouteMatch::Static(r) => (r, None),
-            RouteMatch::Dynamic(r, params) => (r, Some(params)),
+            RouteMatch::Dynamic(r, params) => {
+                let mut decoded = PathParams::with_capacity(params.len());
+                for (name, value) in params.iter() {
+                    decoded.insert(name, decode_path_param(value));
+                }
+                (r, Some(decoded))
+            }
         }
     }
 
@@ -239,7 +253,7 @@ impl Router {
     ///
     /// OPTIMIZATION: #[inline] on hot path - called on every request
     #[inline]
-    pub fn find(&self, method: &str, path: &str) -> Option<RouteMatch<'_>> {
+    pub fn find<'p>(&self, method: &str, path: &'p str) -> Option<RouteMatch<'_, 'p>> {
         let method_router = match method {
             "GET" => &self.get,
             "POST" => &self.post,
@@ -262,13 +276,7 @@ impl Router {
         // Phase 2: Radix tree lookup for dynamic routes
         // Only reached for paths with parameters like /users/{id}
         match method_router.dynamic_router.at(path) {
-            Ok(Match { value, params }) => {
-                let mut path_params = AHashMap::new();
-                for (key, value) in params.iter() {
-                    path_params.insert(key.to_string(), value.to_string());
-                }
-                Some(RouteMatch::Dynamic(value, path_params))
-            }
+            Ok(Match { value, params }) => Some(RouteMatch::Dynamic(value, params)),
             Err(_) => None,
         }
     }
@@ -313,15 +321,24 @@ impl Router {
     }
 }
 
-/// URL-decode path parameters in place (`/items/hello%20world` yields `hello world`).
+/// URL-decode a path param (`hello%20world` yields `hello world`).
 /// A value that does not decode to UTF-8 stays as it is.
 /// A `+` in a path is a literal `+`, so only a `%` starts a decode.
 #[inline]
+pub fn decode_path_param(value: &str) -> Cow<'_, str> {
+    if memchr::memchr(b'%', value.as_bytes()).is_some()
+        && let Ok(decoded) = urlencoding::decode(value)
+    {
+        return decoded;
+    }
+    Cow::Borrowed(value)
+}
+
+/// URL-decode path parameters in place, as `decode_path_param` does.
+#[inline]
 pub fn decode_path_params(params: &mut AHashMap<String, String>) {
     for v in params.values_mut() {
-        if memchr::memchr(b'%', v.as_bytes()).is_some()
-            && let Ok(Cow::Owned(s)) = urlencoding::decode(v)
-        {
+        if let Cow::Owned(s) = decode_path_param(v) {
             *v = s;
         }
     }
@@ -493,17 +510,18 @@ mod tests {
 
     type Params = Option<Vec<(String, String)>>;
 
-    /// The handler id of the match, and its path params in name order, decoded
-    /// as the request handler decodes them.
+    /// The handler id of the match, and its decoded path params in name order.
     fn lookup(router: &Router, method: &str, path: &str) -> Option<(usize, Params)> {
         let found = router.find(method, path)?;
         let handler_id = found.handler_id();
         assert_eq!(found.route().handler_id, handler_id);
         let (route, params) = found.into_parts();
         assert_eq!(route.handler_id, handler_id);
-        let params = params.map(|mut params| {
-            decode_path_params(&mut params);
-            let mut params: Vec<(String, String)> = params.into_iter().collect();
+        let params = params.map(|params| {
+            let mut params: Vec<(String, String)> = params
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.into_owned()))
+                .collect();
             params.sort();
             params
         });
@@ -581,6 +599,15 @@ mod tests {
             lookup(&router, "GET", "/files/a/b%20c+d.txt"),
             Some((1, params(&[("rest", "a/b c+d.txt")])))
         );
+    }
+
+    #[test]
+    fn a_path_param_borrows_from_the_path_unless_it_decodes() {
+        let router = router_with(&[("GET", "/items/{id}/{name}")]);
+        let (_, params) = router.find("GET", "/items/7/a%20b").unwrap().into_parts();
+        let params = params.unwrap();
+        assert!(matches!(params["id"], Cow::Borrowed("7")));
+        assert!(matches!(&params["name"], Cow::Owned(name) if name == "a b"));
     }
 
     #[test]
@@ -855,6 +882,10 @@ mod tests {
         #[test]
         fn an_encoded_path_param_decodes_to_its_text(text in any::<String>()) {
             let encoded = urlencoding::encode(&text).into_owned();
+            prop_assert_eq!(decode_path_param(&encoded), text.as_str());
+            let plain = text.replace('%', "");
+            prop_assert!(matches!(decode_path_param(&plain), Cow::Borrowed(value) if value == plain));
+
             let mut params = AHashMap::from_iter([("value".to_string(), encoded)]);
             decode_path_params(&mut params);
             prop_assert_eq!(&params["value"], &text);

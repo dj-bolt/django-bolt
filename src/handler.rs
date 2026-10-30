@@ -614,7 +614,7 @@ pub async fn response_from_wire_result(
 }
 
 /// One request source as Rust holds it: the string map and its coerced values.
-/// The query map borrows its strings from the request; the other maps own them.
+/// The path and query maps borrow their strings; the header and cookie maps own them.
 pub(crate) struct SourceValues<'a, K = String, V = String> {
     pub values: Option<&'a AHashMap<K, V>>,
     pub coerced: &'a [(&'a str, CoercedValue)],
@@ -642,7 +642,7 @@ impl<K: Borrow<str> + Eq + Hash, V: AsRef<str>> SourceValues<'_, K, V> {
 pub(crate) fn build_prebound_from_values(
     py: Python<'_>,
     bindings: &[RustArgBinding],
-    path: &SourceValues<'_>,
+    path: &SourceValues<'_, &str, Cow<'_, str>>,
     query: &SourceValues<'_, Cow<'_, str>, Cow<'_, str>>,
     headers: &SourceValues<'_>,
     cookies: &SourceValues<'_>,
@@ -775,13 +775,7 @@ async fn route_request<const ACCESS_LOG: bool>(
     let (route, path_params, handler_id) = {
         if let Some(route_match) = router.find(method, path) {
             let handler_id = route_match.handler_id();
-            let (route, raw_params) = route_match.into_parts();
-
-            // Values are decoded in the existing map — no map rebuild.
-            let path_params = raw_params.map(|mut params| {
-                bolt_core::router::decode_path_params(&mut params);
-                params
-            });
+            let (route, path_params) = route_match.into_parts();
             (route, path_params, handler_id)
         } else {
             // No route found - check for trailing slash redirect FIRST
