@@ -611,6 +611,13 @@ mod tests {
     }
 
     #[test]
+    fn a_path_param_decodes_once() {
+        let router = router_with(&[("GET", "/items/{id}")]);
+        let (_, params) = router.find("GET", "/items/a%252Fb").unwrap().into_parts();
+        assert_eq!(params.unwrap()["id"], "a%2Fb");
+    }
+
+    #[test]
     fn a_route_that_conflicts_does_not_register() {
         let mut router = router_with(&[("GET", "/items/{id}")]);
         Python::attach(|py| {
