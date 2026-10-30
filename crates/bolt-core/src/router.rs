@@ -634,13 +634,17 @@ mod tests {
         let router = router_with(&[
             ("GET", "/items"),
             ("POST", "/items"),
+            ("PUT", "/items"),
+            ("PATCH", "/items"),
+            ("HEAD", "/items"),
+            ("QUERY", "/items"),
             ("DELETE", "/items/{id}"),
             ("GET", "/cors"),
             ("OPTIONS", "/cors"),
         ]);
         assert_eq!(
             router.find_all_methods("/items"),
-            ["GET", "POST", "OPTIONS"]
+            ["GET", "POST", "PUT", "PATCH", "HEAD", "QUERY", "OPTIONS"]
         );
         assert_eq!(router.find_all_methods("/items/3"), ["DELETE", "OPTIONS"]);
         // A registered OPTIONS route is listed once.
