@@ -649,6 +649,8 @@ mod tests {
         assert!(request(&limiters, &key, "203.0.113.7", Some(&first)).is_none());
         assert!(request(&limiters, &key, "203.0.113.7", Some(&second)).is_none());
         assert!(request(&limiters, &key, "203.0.113.7", Some(&first)).is_some());
+        // The bucket of an API key does not depend on the address.
+        assert!(request(&limiters, &key, "203.0.113.9", Some(&first)).is_some());
 
         // A JWT is not an API key. Two JWT users from one address share the
         // bucket of that address.
