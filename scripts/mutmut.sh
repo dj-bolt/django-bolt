@@ -8,6 +8,8 @@
 # mutmut there. The built extension (_core) is copied with the package.
 #
 # Needs: the extension built into python/django_bolt (`just build`).
+# Arguments: mutant names for `mutmut run`, to run only those mutants. A name
+# can have the wildcards of fnmatch, for example "django_bolt.api.xǁBoltAPIǁ_dispatch*".
 # Output: $MUTMUT_DIR (default: mutants-work/), with the mutmut results in
 # mutants/ and a summary in summary.txt. A relative MUTMUT_DIR starts at the
 # repository root. The script removes MUTMUT_DIR only when it made it before.
@@ -39,7 +41,7 @@ fi
 # mutmut 3.8 is the first version with process_isolation and forkserver_warmup.
 # An older version ignores them, and forks each mutant from a process that ran tests.
 mutmut=(uv run --project "$root" --no-sync --with "mutmut>=3.8,<4" mutmut)
-"${mutmut[@]}" run --max-children "${MUTMUT_CHILDREN:-$(getconf _NPROCESSORS_ONLN)}"
+"${mutmut[@]}" run --max-children "${MUTMUT_CHILDREN:-$(getconf _NPROCESSORS_ONLN)}" "$@"
 "${mutmut[@]}" export-cicd-stats
 "${mutmut[@]}" results --all false > summary.txt
 cat mutants/mutmut-cicd-stats.json

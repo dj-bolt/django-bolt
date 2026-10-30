@@ -184,6 +184,7 @@ source_paths = ["django_bolt"]
 only_mutate = [
     "django_bolt/analysis.py",
     "django_bolt/middleware/compiler.py",
+    "django_bolt/serialization.py",
 ]
 # The test client starts Rust threads, and a forked child has none of them.
 # The fork server forks each mutant from a process that ran no test.
