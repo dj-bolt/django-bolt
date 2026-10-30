@@ -363,8 +363,8 @@ impl RefreshingJwks {
 /// The SipHash key is random for each `ApiKeys`, so a client cannot compute
 /// the hash of a key. `find` looks up the hash of the request key, and then
 /// compares the request key in constant time with each valid key of that
-/// hash. Thus the lookup compares only hashes, never the bytes of a key, and
-/// the cost does not grow with the number of keys.
+/// hash. Thus only the constant-time comparison reads the bytes of a valid
+/// key, and the cost does not grow with the number of keys.
 #[derive(Debug, Clone, Default)]
 pub struct ApiKeys {
     state: RandomState,
