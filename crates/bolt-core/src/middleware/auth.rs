@@ -10,6 +10,7 @@ use pyo3::types::PyDict;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -357,20 +358,26 @@ impl RefreshingJwks {
     }
 }
 
-/// The valid keys of an API key backend.
+/// The valid keys of an API key backend, by their SipHash.
 ///
-/// `find` compares a request key with each valid key in constant time, and
-/// does not stop at a match. Thus the time of a check does not show how many
-/// bytes of a valid key the request key matches. It shows only the number of
-/// keys and whether the lengths are equal, as `hmac.compare_digest` does.
+/// The SipHash key is random for each `ApiKeys`, so a client cannot compute
+/// the hash of a key. `find` looks up the hash of the request key, and then
+/// compares the request key in constant time with each valid key of that
+/// hash. Thus the lookup compares only hashes, never the bytes of a key, and
+/// the cost does not grow with the number of keys.
 #[derive(Debug, Clone, Default)]
-pub struct ApiKeys(Vec<String>);
+pub struct ApiKeys {
+    state: RandomState,
+    by_hash: AHashMap<u64, Vec<String>>,
+}
 
 impl ApiKeys {
     /// The valid key that equals `candidate`, or None.
     pub fn find(&self, candidate: &str) -> Option<&str> {
+        let keys = self.by_hash.get(&self.state.hash_one(candidate))?;
+        // Two keys can have the same hash. Compare each, with no early stop.
         let mut found = None;
-        for key in &self.0 {
+        for key in keys {
             if constant_time::verify_slices_are_equal(key.as_bytes(), candidate.as_bytes()).is_ok()
             {
                 found = Some(key.as_str());
@@ -382,11 +389,15 @@ impl ApiKeys {
 
 impl FromIterator<String> for ApiKeys {
     fn from_iter<I: IntoIterator<Item = String>>(keys: I) -> Self {
-        let mut keys: Vec<String> = keys.into_iter().collect();
-        // A repeated key would add a comparison to each check.
-        keys.sort_unstable();
-        keys.dedup();
-        Self(keys)
+        let state = RandomState::new();
+        let mut by_hash: AHashMap<u64, Vec<String>> = AHashMap::new();
+        for key in keys {
+            let same_hash = by_hash.entry(state.hash_one(key.as_str())).or_default();
+            if !same_hash.contains(&key) {
+                same_hash.push(key);
+            }
+        }
+        Self { state, by_hash }
     }
 }
 
@@ -854,7 +865,7 @@ fn try_api_key_auth(
     key_permissions: &HashMap<String, Vec<String>>,
 ) -> Option<AuthContext> {
     // SECURITY: Reject if no API keys configured (don't allow empty set)
-    if api_keys.0.is_empty() {
+    if api_keys.by_hash.is_empty() {
         return None;
     }
 
@@ -1750,7 +1761,16 @@ mod tests {
         assert_eq!(ApiKeys::default().find(""), None);
 
         let repeated: ApiKeys = ["b", "a", "b"].into_iter().map(str::to_string).collect();
-        assert_eq!(repeated.0, ["a", "b"]);
+        let mut stored: Vec<&String> = repeated.by_hash.values().flatten().collect();
+        stored.sort();
+        assert_eq!(stored, ["a", "b"]);
+
+        let many: ApiKeys = (0..100).map(|i| format!("key-{i}")).collect();
+        for i in 0..100 {
+            let key = format!("key-{i}");
+            assert_eq!(many.find(&key), Some(key.as_str()));
+        }
+        assert_eq!(many.find("key-100"), None);
     }
 
     #[test]
