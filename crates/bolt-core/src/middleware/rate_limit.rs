@@ -505,9 +505,12 @@ mod tests {
 
         // Another identity from the same address has its own bucket.
         assert!(request(&limiters, &key, "203.0.113.7", Some(&bob)).is_none());
+        // The bucket of an identity does not depend on the address.
+        assert!(request(&limiters, &key, "203.0.113.9", Some(&alice)).is_some());
         // With no identity, the address is the key.
         assert!(request(&limiters, &key, "203.0.113.9", None).is_none());
         assert!(request(&limiters, &key, "203.0.113.9", None).is_some());
+        assert!(request(&limiters, &key, "203.0.113.10", None).is_none());
     }
 
     #[test]
@@ -558,6 +561,7 @@ mod tests {
         let second = identity("api_key", "apikey:bbb");
         assert!(request(&limiters, &key, "203.0.113.7", Some(&first)).is_none());
         assert!(request(&limiters, &key, "203.0.113.7", Some(&second)).is_none());
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&first)).is_some());
 
         // A JWT is not an API key. Two JWT users from one address share the
         // bucket of that address.
