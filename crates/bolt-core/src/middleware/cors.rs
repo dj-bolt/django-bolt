@@ -12,9 +12,9 @@ use actix_web::{
     Error,
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
     http::Method,
-    http::header::{ACCESS_CONTROL_REQUEST_METHOD, ORIGIN},
+    http::header::{ACCESS_CONTROL_REQUEST_METHOD, HeaderName, ORIGIN},
 };
-use futures_util::future::LocalBoxFuture;
+use futures_util::future::{FutureExt, Map};
 use std::future::{Ready, ready};
 use std::sync::Arc;
 
@@ -66,102 +66,87 @@ where
 {
     type Response = ServiceResponse<B>;
     type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+    type Future = Map<S::Future, fn(Outcome<B>) -> Outcome<B>>;
 
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        // Extract Origin header - no allocation if missing (common case for same-origin)
-        let origin = req
-            .headers()
-            .get(ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        // Early exit: no Origin header means no CORS needed
-        // This is the fast path for same-origin requests
-        if origin.is_none() {
-            let fut = self.service.call(req);
-            return Box::pin(async move {
-                let mut res = fut.await?;
-                // Still need to check skip marker
-                if res.headers().get("x-bolt-skip-cors").is_some() {
-                    res.headers_mut().remove("x-bolt-skip-cors");
-                }
-                Ok(res)
-            });
-        }
-
-        let method = req.method().clone();
-        let path = req.path().to_string();
-        // A preflight names the method of the real request.
-        let requested_method = if method == Method::OPTIONS {
-            req.headers()
-                .get(ACCESS_CONTROL_REQUEST_METHOD)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        } else {
-            None
-        };
-
-        // Get app state for CORS config
-        let app_state = req
-            .app_data::<actix_web::web::Data<Arc<AppState>>>()
-            .cloned();
-
-        let fut = self.service.call(req);
-
-        Box::pin(async move {
-            let mut res = fut.await?;
-
-            // Fast path: check skip marker first
-            if res.headers().get("x-bolt-skip-cors").is_some() {
-                res.headers_mut().remove("x-bolt-skip-cors");
-                return Ok(res);
-            }
-
-            let state = match app_state {
-                Some(s) => s,
-                None => return Ok(res),
-            };
-            let state_ref = state.get_ref();
-
-            // Find CORS config: route-level first, then global
-            let cors_config =
-                find_cors_config(&method, requested_method.as_deref(), &path, state_ref);
-
-            // Apply CORS headers
-            match cors_config {
-                Some(CorsConfigRef::Route(cors_cfg)) => {
-                    let origin_allowed = add_cors_headers_with_config(
-                        res.headers_mut(),
-                        origin.as_deref(),
-                        cors_cfg,
-                        state_ref.global_cors_config.as_ref(),
-                    );
-                    if method == Method::OPTIONS && origin_allowed {
-                        add_preflight_headers_with_config(res.headers_mut(), cors_cfg);
-                    }
-                }
-                Some(CorsConfigRef::Global(cors_cfg)) => {
-                    let origin_allowed = add_cors_headers_with_config(
-                        res.headers_mut(),
-                        origin.as_deref(),
-                        cors_cfg,
-                        state_ref.global_cors_config.as_ref(),
-                    );
-                    if method == Method::OPTIONS && origin_allowed {
-                        add_preflight_headers_with_config(res.headers_mut(), cors_cfg);
-                    }
-                }
-                Some(CorsConfigRef::Skipped) | None => {
-                    // No CORS headers needed
-                }
-            }
-
-            Ok(res)
-        })
+        self.service.call(req).map(add_cors_headers::<B>)
     }
+}
+
+type Outcome<B> = Result<ServiceResponse<B>, Error>;
+
+/// The marker of a response that skips CORS (`@skip_middleware("cors")`).
+const SKIP_CORS: HeaderName = HeaderName::from_static("x-bolt-skip-cors");
+
+/// Add the CORS headers to the response of the handler.
+///
+/// The response holds its request. Thus the origin, the method, the path and
+/// the app state are read in place after the handler returns, and the future
+/// of the request needs no box.
+fn add_cors_headers<B>(res: Outcome<B>) -> Outcome<B> {
+    let (req, mut response) = res?.into_parts();
+    let headers = response.headers_mut();
+
+    // Fast path: check skip marker first
+    if headers.contains_key(SKIP_CORS) {
+        headers.remove(SKIP_CORS);
+        return Ok(ServiceResponse::new(req, response));
+    }
+
+    // No Origin header means no CORS needed. This is the fast path for
+    // same-origin requests.
+    let Some(origin) = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return Ok(ServiceResponse::new(req, response));
+    };
+    let Some(state) = req.app_data::<actix_web::web::Data<Arc<AppState>>>() else {
+        return Ok(ServiceResponse::new(req, response));
+    };
+    let state_ref = state.get_ref();
+    let method = req.method();
+    // A preflight names the method of the real request.
+    let requested_method = if method == Method::OPTIONS {
+        req.headers()
+            .get(ACCESS_CONTROL_REQUEST_METHOD)
+            .and_then(|v| v.to_str().ok())
+    } else {
+        None
+    };
+
+    // Find CORS config: route-level first, then global
+    let cors_config = find_cors_config(method, requested_method, req.path(), state_ref);
+
+    // Apply CORS headers
+    match cors_config {
+        Some(CorsConfigRef::Route(cors_cfg)) => {
+            let origin_allowed = add_cors_headers_with_config(
+                headers,
+                Some(origin),
+                cors_cfg,
+                state_ref.global_cors_config.as_ref(),
+            );
+            if method == Method::OPTIONS && origin_allowed {
+                add_preflight_headers_with_config(headers, cors_cfg);
+            }
+        }
+        Some(CorsConfigRef::Global(cors_cfg)) => {
+            let origin_allowed = add_cors_headers_with_config(
+                headers,
+                Some(origin),
+                cors_cfg,
+                state_ref.global_cors_config.as_ref(),
+            );
+            if method == Method::OPTIONS && origin_allowed {
+                add_preflight_headers_with_config(headers, cors_cfg);
+            }
+        }
+        Some(CorsConfigRef::Skipped) | None => {
+            // No CORS headers needed
+        }
+    }
+
+    Ok(ServiceResponse::new(req, response))
 }
 
 /// Reference to CORS config - avoids cloning
@@ -225,6 +210,7 @@ mod tests {
     use crate::router::Router;
     use crate::streaming::StreamConfig;
     use actix_web::http::header::{ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN};
+    use actix_web::middleware::{Condition, NormalizePath, TrailingSlash};
     use actix_web::test::{self, TestRequest};
     use actix_web::{App, HttpRequest, HttpResponse, web};
     use ahash::AHashMap;
@@ -346,13 +332,22 @@ mod tests {
         }
     }
 
-    /// Send `request` through the middleware to a handler that answers 200.
-    /// The handler of `/marker` sets the skip marker. Also check that the
-    /// marker never reaches the client.
     async fn call(state: &Arc<AppState>, request: TestRequest) -> Cors {
+        call_with(state, request, false).await
+    }
+
+    /// Send `request` through the middleware to a handler that answers 200.
+    /// With `merge_slashes`, repeated slashes merge inside the middleware, as
+    /// in `runbolt`. The handler of `/marker` sets the skip marker. Also check
+    /// that the marker never reaches the client.
+    async fn call_with(state: &Arc<AppState>, request: TestRequest, merge_slashes: bool) -> Cors {
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(state.clone()))
+                .wrap(Condition::new(
+                    merge_slashes,
+                    NormalizePath::new(TrailingSlash::MergeOnly),
+                ))
                 .wrap(CorsMiddleware::new())
                 .default_service(web::to(|req: HttpRequest| async move {
                     let mut response = HttpResponse::Ok();
@@ -452,6 +447,20 @@ mod tests {
             preflight(ROUTE)
         );
         assert_eq!(call(&state, options("/items", GLOBAL, None)).await, NONE);
+    }
+
+    #[actix_web::test]
+    async fn a_path_with_repeated_slashes_uses_the_config_of_its_route() {
+        // The router finds `/api/admin` for `/api//admin`, so the route config applies.
+        let state = state(&[("GET", "/api/admin", RouteCors::Own)]);
+        assert_eq!(
+            call_with(&state, get("/api//admin", ROUTE), true).await,
+            allowed(ROUTE)
+        );
+        assert_eq!(
+            call_with(&state, get("/api//admin", GLOBAL), true).await,
+            NONE
+        );
     }
 
     #[actix_web::test]
