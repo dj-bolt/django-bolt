@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Native routes** - `api.native_route(method, path, capsule)` serves a route with a Rust handler from another extension module, without Python. See [Native Routes](docs/src/topics/native-routes.md).
 - **`@cors(origin_regexes=[...])`** - A route can allow the origins that match a pattern, as `CORS_ALLOWED_ORIGIN_REGEXES` does for all routes. `@cors` needs `origins` or `origin_regexes`. An empty pattern raises `ValueError`, because it matches every origin. An origin or a pattern that is not a `str` raises `TypeError`.
 
 ### Fixed

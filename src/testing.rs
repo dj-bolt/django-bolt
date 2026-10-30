@@ -415,20 +415,14 @@ pub fn destroy_test_app(app_id: u64) -> PyResult<()> {
     reason = "PyO3 wire format: Python passes each route as one tuple"
 )]
 pub fn register_test_routes(
-    _py: Python<'_>,
+    py: Python<'_>,
     app_id: u64,
     routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
+    native_routes: Vec<crate::native::NativeRouteSpec>,
 ) -> PyResult<()> {
+    let router = crate::native::build_router(py, routes, native_routes)?;
     let entry = test_app(app_id)?;
-
-    let mut app = entry.write();
-
-    // Create a new router with the routes
-    let mut router = Router::new();
-    for (method, path, handler_id, handler, dispatch, dispatch_sync) in routes {
-        router.register(&method, &path, handler_id, handler, dispatch, dispatch_sync)?;
-    }
-    app.router = Arc::new(router);
+    entry.write().router = Arc::new(router);
     Ok(())
 }
 
@@ -617,6 +611,7 @@ pub fn test_request(
                         max_payload_size,
                         max_param_length: config.max_param_length,
                         asgi_mount_timeout: config.asgi_mount_timeout,
+                        native_route_timeout: config.native_route_timeout,
                         stream_config: config.stream_config,
                         global_cors_config: config.global_cors_config,
                         global_compression_config: compression,
@@ -1104,6 +1099,7 @@ mod tests {
                 max_payload_size: 1024 * 1024,
                 max_param_length: 1024,
                 asgi_mount_timeout: Duration::from_secs(30),
+                native_route_timeout: Duration::from_secs(30),
                 stream_config: StreamConfig {
                     sync_batch_size: 5,
                     channel_capacity: 32,
@@ -1177,5 +1173,129 @@ mod tests {
             .expect("the registration waits for the registry lock that it holds")
             .unwrap();
         assert!(!still_registered, "the finalizer did not run");
+    }
+}
+
+/// Native route handlers for bolt's own tests, written with `handler!` of
+/// `bolt-native-abi`. `ECHO` echoes the request as JSON from another thread, as
+/// a handler with its own runtime would. Its last path segment picks a case:
+/// `hang` (never complete), `drop` (drop the responder), `status-<n>` and
+/// `bad-header`.
+mod native_test_handler {
+    use bolt_native_abi::{self as abi, RequestRef, Responder, handler};
+    use std::ffi::c_void;
+    use std::fmt::Write;
+
+    fn text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// A JSON string. The test values need no more than this.
+    fn json(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for c in value.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    fn echo(req: RequestRef<'_>) -> String {
+        let params = match req.path_param(b"id") {
+            Some(id) => format!("{{\"id\": {}}}", json(&text(id))),
+            None => "{}".to_owned(),
+        };
+        let x_test = req
+            .header(b"x-test")
+            .map_or_else(|| "null".to_owned(), |v| json(&text(v)));
+        format!(
+            "{{\"method\": {}, \"path\": {}, \"query\": {}, \"params\": {}, \"x_test\": {}, \"client\": {}, \"body\": {}}}",
+            json(&text(req.method())),
+            json(&text(req.path())),
+            json(&text(req.query())),
+            params,
+            x_test,
+            json(&text(req.client_addr())),
+            json(&text(req.body())),
+        )
+    }
+
+    const JSON: (&[u8], &[u8]) = (b"content-type", b"application/json");
+
+    handler!(pub static ECHO = c"bolt-test", |req: RequestRef<'_>, responder: Responder| {
+        let case = text(req.path()).rsplit('/').next().unwrap_or("").to_owned();
+        let body = echo(req);
+        match case.as_str() {
+            "hang" => std::mem::forget(responder),
+            "drop" => drop(responder),
+            "bad-header" => responder.send(200, &[(b"bad header", b"x"), JSON], body.as_bytes()),
+            _ => {
+                let status = case
+                    .strip_prefix("status-")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(201);
+                std::thread::spawn(move || {
+                    let headers: [(&[u8], &[u8]); 4] = [
+                        JSON,
+                        (b"x-multi", b"a"),
+                        (b"x-multi", b"b"),
+                        (b"x-bolt-skip-cors", b"true"),
+                    ];
+                    responder.send(status, &headers, body.as_bytes());
+                });
+            }
+        }
+    });
+
+    /// Completes with a null response, which the contract answers with 500.
+    unsafe extern "C" fn null_response(
+        _ctx: *mut c_void,
+        _req: *const abi::Request,
+        complete: abi::CompleteFn,
+        token: *mut c_void,
+    ) {
+        // SAFETY: the token of this `call`, given back once.
+        unsafe { complete(token, std::ptr::null()) };
+    }
+
+    pub static NULL_RESPONSE: abi::HandlerV1 =
+        abi::HandlerV1::new(c"bolt-test-null", std::ptr::null_mut(), null_response);
+    pub static NO_CALL: abi::HandlerV1 = abi::HandlerV1 {
+        call: None,
+        ..abi::HandlerV1::new(c"bolt-test-no-call", std::ptr::null_mut(), null_response)
+    };
+}
+
+/// A `django_bolt.native_handler.v1` capsule for bolt's own tests. `kind` is
+/// `ok`, `null_response` or `no_call`.
+#[pyfunction]
+#[pyo3(signature = (kind="ok"))]
+pub fn native_test_capsule(py: Python<'_>, kind: &str) -> PyResult<Py<PyAny>> {
+    let handler: &'static bolt_native_abi::HandlerV1 = match kind {
+        "ok" => &native_test_handler::ECHO,
+        "null_response" => &native_test_handler::NULL_RESPONSE,
+        "no_call" => &native_test_handler::NO_CALL,
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown kind {kind}"
+            )));
+        }
+    };
+    // SAFETY: the pointer is to a static, and the name is a static C string.
+    unsafe {
+        let capsule = pyo3::ffi::PyCapsule_New(
+            std::ptr::from_ref(handler).cast_mut().cast(),
+            bolt_native_abi::CAPSULE_NAME.as_ptr(),
+            None,
+        );
+        Bound::from_owned_ptr_or_err(py, capsule).map(Bound::unbind)
     }
 }

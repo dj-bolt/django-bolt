@@ -23,7 +23,11 @@ from httpx import Response
 
 from django_bolt import BoltAPI, _core
 from django_bolt._bridge import make_bound_dispatch
-from django_bolt.api import _validate_asgi_mount_conflicts, _validate_mcp_mount_conflicts
+from django_bolt.api import (
+    _routes_and_native_routes,
+    _validate_asgi_mount_conflicts,
+    _validate_mcp_mount_conflicts,
+)
 from django_bolt.testing.dbshare import SharedConnections
 
 logger = logging.getLogger(__name__)
@@ -281,13 +285,13 @@ class TestClient(httpx.Client):
     @staticmethod
     def _validate_asgi_mount_conflicts(api: BoltAPI) -> None:
         """Validate exact-path conflicts for ASGI mounts (same rule as production startup)."""
-        _validate_asgi_mount_conflicts(api._routes, getattr(api, "_asgi_mounts", []))
+        _validate_asgi_mount_conflicts(_routes_and_native_routes(api), getattr(api, "_asgi_mounts", []))
 
     @staticmethod
     def _validate_mcp_mount_conflicts(api: BoltAPI) -> None:
         """Validate MCP paths against routes and ASGI mounts, like production."""
         _validate_mcp_mount_conflicts(
-            api._routes,
+            _routes_and_native_routes(api),
             getattr(api, "_asgi_mounts", []),
             getattr(api, "_mcp_mounts", []),
         )
@@ -342,7 +346,9 @@ class TestClient(httpx.Client):
         _ = use_http_layer
 
         # Validate before allocating native test-app state. A failed constructor
-        # has no client instance available to release that state.
+        # has no client instance available to release that state. Route
+        # conflicts and invalid capsules raise later, in register_test_routes;
+        # the finalizer then releases the state.
         self._validate_asgi_mount_conflicts(api)
         self._validate_mcp_mount_conflicts(api)
 
@@ -371,7 +377,7 @@ class TestClient(httpx.Client):
             )
             for method, path, handler_id, handler in api._routes
         ]
-        _core.register_test_routes(self.app_id, rust_routes)
+        _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes))
 
         # Register WebSocket routes with pre-compiled injectors (same as production)
         ws_routes = []
@@ -649,7 +655,9 @@ class AsyncTestClient(httpx.AsyncClient):
             **kwargs: Additional arguments passed to httpx.AsyncClient
         """
         # Validate before allocating native test-app state. A failed constructor
-        # has no client instance available to release that state.
+        # has no client instance available to release that state. Route
+        # conflicts and invalid capsules raise later, in register_test_routes;
+        # the finalizer then releases the state.
         TestClient._validate_asgi_mount_conflicts(api)
         TestClient._validate_mcp_mount_conflicts(api)
 
@@ -678,7 +686,7 @@ class AsyncTestClient(httpx.AsyncClient):
             )
             for method, path, handler_id, handler in api._routes
         ]
-        _core.register_test_routes(self.app_id, rust_routes)
+        _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes))
 
         # Register WebSocket routes
         ws_routes = []

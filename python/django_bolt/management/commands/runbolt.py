@@ -23,7 +23,13 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
-from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts, _validate_mcp_mount_conflicts, serve_with_lifespan
+from django_bolt.api import (
+    BoltAPI,
+    _routes_and_native_routes,
+    _validate_asgi_mount_conflicts,
+    _validate_mcp_mount_conflicts,
+    serve_with_lifespan,
+)
 from django_bolt.concurrency import close_connections_and_pools
 from django_bolt.workers import MIB, WorkerSupervisor
 
@@ -796,7 +802,7 @@ class Command(BaseCommand):
             return
 
         merged_api = self.merge_apis(apis)
-        _user_route_count = len(merged_api._routes)
+        _user_route_count = len(merged_api._routes) + len(merged_api._native_routes)
 
         features: list[tuple[str, str]] = []
 
@@ -819,7 +825,7 @@ class Command(BaseCommand):
                 admin_prefix = detect_admin_url_prefix() or "admin"
                 features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
 
-        _total_route_count = len(merged_api._routes)
+        _total_route_count = len(merged_api._routes) + len(merged_api._native_routes)
         _framework_route_count = _total_route_count - _user_route_count
 
         ws_count = len(merged_api._websocket_routes)
@@ -890,7 +896,7 @@ class Command(BaseCommand):
         merged_api = self.merge_apis(apis)
 
         # Snapshot user route count before framework routes are added
-        _user_route_count = len(merged_api._routes)
+        _user_route_count = len(merged_api._routes) + len(merged_api._native_routes)
 
         # --- Collect startup info for banner ---
         features: list[tuple[str, str]] = []
@@ -928,13 +934,13 @@ class Command(BaseCommand):
                 features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
 
         # Compute route counts
-        _total_route_count = len(merged_api._routes)
+        _total_route_count = len(merged_api._routes) + len(merged_api._native_routes)
         _framework_route_count = _total_route_count - _user_route_count
 
         # Validate ASGI mount conflicts after all framework/admin/docs routes are added.
-        self.validate_asgi_mount_conflicts(merged_api._routes, merged_api._asgi_mounts)
+        self.validate_asgi_mount_conflicts(_routes_and_native_routes(merged_api), merged_api._asgi_mounts)
         self.validate_mcp_mount_conflicts(
-            merged_api._routes,
+            _routes_and_native_routes(merged_api),
             merged_api._asgi_mounts,
             merged_api._mcp_mounts,
         )
@@ -956,7 +962,10 @@ class Command(BaseCommand):
                 )
             )
 
-        _core.register_routes(rust_routes)
+        try:
+            _core.register_routes(rust_routes, list(merged_api._native_routes))
+        except ValueError as e:
+            raise CommandError(str(e)) from e
 
         # Register HTTP ASGI mounts with Rust
         if merged_api._asgi_mounts:
@@ -1432,6 +1441,17 @@ class Command(BaseCommand):
                 route_map[asgi_key] = api_path
                 merged._asgi_mounts.append((asgi_prefix, asgi_app))
 
+            # Same key as a Python route, so a clash fails here, before
+            # runbolt starts its worker processes.
+            for method, path, capsule in api._native_routes:
+                route_key = f"{method} {path}"
+                if route_key in route_map:
+                    raise CommandError(
+                        f"Route conflict: {route_key} defined in both {route_map[route_key]} and {api_path}"
+                    )
+                route_map[route_key] = api_path
+                merged._native_routes.append((method, path, capsule))
+
             # Merge MCP mounts from this API
             for mcp_mount in getattr(api, "_mcp_mounts", []):
                 mcp_key = f"MCP {mcp_mount['path']}"
@@ -1443,7 +1463,7 @@ class Command(BaseCommand):
                 merged._mcp_mounts.append(mcp_mount)
 
         _validate_mcp_mount_conflicts(
-            merged._routes,
+            _routes_and_native_routes(merged),
             merged._asgi_mounts,
             merged._mcp_mounts,
             error_cls=CommandError,

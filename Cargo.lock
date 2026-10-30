@@ -482,6 +482,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
  "bolt-loop",
+ "bolt-native-abi",
  "brotli",
  "bytes",
  "chrono",
@@ -545,6 +546,10 @@ dependencies = [
  "sha2",
  "tokio",
 ]
+
+[[package]]
+name = "bolt-native-abi"
+version = "0.1.0"
 
 [[package]]
 name = "bolt-websocket"
@@ -928,6 +933,7 @@ dependencies = [
  "bolt-core",
  "bolt-loop",
  "bolt-mcp",
+ "bolt-native-abi",
  "bolt-websocket",
  "bytes",
  "chrono",

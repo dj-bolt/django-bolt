@@ -380,6 +380,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
  "bolt-loop",
+ "bolt-native-abi",
  "brotli",
  "bytes",
  "chrono",
@@ -419,6 +420,10 @@ dependencies = [
  "tokio",
  "tokio-util",
 ]
+
+[[package]]
+name = "bolt-native-abi"
+version = "0.1.0"
 
 [[package]]
 name = "brotli"

@@ -8,6 +8,7 @@ publish = false
 description = "Shared HTTP core for django-bolt: request/response types, routing, auth, guards, middleware, streaming"
 
 [dependencies]
+bolt-native-abi = { workspace = true }
 actix-files = { workspace = true }
 actix-http = { workspace = true }
 actix-multipart = { workspace = true }

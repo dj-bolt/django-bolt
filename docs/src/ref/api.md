@@ -278,6 +278,18 @@ See [ASGI Mounts](../topics/asgi-mounts.md) for usage examples and dispatch/conf
 `mount_django()` inherits the same mount boundary and buffered-bridge behavior as `mount_asgi()`.
 Use `clear_root_path=True` when Django URL patterns already include the mount prefix.
 
+### Native routes
+
+#### api.native_route(method, path, capsule)
+
+Serve `method path` with a Rust handler from another extension module. `capsule` is the `django_bolt.native_handler.v1` capsule of the handler. The request does not go into Python.
+
+```python
+api.native_route("GET", "/native/users/{id}", my_extension.user_handler())
+```
+
+See [Native Routes](../topics/native-routes.md) for what Bolt does for a native route and how to write a handler.
+
 ## Dependency injection
 
 ### Depends

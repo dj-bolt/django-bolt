@@ -319,6 +319,7 @@ An error formatter changes the body of each error response that the framework ma
   - 422 from path, query, header, cookie and form values.
   - 429 from rate limits.
   - A `FileResponse` whose file Rust cannot open or read when it sends the response.
+  - 500 and 504 that Bolt makes for a native route. A response of the native handler is not changed.
 - Python: request and response validation, `HTTPException`, and unhandled exceptions.
 
 Without a formatter, the errors keep their default body.
@@ -390,6 +391,7 @@ api = BoltAPI(error_formatter=format_error)
 | `rate_limited` | 429 | A rate limit |
 | `response_validation` | 500 | A handler return value that fails validation |
 | `internal_error` | 500 | An unhandled exception, also a `FileNotFoundError` or `PermissionError` of handler code, a file in `BOLT_ALLOWED_FILE_PATHS` that the server cannot read, a directory on the way to them that the server cannot search, or a failure in the Rust core |
+| `gateway_timeout` | 504 | A native route handler that does not complete within `BOLT_NATIVE_ROUTE_TIMEOUT` |
 
 An `HTTPException` gets its kind from its status, for example `conflict` for 409. A status with no name gives `http_error`.
 

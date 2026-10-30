@@ -5,6 +5,7 @@ use bolt_core::request::PyRequest;
 mod dev_reload;
 mod error_formatter;
 mod handler;
+mod native;
 mod normalize;
 mod response_body;
 mod response_helpers;
@@ -76,6 +77,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Production server functions
     m.add_function(wrap_pyfunction!(register_routes, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::native::check_native_capsule, m)?)?;
     m.add_function(wrap_pyfunction!(register_websocket_routes, m)?)?;
     m.add_function(wrap_pyfunction!(register_asgi_mounts, m)?)?;
     m.add_function(wrap_pyfunction!(bolt_mcp::register_mcp_mounts, m)?)?;
@@ -95,6 +97,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::testing::register_test_mcp_mounts,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(crate::testing::native_test_capsule, m)?)?;
     m.add_function(wrap_pyfunction!(register_test_middleware_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(test_request, m)?)?;
     m.add_function(wrap_pyfunction!(handle_test_websocket, m)?)?;
