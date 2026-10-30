@@ -1774,6 +1774,21 @@ mod tests {
     }
 
     #[test]
+    fn a_key_with_the_hash_of_a_valid_key_must_still_equal_it() {
+        // A random hash state cannot give a collision on demand, so the test
+        // puts a valid key in the bucket of the hash of "candidate".
+        let mut keys: ApiKeys = ["key-one".to_string()].into_iter().collect();
+        let bucket = keys.state.hash_one("candidate");
+        keys.by_hash
+            .entry(bucket)
+            .or_default()
+            .push("other-key".to_string());
+        assert_eq!(keys.find("candidate"), None);
+        assert_eq!(keys.find("other-key"), None);
+        assert_eq!(keys.find("key-one"), Some("key-one"));
+    }
+
+    #[test]
     fn an_api_key_backend_strips_the_prefix_and_names_the_key() {
         let backends = [AuthBackend::APIKey {
             api_keys: ["key-one".to_string()].into_iter().collect(),
