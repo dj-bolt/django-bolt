@@ -6,7 +6,7 @@ use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, crypto, get_current_
 use pyo3::IntoPyObjectExt;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyString};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -63,7 +63,9 @@ pub struct AuthContext {
     pub user_id: Option<String>,
     pub is_staff: bool,
     pub is_superuser: bool,
-    pub backend: String,
+    /// The scheme name of the backend: "jwt", "api_key" or "session". A
+    /// principal from an MCP `verify_token` hook brings its own name.
+    pub backend: Cow<'static, str>,
     /// Position of the authenticating backend in the route's backend list.
     /// Two backends can have the same scheme name (two JWT secrets), so
     /// Python finds the per-backend revocation handler and user loader by
@@ -77,23 +79,21 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    pub fn from_jwt_claims(claims: Claims, backend: &str, cookie_csrf: bool) -> Self {
+    pub fn from_jwt_claims(mut claims: Claims, backend: &'static str, cookie_csrf: bool) -> Self {
         let user_id = claims.sub.clone();
         let is_staff = claims.is_staff.unwrap_or(false);
         let is_superuser = claims.is_superuser.unwrap_or(false);
 
-        let mut permissions = HashSet::new();
-        if let Some(perms) = &claims.permissions {
-            for perm in perms {
-                permissions.insert(perm.clone());
-            }
-        }
+        // The guards and Python read the permissions from the context, not
+        // from the claims, so they move out of the claims.
+        let permissions: HashSet<String> =
+            claims.permissions.take().into_iter().flatten().collect();
 
         AuthContext {
             user_id,
             is_staff,
             is_superuser,
-            backend: backend.to_string(),
+            backend: Cow::Borrowed(backend),
             backend_index: None,
             claims: Some(claims),
             permissions,
@@ -113,7 +113,7 @@ impl AuthContext {
             user_id: Some(format!("apikey:{}", key)),
             is_staff: false,
             is_superuser: false,
-            backend: "api_key".to_string(),
+            backend: Cow::Borrowed("api_key"),
             backend_index: None,
             claims: None,
             permissions,
@@ -130,7 +130,7 @@ impl AuthContext {
             user_id: None,
             is_staff: false,
             is_superuser: false,
-            backend: "session".to_string(),
+            backend: Cow::Borrowed("session"),
             backend_index: Some(backend_index),
             claims: None,
             permissions: HashSet::new(),
@@ -869,7 +869,13 @@ pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: P
 
     let _ = dict.set_item(intern!(py, "is_staff"), auth_ctx.is_staff);
     let _ = dict.set_item(intern!(py, "is_superuser"), auth_ctx.is_superuser);
-    let _ = dict.set_item(intern!(py, "auth_backend"), &auth_ctx.backend);
+    let backend = match auth_ctx.backend.as_ref() {
+        "jwt" => intern!(py, "jwt"),
+        "api_key" => intern!(py, "api_key"),
+        "session" => intern!(py, "session"),
+        other => &PyString::new(py, other),
+    };
+    let _ = dict.set_item(intern!(py, "auth_backend"), backend);
     set_if_some!(dict, py, "auth_backend_index", auth_ctx.backend_index);
 
     if !auth_ctx.permissions.is_empty() {
@@ -899,7 +905,7 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
             let _ = claims_dict.set_item(intern!(py, "aud"), aud);
         }
         Some(Audience::Multiple(auds)) => {
-            let _ = claims_dict.set_item(intern!(py, "aud"), auds.clone());
+            let _ = claims_dict.set_item(intern!(py, "aud"), auds);
         }
         None => {}
     }
@@ -915,7 +921,7 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
     // statically since the set is open. set_item(&str, ...) handles them.
     for (key, value) in &claims.extra {
         let py_value = match value {
-            serde_json::Value::String(s) => s.clone().into_py_any(py).unwrap_or_else(|_| py.None()),
+            serde_json::Value::String(s) => PyString::new(py, s).into_any().unbind(),
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     i.into_py_any(py).unwrap_or_else(|_| py.None())
@@ -1694,13 +1700,13 @@ mod tests {
 
         let first = authenticate(&bearer_headers("secret-a"), &backends).unwrap();
         assert_eq!(
-            (first.backend.as_str(), first.backend_index),
+            (first.backend.as_ref(), first.backend_index),
             ("jwt", Some(0))
         );
 
         let second = authenticate(&bearer_headers("secret-b"), &backends).unwrap();
         assert_eq!(
-            (second.backend.as_str(), second.backend_index),
+            (second.backend.as_ref(), second.backend_index),
             ("jwt", Some(1))
         );
 
@@ -1722,7 +1728,7 @@ mod tests {
 
         let ctx = authenticate(&headers, &backends).unwrap();
         assert_eq!(
-            (ctx.backend.as_str(), ctx.backend_index),
+            (ctx.backend.as_ref(), ctx.backend_index),
             ("api_key", Some(1))
         );
     }
@@ -1915,6 +1921,48 @@ mod tests {
             assert_eq!(item("team").extract::<String>().unwrap(), "core");
             // A list or an object is not converted.
             assert!(item("tags").is_none());
+        });
+    }
+
+    #[test]
+    fn the_context_names_the_backend_and_keeps_the_jwt_claims() {
+        Python::initialize();
+        let claims: Claims = serde_json::from_value(serde_json::json!({
+            "sub": "1",
+            "aud": ["a", "b"],
+            "permissions": ["read", "write"],
+        }))
+        .unwrap();
+        let mut principal = AuthContext::from_api_key("k", &HashMap::new());
+        principal.backend = "oauth".to_string().into();
+        let contexts = [
+            ("jwt", AuthContext::from_jwt_claims(claims, "jwt", false)),
+            ("api_key", AuthContext::from_api_key("k", &HashMap::new())),
+            ("session", AuthContext::from_session(0, false)),
+            // A principal from an MCP `verify_token` hook names its own backend.
+            ("oauth", principal),
+        ];
+        Python::attach(|py| {
+            for (name, auth_ctx) in &contexts {
+                let context = PyDict::new(py).unbind();
+                populate_auth_context(&context, auth_ctx, py);
+                let context = context.bind(py);
+                let item = |key: &str| context.get_item(key).unwrap();
+                assert_eq!(
+                    item("auth_backend").unwrap().extract::<String>().unwrap(),
+                    *name
+                );
+                if *name != "jwt" {
+                    continue;
+                }
+                let mut permissions: Vec<String> = item("permissions").unwrap().extract().unwrap();
+                permissions.sort();
+                assert_eq!(permissions, ["read", "write"]);
+                let claims = item("auth_claims").unwrap();
+                let claim = |key: &str| claims.get_item(key).unwrap();
+                assert_eq!(claim("sub").extract::<String>().unwrap(), "1");
+                assert_eq!(claim("aud").extract::<Vec<String>>().unwrap(), ["a", "b"]);
+            }
         });
     }
 

@@ -163,7 +163,7 @@ mod tests {
             user_id: Some("other-user".to_string()),
             is_staff: false,
             is_superuser: false,
-            backend: "test".to_string(),
+            backend: "test".into(),
             backend_index: None,
             claims: None,
             permissions: HashSet::new(),

@@ -1260,7 +1260,7 @@ impl GuardCheck {
             user_id: Some(sub.clone()),
             is_staff,
             is_superuser,
-            backend: "session".to_string(),
+            backend: std::borrow::Cow::Borrowed("session"),
             backend_index: None,
             // `Requires` reads these claims. `permissions` reads the set below.
             claims: Some(Claims {
