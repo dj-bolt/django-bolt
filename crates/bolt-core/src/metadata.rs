@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
-    AuthBackend, AuthContext, Claims, JwtKeySource, RefreshingJwks, StaticKey,
+    ApiKeys, AuthBackend, AuthContext, Claims, JwtKeySource, RefreshingJwks, StaticKey,
     build_jwks_key_source, build_jwt_decoding_key, parse_jwt_algorithm,
 };
 use crate::permissions::{
@@ -1165,13 +1165,13 @@ pub fn parse_auth_backend(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyRe
             })
         }
         "api_key" => {
-            let api_keys: HashSet<String> = match dict.get("api_keys") {
+            let api_keys: ApiKeys = match dict.get("api_keys") {
                 Some(k) => k
                     .extract::<Option<Vec<String>>>(py)?
                     .unwrap_or_default()
                     .into_iter()
                     .collect(),
-                None => HashSet::new(),
+                None => ApiKeys::default(),
             };
 
             let header = match dict.get("header") {

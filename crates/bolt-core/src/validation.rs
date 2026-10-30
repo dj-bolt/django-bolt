@@ -358,7 +358,7 @@ mod tests {
 
     fn api_key_backend() -> AuthBackend {
         AuthBackend::APIKey {
-            api_keys: ["k1".to_string()].into(),
+            api_keys: ["k1".to_string()].into_iter().collect(),
             header: "x-api-key".to_string(),
             key_permissions: [("k1".to_string(), vec!["read".to_string()])].into(),
         }

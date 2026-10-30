@@ -1,5 +1,5 @@
 use ahash::AHashMap;
-use aws_lc_rs::hmac;
+use aws_lc_rs::{constant_time, hmac};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, crypto, get_current_timestamp};
@@ -357,6 +357,35 @@ impl RefreshingJwks {
     }
 }
 
+/// The valid keys of an API key backend.
+///
+/// `find` compares a request key with each valid key in constant time, and
+/// does not stop at a match. Thus the time of a check does not show how many
+/// bytes of a valid key the request key matches. It shows only the number of
+/// keys and whether the lengths are equal, as `hmac.compare_digest` does.
+#[derive(Debug, Clone, Default)]
+pub struct ApiKeys(Vec<String>);
+
+impl ApiKeys {
+    /// The valid key that equals `candidate`, or None.
+    pub fn find(&self, candidate: &str) -> Option<&str> {
+        let mut found = None;
+        for key in &self.0 {
+            if constant_time::verify_slices_are_equal(key.as_bytes(), candidate.as_bytes()).is_ok()
+            {
+                found = Some(key.as_str());
+            }
+        }
+        found
+    }
+}
+
+impl FromIterator<String> for ApiKeys {
+    fn from_iter<I: IntoIterator<Item = String>>(keys: I) -> Self {
+        Self(keys.into_iter().collect())
+    }
+}
+
 /// Authentication backend configuration
 #[derive(Debug, Clone)]
 pub enum AuthBackend {
@@ -391,7 +420,7 @@ pub enum AuthBackend {
         cookie_csrf: bool,
     },
     APIKey {
-        api_keys: HashSet<String>,
+        api_keys: ApiKeys,
         header: String,
         key_permissions: HashMap<String, Vec<String>>,
     },
@@ -816,12 +845,12 @@ fn try_jwt_auth(
 
 fn try_api_key_auth(
     headers: &AHashMap<String, String>,
-    api_keys: &HashSet<String>,
+    api_keys: &ApiKeys,
     header_name: &str,
     key_permissions: &HashMap<String, Vec<String>>,
 ) -> Option<AuthContext> {
     // SECURITY: Reject if no API keys configured (don't allow empty set)
-    if api_keys.is_empty() {
+    if api_keys.0.is_empty() {
         return None;
     }
 
@@ -834,12 +863,9 @@ fn try_api_key_auth(
         .or_else(|| api_key_header.strip_prefix("ApiKey "))
         .unwrap_or(api_key_header);
 
-    // Check if key is valid - use constant-time comparison for security
-    if api_keys.contains(api_key) {
-        Some(AuthContext::from_api_key(api_key, key_permissions))
-    } else {
-        None
-    }
+    // Check if the key is valid. See `ApiKeys::find` for the timing.
+    let api_key = api_keys.find(api_key)?;
+    Some(AuthContext::from_api_key(api_key, key_permissions))
 }
 
 /// Insert `key -> value` into a PyDict only if `value` is `Some`.
@@ -1708,11 +1734,43 @@ mod tests {
     }
 
     #[test]
+    fn an_api_key_must_equal_a_valid_key() {
+        let keys: ApiKeys = ["key-one".to_string(), "key-two".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(keys.find("key-one"), Some("key-one"));
+        assert_eq!(keys.find("key-two"), Some("key-two"));
+        for candidate in ["", "key-on", "key-one ", "key-onf", "KEY-ONE", "key-three"] {
+            assert_eq!(keys.find(candidate), None, "{candidate:?}");
+        }
+        assert_eq!(ApiKeys::default().find(""), None);
+    }
+
+    #[test]
+    fn an_api_key_backend_strips_the_prefix_and_names_the_key() {
+        let backends = [AuthBackend::APIKey {
+            api_keys: ["key-one".to_string()].into_iter().collect(),
+            header: "x-api-key".to_string(),
+            key_permissions: HashMap::from([("key-one".to_string(), vec!["read".to_string()])]),
+        }];
+        for value in ["key-one", "Bearer key-one", "ApiKey key-one"] {
+            let headers = AHashMap::from_iter([("x-api-key".to_string(), value.to_string())]);
+            let ctx = authenticate(&headers, &backends).unwrap();
+            assert_eq!(ctx.user_id.as_deref(), Some("apikey:key-one"));
+            assert!(ctx.permissions.contains("read"));
+        }
+        for value in ["key-two", "Token key-one", ""] {
+            let headers = AHashMap::from_iter([("x-api-key".to_string(), value.to_string())]);
+            assert!(authenticate(&headers, &backends).is_none(), "{value:?}");
+        }
+    }
+
+    #[test]
     fn authenticate_records_the_position_of_an_api_key_backend() {
         let backends = [
             hs256_backend("secret-a"),
             AuthBackend::APIKey {
-                api_keys: HashSet::from(["key-1".to_string()]),
+                api_keys: ["key-1".to_string()].into_iter().collect(),
                 header: "x-api-key".to_string(),
                 key_permissions: HashMap::new(),
             },
