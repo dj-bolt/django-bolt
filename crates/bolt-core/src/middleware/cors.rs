@@ -215,3 +215,249 @@ fn route_cors_config<'a>(
     }
     meta.cors_config.as_ref().map(CorsConfigRef::Route)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::{RouteMetadata, RouteMetadataStore};
+    use crate::middleware::client_ip::TrustedProxies;
+    use crate::middleware::rate_limit::RateLimiters;
+    use crate::router::Router;
+    use crate::streaming::StreamConfig;
+    use actix_web::http::header::{ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN};
+    use actix_web::test::{self, TestRequest};
+    use actix_web::{App, HttpRequest, HttpResponse, web};
+    use ahash::AHashMap;
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+    use std::time::Duration;
+
+    const GLOBAL: &str = "https://global.example";
+    const ROUTE: &str = "https://route.example";
+    const OTHER: &str = "https://other.example";
+
+    /// The CORS decision of a route.
+    enum RouteCors {
+        /// `@cors(origins=[ROUTE])`.
+        Own,
+        /// `@skip_middleware("cors")`.
+        Skip,
+        /// No decision of its own: the global config applies.
+        Inherit,
+    }
+
+    /// An app state with `routes` and a global config that allows `GLOBAL`.
+    fn state(routes: &[(&str, &str, RouteCors)]) -> Arc<AppState> {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut router = Router::new();
+            let mut metadata = AHashMap::new();
+            for (handler_id, (method, path, cors)) in routes.iter().enumerate() {
+                router
+                    .register(method, path, handler_id, py.None(), py.None(), py.None())
+                    .unwrap();
+                let meta = PyDict::new(py);
+                for key in [
+                    "needs_body",
+                    "needs_query",
+                    "needs_headers",
+                    "needs_cookies",
+                    "needs_path_params",
+                    "needs_form_parsing",
+                ] {
+                    meta.set_item(key, false).unwrap();
+                }
+                meta.set_item("is_static_route", true).unwrap();
+                meta.set_item("default_status_code", 200).unwrap();
+                match cors {
+                    RouteCors::Own => {
+                        let middleware = PyDict::new(py);
+                        middleware.set_item("type", "cors").unwrap();
+                        middleware.set_item("origins", vec![ROUTE]).unwrap();
+                        meta.set_item("middleware", vec![middleware]).unwrap();
+                    }
+                    RouteCors::Skip => meta.set_item("skip", vec!["cors"]).unwrap(),
+                    RouteCors::Inherit => {}
+                }
+                metadata.insert(handler_id, RouteMetadata::from_python(&meta, py).unwrap());
+            }
+            Arc::new(AppState {
+                dispatch: py.None(),
+                debug: false,
+                max_header_size: 8192,
+                max_payload_size: 1024 * 1024,
+                max_param_length: 4096,
+                asgi_mount_timeout: Duration::from_secs(30),
+                stream_config: StreamConfig {
+                    sync_batch_size: 5,
+                    channel_capacity: 32,
+                    max_sync_threads: 1000,
+                },
+                global_cors_config: Some(CorsConfig::from_django_settings(
+                    vec![GLOBAL.to_string()],
+                    Vec::new(),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                )),
+                global_compression_config: None,
+                trusted_proxies: Arc::new(TrustedProxies::default()),
+                rate_limiters: Arc::new(RateLimiters::default()),
+                router: Arc::new(router),
+                route_metadata: Arc::new(RouteMetadataStore::from_map(metadata)),
+                asgi_mounts: Arc::new(Vec::new()),
+                extensions: http::Extensions::new(),
+                static_files_config: None,
+                media_files_config: None,
+                access_log_levels: 0,
+                access_logger: None,
+                error_renderer: None,
+            })
+        })
+    }
+
+    /// The CORS headers of a response: the allowed origin, and whether it has
+    /// the preflight `Access-Control-Allow-Methods`.
+    #[derive(Debug, PartialEq)]
+    struct Cors {
+        origin: Option<String>,
+        preflight: bool,
+    }
+
+    const NONE: Cors = Cors {
+        origin: None,
+        preflight: false,
+    };
+
+    fn allowed(origin: &str) -> Cors {
+        Cors {
+            origin: Some(origin.to_string()),
+            preflight: false,
+        }
+    }
+
+    fn preflight(origin: &str) -> Cors {
+        Cors {
+            origin: Some(origin.to_string()),
+            preflight: true,
+        }
+    }
+
+    /// Send `request` through the middleware to a handler that answers 200.
+    /// The handler of `/marker` sets the skip marker. Also check that the
+    /// marker never reaches the client.
+    async fn call(state: &Arc<AppState>, request: TestRequest) -> Cors {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state.clone()))
+                .wrap(CorsMiddleware::new())
+                .default_service(web::to(|req: HttpRequest| async move {
+                    let mut response = HttpResponse::Ok();
+                    if req.path() == "/marker" {
+                        response.insert_header(("x-bolt-skip-cors", "1"));
+                    }
+                    response.finish()
+                })),
+        )
+        .await;
+        let response = test::call_service(&app, request.to_request()).await;
+        let headers = response.headers();
+        assert!(headers.get("x-bolt-skip-cors").is_none());
+        Cors {
+            origin: headers
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|value| value.to_str().unwrap().to_string()),
+            preflight: headers.contains_key(ACCESS_CONTROL_ALLOW_METHODS),
+        }
+    }
+
+    fn get(path: &str, origin: &str) -> TestRequest {
+        TestRequest::get().uri(path).insert_header((ORIGIN, origin))
+    }
+
+    fn options(path: &str, origin: &str, requested: Option<&str>) -> TestRequest {
+        let request = TestRequest::default()
+            .method(Method::OPTIONS)
+            .uri(path)
+            .insert_header((ORIGIN, origin));
+        match requested {
+            Some(method) => request.insert_header((ACCESS_CONTROL_REQUEST_METHOD, method)),
+            None => request,
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_request_with_no_origin_gets_no_cors_headers() {
+        let state = state(&[]);
+        for path in ["/items", "/marker"] {
+            let request = TestRequest::get().uri(path);
+            assert_eq!(call(&state, request).await, NONE);
+        }
+    }
+
+    #[actix_web::test]
+    async fn the_global_config_adds_preflight_headers_only_to_an_allowed_preflight() {
+        let state = state(&[]);
+        assert_eq!(call(&state, get("/items", GLOBAL)).await, allowed(GLOBAL));
+        assert_eq!(call(&state, get("/items", OTHER)).await, NONE);
+        assert_eq!(
+            call(&state, options("/items", GLOBAL, None)).await,
+            preflight(GLOBAL)
+        );
+        assert_eq!(call(&state, options("/items", OTHER, None)).await, NONE);
+    }
+
+    #[actix_web::test]
+    async fn a_route_config_replaces_the_global_config() {
+        let state = state(&[("GET", "/route", RouteCors::Own)]);
+        assert_eq!(call(&state, get("/route", ROUTE)).await, allowed(ROUTE));
+        assert_eq!(call(&state, get("/route", GLOBAL)).await, NONE);
+        assert_eq!(call(&state, get("/other", GLOBAL)).await, allowed(GLOBAL));
+    }
+
+    #[actix_web::test]
+    async fn a_preflight_uses_the_route_of_the_requested_method() {
+        let state = state(&[
+            ("GET", "/items", RouteCors::Inherit),
+            ("POST", "/items", RouteCors::Own),
+        ]);
+        assert_eq!(
+            call(&state, options("/items", ROUTE, Some("POST"))).await,
+            preflight(ROUTE)
+        );
+        assert_eq!(
+            call(&state, options("/items", GLOBAL, Some("POST"))).await,
+            NONE
+        );
+        assert_eq!(
+            call(&state, options("/items", GLOBAL, Some("GET"))).await,
+            preflight(GLOBAL)
+        );
+        // The config of the POST route grants nothing to a GET request.
+        assert_eq!(call(&state, get("/items", ROUTE)).await, NONE);
+        assert_eq!(call(&state, get("/items", GLOBAL)).await, allowed(GLOBAL));
+    }
+
+    #[actix_web::test]
+    async fn a_preflight_with_no_requested_method_uses_the_first_route_with_a_decision() {
+        let state = state(&[
+            ("GET", "/items", RouteCors::Inherit),
+            ("PUT", "/items", RouteCors::Own),
+        ]);
+        assert_eq!(
+            call(&state, options("/items", ROUTE, None)).await,
+            preflight(ROUTE)
+        );
+        assert_eq!(call(&state, options("/items", GLOBAL, None)).await, NONE);
+    }
+
+    #[actix_web::test]
+    async fn a_skipped_route_or_the_skip_marker_gets_no_cors_headers() {
+        let state = state(&[("GET", "/skip", RouteCors::Skip)]);
+        assert_eq!(call(&state, get("/skip", GLOBAL)).await, NONE);
+        assert_eq!(call(&state, get("/marker", GLOBAL)).await, NONE);
+    }
+}
