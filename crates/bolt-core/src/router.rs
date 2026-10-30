@@ -473,6 +473,154 @@ mod tests {
         assert_eq!(convert_path("/items/{id}/tags"), "/items/{id}/tags");
     }
 
+    const METHODS: [&str; 8] = [
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY",
+    ];
+
+    /// A router with the handler id of each route at its index. Each callable is `None`.
+    fn router_with(routes: &[(&str, &str)]) -> Router {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut router = Router::new();
+            for (handler_id, (method, path)) in routes.iter().enumerate() {
+                router
+                    .register(method, path, handler_id, py.None(), py.None(), py.None())
+                    .unwrap();
+            }
+            router
+        })
+    }
+
+    type Params = Option<Vec<(String, String)>>;
+
+    /// The handler id of the match, and its path params in name order, decoded
+    /// as the request handler decodes them.
+    fn lookup(router: &Router, method: &str, path: &str) -> Option<(usize, Params)> {
+        let found = router.find(method, path)?;
+        let handler_id = found.handler_id();
+        assert_eq!(found.route().handler_id, handler_id);
+        let (route, params) = found.into_parts();
+        assert_eq!(route.handler_id, handler_id);
+        let params = params.map(|mut params| {
+            decode_path_params(&mut params);
+            let mut params: Vec<(String, String)> = params.into_iter().collect();
+            params.sort();
+            params
+        });
+        Some((handler_id, params))
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> Params {
+        Some(
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn each_method_finds_only_its_own_routes() {
+        let routes: Vec<(&str, &str)> = METHODS
+            .iter()
+            .flat_map(|method| [(*method, "/items"), (*method, "/items/{id}")])
+            .collect();
+        let router = router_with(&routes);
+        for (index, method) in METHODS.iter().enumerate() {
+            assert_eq!(lookup(&router, method, "/items"), Some((2 * index, None)));
+            assert_eq!(
+                lookup(&router, method, "/items/7"),
+                Some((2 * index + 1, params(&[("id", "7")])))
+            );
+        }
+
+        let router = router_with(&[("GET", "/items"), ("GET", "/items/{id}")]);
+        for method in &METHODS[1..] {
+            assert_eq!(lookup(&router, method, "/items"), None);
+            assert_eq!(lookup(&router, method, "/items/7"), None);
+        }
+    }
+
+    #[test]
+    fn an_unknown_method_does_not_register_and_finds_nothing() {
+        let mut router = router_with(&[("GET", "/items")]);
+        Python::attach(|py| {
+            let error = router
+                .register("TRACE", "/items", 1, py.None(), py.None(), py.None())
+                .unwrap_err();
+            assert_eq!(error.to_string(), "ValueError: Unsupported method: TRACE");
+        });
+        assert_eq!(lookup(&router, "TRACE", "/items"), None);
+        assert_eq!(lookup(&router, "get", "/items"), None);
+    }
+
+    #[test]
+    fn a_static_route_wins_and_has_no_params() {
+        let router = router_with(&[("GET", "/users/{id}"), ("GET", "/users/me")]);
+        assert_eq!(lookup(&router, "GET", "/users/me"), Some((1, None)));
+        assert_eq!(
+            lookup(&router, "GET", "/users/42"),
+            Some((0, params(&[("id", "42")])))
+        );
+        assert_eq!(lookup(&router, "GET", "/users"), None);
+        assert_eq!(lookup(&router, "GET", "/users/42/posts"), None);
+    }
+
+    #[test]
+    fn a_dynamic_route_gives_each_param() {
+        let router = router_with(&[
+            ("GET", "/orgs/{org}/repos/{repo:str}"),
+            ("GET", "/files/{rest:path}"),
+        ]);
+        assert_eq!(
+            lookup(&router, "GET", "/orgs/acme/repos/widgets"),
+            Some((0, params(&[("org", "acme"), ("repo", "widgets")])))
+        );
+        // A path param takes the rest of the path. Only `%XX` decodes.
+        assert_eq!(
+            lookup(&router, "GET", "/files/a/b%20c+d.txt"),
+            Some((1, params(&[("rest", "a/b c+d.txt")])))
+        );
+    }
+
+    #[test]
+    fn a_route_that_conflicts_does_not_register() {
+        let mut router = router_with(&[("GET", "/items/{id}")]);
+        Python::attach(|py| {
+            let error = router
+                .register("GET", "/items/{key}", 1, py.None(), py.None(), py.None())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("ValueError: Failed to register route: "),
+                "{error}"
+            );
+        });
+        assert_eq!(
+            lookup(&router, "GET", "/items/1"),
+            Some((0, params(&[("id", "1")])))
+        );
+    }
+
+    #[test]
+    fn find_all_methods_lists_the_methods_of_a_path_and_options() {
+        let router = router_with(&[
+            ("GET", "/items"),
+            ("POST", "/items"),
+            ("DELETE", "/items/{id}"),
+            ("GET", "/cors"),
+            ("OPTIONS", "/cors"),
+        ]);
+        assert_eq!(
+            router.find_all_methods("/items"),
+            ["GET", "POST", "OPTIONS"]
+        );
+        assert_eq!(router.find_all_methods("/items/3"), ["DELETE", "OPTIONS"]);
+        // A registered OPTIONS route is listed once.
+        assert_eq!(router.find_all_methods("/cors"), ["GET", "OPTIONS"]);
+        assert!(router.find_all_methods("/none").is_empty());
+    }
+
     #[test]
     fn collect_query_sequences_keeps_each_value_of_a_listed_key_in_order() {
         let keys: AHashSet<String> = ["tag".to_string(), "id".to_string()].into_iter().collect();
