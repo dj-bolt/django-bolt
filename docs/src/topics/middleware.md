@@ -101,7 +101,10 @@ Parameters:
 
 ### Counting per caller
 
-`key="ip"` counts per client address. A header name counts per header value.
+`key="ip"` counts per client address. An IPv6 client counts per /64 network,
+because one client often holds a whole /64. Set
+[`BOLT_RATE_LIMIT_IPV6_PREFIX`](../ref/settings.md#bolt_rate_limit_ipv6_prefix)
+to change the prefix. A header name counts per header value.
 Callers that do not send the header share one bucket. Bolt hashes the value,
 so its length is not limited.
 

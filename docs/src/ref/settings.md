@@ -123,6 +123,18 @@ Both an address and a block are accepted. `127.0.0.1` matches one address. `10.0
 !!! warning "Set this when you run behind a proxy"
     A client sends `X-Forwarded-For` itself, and a proxy appends to it. Without this setting Bolt ignores the header, so every caller behind the proxy shares one bucket. With the setting, Bolt separates them again and a client cannot pick its own bucket. Behind a proxy that ends TLS, Bolt also needs this setting to see `https`.
 
+### BOLT_RATE_LIMIT_IPV6_PREFIX
+
+The prefix length of the network that a rate limit counts an IPv6 client on. The value is an int from 0 to 128. The default is 64.
+
+```python
+BOLT_RATE_LIMIT_IPV6_PREFIX = 64
+```
+
+A provider usually gives one client a /64 network or more. With a key of the full address, that client could send each request from a new address and get a new bucket. Thus `@rate_limit(key="ip")` counts an IPv6 client per /64 network. The address fallback of `key="user"` and `key="api_key"` does the same. An IPv4 client is counted per address.
+
+Set 128 to count each IPv6 address. Do this when clients that are not related share one /64, for example virtual machines of a cloud provider. Set a smaller value, such as 56 or 48, to count a larger network as one client. The 429 log line names the network, for example `2001:db8:1:2::/64`. `request.META["REMOTE_ADDR"]` keeps the full address. An invalid value raises `ImproperlyConfigured` at startup.
+
 ## File upload settings
 
 ### BOLT_MAX_UPLOAD_SIZE
@@ -511,6 +523,7 @@ api = BoltAPI(
 | `CORS_ALLOW_HEADERS` | `list[str]` | `Content-Type`, `Authorization` | Allowed headers |
 | `CORS_EXPOSE_HEADERS` | `list[str]` | `[]` | Exposed headers |
 | `CORS_PREFLIGHT_MAX_AGE` | `int` | `3600` | Preflight cache (seconds) |
+| `BOLT_RATE_LIMIT_IPV6_PREFIX` | `int` | `64` | Network prefix that a rate limit counts an IPv6 client on |
 | `BOLT_MAX_UPLOAD_SIZE` | `int` | `1048576` | Max upload size (bytes) |
 | `BOLT_MEMORY_SPOOL_THRESHOLD` | `int` | `1048576` | Memory threshold before disk spooling (bytes) |
 | `BOLT_ALLOWED_FILE_PATHS` | `list[str \| Path]` | `None` | File serving whitelist |

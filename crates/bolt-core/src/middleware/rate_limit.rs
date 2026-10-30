@@ -7,7 +7,7 @@ use governor::{Quota, RateLimiter};
 use once_cell::sync::Lazy;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -37,6 +37,8 @@ struct LimiterKey(u64);
 #[derive(Debug, Clone, Copy)]
 enum KeySource<'a> {
     Ip(IpAddr),
+    /// The network of an IPv6 client, with its prefix length.
+    Ipv6Network(Ipv6Addr, u8),
     Header(&'a str),
     Identity(&'a str),
     Unknown,
@@ -54,6 +56,7 @@ impl KeySource<'_> {
             KeySource::Header(value) => (1u8, value).hash(&mut hasher),
             KeySource::Identity(value) => (2u8, value).hash(&mut hasher),
             KeySource::Unknown => 3u8.hash(&mut hasher),
+            KeySource::Ipv6Network(network, _) => (4u8, network).hash(&mut hasher),
         }
         LimiterKey(hasher.finish())
     }
@@ -71,6 +74,7 @@ impl fmt::Display for KeySource<'_> {
         match self {
             // An address is not a credential, and is the useful thing to read.
             KeySource::Ip(ip) => ip.fmt(f),
+            KeySource::Ipv6Network(network, prefix) => write!(f, "{network}/{prefix}"),
             KeySource::Header(_) => write!(f, "header:{:016x}", self.bucket().0),
             KeySource::Identity(_) => write!(f, "identity:{:016x}", self.bucket().0),
             KeySource::Unknown => f.write_str("unknown"),
@@ -84,13 +88,26 @@ impl fmt::Display for KeySource<'_> {
 ///
 /// `runbolt` makes one for all workers. A test app makes its own, because
 /// each test app starts its handler ids at 0.
-#[derive(Default)]
 pub struct RateLimiters {
     /// Keyed on handler id, quota and client key. The client key is already
     /// a seeded hash, so the map hashes with ahash, not SipHash.
     limiters: DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>, RandomState>,
     /// The number of limiters, for cleanup.
     count: AtomicUsize,
+    /// The prefix length of the network that an IPv6 client keys on, and its
+    /// mask. See `client`.
+    ipv6_prefix: u8,
+    ipv6_mask: u128,
+}
+
+/// The default of `BOLT_RATE_LIMIT_IPV6_PREFIX`. A provider gives one client a
+/// /64 or more, so a client can send from 2^64 addresses.
+pub const DEFAULT_IPV6_PREFIX: u8 = 64;
+
+impl Default for RateLimiters {
+    fn default() -> Self {
+        Self::new(DEFAULT_IPV6_PREFIX)
+    }
 }
 
 // SECURITY: Maximum number of rate limiters to prevent memory exhaustion
@@ -160,8 +177,9 @@ pub fn check_rate_limit(
     let burst = config.burst;
 
     // Determine the rate limit key
+    let client = || client_ip.map(|ip| limiters.client(*ip));
     let source = match &config.key {
-        RateLimitKey::Ip => client_ip.map(|ip| KeySource::Ip(*ip)),
+        RateLimitKey::Ip => client(),
         // Custom header key — already lowercased once at startup when the
         // RateLimitConfig was parsed (headers map stores lowercase names).
         // The value is hashed rather than stored, so its length is not capped:
@@ -172,10 +190,8 @@ pub fn check_rate_limit(
         // Identity keys run after authentication. A caller with no identity
         // is limited per client address, so an unauthenticated flood cannot
         // pick a fresh bucket per request.
-        RateLimitKey::User => identity_source(auth_ctx, client_ip, |_| true),
-        RateLimitKey::ApiKey => {
-            identity_source(auth_ctx, client_ip, |ctx| ctx.backend == "api_key")
-        }
+        RateLimitKey::User => identity(auth_ctx, |_| true).or_else(client),
+        RateLimitKey::ApiKey => identity(auth_ctx, |ctx| ctx.backend == "api_key").or_else(client),
     }
     .unwrap_or(KeySource::Unknown);
 
@@ -248,22 +264,45 @@ fn take(limiter: &Limiter) -> Result<(), Duration> {
         .map_err(|not_until| not_until.wait_time_from(limiter.clock().now()))
 }
 
-/// The authenticated identity when `accept` admits the backend, else the
-/// client address.
+/// The authenticated identity when `accept` admits the backend.
 #[inline]
-fn identity_source<'a>(
-    auth_ctx: Option<&'a AuthContext>,
-    client_ip: Option<&IpAddr>,
+fn identity(
+    auth_ctx: Option<&AuthContext>,
     accept: impl Fn(&AuthContext) -> bool,
-) -> Option<KeySource<'a>> {
+) -> Option<KeySource<'_>> {
     auth_ctx
         .filter(|ctx| accept(ctx))
         .and_then(|ctx| ctx.user_id.as_deref())
         .map(KeySource::Identity)
-        .or_else(|| client_ip.map(|ip| KeySource::Ip(*ip)))
 }
 
 impl RateLimiters {
+    /// Limiters that key an IPv6 client on its first `ipv6_prefix` bits. A
+    /// prefix of 128 or more keys on the full address.
+    pub fn new(ipv6_prefix: u8) -> Self {
+        Self {
+            limiters: DashMap::default(),
+            count: AtomicUsize::new(0),
+            ipv6_prefix,
+            // The host bits are `MAX >> prefix`. A prefix over 128 keeps all bits.
+            ipv6_mask: !(u128::MAX.checked_shr(u32::from(ipv6_prefix)).unwrap_or(0)),
+        }
+    }
+
+    /// The key of a client address. An IPv6 client keys on its network, so it
+    /// cannot get a fresh bucket for each address of that network. An IPv4
+    /// client keys on its address.
+    #[inline]
+    fn client(&self, ip: IpAddr) -> KeySource<'static> {
+        match ip {
+            IpAddr::V6(v6) if self.ipv6_prefix < 128 => KeySource::Ipv6Network(
+                Ipv6Addr::from(u128::from(v6) & self.ipv6_mask),
+                self.ipv6_prefix,
+            ),
+            ip => KeySource::Ip(ip),
+        }
+    }
+
     /// Cleanup old rate limiters when limit is reached
     /// Simple strategy: remove 20% of limiters to make room for new ones
     fn cleanup_old_limiters(&self) {
@@ -550,6 +589,54 @@ mod tests {
             );
         }
         assert_eq!(limiters.limiters.len(), 0);
+    }
+
+    #[test]
+    fn an_ipv6_client_keys_on_its_network() {
+        let limiters = RateLimiters::default();
+        let key = RateLimitKey::Ip;
+        assert!(request(&limiters, &key, "2001:db8:1:2::1", None).is_none());
+        // Another address of the same /64 shares the bucket.
+        assert!(request(&limiters, &key, "2001:db8:1:2:ffff::9", None).is_some());
+        // The next /64 is another network.
+        assert!(request(&limiters, &key, "2001:db8:1:3::1", None).is_none());
+
+        // A caller with no identity falls back to its network too.
+        let user = RateLimitKey::User;
+        assert!(request(&limiters, &user, "2001:db8:1:4::1", None).is_none());
+        assert!(request(&limiters, &user, "2001:db8:1:4::2", None).is_some());
+    }
+
+    #[test]
+    fn the_ipv6_prefix_sets_the_network() {
+        let key = RateLimitKey::Ip;
+        // 128 keys on the full address.
+        let full = RateLimiters::new(128);
+        assert!(request(&full, &key, "2001:db8::1", None).is_none());
+        assert!(request(&full, &key, "2001:db8::2", None).is_none());
+        // 48 puts the /64 networks of one /48 in one bucket.
+        let wide = RateLimiters::new(48);
+        assert!(request(&wide, &key, "2001:db8:1:1::1", None).is_none());
+        assert!(request(&wide, &key, "2001:db8:1:2::1", None).is_some());
+        assert!(request(&wide, &key, "2001:db8:2:1::1", None).is_none());
+        // 0 puts all IPv6 clients in one bucket. IPv4 still keys on the address.
+        let none = RateLimiters::new(0);
+        assert!(request(&none, &key, "2001:db8::1", None).is_none());
+        assert!(request(&none, &key, "3fff::1", None).is_some());
+        assert!(request(&none, &key, "203.0.113.7", None).is_none());
+        assert!(request(&none, &key, "203.0.113.8", None).is_none());
+    }
+
+    #[test]
+    fn the_log_label_names_the_ipv6_network() {
+        let limiters = RateLimiters::default();
+        let label = |limiters: &RateLimiters, address| limiters.client(ip(address)).to_string();
+        assert_eq!(
+            label(&limiters, "2001:db8:1:2:3:4:5:6"),
+            "2001:db8:1:2::/64"
+        );
+        assert_eq!(label(&limiters, "203.0.113.7"), "203.0.113.7");
+        assert_eq!(label(&RateLimiters::new(128), "2001:db8::1"), "2001:db8::1");
     }
 
     #[test]

@@ -17,6 +17,7 @@ use bolt_core::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMet
 use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
+use bolt_core::middleware::rate_limit::{DEFAULT_IPV6_PREFIX, RateLimiters};
 use bolt_core::router::Router;
 use bolt_core::settings::{
     DjangoSettings, env_flag, env_non_negative_int, env_positive_int, env_var,
@@ -128,6 +129,12 @@ fn read_max_age_setting(
     ))
 }
 
+/// Read `BOLT_RATE_LIMIT_IPV6_PREFIX`: the prefix length of the network that a
+/// rate limit keys an IPv6 client on. `runbolt` and the test clients read it here.
+pub(crate) fn read_rate_limit_ipv6_prefix(settings: &DjangoSettings<'_>) -> PyResult<u8> {
+    settings.int_up_to("BOLT_RATE_LIMIT_IPV6_PREFIX", 128, DEFAULT_IPV6_PREFIX)
+}
+
 /// The scope prefix for a static URL such as `"/static/"`, or None when the
 /// URL cannot be mounted. An empty prefix (`"/"`) would shadow every route.
 pub(crate) fn static_scope_prefix(static_url: &str) -> Option<String> {
@@ -162,6 +169,8 @@ pub(crate) struct ServerConfig {
     pub ws_config: Arc<WsConfig>,
     pub global_cors_config: Option<CorsConfig>,
     pub trusted_proxies: Arc<TrustedProxies>,
+    /// `BOLT_RATE_LIMIT_IPV6_PREFIX`: the network that an IPv6 client keys on.
+    pub rate_limit_ipv6_prefix: u8,
     pub static_files_config: Option<Arc<ScopeConfig>>,
     pub media_files_config: Option<Arc<ScopeConfig>>,
 }
@@ -187,6 +196,7 @@ impl ServerConfig {
         let asgi_mount_timeout =
             settings.positive_seconds("BOLT_ASGI_MOUNT_TIMEOUT", Duration::from_secs(30))?; // Default 30s
         let stream_config = StreamConfig::read(&settings)?;
+        let rate_limit_ipv6_prefix = read_rate_limit_ipv6_prefix(&settings)?;
         let ws_config = Arc::new(WsConfig::from_django_settings(&settings)?);
 
         let (global_cors_config, static_files_config, media_files_config) = if read_cors_and_files {
@@ -213,6 +223,7 @@ impl ServerConfig {
             ws_config,
             global_cors_config,
             trusted_proxies,
+            rate_limit_ipv6_prefix,
             static_files_config,
             media_files_config,
         })
@@ -782,7 +793,7 @@ pub fn start_server(
         global_cors_config: config.global_cors_config,
         global_compression_config: global_compression_config.clone(),
         trusted_proxies: config.trusted_proxies,
-        rate_limiters: Arc::default(),
+        rate_limiters: Arc::new(RateLimiters::new(config.rate_limit_ipv6_prefix)),
         router: Arc::clone(GLOBAL_ROUTER.get().expect("checked at the start")),
         route_metadata,
         asgi_mounts: GLOBAL_ASGI_MOUNTS.get().cloned().unwrap_or_default(),

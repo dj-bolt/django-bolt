@@ -103,6 +103,14 @@ impl<'py> DjangoSettings<'py> {
             .unwrap_or(default))
     }
 
+    /// Read an int setting from 0 to `max`.
+    pub fn int_up_to(&self, name: &str, max: u8, default: u8) -> PyResult<u8> {
+        let expected = format!("an int from 0 to {max}");
+        Ok(self
+            .int(name, &expected, |value: &u8| *value <= max)?
+            .unwrap_or(default))
+    }
+
     /// Read an int setting from 0 to `u32::MAX`, or None when it is missing.
     pub fn optional_u32(&self, name: &str) -> PyResult<Option<u32>> {
         self.int(name, "an int from 0 to 4294967295", |_| true)
