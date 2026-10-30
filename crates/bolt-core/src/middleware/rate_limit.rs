@@ -10,6 +10,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::metadata::{RateLimitConfig, RateLimitKey};
 use crate::middleware::auth::AuthContext;
@@ -85,8 +86,9 @@ impl fmt::Display for KeySource<'_> {
 /// each test app starts its handler ids at 0.
 #[derive(Default)]
 pub struct RateLimiters {
-    /// Keyed on handler id, quota and client key.
-    limiters: DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>>,
+    /// Keyed on handler id, quota and client key. The client key is already
+    /// a seeded hash, so the map hashes with ahash, not SipHash.
+    limiters: DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>, RandomState>,
     /// The number of limiters, for cleanup.
     count: AtomicUsize,
 }
@@ -182,36 +184,32 @@ pub fn check_rate_limit(
     // line of a rejection.
     let key = (handler_id, rps, burst, source.bucket());
     let outcome = match limiters.limiters.get(&key) {
-        Some(limiter) => limiter.check(),
+        Some(limiter) => take(&limiter),
         None => {
             // SECURITY: Check if we've exceeded max limiters (prevent memory exhaustion)
             if limiters.count.load(Ordering::Relaxed) >= MAX_LIMITERS {
                 // Trigger cleanup of old limiters (simple LRU-style)
                 limiters.cleanup_old_limiters();
             }
-            limiters
-                .limiters
-                .entry(key)
-                .or_insert_with(|| {
-                    // Increment counter
-                    limiters.count.fetch_add(1, Ordering::Relaxed);
+            let limiter = limiters.limiters.entry(key).or_insert_with(|| {
+                // Increment counter
+                limiters.count.fetch_add(1, Ordering::Relaxed);
 
-                    // Use NonZero constructors properly
-                    let rps_nonzero = std::num::NonZeroU32::new(rps.max(1)).unwrap();
-                    let burst_nonzero = std::num::NonZeroU32::new(burst.max(1)).unwrap();
-                    let quota = Quota::per_second(rps_nonzero).allow_burst(burst_nonzero);
-                    Arc::new(RateLimiter::direct(quota))
-                })
-                .check()
+                // Use NonZero constructors properly
+                let rps_nonzero = std::num::NonZeroU32::new(rps.max(1)).unwrap();
+                let burst_nonzero = std::num::NonZeroU32::new(burst.max(1)).unwrap();
+                let quota = Quota::per_second(rps_nonzero).allow_burst(burst_nonzero);
+                Arc::new(RateLimiter::direct(quota))
+            });
+            take(&limiter)
         }
     };
 
     // Check rate limit
     match outcome {
         Ok(_) => None, // Request allowed
-        Err(not_until) => {
+        Err(wait_time) => {
             // Calculate retry after in seconds
-            let wait_time = not_until.wait_time_from(DefaultClock::default().now());
             let retry_after = wait_time.as_secs().max(1);
 
             // Log rate limit exceeded
@@ -238,6 +236,16 @@ pub fn check_rate_limit(
             }))
         }
     }
+}
+
+/// Take one request from `limiter`. A rejection gives the wait for the next
+/// request. The limiter reads its own clock, because a new clock runs `cpuid`
+/// to select its source, and a virtual machine traps that instruction.
+#[inline]
+fn take(limiter: &Limiter) -> Result<(), Duration> {
+    limiter
+        .check()
+        .map_err(|not_until| not_until.wait_time_from(limiter.clock().now()))
 }
 
 /// The authenticated identity when `accept` admits the backend, else the

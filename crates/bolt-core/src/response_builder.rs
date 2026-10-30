@@ -5,12 +5,18 @@
 use actix_web::body::MessageBody;
 use actix_web::http::header::{self, HeaderName, HeaderValue};
 use actix_web::{HttpResponse, HttpResponseBuilder, http::StatusCode};
+use bytes::Bytes;
 
 use crate::cookies::format_cookie;
 use crate::response_meta::ResponseMeta;
 
 /// The `Content-Encoding` marker that tells the compression middleware to skip.
 const IDENTITY: HeaderValue = HeaderValue::from_static("identity");
+
+/// The headers of a 429, parsed once.
+const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
+const X_RATELIMIT_BURST: HeaderName = HeaderName::from_static("x-ratelimit-burst");
+const APPLICATION_JSON: HeaderValue = HeaderValue::from_static("application/json");
 
 /// Build a streaming response with SSE headers.
 /// Pre-bundles common SSE headers to avoid multiple mutations.
@@ -65,14 +71,15 @@ pub fn build_rate_limit_response(
     retry_after: u64,
     rps: u32,
     burst: u32,
-    body: Vec<u8>,
+    body: Bytes,
 ) -> HttpResponse {
-    // Batch all headers at once
+    // The names are constants, and a number becomes a header value with no
+    // `String` between.
     HttpResponse::TooManyRequests()
-        .insert_header(("Retry-After", retry_after.to_string()))
-        .insert_header(("X-RateLimit-Limit", rps.to_string()))
-        .insert_header(("X-RateLimit-Burst", burst.to_string()))
-        .content_type("application/json")
+        .insert_header((header::RETRY_AFTER, HeaderValue::from(retry_after)))
+        .insert_header((X_RATELIMIT_LIMIT, HeaderValue::from(rps)))
+        .insert_header((X_RATELIMIT_BURST, HeaderValue::from(burst)))
+        .insert_header((header::CONTENT_TYPE, APPLICATION_JSON))
         .body(body)
 }
 
@@ -259,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_build_rate_limit_response() {
-        let response = build_rate_limit_response(60, 100, 200, b"{}".to_vec());
+        let response = build_rate_limit_response(60, 100, 200, Bytes::from_static(b"{}"));
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(values(&response, "retry-after"), ["60"]);
         assert_eq!(values(&response, "x-ratelimit-limit"), ["100"]);

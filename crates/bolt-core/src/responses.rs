@@ -5,9 +5,8 @@
 use crate::error::{ErrorInfo, with_error_info};
 use crate::permissions::GuardDenial;
 use actix_web::HttpResponse;
-use once_cell::sync::Lazy;
+use bytes::Bytes;
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 /// Pre-allocated JSON error bodies for common status codes
 /// These are &'static [u8] to avoid any runtime allocations
@@ -18,38 +17,23 @@ pub static ERROR_BODY_404: &[u8] = br#"{"detail":"Not Found"}"#;
 pub static ERROR_BODY_400_HEADERS: &[u8] = br#"{"detail":"Too many headers"}"#;
 pub static ERROR_BODY_413: &[u8] = br#"{"detail":"Payload too large"}"#;
 
-/// Cache for pre-formatted rate limit error bodies (keyed by retry_after seconds)
-/// This avoids allocating the same error message repeatedly
-pub static RATE_LIMIT_CACHE: Lazy<parking_lot::Mutex<HashMap<u64, Vec<u8>>>> =
-    Lazy::new(|| parking_lot::Mutex::new(HashMap::with_capacity(64)));
+/// The rate limit error body for a `retry_after` of one second.
+static RATE_LIMIT_BODY_1: &[u8] =
+    br#"{"detail":"Rate limit exceeded. Try again in 1 seconds.","retry_after":1}"#;
 
-const MAX_RATE_LIMIT_CACHE_SIZE: usize = 128;
-
-/// Get or create a rate limit error body for a given retry_after value
-/// Uses a small cache (128 entries) to avoid formatting the same values repeatedly
-pub fn get_rate_limit_body(retry_after: u64) -> Vec<u8> {
-    // Fast path: check cache first
-    {
-        let cache = RATE_LIMIT_CACHE.lock();
-        if let Some(body) = cache.get(&retry_after) {
-            return body.clone();
-        }
+/// The rate limit error body for `retry_after` seconds.
+///
+/// A rejected request waits at most one request interval. At one request per
+/// second or more, that is one second, so the common body is static.
+pub fn get_rate_limit_body(retry_after: u64) -> Bytes {
+    if retry_after == 1 {
+        return Bytes::from_static(RATE_LIMIT_BODY_1);
     }
-
-    // Slow path: format and cache
-    let body = format!(
+    format!(
         r#"{{"detail":"Rate limit exceeded. Try again in {} seconds.","retry_after":{}}}"#,
         retry_after, retry_after
     )
-    .into_bytes();
-
-    // Insert into cache (with size limit)
-    let mut cache = RATE_LIMIT_CACHE.lock();
-    if cache.len() < MAX_RATE_LIMIT_CACHE_SIZE {
-        cache.insert(retry_after, body.clone());
-    }
-
-    body
+    .into()
 }
 
 /// Create error responses using static bodies
@@ -241,16 +225,17 @@ mod tests {
     }
 
     #[test]
-    fn test_rate_limit_cache() {
-        let body1 = get_rate_limit_body(60);
-        let body2 = get_rate_limit_body(60);
-
-        // Second call should use cache
-        assert_eq!(body1, body2);
-
-        // Verify JSON structure
-        let json: serde_json::Value = serde_json::from_slice(&body1).unwrap();
-        assert_eq!(json["retry_after"], 60);
+    fn the_rate_limit_body_names_the_wait() {
+        // The static body of one second says what the formatted body says.
+        for retry_after in [1, 2, 60] {
+            let body = get_rate_limit_body(retry_after);
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["retry_after"], retry_after);
+            assert_eq!(
+                json["detail"],
+                format!("Rate limit exceeded. Try again in {retry_after} seconds.")
+            );
+        }
     }
 
     fn core_info(response: &HttpResponse) -> (&'static str, String, Option<serde_json::Value>) {
