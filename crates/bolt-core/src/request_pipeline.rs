@@ -758,6 +758,10 @@ mod tests {
         let response = error.into_response();
         assert_eq!(response.status(), 422);
         assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        assert_eq!(
             json_body(response),
             serde_json::json!({"detail": "Query parameter 'page': Expected an integer"})
         );
