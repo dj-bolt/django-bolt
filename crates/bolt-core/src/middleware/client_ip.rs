@@ -9,10 +9,13 @@
 //! list is empty by default. With an empty list Bolt ignores every forwarding
 //! header and keys on the peer address.
 
-use actix_web::http::header::HeaderMap;
+use actix_web::http::header::{HeaderMap, HeaderName, X_FORWARDED_FOR, X_FORWARDED_PROTO};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::net::{IpAddr, SocketAddr};
+
+/// A header name parsed once. A lookup by `&str` parses and copies the name.
+const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 
 /// One entry of the trusted proxy list.
 ///
@@ -20,8 +23,15 @@ use std::net::{IpAddr, SocketAddr};
 /// matches only itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpCidr {
-    network: IpAddr,
-    prefix_len: u8,
+    block: Block,
+}
+
+/// The network bits and the prefix mask of a block. `IpCidr::new` computes
+/// both once, so a check is one AND and one compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Block {
+    V4 { network: u32, mask: u32 },
+    V6 { network: u128, mask: u128 },
 }
 
 impl IpCidr {
@@ -59,16 +69,35 @@ impl IpCidr {
             && prefix_len >= 96
             && let Some(v4) = v6.to_ipv4_mapped()
         {
-            return Ok(IpCidr {
-                network: IpAddr::V4(v4),
-                prefix_len: prefix_len - 96,
-            });
+            return Ok(IpCidr::new(IpAddr::V4(v4), prefix_len - 96));
         }
 
-        Ok(IpCidr {
-            network,
-            prefix_len,
-        })
+        Ok(IpCidr::new(network, prefix_len))
+    }
+
+    /// Build the block of the first `prefix_len` bits of `network`.
+    ///
+    /// The mask is the complement of the host bits, `MAX >> prefix_len`. A
+    /// full prefix has no host bits. `parse` rejects a longer prefix. If one
+    /// gets here, it keeps every bit, so the block matches only `network`.
+    fn new(network: IpAddr, prefix_len: u8) -> Self {
+        let block = match network {
+            IpAddr::V4(network) => {
+                let mask = !(u32::MAX.checked_shr(u32::from(prefix_len)).unwrap_or(0));
+                Block::V4 {
+                    network: u32::from(network) & mask,
+                    mask,
+                }
+            }
+            IpAddr::V6(network) => {
+                let mask = !(u128::MAX.checked_shr(u32::from(prefix_len)).unwrap_or(0));
+                Block::V6 {
+                    network: u128::from(network) & mask,
+                    mask,
+                }
+            }
+        };
+        IpCidr { block }
     }
 
     /// Report whether `candidate` is inside this block.
@@ -76,17 +105,13 @@ impl IpCidr {
     /// An IPv4 block matches an IPv4-mapped IPv6 peer. An IPv6 block that is
     /// wider than the mapped range stays IPv6 and never matches IPv4.
     pub fn contains(&self, candidate: &IpAddr) -> bool {
-        match self.network {
-            IpAddr::V4(network) => match normalize(*candidate) {
-                IpAddr::V4(candidate) => {
-                    prefix_eq(&network.octets(), &candidate.octets(), self.prefix_len)
-                }
+        match self.block {
+            Block::V4 { network, mask } => match normalize(*candidate) {
+                IpAddr::V4(candidate) => u32::from(candidate) & mask == network,
                 IpAddr::V6(_) => false,
             },
-            IpAddr::V6(network) => match candidate {
-                IpAddr::V6(candidate) => {
-                    prefix_eq(&network.octets(), &candidate.octets(), self.prefix_len)
-                }
+            Block::V6 { network, mask } => match candidate {
+                IpAddr::V6(candidate) => u128::from(*candidate) & mask == network,
                 IpAddr::V4(_) => false,
             },
         }
@@ -132,22 +157,6 @@ impl TrustedProxies {
     }
 }
 
-/// Compare the first `prefix_len` bits of two addresses.
-fn prefix_eq(network: &[u8], candidate: &[u8], prefix_len: u8) -> bool {
-    let whole_bytes = (prefix_len / 8) as usize;
-    if network[..whole_bytes] != candidate[..whole_bytes] {
-        return false;
-    }
-
-    let leftover_bits = prefix_len % 8;
-    if leftover_bits == 0 {
-        return true;
-    }
-
-    let mask = 0xffu8 << (8 - leftover_bits);
-    network[whole_bytes] & mask == candidate[whole_bytes] & mask
-}
-
 /// Map an IPv4-mapped IPv6 address back to IPv4.
 ///
 /// A dual-stack listener reports an IPv4 peer as `::ffff:a.b.c.d`. Without this
@@ -162,21 +171,37 @@ fn normalize(address: IpAddr) -> IpAddr {
     }
 }
 
-/// Parse one address and normalize it. Returns `None` for anything else.
-fn parse_ip(value: &str) -> Option<IpAddr> {
-    value.trim().parse::<IpAddr>().ok().map(normalize)
+/// The comma-separated entries of a header value, from the right, as
+/// `value.rsplit(',')` gives them. A comma is one byte in UTF-8, so a byte
+/// search finds it. The `char` search of `rsplit` costs more on a short value.
+fn rsplit_commas(value: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(value);
+    std::iter::from_fn(move || {
+        let chain = rest?;
+        match chain.bytes().rposition(|byte| byte == b',') {
+            Some(comma) => {
+                rest = Some(&chain[..comma]);
+                Some(&chain[comma + 1..])
+            }
+            None => {
+                rest = None;
+                Some(chain)
+            }
+        }
+    })
 }
 
-/// Parse a forwarding hop. Plain IPs are standard; `SocketAddr` additionally
-/// accepts proxy output such as `192.0.2.1:1234` and `[2001:db8::1]:443`.
+/// Parse a forwarding hop and normalize it. Returns `None` for anything else.
+/// Plain IPs are standard; `SocketAddr` additionally accepts proxy output such
+/// as `192.0.2.1:1234` and `[2001:db8::1]:443`. HTTP puts only spaces and tabs
+/// around a list entry, so the trim is ASCII.
 fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
-    let value = value.trim();
-    parse_ip(value).or_else(|| {
-        value
-            .parse::<SocketAddr>()
-            .ok()
-            .map(|address| normalize(address.ip()))
-    })
+    let value = value.trim_ascii();
+    let address = match value.parse::<IpAddr>() {
+        Ok(address) => address,
+        Err(_) => value.parse::<SocketAddr>().ok()?.ip(),
+    };
+    Some(normalize(address))
 }
 
 /// Resolve the canonical client address used by rate limiting, Django request
@@ -191,23 +216,28 @@ fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
 /// 3. With a trusted peer, read `X-Forwarded-For` from the right. Return the
 ///    first entry that is not a trusted proxy. That entry is the client.
 /// 4. When every `X-Forwarded-For` entry is trusted, return the leftmost entry.
-/// 5. Fall back to a valid `X-Real-IP`, then the peer address.
+/// 5. Fall back to the last `X-Real-IP` line when it is a valid address, then
+///    the peer address. The proxy closest to Bolt adds the last line.
 /// 6. A malformed forwarding chain falls back to the peer; it never exposes an
 ///    attacker-controlled entry farther left.
 ///
 /// Returns `None` only when there is no peer address and no usable header. The
 /// caller then keys on a constant.
 ///
-/// `forwarded_for` yields each `X-Forwarded-For` header value in wire order.
-/// A `None` item is a value that is not valid text. `resolve` reads the values
-/// lazily and from the right, so a request that reaches rule 1 or 2 never
-/// touches them.
-pub fn resolve<'a>(
-    forwarded_for: impl DoubleEndedIterator<Item = Option<&'a str>>,
-    real_ip: Option<Option<&'a str>>,
+/// `forwarded_for` returns each `X-Forwarded-For` header value in wire order.
+/// `real_ip` returns the last `X-Real-IP` line. A `None` item or line is a
+/// value that is not valid text. `resolve` calls them only for a trusted peer,
+/// so a request that reaches rule 1 or 2 does no header lookup. It reads the
+/// values from the right.
+pub fn resolve<'a, I>(
+    forwarded_for: impl FnOnce() -> I,
+    real_ip: impl FnOnce() -> Option<Option<&'a str>>,
     peer_addr: Option<IpAddr>,
     trusted_proxies: &TrustedProxies,
-) -> Option<IpAddr> {
+) -> Option<IpAddr>
+where
+    I: DoubleEndedIterator<Item = Option<&'a str>>,
+{
     let peer = peer_addr.map(normalize);
 
     if trusted_proxies.is_empty() {
@@ -218,14 +248,14 @@ pub fn resolve<'a>(
         _ => return peer,
     }
 
-    match client_from_forwarded_for(forwarded_for, trusted_proxies) {
+    match client_from_forwarded_for(forwarded_for(), trusted_proxies) {
         Ok(Some(client)) => return Some(client),
         Ok(None) => {}
         // A malformed chain proves nothing. Fall back to the socket peer
         // instead of searching farther left through client-controlled data.
         Err(()) => return peer,
     }
-    if let Some(value) = real_ip {
+    if let Some(value) = real_ip() {
         return value.and_then(parse_forwarded_ip).or(peer);
     }
 
@@ -241,10 +271,17 @@ pub fn resolve_from_headers(
     trusted_proxies: &TrustedProxies,
 ) -> Option<IpAddr> {
     resolve(
-        headers
-            .get_all("x-forwarded-for")
-            .map(|value| value.to_str().ok()),
-        headers.get("x-real-ip").map(|value| value.to_str().ok()),
+        || {
+            headers
+                .get_all(&X_FORWARDED_FOR)
+                .map(|value| value.to_str().ok())
+        },
+        || {
+            headers
+                .get_all(&X_REAL_IP)
+                .next_back()
+                .map(|value| value.to_str().ok())
+        },
         peer_addr,
         trusted_proxies,
     )
@@ -273,7 +310,7 @@ pub fn resolve_scheme(
     resolve_scheme_with(
         || {
             headers
-                .get_all("x-forwarded-proto")
+                .get_all(&X_FORWARDED_PROTO)
                 .next_back()
                 .and_then(|value| value.to_str().ok())
         },
@@ -304,8 +341,8 @@ pub fn resolve_scheme_with<'a>(
     }
 
     let forwarded = forwarded_proto()
-        .and_then(|value| value.rsplit(',').next())
-        .map(str::trim);
+        .and_then(|value| rsplit_commas(value).next())
+        .map(str::trim_ascii);
     match forwarded {
         Some(proto) if proto.eq_ignore_ascii_case("https") => "https",
         Some(proto) if proto.eq_ignore_ascii_case("http") => "http",
@@ -328,7 +365,7 @@ fn client_from_forwarded_for<'a>(
         let Some(value) = value else {
             return Err(());
         };
-        for entry in value.rsplit(',') {
+        for entry in rsplit_commas(value) {
             let Some(address) = parse_forwarded_ip(entry) else {
                 return Err(());
             };
@@ -346,29 +383,45 @@ fn client_from_forwarded_for<'a>(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     proptest! {
-        /// The first `prefix_len` bits are equal exactly when the XOR of the
-        /// addresses has no set bit in them.
+        /// A block holds an address exactly when the XOR of the two has no
+        /// set bit in the first `prefix_len` bits.
         #[test]
-        fn prefix_eq_compares_the_leading_bits(network in any::<u32>(), noise in any::<u32>(), shift in 0u32..=32, prefix_len in 0u8..=32) {
+        fn a_block_compares_the_leading_bits(network in any::<u32>(), noise in any::<u32>(), shift in 0u32..=32, prefix_len in 0u8..=32) {
             // The addresses differ only after the first `shift` bits.
             let differing = noise.checked_shr(shift).unwrap_or(0);
-            let candidate = network ^ differing;
+            let candidate = Ipv4Addr::from(network ^ differing);
             let expected = prefix_len == 0 || differing >> (32 - u32::from(prefix_len)) == 0;
-            prop_assert_eq!(prefix_eq(&network.to_be_bytes(), &candidate.to_be_bytes(), prefix_len), expected);
+            let block = IpCidr::new(IpAddr::from(Ipv4Addr::from(network)), prefix_len);
+            prop_assert_eq!(block.contains(&IpAddr::V4(candidate)), expected);
         }
 
         #[test]
-        fn prefix_eq_compares_the_leading_bits_of_ipv6(network in any::<u128>(), noise in any::<u128>(), shift in 0u32..=128, prefix_len in 0u8..=128) {
+        fn a_block_compares_the_leading_bits_of_ipv6(network in any::<u128>(), noise in any::<u128>(), shift in 0u32..=128, prefix_len in 0u8..=128) {
             let differing = noise.checked_shr(shift).unwrap_or(0);
-            let candidate = network ^ differing;
+            let candidate = Ipv6Addr::from(network ^ differing);
             let expected = prefix_len == 0 || differing >> (128 - u32::from(prefix_len)) == 0;
-            prop_assert_eq!(prefix_eq(&network.to_be_bytes(), &candidate.to_be_bytes(), prefix_len), expected);
+            let block = IpCidr::new(IpAddr::from(Ipv6Addr::from(network)), prefix_len);
+            prop_assert_eq!(block.contains(&IpAddr::V6(candidate)), expected);
+        }
+
+        /// The byte search splits a value as `rsplit(',')` does, also next to
+        /// a character of more than one byte.
+        #[test]
+        fn rsplit_commas_splits_as_rsplit(value in "[ ,.:0-9a-f\\[\\]é€]{0,40}") {
+            let expected: Vec<&str> = value.rsplit(',').collect();
+            prop_assert_eq!(rsplit_commas(&value).collect::<Vec<_>>(), expected);
         }
     }
 
-    use actix_web::http::header::{HeaderName, HeaderValue};
+    use actix_web::http::header::HeaderValue;
+
+    /// Parse one address and normalize it, as a peer address arrives.
+    fn parse_ip(value: &str) -> Option<IpAddr> {
+        value.trim().parse::<IpAddr>().ok().map(normalize)
+    }
 
     // Keep expectations readable while the production API stays allocation-free.
     fn resolve(
@@ -439,6 +492,17 @@ mod tests {
         let narrow = IpCidr::parse("192.168.1.128/25").unwrap();
         assert!(narrow.contains(&"192.168.1.200".parse().unwrap()));
         assert!(!narrow.contains(&"192.168.1.127".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_oversized_prefix_matches_only_its_address() {
+        // `parse` rejects these. A block built with one must not match all.
+        let v4 = IpCidr::new("10.0.0.1".parse().unwrap(), 40);
+        assert!(v4.contains(&"10.0.0.1".parse().unwrap()));
+        assert!(!v4.contains(&"10.0.0.2".parse().unwrap()));
+        let v6 = IpCidr::new("2001:db8::1".parse().unwrap(), 200);
+        assert!(v6.contains(&"2001:db8::1".parse().unwrap()));
+        assert!(!v6.contains(&"2001:db8::2".parse().unwrap()));
     }
 
     #[test]
@@ -587,6 +651,27 @@ mod tests {
         );
         assert_eq!(ipv4.as_deref(), Some("203.0.113.9"));
         assert_eq!(ipv6.as_deref(), Some("2001:db8::9"));
+    }
+
+    #[test]
+    fn reads_the_last_x_real_ip_line() {
+        // A proxy that appends `X-Real-IP` keeps the line of the client first.
+        let resolved = resolve(
+            &headers(&[("x-real-ip", "1.1.1.1"), ("x-real-ip", "203.0.113.9")]),
+            Some("10.0.0.1"),
+            &proxies(&["10.0.0.0/8"]),
+        );
+        assert_eq!(resolved.as_deref(), Some("203.0.113.9"));
+    }
+
+    #[test]
+    fn rules_1_and_2_read_no_header() {
+        let peer = parse_ip("203.0.113.9");
+        let unread = || -> std::iter::Empty<Option<&str>> { panic!("read X-Forwarded-For") };
+        for trusted in [TrustedProxies::default(), proxies(&["10.0.0.0/8"])] {
+            let resolved = super::resolve(unread, || panic!("read X-Real-IP"), peer, &trusted);
+            assert_eq!(resolved, peer);
+        }
     }
 
     #[test]

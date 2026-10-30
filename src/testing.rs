@@ -849,13 +849,17 @@ pub fn handle_test_websocket(
         client_ip = (!matches!(rate_config.key, RateLimitKey::Header(_)))
             .then(|| {
                 bolt_core::middleware::client_ip::resolve(
-                    header_map
-                        .get("x-forwarded-for")
-                        .into_iter()
-                        .map(|value| Some(value.as_str())),
-                    header_map
-                        .get("x-real-ip")
-                        .map(|value| Some(value.as_str())),
+                    || {
+                        header_map
+                            .get("x-forwarded-for")
+                            .into_iter()
+                            .map(|value| Some(value.as_str()))
+                    },
+                    || {
+                        header_map
+                            .get("x-real-ip")
+                            .map(|value| Some(value.as_str()))
+                    },
                     Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
                     &app.config.trusted_proxies,
                 )
