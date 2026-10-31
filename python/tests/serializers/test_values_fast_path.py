@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 from django.db import connection, models
+from django.db.models.signals import post_init
 
 from django_bolt import BoltAPI
 from django_bolt.serialization import (
@@ -60,6 +61,14 @@ class NonColumnUserSerializer(Serializer):
     id: int
     username: str
     nickname: str = "anon"
+
+
+class RenamedUserSerializer(Serializer, rename="upper"):
+    """The wire names differ from the column names, so values() rows do not fit."""
+
+    id: int
+    username: str
+    email: str
 
 
 @pytest.fixture
@@ -156,6 +165,54 @@ class TestEndToEnd:
             response = client.get("/users")
             assert response.status_code == 200
             assert [u["username"] for u in response.json()] == ["alice", "bob"]
+
+    def test_values_path_builds_no_model_instance_on_any_request(self, values_user_table):
+        """Each request reads the rows as dicts. Django builds no model instance."""
+        api = self._build_api(PlainUserSerializer)
+        instances = []
+
+        def record_instance(sender, instance, **kwargs):
+            instances.append(instance)
+
+        post_init.connect(record_instance, sender=ValuesPathUser)
+        try:
+            with TestClient(api) as client:
+                for path in ("/users", "/users", "/users-sync", "/users-sync"):
+                    response = client.get(path)
+                    assert response.status_code == 200, (path, response.text)
+                    assert [u["username"] for u in response.json()] == ["alice", "bob"], path
+        finally:
+            post_init.disconnect(record_instance, sender=ValuesPathUser)
+
+        assert instances == []
+
+    def test_renamed_serializer_keeps_its_wire_names(self, values_user_table):
+        api = self._build_api(RenamedUserSerializer)
+        with TestClient(api) as client:
+            for path in ("/users", "/users-sync"):
+                response = client.get(path)
+                assert response.status_code == 200, (path, response.text)
+                body = response.json()
+                assert [u["USERNAME"] for u in body] == ["alice", "bob"], path
+                assert set(body[0]) == {"ID", "USERNAME", "EMAIL"}, path
+
+    def test_unvalidated_values_rows_pass_through_when_a_field_is_not_a_column(self, values_user_table):
+        """The nickname field is not a column, so the route reads the rows of the QuerySet.
+
+        Without response validation, each row goes out as it is, also on a later request.
+        """
+        api = BoltAPI()
+
+        @api.get("/users", validate_response=False)
+        async def list_users() -> list[NonColumnUserSerializer]:
+            return ValuesPathUser.objects.order_by("id").values("id", "username")
+
+        rows = list(ValuesPathUser.objects.order_by("id").values("id", "username"))
+        with TestClient(api) as client:
+            for _ in range(2):
+                response = client.get("/users")
+                assert response.status_code == 200, response.text
+                assert response.json() == rows
 
     def test_computed_serializer_uses_model_path(self, values_user_table):
         api = self._build_api(ComputedUserSerializer)
