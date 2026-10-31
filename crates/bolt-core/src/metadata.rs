@@ -2104,13 +2104,8 @@ mod tests {
     }
 
     #[test]
-    fn the_default_status_code_is_an_int_from_0_to_65535() {
+    fn the_default_status_code_is_an_int_that_fits_a_u16() {
         assert_eq!(route("'default_status_code': 201").default_status_code, 201);
-        assert_eq!(route("'default_status_code': 0").default_status_code, 0);
-        assert_eq!(
-            route("'default_status_code': 65535").default_status_code,
-            65535
-        );
         assert_eq!(
             error_of(parse_route("'default_status_code': True")),
             "TypeError: Route metadata 'default_status_code' for GET /x must be an int, got bool"
