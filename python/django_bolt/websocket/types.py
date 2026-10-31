@@ -9,6 +9,7 @@ from urllib.parse import parse_qs
 
 import msgspec
 
+from .. import _json
 from .close_codes import CloseCode
 from .exceptions import WebSocketDisconnect
 from .state import WebSocketState
@@ -194,7 +195,7 @@ class WebSocket:
             data: Data to serialize as JSON
             mode: 'text' or 'binary' - how to send the JSON
         """
-        text = msgspec.json.encode(data).decode("utf-8")
+        text = _json.encode(data).decode("utf-8")
         if mode == "text":
             await self.send_text(text)
         else:

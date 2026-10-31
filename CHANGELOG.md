@@ -65,6 +65,10 @@ All notable changes to this project will be documented in this file.
 - **A response object or a Struct result costs less to serialize** - Bolt checked a response object against each response type in turn, and a `Response` was the eighth check. Now Bolt looks up its class. A Struct result went through the bytes, str, stream and QuerySet checks first. Now it takes the JSON path first. An async route also creates fewer coroutines for each response. A `Response` costs about 23% fewer instructions, and a Struct result about 36% fewer.
 - **The dispatch of a route with no auth costs less** - Bolt read the auth context of each request, also on a route with no auth backend. Now it reads the context only for a route with a backend. The async dispatch also found the API with the middleware of the route on each request. Now registration stores that API. For a route with no auth, the Python dispatch runs 4% to 14% fewer instructions. A route with auth runs about 3% fewer on the async dispatch, and about 1.5% more on the sync dispatch.
 
+### Security
+
+- **A Serializer inside a response value hides its write-only fields** - msgspec encodes each Struct natively. Thus a Serializer in a dict, a list, a tuple, a plain `Struct` field or a dataclass sent all of its fields. These include the `write_only` fields, for example a password. It also lost its computed fields. `JSON(serializer)`, `send_json()` of a WebSocket, stream chunks and server-sent events had the same problem. Now each Serializer in a response value gives its `dump()`. A Rust scan finds the Serializers, so a value with no Serializer gets no Python walk. A route that validates its response does not scan when its return type holds only leaf values, for example `list[int]`. A Struct field can hold a Serializer, so a Struct value is scanned. An app with no `Serializer` subclass does not scan. `send_json()` now also encodes the types that an HTTP response encodes, for example `datetime`.
+
 ## [0.13.0]
 
 ### Added

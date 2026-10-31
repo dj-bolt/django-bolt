@@ -8,6 +8,7 @@ mod handler;
 mod normalize;
 mod response_body;
 mod response_helpers;
+mod serializer_scan;
 mod server;
 mod testing;
 
@@ -54,6 +55,8 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         response_helpers::populate_response_cookies,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(serializer_scan::find_serializer, m)?)?;
+    m.add_class::<serializer_scan::SerializerScanEncoder>()?;
     use crate::dev_reload::run_dev_reloader;
     use crate::server::{
         register_asgi_mounts, register_middleware_metadata, register_routes,
