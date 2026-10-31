@@ -1899,9 +1899,10 @@ class BoltAPI:
             )
             # The API that runs the Python middleware of this route, or None. A
             # mounted or merged API keeps this API: the route has its middleware.
-            meta["_middleware_api"] = (
-                self if self._has_python_global_middleware or meta["_has_route_python_middleware"] else None
-            )
+            if self._has_python_global_middleware or meta["_has_route_python_middleware"]:
+                meta["_middleware_api"] = self
+            else:
+                meta["_middleware_api"] = None
 
             self._handler_meta[handler_id] = meta
 
