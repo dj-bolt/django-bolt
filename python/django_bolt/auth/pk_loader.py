@@ -8,7 +8,8 @@ compilation is roughly two thirds of the per-request cost of loading
 the user. Following the framework's do-it-once-at-registration principle, the
 default user loaders compile the pk SELECT once per (model, database alias)
 and execute it directly, materializing the instance with ``Model.from_db``
-exactly as a QuerySet row would be.
+exactly as a QuerySet row would be. The row goes through the same database
+converters as a QuerySet row, so a UUID primary key on SQLite is a ``UUID``.
 
 The fast path only applies when the model's default manager uses the stock
 ``get_queryset``. A manager that overrides it may inject dynamic WHERE
@@ -27,13 +28,17 @@ from typing import Any
 from django.core.exceptions import ValidationError
 from django.db import DEFAULT_DB_ALIAS, connections, models, router
 
-# (model, db_alias) -> (select-by-pk SQL, concrete field attnames), or None
-# when the model's manager customizes queryset construction and the loader
-# must fall back to the ORM per call.
-_pk_query_cache: dict[tuple[type, str], tuple[str, list[str]] | None] = {}
+# (column position, converters, expression) for each column that the database
+# converts, as SQLCompiler.get_converters gives them.
+_Converters = tuple[tuple[int, list[Any], Any], ...]
+
+# (model, db_alias) -> (select-by-pk SQL, concrete field attnames, converters),
+# or None when the model's manager customizes queryset construction and the
+# loader must fall back to the ORM per call.
+_pk_query_cache: dict[tuple[type, str], tuple[str, list[str], _Converters] | None] = {}
 
 
-def _compiled_pk_query(model: type, alias: str) -> tuple[str, list[str]] | None:
+def _compiled_pk_query(model: type, alias: str) -> tuple[str, list[str], _Converters] | None:
     key = (model, alias)
     if key in _pk_query_cache:
         return _pk_query_cache[key]
@@ -47,9 +52,18 @@ def _compiled_pk_query(model: type, alias: str) -> tuple[str, list[str]] | None:
         # Same SELECT column order as a QuerySet row (concrete fields in
         # Meta order — what from_db expects), single %s param for the pk.
         query = manager.using(alias).filter(pk=1).query
-        sql, _params = query.get_compiler(alias).as_sql()
+        compiler = query.get_compiler(alias)
+        sql, _params = compiler.as_sql()
         fields = [f.attname for f in model._meta.concrete_fields]
-        compiled = (sql, fields)
+        # The converters that a QuerySet applies to each row, such as str to
+        # UUID on SQLite. Find them once, with the SELECT.
+        converters = tuple(
+            (position, column_converters, expression)
+            for position, (column_converters, expression) in compiler.get_converters(
+                [column for column, _sql, _alias in compiler.select]
+            ).items()
+        )
+        compiled = (sql, fields, converters)
 
     _pk_query_cache[key] = compiled
     return compiled
@@ -85,10 +99,17 @@ def load_user_by_pk_sync(model: type, user_id: Any) -> Any | None:
     except (ValueError, TypeError):
         return None
 
-    sql, fields = compiled
+    sql, fields, converters = compiled
     with connection.cursor() as cursor:
         cursor.execute(sql, (pk_value,))
         row = cursor.fetchone()
     if row is None:
         return None
+    if converters:
+        row = list(row)
+        for position, column_converters, expression in converters:
+            value = row[position]
+            for converter in column_converters:
+                value = converter(value, expression, connection)
+            row[position] = value
     return model.from_db(alias, fields, row)
