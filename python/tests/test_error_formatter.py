@@ -409,7 +409,9 @@ def test_request_validation_error_of_a_handler_gives_each_error_a_location_under
     ]
 
 
-def test_response_validation_error_of_a_handler_gives_each_error_a_location_under_response():
+def test_response_validation_error_of_a_handler_gives_each_error_a_location_under_response(settings):
+    """A formatter gets the errors of a response validation error only in debug mode."""
+    settings.DEBUG = True
     api = BoltAPI(error_formatter=_record)
 
     @api.get("/invalid")

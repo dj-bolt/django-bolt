@@ -254,8 +254,9 @@ class TestErrorHandlers:
         exc = ResponseValidationError(
             [{"loc": ["response", "id"], "msg": "Field required", "type": "missing"}, "plain"]
         )
+        # The body has the errors only in debug mode.
         with caplog.at_level(logging.ERROR, logger="django_bolt.error_handlers"):
-            status, _, body = response_validation_error_handler(exc)
+            status, _, body = response_validation_error_handler(exc, debug=True)
 
         data = json.loads(body)
         assert status == 500
