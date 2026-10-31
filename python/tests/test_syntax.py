@@ -564,6 +564,30 @@ def test_response_helpers(client):
     assert "attachment;" in (response.headers.get("content-disposition", "").lower())
 
 
+def test_redirect_sends_extra_headers_and_an_empty_body():
+    """A location header replaces the redirect URL, and does not add a second location."""
+    api = BoltAPI()
+
+    @api.get("/extra")
+    async def extra():
+        return Redirect("/a", headers={"X-Extra": "1"})
+
+    @api.get("/override")
+    async def override():
+        return Redirect("/a", headers={"location": "/b"})
+
+    with TestClient(api) as client:
+        extra_response = client.get("/extra", follow_redirects=False)
+        override_response = client.get("/override", follow_redirects=False)
+
+    assert extra_response.status_code == 307
+    assert extra_response.headers["location"] == "/a"
+    assert extra_response.headers["x-extra"] == "1"
+    assert extra_response.content == b""
+    assert override_response.status_code == 307
+    assert override_response.headers.get_list("location") == ["/b"]
+
+
 def test_streaming_plain(client):
     response = client.get("/stream-plain")
     assert response.status_code == 200
