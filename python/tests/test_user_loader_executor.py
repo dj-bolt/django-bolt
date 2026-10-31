@@ -23,7 +23,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import connections
 
 from django_bolt import concurrency
-from django_bolt.auth import JWTAuthentication, user_loader
+from django_bolt.auth import APIKeyAuthentication, JWTAuthentication, user_loader
 from django_bolt.auth.pk_loader import load_user_by_pk_sync
 from django_bolt.auth.user_loader import default_django_user_loader, resolve_user_loader
 from tests.thread_pools import shutdown_closing_connections
@@ -413,6 +413,16 @@ def test_default_executor_is_built_once_under_concurrent_first_use(monkeypatch):
     assert len(built) == 1, f"{len(built)} default pools were constructed; the loser's threads leak"
 
 
+_ASYNC_ONLY_MESSAGE = (
+    r"^AsyncGetUserAuth\.get_user is async, so sync access to request\.user cannot run it\. "
+    r"Use `await request\.auser\(\)`, or define get_user_sync on the backend\.$"
+)
+
+
+def test_object_without_get_user_has_no_user_loader():
+    assert resolve_user_loader(object()) is None
+
+
 def test_async_only_get_user_rejects_sync_access(fresh_orm_executor):
     """A backend with an async ``get_user`` and no ``get_user_sync`` has no sync loader.
 
@@ -429,9 +439,9 @@ def test_async_only_get_user_rejects_sync_access(fresh_orm_executor):
     assert loaders is not None
     loader, aloader = loaders
 
-    with pytest.raises(RuntimeError, match="request.auser"):
+    with pytest.raises(RuntimeError, match=_ASYNC_ONLY_MESSAGE):
         loader(str(user.pk), None)
-    with pytest.raises(RuntimeError, match="request.auser"):
+    with pytest.raises(RuntimeError, match=_ASYNC_ONLY_MESSAGE):
         _force_on_event_loop(loader, str(user.pk), None)
     assert backend.orm_threads == []
 
@@ -477,3 +487,99 @@ def test_invalid_orm_threads_value_stops_the_pool(fresh_orm_executor, workers):
         ImproperlyConfigured, match=rf"^DJANGO_BOLT_ORM_THREADS must be an int of 1 or more, got '{workers}'\.$"
     ):
         fresh_orm_executor(workers=workers)
+
+
+class SyncGetUserAuth(APIKeyAuthentication):
+    """Backend with a sync ``get_user``. The user is a tuple of what the backend received."""
+
+    def get_user(self, user_id, auth_context):
+        return ("sync", user_id, auth_context)
+
+
+class CoroutineGetUserAuth(APIKeyAuthentication):
+    """Backend with an async ``get_user``. The user is a tuple of what the backend received."""
+
+    async def get_user(self, user_id, auth_context):
+        return ("async", user_id, auth_context)
+
+
+@pytest.fixture
+def backend_registry(monkeypatch):
+    """Give the test an empty registry of auth backends, and restore the real one after."""
+    monkeypatch.setattr(user_loader, "_auth_backend_registry", {})
+    monkeypatch.setattr(user_loader, "_resolved_loader_registry", {})
+
+
+def test_lazy_user_passes_the_auth_context_to_the_backend():
+    """A backend with its own ``get_user`` reads the claims of the request."""
+    lazy = user_loader.LazyUser(resolve_user_loader(SyncGetUserAuth()), "7", {"role": "a"})
+
+    assert tuple(lazy) == ("sync", "7", {"role": "a"})
+    assert repr(lazy) == "<LazyUser: ('sync', '7', {'role': 'a'})>"
+
+
+def test_registered_backend_is_found_by_name(backend_registry):
+    backend = SyncGetUserAuth()
+    user_loader.register_auth_backend("custom", backend)
+
+    assert user_loader.get_registered_backend("custom") is backend
+    assert user_loader.get_registered_backend("other") is None
+
+
+def test_load_user_sync_calls_the_registered_backend(backend_registry, fresh_orm_executor):
+    fresh_orm_executor()
+    user_loader.register_auth_backend("custom", SyncGetUserAuth())
+
+    assert user_loader.load_user_sync("7", "custom", {"role": "a"}) == ("sync", "7", {"role": "a"})
+    # A request with no user ID has no user, also when the backend can load one.
+    assert user_loader.load_user_sync(None, "custom", {"role": "a"}) is None
+    assert user_loader.load_user_sync("", "custom", {"role": "a"}) is None
+
+
+def test_load_user_sync_gives_none_for_a_backend_without_user_resolution(backend_registry):
+    user_loader.register_auth_backend("api_key", APIKeyAuthentication(api_keys={"k"}))
+
+    assert user_loader.load_user_sync("7", "api_key", {}) is None
+
+
+def test_load_user_sync_loads_the_django_user_for_an_unregistered_backend(backend_registry, fresh_orm_executor):
+    """Session auth has no backend instance. It loads the user from the Django user model."""
+    fresh_orm_executor()
+    user = _make_user("session-user")
+
+    loaded = user_loader.load_user_sync(str(user.pk), "session", {})
+
+    assert loaded is not None
+    assert loaded.pk == user.pk
+    assert user_loader.load_user_sync("999999", "session", {}) is None
+
+
+def test_load_user_awaits_the_registered_backend(backend_registry, fresh_orm_executor):
+    fresh_orm_executor()
+    user_loader.register_auth_backend("async", CoroutineGetUserAuth())
+    user_loader.register_auth_backend("sync", SyncGetUserAuth())
+
+    assert asyncio.run(user_loader.load_user("7", "async", {"role": "a"})) == ("async", "7", {"role": "a"})
+    assert asyncio.run(user_loader.load_user("7", "sync", {"role": "a"})) == ("sync", "7", {"role": "a"})
+    # A request with no user ID has no user, also when the backend can load one.
+    assert asyncio.run(user_loader.load_user(None, "async", {"role": "a"})) is None
+    assert asyncio.run(user_loader.load_user("", "async", {"role": "a"})) is None
+
+
+def test_load_user_gives_none_without_a_backend_that_resolves_users(backend_registry):
+    user_loader.register_auth_backend("api_key", APIKeyAuthentication(api_keys={"k"}))
+
+    assert asyncio.run(user_loader.load_user("7", "api_key", {})) is None
+    assert asyncio.run(user_loader.load_user("7", "unregistered", {})) is None
+    assert asyncio.run(user_loader.load_user("7", None, {})) is None
+
+
+def test_default_async_loader_loads_the_django_user(fresh_orm_executor):
+    fresh_orm_executor()
+    user = _make_user("async-default")
+
+    loaded = asyncio.run(user_loader.default_django_user_aloader(str(user.pk), None))
+
+    assert loaded is not None
+    assert loaded.pk == user.pk
+    assert asyncio.run(user_loader.default_django_user_aloader("999999", None)) is None

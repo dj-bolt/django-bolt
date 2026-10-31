@@ -15,12 +15,15 @@ through request.user.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from django.contrib.auth import get_user_model
 from django.db import models
 
 from django_bolt import BoltAPI
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
+from django_bolt.auth.pk_loader import _pk_query_cache
 from django_bolt.auth.user_loader import load_user_by_pk_sync
 from django_bolt.testing import TestClient
 
@@ -52,6 +55,31 @@ class FilteredAccount(models.Model):
 
     class Meta:
         app_label = "django_bolt"
+
+
+class UuidAccount(models.Model):
+    """User-model stand-in with a UUID primary key, as projects with public IDs use."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    username = models.CharField(max_length=100)
+
+    class Meta:
+        app_label = "django_bolt"
+
+
+def test_loads_a_user_with_a_uuid_primary_key():
+    """The pk of a token is a string. The loader converts it for the database column type."""
+    account = UuidAccount.objects.create(username="uuid_account")
+    _pk_query_cache.pop((UuidAccount, "default"), None)
+
+    loaded = load_user_by_pk_sync(UuidAccount, str(account.pk))
+
+    assert loaded is not None
+    assert uuid.UUID(str(loaded.pk)) == account.pk
+    assert loaded.username == "uuid_account"
+    assert load_user_by_pk_sync(UuidAccount, str(uuid.uuid4())) is None
+    # The loader used the compiled statement and cached it.
+    assert _pk_query_cache[(UuidAccount, "default")] is not None
 
 
 def test_loads_same_user_as_orm_get():
@@ -92,9 +120,10 @@ def _filtered_account_table(django_db_setup, django_db_blocker):
     from django.db import connection  # noqa: PLC0415
 
     with django_db_blocker.unblock():
-        if FilteredAccount._meta.db_table not in connection.introspection.table_names():
-            with connection.schema_editor() as schema_editor:
-                schema_editor.create_model(FilteredAccount)
+        for model in (FilteredAccount, UuidAccount):
+            if model._meta.db_table not in connection.introspection.table_names():
+                with connection.schema_editor() as schema_editor:
+                    schema_editor.create_model(model)
 
 
 def test_custom_manager_dynamic_filter_is_not_frozen():

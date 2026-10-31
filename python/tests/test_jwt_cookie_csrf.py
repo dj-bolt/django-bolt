@@ -221,6 +221,64 @@ class TestSetTokenCookies:
         assert cookies["access_token"].path == "/"
         assert cookies["refresh_token"].path == "/auth/refresh"
 
+    def test_cookie_values_lifetimes_and_options(self):
+        """Each cookie carries its token, its own lifetime, and the options of the caller."""
+        now = int(time.time())
+        pair = TokenPair(
+            access_token="acc-token",
+            refresh_token="ref-token",
+            access_claims={"exp": now + 900},
+            refresh_claims={"exp": now + 7200},
+        )
+        response = set_token_cookies(
+            PlainText("ok"),
+            pair,
+            access_cookie="a_cookie",
+            refresh_cookie="r_cookie",
+            refresh_path="/auth/refresh",
+            secure=False,
+            samesite="Strict",
+            domain="example.com",
+        )
+        cookies = {c.name: c for c in response._cookies}
+
+        assert cookies["a_cookie"].value == "acc-token"
+        assert cookies["r_cookie"].value == "ref-token"
+        assert 898 <= cookies["a_cookie"].max_age <= 900
+        assert 7198 <= cookies["r_cookie"].max_age <= 7200
+        for cookie in cookies.values():
+            assert cookie.domain == "example.com"
+            assert cookie.secure is False
+            assert cookie.samesite == "Strict"
+            assert cookie.httponly is True
+
+    def test_refresh_cookie_path_defaults_to_the_whole_site(self):
+        now = int(time.time())
+        pair = TokenPair(
+            access_token="acc",
+            refresh_token="ref",
+            access_claims={"exp": now + 900},
+            refresh_claims={"exp": now + 7200},
+        )
+        response = set_token_cookies(PlainText("ok"), pair)
+        cookies = {c.name: c for c in response._cookies}
+
+        assert cookies["refresh_token"].path == "/"
+        assert cookies["refresh_token"].domain is None
+
+    def test_expired_token_gives_a_cookie_that_expires_now(self):
+        """The lifetime of a cookie never goes below zero and never rounds up."""
+        now = int(time.time())
+        pair = TokenPair(
+            access_token="acc",
+            refresh_token="ref",
+            access_claims={"exp": now - 100},
+            refresh_claims={"exp": now - 100},
+        )
+        response = set_token_cookies(PlainText("ok"), pair)
+
+        assert [c.max_age for c in response._cookies] == [0, 0]
+
     def test_omits_refresh_cookie_when_absent(self):
         now = int(time.time())
         pair = TokenPair(

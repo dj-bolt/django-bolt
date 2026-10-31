@@ -8,6 +8,7 @@ Uses pytest-django for proper Django configuration.
 """
 
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import jwt
@@ -25,6 +26,7 @@ from django_bolt.auth import (
     get_auth_context,
     get_current_user,
 )
+from django_bolt.auth.backends import revocation_takes_claims
 from django_bolt.params import Depends
 
 # Mark all tests to use Django DB
@@ -55,6 +57,50 @@ def test_create_jwt_for_user():
     # Clean up
     user.delete()
     print("✓ JWT token creation for user works correctly")
+
+
+def _plain_user(**fields):
+    """A user object that sets only the given fields, to check which claims the token gets."""
+    base = {"id": 7, "is_staff": False, "is_superuser": True, "username": "plain"}
+    return SimpleNamespace(**{**base, **fields})
+
+
+def test_create_jwt_for_user_adds_the_name_claims():
+    user = _plain_user(email="plain@example.com", first_name="Ada", last_name="Lovelace")
+
+    decoded = jwt.decode(create_jwt_for_user(user, secret="my-secret"), "my-secret", algorithms=["HS256"])
+
+    assert decoded["first_name"] == "Ada"
+    assert decoded["last_name"] == "Lovelace"
+    assert decoded["email"] == "plain@example.com"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{}, {"email": "", "first_name": "", "last_name": ""}],
+    ids=["no-attributes", "empty-values"],
+)
+def test_create_jwt_for_user_leaves_out_missing_optional_claims(fields):
+    decoded = jwt.decode(
+        create_jwt_for_user(_plain_user(**fields), secret="my-secret"), "my-secret", algorithms=["HS256"]
+    )
+
+    assert not {"email", "first_name", "last_name"} & decoded.keys()
+
+
+def test_create_jwt_for_user_expires_in_one_hour_by_default():
+    decoded = jwt.decode(create_jwt_for_user(_plain_user(), secret="my-secret"), "my-secret", algorithms=["HS256"])
+
+    assert decoded["exp"] - decoded["iat"] == 3600
+    assert decoded["sub"] == "7"
+
+
+def test_create_jwt_for_user_signs_with_the_given_algorithm():
+    token = create_jwt_for_user(_plain_user(), secret="my-secret", algorithm="HS512", expires_in=60)
+
+    assert jwt.get_unverified_header(token)["alg"] == "HS512"
+    decoded = jwt.decode(token, "my-secret", algorithms=["HS512"])
+    assert decoded["exp"] - decoded["iat"] == 60
 
 
 def test_create_jwt_with_extra_claims():
@@ -197,6 +243,37 @@ def test_jwt_utils_get_auth_context():
     assert ctx["permissions"] == ["read", "write"]
 
     print("✓ get_auth_context works correctly")
+
+
+def test_jwt_utils_get_auth_context_without_context_is_an_empty_dict():
+    """A request with no authentication context gives an empty dict that the caller can read."""
+    ctx = get_auth_context({})
+
+    assert ctx == {}
+    assert ctx.get("user_id") is None
+
+
+async def _handler_with_jti(jti):
+    return False
+
+
+async def _handler_with_jti_and_claims(jti, claims):
+    return False
+
+
+@pytest.mark.parametrize(
+    ("handler", "takes_claims"),
+    [
+        (_handler_with_jti, False),
+        (_handler_with_jti_and_claims, True),
+        # Bolt cannot read the signature of these. It passes the jti only.
+        (int, False),
+        (42, False),
+    ],
+    ids=["jti-only", "jti-and-claims", "no-signature", "not-callable"],
+)
+def test_revocation_handler_gets_the_claims_only_when_it_takes_two_arguments(handler, takes_claims):
+    assert revocation_takes_claims(handler) is takes_claims
 
 
 def test_jwt_claims_stored_in_context():
@@ -347,6 +424,18 @@ def test_get_user_sync_reraises_interface_error():
         pytest.raises(InterfaceError),
     ):
         auth.get_user_sync("1")
+
+
+def test_get_user_sync_reports_a_load_error_on_stderr_and_gives_no_user(capsys):
+    """An error that is not a lost connection gives no user. The reason goes to stderr."""
+    auth = JWTAuthentication(secret="test-secret")
+
+    with patch("django_bolt.auth.backends.load_user_by_pk_sync", side_effect=RuntimeError("boom")):
+        assert auth.get_user_sync("42") is None
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "Error loading user 42 in JWTAuthentication: RuntimeError: boom\n"
 
 
 if __name__ == "__main__":

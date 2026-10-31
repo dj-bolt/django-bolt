@@ -22,6 +22,7 @@ from django_bolt.auth import (
     SessionAuthentication,
     create_jwt_for_user,
 )
+from django_bolt.auth.session import auth_without_session
 from django_bolt.concurrency import in_lane_mode
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
@@ -336,6 +337,40 @@ def test_only_one_of_the_two_django_middleware_is_an_error():
         @api.get("/me", auth=[SessionAuthentication()], guards=[IsAuthenticated()])
         async def me():
             return {"ok": True}
+
+
+@pytest.mark.parametrize(
+    ("middleware", "have", "need"),
+    [
+        ("django.contrib.sessions.middleware.SessionMiddleware", "SessionMiddleware", "AuthenticationMiddleware"),
+        ("django.contrib.auth.middleware.AuthenticationMiddleware", "AuthenticationMiddleware", "SessionMiddleware"),
+    ],
+    ids=["session-only", "auth-only"],
+)
+def test_the_error_for_one_of_the_two_django_middleware_names_the_missing_one(middleware, have, need):
+    api = BoltAPI(django_middleware=[middleware])
+
+    with pytest.raises(ImproperlyConfigured) as raised:
+
+        @api.get("/me", auth=[SessionAuthentication()], guards=[IsAuthenticated()])
+        async def me():
+            return {"ok": True}
+
+    assert str(raised.value) == (
+        "SessionAuthentication on GET /me needs Django's SessionMiddleware and AuthenticationMiddleware. "
+        f"The middleware of the route has {have} but not {need}. Add {need} to the same middleware list."
+    )
+
+
+def test_a_websocket_route_keeps_the_defaults_when_they_have_no_session_backend():
+    with override_settings(BOLT_AUTHENTICATION_CLASSES=[JWTAuthentication(secret="session-test-secret-of-32-bytes!!")]):
+        assert auth_without_session(None, "WebSocket route /ws") is None
+
+
+def test_a_websocket_route_uses_its_own_auth_without_a_change():
+    backends = [JWTAuthentication(secret="session-test-secret-of-32-bytes!!")]
+
+    assert auth_without_session(backends, "WebSocket route /ws") is backends
 
 
 def test_none_of_on_a_claim_that_a_session_user_lacks_is_an_error():
