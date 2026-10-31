@@ -281,8 +281,15 @@ def kinds():
     return {Holder: ('inner', 'missing')}
 ";
 
+    /// Run the fixtures in a new module for each call.
+    ///
+    /// `PyModule::from_code` runs the code in the module of `sys.modules`
+    /// with the same name. Tests run in parallel threads, so a test could
+    /// then replace the classes of another test while it runs.
     fn fixtures(py: Python<'_>) -> Bound<'_, PyModule> {
-        PyModule::from_code(py, FIXTURES, c"scan_fixtures.py", c"scan_fixtures").unwrap()
+        let module = PyModule::new(py, "scan_fixtures").unwrap();
+        py.run(FIXTURES, Some(&module.dict()), None).unwrap();
+        module
     }
 
     fn scan(module: &Bound<'_, PyModule>, value: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -423,7 +430,8 @@ def kinds():
         Opaque,
         List(Vec<Tree>),
         Tuple(Vec<Tree>),
-        Dict(Vec<(String, Tree)>),
+        // A BTreeMap has unique keys, as a Python dict does.
+        Dict(std::collections::BTreeMap<String, Tree>),
         Holder(Box<Tree>),
     }
 
@@ -433,7 +441,7 @@ def kinds():
                 Tree::Secret => true,
                 Tree::Int(_) | Tree::Text(_) | Tree::Opaque => false,
                 Tree::List(items) | Tree::Tuple(items) => items.iter().any(Tree::has_secret),
-                Tree::Dict(items) => items.iter().any(|(_, item)| item.has_secret()),
+                Tree::Dict(items) => items.values().any(Tree::has_secret),
                 Tree::Holder(inner) => inner.has_secret(),
             }
         }
@@ -478,7 +486,7 @@ def kinds():
             prop_oneof![
                 prop::collection::vec(inner.clone(), 0..5).prop_map(Tree::List),
                 prop::collection::vec(inner.clone(), 0..5).prop_map(Tree::Tuple),
-                prop::collection::vec(("[a-z]{1,3}", inner.clone()), 0..5).prop_map(Tree::Dict),
+                prop::collection::btree_map("[a-z]{1,3}", inner.clone(), 0..5).prop_map(Tree::Dict),
                 inner.prop_map(|item| Tree::Holder(Box::new(item))),
             ]
         })
