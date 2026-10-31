@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import msgspec
+import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.middleware import Middleware
 from django_bolt.openapi.config import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.responses import EventSourceResponse
@@ -276,3 +279,91 @@ def test_list_of_tagged_union_omits_per_arm_examples():
     items = media["schema"]["items"]
     refs = {item["$ref"].rsplit("/", 1)[-1] for item in items["oneOf"]}
     assert refs == {"Cat", "Dog"}
+
+
+class Row(msgspec.Struct):
+    id: int
+    note: str = "default"
+
+
+class RowObject:
+    """An object with attributes in place of keys, as a model instance has."""
+
+    def __init__(self, id: int):
+        self.id = id
+
+
+ROWS_JSON = [{"id": 1, "note": "default"}, {"id": 2, "note": "default"}]
+
+
+class PassThroughMiddleware(Middleware):
+    """Python middleware: the route cannot use the sync dispatch of Rust."""
+
+    async def process_request(self, request):
+        return await self.get_response(request)
+
+
+@pytest.mark.parametrize(
+    "api_kwargs",
+    [
+        {},
+        {"middleware": [PassThroughMiddleware]},
+        {"django_middleware": ["django.middleware.clickjacking.XFrameOptionsMiddleware"]},
+    ],
+    ids=["plain", "python-middleware", "django-middleware"],
+)
+def test_inline_list_path_converts_a_later_object_by_attribute(api_kwargs):
+    """The inline list path checks only the first element.
+
+    A list that starts with a dict and holds an object later gets the result of
+    the slow path, which converts the object by attribute.
+    """
+    api = BoltAPI(**api_kwargs)
+
+    @api.get("/trivial")
+    async def trivial() -> list[Row]:
+        return [{"id": 1}, RowObject(2)]
+
+    @api.get("/trivial-query")
+    async def trivial_query(start: int = 1) -> list[Row]:
+        return [{"id": start}, RowObject(start + 1)]
+
+    @api.get("/awaits")
+    async def awaits() -> list[Row]:
+        await asyncio.sleep(0)
+        return [{"id": 1}, RowObject(2)]
+
+    @api.get("/awaits-query")
+    async def awaits_query(start: int = 1) -> list[Row]:
+        await asyncio.sleep(0)
+        return [{"id": start}, RowObject(start + 1)]
+
+    @api.get("/sync")
+    def sync_rows() -> list[Row]:
+        return [{"id": 1}, RowObject(2)]
+
+    @api.get("/sync-query")
+    def sync_rows_query(start: int = 1) -> list[Row]:
+        return [{"id": start}, RowObject(start + 1)]
+
+    with TestClient(api) as client:
+        for path in ("/trivial", "/trivial-query", "/awaits", "/awaits-query", "/sync", "/sync-query"):
+            resp = client.get(path)
+            assert resp.status_code == 200, (path, resp.text)
+            assert resp.json() == ROWS_JSON, path
+
+
+def test_inline_list_path_reports_an_invalid_element():
+    """An invalid element still gives the validation error of that element."""
+    api = BoltAPI()
+
+    @api.get("/rows")
+    async def rows() -> list[Row]:
+        return [{"id": 1}, {"id": "x"}]
+
+    with TestClient(api) as client:
+        resp = client.get("/rows")
+        assert resp.status_code == 500
+        assert resp.json()["extra"]["validation_errors"] == [
+            {"loc": ["body", "1", "id"], "msg": "Expected `int`, got `str`", "type": "validation_error"}
+        ]

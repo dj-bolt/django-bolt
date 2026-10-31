@@ -95,7 +95,6 @@ from .serialization import (
     _convert_serializers,
     _extract_stream_item_type,
     _infer_wire_response_type,
-    _raise_response_validation_error,
     _wire_bytes,
     compile_response_handlers,
     serialize_json_data,
@@ -2456,8 +2455,10 @@ class BoltAPI:
                                     return serialize_response_sync(result, meta)
                                 try:
                                     validated = _convert(result, _list_ann)
-                                except msgspec.ValidationError as exc:
-                                    _raise_response_validation_error(exc)
+                                except msgspec.ValidationError:
+                                    # A later element can need conversion by attribute.
+                                    # The slow path converts it, or gives the same error.
+                                    return serialize_response_sync(result, meta)
                                 return _encode(validated)
                             return _finish(result)
                     else:
@@ -2482,8 +2483,10 @@ class BoltAPI:
                                     return serialize_response_sync(result, meta)
                                 try:
                                     validated = _convert(result, _list_ann)
-                                except msgspec.ValidationError as exc:
-                                    _raise_response_validation_error(exc)
+                                except msgspec.ValidationError:
+                                    # A later element can need conversion by attribute.
+                                    # The slow path converts it, or gives the same error.
+                                    return serialize_response_sync(result, meta)
                                 return _encode(validated)
                             return _finish(result)
 
@@ -2503,8 +2506,10 @@ class BoltAPI:
                                 return await serialize_response(result, meta)
                             try:
                                 validated = _convert(result, _list_ann)
-                            except msgspec.ValidationError as exc:
-                                _raise_response_validation_error(exc)
+                            except msgspec.ValidationError:
+                                # A later element can need conversion by attribute.
+                                # The slow path converts it, or gives the same error.
+                                return await serialize_response(result, meta)
                             return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
                         return await serialize_response(result, meta)
                 else:
@@ -2522,8 +2527,10 @@ class BoltAPI:
                                 return await serialize_response(result, meta)
                             try:
                                 validated = _convert(result, _list_ann)
-                            except msgspec.ValidationError as exc:
-                                _raise_response_validation_error(exc)
+                            except msgspec.ValidationError:
+                                # A later element can need conversion by attribute.
+                                # The slow path converts it, or gives the same error.
+                                return await serialize_response(result, meta)
                             return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
                         return await serialize_response(result, meta)
 
@@ -2737,8 +2744,10 @@ class BoltAPI:
                                 return serialize_response_sync(result, meta)
                             try:
                                 validated = _convert(result, _list_ann)
-                            except msgspec.ValidationError as exc:
-                                _raise_response_validation_error(exc)
+                            except msgspec.ValidationError:
+                                # A later element can need conversion by attribute.
+                                # The slow path converts it, or gives the same error.
+                                return serialize_response_sync(result, meta)
                             return _encode(validated)
                         return _finish(result)
                 else:
@@ -2756,8 +2765,10 @@ class BoltAPI:
                                 return serialize_response_sync(result, meta)
                             try:
                                 validated = _convert(result, _list_ann)
-                            except msgspec.ValidationError as exc:
-                                _raise_response_validation_error(exc)
+                            except msgspec.ValidationError:
+                                # A later element can need conversion by attribute.
+                                # The slow path converts it, or gives the same error.
+                                return serialize_response_sync(result, meta)
                             return _encode(validated)
                         return _finish(result)
 
@@ -2777,8 +2788,10 @@ class BoltAPI:
                                 return serialize_response_sync(result, meta)
                             try:
                                 validated = _convert(result, _list_ann)
-                            except msgspec.ValidationError as exc:
-                                _raise_response_validation_error(exc)
+                            except msgspec.ValidationError:
+                                # A later element can need conversion by attribute.
+                                # The slow path converts it, or gives the same error.
+                                return serialize_response_sync(result, meta)
                             return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
                         if isinstance(result, QuerySet):
                             return await run_in_orm_executor(serialize_response_sync, result, meta)
@@ -2798,8 +2811,10 @@ class BoltAPI:
                                 return serialize_response_sync(result, meta)
                             try:
                                 validated = _convert(result, _list_ann)
-                            except msgspec.ValidationError as exc:
-                                _raise_response_validation_error(exc)
+                            except msgspec.ValidationError:
+                                # A later element can need conversion by attribute.
+                                # The slow path converts it, or gives the same error.
+                                return serialize_response_sync(result, meta)
                             return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
                         if isinstance(result, QuerySet):
                             return await run_in_orm_executor(serialize_response_sync, result, meta)

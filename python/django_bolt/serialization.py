@@ -371,15 +371,15 @@ def _dump_one_sync(serializer_cls: Any, value: Any, validate_dicts: bool) -> Any
     return serializer_cls.from_model(value).dump()
 
 
-async def _dump_one_async(serializer_cls: Any, value: Any, sync_safe: bool, validate_dicts: bool) -> Any:
+async def _dump_one_async(serializer_cls: Any, value: Any, validate_dicts: bool) -> Any:
     if value is None:
         return value
     if _is_serializer_instance(value):
         return value.dump()
     if isinstance(value, dict):
         return _dump_dict(serializer_cls, value, validate_dicts)
-    if sync_safe:
-        return serializer_cls.from_model(value).dump()
+    # The fields cannot show every relation: a field with a column type can
+    # name one. Thus try from_model() first, and load on UnloadedRelationError.
     try:
         return serializer_cls.from_model(value).dump()
     except UnloadedRelationError:
@@ -400,7 +400,7 @@ def _dump_many_sync(serializer_cls: Any, items: Any, validate_dicts: bool) -> li
     return serializer_cls.dump_many(instances)
 
 
-async def _dump_many_async(serializer_cls: Any, items: Any, sync_safe: bool, validate_dicts: bool) -> list[Any]:
+async def _dump_many_async(serializer_cls: Any, items: Any, validate_dicts: bool) -> list[Any]:
     items = items if isinstance(items, list) else list(items)
     if not items:
         return items
@@ -409,26 +409,11 @@ async def _dump_many_async(serializer_cls: Any, items: Any, sync_safe: bool, val
         return [_dump_dict(serializer_cls, item, validate_dicts) for item in items]
     if _is_serializer_instance(first):
         return [item.dump() for item in items]
-    if sync_safe:
+    try:
         instances = [serializer_cls.from_model(item) for item in items]
-    else:
-        try:
-            instances = [serializer_cls.from_model(item) for item in items]
-        except UnloadedRelationError:
-            instances = list(await asyncio.gather(*(serializer_cls.afrom_model(item) for item in items)))
+    except UnloadedRelationError:
+        instances = list(await asyncio.gather(*(serializer_cls.afrom_model(item) for item in items)))
     return serializer_cls.dump_many(instances)
-
-
-def _serializer_from_model_sync_safe(serializer_cls: Any) -> bool:
-    """True when async relation loading is unnecessary."""
-    serializer_cls._ensure_from_model_ready()
-    type_hints = getattr(serializer_cls, "__cached_type_hints__", {})
-    return not any(
-        spec.nested is not None
-        or spec.source is not None
-        or _annotation_may_need_relation_load(type_hints.get(spec.field_name))
-        for spec in serializer_cls.__model_field_specs__
-    )
 
 
 def _serializer_values_path_eligible(serializer_cls: Any) -> bool:
@@ -447,7 +432,13 @@ def _serializer_values_path_eligible(serializer_cls: Any) -> bool:
         return False
     if getattr(serializer_cls, "__has_rename__", False):
         return False
-    return _serializer_from_model_sync_safe(serializer_cls)
+    type_hints = getattr(serializer_cls, "__cached_type_hints__", {})
+    return not any(
+        spec.nested is not None
+        or spec.source is not None
+        or _annotation_may_need_relation_load(type_hints.get(spec.field_name))
+        for spec in serializer_cls.__model_field_specs__
+    )
 
 
 def _compile_serializer_values_evaluators(serializer_cls: Any) -> tuple[Any, Any]:
@@ -484,8 +475,6 @@ def _compile_serializer_values_evaluators(serializer_cls: Any) -> tuple[Any, Any
 
 def _compile_serializer_response_handlers(serializer_cls: Any, many: bool, validate_dicts: bool) -> tuple[Any, Any]:
     """Compile normalizers that render model/queryset output via the serializer."""
-    sync_safe = _serializer_from_model_sync_safe(serializer_cls)
-
     if many:
 
         def normalize_sync(value: Any) -> Any:
@@ -496,7 +485,7 @@ def _compile_serializer_response_handlers(serializer_cls: Any, many: bool, valid
         async def normalize_async(value: Any) -> Any:
             if not isinstance(value, (list, tuple)):
                 return value
-            return await _dump_many_async(serializer_cls, value, sync_safe, validate_dicts)
+            return await _dump_many_async(serializer_cls, value, validate_dicts)
 
         return normalize_sync, normalize_async
 
@@ -504,7 +493,7 @@ def _compile_serializer_response_handlers(serializer_cls: Any, many: bool, valid
         return _dump_one_sync(serializer_cls, value, validate_dicts)
 
     async def normalize_async(value: Any) -> Any:
-        return await _dump_one_async(serializer_cls, value, sync_safe, validate_dicts)
+        return await _dump_one_async(serializer_cls, value, validate_dicts)
 
     return normalize_sync, normalize_async
 

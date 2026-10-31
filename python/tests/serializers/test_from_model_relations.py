@@ -6,8 +6,10 @@ from typing import Any
 import pytest
 from msgspec import structs as msgspec_structs
 
+from django_bolt import BoltAPI
 from django_bolt.exceptions import SerializationError
 from django_bolt.serializers import Serializer, field
+from django_bolt.testing import TestClient
 from tests.test_models import Author, BlogPost, Comment, User, UserProfile
 
 
@@ -88,6 +90,16 @@ class AuthorPostIdsSerializer(Serializer):
 class AuthorPayloadSerializer(Serializer):
     id: int
     payload: Any = None
+
+
+class UserProfileAsDictSerializer(Serializer):
+    """A relation field with no nested serializer and no default.
+
+    Its type does not show that it is a relation.
+    """
+
+    id: int
+    profile: dict | None
 
 
 @pytest.mark.django_db
@@ -312,3 +324,30 @@ def test_dump_many_fast_path_still_guards_any_fields_for_manager_leaks():
         AuthorPayloadSerializer.dump_many([serializer])
 
     assert "payload" in str(exc_info.value)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_route_loads_a_relation_that_its_field_type_does_not_show():
+    """An async route loads an unloaded relation with afrom_model().
+
+    It does this also when the type of the field does not show a relation.
+    """
+    user = User.objects.create(username="solo", email="solo@example.com", password_hash="x")
+    api = BoltAPI()
+
+    @api.get("/user")
+    async def get_user() -> UserProfileAsDictSerializer:
+        return await User.objects.aget(pk=user.pk)
+
+    @api.get("/users")
+    async def list_users() -> list[UserProfileAsDictSerializer]:
+        return [await User.objects.aget(pk=user.pk)]
+
+    with TestClient(api) as client:
+        resp = client.get("/user")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"id": user.pk, "profile": None}
+
+        resp = client.get("/users")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == [{"id": user.pk, "profile": None}]
