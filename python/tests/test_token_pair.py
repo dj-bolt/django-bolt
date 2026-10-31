@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import types
 import uuid
 
 import jwt
@@ -22,6 +23,7 @@ from django_bolt.auth import (
     create_token_pair,
     rotate_refresh_token,
 )
+from django_bolt.auth import tokens as tokens_module
 from django_bolt.auth.revocation import InMemoryRevocation
 from django_bolt.testing import TestClient
 
@@ -456,14 +458,16 @@ _DELETE = object()
 _FAR_FUTURE = 4_000_000_000
 
 
-def _wait_for_start_of_second() -> None:
-    """Wait until the clock is in the first part of a second.
+@pytest.fixture
+def frozen_now(monkeypatch) -> int:
+    """Stop the clock of the token module at the current second, and return that second.
 
-    Then ``int(time.time())`` keeps its value for the next 0.5 second.
-    A test that checks an exact second count needs this.
+    A test that checks an exact second count needs this. The clock of PyJWT
+    keeps running, so a token stays valid as in a real request.
     """
-    while time.time() % 1 > 0.4:
-        time.sleep(0.01)
+    now = int(time.time())
+    monkeypatch.setattr(tokens_module, "time", types.SimpleNamespace(time=lambda: float(now)))
+    return now
 
 
 def _change(claims: dict, changes: dict) -> dict:
@@ -538,12 +542,11 @@ class TestRotationDetails:
             assert "stale" not in claims
 
     @pytest.mark.asyncio
-    async def test_mode_b_access_token_claims(self):
+    async def test_mode_b_access_token_claims(self, frozen_now):
         store = InMemoryRevocation()
         await store.bump_user_version("u")
-        oat = int(time.time()) - 500
+        oat = frozen_now - 500
         pair = create_token_pair("u", secret=SECRET, method="pwd", version=1, oat=oat)
-        before = int(time.time())
 
         async def rotate():
             return await rotate_refresh_token(
@@ -562,7 +565,7 @@ class TestRotationDetails:
 
         claims = first.access_claims
         assert claims["sub"] == "u"
-        assert before <= claims["iat"] <= before + 2
+        assert claims["iat"] == frozen_now
         assert claims["exp"] == claims["iat"] + 300
         assert claims["typ"] == "access"
         assert claims["ver"] == 1
@@ -578,7 +581,7 @@ class TestRotationDetails:
         assert jwt.decode(first.access_token, SECRET, algorithms=["HS512"]) == claims
 
     @pytest.mark.asyncio
-    async def test_default_leeway_is_sixty_seconds(self):
+    async def test_default_leeway_is_sixty_seconds(self, frozen_now):
         recorded = {}
 
         class SpyStore(InMemoryRevocation):
@@ -586,8 +589,7 @@ class TestRotationDetails:
                 recorded["exp"] = exp
                 return await super().consume(jti, exp=exp)
 
-        _wait_for_start_of_second()
-        now = int(time.time())
+        now = frozen_now
         pair = create_token_pair("u", secret=SECRET)
         pair.refresh_claims["exp"] = now - 10
 
@@ -624,10 +626,9 @@ class TestRotationDetails:
         ids=["one-second-left", "no-time-left", "past-the-cap"],
     )
     @pytest.mark.asyncio
-    async def test_session_cap_boundary(self, age, allowed):
-        _wait_for_start_of_second()
+    async def test_session_cap_boundary(self, age, allowed, frozen_now):
         pair = create_token_pair("u", secret=SECRET)
-        pair.refresh_claims["oat"] = int(time.time()) - age
+        pair.refresh_claims["oat"] = frozen_now - age
         call = rotate_refresh_token(
             pair.refresh_claims,
             store=InMemoryRevocation(),
