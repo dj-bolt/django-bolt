@@ -19,6 +19,7 @@ import hashlib
 from datetime import datetime
 from typing import Annotated
 
+import msgspec
 import pytest
 from asgiref.sync import sync_to_async
 from msgspec import Meta
@@ -30,6 +31,7 @@ from django_bolt.serializers import (
     NonEmptyStr,
     Serializer,
     computed_field,
+    field,
     field_validator,
     model_validator,
 )
@@ -1637,3 +1639,179 @@ class TestAPI6AdvancedSerializerFeatures:
         assert data["tag_names"] == []
         assert data["tag_count"] == 0
         assert data["comment_count"] == 0
+
+
+# ============================================================================
+# RESPONSE NORMALIZATION - Each test builds its own BoltAPI
+# ============================================================================
+
+
+class PublicUser(Serializer):
+    """A user. The password goes in, but never goes out."""
+
+    id: int
+    username: str
+    password: str = field(write_only=True, default="")
+
+
+class LoginUser(Serializer):
+    """A user. The login field reads the username attribute of a model."""
+
+    id: int
+    login: str = field(source="username", default="")
+
+
+class Obj:
+    """An object with attributes, as a Django model instance has."""
+
+    def __init__(self, **attributes):
+        self.__dict__.update(attributes)
+
+
+class Dumpable(msgspec.Struct):
+    """A Struct with a dump() method. It is not a Bolt Serializer."""
+
+    id: int
+
+    def dump(self):
+        return {"dumped": True}
+
+
+def test_serializer_route_validates_a_returned_dict_and_drops_write_only_fields():
+    api = BoltAPI()
+
+    @api.get("/one-sync")
+    def one_sync() -> PublicUser:
+        return {"id": 1, "username": "a", "password": "p"}
+
+    @api.get("/one-async")
+    async def one_async() -> PublicUser:
+        return {"id": 1, "username": "a", "password": "p"}
+
+    @api.get("/many-sync")
+    def many_sync() -> list[PublicUser]:
+        return [{"id": 1, "username": "a", "password": "p"}]
+
+    @api.get("/many-async")
+    async def many_async() -> list[PublicUser]:
+        return [{"id": 1, "username": "a", "password": "p"}]
+
+    with TestClient(api) as client:
+        for path in ("/one-sync", "/one-async"):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == {"id": 1, "username": "a"}, path
+
+        for path in ("/many-sync", "/many-async"):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == [{"id": 1, "username": "a"}], path
+
+
+def test_serializer_route_dumps_a_returned_serializer_instance():
+    """The route dumps the instance. It does not read the instance again with from_model()."""
+    api = BoltAPI()
+
+    @api.get("/login-sync")
+    def login_sync() -> LoginUser:
+        return LoginUser(id=1, login="x")
+
+    @api.get("/login-async")
+    async def login_async() -> LoginUser:
+        return LoginUser(id=1, login="x")
+
+    @api.get("/logins-sync")
+    def logins_sync() -> list[LoginUser]:
+        return [LoginUser(id=1, login="x")]
+
+    @api.get("/logins-async")
+    async def logins_async() -> list[LoginUser]:
+        return [LoginUser(id=1, login="x")]
+
+    @api.get("/public")
+    def public() -> PublicUser:
+        return PublicUser(id=1, username="a", password="p")
+
+    @api.get("/public-optional")
+    async def public_optional() -> PublicUser | None:
+        return PublicUser(id=1, username="a", password="p")
+
+    with TestClient(api) as client:
+        for path in ("/login-sync", "/login-async"):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == {"id": 1, "login": "x"}, path
+
+        for path in ("/logins-sync", "/logins-async"):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == [{"id": 1, "login": "x"}], path
+
+        for path in ("/public", "/public-optional"):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == {"id": 1, "username": "a"}, path
+
+
+def test_serializer_route_reads_returned_objects_and_tuples():
+    api = BoltAPI()
+
+    @api.get("/public-objects")
+    async def public_objects() -> list[PublicUser]:
+        return [Obj(id=1, username="a", password="p")]
+
+    @api.get("/login-objects")
+    async def login_objects() -> list[LoginUser]:
+        return [Obj(id=1, username="x")]
+
+    @api.get("/public-object")
+    def public_object() -> PublicUser:
+        return Obj(id=1, username="a", password="p")
+
+    @api.get("/tuple-sync")
+    def tuple_sync() -> list[PublicUser]:
+        return ({"id": 1, "username": "a"},)
+
+    @api.get("/tuple-async")
+    async def tuple_async() -> list[PublicUser]:
+        return ({"id": 1, "username": "a"},)
+
+    with TestClient(api) as client:
+        expected = {
+            "/public-objects": [{"id": 1, "username": "a"}],
+            "/login-objects": [{"id": 1, "login": "x"}],
+            "/public-object": {"id": 1, "username": "a"},
+            "/tuple-sync": [{"id": 1, "username": "a"}],
+            "/tuple-async": [{"id": 1, "username": "a"}],
+        }
+        for path, body in expected.items():
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == body, path
+
+
+def test_untyped_route_dumps_serializers_but_not_other_objects_with_dump():
+    api = BoltAPI()
+
+    @api.get("/serializers")
+    def serializers():
+        return [PublicUser(id=1, username="a", password="p")]
+
+    @api.get("/dumpable")
+    def dumpable():
+        return Dumpable(id=1)
+
+    @api.get("/dumpables")
+    def dumpables():
+        return [Dumpable(id=1)]
+
+    with TestClient(api) as client:
+        expected = {
+            "/serializers": [{"id": 1, "username": "a"}],
+            "/dumpable": {"id": 1},
+            "/dumpables": [{"id": 1}],
+        }
+        for path, body in expected.items():
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == body, path
