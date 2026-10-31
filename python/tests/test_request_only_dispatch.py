@@ -9,9 +9,12 @@ which dispatch ran.
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 import threading
 
 import pytest
+from asgiref.sync import sync_to_async
 from django.db.models import QuerySet
 
 from django_bolt import BoltAPI, Request
@@ -66,6 +69,56 @@ def test_an_async_request_handler_that_awaits_runs_in_a_task():
         response = client.get("/items")
 
     assert response.json() == {"in_task": True}
+
+
+async def awaiting_items(request: Request, q: str = ""):
+    await asyncio.sleep(0)
+    return {"in_task": in_task(), "q": q}
+
+
+def marked_sync_wrapper(handler):
+    """Wrap ``handler`` in a sync def that returns its coroutine, and mark it as async."""
+
+    @functools.wraps(handler)
+    def wrapper(request: Request, q: str = ""):
+        return handler(request, q)
+
+    return inspect.markcoroutinefunction(wrapper)
+
+
+@pytest.mark.parametrize("path", ["/request-only", "/with-param?q=bolt"])
+def test_a_marked_sync_wrapper_whose_coroutine_awaits_runs_in_a_task(path):
+    """The code of the wrapper has no await, but its coroutine can suspend."""
+    api = BoltAPI()
+
+    @api.get("/request-only")
+    @inspect.markcoroutinefunction
+    def request_only(request: Request):
+        return awaiting_items(request)
+
+    api.get("/with-param")(marked_sync_wrapper(awaiting_items))
+
+    with TestClient(api) as client:
+        response = client.get(path)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["in_task"] is True
+
+
+def test_a_sync_to_async_request_handler_runs_in_a_task():
+    """A ``sync_to_async`` wrapper has no code to read, and its coroutine suspends."""
+    api = BoltAPI()
+
+    def items(request: Request):
+        return {"q": request.query.get("q")}
+
+    api.get("/items")(sync_to_async(items))
+
+    with TestClient(api) as client:
+        response = client.get("/items?q=bolt")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"q": "bolt"}
 
 
 def test_a_request_handler_on_the_sync_dispatch_keeps_its_status_and_response_class():

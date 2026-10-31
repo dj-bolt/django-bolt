@@ -149,15 +149,16 @@ _ASYNC_SUSPEND_OPNAMES = frozenset({"GET_AWAITABLE", "GET_AITER", "GET_ANEXT", "
 
 
 def _never_suspends(fn: Callable) -> bool:
-    """Return whether the code of ``fn`` has no opcode that can suspend.
+    """Return whether one ``send(None)`` runs a coroutine of ``fn`` to its end.
 
-    One ``send(None)`` then runs a coroutine of ``fn`` to its end. A callable
-    with no code, such as a ``sync_to_async`` wrapper, can suspend.
+    Only an ``async def`` with no opcode that can suspend does that. A sync
+    function can return a coroutine that suspends, for example a wrapper that
+    ``inspect.markcoroutinefunction`` marks. A ``sync_to_async`` wrapper has no code.
     """
-    try:
-        return not any(i.opname in _ASYNC_SUSPEND_OPNAMES for i in dis.get_instructions(fn.__code__))
-    except (AttributeError, TypeError):
+    code = getattr(fn, "__code__", None)
+    if code is None or not code.co_flags & inspect.CO_COROUTINE:
         return False
+    return not any(i.opname in _ASYNC_SUSPEND_OPNAMES for i in dis.get_instructions(code))
 
 
 def _sync_finisher(meta: dict[str, Any], defer: Callable) -> Callable[[Any], ResponseWireV1 | Callable]:
