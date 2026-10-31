@@ -972,6 +972,31 @@ mod tests {
     }
 
     #[test]
+    fn a_change_that_arrives_during_the_debounce_replaces_the_path() {
+        let filter = ReloadFilter::new(vec![], vec![]);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(modify_event("/tmp/project/models.py"))).unwrap();
+        let later = tx.clone();
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            later
+                .send(Ok(modify_event("/tmp/project/views.py")))
+                .unwrap();
+        });
+
+        let changed = recv_change(
+            &rx,
+            &filter,
+            Duration::from_millis(500),
+            Duration::from_millis(10),
+        );
+        sender.join().unwrap();
+
+        assert_eq!(changed, Ok(Some(PathBuf::from("/tmp/project/views.py"))));
+        drop(tx);
+    }
+
+    #[test]
     fn wait_for_child_exit_gives_the_status_of_a_child_that_exits_in_time() {
         let mut child = Command::new("sh")
             .arg("-c")
@@ -1064,7 +1089,11 @@ mod tests {
             inside.display().to_string()
         );
 
-        let outside = cwd.parent().unwrap_or(&cwd).join("other").join("app.py");
-        assert_eq!(display_path(&outside), outside.display().to_string());
+        // Each absolute path is inside the root directory, so a test that
+        // runs there has no outside path.
+        if let Some(parent) = cwd.parent() {
+            let outside = parent.join("other").join("app.py");
+            assert_eq!(display_path(&outside), outside.display().to_string());
+        }
     }
 }
