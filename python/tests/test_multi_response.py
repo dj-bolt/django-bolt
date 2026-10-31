@@ -530,3 +530,39 @@ def test_mismatched_body_is_not_validated():
         r = client.get("/items/1")
         assert r.status_code == 200
         assert r.json() == {"wrong_field": "no id or name"}
+
+
+# ============================================================================
+# An undeclared status in a sync (status, data) tuple keeps that status
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("path", "content_type", "body"),
+    [
+        ("/text", "text/plain; charset=utf-8", b"teapot"),
+        ("/dict", "application/json", b'{"a":1}'),
+    ],
+)
+def test_sync_tuple_with_an_undeclared_status_keeps_that_status(path, content_type, body):
+    """The catch-all entry encodes the data, and the tuple status stays.
+
+    The status of the catch-all entry is the route default, 200. A declared
+    status cannot show the difference, because its entry has that status.
+    """
+    api = BoltAPI()
+
+    @api.get("/text", response_model={200: OkSchema})
+    def text():
+        return 418, "teapot"
+
+    @api.get("/dict", response_model={200: OkSchema})
+    def data():
+        return 418, {"a": 1}
+
+    with TestClient(api) as client:
+        response = client.get(path)
+
+    assert response.status_code == 418
+    assert response.headers["content-type"] == content_type
+    assert response.content == body
