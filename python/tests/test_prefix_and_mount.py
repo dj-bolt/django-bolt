@@ -6,7 +6,12 @@ These tests verify:
 2. OpenAPI docs remain at absolute paths regardless of API prefix
 """
 
+import asyncio
+
+import pytest
+
 from django_bolt import BoltAPI
+from django_bolt.middleware import Middleware
 from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
 from django_bolt.testing import TestClient
 
@@ -585,3 +590,60 @@ class TestTrailingSlashSetting:
 
             registered_paths = [path for _method, path, _handler_id, _handler in api._routes]
             assert "/" in registered_paths, f"Root '/' should be unchanged in '{mode}' mode"
+
+
+class TagMiddleware(Middleware):
+    """Add the header ``x-api`` with the name of the API that runs the middleware."""
+
+    name = ""
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.headers["x-api"] = self.name
+        return response
+
+
+class ChildTag(TagMiddleware):
+    name = "child"
+
+
+class ParentTag(TagMiddleware):
+    name = "parent"
+
+
+@pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync", "async"])
+def test_a_mounted_api_runs_its_own_python_middleware(handler_is_async):
+    """The API that registers a route runs its global middleware, also after a mount."""
+    child = BoltAPI(middleware=[ChildTag])
+    plain_child = BoltAPI()
+
+    if handler_is_async:
+
+        @child.get("/items")
+        async def child_items():
+            return {"from": "child"}
+
+    else:
+
+        @child.get("/items")
+        def child_items():
+            return {"from": "child"}
+
+    # The await sends the route through the async dispatch, which picks the middleware.
+    @plain_child.get("/items")
+    async def plain_items():
+        await asyncio.sleep(0)
+        return {"from": "plain"}
+
+    parent = BoltAPI()
+    parent.mount("/child", child)
+    tagged_parent = BoltAPI(middleware=[ParentTag])
+    tagged_parent.mount("/plain", plain_child)
+
+    with TestClient(parent) as client:
+        child_response = client.get("/child/items")
+    with TestClient(tagged_parent) as client:
+        plain_response = client.get("/plain/items")
+
+    assert (child_response.json(), child_response.headers.get("x-api")) == ({"from": "child"}, "child")
+    assert (plain_response.json(), plain_response.headers.get("x-api")) == ({"from": "plain"}, None)
