@@ -818,12 +818,17 @@ class ArticleSerializer(Serializer):
     title: str
 
 
+class ArticleTitleSerializer(Serializer):
+    title: str
+
+
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 def test_a_serializer_entry_converts_model_instances(is_async):
     """A Serializer type builds a converter even when the entry does not validate."""
     api = BoltAPI()
-    responses = {200: list[ArticleSerializer], 404: ErrorSchema}
+    # 201 has its own Serializer, which keeps only the title.
+    responses = {200: list[ArticleSerializer], 201: list[ArticleTitleSerializer], 404: ErrorSchema}
 
     if is_async:
 
@@ -835,6 +840,10 @@ def test_a_serializer_entry_converts_model_instances(is_async):
         async def as_json():
             return JSON([article async for article in Article.objects.all()], status_code=200)
 
+        @api.get("/json-created", response_model=responses)
+        async def as_json_created():
+            return JSON([article async for article in Article.objects.all()], status_code=201)
+
     else:
 
         @api.get("/tuple", response_model=responses)
@@ -845,11 +854,17 @@ def test_a_serializer_entry_converts_model_instances(is_async):
         def as_json():
             return JSON(list(Article.objects.all()), status_code=200)
 
+        @api.get("/json-created", response_model=responses)
+        def as_json_created():
+            return JSON(list(Article.objects.all()), status_code=201)
+
     article = Article.objects.create(title="One", content="First", author="A")
     with TestClient(api) as client:
         tuple_response = client.get("/tuple")
         json_response = client.get("/json")
+        created_response = client.get("/json-created")
 
     expected = [{"id": article.id, "title": "One"}]
     assert (tuple_response.status_code, tuple_response.json()) == (200, expected), tuple_response.text
     assert (json_response.status_code, json_response.json()) == (200, expected), json_response.text
+    assert (created_response.status_code, created_response.json()) == (201, [{"title": "One"}]), created_response.text
