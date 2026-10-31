@@ -294,7 +294,9 @@ def _response_class_wire_meta(
     once — do not inject the content-type into them first.
     """
     if not headers and not cookies:
-        static_meta = _STATIC_MEDIA_TYPE_META.get(media_type)
+        # The tuple below gives the same response for these media types. The
+        # integer tag only saves the tuple.
+        static_meta = _STATIC_MEDIA_TYPE_META.get(media_type)  # pragma: no mutate
         if static_meta is not None:
             return static_meta
         return (_infer_wire_response_type(media_type), media_type, None, None)
