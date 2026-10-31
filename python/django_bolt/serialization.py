@@ -53,7 +53,7 @@ from .responses import (
 from .responses import Response as ResponseClass
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Callable, Coroutine
 
     from .typing import HandlerMetadata
 
@@ -862,6 +862,10 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
 
     default_status_code = meta["default_status_code"]
     stream_info = meta["_stream_info"]
+    # A Struct result goes to the JSON payload before the stream checks. Only a
+    # route with a stream annotation can stream a Struct, so it keeps the full order.
+    # Without this shortcut, the full order gives the same response.
+    struct_first = not stream_info[0]  # pragma: no mutate
     response_class = meta.get("response_class")
 
     _serializer_cls, _serializer_many = _response_serializer_info(meta.get("response_type"))
@@ -907,10 +911,16 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if result is None and current_status == 204:
             return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
 
+        # The async validator awaits only for a QuerySet or a model instance. A
+        # dict or a Struct gets the same result from the sync validator.
         if isinstance(result, dict):
-            return await _serialize_json_payload_async(result, current_status, validator_async)
+            return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, list):
             return await _serialize_json_payload_async(prepare_list(result), current_status, validator_async)
+        if struct_first and isinstance(result, msgspec.Struct):
+            if not is_serializer_response:
+                result = _convert_serializers(result)
+            return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, (bytes, bytearray)):
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
@@ -954,6 +964,10 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, list):
             return _serialize_json_payload_sync(prepare_list(result), current_status, validator_sync)
+        if struct_first and isinstance(result, msgspec.Struct):
+            if not is_serializer_response:
+                result = _convert_serializers(result)
+            return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, (bytes, bytearray)):
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
@@ -989,7 +1003,10 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     # carries a different body, so Bolt encodes it as-is. Per-status schemas
     # come from ``response_model={code: type}``.
     async def response_type_handler(result: Any) -> ResponseWireV1:
-        if isinstance(result, JSON):
+        # The lookup gives an exact response type its own class. This check only skips it.
+        if (cls := result.__class__) is not JSON and cls not in _RESPONSE_CLASSES:  # pragma: no mutate
+            cls = _response_base_class(result)
+        if cls is JSON:
             if validator_async is not None and result.status_code == default_status_code:
                 try:
                     validated = await validator_async(result.data)
@@ -1002,19 +1019,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 data_bytes = result.to_bytes()
             cookies = getattr(result, "_cookies", None)
             return _wire_bytes(result.status_code, _build_wire_meta("json", result.headers, cookies), data_bytes)
-        if isinstance(result, StreamingResponse):
-            return _to_stream_wire(result)
-        if isinstance(result, PlainText):
-            return serialize_plaintext_response(result)
-        if isinstance(result, HTML):
-            return serialize_html_response(result)
-        if isinstance(result, Redirect):
-            return serialize_redirect_response(result)
-        if isinstance(result, File):
-            return serialize_file_response(result)
-        if isinstance(result, FileResponse):
-            return serialize_file_streaming_response(result)
-        if isinstance(result, ResponseClass):
+        if cls is ResponseClass:
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
             if (
@@ -1034,11 +1039,13 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             cookies = getattr(result, "_cookies", None)
             meta = _response_class_wire_meta(result.media_type, result.headers, cookies)
             return _wire_bytes(result.status_code, meta, body)
-        # The last type of _RESPONSE_INSTANCE_TYPES. Only those types come here.
-        return serialize_django_response(result)
+        return _RESPONSE_SERIALIZERS[cls](result)
 
     def response_type_handler_sync(result: Any) -> ResponseWireV1:
-        if isinstance(result, JSON):
+        # The lookup gives an exact response type its own class. This check only skips it.
+        if (cls := result.__class__) is not JSON and cls not in _RESPONSE_CLASSES:  # pragma: no mutate
+            cls = _response_base_class(result)
+        if cls is JSON:
             if validator_sync is not None and result.status_code == default_status_code:
                 try:
                     validated = validator_sync(result.data)
@@ -1051,19 +1058,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 data_bytes = result.to_bytes()
             cookies = getattr(result, "_cookies", None)
             return _wire_bytes(result.status_code, _build_wire_meta("json", result.headers, cookies), data_bytes)
-        if isinstance(result, StreamingResponse):
-            return _to_stream_wire(result)
-        if isinstance(result, PlainText):
-            return serialize_plaintext_response(result)
-        if isinstance(result, HTML):
-            return serialize_html_response(result)
-        if isinstance(result, Redirect):
-            return serialize_redirect_response(result)
-        if isinstance(result, File):
-            return serialize_file_response(result)
-        if isinstance(result, FileResponse):
-            return serialize_file_streaming_response(result)
-        if isinstance(result, ResponseClass):
+        if cls is ResponseClass:
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
             if (
@@ -1083,13 +1078,24 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             cookies = getattr(result, "_cookies", None)
             meta = _response_class_wire_meta(result.media_type, result.headers, cookies)
             return _wire_bytes(result.status_code, meta, body)
-        # The last type of _RESPONSE_INSTANCE_TYPES. Only those types come here.
-        return serialize_django_response(result)
+        return _RESPONSE_SERIALIZERS[cls](result)
 
     meta["_default_response_handler"] = data_handler
     meta["_default_response_handler_sync"] = data_handler_sync
     meta["_response_type_handler"] = response_type_handler
     meta["_response_type_handler_sync"] = response_type_handler_sync
+
+
+_BOLT_RESPONSE_TYPES = _RESPONSE_INSTANCE_TYPES[:-1]
+
+
+def _response_base_class(result: Any) -> type:
+    """Return the response type of an instance of a subclass, for example a Django redirect."""
+    for cls in _BOLT_RESPONSE_TYPES:
+        if isinstance(result, cls):
+            return cls
+    # serialize_response sends only the response types, and Django's is the last of them.
+    return DjangoHttpResponse
 
 
 def serialize_response(result: Any, meta: HandlerMetadata | dict[str, Any]) -> Coroutine[Any, Any, ResponseWireV1]:
@@ -1264,3 +1270,19 @@ async def serialize_json_data(result: Any, status_code: int) -> ResponseWireV1:
 def serialize_json_data_sync(result: Any, status_code: int) -> ResponseWireV1:
     """Serialize dict/list/other data as JSON (sync version)."""
     return _wire_bytes(status_code, _RESPONSE_META_JSON, _json.encode(result))
+
+
+# The response types that need no route data, and their serializers. JSON and
+# Response use the validator of the route, so the route handlers serialize them.
+_RESPONSE_SERIALIZERS: dict[type, Callable[[Any], ResponseWireV1]] = {
+    PlainText: serialize_plaintext_response,
+    HTML: serialize_html_response,
+    Redirect: serialize_redirect_response,
+    File: serialize_file_response,
+    FileResponse: serialize_file_streaming_response,
+    StreamingResponse: _to_stream_wire,
+    EventSourceResponse: _to_stream_wire,
+    DjangoHttpResponse: serialize_django_response,
+}
+# The exact classes that the route handlers dispatch on.
+_RESPONSE_CLASSES = frozenset((JSON, ResponseClass, *_RESPONSE_SERIALIZERS))
