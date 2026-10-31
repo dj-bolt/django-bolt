@@ -1314,7 +1314,7 @@ def test_bolt_builds_each_middleware_chain_one_time():
 
 def test_a_python_middleware_before_a_rust_middleware_runs():
     """A dict spec runs in Rust. The Python middleware before it in the list still runs."""
-    rate_limit_spec = {"type": "rate_limit", "rps": 1000, "burst": 1000, "key": "ip"}
+    rate_limit_spec = {"type": "rate_limit", "rps": 1, "burst": 1, "key": "ip"}
     api = BoltAPI(middleware=[TagMiddleware, rate_limit_spec])
     router = Router(prefix="/router", middleware=[RouterTagMiddleware])
 
@@ -1323,19 +1323,23 @@ def test_a_python_middleware_before_a_rust_middleware_runs():
         return {"ok": True}
 
     @router.get("/items")
-    @rate_limit(rps=1000)
+    @rate_limit(rps=1, burst=1)
     async def on_router():
         return {"ok": True}
 
     api.include_router(router)
 
     with TestClient(api) as client:
+        # The Rust rate limit also runs: a burst of 1 refuses the next request at once.
         api_response = client.get("/api")
+        api_limited = client.get("/api").status_code
         router_response = client.get("/router/items")
+        router_limited = client.get("/router/items").status_code
 
     assert (api_response.status_code, api_response.headers.get("x-api")) == (200, "tagged")
     assert router_response.status_code == 200
     assert (router_response.headers.get("x-api"), router_response.headers.get("x-router")) == ("tagged", "tagged")
+    assert (api_limited, router_limited) == (429, 429)
 
 
 class WireTupleMiddleware(Middleware):
