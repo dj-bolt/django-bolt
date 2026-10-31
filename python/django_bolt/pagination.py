@@ -27,9 +27,24 @@ import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import wraps
-from typing import Any, Generic, TypeVar, get_args, get_origin
+from typing import Any, Generic, NamedTuple, TypeVar, get_args, get_origin
 
 import msgspec
+from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
+from django.db import connections
+from django.db.models import F, Q, Value
+from django.db.models.fields.tuple_lookups import (
+    Tuple,
+    TupleGreaterThan,
+    TupleLessThan,
+)
+from django.db.models.query import (
+    FlatValuesListIterable,
+    NamedValuesListIterable,
+    ValuesIterable,
+    ValuesListIterable,
+)
+from django.db.models.utils import create_namedtuple_class
 
 from . import _json
 from .concurrency import run_in_orm_executor
@@ -47,6 +62,13 @@ __all__ = [
 
 T = TypeVar("T")
 _PAGINATION_UNSET = object()
+_CURSOR_NULL = object()
+_CURSOR_JSON_NULL = object()
+
+
+class _CompositeCursor(NamedTuple):
+    value: Any
+    pk: Any
 
 
 class PaginatedResponse(msgspec.Struct, Generic[T], omit_defaults=True):  # noqa: UP046 — PEP 695 params are unresolvable under PEP 563
@@ -549,6 +571,9 @@ class CursorPagination(PaginationBase):
     """
     Cursor-based pagination for large datasets.
 
+    Non-PK ordering uses the primary key to break ties. A single-key
+    DISTINCT/GROUP BY projection uses its ordering key as the cursor.
+
     More efficient than offset-based pagination for large datasets
     as it doesn't require counting all records or scanning through skipped records.
 
@@ -571,7 +596,7 @@ class CursorPagination(PaginationBase):
     page_size_query_param: str = "page_size"
     ordering: str = "-id"  # Default ordering field
 
-    def _encode_cursor(self, value: Any) -> str:
+    def _encode_cursor(self, value: Any, *, kind: str | None = None) -> str:
         """
         Encode cursor value to base64 string.
 
@@ -581,7 +606,9 @@ class CursorPagination(PaginationBase):
         Returns:
             Base64-encoded cursor string
         """
-        cursor_data = _json.encode({"v": value})
+        # Keep legacy scalar wire format; tag new cursor types outside the value.
+        data = {"v": value} if kind is None else {"v": value, "t": kind}
+        cursor_data = _json.encode(data)
         return base64.b64encode(cursor_data).decode("utf-8")
 
     def _decode_cursor(self, cursor: str) -> Any:
@@ -597,7 +624,20 @@ class CursorPagination(PaginationBase):
         try:
             cursor_data = base64.b64decode(cursor.encode("utf-8"))
             data = msgspec.json.decode(cursor_data)
-            return data.get("v")
+            if not isinstance(data, dict):
+                return None
+            value = data.get("v")
+            if data.get("t") in {"composite-v2", "composite-json-null-v1"}:
+                if not isinstance(value, dict) or set(value) != {"value", "pk"}:
+                    return None
+                if data["t"] == "composite-json-null-v1":
+                    if value["value"] is not None:
+                        return None
+                    return _CompositeCursor(_CURSOR_JSON_NULL, value["pk"])
+                return _CompositeCursor(value["value"], value["pk"])
+            if data.get("t") == "null-v2":
+                return _CURSOR_NULL if value is None else None
+            return value
         except Exception:
             return None
 
@@ -634,20 +674,208 @@ class CursorPagination(PaginationBase):
         ordering = self.ordering
         is_descending = ordering.startswith("-")
         ordering_field = ordering.lstrip("-")
+        projection_ordering_field = ordering_field
+        try:
+            sort_field = queryset.model._meta.get_field(ordering_field)
+        except FieldDoesNotExist:
+            sort_field = None  # Annotation rather than a model field.
 
-        # Apply ordering to queryset
-        ordered_qs = queryset.order_by(ordering)
+        if (
+            ordering_field != "pk"
+            and ordering_field not in queryset.query.annotation_select
+            and (sort_field is None or not sort_field.concrete or "__" in ordering_field)
+        ):
+            raise ValueError("CursorPagination ordering must be a concrete field or annotation")
 
-        # Apply cursor filter if present
-        if cursor_value is not None:
-            if is_descending:
-                # For descending order, we want items less than cursor
-                filter_kwargs = {f"{ordering_field}__lt": cursor_value}
+        if sort_field is not None and sort_field.concrete and sort_field.is_relation:
+            if not (sort_field.many_to_one or sort_field.one_to_one):
+                raise ValueError("CursorPagination cannot order by a multi-valued relation")
+            if sort_field.name == ordering_field and sort_field.remote_field.model._meta.ordering:
+                raise ValueError(
+                    "CursorPagination cannot use related-model default ordering; "
+                    f"use '{sort_field.attname}' to order by the foreign key"
+                )
+
+            # Never fetch a related object to generate a cursor in async code.
+            projection_ordering_field = sort_field.name
+            ordering_field = sort_field.attname
+            ordering = ("-" if is_descending else "") + ordering_field
+
+        pk_field = queryset.model._meta.pk
+        is_pk_ordering = ordering_field in {"pk", pk_field.name, pk_field.attname}
+        iterable = getattr(queryset, "_iterable_class", None)
+        is_values_projection = iterable is ValuesIterable
+        is_flat_values_list = iterable is FlatValuesListIterable
+        is_named_values_list = iterable is NamedValuesListIterable
+        is_values_list_projection = iterable in (ValuesListIterable, FlatValuesListIterable, NamedValuesListIterable)
+        projected = is_values_projection or is_values_list_projection
+        selected_fields = getattr(queryset, "_fields", None) or ()
+
+        # Adding a PK to DISTINCT/GROUP BY changes the rows themselves.
+        # A single projected ordering/grouping key is already unique in
+        # these two cases; otherwise fail clearly rather than lose rows.
+        grouped_or_distinct = projected and bool(queryset.query.distinct or queryset.query.group_by)
+
+        # Top-level JSON null and SQL NULL both become None in Python.
+        # Distinguish them at page boundaries without querying every row.
+        ordering_output_field = sort_field
+        if ordering_output_field is None:
+            annotation = queryset.query.annotations.get(ordering_field)
+            if annotation is not None:
+                try:
+                    ordering_output_field = annotation.output_field
+                except FieldError as exc:
+                    raise ValueError("CursorPagination cannot resolve annotation ordering type") from exc
+        is_json_ordering = (
+            ordering_output_field is not None and ordering_output_field.get_internal_type() == "JSONField"
+        )
+        if grouped_or_distinct and not is_pk_ordering and is_json_ordering:
+            raise ValueError("CursorPagination cannot paginate DISTINCT/GROUP BY over a JSONField ordering")
+
+        if grouped_or_distinct and not is_pk_ordering:
+            if tuple(selected_fields) not in (
+                (ordering_field,),
+                (projection_ordering_field,),
+            ):
+                raise ValueError(
+                    "CursorPagination with DISTINCT/GROUP BY needs an ordering "
+                    "field that uniquely identifies each projected row"
+                )
+            if queryset.query.group_by:
+                if queryset.query.group_by is True or len(queryset.query.group_by) != 1:
+                    raise ValueError("CursorPagination needs one unique GROUP BY ordering key")
+                group_key = queryset.query.group_by[0]
+                grouped_ordering = queryset.query.resolve_ref(ordering_field)
+                if group_key != grouped_ordering and getattr(group_key, "refs", None) != ordering_field:
+                    raise ValueError("CursorPagination GROUP BY ordering must match the grouped key")
+            elif queryset.query.distinct:
+                extra_columns = set(queryset.query.annotation_select) | set(queryset.query.extra_select)
+                if extra_columns - {
+                    ordering_field,
+                    projection_ordering_field,
+                }:
+                    raise ValueError("CursorPagination cannot paginate DISTINCT with extra selected columns")
+
+        if (
+            projected
+            and selected_fields
+            and ordering_field not in selected_fields
+            and projection_ordering_field not in selected_fields
+            and not (is_pk_ordering and bool({"pk", pk_field.name, pk_field.attname}.intersection(selected_fields)))
+        ):
+            raise ValueError("CursorPagination projection must include its ordering field")
+
+        hidden_pk_field = "_bolt_cursor_pk"
+        pk_is_projected = (
+            not selected_fields  # values() with no arguments includes the PK
+            or bool({"pk", pk_field.name, pk_field.attname}.intersection(selected_fields))
+        )
+        # Django disallows annotate() after union(); keep its legacy first page.
+        is_combined = queryset.query.combinator is not None
+        needs_hidden_pk = projected and not grouped_or_distinct and not pk_is_projected and not is_combined
+        if needs_hidden_pk:
+            while hidden_pk_field in selected_fields or hidden_pk_field in queryset.query.annotations:
+                hidden_pk_field += "_"
+            queryset = queryset.annotate(**{hidden_pk_field: F("pk")})
+            if is_flat_values_list or is_named_values_list:
+                # These iterable classes discard the hidden column (flat) or
+                # cannot build a namedtuple with the extra column (named).
+                # Read raw tuples and restore the public shape after slicing.
+                queryset._iterable_class = ValuesListIterable
+
+        # Preserve the original -id fast path and avoid changing SQL meaning
+        # on aggregated or DISTINCT querysets.
+        use_pk_tiebreaker = not is_pk_ordering and not grouped_or_distinct and not is_combined
+        ordered_qs = (
+            queryset.order_by(ordering, "-pk" if is_descending else "pk")
+            if use_pk_tiebreaker
+            else queryset.order_by(ordering)
+        )
+        lookup = "lt" if is_descending else "gt"
+
+        async def is_json_null_at(pk: Any) -> bool:
+            # Query the database only for a NULL cursor boundary. Django
+            # deserializes both JSON null and SQL NULL to Python None.
+            return await run_in_orm_executor(
+                lambda: queryset.filter(
+                    pk=pk,
+                    **{ordering_field: Value(None, output_field=ordering_output_field)},
+                ).exists()
+            )
+
+        if isinstance(cursor_value, _CompositeCursor):
+            try:
+                if not use_pk_tiebreaker or (cursor_value.value is _CURSOR_JSON_NULL and not is_json_ordering):
+                    raise ValueError("Composite cursor is not valid for this ordering")
+                cursor_pk = pk_field.to_python(cursor_value.pk)
+                if cursor_pk is None:
+                    raise ValueError("Missing cursor primary key")
+                value = cursor_value.value
+                if (
+                    value is not None
+                    and value is not _CURSOR_JSON_NULL
+                    and sort_field is not None
+                    and sort_field.concrete
+                    and not is_json_ordering
+                ):
+                    value = sort_field.to_python(value)
+                # Older composite cursors did not distinguish the two NULLs.
+                if is_json_ordering and value is None and await is_json_null_at(cursor_pk):
+                    value = _CURSOR_JSON_NULL
+                cursor_value = _CompositeCursor(value, cursor_pk)
+            except (TypeError, ValueError, OverflowError, ValidationError):
+                cursor_value = None  # Invalid cursor: behave like the first page.
+        elif cursor_value is _CURSOR_NULL and (not grouped_or_distinct or is_pk_ordering):
+            cursor_value = None
+
+        if grouped_or_distinct and not is_pk_ordering and cursor_value is not None:
+            nulls_first = connections[queryset.db].features.nulls_order_largest == is_descending
+            null_lookup = f"{ordering_field}__isnull"
+            if cursor_value is _CURSOR_NULL:
+                # NULL is a real cursor position, not a missing cursor.
+                ordered_qs = ordered_qs.filter(**{null_lookup: False}) if nulls_first else ordered_qs.none()
             else:
-                # For ascending order, we want items greater than cursor
-                filter_kwargs = {f"{ordering_field}__gt": cursor_value}
-
-            ordered_qs = ordered_qs.filter(**filter_kwargs)
+                after_cursor = Q(**{f"{ordering_field}__{lookup}": cursor_value})
+                try:
+                    nullable = queryset.model._meta.get_field(ordering_field).null
+                except FieldDoesNotExist:
+                    nullable = True
+                if nullable and not nulls_first:
+                    after_cursor |= Q(**{null_lookup: True})
+                ordered_qs = ordered_qs.filter(after_cursor)
+        elif isinstance(cursor_value, _CompositeCursor):
+            value, cursor_pk = cursor_value
+            nulls_first = connections[queryset.db].features.nulls_order_largest == is_descending
+            try:
+                nullable = queryset.model._meta.get_field(ordering_field).null
+            except FieldDoesNotExist:  # annotation/expression, so assume nullable
+                nullable = True
+            null_lookup = f"{ordering_field}__isnull"
+            # A JSON null is a non-SQL-NULL value in database ordering.
+            boundary = Value(None, output_field=ordering_output_field) if value is _CURSOR_JSON_NULL else value
+            same_value = Q(**{null_lookup: True}) if value is None else Q(**{ordering_field: boundary})
+            tie = same_value & Q(**{f"pk__{lookup}": cursor_pk})
+            if connections[queryset.db].vendor == "postgresql" and value is not None and (not nullable or nulls_first):
+                # A PostgreSQL composite B-tree can use the row comparison as
+                # an Index Cond. The equivalent OR predicate can scan every
+                # preceding row, making deep pages grow linearly in cost.
+                # Preserve the existing NULL-aware Q fallback when needed.
+                row = Tuple(F(ordering_field), F(pk_field.attname))
+                comparison = TupleLessThan if is_descending else TupleGreaterThan
+                ordered_qs = ordered_qs.filter(comparison(row, (boundary, cursor_pk)))
+            else:
+                if value is None:
+                    after_cursor = tie
+                    if nulls_first:
+                        after_cursor |= Q(**{null_lookup: False})
+                else:
+                    after_cursor = Q(**{f"{ordering_field}__{lookup}": boundary}) | tie
+                    if nullable and not nulls_first:
+                        after_cursor |= Q(**{null_lookup: True})
+                ordered_qs = ordered_qs.filter(after_cursor)
+        elif cursor_value is not None:
+            # Scalar legacy cursors retain their previous semantics.
+            ordered_qs = ordered_qs.filter(**{f"{ordering_field}__{lookup}": cursor_value})
 
         # Fetch page_size + 1 items to determine if there's a next page
         raw_items = await self._evaluate_queryset_slice(ordered_qs[: page_size + 1])
@@ -657,18 +885,99 @@ class CursorPagination(PaginationBase):
         if has_next:
             raw_items = raw_items[:page_size]  # Trim to page_size
 
-        # Generate next cursor from last raw item (before serialization)
+        # Generate a cursor from the raw result before removing internal columns.
         next_cursor = None
         if has_next and raw_items:
             last_item = raw_items[-1]
-            # Items are raw (Django models or dicts from values()), get cursor value
-            if isinstance(last_item, dict):
-                last_value = last_item.get(ordering_field)
+            if is_values_list_projection:
+                # Without explicit fields, Django returns extra columns,
+                # model fields, then selected annotations in that order.
+                result_fields = selected_fields or (
+                    tuple(queryset.query.extra_select)
+                    + tuple(field.attname for field in queryset.model._meta.concrete_fields)
+                    + tuple(queryset.query.annotation_select)
+                )
+
+                # "pk" and the actual PK field name refer to the same key.
+                pk_key = next(
+                    (name for name in ("pk", pk_field.attname, pk_field.name) if name in result_fields),
+                    None,
+                )
+
+                if is_flat_values_list and not needs_hidden_pk:
+                    last_value = last_item
+                else:
+                    value_key = (
+                        pk_key
+                        if is_pk_ordering
+                        else next(
+                            (
+                                name
+                                for name in (
+                                    ordering_field,
+                                    projection_ordering_field,
+                                )
+                                if name in result_fields
+                            ),
+                            ordering_field,
+                        )
+                    )
+                    last_value = last_item[result_fields.index(value_key)]
+
+                if needs_hidden_pk:
+                    last_pk = last_item[-1]
+                elif is_flat_values_list and is_pk_ordering:
+                    last_pk = last_item
+                elif pk_key is not None:
+                    last_pk = last_item[result_fields.index(pk_key)]
+                else:
+                    last_pk = None
+            elif is_values_projection:
+                last_value = last_item.get(
+                    ordering_field,
+                    last_item.get(projection_ordering_field),
+                )
+                last_pk = last_item.get("pk", last_item.get(pk_field.attname, last_item.get(hidden_pk_field)))
             else:
                 last_value = getattr(last_item, ordering_field, None)
+                last_pk = last_item.pk
 
-            if last_value is not None:
+            if is_pk_ordering and last_value is None:
+                last_value = last_pk
+
+            if (
+                is_json_ordering
+                and use_pk_tiebreaker
+                and last_value is None
+                and last_pk is not None
+                and await is_json_null_at(last_pk)
+            ):
+                last_value = _CURSOR_JSON_NULL
+
+            if use_pk_tiebreaker and last_pk is not None:
+                # Keep SQL NULL in the old envelope; tag only JSON null.
+                json_null = last_value is _CURSOR_JSON_NULL
+                next_cursor = self._encode_cursor(
+                    {"value": None if json_null else last_value, "pk": last_pk},
+                    kind="composite-json-null-v1" if json_null else "composite-v2",
+                )
+            elif grouped_or_distinct and not is_pk_ordering and last_value is None:
+                next_cursor = self._encode_cursor(None, kind="null-v2")
+            elif last_value is not None:
                 next_cursor = self._encode_cursor(last_value)
+
+        if needs_hidden_pk:
+            if is_values_projection:
+                for item in raw_items:
+                    item.pop(hidden_pk_field, None)
+            elif is_values_list_projection:
+                if is_flat_values_list:
+                    raw_items = [item[0] for item in raw_items]
+                elif is_named_values_list:
+                    row_type = create_namedtuple_class(*selected_fields)
+                    raw_items = [row_type(*item[:-1]) for item in raw_items]
+                else:
+                    raw_items = [item[:-1] for item in raw_items]
 
         # Serialize items using efficient batch serialization
         items = await self._serialize_items(raw_items)

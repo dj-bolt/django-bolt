@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **CursorPagination preserves rows with duplicate ordering values** - Non-primary-key ordering adds a PK tie-breaker. Nullable single-key DISTINCT/GROUP BY projections advance across page boundaries. Foreign-key ordering uses the stored ID. Cursor values distinguish JSON null from SQL NULL, and older scalar cursors still work. Bolt rejects unsafe multi-column DISTINCT projections rather than skipping rows.
+
 - **`str()` of an `HTTPException` shows its detail once** - `str(NotFound())` gave `404: Not Found Not Found`. The status text was in `args`, and `__str__` added the detail again. This text goes to logs and tracebacks. Now `str()` of an `HTTPException` gives `<status>: <detail>`, for example `404: Not Found`.
 - **`request.read()` in a Django middleware gives `b""` for a request with no body** - The bridge made the stream of the Django request only for a request with a body. Thus `request.read()` in a middleware raised `AttributeError` for a `GET` with no body, and the client got a 500. `request.body` already gave `b""`. Now the stream of an empty body is empty, as in Django.
 - **A JSON decode error gives its column in characters** - Bolt took the column of a JSON syntax error from the byte position of the error. A body with a multi-byte UTF-8 character before the error on the same line gave a column that was too large, and the `^` marker was too far right. Now the line number and the column count characters. `ctx["byte_position"]` still holds the byte position.
