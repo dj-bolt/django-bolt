@@ -6,11 +6,14 @@ validation error" is the failure response; its message names the cause.
 
 from __future__ import annotations
 
+import asyncio
+
 import msgspec
 import pytest
 
 from django_bolt import BoltAPI
-from django_bolt.responses import JSON
+from django_bolt.responses import JSON, Response
+from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
 
 from .test_models import Article
@@ -46,6 +49,19 @@ class ArticleOut(msgspec.Struct):
 class ArticleCamel(msgspec.Struct, rename="camel"):
     id: int
     is_published: bool
+
+
+class ArticleWrongType(msgspec.Struct):
+    """The title column holds a string, so each row fails validation."""
+
+    id: int
+    title: int
+
+
+class PublicUser(Serializer):
+    id: int
+    username: str
+    password: str = field(write_only=True, default="")
 
 
 def _validation_message(response) -> str:
@@ -92,6 +108,44 @@ def client():
     @api.get("/optional/object")
     async def optional_object() -> Item | None:
         return Obj(id=3)
+
+    # The awaiting handlers run the async response handlers. The others run
+    # the sync response handlers.
+    @api.get("/struct/serializer")
+    async def struct_serializer() -> Item:
+        await asyncio.sleep(0)
+        return PublicUser(id=1, username="a", password="p")
+
+    @api.get("/struct/serializer-sync", status_code=201)
+    def struct_serializer_sync() -> Item:
+        return PublicUser(id=1, username="a", password="p")
+
+    @api.get("/json/bad")
+    async def json_bad() -> Item:
+        await asyncio.sleep(0)
+        return JSON({"id": "x"})
+
+    @api.get("/json/bad-sync")
+    def json_bad_sync() -> Item:
+        return JSON({"id": "x"})
+
+    @api.get("/response/bad")
+    async def response_bad() -> Item:
+        await asyncio.sleep(0)
+        return Response({"id": "x"})
+
+    @api.get("/response/bad-sync")
+    def response_bad_sync() -> Item:
+        return Response({"id": "x"})
+
+    @api.get("/response/ok")
+    async def response_ok() -> Item:
+        await asyncio.sleep(0)
+        return Response({"id": 1}, headers={"X-A": "1"})
+
+    @api.get("/response/ok-sync")
+    def response_ok_sync() -> Item:
+        return Response({"id": 1})
 
     @api.get("/list/objects")
     async def list_objects() -> list[Item]:
@@ -157,6 +211,15 @@ def client():
     def camel_json_queryset_sync() -> list[ArticleCamel]:
         return JSON(Article.objects.order_by("id"))
 
+    @api.get("/articles/wrong-type")
+    async def articles_wrong_type() -> list[ArticleWrongType]:
+        await asyncio.sleep(0)
+        return Article.objects.order_by("id")
+
+    @api.get("/articles/wrong-type-sync")
+    def articles_wrong_type_sync() -> list[ArticleWrongType]:
+        return Article.objects.order_by("id")
+
     @api.get("/camel/queryset-unvalidated", validate_response=False)
     async def camel_queryset_unvalidated() -> list[ArticleCamel]:
         return Article.objects.order_by("id")
@@ -198,6 +261,54 @@ def test_other_struct_keeps_only_the_declared_fields(client):
 def test_list_for_a_single_struct_is_a_type_mismatch(client):
     message = _validation_message(client.get("/struct/list"))
     assert message.startswith("Response type mismatch: expected a single Item, but handler returned a list.")
+
+
+def test_validation_error_entry_has_the_response_location_and_the_error_type(client):
+    response = client.get("/struct/list")
+
+    assert response.status_code == 500, response.text
+    assert response.json()["extra"]["validation_errors"] == [
+        {
+            "loc": ["response"],
+            "msg": (
+                "Response type mismatch: expected a single Item, but handler returned a list. "
+                "Did you mean to annotate with list[Item]?"
+            ),
+            "type": "validation_error",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "status_code"),
+    [("/struct/serializer", 200), ("/struct/serializer-sync", 201)],
+)
+def test_serializer_for_a_struct_is_dumped_then_validated(client, path, status_code):
+    response = client.get(path)
+
+    assert response.status_code == status_code, response.text
+    assert response.json() == {"id": 1, "note": "default"}
+
+
+@pytest.mark.parametrize("path", ["/json/bad", "/json/bad-sync", "/response/bad", "/response/bad-sync"])
+def test_invalid_json_or_response_content_names_the_cause(client, path):
+    message = _validation_message(client.get(path))
+    assert message == "Response validation failed for Item: Expected `int`, got `str` - at `$.id`"
+
+
+def test_response_content_is_validated_and_keeps_the_headers(client):
+    response = client.get("/response/ok")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": 1, "note": "default"}
+    assert response.headers["x-a"] == "1"
+
+
+def test_response_content_is_validated_in_a_sync_handler(client):
+    response = client.get("/response/ok-sync")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": 1, "note": "default"}
 
 
 def test_object_converts_to_an_optional_struct(client):
@@ -270,6 +381,16 @@ def test_queryset_rows_use_the_wire_names_of_a_renamed_struct(client, path):
 
     assert response.status_code == 200, response.text
     assert response.json() == [{"id": article.id, "isPublished": True}]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("path", ["/articles/wrong-type", "/articles/wrong-type-sync"])
+def test_queryset_rows_are_validated_against_the_struct(client, path):
+    Article.objects.create(title="One", content="c", author="a")
+
+    message = _validation_message(client.get(path))
+
+    assert message == "Expected `int`, got `str`"
 
 
 def test_unvalidated_objects_use_the_wire_names_of_a_renamed_struct(client):
