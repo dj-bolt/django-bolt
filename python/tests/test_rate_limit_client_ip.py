@@ -131,14 +131,14 @@ def _status_from(client, address):
 
 
 @pytest.mark.parametrize(
-    ("prefix", "neighbour"),
+    ("prefix", "neighbour", "sibling"),
     [
-        pytest.param(None, 429, id="default-64"),
-        pytest.param(56, 429, id="56"),
-        pytest.param(128, 200, id="128"),
+        pytest.param(None, 429, 200, id="default-64"),
+        pytest.param(56, 429, 429, id="56"),
+        pytest.param(128, 200, 200, id="128"),
     ],
 )
-def test_an_ipv6_client_is_counted_per_network(prefix, neighbour):
+def test_an_ipv6_client_is_counted_per_network(prefix, neighbour, sibling):
     """A client cannot get a fresh bucket from each address of its /64."""
     settings = {"BOLT_TRUSTED_PROXIES": ["127.0.0.1"]}
     if prefix is not None:
@@ -155,6 +155,8 @@ def test_an_ipv6_client_is_counted_per_network(prefix, neighbour):
         assert statuses == [200, 200, 429]
         # Another address of the same /64.
         assert _status_from(client, "2001:db8:1:2::2") == neighbour
+        # An address in another /64 of the same /56.
+        assert _status_from(client, "2001:db8:1:3::1") == sibling
         # Another /48.
         assert _status_from(client, "2001:db8:2::1") == 200
         # Each IPv4 address keeps its own bucket.

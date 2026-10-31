@@ -159,6 +159,21 @@ def test_an_ipv6_client_is_counted_per_network(make_server_project):
     assert other.status_code == 200, other.text
 
 
+def test_the_ipv6_prefix_setting_sets_the_network(make_server_project):
+    """``runbolt`` reads ``BOLT_RATE_LIMIT_IPV6_PREFIX`` at startup."""
+    project = make_server_project(api_module=APP, settings_extra=f"{TRUST_LOOPBACK}\nBOLT_RATE_LIMIT_IPV6_PREFIX = 56")
+
+    with project.start() as server:
+        assert _exhaust(server, **{"X-Forwarded-For": "2001:db8:1:2::1"}) == 429
+        # Another /64 of the same /56.
+        sibling = server.request("GET", "/limited", headers={"X-Forwarded-For": "2001:db8:1:3::1"})
+        # Another /56.
+        other = server.request("GET", "/limited", headers={"X-Forwarded-For": "2001:db8:1:100::1"})
+
+    assert sibling.status_code == 429, sibling.text
+    assert other.status_code == 200, other.text
+
+
 def test_remote_addr_follows_the_forwarding_rules(make_server_project):
     """Django code and the limiter must agree on the canonical client IP."""
     project = make_server_project(api_module=APP, settings_extra=TRUST_LOOPBACK)
