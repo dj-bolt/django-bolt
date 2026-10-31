@@ -32,7 +32,7 @@ from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, TimingMiddleware
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
 from django_bolt.param_functions import Cookie, Header
-from django_bolt.responses import HTML, JSON
+from django_bolt.responses import HTML, JSON, PlainText, Redirect, Response
 from django_bolt.testing import TestClient
 
 
@@ -2206,3 +2206,90 @@ class TestDjangoMiddlewareSeesTheQuery:
             "query_string": "next=%2Fa%3Fb%3D1&q=x+y",
             "full_path": "/page?next=%2Fa%3Fb%3D1&q=x+y",
         }
+
+
+def _add_routes_of_each_response_type(api: BoltAPI) -> None:
+    @api.get("/html")
+    async def html():
+        return HTML("<p>x</p>")
+
+    @api.get("/plain")
+    def plain():
+        return PlainText("x")
+
+    @api.get("/octet")
+    async def octet():
+        return Response(b"\x00\x01", media_type="application/octet-stream")
+
+    @api.get("/bytes")
+    async def raw_bytes() -> bytes:
+        return b"raw"
+
+    @api.get("/str")
+    async def text() -> str:
+        return "hello"
+
+    @api.get("/json")
+    async def json_body() -> dict:
+        return {"a": 1}
+
+    @api.get("/empty", status_code=204)
+    async def empty():
+        return None
+
+    @api.get("/redirect")
+    async def redirect():
+        return Redirect("/target")
+
+
+@pytest.mark.parametrize(
+    ("path", "content_type"),
+    [
+        ("/html", "text/html; charset=utf-8"),
+        ("/plain", "text/plain; charset=utf-8"),
+        ("/octet", "application/octet-stream"),
+        ("/bytes", "application/octet-stream"),
+        ("/str", "text/plain; charset=utf-8"),
+        ("/json", "application/json"),
+        ("/empty", None),
+        ("/redirect", None),
+    ],
+)
+def test_django_middleware_keeps_the_content_type_of_the_response(path, content_type):
+    """A response gets the same Content-Type with and without Django middleware.
+
+    A built-in response type keeps its content type in its type, not in its
+    headers. A type with no content type keeps none.
+    """
+    plain_api = BoltAPI()
+    _add_routes_of_each_response_type(plain_api)
+    middleware_api = BoltAPI(django_middleware=["django.middleware.clickjacking.XFrameOptionsMiddleware"])
+    _add_routes_of_each_response_type(middleware_api)
+
+    with TestClient(plain_api) as client:
+        expected = client.get(path, follow_redirects=False)
+    with TestClient(middleware_api) as client:
+        response = client.get(path, follow_redirects=False)
+
+    assert response.headers.get("x-frame-options") == "DENY"
+    assert expected.headers.get("content-type") == content_type
+    assert response.headers.get("content-type") == content_type
+    assert (response.status_code, response.content) == (expected.status_code, expected.content)
+
+
+def test_django_middleware_keeps_a_304_without_a_content_type():
+    """Django's 304 has no Content-Type, and Bolt adds none."""
+    api = BoltAPI(django_middleware=["django.middleware.http.ConditionalGetMiddleware"])
+
+    @api.get("/doc")
+    async def doc() -> dict:
+        return {"a": 1}
+
+    with TestClient(api) as client:
+        first = client.get("/doc")
+        response = client.get("/doc", headers={"If-None-Match": first.headers["etag"]})
+
+    assert first.headers["content-type"] == "application/json"
+    assert response.status_code == 304
+    assert "content-type" not in response.headers
+    assert response.content == b""

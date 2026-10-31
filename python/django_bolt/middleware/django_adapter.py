@@ -90,7 +90,15 @@ _PRESERVED_BODY_ATTR = "_bolt_preserved_body"
 _PRESERVED_BODY_KIND_ATTR = "_bolt_preserved_body_kind"
 _PRESERVED_BODY_KINDS = frozenset((_BODY_FILE, _BODY_STREAM))
 _REBUILT_BODY_HEADER_NAMES = frozenset(("content-length", "transfer-encoding"))
-_DEFAULT_DJANGO_RESPONSE_CONTENT_TYPE = "application/json"
+# The Content-Type of each built-in response type, as Rust sends it
+# (ResponseType::content_type in crates/bolt-core/src/response_meta.rs).
+# Rust sends no Content-Type for the other types.
+_RESPONSE_TYPE_CONTENT_TYPES = {
+    "json": "application/json",
+    "html": "text/html; charset=utf-8",
+    "plaintext": "text/plain; charset=utf-8",
+    "octetstream": "application/octet-stream",
+}
 # Attributes that HttpRequest.__init__ sets, and those that Bolt copies by name.
 # All other public attributes come from middleware and go to request.state.
 # This is a literal set: HttpRequest() needs configured settings, and
@@ -1206,12 +1214,13 @@ def _to_django_response(response: Response) -> HttpResponse:
     status_code = getattr(response, "status_code", 200)
     headers = getattr(response, "headers", {})
     content_type, remaining_headers = _split_content_type_headers(headers)
+    if content_type is None:
+        content_type = _RESPONSE_TYPE_CONTENT_TYPES.get(getattr(response, "_response_type", "json"))
 
-    django_response = HttpResponse(
-        content=content,
-        status=status_code,
-        content_type=content_type or _DEFAULT_DJANGO_RESPONSE_CONTENT_TYPE,
-    )
+    django_response = HttpResponse(content=content, status=status_code, content_type=content_type)
+    if content_type is None:
+        # HttpResponse always sets a Content-Type. Bolt sends none for this type.
+        del django_response["Content-Type"]
 
     if remaining_headers:
         for key, value in remaining_headers:
@@ -1257,7 +1266,8 @@ def _to_bolt_response(django_response: HttpResponse) -> MiddlewareResponse:
             )
 
     body = django_response.content
-    response_type = "json"
+    # The headers hold the Content-Type. A response without one stays without one.
+    response_type = "json" if django_response.has_header("Content-Type") else "empty"
     body_kind = _BODY_BYTES
 
     if preserved_body is not None:
