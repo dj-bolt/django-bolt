@@ -97,6 +97,50 @@ class TestMiddlewareDecorators:
         assert middleware[0]["burst"] == 100
         assert middleware[0]["key"] == "ip"
 
+    @pytest.mark.parametrize(
+        ("kwargs", "error", "message"),
+        [
+            ({"rps": 0.5}, TypeError, "rate_limit rps must be an int, got float 0.5"),
+            ({"rps": "10"}, TypeError, "rate_limit rps must be an int, got str '10'"),
+            ({"rps": True}, TypeError, "rate_limit rps must be an int, got bool True"),
+            ({"rps": 0}, ValueError, "rate_limit rps must be 1 or more, got 0"),
+            ({"rps": -5}, ValueError, "rate_limit rps must be 1 or more, got -5"),
+            ({"rps": 10, "burst": 2.5}, TypeError, "rate_limit burst must be an int, got float 2.5"),
+            ({"rps": 10, "burst": 0}, ValueError, "rate_limit burst must be 1 or more, got 0"),
+            ({"key": 5}, TypeError, "rate_limit key must be a str, got int 5"),
+            ({"key": ""}, ValueError, "rate_limit key must not be empty"),
+        ],
+        ids=[
+            "rps-float",
+            "rps-str",
+            "rps-bool",
+            "rps-zero",
+            "rps-negative",
+            "burst-float",
+            "burst-zero",
+            "key-int",
+            "key-empty",
+        ],
+    )
+    def test_rate_limit_decorator_rejects_a_bad_value(self, kwargs, error, message):
+        """A bad value raises at once. Before, Rust used the default limit for it, with no error."""
+        with pytest.raises(error, match=f"^{re.escape(message)}$"):
+            rate_limit(**kwargs)
+
+    def test_router_rate_limit_with_a_bad_value_stops_the_registration(self):
+        """A rate limit dict that does not come from @rate_limit is checked in Rust."""
+        api = BoltAPI()
+        router = Router(prefix="/rl", middleware=[{"type": "rate_limit", "rps": 0.5, "burst": 1, "key": "ip"}])
+
+        @router.get("/items")
+        async def list_items():
+            return {"ok": True}
+
+        api.include_router(router)
+
+        with pytest.raises(TypeError, match="rate_limit rps must be an int of 1 or more"), TestClient(api):
+            pass
+
     def test_cors_decorator(self):
         """Test CORS decorator attaches metadata"""
         api = BoltAPI()

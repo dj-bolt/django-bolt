@@ -704,7 +704,7 @@ impl RouteMetadata {
 
                     // Parse rate_limit config separately for fast access
                     if type_str == "rate_limit" && rate_limit_config.is_none() {
-                        rate_limit_config = parse_rate_limit_config(&mw_dict, py);
+                        rate_limit_config = Some(parse_rate_limit_config(&mw_dict, py)?);
                     }
                 }
             }
@@ -1017,32 +1017,34 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<
 fn parse_rate_limit_config(
     dict: &HashMap<String, Py<PyAny>>,
     py: Python,
-) -> Option<RateLimitConfig> {
+) -> PyResult<RateLimitConfig> {
     let mut config = RateLimitConfig::default();
 
-    // Parse rps (required)
-    if let Some(rps_py) = dict.get("rps")
-        && let Ok(rps) = rps_py.extract::<u32>(py)
-    {
+    // A value that is present must be valid. A bad value must stop startup,
+    // not give the route the default limit.
+    if let Some(rps) = rate_limit_count(dict, "rps", py)? {
         config.rps = rps;
     }
-
-    // Parse burst (optional, defaults to 2x rps)
-    if let Some(burst_py) = dict.get("burst") {
-        if let Ok(burst) = burst_py.extract::<u32>(py) {
-            config.burst = burst;
-        }
-    } else {
+    config.burst = match rate_limit_count(dict, "burst", py)? {
+        Some(burst) => burst,
         // If burst not specified, default to 2x rps
-        config.burst = config.rps * 2;
-    }
+        None => config.rps.saturating_mul(2),
+    };
 
     // Parse key_type (optional, defaults to "ip").
     // Custom header keys are lowercased ONCE here so the per-request rate-limit
     // check can look them up directly (headers are stored lowercase).
-    if let Some(key_py) = dict.get("key")
-        && let Ok(key_type) = key_py.extract::<String>(py)
-    {
+    if let Some(key_py) = dict.get("key") {
+        let key_py = key_py.bind(py);
+        let key_type = match key_py.extract::<String>() {
+            Ok(key_type) if !key_type.is_empty() => key_type,
+            _ => {
+                return Err(PyTypeError::new_err(format!(
+                    "rate_limit key must be a non-empty str, got {}",
+                    describe(key_py)
+                )));
+            }
+        };
         config.key = match key_type.to_lowercase().as_str() {
             "ip" => RateLimitKey::Ip,
             "user" => RateLimitKey::User,
@@ -1051,7 +1053,45 @@ fn parse_rate_limit_config(
         };
     }
 
-    Some(config)
+    Ok(config)
+}
+
+/// Read `rps` or `burst` of a rate limit: None when the key is missing. A bool,
+/// a value that is not an int, and an int less than 1 or more than `u32::MAX`
+/// raise `TypeError`.
+fn rate_limit_count(
+    dict: &HashMap<String, Py<PyAny>>,
+    key: &str,
+    py: Python,
+) -> PyResult<Option<u32>> {
+    let Some(value) = dict.get(key) else {
+        return Ok(None);
+    };
+    let value = value.bind(py);
+    if !value.is_instance_of::<PyBool>()
+        && let Ok(count) = value.extract::<u32>()
+        && count >= 1
+    {
+        return Ok(Some(count));
+    }
+    Err(PyTypeError::new_err(format!(
+        "rate_limit {key} must be an int of 1 or more, got {}",
+        describe(value)
+    )))
+}
+
+/// The type name and the repr of a value, for an error message.
+fn describe(value: &Bound<'_, PyAny>) -> String {
+    let type_name = value
+        .get_type()
+        .name()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    let repr = value
+        .repr()
+        .map(|repr| repr.to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    format!("{type_name} {repr}")
 }
 
 /// Parse a single auth backend from Python dict.
@@ -1979,6 +2019,68 @@ mod tests {
         assert_eq!(
             rate_limit("{'key': 'X-Tenant-ID'}").key,
             RateLimitKey::Header("x-tenant-id".to_string())
+        );
+    }
+
+    fn rate_limit_error(code: &str) -> String {
+        with_py(|py| {
+            parse_rate_limit_config(&map(py, code), py)
+                .expect_err("a bad rate limit value")
+                .to_string()
+        })
+    }
+
+    /// A bad value stops startup. Before, the route got 100 rps and burst 200.
+    #[test]
+    fn a_rate_limit_with_a_bad_count_is_an_error() {
+        for (code, got) in [
+            ("{'rps': 0.5, 'burst': 1}", "float 0.5"),
+            ("{'rps': '10'}", "str '10'"),
+            ("{'rps': True}", "bool True"),
+            ("{'rps': 0}", "int 0"),
+            ("{'rps': -5}", "int -5"),
+            ("{'rps': 2**32}", "int 4294967296"),
+        ] {
+            assert_eq!(
+                rate_limit_error(code),
+                format!("TypeError: rate_limit rps must be an int of 1 or more, got {got}"),
+                "{code}"
+            );
+        }
+        assert_eq!(
+            rate_limit_error("{'rps': 10, 'burst': 0}"),
+            "TypeError: rate_limit burst must be an int of 1 or more, got int 0"
+        );
+        assert_eq!(
+            rate_limit_error("{'rps': 10, 'burst': None}"),
+            "TypeError: rate_limit burst must be an int of 1 or more, got NoneType None"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_key_that_is_not_a_non_empty_str_is_an_error() {
+        assert_eq!(
+            rate_limit_error("{'key': 5}"),
+            "TypeError: rate_limit key must be a non-empty str, got int 5"
+        );
+        assert_eq!(
+            rate_limit_error("{'key': ''}"),
+            "TypeError: rate_limit key must be a non-empty str, got str ''"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_of_the_largest_rps_keeps_a_burst_that_fits() {
+        let config = rate_limit("{'rps': 4294967295}");
+        assert_eq!((config.rps, config.burst), (u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn a_route_with_a_bad_rate_limit_is_an_error() {
+        let err = parse_route("'middleware': [{'type': 'rate_limit', 'rps': 0.5}]").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "TypeError: rate_limit rps must be an int of 1 or more, got float 0.5"
         );
     }
 

@@ -392,6 +392,15 @@ def middleware(*args, **kwargs):
     return decorator
 
 
+def _rate_limit_count(name: str, value: Any) -> int:
+    """Return a count of @rate_limit. Raise for a value that is not an int of 1 or more."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"rate_limit {name} must be an int, got {type(value).__name__} {value!r}")
+    if value < 1:
+        raise ValueError(f"rate_limit {name} must be 1 or more, got {value}")
+    return value
+
+
 def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     """
     Rate limiting decorator (Rust-accelerated).
@@ -415,9 +424,13 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     route or the API; the server refuses to start without one.
 
     Args:
-        rps: Requests per second limit
-        burst: Burst capacity (defaults to 2x rps)
+        rps: Requests per second limit. An int of 1 or more.
+        burst: Burst capacity. An int of 1 or more (defaults to 2x rps).
         key: Rate limit key strategy ("ip", "user", "api_key", or header name)
+
+    Raises:
+        TypeError: rps or burst is not an int, or key is not a str.
+        ValueError: rps or burst is less than 1, or key is empty.
 
     Example:
         @api.get("/api/data")
@@ -426,10 +439,19 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
             return {"data": [...]}
     """
 
+    # Check the values here. Rust cannot read a bad value, and the route must
+    # not get another limit than the one its author gave.
+    rps = _rate_limit_count("rps", rps)
+    burst = rps * 2 if burst is None else _rate_limit_count("burst", burst)
+    if not isinstance(key, str):
+        raise TypeError(f"rate_limit key must be a str, got {type(key).__name__} {key!r}")
+    if not key:
+        raise ValueError("rate_limit key must not be empty")
+
     def decorator(func):
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
-        func.__bolt_middleware__.append({"type": "rate_limit", "rps": rps, "burst": burst or rps * 2, "key": key})
+        func.__bolt_middleware__.append({"type": "rate_limit", "rps": rps, "burst": burst, "key": key})
         return func
 
     return decorator
