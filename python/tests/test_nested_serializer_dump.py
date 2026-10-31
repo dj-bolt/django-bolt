@@ -15,7 +15,7 @@ import uuid
 from collections.abc import Iterator
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NewType, TypeVar
 
 import msgspec
 import pytest
@@ -24,7 +24,7 @@ from hypothesis import strategies as st
 
 from django_bolt import BoltAPI, EventSourceResponse, ServerSentEvent, WebSocket, _json
 from django_bolt._core import find_serializer
-from django_bolt._serializer_dump import SCAN_KINDS, annotation_excludes_serializer, classify
+from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, annotation_excludes_serializer, classify
 from django_bolt.responses import JSON, Response
 from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.testing import TestClient, WebSocketTestClient
@@ -59,6 +59,11 @@ class LooseEnvelope(msgspec.Struct):
 @dataclasses.dataclass
 class Box:
     account: Any
+
+
+@dataclasses.dataclass
+class IntBox:
+    n: int
 
 
 class Renamed(msgspec.Struct, rename="camel", frozen=True):
@@ -98,7 +103,7 @@ class UserBox(msgspec.Struct):
 
 
 class Counted(msgspec.Struct):
-    """The annotation of the field cannot hold a Serializer, so the scan skips it."""
+    """Nothing checks the type of ``n``, so ``n`` can hold a Serializer too."""
 
     n: int
 
@@ -256,6 +261,18 @@ def client():
     def trust_generic_of_int() -> Page[int]:
         return Page(items=[1], owner=account())
 
+    @api.get("/trust/int-field")
+    def trust_int_field():
+        return [Counted(n=1), Counted(n=account())]
+
+    @api.get("/trust/int-field-validated")
+    def trust_int_field_validated() -> list[Counted]:
+        return [Counted(n=account())]
+
+    @api.get("/trust/int-field-dataclass")
+    def trust_int_field_dataclass():
+        return {"box": IntBox(n=account())}
+
     @api.get("/trust/leaf-structs-then-serializer")
     def trust_leaf_structs_then_serializer():
         return [Counted(n=1), Counted(n=2), account()]
@@ -390,6 +407,12 @@ def test_a_serializer_in_a_generic_struct_of_a_leaf_type_gives_its_dump(client):
     _check(client.get("/trust/generic-of-int"), {"items": [1], "owner": DUMPED})
 
 
+def test_a_serializer_in_an_int_field_gives_its_dump(client):
+    _check(client.get("/trust/int-field"), [{"n": 1}, {"n": DUMPED}])
+    _check(client.get("/trust/int-field-validated"), [{"n": DUMPED}])
+    _check(client.get("/trust/int-field-dataclass"), {"box": {"n": DUMPED}})
+
+
 def test_a_serializer_after_structs_with_only_leaf_fields_gives_its_dump(client):
     _check(client.get("/trust/leaf-structs-then-serializer"), [{"n": 1}, {"n": 2}, DUMPED])
 
@@ -482,7 +505,8 @@ def test_a_leaf_annotation_cannot_hold_a_serializer(annotation):
 
 @pytest.mark.parametrize(
     "annotation",
-    [Any, dict, list, object, UserOut, Account, list[UserOut], dict[str, Any], int | UserOut, Page[int]],
+    [Any, dict, list, object, UserOut, Account, list[UserOut], dict[str, Any], int | UserOut, Page[int]]
+    + [TypeVar("T"), NewType("UserId", int)],
     ids=repr,
 )
 def test_a_class_or_an_open_annotation_can_hold_a_serializer(annotation):
@@ -503,7 +527,7 @@ def _reference(value: Any) -> Any:
     if isinstance(value, FrozenBox):
         return {"item": _reference(value.item)}
     if isinstance(value, Counted):
-        return {"n": value.n}
+        return {"n": _reference(value.n)}
     return value
 
 
@@ -518,6 +542,8 @@ def _holds_serializer(value: Any) -> bool:
         return _holds_serializer(value.inner_value)
     if isinstance(value, FrozenBox):
         return _holds_serializer(value.item)
+    if isinstance(value, Counted):
+        return _holds_serializer(value.n)
     return False
 
 
@@ -538,6 +564,7 @@ _values = st.recursive(
         st.dictionaries(st.text(max_size=3), children, max_size=4),
         st.builds(Renamed, inner_value=children),
         st.builds(FrozenBox, item=children),
+        st.builds(Counted, n=children),
     ),
     max_leaves=24,
 )
@@ -545,7 +572,10 @@ _values = st.recursive(
 
 @given(value=_values)
 def test_the_scan_finds_a_serializer_exactly_when_the_value_holds_one(value):
-    assert find_serializer(value, SCAN_KINDS, classify) == _holds_serializer(value)
+    expected = _holds_serializer(value)
+    assert find_serializer(value, SCAN_KINDS, classify) == expected
+    # The encoder reads the fields of a Struct at their slot offsets.
+    assert find_serializer(value, SCAN_KINDS, classify, SCAN_OFFSETS) == expected
 
 
 @given(value=_values)

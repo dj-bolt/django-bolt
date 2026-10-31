@@ -31,7 +31,7 @@ from uuid import UUID
 import msgspec
 
 from ._core import SerializerScanEncoder, find_serializer
-from ._serializer_dump import SCAN_KINDS, classify, dump_serializers
+from ._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, classify, dump_serializers
 
 T = TypeVar("T")
 
@@ -109,7 +109,7 @@ PLAIN_ENCODER = ResponseEncoder(_ENCODER.encode)
 # For each other route, and for encode(). Before the first Serializer
 # subclass, no value can hold a Serializer, so this holder does not scan.
 RESPONSE_ENCODER = ResponseEncoder(_ENCODER.encode)
-_SCANNING_ENCODER = SerializerScanEncoder(_ENCODER.encode, SCAN_KINDS, classify, dump_serializers)
+_SCANNING_ENCODER = SerializerScanEncoder(_ENCODER.encode, SCAN_KINDS, classify, dump_serializers, SCAN_OFFSETS)
 
 
 def mark_serializers_defined() -> None:
@@ -137,7 +137,7 @@ def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
     if serializer is None:
         return RESPONSE_ENCODER.encode(value)
     # Custom serializer provided - use one-off encoder
-    if find_serializer(value, SCAN_KINDS, classify):
+    if find_serializer(value, SCAN_KINDS, classify, SCAN_OFFSETS):
         value = dump_serializers(value)
     return msgspec.json.encode(value, enc_hook=serializer)
 

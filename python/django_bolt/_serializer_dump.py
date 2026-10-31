@@ -11,8 +11,10 @@ The scan reads the kind of each type from ``SCAN_KINDS``:
 - ``True``: the type is a Serializer.
 - a tuple of attribute names: the scan looks into these attributes.
 
-The kind of a Struct, dataclass or attrs class skips a field whose
-annotation holds only leaf values, such as ``int`` or ``list[str]``.
+The kind of a Struct, dataclass or attrs class lists each of its fields.
+Nothing checks the type of a field, so an ``int`` field can hold a
+Serializer too. For a Struct, the Rust scan reads the fields at their slot
+offsets, which costs about as much as a leaf check.
 """
 
 from __future__ import annotations
@@ -21,7 +23,6 @@ import copy
 import dataclasses
 import itertools
 import types
-import typing
 from collections import abc
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -54,6 +55,8 @@ _CONTAINER_ORIGINS = frozenset(
 )
 
 SCAN_KINDS: dict[type, Any] = {}
+# The slot offsets of the fields of each Struct type. The Rust scan fills it.
+SCAN_OFFSETS: dict[type, Any] = {}
 
 # The maximum number of types in SCAN_KINDS. A type past it gets its kind
 # again each time. This keeps memory bounded when an app makes types at runtime.
@@ -66,27 +69,19 @@ def _is_serializer_class(tp: Any) -> bool:
     return bool(getattr(tp, "__is_bolt_serializer__", False))
 
 
-def _field_annotations(tp: type) -> list[tuple[str, Any]] | None:
-    """Return (attribute, annotation) for each field that msgspec encodes, or None.
+def _field_names(tp: type) -> tuple[str, ...] | None:
+    """Return the attribute of each field that msgspec encodes, or None.
 
     None means that msgspec does not encode the fields of the type, so no
     field can hold a Serializer that msgspec sends.
     """
     if issubclass(tp, msgspec.Struct):
-        names: tuple[str, ...] = tp.__struct_fields__
-    elif dataclasses.is_dataclass(tp):
-        names = tuple(field.name for field in dataclasses.fields(tp))
-    elif (attributes := getattr(tp, "__attrs_attrs__", None)) is not None:
-        names = tuple(attribute.name for attribute in attributes)
-    else:
-        return None
-    try:
-        hints = typing.get_type_hints(tp, include_extras=True)
-    except (NameError, TypeError):
-        # An annotation that does not resolve can hold anything. Each field
-        # then gets Any, and the scan looks into all of them.
-        hints = {}
-    return [(name, hints.get(name, Any)) for name in names]
+        return tp.__struct_fields__
+    if dataclasses.is_dataclass(tp):
+        return tuple(field.name for field in dataclasses.fields(tp))
+    if (attributes := getattr(tp, "__attrs_attrs__", None)) is not None:
+        return tuple(attribute.name for attribute in attributes)
+    return None
 
 
 def annotation_excludes_serializer(annotation: Any) -> bool:
@@ -115,11 +110,7 @@ def annotation_excludes_serializer(annotation: Any) -> bool:
 def _kind_of(tp: type) -> Any:
     if _is_serializer_class(tp):
         return True
-    fields = _field_annotations(tp)
-    if fields is None:
-        return None
-    names = tuple(name for name, annotation in fields if not annotation_excludes_serializer(annotation))
-    return names or None
+    return _field_names(tp) or None
 
 
 def classify(tp: type) -> Any:
