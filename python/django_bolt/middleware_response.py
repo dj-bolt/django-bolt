@@ -214,9 +214,11 @@ class MiddlewareResponse:
 
         response_type, custom_ct, custom_headers, cookies = meta
         headers = ResponseHeaders(custom_headers or ())
-        if custom_ct:
-            # A content-type in the custom headers wins, as before.
-            headers.setdefault("content-type", custom_ct)
+        # The custom content type, else the one of the response type. A
+        # content-type in the custom headers wins, as before.
+        content_type = custom_ct or _response_type_content_type(response_type)
+        if content_type is not None:
+            headers.setdefault("content-type", content_type)
 
         return cls(status_code, headers, body, response_type, cookies, body_kind=body_kind)
 

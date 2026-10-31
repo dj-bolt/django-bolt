@@ -20,7 +20,7 @@ from django_bolt import BoltAPI, Router
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
 from django_bolt.middleware import DjangoMiddlewareStack, Middleware, cors, middleware, rate_limit, skip_middleware
 from django_bolt.params import Cookie, Header
-from django_bolt.responses import HTML, PlainText
+from django_bolt.responses import HTML, JSON, PlainText
 from django_bolt.testing import TestClient
 
 
@@ -768,6 +768,8 @@ class CsvContentType(Middleware):
         ("/bytes", "application/octet-stream"),
         ("/str", "text/plain; charset=utf-8"),
         ("/json", "application/json"),
+        ("/json-with-header", "application/json"),
+        ("/plain-with-cookie", "text/plain; charset=utf-8"),
         ("/empty", None),
     ],
 )
@@ -795,6 +797,14 @@ def test_python_middleware_reads_the_content_type_of_a_built_in_response(path, c
     @api.get("/json")
     async def json_body() -> dict:
         return {"a": 1}
+
+    @api.get("/json-with-header")
+    async def json_with_header():
+        return JSON({"a": 1}, headers={"x-extra": "1"})
+
+    @api.get("/plain-with-cookie")
+    async def plain_with_cookie():
+        return PlainText("x").set_cookie("flavor", "oat")
 
     @api.get("/empty", status_code=204)
     async def empty():
