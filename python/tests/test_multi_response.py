@@ -8,10 +8,13 @@ and OpenAPI documentation.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Depends
 from django_bolt.openapi.config import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.responses import JSON
@@ -624,3 +627,154 @@ def test_a_bare_queryset_uses_the_type_of_the_default_status(is_async):
         response = client.get("/articles")
 
     assert (response.status_code, response.json()) == (200, [{"title": "One"}])
+
+
+# ============================================================================
+# The executor of each kind of handler
+# ============================================================================
+
+
+def register_multi_routes(api: BoltAPI, prefix: str, is_async: bool) -> None:
+    """Register multi-response routes, sync or async, under ``prefix``."""
+    responses = {200: OkSchema, 202: None}
+
+    if is_async:
+
+        @api.get(f"{prefix}/no-type", response_model=responses)
+        async def no_type():
+            # 202 has no type, so the data is not sent.
+            return 202, {"ignored": True}
+
+        @api.get(f"{prefix}/no-data", response_model=responses)
+        async def no_data():
+            return 202, None
+
+        @api.get(f"{prefix}/list", response_model=responses)
+        async def listing():
+            return 200, [{"id": 1, "name": "One"}]
+
+        @api.get(f"{prefix}/args/{{item_id}}", response_model=responses)
+        async def args(item_id: int, *, name: str):
+            return 200, {"id": item_id, "name": name}
+
+    else:
+
+        @api.get(f"{prefix}/no-type", response_model=responses)
+        def no_type():
+            return 202, {"ignored": True}
+
+        @api.get(f"{prefix}/no-data", response_model=responses)
+        def no_data():
+            return 202, None
+
+        @api.get(f"{prefix}/list", response_model=responses)
+        def listing():
+            return 200, [{"id": 1, "name": "One"}]
+
+        @api.get(f"{prefix}/args/{{item_id}}", response_model=responses)
+        def args(item_id: int, *, name: str):
+            return 200, {"id": item_id, "name": name}
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize(
+    ("path", "status", "body"),
+    [
+        ("/no-type", 202, b""),
+        ("/no-data", 202, b""),
+        ("/list", 200, b'[{"id":1,"name":"One"}]'),
+        ("/args/7?name=Seven", 200, b'{"id":7,"name":"Seven"}'),
+    ],
+)
+def test_a_multi_response_tuple_keeps_its_status_and_body(kind, path, status, body):
+    api = BoltAPI()
+    register_multi_routes(api, f"/{kind}", kind == "async")
+
+    with TestClient(api) as client:
+        response = client.get(f"/{kind}{path}")
+
+    assert (response.status_code, response.content) == (status, body)
+
+
+async def async_name() -> str:
+    await asyncio.sleep(0)
+    return "from-async-dependency"
+
+
+def test_a_multi_response_route_awaits_an_async_dependency():
+    api = BoltAPI()
+
+    @api.get("/items/{item_id}", response_model={200: OkSchema, 404: ErrorSchema})
+    async def get_item(item_id: int, name: str = Depends(async_name)):
+        return 200, {"id": item_id, "name": name}
+
+    with TestClient(api) as client:
+        response = client.get("/items/3")
+
+    assert response.json() == {"id": 3, "name": "from-async-dependency"}
+
+
+def test_a_multi_response_route_with_a_missing_query_parameter_gets_422():
+    """Rust binds no argument, and the injector reports the missing parameter."""
+    api = BoltAPI()
+
+    @api.get("/items", response_model={200: OkSchema, 404: ErrorSchema})
+    async def get_item(item_id: int):
+        return 200, {"id": item_id, "name": "One"}
+
+    with TestClient(api) as client:
+        missing = client.get("/items")
+        found = client.get("/items", params={"item_id": 4})
+
+    assert missing.status_code == 422, missing.text
+    assert found.json() == {"id": 4, "name": "One"}
+
+
+def thread_name() -> str:
+    return threading.current_thread().name
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_blocking_multi_response_handler_runs_with_its_dependencies_on_one_pool_thread():
+    """A sync handler that uses the ORM runs on the pool. Its sync dependencies run on that thread too."""
+    api = BoltAPI()
+
+    @api.get("/count", response_model={200: dict})
+    def count(label: str, dependency_thread: str = Depends(thread_name)):
+        return 200, {
+            "count": Article.objects.count(),
+            "label": label,
+            "dependency": dependency_thread,
+            "handler": threading.current_thread().name,
+        }
+
+    @api.get("/count/{item_id}", response_model={200: dict})
+    def count_item(item_id: int, *, label: str):
+        return 200, {
+            "count": Article.objects.count(),
+            "item": [item_id, label],
+            "handler": threading.current_thread().name,
+        }
+
+    with TestClient(api) as client:
+        with_dependency = client.get("/count", params={"label": "all"}).json()
+        with_arguments = client.get("/count/5", params={"label": "five"}).json()
+
+    assert (with_dependency["count"], with_dependency["label"]) == (0, "all")
+    assert with_dependency["handler"].startswith("bolt_default"), with_dependency
+    assert with_dependency["dependency"] == with_dependency["handler"]
+    assert with_arguments["item"] == [5, "five"]
+    assert with_arguments["handler"].startswith("bolt_default"), with_arguments
+
+
+def test_a_multi_response_handler_that_does_not_block_runs_off_the_pool():
+    api = BoltAPI()
+
+    @api.get("/thread", response_model={200: dict})
+    def thread():
+        return 200, {"handler": threading.current_thread().name}
+
+    with TestClient(api) as client:
+        response = client.get("/thread")
+
+    assert not response.json()["handler"].startswith("bolt_default"), response.json()
