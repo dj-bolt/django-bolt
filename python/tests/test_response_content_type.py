@@ -259,6 +259,11 @@ def test_subclass_of_a_response_type_serializes_as_its_base_type():
     def created_sync() -> Item:
         return Created({"id": 2, "extra": "dropped"})
 
+    @api.get("/created-awaits", status_code=201)
+    async def created_awaits() -> Item:
+        await asyncio.sleep(0)
+        return Created({"id": 3, "extra": "dropped"})
+
     @api.get("/csv")
     async def csv():
         return Csv(b"a,b")
@@ -272,7 +277,7 @@ def test_subclass_of_a_response_type_serializes_as_its_base_type():
         return Moved("/new")
 
     with TestClient(api) as client:
-        for path, item_id in (("/created", 1), ("/created-sync", 2)):
+        for path, item_id in (("/created", 1), ("/created-sync", 2), ("/created-awaits", 3)):
             response = client.get(path)
             assert response.status_code == 201, (path, response.text)
             assert response.json() == {"id": item_id}

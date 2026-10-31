@@ -21,6 +21,7 @@ import pytest
 from django_bolt import BoltAPI
 from django_bolt.error_handlers import BoltError
 from django_bolt.responses import JSON
+from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
 
 NDJSON = "application/x-ndjson"
@@ -356,3 +357,51 @@ def test_unsupported_result_is_an_error_that_names_its_type(raw_client, path):
 
     assert response.status_code == 500, response.text
     assert response.json() == {"kind": "internal_error", "exception": UNSUPPORTED_INT}
+
+
+class PublicUser(Serializer):
+    """A user. The password goes in, but never goes out."""
+
+    id: int
+    password: str = field(write_only=True, default="")
+
+
+def test_stream_route_that_returns_a_serializer_sends_it_dumped():
+    """A Serializer is not a stream, so the route sends it as JSON, with no write-only field."""
+    api = BoltAPI()
+
+    @api.get("/awaits", validate_response=False)
+    async def awaits() -> Iterator[dict]:
+        await asyncio.sleep(0)
+        return PublicUser(id=1, password="secret")
+
+    @api.get("/sync", validate_response=False)
+    def sync_route() -> Iterator[dict]:
+        return PublicUser(id=2, password="secret")
+
+    with TestClient(api) as client:
+        for path, user_id in (("/awaits", 1), ("/sync", 2)):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.headers["content-type"] == "application/json"
+            assert response.json() == {"id": user_id}, path
+
+
+def test_stream_route_that_returns_a_serializer_fails_response_validation():
+    """With response validation, the dumped Serializer is not the stream that the route declares."""
+    api = BoltAPI()
+
+    @api.get("/awaits")
+    async def awaits() -> Iterator[dict]:
+        await asyncio.sleep(0)
+        return PublicUser(id=1)
+
+    @api.get("/sync")
+    def sync_route() -> Iterator[dict]:
+        return PublicUser(id=2)
+
+    with TestClient(api) as client:
+        for path in ("/awaits", "/sync"):
+            response = client.get(path)
+            assert response.status_code == 500, (path, response.text)
+            assert response.json()["detail"] == "Response validation error", path

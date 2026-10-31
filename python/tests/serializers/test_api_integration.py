@@ -1793,6 +1793,10 @@ def test_serializer_route_reads_returned_objects_and_tuples():
 def test_untyped_route_dumps_serializers_but_not_other_objects_with_dump():
     api = BoltAPI()
 
+    @api.get("/serializer")
+    def serializer():
+        return PublicUser(id=1, username="a", password="p")
+
     @api.get("/serializers")
     def serializers():
         return [PublicUser(id=1, username="a", password="p")]
@@ -1807,6 +1811,7 @@ def test_untyped_route_dumps_serializers_but_not_other_objects_with_dump():
 
     with TestClient(api) as client:
         expected = {
+            "/serializer": {"id": 1, "username": "a"},
             "/serializers": [{"id": 1, "username": "a"}],
             "/dumpable": {"id": 1},
             "/dumpables": [{"id": 1}],
