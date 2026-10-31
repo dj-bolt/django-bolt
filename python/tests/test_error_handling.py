@@ -759,12 +759,15 @@ class TestParseMsgspecDecodeError:
         assert error["input"] == body.decode()[:100]
         assert "ctx" not in error
 
-    def test_position_after_the_last_line_keeps_the_first_line_and_no_caret(self):
+    def test_position_after_the_end_points_after_the_last_character(self):
+        """A position past the end of the body gives the column after its last character, one-indexed."""
         error = parse_msgspec_decode_error(
             msgspec.DecodeError("JSON is malformed: invalid character (byte 999)"), b"{}"
         )
-        assert error["loc"] == ("body", 1, 0)
-        assert error["msg"] == "Invalid JSON at line 1, column 0: JSON is malformed: invalid character (byte 999)"
+        assert error["loc"] == ("body", 1, 3)
+        assert error["msg"] == (
+            "Invalid JSON at line 1, column 3: JSON is malformed: invalid character (byte 999)\n  {}\n    ^"
+        )
 
     def test_http_422_names_the_line_and_the_column(self):
         api = BoltAPI()
