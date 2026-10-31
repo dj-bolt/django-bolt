@@ -2087,7 +2087,7 @@ class BoltAPI:
                         if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
-                            return await serialize_json_data(data, entry, status_code=code)
+                            return await serialize_json_data(data, code)
                         return await entry["_default_response_handler"](data, status_code=code)
 
                 # JSON() with explicit status: pick schema by its status_code.
@@ -2109,7 +2109,7 @@ class BoltAPI:
                         if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
-                            return serialize_json_data_sync(data, entry, status_code=code)
+                            return serialize_json_data_sync(data, code)
                         return entry["_default_response_handler_sync"](data, status_code=code)
 
                 # JSON() with explicit status: pick schema by its status_code.

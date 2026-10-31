@@ -133,23 +133,11 @@ class HandlerMetadata(TypedDict, total=False):
     """Pre-built per-status-code meta dicts for O(1) lookup at request time.
     Keys mirror ``response_map`` (int codes + optional ``...``)."""
 
-    _response_validator: Callable[[Any], Any] | None
-    """Compiled sync response validator/coercer"""
-
-    _response_validator_async: Callable[[Any], Any] | None
-    """Compiled async response validator/coercer"""
-
     _stream_item_validator: Callable[[Any], Any] | None
     """Compiled sync validator for typed stream items"""
 
     _stream_item_validator_async: Callable[[Any], Any] | None
     """Compiled async validator for typed stream items"""
-
-    _queryset_serializer: Callable[[Any], Any] | None
-    """Compiled sync queryset projection serializer"""
-
-    _queryset_serializer_async: Callable[[Any], Any] | None
-    """Compiled async queryset projection serializer"""
 
     _has_response_validation: bool
     """Whether this route has a compiled response validator"""
