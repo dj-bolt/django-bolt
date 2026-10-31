@@ -27,9 +27,15 @@ from django.template import RequestContext, Template
 from django.utils.deprecation import MiddlewareMixin
 from django.views.decorators.csrf import csrf_exempt
 
-from django_bolt import BoltAPI, Request
+from django_bolt import BoltAPI, Request, Router
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
-from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, Middleware, TimingMiddleware
+from django_bolt.middleware import (
+    DjangoMiddleware,
+    DjangoMiddlewareStack,
+    Middleware,
+    TimingMiddleware,
+    skip_middleware,
+)
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
 from django_bolt.middleware_response import MiddlewareResponse
 from django_bolt.param_functions import Cookie, Header
@@ -2393,3 +2399,54 @@ def test_django_middleware_keeps_the_body_of_a_response(path, body):
     assert response.headers.get("x-frame-options") == "DENY"
     assert response.status_code == 200
     assert response.content == body
+
+
+class _PassThrough(MiddlewareMixin):
+    """A Django middleware with no hooks."""
+
+
+class _TagResponse(MiddlewareMixin):
+    def process_response(self, request, response):
+        response["X-Tag"] = "tagged"
+        return response
+
+
+def test_routes_of_a_router_with_one_django_middleware_answer_their_own_bodies():
+    """Each route chain gets its own copy of a wrapper that the routes share."""
+    api = BoltAPI()
+    router = Router(prefix="/r", middleware=[DjangoMiddleware(_TagResponse)])
+
+    @router.get("/a")
+    async def route_a():
+        return {"route": "a"}
+
+    @router.get("/b")
+    async def route_b():
+        return {"route": "b"}
+
+    api.include_router(router)
+
+    with TestClient(api) as client:
+        for name in ("a", "b", "a", "b"):
+            response = client.get(f"/r/{name}")
+            assert response.json() == {"route": name}
+            assert response.headers.get("x-tag") == "tagged"
+
+
+def test_a_route_that_skips_a_django_middleware_keeps_it_for_the_other_routes():
+    """The own global chain of a route does not change the wrappers of the API chain."""
+    api = BoltAPI(middleware=[DjangoMiddleware(_PassThrough), DjangoMiddleware(_TagResponse)])
+
+    @api.get("/normal")
+    async def normal():
+        return {"ok": True}
+
+    @api.get("/skip")
+    @skip_middleware("_TagResponse")
+    async def skip():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        assert client.get("/normal").headers.get("x-tag") == "tagged"
+        assert "x-tag" not in client.get("/skip").headers
+        assert client.get("/normal").headers.get("x-tag") == "tagged"

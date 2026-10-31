@@ -13,6 +13,7 @@ import functools
 import inspect
 import threading
 
+import msgspec
 import pytest
 from asgiref.sync import sync_to_async
 from django.db.models import QuerySet
@@ -119,6 +120,35 @@ def test_a_sync_to_async_request_handler_runs_in_a_task():
 
     assert response.status_code == 200, response.text
     assert response.json() == {"q": "bolt"}
+
+
+class Echo(msgspec.Struct):
+    q: str
+    in_task: bool
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_request_handler_with_a_response_type_reads_the_request(is_async):
+    """The route validates the response, so the result goes through the serializer."""
+    api = BoltAPI()
+
+    if is_async:
+
+        @api.get("/echo")
+        async def echo(request: Request) -> Echo:
+            return Echo(q=request.query["q"], in_task=in_task())
+
+    else:
+
+        @api.get("/echo")
+        def echo(request: Request) -> Echo:
+            return Echo(q=request.query["q"], in_task=in_task())
+
+    with TestClient(api) as client:
+        response = client.get("/echo?q=bolt")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"q": "bolt", "in_task": False}
 
 
 def test_a_request_handler_on_the_sync_dispatch_keeps_its_status_and_response_class():

@@ -895,6 +895,140 @@ def test_python_middleware_replaces_the_content_type_in_any_letter_case():
     assert response.text == "<p>x</p>"
 
 
+class TagMiddleware(Middleware):
+    """Add the header ``x-api``."""
+
+    header = "x-api"
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.headers[self.header] = "tagged"
+        return response
+
+
+class RouterTagMiddleware(TagMiddleware):
+    header = "x-router"
+
+
+class BuildCounting(Middleware):
+    """Count the middleware instances that Bolt builds, by class name."""
+
+    built: list[str] = []
+
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        BuildCounting.built.append(type(self).__name__)
+
+    async def process_request(self, request):
+        return await self.get_response(request)
+
+
+class GlobalCounting(BuildCounting):
+    pass
+
+
+class SkippedCounting(BuildCounting):
+    pass
+
+
+class RouteCounting(BuildCounting):
+    pass
+
+
+def test_bolt_builds_each_middleware_chain_one_time():
+    """The chain of the API, the route chain and the own global chain of a route are cached."""
+    BuildCounting.built = []
+    api = BoltAPI(middleware=[GlobalCounting, SkippedCounting])
+
+    @api.get("/shared")
+    async def shared():
+        return {"ok": True}
+
+    @api.get("/own")
+    @middleware(RouteCounting)
+    @skip_middleware("SkippedCounting")
+    async def own():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        for _ in range(3):
+            assert client.get("/shared").status_code == 200
+            assert client.get("/own").status_code == 200
+
+    # The chain of the API, then the own global chain of /own and its route chain.
+    assert sorted(BuildCounting.built) == ["GlobalCounting", "GlobalCounting", "RouteCounting", "SkippedCounting"]
+
+
+def test_a_python_middleware_before_a_rust_middleware_runs():
+    """A dict spec runs in Rust. The Python middleware before it in the list still runs."""
+    rate_limit_spec = {"type": "rate_limit", "rps": 1000, "burst": 1000, "key": "ip"}
+    api = BoltAPI(middleware=[TagMiddleware, rate_limit_spec])
+    router = Router(prefix="/router", middleware=[RouterTagMiddleware])
+
+    @api.get("/api")
+    async def on_api():
+        return {"ok": True}
+
+    @router.get("/items")
+    @rate_limit(rps=1000)
+    async def on_router():
+        return {"ok": True}
+
+    api.include_router(router)
+
+    with TestClient(api) as client:
+        api_response = client.get("/api")
+        router_response = client.get("/router/items")
+
+    assert (api_response.status_code, api_response.headers.get("x-api")) == (200, "tagged")
+    assert router_response.status_code == 200
+    assert (router_response.headers.get("x-api"), router_response.headers.get("x-router")) == ("tagged", "tagged")
+
+
+class WireTupleMiddleware(Middleware):
+    """Answer with a ResponseWireV1 tuple, without the handler."""
+
+    async def process_request(self, request):
+        return (418, 0, 0, b'{"teapot":true}')
+
+
+class StrMiddleware(Middleware):
+    """Answer with a type that is not a response."""
+
+    async def process_request(self, request):
+        return "not a response"
+
+
+def test_a_middleware_can_answer_with_a_wire_tuple():
+    api = BoltAPI(middleware=[WireTupleMiddleware])
+
+    @api.get("/tea")
+    async def tea():
+        return {"handler": True}
+
+    with TestClient(api) as client:
+        response = client.get("/tea")
+
+    assert (response.status_code, response.json()) == (418, {"teapot": True})
+    assert response.headers["content-type"] == "application/json"
+
+
+def test_a_middleware_answer_of_another_type_is_a_500_that_names_the_type():
+    api = BoltAPI(middleware=[StrMiddleware])
+
+    @api.get("/tea")
+    async def tea():
+        return {"handler": True}
+
+    with override_settings(DEBUG=True), TestClient(api) as client:
+        response = client.get("/tea")
+
+    assert response.status_code == 500
+    assert (
+        "Middleware chain returned unsupported response type: str. Expected MiddlewareResponse or ResponseWireV1 tuple."
+    ) in response.text
+
+
 if __name__ == "__main__":
     # Run basic tests
     print("Testing middleware decorators...")

@@ -484,6 +484,21 @@ class TestUploadFileValidation:
         assert response.status_code == 200
         assert response.json()["has_file"] is True
 
+    def test_optional_file_on_a_route_that_awaits(self):
+        """The async dispatch has no upload file to close when the client sends none."""
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(avatar: Annotated[UploadFile | None, File()] = None):
+            await asyncio.sleep(0)
+            return {"has_file": avatar is not None}
+
+        with TestClient(api) as client:
+            response = client.post("/upload", data={"name": "test"})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"has_file": False}
+
     def test_a_part_header_over_64_kb_gets_422(self):
         """The multipart parser keeps at most 64 KB that it cannot use yet, for example a part header."""
         api = BoltAPI()

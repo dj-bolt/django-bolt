@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from types import SimpleNamespace
 
@@ -109,3 +110,46 @@ def test_no_hint_outside_dev_mode(caplog, debug, monkeypatch):
         assert client.get("/profile/ann", headers=_headers()).status_code == 500
 
     assert not [r for r in caplog.records if r.levelno == logging.WARNING and "await request.auser()" in r.getMessage()]
+
+
+def _hint_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno == logging.WARNING and "await request.auser()" in r.getMessage()]
+
+
+# The handler of _api: its qualified name, then its file and line.
+_WHERE = re.escape(f"{__name__}._api.<locals>.profile (") + r"[^()]*test_lane_affinity_error\.py:\d+\)"
+
+
+def test_the_error_names_the_qualified_name_of_the_handler(caplog):
+    caplog.set_level(logging.ERROR)
+    with TestClient(_api()) as client:
+        assert client.get("/profile/ann", headers=_headers()).status_code == 500
+
+    message = str(_error_records(caplog)[0].exc_info[1])
+    assert re.search(rf"Route: GET /profile/\{{name\}}\. Handler: {_WHERE}\.$", message), message
+
+
+def test_the_dev_mode_hint_names_the_handler_the_route_and_the_fix(caplog):
+    caplog.set_level(logging.WARNING, logger="django_bolt")
+    with override_settings(DEBUG=True), TestClient(_api()) as client:
+        assert client.get("/profile/ann", headers=_headers()).status_code == 500
+
+    hints = _hint_records(caplog)
+    assert len(hints) == 1, [r.getMessage() for r in hints]
+    assert re.fullmatch(
+        rf"(?P<where>{_WHERE}) reads request\.user synchronously on a thread that cannot reach the request lane\. "
+        r"Route: GET /profile/\{name\}\. Handler: (?P=where)\. "
+        r"Use `await request\.auser\(\)` or a `CurrentUser` parameter\. "
+        r"Bolt logs this one time for each route\.",
+        hints[0].getMessage(),
+    ), hints[0].getMessage()
+
+
+def test_the_dev_worker_of_runbolt_logs_the_hint_with_debug_off(caplog, monkeypatch):
+    """``runbolt --dev`` sets DJANGO_BOLT_DEV_WORKER=1 in its worker."""
+    monkeypatch.setenv("DJANGO_BOLT_DEV_WORKER", "1")
+    caplog.set_level(logging.WARNING, logger="django_bolt")
+    with override_settings(DEBUG=False), TestClient(_api()) as client:
+        assert client.get("/profile/ann", headers=_headers()).status_code == 500
+
+    assert len(_hint_records(caplog)) == 1
