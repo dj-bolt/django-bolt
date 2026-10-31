@@ -1,5 +1,3 @@
-import os
-import tempfile
 import time
 
 import pytest
@@ -8,54 +6,50 @@ from django_bolt import BoltAPI
 from django_bolt.responses import File, FileResponse
 from django_bolt.testing import TestClient
 
-# Create test files once at module level
-TEST_DIR = tempfile.mkdtemp()
 
-# Small file (< 10MB) - 1KB
-SMALL_FILE = os.path.join(TEST_DIR, "small_file.txt")
-with open(SMALL_FILE, "w") as f:
-    f.write("x" * 1024)
-
-# Medium file (< 10MB) - 1MB
-MEDIUM_FILE = os.path.join(TEST_DIR, "medium_file.txt")
-with open(MEDIUM_FILE, "w") as f:
-    f.write("y" * (1024 * 1024))
-
-# Large file (> 10MB) - 11MB
-LARGE_FILE = os.path.join(TEST_DIR, "large_file.bin")
-with open(LARGE_FILE, "wb") as f:
-    f.write(b"z" * (11 * 1024 * 1024))
+@pytest.fixture(scope="module")
+def files(tmp_path_factory):
+    """Write the test files once per module, in a temporary directory that pytest removes."""
+    directory = tmp_path_factory.mktemp("files")
+    small = directory / "small_file.txt"
+    small.write_text("x" * 1024)  # 1 KB
+    medium = directory / "medium_file.txt"
+    medium.write_text("y" * (1024 * 1024))  # 1 MB
+    large = directory / "large_file.bin"
+    large.write_bytes(b"z" * (11 * 1024 * 1024))  # 11 MB: over 10 MB, so Bolt streams it
+    return {"small": str(small), "medium": str(medium), "large": str(large)}
 
 
 @pytest.fixture(scope="module")
-def api():
+def api(files):
     """Create test API with file endpoints"""
     api = BoltAPI()
+    small_file, medium_file, large_file = files["small"], files["medium"], files["large"]
 
     @api.get("/file/small")
     async def get_small_file():
         """Small file should be read into memory"""
-        return FileResponse(SMALL_FILE, filename="small_file.txt")
+        return FileResponse(small_file, filename="small_file.txt")
 
     @api.get("/file/medium")
     async def get_medium_file():
         """Medium file should be read into memory"""
-        return FileResponse(MEDIUM_FILE, filename="medium_file.txt")
+        return FileResponse(medium_file, filename="medium_file.txt")
 
     @api.get("/file/large")
     async def get_large_file():
         """Large file should be streamed"""
-        return FileResponse(LARGE_FILE, filename="large_file.bin")
+        return FileResponse(large_file, filename="large_file.bin")
 
     @api.get("/file/custom-headers")
     async def get_file_with_headers():
         """Test custom headers"""
-        return FileResponse(SMALL_FILE, filename="custom.txt", headers={"X-Custom-Header": "test-value"})
+        return FileResponse(small_file, filename="custom.txt", headers={"X-Custom-Header": "test-value"})
 
     @api.get("/file/custom-media-type")
     async def get_file_with_media_type():
         """Test custom media type"""
-        return FileResponse(SMALL_FILE, media_type="application/octet-stream")
+        return FileResponse(small_file, media_type="application/octet-stream")
 
     return api
 
@@ -151,13 +145,12 @@ def test_file_not_found():
     assert b"File not found" in response.content or response.content == b""
 
 
-def test_file_performance_small_vs_large():
+def test_file_performance_small_vs_large(tmp_path):
     """Test that small files use in-memory buffering for better performance"""
     api = BoltAPI()
-    temp_dir = tempfile.mkdtemp()
 
     # Create small file
-    small_file = os.path.join(temp_dir, "perf_small.txt")
+    small_file = str(tmp_path / "perf_small.txt")
     with open(small_file, "w") as f:
         f.write("x" * (100 * 1024))  # 100KB
 
