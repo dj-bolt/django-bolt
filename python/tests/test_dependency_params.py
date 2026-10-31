@@ -7,6 +7,8 @@ the parameters and the body of its dependencies in its OpenAPI schema.
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 from types import SimpleNamespace
 from typing import Annotated
 
@@ -14,9 +16,11 @@ import msgspec
 import pytest
 
 from django_bolt import BoltAPI, Depends, UploadFile, ViewSet
+from django_bolt._kwargs.model import compile_binder
+from django_bolt.dependencies import compile_dependency
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
-from django_bolt.param_functions import Body, Cookie, File, Form, Header, Query
+from django_bolt.param_functions import Body, Cookie, File, Form, Header, Path, Query
 from django_bolt.params import Param
 from django_bolt.testing import TestClient
 
@@ -596,3 +600,499 @@ def test_a_viewset_method_that_delegates_to_super_keeps_the_body():
         response = client.post("/items", content=b"payload")
     assert response.status_code == 201
     assert response.json() == {"body": "payload"}
+
+
+# The cache of dependencies lives for one request. A dependency that many
+# parameters need runs one time in that request, and again in the next request.
+
+_TICKETS = itertools.count(1)
+TICKET_CALLS: list[int] = []
+
+
+def sync_ticket() -> int:
+    TICKET_CALLS.append(1)
+    return next(_TICKETS)
+
+
+async def async_ticket() -> int:
+    TICKET_CALLS.append(1)
+    return next(_TICKETS)
+
+
+def sync_wrap_a(ticket: int = Depends(sync_ticket)) -> dict:
+    return {"who": "a", "ticket": ticket}
+
+
+def sync_wrap_b(ticket: int = Depends(sync_ticket)) -> dict:
+    return {"who": "b", "ticket": ticket}
+
+
+async def async_wrap_a(ticket: int = Depends(async_ticket)) -> dict:
+    return {"who": "a", "ticket": ticket}
+
+
+async def async_wrap_b(ticket: int = Depends(async_ticket)) -> dict:
+    return {"who": "b", "ticket": ticket}
+
+
+def sync_pair(
+    first: int = Depends(sync_ticket, use_cache=False),
+    second: int = Depends(sync_ticket, use_cache=False),
+) -> dict:
+    return {"first": first, "second": second}
+
+
+async def async_pair(
+    first: int = Depends(async_ticket, use_cache=False),
+    second: int = Depends(async_ticket, use_cache=False),
+) -> dict:
+    return {"first": first, "second": second}
+
+
+@pytest.fixture(scope="module")
+def cache_client():
+    api = BoltAPI()
+
+    @api.get("/sync/cached")
+    def sync_cached(direct=Depends(sync_ticket), a=Depends(sync_wrap_a), b=Depends(sync_wrap_b)):
+        return {"direct": direct, "a": a, "b": b}
+
+    @api.get("/async/cached")
+    async def async_cached(direct=Depends(async_ticket), a=Depends(async_wrap_a), b=Depends(async_wrap_b)):
+        return {"direct": direct, "a": a, "b": b}
+
+    @api.get("/sync/uncached")
+    def sync_uncached(
+        first=Depends(sync_ticket, use_cache=False),
+        second=Depends(sync_ticket),
+        third=Depends(sync_ticket),
+        fourth=Depends(sync_ticket, use_cache=False),
+    ):
+        return [first, second, third, fourth]
+
+    @api.get("/async/uncached")
+    async def async_uncached(
+        first=Depends(async_ticket, use_cache=False),
+        second=Depends(async_ticket),
+        third=Depends(async_ticket),
+        fourth=Depends(async_ticket, use_cache=False),
+    ):
+        return [first, second, third, fourth]
+
+    @api.get("/sync/nested-uncached")
+    def sync_nested_uncached(pair=Depends(sync_pair)):
+        return pair
+
+    @api.get("/async/nested-uncached")
+    async def async_nested_uncached(pair=Depends(async_pair)):
+        return pair
+
+    with TestClient(api) as c:
+        yield c
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_runs_one_time_in_a_request_and_again_in_the_next(cache_client, mode):
+    TICKET_CALLS.clear()
+    first = cache_client.get(f"/{mode}/cached")
+    assert first.status_code == 200, first.text
+    body = first.json()
+    ticket = body["direct"]
+    assert body["a"] == {"who": "a", "ticket": ticket}
+    assert body["b"] == {"who": "b", "ticket": ticket}
+    assert len(TICKET_CALLS) == 1
+
+    second = cache_client.get(f"/{mode}/cached").json()
+    assert second["direct"] != ticket
+    assert second["a"]["ticket"] == second["b"]["ticket"] == second["direct"]
+    assert len(TICKET_CALLS) == 2
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_with_use_cache_false_runs_each_time_and_keeps_no_value(cache_client, mode):
+    TICKET_CALLS.clear()
+    response = cache_client.get(f"/{mode}/uncached")
+    assert response.status_code == 200, response.text
+    first, second, third, fourth = response.json()
+    # The two cached markers share one run, and the uncached markers do not use it.
+    assert second == third
+    assert len({first, second, fourth}) == 3
+    assert len(TICKET_CALLS) == 3
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_nested_dependency_with_use_cache_false_runs_each_time(cache_client, mode):
+    TICKET_CALLS.clear()
+    response = cache_client.get(f"/{mode}/nested-uncached")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["first"] != body["second"]
+    assert len(TICKET_CALLS) == 2
+
+
+# Two or more async dependencies of an async handler run at the same time.
+
+STARTED: dict[str, set[str]] = {}
+
+
+async def _sees_other(rid: str, me: str, other: str) -> bool:
+    started = STARTED.setdefault(rid, set())
+    started.add(me)
+    for _ in range(200):
+        if other in started:
+            return True
+        await asyncio.sleep(0.005)
+    return False
+
+
+async def dep_left(rid: Annotated[str, Query()]) -> bool:
+    return await _sees_other(rid, "left", "right")
+
+
+async def dep_right(rid: Annotated[str, Query()]) -> bool:
+    return await _sees_other(rid, "right", "left")
+
+
+def test_async_dependencies_of_a_handler_run_at_the_same_time():
+    """Each dependency waits for the other one to start. In series, the first one times out."""
+    api = BoltAPI()
+
+    @api.get("/parallel")
+    async def parallel(left=Depends(dep_left), plain=Depends(sync_ticket), right=Depends(dep_right)):
+        return {"left": left, "right": right, "plain": plain > 0}
+
+    with TestClient(api) as client:
+        response = client.get("/parallel?rid=r1")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"left": True, "right": True, "plain": True}
+
+
+# A dependency can take the request with other parameters, keyword-only
+# parameters, and a form model that holds uploads.
+
+
+def sync_request_and_page(request, page: Annotated[int, Query()] = 1) -> dict:
+    return {"method": request.method, "page": page}
+
+
+async def async_request_and_page(request, page: Annotated[int, Query()] = 1) -> dict:
+    return {"method": request.method, "page": page}
+
+
+def sync_keyword_only(*, page: Annotated[int, Query()] = 1, theme: Annotated[str, Cookie()] = "light") -> dict:
+    return {"page": page, "theme": theme}
+
+
+async def async_keyword_only(*, page: Annotated[int, Query()] = 1, theme: Annotated[str, Cookie()] = "light") -> dict:
+    return {"page": page, "theme": theme}
+
+
+class UploadForm(msgspec.Struct):
+    title: str
+    upload: UploadFile
+
+
+def sync_upload_form(form: Annotated[UploadForm, Form()]) -> dict:
+    return {"title": form.title, "filename": form.upload.filename, "size": form.upload.size}
+
+
+async def async_upload_form(form: Annotated[UploadForm, Form()]) -> dict:
+    return {"title": form.title, "filename": form.upload.filename, "size": form.upload.size}
+
+
+@pytest.fixture(scope="module")
+def argument_client():
+    api = BoltAPI()
+
+    @api.post("/async/request-and-page")
+    async def async_request_route(values=Depends(async_request_and_page)):
+        return values
+
+    @api.post("/sync/request-and-page")
+    def sync_request_route(values=Depends(sync_request_and_page)):
+        return values
+
+    @api.get("/async/keyword-only")
+    async def async_keyword_route(values=Depends(async_keyword_only)):
+        return values
+
+    @api.get("/sync/keyword-only")
+    def sync_keyword_route(values=Depends(sync_keyword_only)):
+        return values
+
+    @api.post("/async/upload-form")
+    async def async_upload_form_route(values=Depends(async_upload_form)):
+        return values
+
+    @api.post("/sync/upload-form")
+    def sync_upload_form_route(values=Depends(sync_upload_form)):
+        return values
+
+    with TestClient(api) as c:
+        yield c
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_gets_the_request_with_other_parameters(argument_client, mode):
+    response = argument_client.post(f"/{mode}/request-and-page?page=4")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"method": "POST", "page": 4}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_gets_its_keyword_only_parameters(argument_client, mode):
+    response = argument_client.get(f"/{mode}/keyword-only?page=5", headers={"Cookie": "theme=dark"})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"page": 5, "theme": "dark"}
+    assert argument_client.get(f"/{mode}/keyword-only").json() == {"page": 1, "theme": "light"}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_gets_a_form_model_with_an_upload(argument_client, mode):
+    response = argument_client.post(
+        f"/{mode}/upload-form", data={"title": "report"}, files={"upload": ("a.txt", b"hello", "text/plain")}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"title": "report", "filename": "a.txt", "size": 5}
+    assert argument_client.post(f"/{mode}/upload-form", data={"title": "report"}).status_code == 422
+
+
+# An async dependency makes the injector async. The sync dependencies of the
+# same handler, and the nested dependencies, still get all request data.
+
+
+def sync_method(request) -> str:
+    return request.method
+
+
+def sync_inner(request, item_id: Annotated[int, Path()], page: Annotated[int, Query()] = 1) -> dict:
+    return {"method": request.method, "item_id": item_id, "page": page}
+
+
+def sync_outer_of_inner(inner: dict = Depends(sync_inner)) -> dict:
+    return {"inner": inner}
+
+
+async def async_outer_of_inner(inner: dict = Depends(sync_inner)) -> dict:
+    return {"inner": inner}
+
+
+@pytest.fixture(scope="module")
+def mixed_client():
+    api = BoltAPI()
+
+    @api.get("/mixed")
+    async def mixed(
+        values=Depends(async_values),
+        method=Depends(sync_method),
+        keyword_only=Depends(sync_keyword_only),
+    ):
+        return {"values": values, "method": method, "keyword_only": keyword_only}
+
+    @api.get("/async/nested-request/{item_id}")
+    async def async_nested_request(outer=Depends(async_outer_of_inner)):
+        return outer
+
+    @api.get("/sync/nested-request/{item_id}")
+    def sync_nested_request(outer=Depends(sync_outer_of_inner)):
+        return outer
+
+    with TestClient(api) as c:
+        yield c
+
+
+def test_sync_dependencies_next_to_an_async_dependency_get_the_request_and_their_arguments(mixed_client):
+    response = mixed_client.get("/mixed?page=2", headers={"Cookie": "theme=dark"})
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "values": {"session": None, "token": None, "version": "v1", "theme": "dark", "page": 2},
+        "method": "GET",
+        "keyword_only": {"page": 2, "theme": "dark"},
+    }
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_nested_dependency_gets_the_request_and_the_path_and_query_values(mixed_client, mode):
+    response = mixed_client.get(f"/{mode}/nested-request/7?page=3")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"inner": {"method": "GET", "item_id": 7, "page": 3}}
+
+
+# A dependency can have a sync form (``_bolt_sync_variant``), like ``get_current_user_sync``.
+# A sync handler uses the sync form at each depth of its dependencies. An async handler
+# uses the async form. The sync form keeps the ``use_cache`` setting of the marker.
+
+VARIANTS: list[str] = []
+
+
+def sync_form_of_ticket() -> int:
+    VARIANTS.append("sync")
+    return next(_TICKETS)
+
+
+async def ticket_with_sync_form() -> int:
+    VARIANTS.append("async")
+    return next(_TICKETS)
+
+
+ticket_with_sync_form._bolt_sync_variant = sync_form_of_ticket
+
+
+def middle_of_ticket(ticket: int = Depends(ticket_with_sync_form)) -> int:
+    return ticket
+
+
+def outer_of_ticket(middle: int = Depends(middle_of_ticket)) -> int:
+    return middle
+
+
+@pytest.fixture(scope="module")
+def variant_client():
+    api = BoltAPI()
+
+    @api.get("/sync/direct")
+    def sync_direct(ticket=Depends(ticket_with_sync_form)):
+        return {"ticket": ticket}
+
+    @api.get("/async/direct")
+    async def async_direct(ticket=Depends(ticket_with_sync_form)):
+        return {"ticket": ticket}
+
+    @api.get("/sync/deep")
+    def sync_deep(ticket=Depends(outer_of_ticket)):
+        return {"ticket": ticket}
+
+    @api.get("/async/deep")
+    async def async_deep(ticket=Depends(outer_of_ticket)):
+        return {"ticket": ticket}
+
+    @api.get("/sync/uncached")
+    def sync_uncached(
+        first=Depends(ticket_with_sync_form, use_cache=False), second=Depends(ticket_with_sync_form, use_cache=False)
+    ):
+        return [first, second]
+
+    @api.get("/async/uncached")
+    async def async_uncached(
+        first=Depends(ticket_with_sync_form, use_cache=False), second=Depends(ticket_with_sync_form, use_cache=False)
+    ):
+        return [first, second]
+
+    @api.get("/sync/cached")
+    def sync_cached(first=Depends(ticket_with_sync_form), second=Depends(ticket_with_sync_form)):
+        return [first, second]
+
+    @api.get("/async/cached")
+    async def async_cached(first=Depends(ticket_with_sync_form), second=Depends(ticket_with_sync_form)):
+        return [first, second]
+
+    with TestClient(api) as c:
+        yield c
+
+
+@pytest.mark.parametrize("path", ["direct", "deep"])
+@pytest.mark.parametrize("mode", MODES)
+def test_each_handler_uses_its_own_form_of_a_dependency_at_each_depth(variant_client, mode, path):
+    VARIANTS.clear()
+    response = variant_client.get(f"/{mode}/{path}")
+    assert response.status_code == 200, response.text
+    assert [mode] == VARIANTS
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_the_sync_form_of_a_dependency_keeps_the_cache_setting(variant_client, mode):
+    first, second = variant_client.get(f"/{mode}/uncached").json()
+    assert first != second
+    first, second = variant_client.get(f"/{mode}/cached").json()
+    assert first == second
+
+
+def test_a_binding_is_compiled_one_time_for_a_route():
+    """``compile_dependency`` keeps the binding of a route, and its plan, for each request."""
+    handler_meta: dict = {}
+    key = (sync_wrap_a, "GET", "/x")
+
+    first = compile_dependency(sync_wrap_a, handler_meta, compile_binder, "GET", "/x")
+    plan = first["_dep_arg_plan"]
+    nested = first["_dep_nested"]
+    assert handler_meta[key] is first
+
+    second = compile_dependency(sync_wrap_a, handler_meta, compile_binder, "GET", "/x")
+    assert second is first
+    assert second["_dep_arg_plan"] is plan
+    assert second["_dep_nested"] is nested
+    # Another route gets another binding.
+    assert compile_dependency(sync_wrap_a, handler_meta, compile_binder, "POST", "/x") is not first
+
+
+def sync_item_body(item: Item) -> str:
+    return item.name
+
+
+def outer_of_item_body(name: str = Depends(sync_item_body)) -> str:
+    return name
+
+
+@pytest.mark.parametrize("dependency", [sync_item_body, outer_of_item_body], ids=["direct", "nested"])
+def test_a_dependency_with_a_body_fails_on_a_get_route_at_registration(dependency):
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match="GET /with-body cannot have body parameters"):
+
+        @api.get("/with-body")
+        def with_body(value=Depends(dependency)):
+            return {"value": value}
+
+    @api.post("/with-body")
+    def accepted(value=Depends(dependency)):
+        return {"value": value}
+
+
+async def async_name_with_body_form() -> str:
+    return "async"
+
+
+def sync_form_with_body(item: Item) -> str:
+    return item.name
+
+
+async_name_with_body_form._bolt_sync_variant = sync_form_with_body
+
+
+def outer_of_name_with_body_form(name: str = Depends(async_name_with_body_form)) -> str:
+    return name
+
+
+@pytest.mark.parametrize(
+    "dependency", [async_name_with_body_form, outer_of_name_with_body_form], ids=["direct", "nested"]
+)
+def test_the_sync_form_of_a_dependency_is_checked_for_the_method_of_the_route(dependency):
+    """A sync handler uses the sync form, so a body in that form fails on a GET route."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match="GET /sync-form cannot have body parameters"):
+
+        @api.get("/sync-form")
+        def sync_form_route(value=Depends(dependency)):
+            return {"value": value}
+
+
+def test_a_dependency_used_twice_does_not_hide_the_dependencies_after_it():
+    api = BoltAPI()
+
+    @api.get("/twice")
+    async def twice(first=Depends(async_required), second=Depends(async_required), values=Depends(async_values)):
+        return {"tenants": [first, second], "page": values["page"]}
+
+    with TestClient(api) as client:
+        response = client.get("/twice?page=3", headers={"X-Tenant": "acme"})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenants": ["acme", "acme"], "page": 3}
+
+    parameters = (
+        SchemaGenerator(api, OpenAPIConfig(title="Test", version="1")).generate().paths["/twice"].get.parameters
+    )
+    # The header of the repeated dependency, and the fields of the dependency after it.
+    assert {("header", "x-tenant"), ("header", "X-Api-Token"), ("cookie", "theme"), ("query", "page")} <= {
+        (p.param_in, p.name) for p in parameters
+    }
