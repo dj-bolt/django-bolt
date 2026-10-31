@@ -479,9 +479,12 @@ def test_response_validation_error_locates_the_error_in_the_response():
     async def serialized() -> RowSerializer:
         return {"id": "x"}
 
+    # The struct coercer wraps the msgspec error, so the field path of /struct
+    # is in the message, not in the location.
+    expected = {"/list": ["response", "1", "id"], "/struct": ["response"], "/serializer": ["response", "id"]}
     with TestClient(api) as client:
-        for path in ("/list", "/struct", "/serializer"):
+        for path, loc in expected.items():
             resp = client.get(path)
             assert resp.status_code == 500, path
             errors = resp.json()["extra"]["validation_errors"]
-            assert [error["loc"][0] for error in errors] == ["response"], (path, errors)
+            assert [error["loc"] for error in errors] == [loc], (path, errors)
