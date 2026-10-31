@@ -813,9 +813,9 @@ def _compile_inline_response_validator(
     union_structs = _union_of_plain_structs(response_type)
     # pragma: no mutate end
     if union_structs is not None:
-        # pragma: no mutate start
-        return ("struct", union_structs)
+        return ("struct", union_structs)  # pragma: no mutate
 
+    # pragma: no mutate start
     if get_origin(response_type) is list:
         args = get_args(response_type)
         if args:
