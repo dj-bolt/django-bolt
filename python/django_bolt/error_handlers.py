@@ -84,36 +84,6 @@ def format_error_response(
     return _json_response(status_code, headers, error_body)
 
 
-def serialize_django_response(response: Any) -> tuple[int, list[tuple[str, str]], bytes]:
-    """Convert Django HttpResponse to response tuple.
-
-    This is called by middleware adapter when Django middleware returns an
-    HttpResponse (e.g., redirects from @login_required, CSRF failures, etc.).
-
-    Args:
-        response: Django HttpResponse instance
-
-    Returns:
-        Tuple of (status_code, headers, body)
-    """
-    status_code = response.status_code
-
-    # Extract headers from Django response
-    headers: list[tuple[str, str]] = []
-    for header, value in response.items():
-        headers.append((header.lower(), value))
-
-    # Get response content
-    if hasattr(response, "content"):
-        body = response.content
-        if isinstance(body, str):
-            body = body.encode("utf-8")
-    else:
-        body = b""
-
-    return status_code, headers, body
-
-
 def http_exception_handler(exc: HTTPException) -> tuple[int, list[tuple[str, str]], bytes]:
     """Convert an HTTPException to a response tuple.
 
