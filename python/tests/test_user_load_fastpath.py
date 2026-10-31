@@ -75,7 +75,9 @@ def test_loads_a_user_with_a_uuid_primary_key():
     loaded = load_user_by_pk_sync(UuidAccount, str(account.pk))
 
     assert loaded is not None
-    assert uuid.UUID(str(loaded.pk)) == account.pk
+    # The pk is a UUID, as the ORM gives it. The database converters ran.
+    assert loaded.pk == account.pk
+    assert isinstance(loaded.pk, uuid.UUID)
     assert loaded.username == "uuid_account"
     assert load_user_by_pk_sync(UuidAccount, str(uuid.uuid4())) is None
     # The loader used the compiled statement and cached it.
@@ -99,6 +101,9 @@ def test_loads_same_user_as_orm_get():
     assert loaded.email == orm_user.email
     assert loaded.first_name == orm_user.first_name
     assert loaded.is_staff is True
+    # The same database converters ran: an aware datetime under USE_TZ.
+    assert loaded.date_joined == orm_user.date_joined
+    assert loaded.date_joined.tzinfo is not None
     # Materialized like a real ORM row: attached to a database, not "adding".
     assert loaded._state.db == orm_user._state.db
     assert loaded._state.adding is False
