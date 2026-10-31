@@ -432,6 +432,56 @@ def test_custom_request_attribute_reaches_async_handler(middleware):
         assert client.get("/tenant").json() == {"tenant": "acme"}
 
 
+class _ReadBodyMiddleware(MiddlewareMixin):
+    """Read the body in process_request, as a logging or signing middleware does."""
+
+    def process_request(self, request):
+        request.read_result = request.read()
+        request.body_result = request.body
+
+
+@pytest.mark.parametrize(
+    "middleware",
+    [
+        lambda: DjangoMiddleware(_ReadBodyMiddleware),
+        lambda: DjangoMiddlewareStack([_ReadBodyMiddleware]),
+    ],
+    ids=["DjangoMiddleware", "DjangoMiddlewareStack"],
+)
+class TestMiddlewareReadsBody:
+    """A middleware reads the body of a request with no body as b""."""
+
+    def test_get_without_body_reads_empty_bytes(self, middleware):
+        api = BoltAPI(middleware=[middleware()])
+
+        @api.get("/read")
+        async def read(request: Request):
+            return {
+                "read": request.state["read_result"].decode(),
+                "body": request.state["body_result"].decode(),
+            }
+
+        with TestClient(api) as client:
+            response = client.get("/read")
+            assert response.status_code == 200
+            assert response.json() == {"read": "", "body": ""}
+
+    def test_post_with_body_reads_the_body(self, middleware):
+        api = BoltAPI(middleware=[middleware()])
+
+        @api.post("/read")
+        async def read(request: Request):
+            return {
+                "read": request.state["read_result"].decode(),
+                "body": request.state["body_result"].decode(),
+            }
+
+        with TestClient(api) as client:
+            response = client.post("/read", content=b"payload")
+            assert response.status_code == 200
+            assert response.json() == {"read": "payload", "body": "payload"}
+
+
 # =============================================================================
 # Test Full HTTP Cycle - Middleware Chaining
 # =============================================================================
