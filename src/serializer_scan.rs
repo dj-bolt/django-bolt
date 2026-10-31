@@ -19,8 +19,6 @@ use pyo3::types::{
 /// the thread stack.
 const MAX_DEPTH: usize = 10_000;
 
-type Stack<'py> = Vec<(Bound<'py, PyAny>, usize)>;
-
 /// A value of an exact builtin type that cannot hold a Serializer.
 #[inline]
 fn is_exact_leaf(value: &Bound<'_, PyAny>) -> bool {
@@ -59,126 +57,166 @@ fn is_scalar_subclass(value: &Bound<'_, PyAny>) -> bool {
         || value.is_instance_of::<PyByteArray>()
 }
 
-#[inline]
-fn push_unless_leaf<'py>(stack: &mut Stack<'py>, child: Bound<'py, PyAny>, depth: usize) {
-    if !is_exact_leaf(&child) {
-        stack.push((child, depth));
-    }
+/// The state of one scan: the objects to visit, and the last type that
+/// holds no Serializer.
+struct Scan<'a, 'py> {
+    stack: Vec<(Bound<'py, PyAny>, usize)>,
+    kinds: &'a Bound<'py, PyDict>,
+    classify: &'a Bound<'py, PyAny>,
+    /// The last type that `kinds` marks as a leaf. A child of this type is
+    /// skipped with one pointer compare, so a list of one Struct type reads
+    /// its kind once. The value holds an instance of the type during the
+    /// scan, so the type stays alive.
+    leaf_type: *mut pyo3::ffi::PyTypeObject,
 }
 
-/// Put the items of a dict, list or tuple on the stack. Return false for any
-/// other value.
-///
-/// With the GIL, the loops read borrowed pointers, so a leaf item costs no
-/// reference count change.
-#[cfg(not(Py_GIL_DISABLED))]
-fn push_items<'py>(item: &Bound<'py, PyAny>, depth: usize, stack: &mut Stack<'py>) -> bool {
-    use pyo3::ffi;
-    let py = item.py();
-    let container = item.as_ptr();
-    // SAFETY: the thread holds the GIL, and these loops run no Python code.
-    // Thus no thread can change the container while a loop reads it, and each
-    // borrowed item stays alive. An item goes on the stack as a new reference.
-    unsafe {
-        if ffi::PyDict_Check(container) != 0 {
-            let mut position: ffi::Py_ssize_t = 0;
-            let mut key = std::ptr::null_mut();
-            let mut value = std::ptr::null_mut();
-            while ffi::PyDict_Next(container, &mut position, &mut key, &mut value) != 0 {
-                if !is_exact_leaf_ptr(value) {
-                    stack.push((Bound::from_borrowed_ptr(py, value), depth));
-                }
-            }
+impl<'a, 'py> Scan<'a, 'py> {
+    /// Return whether the scan must visit an object of type `item_type`
+    /// that is not an exact leaf. A type that `kinds` marks as a leaf
+    /// becomes `leaf_type`.
+    #[inline]
+    fn wants_type(&mut self, item_type: *mut pyo3::ffi::PyTypeObject) -> bool {
+        use pyo3::ffi;
+        if item_type == self.leaf_type {
+            return false;
+        }
+        let is_builtin_container = {
+            item_type == &raw mut ffi::PyDict_Type
+                || item_type == &raw mut ffi::PyList_Type
+                || item_type == &raw mut ffi::PyTuple_Type
+        };
+        if is_builtin_container {
             return true;
         }
-        let (size, get_item): (
-            unsafe extern "C" fn(*mut ffi::PyObject) -> ffi::Py_ssize_t,
-            unsafe extern "C" fn(*mut ffi::PyObject, ffi::Py_ssize_t) -> *mut ffi::PyObject,
-        ) = if ffi::PyList_Check(container) != 0 {
-            (ffi::PyList_Size, ffi::PyList_GetItem)
-        } else if ffi::PyTuple_Check(container) != 0 {
-            (ffi::PyTuple_Size, ffi::PyTuple_GetItem)
-        } else {
-            return false;
-        };
-        for index in 0..size(container) {
-            let child = get_item(container, index);
-            if !is_exact_leaf_ptr(child) {
-                stack.push((Bound::from_borrowed_ptr(py, child), depth));
+        // SAFETY: `item_type` is the type of a live object, so it is alive.
+        let item_type_object =
+            unsafe { Bound::from_borrowed_ptr(self.kinds.py(), item_type.cast()) };
+        match self.kinds.get_item(&item_type_object) {
+            Ok(Some(kind)) if kind.is_none() => {
+                self.leaf_type = item_type;
+                false
+            }
+            // An unknown type, a Serializer or a type with fields: `visit`
+            // reads the kind again and raises an error of the lookup.
+            _ => true,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, child: Bound<'py, PyAny>, depth: usize) {
+        if !is_exact_leaf(&child) && self.wants_type(child.get_type().as_type_ptr()) {
+            self.stack.push((child, depth));
+        }
+    }
+
+    /// Put the items of a dict, list or tuple on the stack. Return false for
+    /// any other value.
+    ///
+    /// With the GIL, the loops read borrowed pointers, so a leaf item costs no
+    /// reference count change.
+    #[cfg(not(Py_GIL_DISABLED))]
+    fn push_items(&mut self, item: &Bound<'py, PyAny>, depth: usize) -> bool {
+        use pyo3::ffi;
+        let py = item.py();
+        let container = item.as_ptr();
+        // SAFETY: the thread holds the GIL. The loops run no Python code: a
+        // kind lookup hashes and compares type objects, which is native.
+        // Thus no thread can change the container while a loop reads it, and
+        // each borrowed item stays alive. An item goes on the stack as a new
+        // reference.
+        unsafe {
+            if ffi::PyDict_Check(container) != 0 {
+                let mut position: ffi::Py_ssize_t = 0;
+                let mut key = std::ptr::null_mut();
+                let mut value = std::ptr::null_mut();
+                while ffi::PyDict_Next(container, &mut position, &mut key, &mut value) != 0 {
+                    if !is_exact_leaf_ptr(value) && self.wants_type(ffi::Py_TYPE(value)) {
+                        self.stack
+                            .push((Bound::from_borrowed_ptr(py, value), depth));
+                    }
+                }
+                return true;
+            }
+            let (size, get_item): (
+                unsafe extern "C" fn(*mut ffi::PyObject) -> ffi::Py_ssize_t,
+                unsafe extern "C" fn(*mut ffi::PyObject, ffi::Py_ssize_t) -> *mut ffi::PyObject,
+            ) = if ffi::PyList_Check(container) != 0 {
+                (ffi::PyList_Size, ffi::PyList_GetItem)
+            } else if ffi::PyTuple_Check(container) != 0 {
+                (ffi::PyTuple_Size, ffi::PyTuple_GetItem)
+            } else {
+                return false;
+            };
+            for index in 0..size(container) {
+                let child = get_item(container, index);
+                if !is_exact_leaf_ptr(child) && self.wants_type(ffi::Py_TYPE(child)) {
+                    self.stack
+                        .push((Bound::from_borrowed_ptr(py, child), depth));
+                }
             }
         }
+        true
     }
-    true
-}
 
-/// Put the items of a dict, list or tuple on the stack. Return false for any
-/// other value.
-///
-/// Without the GIL, another thread can change a container. The PyO3
-/// iterators hold a strong reference to each item.
-#[cfg(Py_GIL_DISABLED)]
-fn push_items<'py>(item: &Bound<'py, PyAny>, depth: usize, stack: &mut Stack<'py>) -> bool {
-    if let Ok(dict) = item.cast::<PyDict>() {
-        dict.iter()
-            .for_each(|(_, child)| push_unless_leaf(stack, child, depth));
-    } else if let Ok(list) = item.cast::<PyList>() {
-        list.iter()
-            .for_each(|child| push_unless_leaf(stack, child, depth));
-    } else if let Ok(tuple) = item.cast::<PyTuple>() {
-        tuple
-            .iter()
-            .for_each(|child| push_unless_leaf(stack, child, depth));
-    } else {
-        return false;
-    }
-    true
-}
-
-/// Put the children of `item` on the stack at `depth`. Return true if `item`
-/// is a Serializer.
-fn visit<'py>(
-    item: &Bound<'py, PyAny>,
-    depth: usize,
-    stack: &mut Stack<'py>,
-    kinds: &Bound<'py, PyDict>,
-    classify: &Bound<'py, PyAny>,
-) -> PyResult<bool> {
-    if push_items(item, depth, stack) {
-        return Ok(false);
-    }
-    if let Ok(set) = item.cast::<PySet>() {
-        set.iter()
-            .for_each(|child| push_unless_leaf(stack, child, depth));
-        return Ok(false);
-    }
-    if let Ok(set) = item.cast::<PyFrozenSet>() {
-        set.iter()
-            .for_each(|child| push_unless_leaf(stack, child, depth));
-        return Ok(false);
-    }
-    if is_scalar_subclass(item) {
-        return Ok(false);
-    }
-    let item_type = item.get_type();
-    let kind = match kinds.get_item(&item_type)? {
-        Some(kind) => kind,
-        None => classify.call1((&item_type,))?,
-    };
-    if kind.is_none() {
-        return Ok(false);
-    }
-    let Ok(names) = kind.cast::<PyTuple>() else {
-        return Ok(true);
-    };
-    for name in names.iter() {
-        match item.getattr(name.cast::<PyString>()?) {
-            Ok(child) => push_unless_leaf(stack, child, depth),
-            // msgspec skips an attribute that the object does not have.
-            Err(err) if err.is_instance_of::<PyAttributeError>(item.py()) => {}
-            Err(err) => return Err(err),
+    /// Put the items of a dict, list or tuple on the stack. Return false for
+    /// any other value.
+    ///
+    /// Without the GIL, another thread can change a container. The PyO3
+    /// iterators hold a strong reference to each item.
+    #[cfg(Py_GIL_DISABLED)]
+    fn push_items(&mut self, item: &Bound<'py, PyAny>, depth: usize) -> bool {
+        if let Ok(dict) = item.cast::<PyDict>() {
+            dict.iter().for_each(|(_, child)| self.push(child, depth));
+        } else if let Ok(list) = item.cast::<PyList>() {
+            list.iter().for_each(|child| self.push(child, depth));
+        } else if let Ok(tuple) = item.cast::<PyTuple>() {
+            tuple.iter().for_each(|child| self.push(child, depth));
+        } else {
+            return false;
         }
+        true
     }
-    Ok(false)
+
+    /// Put the children of `item` on the stack at `depth`. Return true if
+    /// `item` is a Serializer.
+    fn visit(&mut self, item: &Bound<'py, PyAny>, depth: usize) -> PyResult<bool> {
+        if self.push_items(item, depth) {
+            return Ok(false);
+        }
+        if let Ok(set) = item.cast::<PySet>() {
+            set.iter().for_each(|child| self.push(child, depth));
+            return Ok(false);
+        }
+        if let Ok(set) = item.cast::<PyFrozenSet>() {
+            set.iter().for_each(|child| self.push(child, depth));
+            return Ok(false);
+        }
+        let item_type = item.get_type();
+        if is_scalar_subclass(item) {
+            self.leaf_type = item_type.as_type_ptr();
+            return Ok(false);
+        }
+        let kind = match self.kinds.get_item(&item_type)? {
+            Some(kind) => kind,
+            None => self.classify.call1((&item_type,))?,
+        };
+        if kind.is_none() {
+            self.leaf_type = item_type.as_type_ptr();
+            return Ok(false);
+        }
+        let Ok(names) = kind.cast::<PyTuple>() else {
+            return Ok(true);
+        };
+        for name in names.iter() {
+            match item.getattr(name.cast::<PyString>()?) {
+                Ok(child) => self.push(child, depth),
+                // msgspec skips an attribute that the object does not have.
+                Err(err) if err.is_instance_of::<PyAttributeError>(item.py()) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Return whether `value` holds an object whose kind marks a Serializer.
@@ -200,13 +238,18 @@ pub fn find_serializer<'py>(
     if is_exact_leaf(value) {
         return Ok(false);
     }
-    // The stack allocates only when the value has a child that is not a leaf.
-    let mut stack: Stack<'py> = Vec::new();
-    if visit(value, 1, &mut stack, kinds, classify)? {
+    // The stack allocates only when the value has a child to visit.
+    let mut scan = Scan {
+        stack: Vec::new(),
+        kinds,
+        classify,
+        leaf_type: std::ptr::null_mut(),
+    };
+    if scan.visit(value, 1)? {
         return Ok(true);
     }
-    while let Some((item, depth)) = stack.pop() {
-        if depth >= MAX_DEPTH || visit(&item, depth + 1, &mut stack, kinds, classify)? {
+    while let Some((item, depth)) = scan.stack.pop() {
+        if depth >= MAX_DEPTH || scan.visit(&item, depth + 1)? {
             return Ok(true);
         }
     }
@@ -268,17 +311,21 @@ class Text(str):
     pass
 
 calls = []
+KINDS = {Holder: ('inner', 'missing')}
 
 def classify(tp):
     calls.append(tp)
     if tp is Secret:
-        return True
-    if tp is Holder:
-        return ('inner', 'missing')
-    return None
+        kind = True
+    elif tp is Holder:
+        kind = ('inner', 'missing')
+    else:
+        kind = None
+    KINDS[tp] = kind
+    return kind
 
 def kinds():
-    return {Holder: ('inner', 'missing')}
+    return KINDS
 ";
 
     /// Run the fixtures in a new module for each call.
@@ -356,6 +403,24 @@ def kinds():
             assert!(!scan(&module, &value).unwrap());
             let calls = eval(&module, "[tp.__name__ for tp in calls]");
             assert_eq!(calls.extract::<Vec<String>>().unwrap(), vec!["Empty"]);
+        });
+    }
+
+    #[test]
+    fn a_leaf_type_hides_no_other_type() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = fixtures(py);
+            let value = eval(&module, "[Empty(), Empty(), {'e': Empty()}, (Empty(),)]");
+            assert!(!scan(&module, &value).unwrap());
+            let calls = eval(&module, "[tp.__name__ for tp in calls]");
+            assert_eq!(calls.extract::<Vec<String>>().unwrap(), vec!["Empty"]);
+            for expr in [
+                "[Empty(), Empty(), Secret()]",
+                "[Empty(), Holder(Secret())]",
+            ] {
+                assert!(scan(&module, &eval(&module, expr)).unwrap(), "{expr}");
+            }
         });
     }
 

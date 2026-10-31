@@ -11,8 +11,8 @@ The scan reads the kind of each type from ``SCAN_KINDS``:
 - ``True``: the type is a Serializer.
 - a tuple of attribute names: the scan looks into these attributes.
 
-The kind of a Struct, dataclass or attrs class trusts its field annotations:
-the scan skips a field whose annotation cannot hold a Serializer.
+The kind of a Struct, dataclass or attrs class skips a field whose
+annotation holds only leaf values, such as ``int`` or ``list[str]``.
 """
 
 from __future__ import annotations
@@ -89,38 +89,27 @@ def _field_annotations(tp: type) -> list[tuple[str, Any]] | None:
     return [(name, hints.get(name, Any)) for name in names]
 
 
-def annotation_excludes_serializer(annotation: Any, _seen: set[type] | None = None) -> bool:
-    """Return whether no value of ``annotation`` can hold a Bolt Serializer.
+def annotation_excludes_serializer(annotation: Any) -> bool:
+    """Return whether ``annotation`` holds only leaf values, which cannot be a Serializer.
 
-    The check trusts the annotation. A value that breaks its annotation is
-    not checked. ``Any``, a bare ``dict`` or ``list``, ``object`` and an
-    unknown class can hold a Serializer.
+    A leaf is None, a str, a number, bytes, a date or time, a UUID, a
+    Decimal, an Enum or a Literal value. A container or a union of leaves is
+    a leaf type too. A Struct, dataclass or other class is not: nothing
+    checks the types of its fields, so a field can hold a Serializer.
     """
     origin = get_origin(annotation)
     if origin is None:
         if annotation is type(None):
             return True
-        if not isinstance(annotation, type) or _is_serializer_class(annotation):
-            return False
-        if issubclass(annotation, _LEAF_TYPES):
-            return True
-        fields = _field_annotations(annotation)
-        if fields is None:
-            return False
-        seen = set() if _seen is None else _seen
-        if annotation in seen:
-            # A recursive type: the other fields decide.
-            return True
-        seen.add(annotation)
-        return all(annotation_excludes_serializer(field_annotation, seen) for _, field_annotation in fields)
+        return isinstance(annotation, type) and issubclass(annotation, _LEAF_TYPES)
     if origin is Literal:
         return True
     args = get_args(annotation)
     if origin is Annotated:
-        return annotation_excludes_serializer(args[0], _seen)
+        return annotation_excludes_serializer(args[0])
     if origin not in _CONTAINER_ORIGINS or not args:
         return False
-    return all(arg is Ellipsis or annotation_excludes_serializer(arg, _seen) for arg in args)
+    return all(arg is Ellipsis or annotation_excludes_serializer(arg) for arg in args)
 
 
 def _kind_of(tp: type) -> Any:

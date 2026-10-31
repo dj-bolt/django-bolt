@@ -9,9 +9,13 @@ different path of the dispatch.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import json
+import uuid
 from collections.abc import Iterator
-from typing import Any
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated, Any, Literal
 
 import msgspec
 import pytest
@@ -20,7 +24,7 @@ from hypothesis import strategies as st
 
 from django_bolt import BoltAPI, EventSourceResponse, ServerSentEvent, WebSocket, _json
 from django_bolt._core import find_serializer
-from django_bolt._serializer_dump import SCAN_KINDS, classify
+from django_bolt._serializer_dump import SCAN_KINDS, annotation_excludes_serializer, classify
 from django_bolt.responses import JSON, Response
 from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.testing import TestClient, WebSocketTestClient
@@ -72,12 +76,25 @@ class Page[T](msgspec.Struct):
     """A generic envelope: a type variable can hold a Serializer."""
 
     items: list[T]
+    owner: Any = None
 
 
 class Wrapper(Serializer):
     """A Serializer whose dump() keeps the values of a plain dict field."""
 
     payload: dict
+
+
+class UserOut(msgspec.Struct):
+    """A plain Struct with the public fields of Account."""
+
+    id: int
+
+
+class UserBox(msgspec.Struct):
+    """Nothing checks the type of a field, so ``user`` can hold an Account."""
+
+    user: UserOut
 
 
 class Counted(msgspec.Struct):
@@ -214,6 +231,35 @@ def client():
         await msgspec_noop()
         return [Envelope(account=account())]
 
+    # The annotation of these routes is not checked against the value.
+    @api.get("/trust/dict-of-int", validate_response=False)
+    def trust_dict_of_int() -> dict[str, int]:
+        return {"account": account()}
+
+    @api.get("/trust/list-of-structs", validate_response=False)
+    def trust_list_of_structs() -> list[UserOut]:
+        return [account()]
+
+    @api.get("/trust/struct-field")
+    def trust_struct_field() -> UserBox:
+        return UserBox(user=account())
+
+    @api.get("/trust/struct-field-no-validation", validate_response=False)
+    def trust_struct_field_no_validation() -> UserBox:
+        return UserBox(user=account())
+
+    @api.get("/trust/struct-field-untyped")
+    def trust_struct_field_untyped():
+        return UserBox(user=account())
+
+    @api.get("/trust/generic-of-int")
+    def trust_generic_of_int() -> Page[int]:
+        return Page(items=[1], owner=account())
+
+    @api.get("/trust/leaf-structs-then-serializer")
+    def trust_leaf_structs_then_serializer():
+        return [Counted(n=1), Counted(n=2), account()]
+
     # Response classes.
     @api.get("/json/serializer")
     def json_serializer():
@@ -328,12 +374,32 @@ def test_a_serializer_in_a_dataclass_gives_its_dump(client):
     _check(client.get("/untyped/dataclass"), {"box": {"account": DUMPED}})
 
 
+def test_a_serializer_in_a_route_that_does_not_validate_its_type_gives_its_dump(client):
+    _check(client.get("/trust/dict-of-int"), {"account": DUMPED})
+    _check(client.get("/trust/list-of-structs"), [DUMPED])
+
+
+@pytest.mark.parametrize(
+    "path", ["/trust/struct-field", "/trust/struct-field-no-validation", "/trust/struct-field-untyped"]
+)
+def test_a_serializer_in_a_struct_field_of_another_type_gives_its_dump(client, path):
+    _check(client.get(path), {"user": DUMPED})
+
+
+def test_a_serializer_in_a_generic_struct_of_a_leaf_type_gives_its_dump(client):
+    _check(client.get("/trust/generic-of-int"), {"items": [1], "owner": DUMPED})
+
+
+def test_a_serializer_after_structs_with_only_leaf_fields_gives_its_dump(client):
+    _check(client.get("/trust/leaf-structs-then-serializer"), [{"n": 1}, {"n": 2}, DUMPED])
+
+
 def test_a_serializer_in_json_gives_its_dump(client):
     _check(client.get("/json/serializer"), DUMPED)
 
 
 def test_a_serializer_in_a_generic_struct_gives_its_dump(client):
-    _check(client.get("/untyped/generic-page"), {"items": [DUMPED]})
+    _check(client.get("/untyped/generic-page"), {"items": [DUMPED], "owner": None})
 
 
 def test_a_serializer_in_the_dump_of_another_serializer_gives_its_dump(client):
@@ -398,6 +464,30 @@ def test_a_deeply_nested_response_fails_as_before():
         assert response.status_code == 500
         assert SECRET not in response.text
         _check(test_client.get("/ok"), {"account": DUMPED})
+
+
+class Color(enum.Enum):
+    RED = "red"
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [int, str, type(None), int | None, list[int], dict[str, int], tuple[int, ...], Literal["a"]]
+    + [Annotated[int, "doc"], Color, datetime, uuid.UUID, Decimal],
+    ids=repr,
+)
+def test_a_leaf_annotation_cannot_hold_a_serializer(annotation):
+    assert annotation_excludes_serializer(annotation)
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [Any, dict, list, object, UserOut, Account, list[UserOut], dict[str, Any], int | UserOut, Page[int]],
+    ids=repr,
+)
+def test_a_class_or_an_open_annotation_can_hold_a_serializer(annotation):
+    """Nothing checks the fields of a Struct, so a Struct type is not a leaf, also with leaf arguments."""
+    assert not annotation_excludes_serializer(annotation)
 
 
 def _reference(value: Any) -> Any:
