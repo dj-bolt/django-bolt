@@ -32,6 +32,16 @@ _META_TAG_TO_RESPONSE_TYPE = {
     _RESPONSE_META_HTML: "html",
 }
 
+# The Content-Type of each built-in response type, as Rust sends it
+# (ResponseType::content_type in crates/bolt-core/src/response_meta.rs).
+# Rust sends no Content-Type for the other types.
+_RESPONSE_TYPE_CONTENT_TYPES = {
+    "json": "application/json",
+    "html": "text/html; charset=utf-8",
+    "plaintext": "text/plain; charset=utf-8",
+    "octetstream": "application/octet-stream",
+}
+
 # Raw cookie tuple type (matches serialization.py CookieTuple)
 CookieTuple = tuple[str, str, str, int | None, str | None, str | None, bool, bool, str | None]
 
@@ -64,8 +74,8 @@ def _split_content_type_headers(
 
     for key, value in headers.items():
         if key.lower() == "content-type":
-            if content_type is None:
-                content_type = value
+            # The last one wins: middleware can add a key with another case.
+            content_type = value
             continue
         remaining_headers.append((key, value))
 
@@ -122,7 +132,10 @@ class MiddlewareResponse:
             response_type = _META_TAG_TO_RESPONSE_TYPE.get(meta)
             if response_type is None:
                 raise TypeError(f"Unknown response meta tag {meta!r}")
-            return cls(status_code, {}, body, response_type, None, body_kind=body_kind)
+            # The tag carries the Content-Type. Middleware reads it from the headers.
+            content_type = _RESPONSE_TYPE_CONTENT_TYPES.get(response_type)
+            headers = {"content-type": content_type} if content_type is not None else {}
+            return cls(status_code, headers, body, response_type, None, body_kind=body_kind)
 
         if not (isinstance(meta, tuple) and len(meta) == 4):
             raise TypeError("Invalid middleware response metadata tuple")

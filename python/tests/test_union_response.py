@@ -367,3 +367,88 @@ def test_inline_list_path_reports_an_invalid_element():
         assert resp.json()["extra"]["validation_errors"] == [
             {"loc": ["body", "1", "id"], "msg": "Expected `int`, got `str`", "type": "validation_error"}
         ]
+
+
+class Left(msgspec.Struct):
+    left: int
+
+
+class Right(msgspec.Struct):
+    right: int
+
+
+class Checked(msgspec.Struct):
+    n: int
+
+    def __post_init__(self):
+        if self.n < 0:
+            # msgspec wraps a TypeError or a ValueError of __post_init__ in a
+            # ValidationError, but not this error.
+            raise RuntimeError("n must not be negative")
+
+
+@pytest.mark.parametrize(
+    "api_kwargs", [{}, {"middleware": [PassThroughMiddleware]}], ids=["plain", "python-middleware"]
+)
+def test_inline_list_path_reports_each_error_as_the_slow_path_does(api_kwargs):
+    """Each error of the inline list path gives the error body of the slow path.
+
+    An untagged union of Structs makes msgspec raise TypeError. An error in
+    __post_init__ escapes msgspec as it is.
+    """
+    api = BoltAPI(**api_kwargs)
+
+    @api.get("/slow-union")
+    async def slow_union(request) -> list[Left | Right]:
+        return [{"left": 1}]
+
+    @api.get("/slow-checked")
+    async def slow_checked(request) -> list[Checked]:
+        return [{"n": -1}]
+
+    @api.get("/trivial")
+    async def trivial() -> list[Left | Right]:
+        return [{"left": 1}]
+
+    @api.get("/trivial-query")
+    async def trivial_query(start: int = 1) -> list[Left | Right]:
+        return [{"left": start}]
+
+    @api.get("/awaits")
+    async def awaits() -> list[Left | Right]:
+        await asyncio.sleep(0)
+        return [{"left": 1}]
+
+    @api.get("/awaits-query")
+    async def awaits_query(start: int = 1) -> list[Left | Right]:
+        await asyncio.sleep(0)
+        return [{"left": start}]
+
+    @api.get("/sync")
+    def sync_rows() -> list[Left | Right]:
+        return [{"left": 1}]
+
+    @api.get("/sync-query")
+    def sync_rows_query(start: int = 1) -> list[Left | Right]:
+        return [{"left": start}]
+
+    @api.get("/checked")
+    async def checked() -> list[Checked]:
+        return [{"n": -1}]
+
+    @api.get("/checked-sync")
+    def checked_sync() -> list[Checked]:
+        return [{"n": -1}]
+
+    with TestClient(api) as client:
+        slow_union_body = client.get("/slow-union").json()
+        slow_checked_body = client.get("/slow-checked").json()
+        assert slow_union_body["detail"] == "Response validation error"
+        assert slow_checked_body["extra"]["validation_errors"][0]["msg"] == "n must not be negative"
+
+        for path in ("/trivial", "/trivial-query", "/awaits", "/awaits-query", "/sync", "/sync-query"):
+            resp = client.get(path)
+            assert (resp.status_code, resp.json()) == (500, slow_union_body), path
+        for path in ("/checked", "/checked-sync"):
+            resp = client.get(path)
+            assert (resp.status_code, resp.json()) == (500, slow_checked_body), path
