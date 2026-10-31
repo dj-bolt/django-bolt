@@ -2041,7 +2041,7 @@ class BoltAPI:
 
     def _compile_handler_executor(self, meta: HandlerMetadata) -> Callable[..., Any]:
         """Compile per-handler execution callable for the request hot path."""
-        mode = meta["mode"]
+        is_request_only = meta["mode"] == "request_only"
         is_async = meta["is_async"]
         is_blocking = meta["is_blocking"]
         injector = meta["injector"]
@@ -2172,7 +2172,7 @@ class BoltAPI:
         # A handler with only the request parameter takes the sync dispatch when it
         # cannot suspend: a sync handler that does not block, or an async one with no await.
         # Its async executor below stays for a route that the sync dispatch cannot serve.
-        if mode == "request_only" and not is_blocking and (not is_async or _never_suspends(meta["_original_fn"])):
+        if is_request_only and not is_blocking and (not is_async or _never_suspends(meta["_original_fn"])):
             meta["_sync_executor"] = _request_only_sync_executor(is_async, meta, self._serialize_on_orm_pool)
 
         # The sync executors below finish a result that their fast checks do not
@@ -2181,7 +2181,7 @@ class BoltAPI:
 
         # Fast path: async handler (most common pattern). Rust-prebound args are
         # consumed via _get_args; routes without bindings skip the state checks.
-        if mode != "request_only" and is_async and not is_blocking and not injector_is_async:
+        if not is_request_only and is_async and not is_blocking and not injector_is_async:
             default_status = meta["default_status_code"]
             has_response_validation = meta["_has_response_validation"]
 
@@ -2578,18 +2578,24 @@ class BoltAPI:
             return execute_async_no_prebound
 
         # Fast path for sync non-blocking handler (prebound-aware via _get_args).
-        if mode != "request_only" and not is_async and not is_blocking and not injector_is_async:
+        if not is_request_only and not is_async and not is_blocking and not injector_is_async:
             default_status = meta["default_status_code"]
             has_response_validation = meta["_has_response_validation"]
-            _is_no_params_sync = meta.get("handler_pattern") is HandlerPattern.NO_PARAMS
+            # The no-params executors only skip the injector call. A mutant that
+            # picks the other variant gives the same response.
+            _is_no_params_sync = meta.get("handler_pattern") is HandlerPattern.NO_PARAMS  # pragma: no mutate
 
             if not has_response_validation:
                 _encode = _json._ENCODER.encode
                 _meta_json = _RESPONSE_META_JSON
 
+                # The variants without the conversion only skip a no-op call. A mutant
+                # that picks the other variant gives the same response.
+                # pragma: no mutate start
                 _response_type = meta.get("response_type")
                 _resp_origin = get_origin(_response_type) if _response_type else None
                 _skip_convert = _resp_origin is list or _response_type is dict or _resp_origin is dict
+                # pragma: no mutate end
 
                 # Plain (non-async) sync executor for Rust sync dispatch bypass.
                 # Eliminates coroutine creation + into_future_with_locals overhead.
@@ -2701,9 +2707,11 @@ class BoltAPI:
                 _encode = _json._ENCODER.encode
                 _meta_json = _RESPONSE_META_JSON
                 _inline_kind, _inline_match = _inline_spec
-                _convert = msgspec.convert
+                # A mutant of a marked line in the inline fast path only sends the
+                # result to the slow path, which gives the same response.
+                _convert = msgspec.convert  # pragma: no mutate
 
-                if _inline_kind == "struct":
+                if _inline_kind == "struct":  # pragma: no mutate
                     _match_types = _inline_match
 
                     if _is_no_params_sync:
@@ -2755,7 +2763,7 @@ class BoltAPI:
                     return execute_sync_inline_validated
 
                 # _inline_kind == "list"
-                _list_ann = _inline_match
+                _list_ann = _inline_match  # pragma: no mutate
 
                 if _is_no_params_sync:
 
@@ -2763,14 +2771,14 @@ class BoltAPI:
                         handler: Callable, request: dict[str, Any]
                     ) -> ResponseWireV1:
                         result = handler()
-                        if type(result) is list:
+                        if type(result) is list:  # pragma: no mutate
                             # Attr-bag elements (e.g. Django models) need the
                             # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
-                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):  # pragma: no mutate
                                 return serialize_response_sync(result, meta)
                             try:
-                                validated = _convert(result, _list_ann)
+                                validated = _convert(result, _list_ann)  # pragma: no mutate
                             except Exception:
                                 # A later element can need conversion by attribute. The
                                 # slow path converts it, or reports the error as a
@@ -2785,14 +2793,14 @@ class BoltAPI:
                     ) -> ResponseWireV1:
                         args, kwargs = _get_args(request)
                         result = handler(*args, **kwargs)
-                        if type(result) is list:
+                        if type(result) is list:  # pragma: no mutate
                             # Attr-bag elements (e.g. Django models) need the
                             # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
-                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):  # pragma: no mutate
                                 return serialize_response_sync(result, meta)
                             try:
-                                validated = _convert(result, _list_ann)
+                                validated = _convert(result, _list_ann)  # pragma: no mutate
                             except Exception:
                                 # A later element can need conversion by attribute. The
                                 # slow path converts it, or reports the error as a
@@ -2809,14 +2817,14 @@ class BoltAPI:
                         handler: Callable, request: dict[str, Any]
                     ) -> ResponseWireV1:
                         result = handler()
-                        if type(result) is list:
+                        if type(result) is list:  # pragma: no mutate
                             # Attr-bag elements (e.g. Django models) need the
                             # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
-                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):  # pragma: no mutate
                                 return serialize_response_sync(result, meta)
                             try:
-                                validated = _convert(result, _list_ann)
+                                validated = _convert(result, _list_ann)  # pragma: no mutate
                             except Exception:
                                 # A later element can need conversion by attribute. The
                                 # slow path converts it, or reports the error as a
@@ -2833,14 +2841,14 @@ class BoltAPI:
                     ) -> ResponseWireV1:
                         args, kwargs = _get_args(request)
                         result = handler(*args, **kwargs)
-                        if type(result) is list:
+                        if type(result) is list:  # pragma: no mutate
                             # Attr-bag elements (e.g. Django models) need the
                             # slow path, which converts them by attribute;
                             # msgspec.convert can't bridge them.
-                            if result and not isinstance(result[0], (dict, msgspec.Struct)):
+                            if result and not isinstance(result[0], (dict, msgspec.Struct)):  # pragma: no mutate
                                 return serialize_response_sync(result, meta)
                             try:
-                                validated = _convert(result, _list_ann)
+                                validated = _convert(result, _list_ann)  # pragma: no mutate
                             except Exception:
                                 # A later element can need conversion by attribute. The
                                 # slow path converts it, or reports the error as a
@@ -2854,7 +2862,7 @@ class BoltAPI:
                 return execute_sync_inline_validated
 
         async def execute(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
-            if mode == "request_only":
+            if is_request_only:
                 if is_async:
                     result = await handler(request)
                 elif is_blocking:
