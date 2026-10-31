@@ -45,6 +45,7 @@ def test_middleware_response_extracts_content_type_case_insensitively():
 
     _status, meta, body_kind, payload = response.to_tuple()
 
-    assert meta == ("file", "text/css", [("X-Test", "1")], None)
+    # The headers store each name in lower case. Rust sends each name in lower case too.
+    assert meta == ("file", "text/css", [("x-test", "1")], None)
     assert body_kind == _BODY_FILE
     assert payload == "/tmp/example.css"

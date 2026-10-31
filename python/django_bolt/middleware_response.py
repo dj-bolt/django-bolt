@@ -69,14 +69,75 @@ ResponseBody = bytes | StreamingResponse | str
 Response = tuple[int, ResponseMetaTuple, int, ResponseBody]
 
 
+class ResponseHeaders(dict[str, str]):
+    """Response headers whose names ignore letter case.
+
+    Each name is stored in lower case. Thus ``headers["Content-Type"] = ...``
+    replaces the value that ``headers["content-type"]`` holds, and either name
+    reads it.
+    """
+
+    __slots__ = ()
+
+    def __init__(self, headers: Any = (), /) -> None:
+        items = headers.items() if hasattr(headers, "items") else headers
+        super().__init__({name.lower(): value for name, value in items})
+
+    def __setitem__(self, name: str, value: str) -> None:
+        super().__setitem__(name.lower(), value)
+
+    def __getitem__(self, name: str) -> str:
+        return super().__getitem__(name.lower())
+
+    def __delitem__(self, name: str) -> None:
+        super().__delitem__(name.lower())
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and super().__contains__(name.lower())
+
+    def __ior__(self, headers: Any) -> ResponseHeaders:  # type: ignore[override]
+        self.update(headers)
+        return self
+
+    def get(self, name: str, default: Any = None) -> Any:  # type: ignore[override]
+        return super().get(name.lower(), default)
+
+    def pop(self, name: str, *default: Any) -> Any:  # type: ignore[override]
+        return super().pop(name.lower(), *default)
+
+    def setdefault(self, name: str, default: str) -> str:  # type: ignore[override]
+        return super().setdefault(name.lower(), default)
+
+    def update(self, headers: Any = (), /, **more: str) -> None:  # type: ignore[override]
+        items = headers.items() if hasattr(headers, "items") else headers
+        for name, value in items:
+            self[name] = value
+        for name, value in more.items():
+            self[name] = value
+
+    @classmethod
+    def _from_lower(cls, headers: dict[str, str]) -> ResponseHeaders:
+        """Copy headers whose names are already in lower case, with no Python loop."""
+        result = cls.__new__(cls)
+        dict.update(result, headers)
+        return result
+
+
+# The response type and the headers of each integer meta tag. The tag carries the
+# Content-Type, and middleware reads it from the headers.
+_META_TAG_HEADERS = {
+    tag: (response_type, {} if (ct := _response_type_content_type(response_type)) is None else {"content-type": ct})
+    for tag, response_type in _META_TAG_TO_RESPONSE_TYPE.items()
+}
+
+
 def _split_content_type_headers(
     headers: dict[str, str] | None,
 ) -> tuple[str | None, list[tuple[str, str]] | None]:
     """Split a headers dict into content-type and remaining headers.
 
-    Header names are treated case-insensitively, but original key casing is
-    preserved for the remaining header list so Rust remains the single place
-    that normalizes header names.
+    Header names are treated case-insensitively. A plain dict can hold two
+    content-type keys with other letter cases; the last one wins.
     """
     if not headers:
         return None, None
@@ -86,7 +147,6 @@ def _split_content_type_headers(
 
     for key, value in headers.items():
         if key.lower() == "content-type":
-            # The last one wins: middleware can add a key with another case.
             content_type = value
             continue
         remaining_headers.append((key, value))
@@ -119,7 +179,15 @@ class MiddlewareResponse:
         body_kind: int = _BODY_BYTES,
     ):
         self.status_code = status_code
-        self.headers = headers  # Dict for easy middleware modification
+        # Middleware reads and changes these. A name ignores letter case.
+        headers = headers if type(headers) is ResponseHeaders else ResponseHeaders(headers)
+        if not dict.__contains__(headers, "content-type"):
+            # The headers hold the Content-Type of the response type, so a
+            # Content-Type that is not there was deleted.
+            content_type = _response_type_content_type(response_type)
+            if content_type is not None:
+                dict.__setitem__(headers, "content-type", content_type)
+        self.headers = headers
         self.body = body
         self._response_type = response_type  # Preserve for Rust content-type
         self._raw_cookies = raw_cookies or []  # Raw tuples, Rust serializes
@@ -141,25 +209,24 @@ class MiddlewareResponse:
 
         # Handle integer meta tags (fast path) and tuple meta (slow path)
         if isinstance(meta, int):
-            response_type = _META_TAG_TO_RESPONSE_TYPE.get(meta)
-            if response_type is None:
+            tag = _META_TAG_HEADERS.get(meta)
+            if tag is None:
                 raise TypeError(f"Unknown response meta tag {meta!r}")
-            # The tag carries the Content-Type. Middleware reads it from the headers.
-            content_type = _response_type_content_type(response_type)
-            headers = {"content-type": content_type} if content_type is not None else {}
+            response_type, tag_headers = tag
+            headers = ResponseHeaders._from_lower(tag_headers)
             return cls(status_code, headers, body, response_type, None, body_kind=body_kind)
 
         if not (isinstance(meta, tuple) and len(meta) == 4):
             raise TypeError("Invalid middleware response metadata tuple")
 
         response_type, custom_ct, custom_headers, cookies = meta
-        headers: dict[str, str] = {}
-
-        if custom_ct:
-            headers["content-type"] = custom_ct
-        if custom_headers:
-            for k, v in custom_headers:
-                headers[k.lower()] = v
+        headers = ResponseHeaders(custom_headers or ())
+        # The custom content type, else the one of the response type. An empty
+        # custom content type means none. A content-type in the custom headers
+        # wins, as before.
+        content_type = custom_ct if custom_ct is not None else _response_type_content_type(response_type)
+        if content_type is not None:
+            headers.setdefault("content-type", content_type)
 
         return cls(status_code, headers, body, response_type, cookies, body_kind=body_kind)
 
@@ -168,7 +235,21 @@ class MiddlewareResponse:
 
         Returns ResponseMeta format so Rust handles all header/cookie serialization.
         """
-        custom_ct, custom_headers = _split_content_type_headers(self.headers)
+        headers = self.headers
+        if type(headers) is ResponseHeaders:
+            # Each name is in lower case, so one lookup finds the content type.
+            custom_ct = dict.get(headers, "content-type")
+            custom_headers = (
+                [(name, value) for name, value in dict.items(headers) if name != "content-type"]
+                if len(headers) > (custom_ct is not None)
+                else None
+            )
+        else:
+            custom_ct, custom_headers = _split_content_type_headers(headers)
+        if custom_ct is None:
+            # The headers have no Content-Type, so send none. Rust reads an empty
+            # one as none; without it, Rust sends the one of the response type.
+            custom_ct = ""
 
         # Return ResponseMeta format - Rust serializes headers and cookies
         meta: ResponseMetaTuple = (

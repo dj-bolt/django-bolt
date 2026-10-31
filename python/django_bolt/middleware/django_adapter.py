@@ -1208,11 +1208,13 @@ def _to_django_response(response: Response) -> HttpResponse:
     status_code = getattr(response, "status_code", 200)
     headers = getattr(response, "headers", {})
     content_type, remaining_headers = _split_content_type_headers(headers)
-    if content_type is None:
+    if content_type is None and not isinstance(response, MiddlewareResponse):
+        # A MiddlewareResponse holds its Content-Type in its headers. Other
+        # objects get the one of their response type.
         content_type = _response_type_content_type(getattr(response, "_response_type", "json"))
 
-    django_response = HttpResponse(content=content, status=status_code, content_type=content_type)
-    if content_type is None:
+    django_response = HttpResponse(content=content, status=status_code, content_type=content_type or None)
+    if not content_type:
         # HttpResponse always sets a Content-Type. Bolt sends none for this type.
         del django_response["Content-Type"]
 
