@@ -17,7 +17,9 @@ from django_bolt.param_functions import Cookie, Form, Header, Path, Query
 from django_bolt.testing import TestClient, WebSocketTestClient
 
 
-@pytest.fixture(scope="module")
+# Function scope: each test registers its routes, so a mutation tool sees
+# each test reach the request-time closures of the extractors.
+@pytest.fixture
 def client():
     api = BoltAPI()
 
@@ -84,6 +86,28 @@ def test_aliased_form_field_rejects_bad_value(client):
     assert response.status_code == 422, response.text
 
 
+def test_aliased_cookie_and_header_are_read_by_their_alias():
+    """A route with a request parameter uses the Python injector. It reads the cookie and the header by alias."""
+    api = BoltAPI()
+
+    @api.get("/alias")
+    async def alias(
+        request,
+        session: Annotated[str, Cookie(alias="sid")],
+        trace: Annotated[str, Header(alias="X-Trace-Id")],
+    ):
+        return {"session": session, "trace": trace}
+
+    with TestClient(api) as test_client:
+        response = test_client.get("/alias", headers={"Cookie": "sid=abc", "X-Trace-Id": "t-1"})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"session": "abc", "trace": "t-1"}
+
+        missing = test_client.get("/alias", headers={"X-Trace-Id": "t-1"})
+        assert missing.status_code == 422
+        assert missing.json()["detail"] == "Missing required cookie: sid"
+
+
 def test_field_name_equal_to_other_alias_keeps_each_type(client):
     """Each field gets the type of the field that reads that wire key."""
     response = client.get("/swapped?p=3&page=abc")
@@ -148,7 +172,7 @@ def test_same_type_for_one_wire_key_is_allowed():
     assert response.json() == {"a": 2, "b": 2}
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def ws_api():
     api = BoltAPI()
 

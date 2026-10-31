@@ -77,7 +77,9 @@ def sync_outer_of_async(values: dict = Depends(async_values)) -> dict:
     return {"nested": values["version"]}
 
 
-@pytest.fixture(scope="module")
+# Function scope: each test registers its routes, so a mutation tool sees
+# each test reach the request-time closures of the extractors.
+@pytest.fixture
 def client():
     api = BoltAPI()
 
@@ -232,7 +234,7 @@ def _body_api() -> BoltAPI:
     return api
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def body_client():
     with TestClient(_body_api()) as c:
         yield c
@@ -324,7 +326,7 @@ async def async_item_name(item: Annotated[ItemName, Body()]) -> str:
     return item.name
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def shared_body_client():
     api = BoltAPI()
 

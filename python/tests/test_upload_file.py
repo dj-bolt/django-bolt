@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+import uuid
+from datetime import date
+from decimal import Decimal
+from enum import Enum
+from typing import Annotated, Literal
 
 import msgspec
 import pytest
@@ -56,6 +60,40 @@ class ProfileFormAnnotatedOptional(msgspec.Struct):
 class DocumentFormAnnotated(msgspec.Struct):
     title: str
     documents: Annotated[list[UploadFile], File(max_files=5)]
+
+
+class AdultRegistrationForm(msgspec.Struct):
+    """Struct whose scalar field has a msgspec.Meta constraint."""
+
+    username: str
+    age: Annotated[int, msgspec.Meta(ge=18)]
+    resume: UploadFile
+
+
+class Shade(Enum):
+    RED = "red"
+
+
+class TypedFileForm(msgspec.Struct):
+    """Struct with a file and a field of each type that a form text value becomes."""
+
+    doc: UploadFile
+    count: int
+    ratio: float
+    flag: bool
+    token: uuid.UUID
+    price: Decimal
+    day: date
+    shade: Shade
+    level: Literal[1, 2]
+    ids: list[int]
+
+
+class RequiredNameForm(msgspec.Struct):
+    """Struct with a file and a required text field."""
+
+    name: str
+    doc: UploadFile
 
 
 class PdfTypesByIndex:
@@ -457,7 +495,76 @@ class TestUploadFileValidation:
         assert len(errors) == 1
         assert errors[0]["type"] == "file_missing"
         assert errors[0]["loc"] == ["body", "avatar"]
-        assert "Missing required file" in errors[0]["msg"]
+        assert errors[0]["msg"] == "Missing required file"
+        assert errors[0]["input"] is None
+
+    def test_file_parameter_without_default_that_allows_none_is_none_when_missing(self):
+        """`UploadFile | None` with no default is optional and gives None."""
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(avatar: Annotated[UploadFile | None, File()]):
+            return {"avatar": None if avatar is None else avatar.filename}
+
+        client = TestClient(api)
+        assert client.post("/upload", data={"name": "x"}).json() == {"avatar": None}
+        response = client.post("/upload", files={"avatar": ("a.png", b"x", "image/png")})
+        assert response.json() == {"avatar": "a.png"}
+
+    def test_missing_optional_file_takes_the_default_of_the_parameter(self):
+        """The default of the parameter is the value of a missing file, also when it is not None."""
+        api = BoltAPI()
+        fallback = {"filename": "fallback.txt"}
+
+        @api.post("/upload")
+        async def upload(doc: Annotated[dict | None, File()] = fallback):
+            return {"filename": doc["filename"]}
+
+        client = TestClient(api)
+        assert client.post("/upload", data={"name": "x"}).json() == {"filename": "fallback.txt"}
+        response = client.post("/upload", files={"doc": ("real.txt", b"x", "text/plain")})
+        assert response.json() == {"filename": "real.txt"}
+
+    def test_optional_list_of_dicts_wraps_one_file_in_a_list(self):
+        """A `list[dict]` annotation gives a list for one file and for several files."""
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(files: Annotated[list[dict], File()] = None):
+            return {"names": [f["filename"] for f in files]}
+
+        client = TestClient(api)
+        one = client.post("/upload", files={"files": ("a.txt", b"a", "text/plain")})
+        assert one.json() == {"names": ["a.txt"]}
+        two = client.post(
+            "/upload",
+            files=[("files", ("a.txt", b"a", "text/plain")), ("files", ("b.txt", b"b", "text/plain"))],
+        )
+        assert two.json() == {"names": ["a.txt", "b.txt"]}
+
+    @pytest.mark.parametrize("required", [True, False], ids=["required", "optional"])
+    def test_single_file_parameter_takes_the_first_of_several_files(self, required):
+        """A parameter that is not a list gets the first file when the client sends more."""
+        api = BoltAPI()
+
+        if required:
+
+            @api.post("/upload")
+            async def upload(doc: Annotated[UploadFile, File()]):
+                return {"filename": doc.filename}
+
+        else:
+
+            @api.post("/upload")
+            async def upload(doc: Annotated[UploadFile | None, File()] = None):
+                return {"filename": doc.filename}
+
+        client = TestClient(api)
+        response = client.post(
+            "/upload",
+            files=[("doc", ("a.txt", b"a", "text/plain")), ("doc", ("b.txt", b"b", "text/plain"))],
+        )
+        assert response.json() == {"filename": "a.txt"}
 
     def test_optional_file(self):
         """Test optional file upload."""
@@ -875,7 +982,96 @@ class TestFormStructWithUploadFile:
         assert len(errors) == 1
         assert errors[0]["type"] == "file_missing"
         assert errors[0]["loc"] == ["body", "avatar"]
-        assert "Missing required file" in errors[0]["msg"]
+        assert errors[0]["msg"] == "Missing required file"
+
+    def test_struct_with_bad_field_reports_only_that_field(self):
+        """A valid file does not add an error next to the error of a bad field."""
+        api = BoltAPI()
+
+        @api.post("/register")
+        async def register(data: Annotated[AdultRegistrationForm, Form()]):
+            return {"username": data.username}
+
+        client = TestClient(api)
+        response = client.post(
+            "/register",
+            data={"username": "john", "age": "12"},
+            files={"resume": ("cv.pdf", b"pdf", "application/pdf")},
+        )
+
+        assert response.status_code == 422, response.text
+        errors = response.json()["detail"]
+        assert [err["loc"] for err in errors] == [["body", "age"]]
+
+    def test_struct_with_a_file_converts_each_text_field_to_its_type(self):
+        """A text field of a struct with a file becomes its type, as in a struct without a file."""
+        api = BoltAPI()
+
+        @api.post("/typed")
+        async def typed(data: Annotated[TypedFileForm, Form()]):
+            return {
+                "values": [
+                    data.count,
+                    data.ratio,
+                    data.flag,
+                    str(data.token),
+                    str(data.price),
+                    data.day.isoformat(),
+                    data.shade.value,
+                    data.level,
+                    data.ids,
+                ],
+                "types": [type(getattr(data, name)).__name__ for name in TypedFileForm.__struct_fields__],
+            }
+
+        token = uuid.uuid4()
+        client = TestClient(api)
+        response = client.post(
+            "/typed",
+            data={
+                "count": "3",
+                "ratio": "1.5",
+                "flag": "true",
+                "token": str(token),
+                "price": "1.25",
+                "day": "2024-02-03",
+                "shade": "red",
+                "level": "2",
+                "ids": ["1", "2"],
+            },
+            files={"doc": ("a.txt", b"x", "text/plain")},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["values"] == [3, 1.5, True, str(token), "1.25", "2024-02-03", "red", 2, [1, 2]]
+        assert body["types"] == [
+            "UploadFile",
+            "int",
+            "float",
+            "bool",
+            "UUID",
+            "Decimal",
+            "date",
+            "Shade",
+            "int",
+            "list",
+        ]
+
+    def test_struct_with_a_file_reports_a_missing_text_field_by_name(self):
+        """The message and the place of a missing text field name the form field."""
+        api = BoltAPI()
+
+        @api.post("/named")
+        async def named(data: Annotated[RequiredNameForm, Form()]):
+            return {"name": data.name}
+
+        client = TestClient(api)
+        response = client.post("/named", data={}, files={"doc": ("a.txt", b"x", "text/plain")})
+
+        assert response.status_code == 422, response.text
+        errors = response.json()["detail"]
+        assert [(err["loc"], err["msg"]) for err in errors] == [(["body", "name"], "Missing required form field: name")]
 
     def test_struct_with_annotated_upload_file(self):
         """Annotated[UploadFile, File(...)] inside a struct must be parsed as a file."""
@@ -973,6 +1169,7 @@ class TestFormStructWithUploadFile:
         assert response.status_code == 422, response.text
         errors = response.json()["detail"]
         assert any(err["loc"][-1] == "avatar" for err in errors)
+        assert [err["msg"] for err in errors if err["loc"][-1] == "avatar"] == ["Expected uploaded file, got str"]
 
 
 class TestBackwardCompatibility:
@@ -1282,6 +1479,51 @@ class TestAutoCleanup:
         # All files should be closed
         for i, upload in enumerate(tracked_files):
             assert upload._file.closed, f"File {i} should be closed"
+
+    def test_files_of_every_parameter_are_closed(self):
+        """A later file parameter must not drop the files of an earlier one from the cleanup."""
+        api = BoltAPI()
+        tracked: dict[str, list[UploadFile]] = {}
+
+        @api.post("/upload")
+        async def upload(
+            first: Annotated[UploadFile, File()],
+            second: Annotated[UploadFile, File()],
+            docs: Annotated[list[UploadFile], File()],
+            maybe: Annotated[UploadFile | None, File()] = None,
+            more: Annotated[list[UploadFile] | None, File()] = None,
+        ):
+            tracked["first"] = [first]
+            tracked["second"] = [second]
+            tracked["docs"] = docs
+            tracked["maybe"] = [maybe]
+            tracked["more"] = more
+            return {"ok": True}
+
+        client = TestClient(api)
+        response = client.post(
+            "/upload",
+            files=[
+                ("first", ("1.txt", b"1", "text/plain")),
+                ("second", ("2.txt", b"2", "text/plain")),
+                ("docs", ("3.txt", b"3", "text/plain")),
+                ("docs", ("7.txt", b"7", "text/plain")),
+                ("maybe", ("4.txt", b"4", "text/plain")),
+                ("more", ("5.txt", b"5", "text/plain")),
+                ("more", ("6.txt", b"6", "text/plain")),
+            ],
+        )
+
+        assert response.status_code == 200, response.text
+        assert {name: len(files) for name, files in tracked.items()} == {
+            "first": 1,
+            "second": 1,
+            "docs": 2,
+            "maybe": 1,
+            "more": 2,
+        }
+        for name, files in tracked.items():
+            assert all(upload._file.closed for upload in files), f"{name} should be closed"
 
     def test_struct_files_closed_after_handler(self):
         """Verify files in Form struct are closed after handler."""

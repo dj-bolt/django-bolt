@@ -25,7 +25,9 @@ from django_bolt.params import Param
 from django_bolt.testing import TestClient, WebSocketTestClient
 
 
-@pytest.fixture(scope="module")
+# Function scope: each test registers its routes, so a mutation tool sees
+# each test reach the request-time closures of the extractors.
+@pytest.fixture
 def api():
     api = BoltAPI()
 
@@ -74,7 +76,7 @@ def api():
     return api
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def client(api):
     with TestClient(api) as client:
         yield client
