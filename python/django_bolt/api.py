@@ -148,13 +148,12 @@ Response = ResponseWireV1
 _ASYNC_SUSPEND_OPNAMES = frozenset({"GET_AWAITABLE", "GET_AITER", "GET_ANEXT", "END_ASYNC_FOR"})
 
 
-def _never_suspends(fn: Callable | None) -> bool:
+def _never_suspends(fn: Callable) -> bool:
     """Return whether the code of ``fn`` has no opcode that can suspend.
 
-    One ``send(None)`` then runs a coroutine of ``fn`` to its end.
+    One ``send(None)`` then runs a coroutine of ``fn`` to its end. A callable
+    with no code, such as a ``sync_to_async`` wrapper, can suspend.
     """
-    if fn is None:
-        return False
     try:
         return not any(i.opname in _ASYNC_SUSPEND_OPNAMES for i in dis.get_instructions(fn.__code__))
     except (AttributeError, TypeError):
@@ -2165,11 +2164,7 @@ class BoltAPI:
         # A handler with only the request parameter takes the sync dispatch when it
         # cannot suspend: a sync handler that does not block, or an async one with no await.
         # Its async executor below stays for a route that the sync dispatch cannot serve.
-        if (
-            mode == "request_only"
-            and not is_blocking
-            and (not is_async or _never_suspends(meta.get("_original_fn") or meta.get("handler")))
-        ):
+        if mode == "request_only" and not is_blocking and (not is_async or _never_suspends(meta["_original_fn"])):
             meta["_sync_executor"] = _request_only_sync_executor(is_async, meta, self._serialize_on_orm_pool)
 
         # The sync executors below finish a result that their fast checks do not
@@ -2185,7 +2180,7 @@ class BoltAPI:
             # Detect trivially-async handlers: async def with no suspension points.
             # These can be dispatched synchronously by driving the coroutine inline
             # via coro.send(None) → StopIteration, avoiding the entire async bridge.
-            _trivially_async = _never_suspends(meta.get("_original_fn") or meta.get("handler"))
+            _trivially_async = _never_suspends(meta["_original_fn"])
 
             # Super-fast path: no compiled response validation → inline dict/list serialization
             # directly into the executor. Eliminates 2 async function call overheads
@@ -2925,10 +2920,8 @@ class BoltAPI:
 
         The read of ``request.user`` can be indirect, for example in a template,
         so the message must say where the request ran. This runs on the error path only.
+        ``_dispatch`` catches each error, so it describes each error one time.
         """
-        if getattr(error, "_bolt_route_described", False):
-            return
-        error._bolt_route_described = True
         route = next((f"{method} {path}" for method, path, route_id, _ in self._routes if route_id == handler_id), None)
         target = inspect.unwrap(handler)
         code = getattr(target, "__code__", None)
@@ -2936,7 +2929,7 @@ class BoltAPI:
         if code is not None:
             where += f" ({code.co_filename}:{code.co_firstlineno})"
         description = f"Route: {route or 'unknown'}. Handler: {where}."
-        error.args = (f"{error.args[0]} {description}", *error.args[1:])
+        error.args = (f"{error.args[0]} {description}",)
 
         dev_mode = django_settings.DEBUG or os.environ.get("DJANGO_BOLT_DEV_WORKER") == "1"
         if dev_mode and handler_id not in self._lane_affinity_hinted:
@@ -2957,11 +2950,11 @@ class BoltAPI:
         The ``error_formatter`` can change the response, but not this choice.
         """
         if self._logging_middleware and is_server_exception(e):
-            self._logging_middleware.log_exception(request, e, exc_info=True)
+            self._logging_middleware.log_exception(request, e)
         try:
             # Without a formatter, the handler reads the Django DEBUG setting.
             if self._error_formatter is None:
-                return _wire_from_error_parts(*handle_exception(e, debug=None, request=request))
+                return _wire_from_error_parts(*handle_exception(e))
             return _wire_from_error_parts(*handle_exception_with_formatter(self._error_formatter, e, request))
         except Exception as error:
             self._log_error_response_failure(request, error)
@@ -3132,10 +3125,8 @@ class BoltAPI:
         meta: dict[str, Any],
     ) -> Callable[[Any], Any]:
         """Build the route executor of one route (router+route middleware + handler)."""
-        router_middleware = meta.get("_router_middleware", [])
-        route_middleware = meta.get("_route_middleware", getattr(handler, "__bolt_middleware__", []))
-        combined_specs = [*router_middleware, *route_middleware]
-        normalized_specs = normalize_middleware_specs(combined_specs, context="route", allow_function_middleware=True)
+        # Registration normalized both lists.
+        route_specs = [*meta["_router_middleware"], *meta["_route_middleware"]]
 
         check_session_guards = meta["_session_guard_check"]
         if check_session_guards is None:
@@ -3152,7 +3143,7 @@ class BoltAPI:
                 return await self._execute_handler_as_middleware_response(handler, req, meta)
 
         chain = execute_handler
-        for middleware_spec in reversed(normalized_specs):
+        for middleware_spec in reversed(route_specs):
             if not self._is_python_middleware_spec(middleware_spec):
                 continue
             # Route executors are cached per route, so wrapper instances must be cloned.
@@ -3189,7 +3180,6 @@ class BoltAPI:
         self,
         handler: Callable,
         request: dict[str, Any],
-        handler_id: int,
         api: BoltAPI,
         meta: dict[str, Any],
     ) -> Response:
@@ -3199,7 +3189,6 @@ class BoltAPI:
         Args:
             handler: The route handler function
             request: The request dictionary
-            handler_id: Handler ID
             api: The BoltAPI instance that owns this handler (may be sub-app)
             meta: Handler metadata
         """
@@ -3215,25 +3204,21 @@ class BoltAPI:
         else:
             middleware_chain = self._get_route_global_chain(global_middleware)
 
-        request_state = request.setdefault("state", {})
+        request_state = request.state
 
         # Django middleware gets this view in process_view.
         request_state["_view_func"] = meta["view_func"]
         request_state["_bolt_route_executor"] = self._get_route_executor(handler, meta)
 
-        try:
-            middleware_response = await middleware_chain(request)
-            if isinstance(middleware_response, MiddlewareResponse):
-                return middleware_response.to_tuple()
-            if isinstance(middleware_response, tuple):
-                return MiddlewareResponse.from_tuple(middleware_response).to_tuple()
-            raise TypeError(
-                f"Middleware chain returned unsupported response type: {type(middleware_response).__name__}. "
-                "Expected MiddlewareResponse or ResponseWireV1 tuple."
-            )
-        finally:
-            if request_state:
-                request_state.pop("_bolt_route_executor", None)
+        middleware_response = await middleware_chain(request)
+        if isinstance(middleware_response, MiddlewareResponse):
+            return middleware_response.to_tuple()
+        if isinstance(middleware_response, tuple):
+            return MiddlewareResponse.from_tuple(middleware_response).to_tuple()
+        raise TypeError(
+            f"Middleware chain returned unsupported response type: {type(middleware_response).__name__}. "
+            "Expected MiddlewareResponse or ResponseWireV1 tuple."
+        )
 
     async def _check_revocation(
         self,
@@ -3299,7 +3284,7 @@ class BoltAPI:
         # For merged APIs, use the original API's middleware chain and logging
         # This preserves per-API auth, middleware, and logging config (Litestar-style)
         # Note: _handler_api_map is always initialized in __init__ (no hasattr needed)
-        original_api = self._handler_api_map.get(handler_id) if handler_id is not None else None
+        original_api = self._handler_api_map.get(handler_id)
 
         try:
             # 1. Direct metadata access using handler_id (int key is faster than callable key)
@@ -3340,7 +3325,7 @@ class BoltAPI:
 
             if api_with_middleware:
                 # Execute through middleware chain (Django-style)
-                return await self._dispatch_with_middleware(handler, request, handler_id, api_with_middleware, meta)
+                return await self._dispatch_with_middleware(handler, request, api_with_middleware, meta)
             else:
                 # Fast path: no middleware, execute pre-compiled handler executor directly.
                 return await meta["_handler_executor"](handler, request)
@@ -3358,8 +3343,7 @@ class BoltAPI:
             # Auto-cleanup UploadFiles to prevent resource leaks
             # Only runs for handlers with file uploads (optimization: skip for 95%+ of requests)
             if meta["has_file_uploads"]:
-                request_state = request.setdefault("state", {})
-                upload_files = request_state.get("_upload_files", [])
+                upload_files = request.state.get("_upload_files", [])
                 for upload in upload_files:
                     with suppress(Exception):
                         upload.close_sync()
@@ -3412,8 +3396,7 @@ class BoltAPI:
             return self._handle_generic_exception(e, request=request)
         finally:
             if meta["has_file_uploads"]:
-                request_state = request.setdefault("state", {})
-                upload_files = request_state.get("_upload_files", [])
+                upload_files = request.state.get("_upload_files", [])
                 for upload in upload_files:
                     with suppress(Exception):
                         upload.close_sync()
