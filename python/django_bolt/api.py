@@ -1871,6 +1871,16 @@ class BoltAPI:
             if meta["is_multi_response"]:
                 for entry in meta["_resolved_metas"].values():
                     compile_response_handlers(entry)
+                    # The data types that a (status, data) tuple encodes with no
+                    # handler. A Serializer type converts its data even when the
+                    # entry does not validate. The handler of an entry with row
+                    # fields converts a list of model instances to them.
+                    if entry["_has_response_validation"]:
+                        entry["_tuple_plain_types"] = ()
+                    elif "response_field_names" in entry:
+                        entry["_tuple_plain_types"] = (dict,)
+                    else:
+                        entry["_tuple_plain_types"] = (dict, list)
 
             # Compile optimized argument injector (once at registration time)
             # This pre-compiles all parameter extraction logic for maximum performance
@@ -2089,8 +2099,7 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        # A Serializer type converts its data even when the entry does not validate.
-                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
+                        if isinstance(data, entry["_tuple_plain_types"]):
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
                             return await serialize_json_data(data, code)
@@ -2112,8 +2121,7 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        # A Serializer type converts its data even when the entry does not validate.
-                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
+                        if isinstance(data, entry["_tuple_plain_types"]):
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
                             return serialize_json_data_sync(data, code)

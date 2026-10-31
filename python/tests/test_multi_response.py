@@ -693,6 +693,34 @@ def test_a_bare_return_uses_the_fields_of_the_catch_all_type(is_async, as_list):
     assert (response.status_code, response.json()) == (200, [{"title": "One"}])
 
 
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("code", [200, 201], ids=["listed", "catch-all"])
+def test_a_tuple_with_a_list_of_model_instances_uses_the_fields_of_its_entry(is_async, code):
+    """A (status, list) tuple projects model instances to the row fields of the entry, as a bare return does."""
+    api = BoltAPI()
+    responses = {200: list[TitleRow], ...: list[TitleRow]}
+    Article.objects.create(title="One", content="First", author="A")
+    loaded = list(Article.objects.all())
+
+    if is_async:
+
+        @api.get("/articles", response_model=responses)
+        async def articles():
+            return code, loaded
+
+    else:
+
+        @api.get("/articles", response_model=responses)
+        def articles():
+            return code, loaded
+
+    with TestClient(api) as client:
+        response = client.get("/articles")
+
+    assert (response.status_code, response.json()) == (code, [{"title": "One"}])
+
+
 # ============================================================================
 # The executor of each kind of handler
 # ============================================================================
