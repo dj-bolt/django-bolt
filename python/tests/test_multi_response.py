@@ -600,6 +600,29 @@ def test_a_bare_return_has_an_explicit_status_code_that_the_dict_does_not_list(i
     assert (response.status_code, response.json()) == (201, {"id": 1, "name": "New"})
 
 
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_bare_return_uses_the_implicit_catch_all_with_an_explicit_status_code(is_async):
+    """With no ``...`` in the dict, registration adds a catch-all entry with the status of the route."""
+    api = BoltAPI()
+
+    if is_async:
+
+        @api.post("/items", response_model={200: OkSchema}, status_code=201)
+        async def create_item():
+            return {"id": 1, "name": "New"}
+
+    else:
+
+        @api.post("/items", response_model={200: OkSchema}, status_code=201)
+        def create_item():
+            return {"id": 1, "name": "New"}
+
+    with TestClient(api) as client:
+        response = client.post("/items")
+
+    assert (response.status_code, response.json()) == (201, {"id": 1, "name": "New"})
+
+
 class TitleRow(msgspec.Struct):
     title: str
 

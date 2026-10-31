@@ -87,8 +87,8 @@ def marked_sync_wrapper(handler):
     return inspect.markcoroutinefunction(wrapper)
 
 
-@pytest.mark.parametrize("path", ["/request-only", "/with-param?q=bolt"])
-def test_a_marked_sync_wrapper_whose_coroutine_awaits_runs_in_a_task(path):
+@pytest.mark.parametrize(("path", "q"), [("/request-only", ""), ("/with-param?q=bolt", "bolt")])
+def test_a_marked_sync_wrapper_whose_coroutine_awaits_runs_in_a_task(path, q):
     """The code of the wrapper has no await, but its coroutine can suspend."""
     api = BoltAPI()
 
@@ -103,7 +103,7 @@ def test_a_marked_sync_wrapper_whose_coroutine_awaits_runs_in_a_task(path):
         response = client.get(path)
 
     assert response.status_code == 200, response.text
-    assert response.json()["in_task"] is True
+    assert response.json() == {"in_task": True, "q": q}
 
 
 def test_a_sync_to_async_request_handler_runs_in_a_task():
