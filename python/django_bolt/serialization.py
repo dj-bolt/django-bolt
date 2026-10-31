@@ -53,6 +53,8 @@ from .responses import (
 from .responses import Response as ResponseClass
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from .typing import HandlerMetadata
 
 # Type aliases for response formats
@@ -1090,20 +1092,20 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     meta["_response_type_handler_sync"] = response_type_handler_sync
 
 
-def is_response_instance(value: Any) -> bool:
-    return isinstance(value, _RESPONSE_INSTANCE_TYPES)
+def serialize_response(result: Any, meta: HandlerMetadata | dict[str, Any]) -> Coroutine[Any, Any, ResponseWireV1]:
+    """Serialize handler result to HTTP response.
 
-
-async def serialize_response(result: Any, meta: HandlerMetadata | dict[str, Any]) -> ResponseWireV1:
-    """Serialize handler result to HTTP response."""
-    if is_response_instance(result):
-        return await meta["_response_type_handler"](result)
-    return await meta["_default_response_handler"](result)
+    The caller awaits the coroutine of the route handler. This function adds no
+    coroutine of its own.
+    """
+    if isinstance(result, _RESPONSE_INSTANCE_TYPES):
+        return meta["_response_type_handler"](result)
+    return meta["_default_response_handler"](result)
 
 
 def serialize_response_sync(result: Any, meta: HandlerMetadata | dict[str, Any]) -> ResponseWireV1:
     """Serialize handler result to HTTP response (sync version for sync handlers)."""
-    if is_response_instance(result):
+    if isinstance(result, _RESPONSE_INSTANCE_TYPES):
         return meta["_response_type_handler_sync"](result)
     return meta["_default_response_handler_sync"](result)
 
