@@ -2878,16 +2878,15 @@ class BoltAPI:
                 # State dict is only touched when Rust may have prebound args —
                 # all other routes skip the setdefault entirely (hot-path rule:
                 # no per-request allocations that can be avoided).
+                # Rust sets both prebound keys or neither. It sets neither when it
+                # bails, and then the injector raises the proper error.
+                prebound_args = None
                 if has_rust_prebound:
-                    request_state = request.setdefault("state", {})
+                    request_state = request.state
                     prebound_args = request_state.pop("_bolt_prebound_args", None)
-                    prebound_kwargs = request_state.pop("_bolt_prebound_kwargs", None)
-                    has_prebound = prebound_args is not None and prebound_kwargs is not None
-                else:
-                    has_prebound = False
 
-                if has_prebound:
-                    args, kwargs = prebound_args, prebound_kwargs
+                if prebound_args is not None:
+                    args, kwargs = prebound_args, request_state.pop("_bolt_prebound_kwargs")
                 elif injector_is_async:
                     args, kwargs = await injector(request)
                 elif is_blocking and not is_async:
