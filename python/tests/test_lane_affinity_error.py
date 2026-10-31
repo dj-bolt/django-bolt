@@ -117,7 +117,7 @@ def _hint_records(caplog) -> list[logging.LogRecord]:
 
 
 # The handler of _api: its qualified name, then its file and line.
-_WHERE = re.escape(f"{__name__}._api.<locals>.profile (") + r"[^()]*test_lane_affinity_error\.py:\d+\)"
+_WHERE = re.escape(f"{__name__}._api.<locals>.profile (") + r".*?test_lane_affinity_error\.py:\d+\)"
 
 
 def test_the_error_names_the_qualified_name_of_the_handler(caplog):
