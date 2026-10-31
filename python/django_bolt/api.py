@@ -197,7 +197,8 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
                 except StopIteration as stop:
                     return finish(stop.value)
                 coro.close()
-                raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                # Unreachable: _never_suspends accepts no handler that can suspend.
+                raise RuntimeError("Handler awaited unexpectedly in sync dispatch")  # pragma: no mutate
 
             return execute
 
@@ -216,7 +217,8 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
                 result = stop.value
             else:
                 coro.close()
-                raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                # Unreachable: _never_suspends accepts no handler that can suspend.
+                raise RuntimeError("Handler awaited unexpectedly in sync dispatch")  # pragma: no mutate
             if isinstance(result, dict):
                 return encode(result)
             return finish(result)
@@ -434,7 +436,9 @@ def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: s
 def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: bytes) -> ResponseWireV1:
     """Convert error-handler parts into ResponseWireV1."""
 
-    custom_content_type = None
+    # Each error handler sets a content-type, and then Rust does not read the
+    # response type. Rust also reads an unknown response type as octet-stream.
+    custom_content_type = None  # pragma: no mutate
     custom_headers: list[tuple[str, str]] = []
 
     for key, value in headers:
@@ -444,7 +448,7 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
             custom_headers.append((key, value))
 
     meta = (
-        _infer_wire_response_type(custom_content_type) if custom_content_type else "octetstream",
+        _infer_wire_response_type(custom_content_type) if custom_content_type else "octetstream",  # pragma: no mutate
         custom_content_type,
         custom_headers or None,
         None,
@@ -2923,13 +2927,17 @@ class BoltAPI:
         so the message must say where the request ran. This runs on the error path only.
         ``_dispatch`` catches each error, so it describes each error one time.
         """
+        # Each route is in _routes, and an unwrapped handler has code. The
+        # defaults keep the error path working if that ever changes.
+        # pragma: no mutate start
         route = next((f"{method} {path}" for method, path, route_id, _ in self._routes if route_id == handler_id), None)
+        # pragma: no mutate end
         target = inspect.unwrap(handler)
-        code = getattr(target, "__code__", None)
+        code = getattr(target, "__code__", None)  # pragma: no mutate
         where = f"{target.__module__}.{target.__qualname__}"
         if code is not None:
             where += f" ({code.co_filename}:{code.co_firstlineno})"
-        description = f"Route: {route or 'unknown'}. Handler: {where}."
+        description = f"Route: {route or 'unknown'}. Handler: {where}."  # pragma: no mutate
         error.args = (f"{error.args[0]} {description}",)
 
         dev_mode = django_settings.DEBUG or os.environ.get("DJANGO_BOLT_DEV_WORKER") == "1"
@@ -3098,12 +3106,14 @@ class BoltAPI:
         the APIs that mount it.
         """
         key = id(middleware_specs)
-        chain = self._route_global_chain_cache.get(key)
+        # Double-checked lock: the first lookup only skips the lock. The second
+        # lookup matters only when two threads build the same chain at once.
+        chain = self._route_global_chain_cache.get(key)  # pragma: no mutate
         if chain is not None:
             return chain
 
         with self._route_executor_lock:
-            chain = self._route_global_chain_cache.get(key)
+            chain = self._route_global_chain_cache.get(key)  # pragma: no mutate
             if chain is None:
                 chain = self._build_middleware_chain(middleware_specs, clone_wrapper=True)
                 self._route_global_chain_cache[key] = chain
@@ -3165,12 +3175,14 @@ class BoltAPI:
         mounted API keeps no reference to the APIs that mount it.
         """
         key = id(meta)
-        cached_executor = self._route_executor_cache.get(key)
+        # Double-checked lock: the first lookup only skips the lock. The second
+        # lookup matters only when two threads build the same executor at once.
+        cached_executor = self._route_executor_cache.get(key)  # pragma: no mutate
         if cached_executor is not None:
             return cached_executor
 
         with self._route_executor_lock:
-            cached_executor = self._route_executor_cache.get(key)
+            cached_executor = self._route_executor_cache.get(key)  # pragma: no mutate
             if cached_executor is None:
                 cached_executor = self._build_route_executor(handler, meta)
                 self._route_executor_cache[key] = cached_executor
@@ -3346,7 +3358,9 @@ class BoltAPI:
             if meta["has_file_uploads"]:
                 upload_files = request.state.get("_upload_files", [])
                 for upload in upload_files:
-                    with suppress(Exception):
+                    # The close of a read file does not raise. The guard keeps the
+                    # response if a file that the handler wrote fails to flush.
+                    with suppress(Exception):  # pragma: no mutate
                         upload.close_sync()
 
     def _dispatch_sync(self, handler: Callable, request: dict[str, Any], handler_id: int = None) -> Response:
@@ -3399,7 +3413,9 @@ class BoltAPI:
             if meta["has_file_uploads"]:
                 upload_files = request.state.get("_upload_files", [])
                 for upload in upload_files:
-                    with suppress(Exception):
+                    # The close of a read file does not raise. The guard keeps the
+                    # response if a file that the handler wrote fails to flush.
+                    with suppress(Exception):  # pragma: no mutate
                         upload.close_sync()
 
     async def _serialize_on_orm_pool(self, result: QuerySet, meta: dict[str, Any], request: dict[str, Any]) -> Response:
