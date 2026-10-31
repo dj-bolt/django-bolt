@@ -846,6 +846,40 @@ def test_python_middleware_headers_ignore_the_letter_case_of_a_name():
     assert response.headers.get_list("content-type") == ["application/xml"]
 
 
+class DropContentType(Middleware):
+    """Delete the Content-Type, or set it to an empty value."""
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        if request.query.get("how") == "empty":
+            response.headers["Content-Type"] = ""
+        else:
+            del response.headers["Content-Type"]
+        return response
+
+
+@pytest.mark.parametrize("how", ["delete", "empty"])
+@pytest.mark.parametrize(
+    "django_middleware",
+    [None, ["django.middleware.clickjacking.XFrameOptionsMiddleware"]],
+    ids=["python", "python+django"],
+)
+def test_python_middleware_removes_the_content_type(how, django_middleware):
+    """A Content-Type that middleware deletes or empties is not sent."""
+    api = BoltAPI(middleware=[DropContentType], django_middleware=django_middleware)
+
+    @api.get("/html")
+    async def html():
+        return HTML("<p>x</p>")
+
+    with TestClient(api) as client:
+        response = client.get("/html", params={"how": how})
+
+    assert response.status_code == 200
+    assert "content-type" not in response.headers
+    assert response.text == "<p>x</p>"
+
+
 def test_python_middleware_replaces_the_content_type_in_any_letter_case():
     """A Content-Type that middleware sets wins over the one of the response."""
     api = BoltAPI(middleware=[CsvContentType])

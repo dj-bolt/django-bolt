@@ -180,7 +180,14 @@ class MiddlewareResponse:
     ):
         self.status_code = status_code
         # Middleware reads and changes these. A name ignores letter case.
-        self.headers = headers if type(headers) is ResponseHeaders else ResponseHeaders(headers)
+        headers = headers if type(headers) is ResponseHeaders else ResponseHeaders(headers)
+        if not dict.__contains__(headers, "content-type"):
+            # The headers hold the Content-Type of the response type, so a
+            # Content-Type that is not there was deleted.
+            content_type = _response_type_content_type(response_type)
+            if content_type is not None:
+                dict.__setitem__(headers, "content-type", content_type)
+        self.headers = headers
         self.body = body
         self._response_type = response_type  # Preserve for Rust content-type
         self._raw_cookies = raw_cookies or []  # Raw tuples, Rust serializes
@@ -214,9 +221,10 @@ class MiddlewareResponse:
 
         response_type, custom_ct, custom_headers, cookies = meta
         headers = ResponseHeaders(custom_headers or ())
-        # The custom content type, else the one of the response type. A
-        # content-type in the custom headers wins, as before.
-        content_type = custom_ct or _response_type_content_type(response_type)
+        # The custom content type, else the one of the response type. An empty
+        # custom content type means none. A content-type in the custom headers
+        # wins, as before.
+        content_type = custom_ct if custom_ct is not None else _response_type_content_type(response_type)
         if content_type is not None:
             headers.setdefault("content-type", content_type)
 
@@ -238,6 +246,10 @@ class MiddlewareResponse:
             )
         else:
             custom_ct, custom_headers = _split_content_type_headers(headers)
+        if custom_ct is None:
+            # The headers have no Content-Type, so send none. Rust reads an empty
+            # one as none; without it, Rust sends the one of the response type.
+            custom_ct = ""
 
         # Return ResponseMeta format - Rust serializes headers and cookies
         meta: ResponseMetaTuple = (
