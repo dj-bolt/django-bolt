@@ -119,20 +119,26 @@ impl<'a, 'py> Scan<'a, 'py> {
         use pyo3::ffi;
         let py = item.py();
         let container = item.as_ptr();
-        // SAFETY: the thread holds the GIL. The loops run no Python code: a
-        // kind lookup hashes and compares type objects, which is native.
-        // Thus no thread can change the container while a loop reads it, and
-        // each borrowed item stays alive. An item goes on the stack as a new
-        // reference.
+        // SAFETY: the thread holds the GIL. A leaf check and a memo check run
+        // no Python code, so the borrowed item stays alive for them. A kind
+        // lookup can run Python code: the metaclass of the item can hash in
+        // Python, and that code can change the container. Thus each item
+        // takes a strong reference before its lookup, the list loop reads the
+        // size again for each index, and it stops on a missing item.
         unsafe {
             if ffi::PyDict_Check(container) != 0 {
                 let mut position: ffi::Py_ssize_t = 0;
                 let mut key = std::ptr::null_mut();
                 let mut value = std::ptr::null_mut();
+                // PyDict_Next checks its position against the current table,
+                // so a dict that changes during a lookup cannot crash it.
                 while ffi::PyDict_Next(container, &mut position, &mut key, &mut value) != 0 {
-                    if !is_exact_leaf_ptr(value) && self.wants_type(ffi::Py_TYPE(value)) {
-                        self.stack
-                            .push((Bound::from_borrowed_ptr(py, value), depth));
+                    if is_exact_leaf_ptr(value) || ffi::Py_TYPE(value) == self.leaf_type {
+                        continue;
+                    }
+                    let child = Bound::from_borrowed_ptr(py, value);
+                    if self.wants_type(child.get_type().as_type_ptr()) {
+                        self.stack.push((child, depth));
                     }
                 }
                 return true;
@@ -147,11 +153,21 @@ impl<'a, 'py> Scan<'a, 'py> {
             } else {
                 return false;
             };
-            for index in 0..size(container) {
+            let mut index = 0;
+            while index < size(container) {
                 let child = get_item(container, index);
-                if !is_exact_leaf_ptr(child) && self.wants_type(ffi::Py_TYPE(child)) {
-                    self.stack
-                        .push((Bound::from_borrowed_ptr(py, child), depth));
+                if child.is_null() {
+                    // The list became shorter during a kind lookup.
+                    ffi::PyErr_Clear();
+                    break;
+                }
+                index += 1;
+                if is_exact_leaf_ptr(child) || ffi::Py_TYPE(child) == self.leaf_type {
+                    continue;
+                }
+                let child = Bound::from_borrowed_ptr(py, child);
+                if self.wants_type(child.get_type().as_type_ptr()) {
+                    self.stack.push((child, depth));
                 }
             }
         }
@@ -421,6 +437,34 @@ def kinds():
             ] {
                 assert!(scan(&module, &eval(&module, expr)).unwrap(), "{expr}");
             }
+        });
+    }
+
+    #[test]
+    fn a_container_that_changes_during_a_kind_lookup_does_not_crash_the_scan() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = fixtures(py);
+            // The kind lookup hashes the type. This metaclass runs Python
+            // code there that empties the list under scan.
+            let code = c"
+class Clearing(type):
+    def __hash__(cls):
+        items.clear()
+        return type.__hash__(cls)
+
+class Item(metaclass=Clearing):
+    pass
+
+items = [Item(), Item(), Item(), Secret()]
+by_key = {'a': Item(), 'b': Item()}
+";
+            py.run(code, Some(&module.dict()), None).unwrap();
+            let items = eval(&module, "items");
+            scan(&module, &items).unwrap();
+            assert_eq!(items.len().unwrap(), 0);
+            let by_key = eval(&module, "by_key");
+            assert!(!scan(&module, &by_key).unwrap());
         });
     }
 
