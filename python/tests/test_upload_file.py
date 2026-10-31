@@ -214,6 +214,242 @@ class TestUploadFileClass:
         assert django_file.read() == b"fake pdf content"
 
 
+class TestUploadFileFileHandling:
+    """Test the file position, file mode and close behavior of UploadFile."""
+
+    CONTENT = b"hello world"
+
+    @pytest.fixture
+    def uploads(self):
+        """Collect UploadFile objects and close each one after the test."""
+        created = []
+        yield created
+        for upload in created:
+            upload.close_sync()
+
+    @pytest.fixture
+    def disk_upload(self, tmp_path, uploads):
+        """Build an UploadFile that Rust spooled to disk."""
+        path = tmp_path / "spooled.bin"
+        path.write_bytes(self.CONTENT)
+        upload = UploadFileClass.from_file_info(
+            {
+                "filename": "spooled.bin",
+                "content_type": "application/x-test",
+                "size": len(self.CONTENT),
+                "content": None,
+                "temp_path": str(path),
+            }
+        )
+        uploads.append(upload)
+        return upload
+
+    @pytest.fixture
+    def memory_upload(self, uploads):
+        """Build an UploadFile that stays in memory."""
+        upload = UploadFileClass.from_file_info(
+            {"filename": "memory.bin", "content_type": "text/plain", "size": len(self.CONTENT), "content": self.CONTENT}
+        )
+        uploads.append(upload)
+        return upload
+
+    @pytest.fixture
+    def rolled_upload(self, uploads):
+        """Build an UploadFile that Python rolled over to disk."""
+        upload = UploadFileClass("rolled.bin", file_data=self.CONTENT, max_spool_size=4)
+        uploads.append(upload)
+        return upload
+
+    @pytest.fixture(params=["disk_upload", "memory_upload", "rolled_upload"])
+    def any_upload(self, request):
+        """Run a test once for each kind of UploadFile."""
+        return request.getfixturevalue(request.param)
+
+    def test_init_defaults(self, uploads):
+        """An UploadFile with only a name has the default type, size and headers."""
+        upload = UploadFileClass("empty.bin")
+        uploads.append(upload)
+
+        assert upload.content_type == "application/octet-stream"
+        assert upload.size == 0
+        assert upload.headers == {}
+        assert upload.rolled_to_disk is False
+        assert upload.file.read() == b""
+
+    def test_init_rolls_to_disk_above_max_spool_size(self, uploads):
+        """The max_spool_size argument sets when the content goes to disk."""
+        small = UploadFileClass("a.bin", file_data=b"x" * 10, max_spool_size=100)
+        large = UploadFileClass("b.bin", file_data=b"x" * 10, max_spool_size=4)
+        uploads.extend([small, large])
+
+        assert small.rolled_to_disk is False
+        assert large.rolled_to_disk is True
+        assert large.file.read() == b"x" * 10
+
+    def test_from_file_info_in_memory_copies_every_field(self, uploads):
+        """A memory-backed file_info gives an UploadFile with all its fields."""
+        upload = UploadFileClass.from_file_info(
+            {
+                "filename": "image.png",
+                "content_type": "image/png",
+                "size": 3,
+                "headers": {"x-part": "1"},
+                "content": b"abc",
+            }
+        )
+        uploads.append(upload)
+
+        assert upload.filename == "image.png"
+        assert upload.content_type == "image/png"
+        assert upload.size == 3
+        assert upload.headers == {"x-part": "1"}
+        assert upload.rolled_to_disk is False
+        assert isinstance(upload.file, DjangoFile)
+        assert upload.file.read() == b"abc"
+
+    def test_from_file_info_in_memory_uses_defaults(self, uploads):
+        """A memory-backed file_info with no fields gives the default values."""
+        upload = UploadFileClass.from_file_info({})
+        uploads.append(upload)
+
+        assert upload.filename == ""
+        assert upload.content_type == "application/octet-stream"
+        assert upload.size == 0
+        assert upload.headers == {}
+        assert upload.file.read() == b""
+
+    def test_from_file_info_on_disk_copies_every_field(self, tmp_path, uploads):
+        """A disk-backed file_info gives an UploadFile with all its fields."""
+        path = tmp_path / "spooled.bin"
+        path.write_bytes(b"abc")
+        upload = UploadFileClass.from_file_info(
+            {
+                "filename": "big.bin",
+                "content_type": "application/x-big",
+                "size": 3,
+                "headers": {"x-part": "2"},
+                "temp_path": str(path),
+            }
+        )
+        uploads.append(upload)
+
+        assert upload.filename == "big.bin"
+        assert upload.content_type == "application/x-big"
+        assert upload.size == 3
+        assert upload.headers == {"x-part": "2"}
+        assert upload.rolled_to_disk is True
+        assert isinstance(upload.file, DjangoFile)
+        assert upload.file.read() == b"abc"
+
+    def test_from_file_info_on_disk_uses_defaults(self, tmp_path, uploads):
+        """A disk-backed file_info with only a path gives the default values."""
+        path = tmp_path / "spooled.bin"
+        path.write_bytes(b"")
+        upload = UploadFileClass.from_file_info({"temp_path": str(path)})
+        uploads.append(upload)
+
+        assert upload.filename == ""
+        assert upload.content_type == "application/octet-stream"
+        assert upload.size == 0
+        assert upload.headers == {}
+
+    def test_disk_file_opens_in_binary_read_write_mode(self, disk_upload):
+        """The lazy open gives a binary file that accepts a write."""
+        raw = disk_upload.raw_file
+
+        assert raw.mode == "rb+"
+        assert raw.read(5) == b"hello"
+        assert raw.write(b"_WORLD") == 6
+        raw.seek(0)
+        assert raw.read() == b"hello_WORLD"
+
+    @pytest.mark.asyncio
+    async def test_read_returns_only_the_asked_size(self, any_upload):
+        """A read with a size returns that many bytes, then the rest."""
+        assert await any_upload.read(5) == b"hello"
+        assert await any_upload.read() == b" world"
+        assert await any_upload.read() == b""
+
+    @pytest.mark.asyncio
+    async def test_seek_returns_the_new_position(self, any_upload):
+        """Seek honors both the offset and the reference point."""
+        assert await any_upload.seek(3) == 3
+        assert await any_upload.read(2) == b"lo"
+        assert await any_upload.seek(2, 1) == 7
+        assert await any_upload.read() == b"orld"
+        assert await any_upload.seek(-5, 2) == 6
+        assert await any_upload.read() == b"world"
+
+    @pytest.mark.asyncio
+    async def test_write_returns_the_count_and_changes_the_content(self, any_upload):
+        """A write puts the bytes at the position and returns their count."""
+        assert await any_upload.write(b"HELLO") == 5
+        await any_upload.seek(0)
+        assert await any_upload.read() == b"HELLO world"
+
+    @pytest.mark.asyncio
+    async def test_write_on_disk_reaches_the_file(self, disk_upload):
+        """A write to a disk-spooled file lands in the file on disk."""
+        await disk_upload.write(b"HELLO")
+        await disk_upload.close()
+
+        with open(disk_upload._temp_path, "rb") as handle:
+            assert handle.read() == b"HELLO world"
+
+    @pytest.mark.asyncio
+    async def test_close_closes_the_file(self, any_upload):
+        """The async close closes the file, and a second close is safe."""
+        raw = any_upload.raw_file
+        assert raw.closed is False
+
+        await any_upload.close()
+        assert raw.closed is True
+
+        await any_upload.close()
+        assert raw.closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_of_a_never_opened_file_opens_nothing(self, disk_upload):
+        """Closing a disk-spooled file that nobody read does not open it."""
+        await disk_upload.close()
+
+        assert disk_upload._file is None
+
+    def test_close_sync_closes_the_file(self, any_upload):
+        """The sync close closes the file, and a second close is safe."""
+        raw = any_upload.raw_file
+
+        any_upload.close_sync()
+        assert raw.closed is True
+
+        any_upload.close_sync()
+        assert raw.closed is True
+
+    def test_close_sync_of_a_never_opened_file_opens_nothing(self, disk_upload):
+        """Closing a disk-spooled file that nobody read does not fail or open it."""
+        disk_upload.close_sync()
+
+        assert disk_upload._file is None
+
+    def test_repr_of_a_memory_file(self, memory_upload):
+        """The repr shows the name, type and size only."""
+        assert repr(memory_upload) == "UploadFile(filename='memory.bin', content_type='text/plain', size=11)"
+
+    def test_repr_of_a_rolled_file(self, rolled_upload):
+        """The repr says that the file rolled to disk."""
+        assert repr(rolled_upload) == (
+            "UploadFile(filename='rolled.bin', content_type='application/octet-stream', size=0 (rolled to disk))"
+        )
+
+    def test_repr_of_a_disk_spooled_file(self, disk_upload):
+        """The repr says that the file is on disk, and says when it is open."""
+        expected = "UploadFile(filename='spooled.bin', content_type='application/x-test', size=11, disk-spooled"
+        assert repr(disk_upload) == expected + ")"
+
+        disk_upload.raw_file  # noqa: B018 - the access opens the file
+        assert repr(disk_upload) == expected + ", opened)"
+
+
 class TestUploadFileValidation:
     """Test file upload validation with File() constraints."""
 

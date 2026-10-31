@@ -125,6 +125,154 @@ class TestCookieSerialization:
         assert "data=" in header
 
 
+class TestCookieHeaderExactText:
+    """Tests for the exact text of Cookie.to_header_value()."""
+
+    def test_header_value_starts_with_the_name_and_value(self):
+        """The header value holds no prefix before the name."""
+        assert Cookie("session", "abc123").to_header_value() == "session=abc123; Path=/; SameSite=Lax"
+
+    def test_header_value_with_every_attribute(self):
+        """Each attribute appears once in the header value."""
+        cookie = Cookie(
+            "session",
+            "abc123",
+            max_age=3600,
+            expires=datetime(2025, 12, 31, 23, 59, 59, tzinfo=UTC),
+            path="/api",
+            domain="example.com",
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+        )
+        assert cookie.to_header_value() == (
+            "session=abc123; Domain=example.com; expires=Wed, 31 Dec 2025 23:59:59 GMT; "
+            "HttpOnly; Max-Age=3600; Path=/api; SameSite=Strict; Secure"
+        )
+
+
+class TestCookieRawTuple:
+    """Tests for the 9-tuple that Rust serializes."""
+
+    def test_raw_tuple_with_every_attribute(self):
+        """The tuple holds each field in the documented order."""
+        cookie = Cookie(
+            "session",
+            "abc123",
+            max_age=3600,
+            expires=datetime(2025, 12, 31, 23, 59, 59, tzinfo=UTC),
+            path="/api",
+            domain="example.com",
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+        )
+        assert cookie.to_raw_tuple() == (
+            "session",
+            "abc123",
+            "/api",
+            3600,
+            "Wed, 31 Dec 2025 23:59:59 GMT",
+            "example.com",
+            True,
+            True,
+            "Strict",
+        )
+
+    def test_raw_tuple_keeps_an_expires_string(self):
+        """An expires string goes to Rust without a change."""
+        cookie = Cookie("session", "abc123", expires="Thu, 01 Jan 2026 00:00:00 GMT")
+        assert cookie.to_raw_tuple()[4] == "Thu, 01 Jan 2026 00:00:00 GMT"
+
+    def test_raw_tuple_defaults(self):
+        """A cookie with samesite=False has None for expires, max age, domain and samesite."""
+        assert Cookie("session", "abc123", samesite=False).to_raw_tuple() == (
+            "session",
+            "abc123",
+            "/",
+            None,
+            None,
+            None,
+            False,
+            False,
+            None,
+        )
+
+
+class TestCookieAttributesInSetCookieHeader:
+    """Tests for the Set-Cookie header that the server sends."""
+
+    @staticmethod
+    def _set_cookie_parts(cookie: Cookie) -> list[str]:
+        api = BoltAPI()
+
+        @api.get("/cookie")
+        async def set_cookie():
+            return Response({"ok": True}).set_cookie(
+                cookie.name,
+                cookie.value,
+                max_age=cookie.max_age,
+                expires=cookie.expires,
+                path=cookie.path,
+                domain=cookie.domain,
+                secure=cookie.secure,
+                httponly=cookie.httponly,
+                samesite=cookie.samesite,
+            )
+
+        with TestClient(api) as client:
+            header = client.get("/cookie").headers["set-cookie"]
+        return header.split("; ")
+
+    def test_every_attribute_reaches_the_header(self):
+        """The header holds the value and every attribute."""
+        cookie = Cookie(
+            "session",
+            "abc123",
+            max_age=3600,
+            expires=datetime(2025, 12, 31, 23, 59, 59, tzinfo=UTC),
+            path="/api",
+            domain="example.com",
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+        )
+        parts = self._set_cookie_parts(cookie)
+        assert parts[0] == "session=abc123"
+        assert sorted(parts[1:]) == sorted(
+            [
+                "Max-Age=3600",
+                "Expires=Wed, 31 Dec 2025 23:59:59 GMT",
+                "Path=/api",
+                "Domain=example.com",
+                "Secure",
+                "HttpOnly",
+                "SameSite=Strict",
+            ]
+        )
+
+    def test_expires_string_reaches_the_header(self):
+        """An expires string appears in the header."""
+        parts = self._set_cookie_parts(Cookie("session", "abc123", expires="Thu, 01 Jan 2026 00:00:00 GMT"))
+        assert "Expires=Thu, 01 Jan 2026 00:00:00 GMT" in parts
+
+    def test_no_expires_gives_no_expires_attribute(self):
+        """A cookie with no expires has no Expires attribute."""
+        parts = self._set_cookie_parts(Cookie("session", "abc123"))
+        assert not any(part.lower().startswith("expires") for part in parts)
+
+    def test_samesite_false_omits_the_attribute(self):
+        """A cookie with samesite=False has no SameSite attribute."""
+        parts = self._set_cookie_parts(Cookie("session", "abc123", samesite=False))
+        assert parts[0] == "session=abc123"
+        assert not any(part.lower().startswith("samesite") for part in parts)
+
+    def test_default_cookie_attributes(self):
+        """A plain cookie has the path and SameSite=Lax only."""
+        parts = self._set_cookie_parts(Cookie("session", "abc123"))
+        assert sorted(parts) == ["Path=/", "SameSite=Lax", "session=abc123"]
+
+
 class TestMakeDeleteCookie:
     """Tests for make_delete_cookie helper function."""
 
