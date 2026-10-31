@@ -1765,10 +1765,11 @@ class BoltAPI:
                     meta["is_multi_response"] = True
                     meta["response_map"] = response_model
 
-                    # Pre-compute field names for each code's type
+                    # Pre-compute field names for each code's type, and for
+                    # the ... entry, which serves each unlisted status.
                     field_names_map = {}
                     for code, resp_type in response_model.items():
-                        if resp_type is not None and code is not ...:
+                        if resp_type is not None:
                             resp_meta = extract_response_metadata(resp_type)
                             if "response_field_names" in resp_meta:
                                 field_names_map[code] = resp_meta["response_field_names"]
