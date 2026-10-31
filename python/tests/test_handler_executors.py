@@ -90,6 +90,11 @@ def register_routes(api: BoltAPI) -> None:
         await asyncio.sleep(0)
         return [Item(id=item_id, q=q, in_task=in_task())]
 
+    @api.get("/awaits/object-list/{item_id}")
+    async def awaits_object_list(item_id: int, *, q: str) -> list[Item]:
+        await asyncio.sleep(0)
+        return [SimpleNamespace(id=item_id, q=q, in_task=in_task())]
+
     @api.get("/awaits/int-list/{item_id}")
     async def awaits_int_list(item_id: int, *, q: str) -> list[int]:
         # A validated type that the inline fast path does not take.
@@ -132,6 +137,7 @@ TASK = {**ITEM, "in_task": True}
         ("/awaits/struct/7", TASK),
         ("/awaits/struct-from-dict/7", TASK),
         ("/awaits/struct-list/7", [TASK]),
+        ("/awaits/object-list/7", [TASK]),
         ("/awaits/int-list/7", [7, 4]),
         ("/sync/untyped/7", NO_TASK),
         ("/sync/dict/7", NO_TASK),
@@ -162,6 +168,11 @@ def register_no_param_routes(api: BoltAPI) -> None:
         await asyncio.sleep(0)
         return Item(id=1, q="none", in_task=in_task())
 
+    @api.get("/awaits/object-list")
+    async def awaits_object_list() -> list[Item]:
+        await asyncio.sleep(0)
+        return [SimpleNamespace(id=1, q="none", in_task=in_task())]
+
     @api.get("/awaits/untyped-list")
     async def awaits_untyped_list():
         await asyncio.sleep(0)
@@ -173,6 +184,7 @@ def register_no_param_routes(api: BoltAPI) -> None:
     [
         ("/trivial/struct", {"id": 1, "q": "none", "in_task": False}),
         ("/awaits/struct", {"id": 1, "q": "none", "in_task": True}),
+        ("/awaits/object-list", [{"id": 1, "q": "none", "in_task": True}]),
         ("/awaits/untyped-list", [{"id": 1, "q": "none", "in_task": True}]),
     ],
 )
