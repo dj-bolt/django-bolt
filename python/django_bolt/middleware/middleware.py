@@ -130,14 +130,9 @@ def normalize_middleware_specs(
             if allow_function_middleware and _is_function_middleware_callable(spec):
                 normalized.append(FunctionMiddlewareSpec(spec))
                 continue
-            if not isinstance(spec, type):
-                raise TypeError(
-                    f"{context} middleware does not accept middleware instances ({type(spec).__name__}). "
-                    "Pass middleware classes instead, e.g. middleware=[MyMiddleware]."
-                )
             raise TypeError(
-                f"{context} middleware entry '{spec}' must be a middleware class "
-                "or DjangoMiddleware/DjangoMiddlewareStack wrapper."
+                f"{context} middleware does not accept middleware instances ({type(spec).__name__}). "
+                "Pass middleware classes instead, e.g. middleware=[MyMiddleware]."
             )
 
         raise TypeError(
