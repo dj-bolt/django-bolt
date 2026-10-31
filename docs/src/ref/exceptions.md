@@ -137,7 +137,7 @@ except RequestValidationError as e:
 
 ### ResponseValidationError
 
-Raised when handler return value fails validation. Returns **500 Internal Server Error**.
+Raised when handler return value fails validation. Returns **500 Internal Server Error**. With `DEBUG=False`, the response body does not show the validation errors. Bolt writes them to the server log.
 
 <!-- fragment -->
 ```python

@@ -134,7 +134,9 @@ def test_plain_iterator_is_not_streamed_without_a_stream_annotation():
             assert response.json()["kind"] == "response_validation", path
 
 
-def test_tuple_is_not_streamed_under_a_stream_annotation():
+def test_tuple_is_not_streamed_under_a_stream_annotation(settings):
+    # The 500 shows the validation errors only when DEBUG is on. This test reads them.
+    settings.DEBUG = True
     api = BoltAPI()
 
     @api.get("/tuple")

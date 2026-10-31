@@ -7,6 +7,7 @@ validation error" is the failure response; its message names the cause.
 from __future__ import annotations
 
 import asyncio
+from typing import List  # noqa: UP035 - the test needs the bare typing.List
 
 import msgspec
 import pytest
@@ -35,6 +36,13 @@ class ItemFull(msgspec.Struct):
     id: int
     note: str
     secret: str
+
+
+class Envelope[T](msgspec.Struct):
+    """A parametrized Struct, as the pagination envelope is."""
+
+    items: list[T]
+    total: int
 
 
 class Camel(msgspec.Struct, rename="camel"):
@@ -74,7 +82,9 @@ def _validation_message(response) -> str:
 # Function scope: each test registers the routes, so a mutation tool sees
 # each test reach the compiled coercers.
 @pytest.fixture
-def client():
+def client(settings):
+    # The 500 shows the validation errors only when DEBUG is on. These tests read them.
+    settings.DEBUG = True
     api = BoltAPI()
 
     @api.get("/struct/dict")
@@ -182,6 +192,22 @@ def client():
     @api.get("/list-int/dict")
     async def list_int_dict() -> list[int]:
         return {"a": 1}
+
+    @api.get("/list-bare/ok")
+    async def list_bare_ok() -> List:  # noqa: UP006
+        return [1, "a"]
+
+    @api.get("/list-bare/dict")
+    async def list_bare_dict() -> List:  # noqa: UP006
+        return {"a": 1}
+
+    @api.get("/generic/dict")
+    async def generic_dict() -> Envelope[int]:
+        return {"items": [1, 2], "total": 2}
+
+    @api.get("/generic/bad-dict")
+    async def generic_bad_dict() -> Envelope[int]:
+        return {"items": ["x"], "total": 1}
 
     @api.get("/mapping/bad")
     async def mapping_bad() -> dict[str, int]:
@@ -344,6 +370,18 @@ def test_list_of_scalars_is_validated(client):
     assert client.get("/list-int/ok").json() == [1, 2]
     message = _validation_message(client.get("/list-int/bad-item"))
     assert "Expected `int`, got `str`" in message
+
+
+def test_bare_list_accepts_any_item_and_names_its_item_type_in_a_mismatch(client):
+    assert client.get("/list-bare/ok").json() == [1, "a"]
+    message = _validation_message(client.get("/list-bare/dict"))
+    assert message.startswith("Response type mismatch: expected list[Any], but handler returned dict.")
+
+
+def test_parametrized_struct_from_a_dict_is_validated(client):
+    assert client.get("/generic/dict").json() == {"items": [1, 2], "total": 2}
+    message = _validation_message(client.get("/generic/bad-dict"))
+    assert message.startswith("Response validation failed: Expected `int`, got `str`")
 
 
 def test_other_generic_type_is_validated(client):

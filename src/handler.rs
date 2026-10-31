@@ -1525,19 +1525,12 @@ async fn route_request<const ACCESS_LOG: bool>(
                 .await
                 {
                     Ok(response) => response,
-                    Err(e) => Python::attach(|py| {
+                    Err(e) => {
                         let reason =
                             format!("Handler returned unsupported response wire format: {}", e);
-                        let response = error::build_error_response(
-                            py,
-                            500,
-                            reason.clone(),
-                            vec![],
-                            None,
-                            state.debug,
-                        );
+                        let response = error::internal_error_response(&reason);
                         error::with_error_info(response, || error::ErrorInfo::internal(reason))
-                    }),
+                    }
                 }
             }
             Err(e) => Python::attach(|py| {

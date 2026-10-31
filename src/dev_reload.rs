@@ -23,12 +23,13 @@ struct Paint {
 
 impl Paint {
     fn detect() -> Self {
-        let enabled = std::io::stderr().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none()
-            && std::env::var("TERM")
-                .map(|term| term != "dumb")
-                .unwrap_or(true);
-        Self { enabled }
+        Self {
+            enabled: color_enabled(
+                std::io::stderr().is_terminal(),
+                std::env::var_os("NO_COLOR").is_some(),
+                std::env::var("TERM").ok().as_deref(),
+            ),
+        }
     }
 
     fn wrap(&self, code: &str, text: &str) -> String {
@@ -69,6 +70,12 @@ impl Paint {
             body
         );
     }
+}
+
+/// True when the log lines of the supervisor get colors: stderr is a terminal,
+/// `NO_COLOR` is not set and `TERM` is not `dumb`.
+fn color_enabled(is_terminal: bool, no_color: bool, term: Option<&str>) -> bool {
+    is_terminal && !no_color && term != Some("dumb")
 }
 
 /// Render a path relative to the current directory when possible; developers
@@ -619,18 +626,19 @@ pub fn run_dev_reloader(
 #[cfg(test)]
 mod tests {
     use super::{
-        ReloadFilter, first_relevant_path, is_temporary_path, recv_change,
-        terminal_worker_exit_code,
+        Paint, ReloadFilter, color_enabled, display_path, first_relevant_file_in,
+        first_relevant_path, format_exit_status, is_temporary_path, recv_change,
+        terminal_worker_exit_code, wait_for_child_exit,
     };
     use notify::{
         Event, EventKind,
-        event::{CreateKind, ModifyKind, RenameMode},
+        event::{CreateKind, DataChange, ModifyKind, RenameMode},
     };
     use std::path::PathBuf;
     use std::process::{Command, ExitStatus};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn exit_status(code: i32) -> ExitStatus {
         Command::new("sh")
@@ -687,6 +695,27 @@ mod tests {
         )));
         assert!(is_temporary_path(&PathBuf::from("/tmp/project/.#main.py")));
         assert!(!is_temporary_path(&PathBuf::from("/tmp/project/main.py")));
+    }
+
+    #[test]
+    fn each_temporary_file_pattern_does_not_trigger_reload() {
+        let project = PathBuf::from("/tmp/project");
+        for name in [
+            "main.py~",
+            "main.py.swp",
+            "main.py.swo",
+            "main.py.swx",
+            "main.py.tmp",
+            "4913",
+            ".#main.py",
+            "#main.py#",
+        ] {
+            assert!(is_temporary_path(&project.join(name)), "{name}");
+        }
+        // A `#` at only one end is a normal name.
+        for name in ["main.py", "#main.py", "main.py#", "49130"] {
+            assert!(!is_temporary_path(&project.join(name)), "{name}");
+        }
     }
 
     #[test]
@@ -901,5 +930,170 @@ mod tests {
         assert!(filter.is_relevant(&PathBuf::from("/tmp/project/templates/index.html")));
         assert!(!filter.is_relevant(&PathBuf::from("/tmp/project/runtime.log")));
         assert!(!filter.is_relevant(&PathBuf::from("/tmp/project/static/app.css")));
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_directory_has_no_file_to_find() {
+        // A new path that is gone or is a file has nothing to scan. Only a
+        // directory that cannot be read gives itself.
+        let root = TempDir::new("not-a-dir");
+        let file = root.0.join("app.py");
+        std::fs::write(&file, "VALUE = 1\n").unwrap();
+        let filter = ReloadFilter::new(vec![], vec![]);
+
+        assert_eq!(first_relevant_file_in(&root.0.join("gone"), &filter), None);
+        assert_eq!(first_relevant_file_in(&file, &filter), None);
+    }
+
+    fn modify_event(path: &str) -> Event {
+        Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            paths: vec![PathBuf::from(path)],
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn changes_within_the_debounce_give_one_reload_for_the_last_path() {
+        let filter = ReloadFilter::new(vec![], vec![]);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(modify_event("/tmp/project/models.py"))).unwrap();
+        tx.send(Ok(modify_event("/tmp/project/views.py"))).unwrap();
+        let debounce = Duration::from_millis(200);
+        let timeout = Duration::from_millis(10);
+
+        assert_eq!(
+            recv_change(&rx, &filter, debounce, timeout),
+            Ok(Some(PathBuf::from("/tmp/project/views.py")))
+        );
+        // The first reload took the second event.
+        assert_eq!(recv_change(&rx, &filter, debounce, timeout), Ok(None));
+        drop(tx);
+    }
+
+    #[test]
+    fn a_change_that_arrives_during_the_debounce_replaces_the_path() {
+        let filter = ReloadFilter::new(vec![], vec![]);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(modify_event("/tmp/project/models.py"))).unwrap();
+        let later = tx.clone();
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            later
+                .send(Ok(modify_event("/tmp/project/views.py")))
+                .unwrap();
+        });
+
+        let changed = recv_change(
+            &rx,
+            &filter,
+            Duration::from_millis(500),
+            Duration::from_millis(10),
+        );
+        sender.join().unwrap();
+
+        assert_eq!(changed, Ok(Some(PathBuf::from("/tmp/project/views.py"))));
+        drop(tx);
+    }
+
+    #[test]
+    fn wait_for_child_exit_gives_the_status_of_a_child_that_exits_in_time() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.1; exit 3")
+            .spawn()
+            .unwrap();
+
+        let status = wait_for_child_exit(&mut child, Duration::from_secs(30)).unwrap();
+
+        assert_eq!(status.and_then(|status| status.code()), Some(3));
+    }
+
+    #[test]
+    fn wait_for_child_exit_gives_none_after_the_timeout() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+
+        let status = wait_for_child_exit(&mut child, Duration::from_millis(100));
+        let waited = started.elapsed();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert!(matches!(status, Ok(None)), "{status:?}");
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sighup_is_ignored_reads_the_current_action() {
+        use super::sighup_is_ignored;
+
+        // SAFETY: SIG_IGN and SIG_DFL install no Rust code. No test of this
+        // binary sends SIGHUP.
+        let previous = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        let ignored = sighup_is_ignored();
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_DFL) };
+        let default = sighup_is_ignored();
+        unsafe { libc::signal(libc::SIGHUP, previous) };
+
+        assert!(ignored);
+        assert!(!default);
+    }
+
+    #[test]
+    fn exit_status_names_the_exit_code() {
+        assert_eq!(format_exit_status(exit_status(3)), "exit code 3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_status_names_a_signal() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(
+            format_exit_status(ExitStatus::from_raw(libc::SIGKILL)),
+            "terminated by signal"
+        );
+    }
+
+    #[test]
+    fn colors_need_a_terminal_without_no_color_or_a_dumb_term() {
+        assert!(color_enabled(true, false, None));
+        assert!(color_enabled(true, false, Some("xterm-256color")));
+        assert!(!color_enabled(false, false, None));
+        assert!(!color_enabled(true, true, None));
+        assert!(!color_enabled(true, false, Some("dumb")));
+    }
+
+    #[test]
+    fn paint_adds_the_color_code_only_when_enabled() {
+        let paint = Paint { enabled: true };
+        assert_eq!(paint.dim("t"), "\x1b[2mt\x1b[0m");
+        assert_eq!(paint.cyan("t"), "\x1b[36mt\x1b[0m");
+        assert_eq!(paint.green("t"), "\x1b[32mt\x1b[0m");
+        assert_eq!(paint.yellow("t"), "\x1b[33mt\x1b[0m");
+        assert_eq!(paint.red("t"), "\x1b[31mt\x1b[0m");
+        assert_eq!(Paint { enabled: false }.red("t"), "t");
+    }
+
+    #[test]
+    fn display_path_is_relative_to_the_current_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let inside = PathBuf::from("api").join("views.py");
+        assert_eq!(
+            display_path(&cwd.join(&inside)),
+            inside.display().to_string()
+        );
+
+        // Each absolute path is inside the root directory, so a test that
+        // runs there has no outside path.
+        if let Some(parent) = cwd.parent() {
+            let outside = parent.join("other").join("app.py");
+            assert_eq!(display_path(&outside), outside.display().to_string());
+        }
     }
 }

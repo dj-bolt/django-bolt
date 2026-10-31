@@ -540,6 +540,32 @@ def test_single_wrapper_inspects_the_instance_that_a_factory_returns():
         assert client.get("/guarded").status_code == 403
 
 
+@pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "middleware_classes",
+    [[_AsyncCallMixinMiddleware], [_TenantMixinMiddleware, _AsyncCallMixinMiddleware]],
+    ids=["alone", "after-a-hook"],
+)
+def test_stack_awaits_a_middleware_with_an_async_call_and_default_flags(middleware_classes, handler_is_async):
+    """A class with an async ``__call__`` needs the event loop, even when it sets no capability flag."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack(middleware_classes)])
+
+    if handler_is_async:
+
+        @api.get("/guarded")
+        async def guarded():
+            return {"reached": True}
+
+    else:
+
+        @api.get("/guarded")
+        def guarded():
+            return {"reached": True}
+
+    with TestClient(api) as client:
+        assert client.get("/guarded").status_code == 403
+
+
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("handler_is_async", [False, True], ids=["sync", "async"])
 def test_test_client_exit_closes_the_connections_of_its_lanes(handler_is_async):
@@ -634,6 +660,74 @@ def test_single_wrapper_awaits_an_async_only_call_override_on_the_event_loop():
             assert response.status_code == 200, response.text
             assert response.json() == {"ok": True}
             assert response.headers["x-shielded"] == "yes"
+
+
+class _ThreadProbeMiddleware(MiddlewareMixin):
+    """A mixin subclass with a sync ``__call__``. It records where its ``__call__`` and its hook run."""
+
+    seen: dict = {}
+
+    def __call__(self, request):
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False
+        type(self).seen["call"] = (on_loop, threading.get_ident())
+        return super().__call__(request)
+
+    def process_response(self, request, response):
+        type(self).seen["hook"] = threading.get_ident()
+        return response
+
+
+def test_single_wrapper_runs_a_sync_call_override_on_the_thread_of_the_request():
+    """A sync ``__call__`` runs off the event loop. It runs on the thread where the hooks of the request run."""
+    _ThreadProbeMiddleware.seen = {}
+    api = BoltAPI(middleware=[DjangoMiddleware(_ThreadProbeMiddleware)])
+
+    @api.get("/probe")
+    async def probe():
+        await asyncio.sleep(0)
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        assert client.get("/probe").status_code == 200
+
+    on_loop, call_thread = _ThreadProbeMiddleware.seen["call"]
+    assert on_loop is False
+    assert call_thread == _ThreadProbeMiddleware.seen["hook"]
+
+
+class _HookThreadRecorder:
+    """A third-party hook middleware. It records the thread of each of its hooks."""
+
+    idents: dict = {}
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def process_request(self, request):
+        type(self).idents["request"] = threading.get_ident()
+
+    def process_response(self, request, response):
+        type(self).idents["response"] = threading.get_ident()
+        return response
+
+
+def test_stack_runs_the_request_hook_and_the_response_hook_on_the_thread_of_the_request():
+    """A hook that writes thread-local state in one phase finds it again in the next phase."""
+    _HookThreadRecorder.idents = {}
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([_HookThreadRecorder])])
+
+    @api.get("/thread")
+    async def thread_route():
+        return {"request_thread": await sync_to_async(threading.get_ident, thread_sensitive=True)()}
+
+    with TestClient(api) as client:
+        request_thread = client.get("/thread").json()["request_thread"]
+
+    assert _HookThreadRecorder.idents == {"request": request_thread, "response": request_thread}
 
 
 _TEST_JWT_SECRET = "test-only-secret-longer-than-32-characters"
@@ -1048,15 +1142,29 @@ class _NeitherCapableMiddleware:
         return self.get_response(request)
 
 
+class _SyncOffAsyncUnsetMiddleware:
+    """Turn sync off and leave async_capable unset. Django reads an unset async_capable as False."""
+
+    sync_capable = False
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+
+@pytest.mark.parametrize("middleware_class", [_NeitherCapableMiddleware, _SyncOffAsyncUnsetMiddleware])
 @pytest.mark.parametrize(
     "wrap",
-    [lambda: DjangoMiddlewareStack([_NeitherCapableMiddleware]), lambda: DjangoMiddleware(_NeitherCapableMiddleware)],
+    [lambda cls: DjangoMiddlewareStack([cls]), lambda cls: DjangoMiddleware(cls)],
     ids=["stack", "single_wrapper"],
 )
-def test_a_middleware_with_no_capability_is_rejected(wrap):
+def test_a_middleware_with_no_capability_is_rejected(wrap, middleware_class):
     """Django rejects such a middleware at load. Bolt must not run it."""
-    with pytest.raises(RuntimeError, match="sync_capable"):
-        wrap()
+    with pytest.raises(RuntimeError) as raised:
+        wrap(middleware_class)
+
+    assert str(raised.value) == (
+        f"Middleware {middleware_class.__qualname__} must have at least one of sync_capable/async_capable set to True."
+    )
 
 
 @pytest.mark.django_db(transaction=True)

@@ -385,5 +385,93 @@ def test_compression_config_validation():
         CompressionConfig(backend="invalid")
 
     # Negative minimum_size should raise error
-    with pytest.raises(ValueError, match="minimum_size must be non-negative"):
+    with pytest.raises(ValueError, match="^minimum_size must be non-negative$"):
         CompressionConfig(backend="gzip", minimum_size=-1)
+
+
+def test_compression_config_defaults_reach_rust_unchanged():
+    """The default config and its Rust form hold the documented values."""
+    assert CompressionConfig().to_rust_config() == {
+        "backend": "brotli",
+        "minimum_size": 500,
+        "gzip_fallback": True,
+        "brotli_level": 5,
+        "brotli_lgwin": 14,
+        "gzip_level": 6,
+        "zstd_level": 3,
+    }
+
+
+def test_compression_config_rust_form_keeps_each_custom_value():
+    """Each field has its own key in the Rust form."""
+    config = CompressionConfig(
+        backend="zstd",
+        minimum_size=0,
+        gzip_fallback=False,
+        brotli_level=11,
+        brotli_lgwin=24,
+        gzip_level=9,
+        zstd_level=22,
+    )
+
+    assert config.to_rust_config() == {
+        "backend": "zstd",
+        "minimum_size": 0,
+        "gzip_fallback": False,
+        "brotli_level": 11,
+        "brotli_lgwin": 24,
+        "gzip_level": 9,
+        "zstd_level": 22,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "low", "high"),
+    [
+        ("brotli_level", 0, 11),
+        ("brotli_lgwin", 10, 24),
+        ("gzip_level", 0, 9),
+        ("zstd_level", 1, 22),
+    ],
+)
+def test_compression_config_accepts_the_edges_of_a_level_range(field, low, high):
+    """A level at the lowest or the highest edge of its range is valid."""
+    assert getattr(CompressionConfig(**{field: low}), field) == low
+    assert getattr(CompressionConfig(**{field: high}), field) == high
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("brotli_level", -1),
+        ("brotli_level", 12),
+        ("brotli_lgwin", 9),
+        ("brotli_lgwin", 25),
+        ("gzip_level", -1),
+        ("gzip_level", 10),
+        ("zstd_level", 0),
+        ("zstd_level", 23),
+        ("gzip_level", True),
+        ("zstd_level", True),
+        ("brotli_level", 5.0),
+        ("brotli_lgwin", "14"),
+    ],
+)
+def test_compression_config_rejects_a_level_outside_its_range(field, bad):
+    """A level out of range, a bool and a non-int stop startup. The message names the field and the range."""
+    with pytest.raises(ValueError, match=rf"{field} must be an int in \[\d+, \d+\], got {bad!r}"):
+        CompressionConfig(**{field: bad})
+
+
+def test_compression_config_accepts_a_minimum_size_of_zero():
+    """Zero means that each buffered response is compressed."""
+    api = BoltAPI(compression=CompressionConfig(backend="gzip", minimum_size=0))
+
+    @api.get("/tiny")
+    async def tiny():
+        return {"data": "x" * 200}
+
+    with TestClient(api, use_http_layer=True) as client:
+        response = client.get("/tiny", headers={"Accept-Encoding": "gzip"})
+
+    assert response.headers.get("content-encoding") == "gzip"

@@ -815,3 +815,50 @@ async def test_websocket_mixed_injection(injection_api):
         assert response["authorization"] == "Bearer mix-token"
         # Cookie param
         assert response["session"] == "mix-session"
+
+
+# --- The WebSocket parameter ---
+
+
+class AppWebSocket(WebSocket):
+    """A subclass of WebSocket for an annotation."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["annotated", "subclass"])
+async def test_websocket_parameter_may_be_annotated_or_a_subclass(kind):
+    """The handler gets the socket for `Annotated[WebSocket, ...]` and for a subclass. The next parameter binds as usual."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/annotated")
+    async def annotated(websocket: Annotated[WebSocket, "the socket"], room: str = "lobby"):
+        await websocket.accept()
+        await websocket.send_text(room)
+
+    @api.websocket("/ws/subclass")
+    async def subclass(websocket: AppWebSocket, room: str = "lobby"):
+        await websocket.accept()
+        await websocket.send_text(room)
+
+    async with WebSocketTestClient(api, f"/ws/{kind}", query_string="room=blue") as ws:
+        assert await ws.receive_text() == "blue"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/ws/bare-websocket", "/ws/bare-ws"])
+async def test_websocket_parameter_may_have_no_annotation(route):
+    """A first parameter named `websocket` or `ws` with no annotation is the socket. The next one binds as usual."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/bare-websocket")
+    async def named_websocket(websocket, room: str = "lobby"):
+        await websocket.accept()
+        await websocket.send_text(room)
+
+    @api.websocket("/ws/bare-ws")
+    async def named_ws(ws, room: str = "lobby"):
+        await ws.accept()
+        await ws.send_text(room)
+
+    async with WebSocketTestClient(api, route, query_string="room=blue") as ws:
+        assert await ws.receive_text() == "blue"

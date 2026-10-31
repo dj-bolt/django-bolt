@@ -266,7 +266,9 @@ def test_formatter_request_takes_the_scheme_from_a_trusted_proxy_only(settings, 
     assert response.json() == {"port": port}
 
 
-def test_response_validation_500_reaches_the_formatter(recorded, caplog):
+def test_response_validation_500_reaches_the_formatter(recorded, caplog, settings):
+    # The formatter gets the field errors only when DEBUG is on.
+    settings.DEBUG = True
     with caplog.at_level(logging.ERROR, logger="django_bolt.error_handlers"):
         response = recorded.get("/bad-response")
     assert response.status_code == 500

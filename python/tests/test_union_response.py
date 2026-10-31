@@ -358,8 +358,10 @@ def test_inline_list_path_converts_a_later_object_by_attribute(api_kwargs):
             assert resp.json() == [{"id": 4, "note": "default"}, {"id": 5, "note": "default"}], path
 
 
-def test_inline_list_path_reports_an_invalid_element():
+def test_inline_list_path_reports_an_invalid_element(settings):
     """An invalid element still gives the validation error of that element."""
+    # The 500 shows the validation errors only when DEBUG is on. This test reads them.
+    settings.DEBUG = True
     api = BoltAPI()
 
     @api.get("/rows")
@@ -409,12 +411,14 @@ class Checked(msgspec.Struct):
 @pytest.mark.parametrize(
     "api_kwargs", [{}, {"middleware": [PassThroughMiddleware]}], ids=["plain", "python-middleware"]
 )
-def test_inline_list_path_reports_each_error_as_the_slow_path_does(api_kwargs):
+def test_inline_list_path_reports_each_error_as_the_slow_path_does(api_kwargs, settings):
     """Each error of the inline list path gives the error body of the slow path.
 
     An untagged union of Structs makes msgspec raise TypeError. An error in
     __post_init__ escapes msgspec as it is.
     """
+    # The 500 shows the validation errors only when DEBUG is on. This test reads them.
+    settings.DEBUG = True
     api = BoltAPI(**api_kwargs)
 
     @api.get("/slow-union")
@@ -477,8 +481,10 @@ class RowSerializer(Serializer):
     id: int
 
 
-def test_response_validation_error_locates_the_error_in_the_response():
+def test_response_validation_error_locates_the_error_in_the_response(settings):
     """A response validation error has the root "response", not the root of the request body."""
+    # The 500 shows the validation errors only when DEBUG is on. This test reads them.
+    settings.DEBUG = True
     api = BoltAPI()
 
     @api.get("/list")

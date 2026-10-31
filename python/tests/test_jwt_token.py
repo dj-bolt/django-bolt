@@ -4,7 +4,8 @@ Test JWT Token class for Django-Bolt.
 Tests the Token dataclass for encoding/decoding JWTs with performance focus.
 """
 
-from datetime import UTC, datetime, timedelta
+import time
+from datetime import UTC, datetime, timedelta, timezone
 
 import jwt as pyjwt
 import pytest
@@ -431,6 +432,257 @@ class TestTokenRoundTrip:
 
             assert token.sub == "user123"
             assert token.is_staff is True
+
+
+@pytest.fixture(params=["JST-9", "PST8"])
+def local_timezone(request, monkeypatch):
+    """Set the local time zone of the process to one that is not UTC.
+
+    JST-9 is nine hours ahead of UTC. PST8 is eight hours behind.
+    A Token must use UTC and must not use the local time zone.
+    """
+    monkeypatch.setenv("TZ", request.param)
+    time.tzset()
+    yield request.param
+    monkeypatch.undo()
+    time.tzset()
+
+
+def _all_claims_token(**overrides) -> Token:
+    """Build a token that sets every standard claim, with a past ``iat`` and a past ``nbf``."""
+    now = datetime.now(UTC)
+    fields = {
+        "sub": "claims-user",
+        "exp": now + timedelta(hours=5),
+        "iat": now - timedelta(hours=2),
+        "nbf": now - timedelta(hours=1),
+        "iss": "auth-service",
+        "aud": "my-api",
+        "jti": "jti-1",
+        "is_staff": True,
+        "is_superuser": True,
+        "is_admin": False,
+        "permissions": ["read"],
+    }
+    fields.update(overrides)
+    return Token(**fields)
+
+
+class TestTokenClaimValidation:
+    """Token checks its own claims when it is built."""
+
+    def test_none_subject_raises_value_error(self):
+        """A subject of None gives a ValueError, not a TypeError."""
+        with pytest.raises(ValueError, match=r"^sub \(subject\) must be a non-empty string$"):
+            Token(sub=None, exp=datetime.now(UTC) + timedelta(hours=1))
+
+    def test_one_character_subject_is_valid(self):
+        """A subject of one character is not empty."""
+        token = Token(sub="a", exp=datetime.now(UTC) + timedelta(hours=1))
+
+        assert token.sub == "a"
+
+    def test_expiry_at_the_current_second_raises_error(self):
+        """An expiry in the current second is not in the future."""
+        # Start in the first half of a second. Then the stripped microseconds stay in one second.
+        while datetime.now(UTC).microsecond > 500_000:
+            time.sleep(0.01)
+
+        with pytest.raises(ValueError, match=r"^exp \(expiration\) must be in the future$"):
+            Token(sub="user123", exp=datetime.now(UTC))
+
+    def test_expiry_that_is_not_a_datetime_raises_error(self):
+        with pytest.raises(ValueError, match=r"^exp must be a datetime object$"):
+            Token(sub="user123", exp="tomorrow")
+
+    def test_future_iat_message(self):
+        with pytest.raises(ValueError, match=r"^iat \(issued at\) must be current or past time$"):
+            Token(
+                sub="user123",
+                exp=datetime.now(UTC) + timedelta(hours=2),
+                iat=datetime.now(UTC) + timedelta(hours=1),
+            )
+
+    def test_nbf_is_normalized_to_utc_without_microseconds(self):
+        """``nbf`` follows the same rules as ``exp``: UTC, with no microseconds."""
+        offset = timezone(timedelta(hours=5))
+        nbf = datetime.now(offset).replace(microsecond=123456)
+
+        token = Token(sub="user123", exp=datetime.now(UTC) + timedelta(hours=1), nbf=nbf)
+
+        assert token.nbf == nbf.replace(microsecond=0)
+        assert token.nbf.utcoffset() == timedelta(0)
+        assert token.nbf.microsecond == 0
+
+
+class TestTokenLocalTimezone:
+    """Token claims do not change when the local time zone is not UTC."""
+
+    def test_aware_datetime_keeps_the_same_instant(self, local_timezone):
+        exp = datetime(2099, 1, 1, 12, 0, 0, 999, tzinfo=timezone(timedelta(hours=5)))
+
+        token = Token(sub="user123", exp=exp)
+
+        assert token.exp == exp.replace(microsecond=0)
+        assert token.exp.utcoffset() == timedelta(0)
+
+    def test_naive_datetime_is_read_as_utc(self, local_timezone):
+        token = Token(sub="user123", exp=datetime(2099, 1, 1, 12, 0, 0))
+
+        assert token.exp == datetime(2099, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_new_token_with_default_iat_is_valid(self, local_timezone):
+        """The check of ``exp`` and ``iat`` compares UTC times with UTC times."""
+        token = Token(sub="user123", exp=datetime.now(UTC) + timedelta(hours=1))
+
+        assert abs(token.iat.timestamp() - time.time()) < 5
+
+    def test_create_uses_utc_now(self, local_timezone):
+        token = Token.create(sub="user123", expires_delta=timedelta(minutes=30))
+
+        assert abs(token.iat.timestamp() - time.time()) < 5
+        assert abs(token.exp.timestamp() - (time.time() + 1800)) < 5
+
+    def test_decode_restores_the_same_instants(self, local_timezone):
+        original = _all_claims_token()
+        encoded = original.encode(secret="test-secret")
+
+        decoded = Token.decode(encoded, secret="test-secret", audience="my-api", issuer="auth-service")
+
+        assert decoded.exp.timestamp() == int(original.exp.timestamp())
+        assert decoded.iat.timestamp() == int(original.iat.timestamp())
+        assert decoded.nbf.timestamp() == int(original.nbf.timestamp())
+
+
+class TestTokenCreateDefaults:
+    """Token.create() sets safe defaults."""
+
+    def test_defaults_give_no_staff_and_no_admin(self):
+        token = Token.create(sub="user123")
+
+        assert token.is_staff is False
+        assert token.is_admin is False
+
+    def test_default_lifetime_is_one_hour(self):
+        token = Token.create(sub="user123")
+
+        assert token.exp - token.iat == timedelta(hours=1)
+        assert abs(token.iat.timestamp() - time.time()) < 5
+
+    def test_audience_is_set(self):
+        token = Token.create(sub="user123", audience="my-api")
+
+        assert token.aud == "my-api"
+
+    def test_staff_implies_admin(self):
+        assert Token.create(sub="user123", is_staff=True).is_admin is True
+        assert Token.create(sub="user123", is_admin=True).is_admin is True
+        assert Token.create(sub="user123", is_admin=True).is_staff is False
+
+
+class TestTokenToDictClaims:
+    """to_dict() writes each claim that is set."""
+
+    def test_nbf_and_is_superuser_are_written(self):
+        token = _all_claims_token()
+
+        claims = token.to_dict()
+
+        assert claims["nbf"] == int(token.nbf.timestamp())
+        assert claims["is_superuser"] is True
+        assert "is_superuser" not in _all_claims_token(is_superuser=None).to_dict()
+        assert _all_claims_token(is_superuser=False).to_dict()["is_superuser"] is False
+
+
+class TestTokenEncodeErrors:
+    def test_unknown_algorithm_raises_value_error_with_reason(self):
+        token = Token(sub="user123", exp=datetime.now(UTC) + timedelta(hours=1))
+
+        with pytest.raises(ValueError, match=r"^Failed to encode token: .*[Aa]lgorithm"):
+            token.encode(secret="test-secret", algorithm="BOGUS")
+
+
+class TestTokenDecodeChecks:
+    """Token.decode() applies the checks that the caller asks for."""
+
+    SECRET = "test-secret"
+
+    def _encode(self, **claims) -> str:
+        now = int(time.time())
+        payload = {"sub": "user123", "exp": now + 7200, "iat": now - 60}
+        payload.update(claims)
+        return pyjwt.encode(payload, self.SECRET, algorithm="HS256")
+
+    def test_future_nbf_is_rejected_by_default(self):
+        encoded = self._encode(nbf=int(time.time()) + 3600)
+
+        with pytest.raises(ValueError, match="Failed to decode token"):
+            Token.decode(encoded, secret=self.SECRET)
+
+    def test_future_nbf_is_accepted_when_nbf_check_is_off(self):
+        nbf = int(time.time()) + 3600
+        encoded = self._encode(nbf=nbf)
+
+        decoded = Token.decode(encoded, secret=self.SECRET, verify_nbf=False)
+
+        assert decoded.nbf.timestamp() == nbf
+
+    def test_audience_claim_is_ignored_when_no_audience_is_asked(self):
+        encoded = self._encode(aud="my-api")
+
+        decoded = Token.decode(encoded, secret=self.SECRET)
+
+        assert decoded.aud == "my-api"
+
+    def test_empty_audience_and_issuer_ask_for_no_check(self):
+        """An empty string works as no value. A token without ``aud`` and ``iss`` stays valid."""
+        encoded = self._encode()
+
+        decoded = Token.decode(encoded, secret=self.SECRET, audience="", issuer="")
+
+        assert decoded.sub == "user123"
+
+    def test_wrong_issuer_is_rejected(self):
+        encoded = self._encode(iss="evil-service")
+
+        with pytest.raises(ValueError, match="Failed to decode token"):
+            Token.decode(encoded, secret=self.SECRET, issuer="auth-service")
+
+    def test_matching_issuer_is_accepted(self):
+        encoded = self._encode(iss="auth-service")
+
+        assert Token.decode(encoded, secret=self.SECRET, issuer="auth-service").iss == "auth-service"
+
+    def test_missing_iat_defaults_to_one_hour_before_exp(self):
+        now = int(time.time())
+        encoded = pyjwt.encode({"sub": "user123", "exp": now + 7200}, self.SECRET, algorithm="HS256")
+
+        decoded = Token.decode(encoded, secret=self.SECRET)
+
+        assert decoded.iat.timestamp() == now + 7200 - 3600
+
+    def test_iat_claim_wins_over_the_default(self):
+        now = int(time.time())
+        encoded = self._encode(iat=now - 30)
+
+        assert Token.decode(encoded, secret=self.SECRET).iat.timestamp() == now - 30
+
+    def test_standard_claims_are_not_extras(self):
+        """Each standard claim goes to its own field. Only custom claims go to ``extras``."""
+        original = _all_claims_token(extras={"tenant": "acme"})
+        encoded = original.encode(secret=self.SECRET)
+
+        decoded = Token.decode(encoded, secret=self.SECRET, audience="my-api", issuer="auth-service")
+
+        assert decoded.extras == {"tenant": "acme"}
+        assert decoded.jti == "jti-1"
+        assert decoded.is_superuser is True
+        assert decoded.is_staff is True
+        assert decoded.is_admin is False
+        assert decoded.permissions == ["read"]
+        assert decoded.nbf == original.nbf
+        assert decoded.iat == original.iat
+        assert decoded.exp == original.exp
 
 
 if __name__ == "__main__":
