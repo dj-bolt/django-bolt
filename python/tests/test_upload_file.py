@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+import uuid
+from datetime import date
+from decimal import Decimal
+from enum import Enum
+from typing import Annotated, Literal
 
 import msgspec
 import pytest
@@ -56,6 +60,40 @@ class ProfileFormAnnotatedOptional(msgspec.Struct):
 class DocumentFormAnnotated(msgspec.Struct):
     title: str
     documents: Annotated[list[UploadFile], File(max_files=5)]
+
+
+class AdultRegistrationForm(msgspec.Struct):
+    """Struct whose scalar field has a msgspec.Meta constraint."""
+
+    username: str
+    age: Annotated[int, msgspec.Meta(ge=18)]
+    resume: UploadFile
+
+
+class Shade(Enum):
+    RED = "red"
+
+
+class TypedFileForm(msgspec.Struct):
+    """Struct with a file and a field of each type that a form text value becomes."""
+
+    doc: UploadFile
+    count: int
+    ratio: float
+    flag: bool
+    token: uuid.UUID
+    price: Decimal
+    day: date
+    shade: Shade
+    level: Literal[1, 2]
+    ids: list[int]
+
+
+class RequiredNameForm(msgspec.Struct):
+    """Struct with a file and a required text field."""
+
+    name: str
+    doc: UploadFile
 
 
 class PdfTypesByIndex:
@@ -212,6 +250,242 @@ class TestUploadFileClass:
         assert isinstance(django_file, DjangoFile)
         assert django_file.name == "document.pdf"
         assert django_file.read() == b"fake pdf content"
+
+
+class TestUploadFileFileHandling:
+    """Test the file position, file mode and close behavior of UploadFile."""
+
+    CONTENT = b"hello world"
+
+    @pytest.fixture
+    def uploads(self):
+        """Collect UploadFile objects and close each one after the test."""
+        created = []
+        yield created
+        for upload in created:
+            upload.close_sync()
+
+    @pytest.fixture
+    def disk_upload(self, tmp_path, uploads):
+        """Build an UploadFile that Rust spooled to disk."""
+        path = tmp_path / "spooled.bin"
+        path.write_bytes(self.CONTENT)
+        upload = UploadFileClass.from_file_info(
+            {
+                "filename": "spooled.bin",
+                "content_type": "application/x-test",
+                "size": len(self.CONTENT),
+                "content": None,
+                "temp_path": str(path),
+            }
+        )
+        uploads.append(upload)
+        return upload
+
+    @pytest.fixture
+    def memory_upload(self, uploads):
+        """Build an UploadFile that stays in memory."""
+        upload = UploadFileClass.from_file_info(
+            {"filename": "memory.bin", "content_type": "text/plain", "size": len(self.CONTENT), "content": self.CONTENT}
+        )
+        uploads.append(upload)
+        return upload
+
+    @pytest.fixture
+    def rolled_upload(self, uploads):
+        """Build an UploadFile that Python rolled over to disk."""
+        upload = UploadFileClass("rolled.bin", file_data=self.CONTENT, max_spool_size=4)
+        uploads.append(upload)
+        return upload
+
+    @pytest.fixture(params=["disk_upload", "memory_upload", "rolled_upload"])
+    def any_upload(self, request):
+        """Run a test once for each kind of UploadFile."""
+        return request.getfixturevalue(request.param)
+
+    def test_init_defaults(self, uploads):
+        """An UploadFile with only a name has the default type, size and headers."""
+        upload = UploadFileClass("empty.bin")
+        uploads.append(upload)
+
+        assert upload.content_type == "application/octet-stream"
+        assert upload.size == 0
+        assert upload.headers == {}
+        assert upload.rolled_to_disk is False
+        assert upload.file.read() == b""
+
+    def test_init_rolls_to_disk_above_max_spool_size(self, uploads):
+        """The max_spool_size argument sets when the content goes to disk."""
+        small = UploadFileClass("a.bin", file_data=b"x" * 10, max_spool_size=100)
+        large = UploadFileClass("b.bin", file_data=b"x" * 10, max_spool_size=4)
+        uploads.extend([small, large])
+
+        assert small.rolled_to_disk is False
+        assert large.rolled_to_disk is True
+        assert large.file.read() == b"x" * 10
+
+    def test_from_file_info_in_memory_copies_every_field(self, uploads):
+        """A memory-backed file_info gives an UploadFile with all its fields."""
+        upload = UploadFileClass.from_file_info(
+            {
+                "filename": "image.png",
+                "content_type": "image/png",
+                "size": 3,
+                "headers": {"x-part": "1"},
+                "content": b"abc",
+            }
+        )
+        uploads.append(upload)
+
+        assert upload.filename == "image.png"
+        assert upload.content_type == "image/png"
+        assert upload.size == 3
+        assert upload.headers == {"x-part": "1"}
+        assert upload.rolled_to_disk is False
+        assert isinstance(upload.file, DjangoFile)
+        assert upload.file.read() == b"abc"
+
+    def test_from_file_info_in_memory_uses_defaults(self, uploads):
+        """A memory-backed file_info with no fields gives the default values."""
+        upload = UploadFileClass.from_file_info({})
+        uploads.append(upload)
+
+        assert upload.filename == ""
+        assert upload.content_type == "application/octet-stream"
+        assert upload.size == 0
+        assert upload.headers == {}
+        assert upload.file.read() == b""
+
+    def test_from_file_info_on_disk_copies_every_field(self, tmp_path, uploads):
+        """A disk-backed file_info gives an UploadFile with all its fields."""
+        path = tmp_path / "spooled.bin"
+        path.write_bytes(b"abc")
+        upload = UploadFileClass.from_file_info(
+            {
+                "filename": "big.bin",
+                "content_type": "application/x-big",
+                "size": 3,
+                "headers": {"x-part": "2"},
+                "temp_path": str(path),
+            }
+        )
+        uploads.append(upload)
+
+        assert upload.filename == "big.bin"
+        assert upload.content_type == "application/x-big"
+        assert upload.size == 3
+        assert upload.headers == {"x-part": "2"}
+        assert upload.rolled_to_disk is True
+        assert isinstance(upload.file, DjangoFile)
+        assert upload.file.read() == b"abc"
+
+    def test_from_file_info_on_disk_uses_defaults(self, tmp_path, uploads):
+        """A disk-backed file_info with only a path gives the default values."""
+        path = tmp_path / "spooled.bin"
+        path.write_bytes(b"")
+        upload = UploadFileClass.from_file_info({"temp_path": str(path)})
+        uploads.append(upload)
+
+        assert upload.filename == ""
+        assert upload.content_type == "application/octet-stream"
+        assert upload.size == 0
+        assert upload.headers == {}
+
+    def test_disk_file_opens_in_binary_read_write_mode(self, disk_upload):
+        """The lazy open gives a binary file that accepts a write."""
+        raw = disk_upload.raw_file
+
+        assert raw.mode == "rb+"
+        assert raw.read(5) == b"hello"
+        assert raw.write(b"_WORLD") == 6
+        raw.seek(0)
+        assert raw.read() == b"hello_WORLD"
+
+    @pytest.mark.asyncio
+    async def test_read_returns_only_the_asked_size(self, any_upload):
+        """A read with a size returns that many bytes, then the rest."""
+        assert await any_upload.read(5) == b"hello"
+        assert await any_upload.read() == b" world"
+        assert await any_upload.read() == b""
+
+    @pytest.mark.asyncio
+    async def test_seek_returns_the_new_position(self, any_upload):
+        """Seek honors both the offset and the reference point."""
+        assert await any_upload.seek(3) == 3
+        assert await any_upload.read(2) == b"lo"
+        assert await any_upload.seek(2, 1) == 7
+        assert await any_upload.read() == b"orld"
+        assert await any_upload.seek(-5, 2) == 6
+        assert await any_upload.read() == b"world"
+
+    @pytest.mark.asyncio
+    async def test_write_returns_the_count_and_changes_the_content(self, any_upload):
+        """A write puts the bytes at the position and returns their count."""
+        assert await any_upload.write(b"HELLO") == 5
+        await any_upload.seek(0)
+        assert await any_upload.read() == b"HELLO world"
+
+    @pytest.mark.asyncio
+    async def test_write_on_disk_reaches_the_file(self, disk_upload):
+        """A write to a disk-spooled file lands in the file on disk."""
+        await disk_upload.write(b"HELLO")
+        await disk_upload.close()
+
+        with open(disk_upload._temp_path, "rb") as handle:
+            assert handle.read() == b"HELLO world"
+
+    @pytest.mark.asyncio
+    async def test_close_closes_the_file(self, any_upload):
+        """The async close closes the file, and a second close is safe."""
+        raw = any_upload.raw_file
+        assert raw.closed is False
+
+        await any_upload.close()
+        assert raw.closed is True
+
+        await any_upload.close()
+        assert raw.closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_of_a_never_opened_file_opens_nothing(self, disk_upload):
+        """Closing a disk-spooled file that nobody read does not open it."""
+        await disk_upload.close()
+
+        assert disk_upload._file is None
+
+    def test_close_sync_closes_the_file(self, any_upload):
+        """The sync close closes the file, and a second close is safe."""
+        raw = any_upload.raw_file
+
+        any_upload.close_sync()
+        assert raw.closed is True
+
+        any_upload.close_sync()
+        assert raw.closed is True
+
+    def test_close_sync_of_a_never_opened_file_opens_nothing(self, disk_upload):
+        """Closing a disk-spooled file that nobody read does not fail or open it."""
+        disk_upload.close_sync()
+
+        assert disk_upload._file is None
+
+    def test_repr_of_a_memory_file(self, memory_upload):
+        """The repr shows the name, type and size only."""
+        assert repr(memory_upload) == "UploadFile(filename='memory.bin', content_type='text/plain', size=11)"
+
+    def test_repr_of_a_rolled_file(self, rolled_upload):
+        """The repr says that the file rolled to disk."""
+        assert repr(rolled_upload) == (
+            "UploadFile(filename='rolled.bin', content_type='application/octet-stream', size=0 (rolled to disk))"
+        )
+
+    def test_repr_of_a_disk_spooled_file(self, disk_upload):
+        """The repr says that the file is on disk, and says when it is open."""
+        expected = "UploadFile(filename='spooled.bin', content_type='application/x-test', size=11, disk-spooled"
+        assert repr(disk_upload) == expected + ")"
+
+        disk_upload.raw_file  # noqa: B018 - the access opens the file
+        assert repr(disk_upload) == expected + ", opened)"
 
 
 class TestUploadFileValidation:
@@ -457,7 +731,76 @@ class TestUploadFileValidation:
         assert len(errors) == 1
         assert errors[0]["type"] == "file_missing"
         assert errors[0]["loc"] == ["body", "avatar"]
-        assert "Missing required file" in errors[0]["msg"]
+        assert errors[0]["msg"] == "Missing required file"
+        assert errors[0]["input"] is None
+
+    def test_file_parameter_without_default_that_allows_none_is_none_when_missing(self):
+        """`UploadFile | None` with no default is optional and gives None."""
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(avatar: Annotated[UploadFile | None, File()]):
+            return {"avatar": None if avatar is None else avatar.filename}
+
+        client = TestClient(api)
+        assert client.post("/upload", data={"name": "x"}).json() == {"avatar": None}
+        response = client.post("/upload", files={"avatar": ("a.png", b"x", "image/png")})
+        assert response.json() == {"avatar": "a.png"}
+
+    def test_missing_optional_file_takes_the_default_of_the_parameter(self):
+        """The default of the parameter is the value of a missing file, also when it is not None."""
+        api = BoltAPI()
+        fallback = {"filename": "fallback.txt"}
+
+        @api.post("/upload")
+        async def upload(doc: Annotated[dict | None, File()] = fallback):
+            return {"filename": doc["filename"]}
+
+        client = TestClient(api)
+        assert client.post("/upload", data={"name": "x"}).json() == {"filename": "fallback.txt"}
+        response = client.post("/upload", files={"doc": ("real.txt", b"x", "text/plain")})
+        assert response.json() == {"filename": "real.txt"}
+
+    def test_optional_list_of_dicts_wraps_one_file_in_a_list(self):
+        """A `list[dict]` annotation gives a list for one file and for several files."""
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(files: Annotated[list[dict], File()] = None):
+            return {"names": [f["filename"] for f in files]}
+
+        client = TestClient(api)
+        one = client.post("/upload", files={"files": ("a.txt", b"a", "text/plain")})
+        assert one.json() == {"names": ["a.txt"]}
+        two = client.post(
+            "/upload",
+            files=[("files", ("a.txt", b"a", "text/plain")), ("files", ("b.txt", b"b", "text/plain"))],
+        )
+        assert two.json() == {"names": ["a.txt", "b.txt"]}
+
+    @pytest.mark.parametrize("required", [True, False], ids=["required", "optional"])
+    def test_single_file_parameter_takes_the_first_of_several_files(self, required):
+        """A parameter that is not a list gets the first file when the client sends more."""
+        api = BoltAPI()
+
+        if required:
+
+            @api.post("/upload")
+            async def upload(doc: Annotated[UploadFile, File()]):
+                return {"filename": doc.filename}
+
+        else:
+
+            @api.post("/upload")
+            async def upload(doc: Annotated[UploadFile | None, File()] = None):
+                return {"filename": doc.filename}
+
+        client = TestClient(api)
+        response = client.post(
+            "/upload",
+            files=[("doc", ("a.txt", b"a", "text/plain")), ("doc", ("b.txt", b"b", "text/plain"))],
+        )
+        assert response.json() == {"filename": "a.txt"}
 
     def test_optional_file(self):
         """Test optional file upload."""
@@ -890,7 +1233,96 @@ class TestFormStructWithUploadFile:
         assert len(errors) == 1
         assert errors[0]["type"] == "file_missing"
         assert errors[0]["loc"] == ["body", "avatar"]
-        assert "Missing required file" in errors[0]["msg"]
+        assert errors[0]["msg"] == "Missing required file"
+
+    def test_struct_with_bad_field_reports_only_that_field(self):
+        """A valid file does not add an error next to the error of a bad field."""
+        api = BoltAPI()
+
+        @api.post("/register")
+        async def register(data: Annotated[AdultRegistrationForm, Form()]):
+            return {"username": data.username}
+
+        client = TestClient(api)
+        response = client.post(
+            "/register",
+            data={"username": "john", "age": "12"},
+            files={"resume": ("cv.pdf", b"pdf", "application/pdf")},
+        )
+
+        assert response.status_code == 422, response.text
+        errors = response.json()["detail"]
+        assert [err["loc"] for err in errors] == [["body", "age"]]
+
+    def test_struct_with_a_file_converts_each_text_field_to_its_type(self):
+        """A text field of a struct with a file becomes its type, as in a struct without a file."""
+        api = BoltAPI()
+
+        @api.post("/typed")
+        async def typed(data: Annotated[TypedFileForm, Form()]):
+            return {
+                "values": [
+                    data.count,
+                    data.ratio,
+                    data.flag,
+                    str(data.token),
+                    str(data.price),
+                    data.day.isoformat(),
+                    data.shade.value,
+                    data.level,
+                    data.ids,
+                ],
+                "types": [type(getattr(data, name)).__name__ for name in TypedFileForm.__struct_fields__],
+            }
+
+        token = uuid.uuid4()
+        client = TestClient(api)
+        response = client.post(
+            "/typed",
+            data={
+                "count": "3",
+                "ratio": "1.5",
+                "flag": "true",
+                "token": str(token),
+                "price": "1.25",
+                "day": "2024-02-03",
+                "shade": "red",
+                "level": "2",
+                "ids": ["1", "2"],
+            },
+            files={"doc": ("a.txt", b"x", "text/plain")},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["values"] == [3, 1.5, True, str(token), "1.25", "2024-02-03", "red", 2, [1, 2]]
+        assert body["types"] == [
+            "UploadFile",
+            "int",
+            "float",
+            "bool",
+            "UUID",
+            "Decimal",
+            "date",
+            "Shade",
+            "int",
+            "list",
+        ]
+
+    def test_struct_with_a_file_reports_a_missing_text_field_by_name(self):
+        """The message and the place of a missing text field name the form field."""
+        api = BoltAPI()
+
+        @api.post("/named")
+        async def named(data: Annotated[RequiredNameForm, Form()]):
+            return {"name": data.name}
+
+        client = TestClient(api)
+        response = client.post("/named", data={}, files={"doc": ("a.txt", b"x", "text/plain")})
+
+        assert response.status_code == 422, response.text
+        errors = response.json()["detail"]
+        assert [(err["loc"], err["msg"]) for err in errors] == [(["body", "name"], "Missing required form field: name")]
 
     def test_struct_with_annotated_upload_file(self):
         """Annotated[UploadFile, File(...)] inside a struct must be parsed as a file."""
@@ -988,6 +1420,7 @@ class TestFormStructWithUploadFile:
         assert response.status_code == 422, response.text
         errors = response.json()["detail"]
         assert any(err["loc"][-1] == "avatar" for err in errors)
+        assert [err["msg"] for err in errors if err["loc"][-1] == "avatar"] == ["Expected uploaded file, got str"]
 
 
 class TestBackwardCompatibility:
@@ -1297,6 +1730,51 @@ class TestAutoCleanup:
         # All files should be closed
         for i, upload in enumerate(tracked_files):
             assert upload._file.closed, f"File {i} should be closed"
+
+    def test_files_of_every_parameter_are_closed(self):
+        """A later file parameter must not drop the files of an earlier one from the cleanup."""
+        api = BoltAPI()
+        tracked: dict[str, list[UploadFile]] = {}
+
+        @api.post("/upload")
+        async def upload(
+            first: Annotated[UploadFile, File()],
+            second: Annotated[UploadFile, File()],
+            docs: Annotated[list[UploadFile], File()],
+            maybe: Annotated[UploadFile | None, File()] = None,
+            more: Annotated[list[UploadFile] | None, File()] = None,
+        ):
+            tracked["first"] = [first]
+            tracked["second"] = [second]
+            tracked["docs"] = docs
+            tracked["maybe"] = [maybe]
+            tracked["more"] = more
+            return {"ok": True}
+
+        client = TestClient(api)
+        response = client.post(
+            "/upload",
+            files=[
+                ("first", ("1.txt", b"1", "text/plain")),
+                ("second", ("2.txt", b"2", "text/plain")),
+                ("docs", ("3.txt", b"3", "text/plain")),
+                ("docs", ("7.txt", b"7", "text/plain")),
+                ("maybe", ("4.txt", b"4", "text/plain")),
+                ("more", ("5.txt", b"5", "text/plain")),
+                ("more", ("6.txt", b"6", "text/plain")),
+            ],
+        )
+
+        assert response.status_code == 200, response.text
+        assert {name: len(files) for name, files in tracked.items()} == {
+            "first": 1,
+            "second": 1,
+            "docs": 2,
+            "maybe": 1,
+            "more": 2,
+        }
+        for name, files in tracked.items():
+            assert all(upload._file.closed for upload in files), f"{name} should be closed"
 
     def test_struct_files_closed_after_handler(self):
         """Verify files in Form struct are closed after handler."""

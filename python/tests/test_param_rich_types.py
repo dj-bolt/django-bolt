@@ -46,7 +46,9 @@ def _show(value):
 # --- Sequences in the query ---------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
+# Function scope: each test registers its routes, so a mutation tool sees
+# each test reach the request-time closures of the extractors.
+@pytest.fixture
 def query_client():
     api = BoltAPI()
 
@@ -160,7 +162,7 @@ def test_a_renamed_sequence_struct_field_leaves_its_python_name_as_one_value():
 # --- Sequences in a form, a header and a cookie --------------------------------------
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def form_client():
     api = BoltAPI()
 
@@ -230,7 +232,10 @@ def test_a_single_value_source_rejects_a_type_that_cannot_hold_one_item(route, a
     async def handler(value: annotation):
         return {"value": list(value)}
 
-    with pytest.raises(TypeError, match="one item"):
+    with pytest.raises(
+        TypeError,
+        match=r"gets one value, but its type .* cannot hold one item\. Use list\[T\], set\[T\], tuple\[T\] or tuple\[T, \.\.\.\]\.",
+    ):
         api.get(route)(handler)
 
 
@@ -287,7 +292,7 @@ def test_a_one_item_or_variadic_tuple_header_takes_the_value():
 # --- NewType and type aliases ----------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def alias_client():
     api = BoltAPI()
 
@@ -349,7 +354,7 @@ def test_a_bad_newtype_or_type_alias_value_is_a_422(alias_client, method, url, k
     assert response.status_code == 422, response.text
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def generic_alias_client():
     api = BoltAPI()
 
@@ -397,7 +402,7 @@ def test_a_bad_parameterized_type_alias_value_is_a_422(generic_alias_client, url
 # --- msgspec.Meta constraints ----------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def constraint_client():
     api = BoltAPI()
 
@@ -491,10 +496,247 @@ def test_path_alias_with_constraint():
         assert client.get("/items/0").status_code == 422
 
 
+@pytest.fixture
+def cookie_header_client():
+    api = BoltAPI()
+
+    @api.get("/cookie/required")
+    async def cookie_required(size: Annotated[float, msgspec.Meta(gt=0), Cookie()]):
+        return _show(size)
+
+    @api.get("/cookie/default")
+    async def cookie_default(size: Annotated[float, msgspec.Meta(gt=0), Cookie()] = 2.5):
+        return _show(size)
+
+    @api.get("/cookie/optional")
+    async def cookie_optional(size: Annotated[float | None, msgspec.Meta(gt=0), Cookie()]):
+        return _show(size)
+
+    # A request parameter makes the route use the Python injector. Without it, Rust binds the value.
+    @api.get("/cookie/plain-optional")
+    async def cookie_plain_optional(request, count: Annotated[int | None, Cookie()]):
+        return _show(count)
+
+    @api.get("/cookie/plain-required")
+    async def cookie_plain_required(session: Annotated[str, Cookie()]):
+        return _show(session)
+
+    @api.get("/header/required")
+    async def header_required(x_name: Annotated[str, msgspec.Meta(max_length=3), Header()]):
+        return _show(x_name)
+
+    @api.get("/header/default")
+    async def header_default(x_size: Annotated[float, msgspec.Meta(gt=0), Header()] = 2.5):
+        return _show(x_size)
+
+    @api.get("/header/optional")
+    async def header_optional(x_size: Annotated[float | None, msgspec.Meta(gt=0), Header()]):
+        return _show(x_size)
+
+    @api.get("/header/plain-optional")
+    async def header_plain_optional(request, x_count: Annotated[int | None, Header()]):
+        return _show(x_count)
+
+    @api.get("/header/plain-required")
+    async def header_plain_required(request, x_name: Annotated[str, Header()]):
+        return _show(x_name)
+
+    @api.get("/query/required")
+    async def query_required(n: Annotated[int, msgspec.Meta(ge=1), Query()]):
+        return _show(n)
+
+    @api.get("/query/plain-optional")
+    async def query_plain_optional(request, limit: Annotated[int | None, Query()]):
+        return _show(limit)
+
+    @api.get("/query/plain-required")
+    async def query_plain_required(request, q: Annotated[str, Query()]):
+        return _show(q)
+
+    @api.get("/header/min-one")
+    async def header_min_one(x_tag: Annotated[list[int], msgspec.Meta(min_length=1), Header()]):
+        return _show(x_tag)
+
+    @api.get("/header/max-one")
+    async def header_max_one(x_tag: Annotated[list[int], msgspec.Meta(max_length=1), Header()]):
+        return _show(x_tag)
+
+    with TestClient(api) as client:
+        yield client
+
+
+def test_a_constrained_cookie_converts_its_value(cookie_header_client):
+    assert cookie_header_client.get("/cookie/required", headers={"Cookie": "size=0.5"}).json() == {
+        "value": 0.5,
+        "type": "float",
+    }
+
+
+def test_a_constraint_error_of_a_cookie_or_header_names_the_parameter(cookie_header_client):
+    response = cookie_header_client.get("/cookie/required", headers={"Cookie": "size=0"})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["cookie", "size"]
+
+    response = cookie_header_client.get("/header/required", headers={"X-Name": "abcd"})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["header", "x-name"]
+
+
+def test_a_missing_constrained_cookie_is_a_422_that_names_it(cookie_header_client):
+    response = cookie_header_client.get("/cookie/required")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Missing required cookie: size"
+
+
+def test_a_missing_constrained_cookie_takes_its_default_or_none(cookie_header_client):
+    assert cookie_header_client.get("/cookie/default").json() == {"value": 2.5, "type": "float"}
+    assert cookie_header_client.get("/cookie/optional").json() == {"value": None, "type": "NoneType"}
+    assert cookie_header_client.get("/cookie/optional", headers={"Cookie": "size=3"}).json() == {
+        "value": 3.0,
+        "type": "float",
+    }
+
+
+def test_a_missing_optional_cookie_without_default_is_none(cookie_header_client):
+    response = cookie_header_client.get("/cookie/plain-optional")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"value": None, "type": "NoneType"}
+
+
+def test_a_missing_required_cookie_is_a_422_that_names_it(cookie_header_client):
+    response = cookie_header_client.get("/cookie/plain-required")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Missing required cookie: session"
+
+
+def test_a_missing_constrained_header_is_a_422_that_names_it(cookie_header_client):
+    response = cookie_header_client.get("/header/required")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Missing required header: x-name"
+
+
+def test_a_missing_constrained_header_takes_its_default_or_none(cookie_header_client):
+    assert cookie_header_client.get("/header/default").json() == {"value": 2.5, "type": "float"}
+    assert cookie_header_client.get("/header/optional").json() == {"value": None, "type": "NoneType"}
+    assert cookie_header_client.get("/header/optional", headers={"X-Size": "3"}).json() == {
+        "value": 3.0,
+        "type": "float",
+    }
+
+
+def test_a_missing_optional_header_without_default_is_none(cookie_header_client):
+    response = cookie_header_client.get("/header/plain-optional")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"value": None, "type": "NoneType"}
+
+
+def test_a_missing_required_header_is_a_422_that_names_it(cookie_header_client):
+    response = cookie_header_client.get("/header/plain-required")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Missing required header: x-name"
+
+
+def test_a_missing_constrained_query_parameter_is_a_422_that_names_it(cookie_header_client):
+    response = cookie_header_client.get("/query/required")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Missing required query parameter: n"
+
+
+def test_a_missing_optional_query_parameter_without_default_is_none(cookie_header_client):
+    response = cookie_header_client.get("/query/plain-optional")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"value": None, "type": "NoneType"}
+
+
+def test_a_missing_required_query_parameter_is_a_422_that_names_it(cookie_header_client):
+    response = cookie_header_client.get("/query/plain-required")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Missing required query parameter: q"
+
+
+def test_a_header_sequence_with_a_limit_of_one_item_takes_the_value(cookie_header_client):
+    """A header gives one item. A length limit of exactly one item still holds it."""
+    expected = {"value": [4], "type": "list", "item_types": ["int"]}
+    assert cookie_header_client.get("/header/min-one", headers={"X-Tag": "4"}).json() == expected
+    assert cookie_header_client.get("/header/max-one", headers={"X-Tag": "4"}).json() == expected
+
+
+def test_a_header_sequence_that_cannot_hold_one_item_fails_at_registration():
+    api = BoltAPI()
+
+    async def handler(x_tag: Annotated[list[int], msgspec.Meta(max_length=0), Header()]):
+        return _show(x_tag)
+
+    with pytest.raises(TypeError, match="one item"):
+        api.get("/empty")(handler)
+
+
+@pytest.fixture
+def form_field_client():
+    api = BoltAPI()
+
+    @api.post("/required")
+    async def required(name: Annotated[str, Form()]):
+        return _show(name)
+
+    @api.post("/default")
+    async def default(nick: Annotated[str, Form()] = "anon"):
+        return _show(nick)
+
+    @api.post("/optional")
+    async def optional(alt: Annotated[str | None, Form()]):
+        return _show(alt)
+
+    @api.post("/limited")
+    async def limited(count: Annotated[int, msgspec.Meta(ge=1), Form()]):
+        return _show(count)
+
+    @api.post("/limited-default")
+    async def limited_default(count: Annotated[int, msgspec.Meta(ge=1), Form()] = 5):
+        return _show(count)
+
+    @api.post("/limited-optional")
+    async def limited_optional(count: Annotated[int | None, msgspec.Meta(ge=1), Form()]):
+        return _show(count)
+
+    @api.post("/sequence")
+    async def sequence(tag: Annotated[list[int], Form()]):
+        return _show(tag)
+
+    with TestClient(api) as client:
+        yield client
+
+
+def test_a_missing_form_field_is_a_422_that_names_it(form_field_client):
+    for url, name in [("/required", "name"), ("/limited", "count"), ("/sequence", "tag")]:
+        response = form_field_client.post(url, data={})
+        assert response.status_code == 422, url
+        assert response.json()["detail"] == f"Missing required form field: {name}"
+
+
+def test_a_missing_form_field_takes_its_default_or_none(form_field_client):
+    assert form_field_client.post("/default", data={}).json() == {"value": "anon", "type": "str"}
+    assert form_field_client.post("/default", data={"nick": "bo"}).json() == {"value": "bo", "type": "str"}
+    assert form_field_client.post("/optional", data={}).json() == {"value": None, "type": "NoneType"}
+    assert form_field_client.post("/limited-default", data={}).json() == {"value": 5, "type": "int"}
+    assert form_field_client.post("/limited-optional", data={}).json() == {"value": None, "type": "NoneType"}
+    assert form_field_client.post("/limited-optional", data={"count": "2"}).json() == {"value": 2, "type": "int"}
+
+
+def test_a_form_field_outside_its_constraint_names_the_field(form_field_client):
+    response = form_field_client.post("/limited", data={"count": "0"})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "count"]
+
+    response = form_field_client.post("/sequence", data={"tag": ["1", "x"]})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][:2] == ["body", "tag"]
+
+
 # --- msgspec.Meta on an optional type, on a bad type, and on a file ---------------------
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def optional_constraint_client():
     api = BoltAPI()
 
@@ -665,7 +907,7 @@ def test_the_query_string_of_the_request_encodes_each_key_and_value():
 # --- Sequences in the query of a WebSocket route -------------------------------------
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def ws_api():
     api = BoltAPI()
 

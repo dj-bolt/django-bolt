@@ -923,7 +923,6 @@ def _to_django_request(request: Request) -> HttpRequest:
 
     Performance optimizations:
     - Reuse empty dicts/QueryDicts where possible
-    - Skip BytesIO creation for empty bodies
     - Use direct attribute assignment (faster than setattr)
     """
     django_request = HttpRequest()
@@ -969,8 +968,8 @@ def _to_django_request(request: Request) -> HttpRequest:
 
     # Store body for raw access
     django_request._body = body
-    if body:
-        django_request._stream = io.BytesIO(body)
+    # An empty body needs a stream too, so request.read() gives b"" as in Django.
+    django_request._stream = io.BytesIO(body)
 
     return django_request
 

@@ -1,6 +1,7 @@
 """Tests for Django-Bolt error handling system."""
 
 import json
+import logging
 from unittest.mock import patch
 
 import django
@@ -8,7 +9,9 @@ import msgspec
 import pytest
 from django.conf import settings  # noqa: PLC0415
 
+from django_bolt import BoltAPI
 from django_bolt.error_handlers import (
+    BoltError,
     format_error_response,
     generic_exception_handler,
     handle_exception,
@@ -30,6 +33,8 @@ from django_bolt.exceptions import (
     Unauthorized,
     UnprocessableEntity,
 )
+from django_bolt.responses import JSON
+from django_bolt.testing import TestClient
 
 
 class TestExceptions:
@@ -170,8 +175,18 @@ class TestErrorHandlers:
 
         assert status == 500
         data = json.loads(body)
+        assert data == {"detail": "Response validation error"}
+
+    def test_response_validation_error_handler_debug(self):
+        """Debug mode keeps the validation errors in the response."""
+        errors = [{"loc": ["response", "id"], "msg": "Field required", "type": "missing"}]
+        exc = ResponseValidationError(errors)
+        status, headers, body = response_validation_error_handler(exc, debug=True)
+
+        assert status == 500
+        data = json.loads(body)
         assert data["detail"] == "Response validation error"
-        assert "validation_errors" in data["extra"]
+        assert data["extra"]["validation_errors"] == errors
 
     def test_generic_exception_handler_production(self):
         """Test generic exception handler in production mode."""
@@ -432,3 +447,92 @@ class TestExceptionIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class Item(msgspec.Struct):
+    id: int
+
+
+def _bad_response_api(**api_kwargs) -> BoltAPI:
+    api = BoltAPI(**api_kwargs)
+
+    @api.get("/async-bad")
+    async def async_bad() -> Item:
+        return {"id": "not-an-int"}
+
+    @api.get("/sync-bad")
+    def sync_bad() -> Item:
+        return {"id": "not-an-int"}
+
+    return api
+
+
+def _validation_log_messages(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "django_bolt.error_handlers" and record.levelno == logging.ERROR
+    ]
+
+
+class TestResponseValidationDisclosure:
+    """A response validation 500 shows the validation errors only when DEBUG is on."""
+
+    @pytest.mark.parametrize("path", ["/async-bad", "/sync-bad"])
+    def test_debug_off_hides_the_validation_errors(self, settings, caplog, path):
+        settings.DEBUG = False
+        with TestClient(_bad_response_api()) as client, caplog.at_level(logging.ERROR, logger="django_bolt"):
+            response = client.get(path)
+
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Response validation error"}
+        logged = _validation_log_messages(caplog)
+        assert len(logged) == 1
+        assert logged[0].startswith("Response Validation Error:")
+        assert "Response validation failed for Item" in logged[0]
+        assert "Expected `int`, got `str`" in logged[0]
+
+    @pytest.mark.parametrize("path", ["/async-bad", "/sync-bad"])
+    def test_debug_on_keeps_the_validation_errors(self, settings, path):
+        settings.DEBUG = True
+        with TestClient(_bad_response_api()) as client:
+            response = client.get(path)
+
+        assert response.status_code == 500
+        body = response.json()
+        assert body["detail"] == "Response validation error"
+        errors = body["extra"]["validation_errors"]
+        assert errors[0]["loc"][0] == "response"
+        assert "Expected `int`, got `str`" in errors[0]["msg"]
+
+    def test_formatter_gets_no_errors_when_debug_is_off(self, settings, caplog):
+        """A formatter can show `error.errors` to the client, so Bolt leaves them out. The log keeps them."""
+        settings.DEBUG = False
+        seen: list[BoltError] = []
+
+        def formatter(error: BoltError, request) -> JSON:
+            seen.append(error)
+            return JSON({"kind": error.kind, "errors": error.errors}, status_code=error.status)
+
+        api = _bad_response_api(error_formatter=formatter)
+        with TestClient(api) as client, caplog.at_level(logging.ERROR, logger="django_bolt"):
+            response = client.get("/async-bad")
+
+        assert response.status_code == 500
+        assert response.json() == {"kind": "response_validation", "errors": []}
+        assert isinstance(seen[0].exception, ResponseValidationError)
+        logged = _validation_log_messages(caplog)
+        assert len(logged) == 1
+        assert "Response validation failed for Item" in logged[0]
+
+    def test_formatter_gets_the_errors_when_debug_is_on(self, settings):
+        settings.DEBUG = True
+
+        def formatter(error: BoltError, request) -> JSON:
+            return JSON({"errors": error.errors}, status_code=error.status)
+
+        with TestClient(_bad_response_api(error_formatter=formatter)) as client:
+            response = client.get("/async-bad")
+
+        assert response.status_code == 500
+        assert "Expected `int`, got `str`" in response.json()["errors"][0]["msg"]

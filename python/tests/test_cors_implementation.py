@@ -115,6 +115,22 @@ class TestWildcardCredentials:
             assert "wildcard" in str(cors_warnings[0].message).lower()
             assert "credentials" in str(cors_warnings[0].message).lower()
 
+    def test_wildcard_warning_points_at_the_decorator_line(self):
+        """The warning names the file of the caller, not the file of the library."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+
+            @cors(origins=["*"], credentials=True)
+            async def get_data():
+                return {}
+
+        assert [warning.filename for warning in caught] == [__file__]
+        assert caught[0].category is RuntimeWarning
+        assert str(caught[0].message) == (
+            "CORS misconfiguration: Cannot use wildcard '*' with credentials=True. "
+            "This violates the CORS specification. Please specify explicit origins."
+        )
+
 
 class TestVaryHeaders:
     """Test Vary headers are added per CORS spec"""
@@ -275,6 +291,24 @@ class TestPreflightRequests:
             # CRITICAL: Preflight must include max-age
             max_age = preflight.headers.get("Access-Control-Max-Age")
             assert max_age == "86400"
+
+    def test_preflight_defaults_allow_each_standard_method_for_one_hour(self):
+        """A @cors with no methods and no max_age allows seven methods and caches the preflight for 3600 seconds."""
+        api = BoltAPI()
+
+        @api.get("/data")
+        @cors(origins=["https://app.example.com"])
+        async def get_data():
+            return {}
+
+        with TestClient(api, use_http_layer=True) as client:
+            preflight = client.options(
+                "/data", headers={"Origin": "https://app.example.com", "Access-Control-Request-Method": "GET"}
+            )
+
+        assert preflight.status_code == 204
+        assert preflight.headers.get("Access-Control-Allow-Methods") == "GET, POST, PUT, PATCH, DELETE, OPTIONS, QUERY"
+        assert preflight.headers.get("Access-Control-Max-Age") == "3600"
 
 
 class TestRouteLevelVsGlobal:

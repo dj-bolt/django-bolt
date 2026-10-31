@@ -12,9 +12,10 @@ from django.contrib.sessions.middleware import SessionMiddleware
 from django.core.exceptions import ImproperlyConfigured
 from django.middleware.common import CommonMiddleware
 from django.test import override_settings
+from django.utils.module_loading import import_string
 
 from django_bolt import BoltAPI
-from django_bolt.middleware import DjangoMiddlewareStack, TimingMiddleware
+from django_bolt.middleware import DjangoMiddlewareStack, TimingMiddleware, django_loader
 from django_bolt.middleware.django_loader import (
     DEFAULT_EXCLUDED_MIDDLEWARE,
     get_django_middleware_setting,
@@ -143,6 +144,93 @@ class TestLoadDjangoMiddleware:
             pytest.raises(ImproperlyConfigured, match="dotted path"),
         ):
             load_django_middleware({key: "django.contrib.sessions.middleware.SessionMiddleware"})
+
+
+SESSION = "django.contrib.sessions.middleware.SessionMiddleware"
+COMMON = "django.middleware.common.CommonMiddleware"
+CLICKJACKING = "django.middleware.clickjacking.XFrameOptionsMiddleware"
+
+
+class TestLoadFromSettings:
+    """The loader reads settings.MIDDLEWARE, keeps its order and applies include and exclude."""
+
+    def test_true_loads_all_settings_middleware_in_order(self):
+        with override_settings(MIDDLEWARE=[COMMON, SESSION, CLICKJACKING]):
+            result = load_django_middleware(True)
+
+        assert [cls.__name__ for cls in result[0].middleware_classes] == [
+            "CommonMiddleware",
+            "SessionMiddleware",
+            "XFrameOptionsMiddleware",
+        ]
+
+    def test_the_default_config_loads_the_settings(self):
+        with override_settings(MIDDLEWARE=[COMMON, SESSION]):
+            result = load_django_middleware()
+
+        assert result[0].middleware_classes == [CommonMiddleware, SessionMiddleware]
+
+    def test_a_class_in_a_list_tells_how_to_pass_a_class(self):
+        with pytest.raises(ImproperlyConfigured) as raised:
+            load_django_middleware([SessionMiddleware])
+
+        assert str(raised.value).endswith(
+            "To use a middleware class directly, pass BoltAPI(middleware=[DjangoMiddlewareStack([...])])."
+        )
+
+    def test_empty_settings_load_nothing(self):
+        with override_settings(MIDDLEWARE=[]):
+            assert load_django_middleware(True) == []
+            assert load_django_middleware({"exclude": [SESSION]}) == []
+
+    def test_exclude_drops_only_the_listed_paths(self):
+        with override_settings(MIDDLEWARE=[COMMON, SESSION, CLICKJACKING]):
+            result = load_django_middleware({"exclude": [SESSION]})
+
+        assert result[0].middleware_classes == [CommonMiddleware, import_string(CLICKJACKING)]
+
+    def test_include_keeps_only_the_listed_paths_in_the_order_of_settings(self):
+        with override_settings(MIDDLEWARE=[COMMON, SESSION, CLICKJACKING]):
+            result = load_django_middleware({"include": [CLICKJACKING, COMMON]})
+
+        assert result[0].middleware_classes == [CommonMiddleware, import_string(CLICKJACKING)]
+
+    def test_include_does_not_add_paths_that_settings_lack(self):
+        with override_settings(MIDDLEWARE=[COMMON]):
+            assert load_django_middleware({"include": [SESSION]}) == []
+
+    def test_exclude_wins_over_include(self):
+        with override_settings(MIDDLEWARE=[COMMON, SESSION]):
+            result = load_django_middleware({"include": [COMMON, SESSION], "exclude": [COMMON]})
+
+        assert result[0].middleware_classes == [SessionMiddleware]
+
+    def test_an_empty_include_keeps_nothing(self):
+        with override_settings(MIDDLEWARE=[COMMON, SESSION]):
+            assert load_django_middleware({"include": []}) == []
+
+    def test_default_exclusions_apply_unless_the_caller_turns_them_off(self, monkeypatch):
+        monkeypatch.setattr(django_loader, "DEFAULT_EXCLUDED_MIDDLEWARE", {COMMON})
+        with override_settings(MIDDLEWARE=[COMMON, SESSION]):
+            default = load_django_middleware(True)
+            dict_config = load_django_middleware({"exclude": [CLICKJACKING]})
+            explicit = load_django_middleware(True, exclude_defaults=False)
+
+        assert default[0].middleware_classes == [SessionMiddleware]
+        assert dict_config[0].middleware_classes == [SessionMiddleware]
+        assert explicit[0].middleware_classes == [CommonMiddleware, SessionMiddleware]
+
+    def test_a_list_ignores_the_default_exclusions(self, monkeypatch):
+        monkeypatch.setattr(django_loader, "DEFAULT_EXCLUDED_MIDDLEWARE", {COMMON})
+
+        assert load_django_middleware([COMMON])[0].middleware_classes == [CommonMiddleware]
+
+    def test_the_setting_is_returned_as_a_copy(self):
+        with override_settings(MIDDLEWARE=[COMMON, SESSION]):
+            result = get_django_middleware_setting()
+            result.append("changed")
+
+            assert get_django_middleware_setting() == [COMMON, SESSION]
 
 
 # =============================================================================

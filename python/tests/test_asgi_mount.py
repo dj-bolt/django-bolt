@@ -5,6 +5,7 @@ import io
 import json
 import threading
 
+import msgspec
 import pytest
 from django.core.handlers.asgi import ASGIRequest
 from django.core.management.base import CommandError
@@ -15,6 +16,7 @@ from django_bolt.api import (
     _rewrite_django_mount_redirect_message,
     _rewrite_scope_for_django_mount,
 )
+from django_bolt.exceptions import HTTPException
 from django_bolt.management.commands.runbolt import Command
 from django_bolt.testing import TestClient
 
@@ -525,6 +527,37 @@ def test_mount_asgi_exception_surfaces_in_response(exc_class, exc_msg, expected_
     assert response.status_code == 500
     for fragment in expected_fragments:
         assert fragment in response.text
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        HTTPException(418, "teapot", headers={"X-Mount": "1"}, extra={"id": 3}),
+        msgspec.ValidationError("Expected `int`, got `str`"),
+    ],
+    ids=["http-exception", "validation-error"],
+)
+def test_mount_asgi_http_and_validation_errors_are_a_500(settings, exc):
+    """An ASGI app sends its own responses. Each exception from it is a 500.
+
+    HTTPException and msgspec.ValidationError are the errors of Bolt routes.
+    An ASGI app does not use them, so they get no status of their own. The
+    app raises when Bolt calls it, so the error reaches the Rust core.
+    """
+    settings.DEBUG = False
+    api = BoltAPI()
+
+    def raising_asgi(scope, receive, send):
+        raise exc
+
+    api.mount_asgi("/raising", raising_asgi)
+
+    with TestClient(api) as client:
+        response = client.get("/raising")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+    assert "x-mount" not in response.headers
 
 
 def test_mount_asgi_send_after_timeout_is_a_noop(settings):

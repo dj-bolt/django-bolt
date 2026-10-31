@@ -191,6 +191,8 @@ raise ResponseValidationError(errors)
 
 Response validation errors indicate a server bug, so they return 500 Internal Server Error.
 
+The validation errors name the model, the fields and the types of your handler. With `DEBUG=False`, the body is only `{"detail": "Response validation error"}`. Bolt writes the validation errors to the server log. With `DEBUG=True`, the body also has `extra.validation_errors`.
+
 ## Error handlers
 
 Django-Bolt provides built-in error handlers:
@@ -374,7 +376,7 @@ api = BoltAPI(error_formatter=format_error)
 | `status` | The HTTP status code. |
 | `kind` | A stable name for the error. See the table below. |
 | `detail` | A message for a human. Bolt does not put internal data, such as a file path, in it. |
-| `errors` | The field errors. Each one has `loc`, `msg` and `type`. Some also have `ctx`. |
+| `errors` | The field errors. Each one has `loc`, `msg` and `type`. Some also have `ctx`. A `response_validation` error has no `errors` when `DEBUG=False`. Read `error.exception.errors()` for them. |
 | `headers` | The headers that the error needs, for example `WWW-Authenticate` or `Retry-After`. |
 | `extra` | The `extra` of an `HTTPException`, or `{"retry_after": n}` for a rate limit. |
 | `exception` | The Python exception. It is `None` for an error of the Rust core. |

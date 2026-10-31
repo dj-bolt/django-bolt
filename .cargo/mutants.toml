@@ -10,6 +10,7 @@ examine_globs = [
     "crates/bolt-core/src/cookies.rs",
     "crates/bolt-core/src/cors.rs",
     "crates/bolt-core/src/form_parsing.rs",
+    "crates/bolt-core/src/metadata.rs",
     "crates/bolt-core/src/middleware/auth.rs",
     "crates/bolt-core/src/middleware/client_ip.rs",
     "crates/bolt-core/src/middleware/compression.rs",
@@ -23,6 +24,7 @@ examine_globs = [
     "crates/bolt-core/src/type_coercion.rs",
     "crates/bolt-core/src/validation.rs",
     "crates/bolt-websocket/src/origin.rs",
+    "src/dev_reload.rs",
 ]
 
 # A mutant in a crate is caught by the tests of that crate.
@@ -61,4 +63,10 @@ exclude_re = [
     # The unknown-kid cooldown compares two durations, which are not equal
     # in practice.
     'replace < with <= in RefreshingJwks::select',
+    # The debounce loop also stops on the receive timeout at the deadline.
+    'replace < with <= in recv_change',
+    # `NEEDS_BODY` is `1 << 0`. Shifting 1 right by 0 also gives 1. The match
+    # on column 31 keeps this to that constant. The other flag constants
+    # have other columns, and a shift of them changes the flag.
+    'metadata\.rs:\d+:31: replace << with >>$',
 ]

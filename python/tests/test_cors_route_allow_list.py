@@ -316,3 +316,20 @@ def test_a_cors_config_with_an_empty_pattern_stops_startup():
 
     with pytest.raises(ValueError, match="empty pattern"), TestClient(api, read_django_settings=False):
         pass
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"origins": 5}, "@cors() origins must be a str or a list of str, not int"),
+        ({"origins": {"a": 1}}, "@cors() origins must be a str or a list of str, not dict"),
+        ({"origin_regexes": 1.5}, "@cors() origin_regexes must be a str or a list of str, not float"),
+        ({"origins": ["https://a.test", 1]}, "@cors() origins must hold only str, not int"),
+        ({"origin_regexes": [b"^a$"]}, "@cors() origin_regexes must hold only str, not bytes"),
+    ],
+)
+def test_cors_names_the_argument_and_the_type_that_it_rejects(kwargs, message):
+    with pytest.raises(TypeError) as raised:
+        cors(**kwargs)(lambda: None)
+
+    assert str(raised.value) == message

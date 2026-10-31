@@ -15,7 +15,7 @@ import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import ErrorHandlerMiddleware
-from django_bolt.params import Cookie, Form, Header, Query
+from django_bolt.params import Cookie, Form, Header, Path, Query
 from django_bolt.testing import TestClient
 
 
@@ -32,7 +32,9 @@ class Headers(msgspec.Struct):
     label: Annotated[str, msgspec.Meta(min_length=2)] = msgspec.field(name="x_label", default="ok")
 
 
-@pytest.fixture(scope="module")
+# Function scope: each test registers its routes, so a mutation tool sees
+# each test reach the request-time closures of the extractors.
+@pytest.fixture
 def client():
     api = BoltAPI()
 
@@ -269,3 +271,36 @@ def test_error_handler_middleware_keeps_a_validation_error_a_422(send, status):
         response = send(client)
 
     assert response.status_code == status
+
+
+def test_a_path_constraint_error_names_the_path_parameter():
+    api = BoltAPI()
+
+    @api.get("/items/{item_id}")
+    async def item(item_id: Annotated[int, msgspec.Meta(ge=5), Path()]):
+        return {"id": item_id}
+
+    with TestClient(api) as client:
+        response = client.get("/items/2")
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["path", "item_id"]
+
+
+def test_a_path_alias_that_the_route_does_not_have_is_a_422_that_names_it():
+    """The route has no `{nope}` part, so the value is missing. A constraint does not change the answer."""
+    api = BoltAPI()
+
+    @api.get("/plain/{item_id}")
+    async def plain(value: Annotated[int, Path(alias="nope")]):
+        return {"value": value}
+
+    @api.get("/constrained/{item_id}")
+    async def constrained(value: Annotated[int, msgspec.Meta(ge=1), Path(alias="nope")]):
+        return {"value": value}
+
+    with TestClient(api) as client:
+        for url in ("/plain/3", "/constrained/3"):
+            response = client.get(url)
+            assert response.status_code == 422, url
+            assert response.json()["detail"] == "Missing required path parameter: nope"
