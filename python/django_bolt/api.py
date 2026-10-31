@@ -2071,10 +2071,10 @@ class BoltAPI:
         # is_multi branching never touches the hot path of normal (single-schema) routes.
         if meta.get("is_multi_response"):
             resolved_metas = meta["_resolved_metas"]
-            default_status = meta["default_status_code"]
-            default_entry = resolved_metas.get(default_status) or next(iter(resolved_metas.values()))
-
+            # Registration adds a catch-all entry with the default status of the route.
+            # It serves a bare return when the dict does not list that status.
             catch_all_entry = resolved_metas[...]
+            default_entry = resolved_metas.get(meta["default_status_code"], catch_all_entry)
 
             def _lookup(code: int) -> dict:
                 return resolved_metas.get(code, catch_all_entry)

@@ -21,6 +21,7 @@ from django_bolt.serialization import (
 )
 from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
+from tests.test_models import Article
 
 # ============================================================================
 # Test schemas
@@ -566,3 +567,60 @@ def test_sync_tuple_with_an_undeclared_status_keeps_that_status(path, content_ty
     assert response.status_code == 418
     assert response.headers["content-type"] == content_type
     assert response.content == body
+
+
+# ============================================================================
+# An explicit status_code that the dict does not list
+# ============================================================================
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_bare_return_has_an_explicit_status_code_that_the_dict_does_not_list(is_async):
+    """The catch-all entry serves the bare return, with the status of the route."""
+    api = BoltAPI()
+
+    if is_async:
+
+        @api.post("/items", response_model={200: OkSchema, ...: ErrorSchema}, status_code=201)
+        async def create_item():
+            return {"id": 1, "name": "New"}
+
+    else:
+
+        @api.post("/items", response_model={200: OkSchema, ...: ErrorSchema}, status_code=201)
+        def create_item():
+            return {"id": 1, "name": "New"}
+
+    with TestClient(api) as client:
+        response = client.post("/items")
+
+    assert (response.status_code, response.json()) == (201, {"id": 1, "name": "New"})
+
+
+class TitleRow(msgspec.Struct):
+    title: str
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_bare_queryset_uses_the_type_of_the_default_status(is_async):
+    """The default status is not first in the dict. Its type selects the fields."""
+    api = BoltAPI()
+
+    if is_async:
+
+        @api.get("/articles", response_model={404: ErrorSchema, 200: list[TitleRow]})
+        async def articles():
+            return Article.objects.all()
+
+    else:
+
+        @api.get("/articles", response_model={404: ErrorSchema, 200: list[TitleRow]})
+        def articles():
+            return Article.objects.all()
+
+    Article.objects.create(title="One", content="First", author="A")
+    with TestClient(api) as client:
+        response = client.get("/articles")
+
+    assert (response.status_code, response.json()) == (200, [{"title": "One"}])
