@@ -23,6 +23,7 @@ from django.http import Http404
 from django.shortcuts import get_object_or_404
 
 from django_bolt import BoltAPI, responses
+from django_bolt.error_handlers import is_server_exception
 from django_bolt.exceptions import HTTPException, RequestValidationError, ResponseValidationError
 from django_bolt.logging import LoggingConfig, LoggingMiddleware
 from django_bolt.params import Query
@@ -135,6 +136,40 @@ def test_the_exception_logging_handler_gets_only_5xx_exceptions():
         assert client.get("/async/crash").status_code == 500
 
     assert seen == ["/async/crash: RuntimeError"]
+
+
+@pytest.mark.parametrize(
+    ("exc", "is_server"),
+    [
+        (HTTPException(418), False),
+        (HTTPException(500), True),
+        (HTTPException(501), True),
+        (ResponseValidationError([]), True),
+        (RuntimeError("fault"), True),
+        (FileNotFoundError("config.json"), True),
+        (PermissionDenied("no access"), False),
+        (Http404(), False),
+        (DisallowedHost("bad"), False),
+        (RequestValidationError([]), False),
+        (msgspec.ValidationError("bad"), False),
+    ],
+    ids=[
+        "http-418",
+        "http-500",
+        "http-501",
+        "response-validation",
+        "runtime",
+        "file-not-found",
+        "permission-denied",
+        "http404",
+        "disallowed-host",
+        "request-validation",
+        "msgspec-validation",
+    ],
+)
+def test_is_server_exception_tells_which_exceptions_get_a_5xx(exc, is_server):
+    """The log uses this answer. It follows the status that handle_exception sends."""
+    assert is_server_exception(exc) is is_server
 
 
 _ERRORS = {

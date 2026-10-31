@@ -8,6 +8,7 @@ import django
 import msgspec
 import pytest
 from django.conf import settings  # noqa: PLC0415
+from django.core.exceptions import PermissionDenied
 
 from django_bolt import BoltAPI
 from django_bolt.error_handlers import (
@@ -22,6 +23,7 @@ from django_bolt.error_handlers import (
 )
 from django_bolt.exceptions import (
     BadRequest,
+    BoltException,
     Forbidden,
     HTTPException,
     InternalServerError,
@@ -32,6 +34,8 @@ from django_bolt.exceptions import (
     TooManyRequests,
     Unauthorized,
     UnprocessableEntity,
+    ValidationException,
+    parse_msgspec_decode_error,
 )
 from django_bolt.responses import JSON
 from django_bolt.testing import TestClient
@@ -114,6 +118,49 @@ class TestExceptions:
         exc = RequestValidationError(errors, body=body)
         assert exc.body == body
 
+    def test_bolt_exception_text_has_the_arguments_and_the_detail(self):
+        """The text of an exception is in the log. It has each argument, then the detail."""
+        assert str(BoltException("first", "second", detail="why")) == "first second why"
+        assert str(BoltException("only")) == "only"
+        assert repr(BoltException(detail="why")) == "BoltException - why"
+
+    def test_bolt_exception_subclass_keeps_the_detail_that_it_declares(self):
+        class Custom(BoltException):
+            detail = "Custom default"
+
+        assert Custom().detail == "Custom default"
+        assert str(Custom()) == "Custom default"
+        assert Custom("given").detail == "given"
+        assert Custom(detail="other").detail == "other"
+
+    def test_http_exception_with_an_empty_detail_uses_the_status_phrase(self):
+        assert HTTPException(404, detail=[]).detail == "Not Found"
+        assert HTTPException(404, detail="").detail == "Not Found"
+
+    def test_validation_exception_has_a_fixed_detail(self):
+        assert ValidationException([1]).detail == "Validation error"
+        assert str(ValidationException([1])) == "Validation error"
+
+    def test_request_validation_error_text_joins_the_errors(self):
+        """msgspec uses this text for the message of a Serializer validator error."""
+        errors = [
+            {"loc": ["body", "items", 1], "msg": "too small", "type": "value_error"},
+            {"msg": "no location"},
+            {"loc": [], "msg": "empty location"},
+            {"loc": ["name"]},
+            "plain text",
+        ]
+        assert (
+            str(RequestValidationError(errors))
+            == "body.items.1: too small; no location; empty location; name: ; plain text"
+        )
+        assert str(RequestValidationError([])) == "Validation error"
+
+    def test_response_validation_error_text_counts_the_errors(self):
+        error = ResponseValidationError([{"loc": ["response", "id"]}, "second"], body={"id": "x"})
+        assert str(error) == "2 validation error(s):\n  {'loc': ['response', 'id']}\n  second\n"
+        assert error.body == {"id": "x"}
+
 
 class TestErrorHandlers:
     """Test error handler functions."""
@@ -187,6 +234,62 @@ class TestErrorHandlers:
         data = json.loads(body)
         assert data["detail"] == "Response validation error"
         assert data["extra"]["validation_errors"] == errors
+
+    def test_request_validation_error_handler_puts_each_kind_of_error_under_body(self):
+        errors = [
+            {"loc": ["body", "a"], "msg": "m", "type": "t"},
+            "plain text",
+            msgspec.ValidationError("Expected `int` - at `$.x`"),
+        ]
+        status, _, body = request_validation_error_handler(RequestValidationError(errors))
+
+        assert status == 422
+        assert json.loads(body)["detail"] == [
+            {"loc": ["body", "a"], "msg": "m", "type": "t"},
+            {"loc": ["body"], "msg": "plain text", "type": "validation_error"},
+            {"loc": ["body", "x"], "msg": "Expected `int`", "type": "validation_error"},
+        ]
+
+    def test_response_validation_error_handler_logs_the_errors_and_the_exception(self, caplog):
+        exc = ResponseValidationError(
+            [{"loc": ["response", "id"], "msg": "Field required", "type": "missing"}, "plain"]
+        )
+        # The body has the errors only in debug mode.
+        with caplog.at_level(logging.ERROR, logger="django_bolt.error_handlers"):
+            status, _, body = response_validation_error_handler(exc, debug=True)
+
+        data = json.loads(body)
+        assert status == 500
+        assert data["detail"] == "Response validation error"
+        assert data["extra"]["validation_errors"] == [
+            {"loc": ["response", "id"], "msg": "Field required", "type": "missing"},
+            {"loc": ["response"], "msg": "plain", "type": "validation_error"},
+        ]
+        [record] = caplog.records
+        assert record.levelno == logging.ERROR
+        assert record.getMessage() == (
+            "Response Validation Error: Handler returned invalid response. Errors: "
+            "[{'loc': ['response', 'id'], 'msg': 'Field required', 'type': 'missing'}, 'plain']"
+        )
+        assert record.exc_info[1] is exc
+
+    def test_generic_exception_handler_hides_the_exception_by_default(self):
+        """The default is production mode. The body does not tell the client what failed."""
+        status, headers, body = generic_exception_handler(ValueError("secret value"))
+
+        assert status == 500
+        assert headers == [("content-type", "application/json")]
+        assert json.loads(body) == {"detail": "Internal Server Error"}
+
+    def test_generic_exception_handler_logs_the_server_error(self, caplog):
+        exc = ValueError("secret value")
+        with caplog.at_level(logging.ERROR, logger="django_bolt.error_handlers"):
+            generic_exception_handler(exc, debug=False)
+
+        [record] = caplog.records
+        assert record.levelno == logging.ERROR
+        assert record.getMessage() == "Internal Server Error: ValueError - secret value"
+        assert record.exc_info[1] is exc
 
     def test_generic_exception_handler_production(self):
         """Test generic exception handler in production mode."""
@@ -275,6 +378,48 @@ class TestErrorHandlers:
         assert "traceback" in data["extra"], "Fallback JSON must include traceback"
         assert "exception_type" in data["extra"], "Fallback JSON must include exception_type"
         assert data["extra"]["exception_type"] == "ValueError"
+
+    def test_generic_exception_handler_debug_json_has_the_exception_and_one_traceback_line_per_entry(self):
+        """The JSON fallback of debug mode lists the lines of the traceback, with no empty line."""
+
+        # The first line ends with X, and the last line ends with a space. A strip must keep both.
+        message = "first X\nsecond "
+
+        def fail():
+            raise ValueError(message)
+
+        try:
+            fail()
+        except ValueError as exc:
+            with patch("django_bolt.error_handlers.ExceptionReporter", side_effect=Exception("HTML failed")):
+                status, _, body = generic_exception_handler(exc, debug=True)
+
+        data = json.loads(body)
+        assert status == 500
+        assert data["detail"] == f"ValueError: {message}"
+        extra = data["extra"]
+        assert (extra["exception"], extra["exception_type"]) == (message, "ValueError")
+        lines = extra["traceback"]
+        assert lines[0] == "Traceback (most recent call last):"
+        assert any(line.strip() == "fail()" for line in lines)
+        assert any(line.strip() == "raise ValueError(message)" for line in lines)
+        assert lines[-2:] == ["ValueError: first X", "second "]
+        assert all(line.strip() and "\n" not in line for line in lines)
+
+    def test_generic_exception_handler_debug_json_logs_the_report_failure_at_debug_level(self, caplog):
+        with (
+            caplog.at_level(logging.DEBUG, logger="django_bolt.error_handlers"),
+            patch("django_bolt.error_handlers.ExceptionReporter", side_effect=Exception("HTML failed")),
+        ):
+            generic_exception_handler(ValueError("x"), debug=True)
+
+        assert [(r.levelno, r.getMessage()) for r in caplog.records if r.levelno < logging.ERROR] == [
+            (
+                logging.DEBUG,
+                "Failed to generate Django ExceptionReporter HTML. Falling back to JSON traceback format. "
+                "Error: HTML failed",
+            )
+        ]
 
     def test_generic_exception_handler_preserves_traceback(self):
         """Test that exception traceback is properly preserved and formatted."""
@@ -379,6 +524,39 @@ class TestErrorHandlers:
         )
         assert status == 500
 
+    def test_handle_exception_hides_the_exception_when_django_debug_is_false(self, settings):
+        settings.DEBUG = False
+        status, headers, body = handle_exception(ValueError("secret value"))
+
+        assert status == 500
+        assert headers == [("content-type", "application/json")]
+        assert json.loads(body) == {"detail": "Internal Server Error"}
+
+    def test_handle_exception_hides_the_exception_when_django_debug_is_not_set(self, settings):
+        del settings.DEBUG
+        status, headers, body = handle_exception(ValueError("secret value"))
+
+        assert status == 500
+        assert headers == [("content-type", "application/json")]
+        assert json.loads(body) == {"detail": "Internal Server Error"}
+
+    def test_handle_exception_answers_a_validation_exception_with_a_422(self):
+        errors = [{"loc": ["body", "a"], "msg": "m", "type": "t"}, "plain text"]
+        status, _, body = handle_exception(ValidationException(errors))
+
+        assert status == 422
+        assert json.loads(body)["detail"] == [
+            {"loc": ["body", "a"], "msg": "m", "type": "t"},
+            {"loc": ["body"], "msg": "plain text", "type": "validation_error"},
+        ]
+
+    @pytest.mark.parametrize(("message", "detail"), [("no access", "no access"), ("", "Permission denied")])
+    def test_handle_exception_answers_permission_denied_with_a_403(self, message, detail):
+        status, _, body = handle_exception(PermissionDenied(message), debug=False)
+
+        assert status == 403
+        assert json.loads(body) == {"detail": detail}
+
     def test_handle_exception_debug_overrides_django_setting(self):
         """Test that explicit debug=True overrides Django DEBUG=False."""
         exc = ValueError("Explicit debug override")
@@ -406,6 +584,66 @@ class TestErrorHandlers:
             assert "loc" in errors[0]
             assert "msg" in errors[0]
             assert "type" in errors[0]
+
+
+class _Inner(msgspec.Struct):
+    age: int
+
+
+class _Outer(msgspec.Struct):
+    name: str
+    inner: _Inner
+
+
+def _validation_error(body: bytes, type_: type = _Outer) -> msgspec.ValidationError:
+    try:
+        msgspec.json.decode(body, type=type_)
+    except msgspec.ValidationError as error:
+        return error
+    raise AssertionError("The body must fail validation.")
+
+
+class TestMsgspecValidationErrorToDict:
+    """Each client gets one entry per msgspec error, with a location, a message and a type."""
+
+    def test_wrong_type_has_the_path_of_the_value(self):
+        error = _validation_error(b'{"name": "a", "inner": {"age": "x"}}')
+        assert msgspec_validation_error_to_dict(error) == [
+            {"loc": ["body", "inner", "age"], "msg": "Expected `int`, got `str`", "type": "validation_error"}
+        ]
+
+    def test_root_is_the_first_item_of_the_location(self):
+        error = _validation_error(b'{"name": "a", "inner": {"age": "x"}}')
+        [entry] = msgspec_validation_error_to_dict(error, "response")
+        assert entry["loc"] == ["response", "inner", "age"]
+
+    def test_missing_field_names_the_field(self):
+        error = _validation_error(b"{}", _Inner)
+        assert msgspec_validation_error_to_dict(error) == [
+            {"loc": ["body", "age"], "msg": "Object missing required field `age`", "type": "missing_field"}
+        ]
+
+    def test_missing_field_of_a_nested_struct_has_the_path_of_the_struct(self):
+        error = _validation_error(b'{"name": "a", "inner": {}}')
+        assert msgspec_validation_error_to_dict(error) == [
+            {
+                "loc": ["body", "inner"],
+                "msg": "Object missing required field `age`",
+                "type": "validation_error",
+            }
+        ]
+
+    def test_missing_field_with_no_name_in_the_message(self):
+        error = msgspec.ValidationError("Object missing required field")
+        assert msgspec_validation_error_to_dict(error) == [
+            {"loc": ["body", "unknown"], "msg": "Object missing required field", "type": "missing_field"}
+        ]
+
+    def test_error_with_no_path_and_no_missing_field(self):
+        error = msgspec.ValidationError("Expected `object`, got `array`")
+        assert msgspec_validation_error_to_dict(error) == [
+            {"loc": ["body"], "msg": "Expected `object`, got `array`", "type": "validation_error"}
+        ]
 
 
 class TestExceptionIntegration:
@@ -443,6 +681,113 @@ class TestExceptionIntegration:
 
         data = json.loads(body)
         assert len(data["detail"]) == 3
+
+
+def _decode_error(body: bytes) -> msgspec.DecodeError:
+    try:
+        msgspec.json.decode(body)
+    except msgspec.DecodeError as error:
+        return error
+    raise AssertionError("The body must be invalid JSON.")
+
+
+class TestParseMsgspecDecodeError:
+    """The 422 body of a malformed JSON request names the line and the column of the fault."""
+
+    def test_error_on_the_first_line(self):
+        body = b'{"a" 1}'
+        assert parse_msgspec_decode_error(_decode_error(body), body) == {
+            "type": "json_invalid",
+            "loc": ("body", 1, 6),
+            "msg": "Invalid JSON at line 1, column 6: JSON is malformed: expected ':' (byte 5)\n  {\"a\" 1}\n       ^",
+            "input": '{"a" 1}',
+            "ctx": {
+                "line": 1,
+                "column": 6,
+                "byte_position": 5,
+                "error": "JSON is malformed: expected ':' (byte 5)",
+            },
+        }
+
+    def test_error_after_a_blank_line(self):
+        body = b'{"a": 1,\n\n  xyz}'
+        error = parse_msgspec_decode_error(_decode_error(body), body)
+        assert error["loc"] == ("body", 3, 3)
+        assert error["msg"] == (
+            "Invalid JSON at line 3, column 3: JSON is malformed: object keys must be strings (byte 12)"
+            "\n    xyz}\n    ^"
+        )
+        assert (error["ctx"]["line"], error["ctx"]["column"], error["ctx"]["byte_position"]) == (3, 3, 12)
+
+    def test_error_at_the_first_byte_of_a_line(self):
+        body = b'{"a": 1,\n?'
+        error = parse_msgspec_decode_error(_decode_error(body), body)
+        assert error["loc"] == ("body", 2, 1)
+        assert error["msg"].endswith("\n  ?\n  ^")
+
+    def test_input_is_cut_at_200_characters(self):
+        body = b'{"k": "' + b"x" * 250 + b'" ?}'
+        error = parse_msgspec_decode_error(_decode_error(body), body)
+        assert error["input"] == body.decode()[:200]
+
+    def test_bytes_that_are_not_utf8_are_replaced(self):
+        body = b"\xff\xfe"
+        error = parse_msgspec_decode_error(_decode_error(body), body)
+        assert error["input"] == "��"
+        assert error["msg"].endswith("\n  ��\n  ^")
+
+    def test_error_without_a_position(self):
+        assert parse_msgspec_decode_error(_decode_error(b""), b"") == {
+            "type": "json_invalid",
+            "loc": ("body",),
+            "msg": "Input data was truncated",
+            "input": "",
+        }
+
+    def test_bytes_that_are_not_utf8_are_replaced_without_a_position(self):
+        error = parse_msgspec_decode_error(msgspec.DecodeError("The input is not valid"), b'{"a": "\xff"')
+        assert error["input"] == '{"a": "�"'
+
+    def test_empty_input_with_a_position_gives_an_empty_input(self):
+        error = parse_msgspec_decode_error(msgspec.DecodeError("JSON is malformed: invalid character (byte 0)"), b"")
+        assert error["loc"] == ("body", 1, 1)
+        assert error["input"] == ""
+
+    def test_input_without_a_position_is_cut_at_100_characters(self):
+        body = b"[" + b"1," * 150
+        error = parse_msgspec_decode_error(_decode_error(body), body)
+        assert error["loc"] == ("body",)
+        assert error["input"] == body.decode()[:100]
+        assert "ctx" not in error
+
+    def test_position_after_the_end_points_after_the_last_character(self):
+        """A position past the end of the body gives the column after its last character, one-indexed."""
+        error = parse_msgspec_decode_error(
+            msgspec.DecodeError("JSON is malformed: invalid character (byte 999)"), b"{}"
+        )
+        assert error["loc"] == ("body", 1, 3)
+        assert error["msg"] == (
+            "Invalid JSON at line 1, column 3: JSON is malformed: invalid character (byte 999)\n  {}\n    ^"
+        )
+
+    def test_http_422_names_the_line_and_the_column(self):
+        api = BoltAPI()
+
+        class Payload(msgspec.Struct):
+            name: str
+
+        @api.post("/payload")
+        async def payload(body: Payload) -> dict:
+            return {}
+
+        with TestClient(api) as client:
+            response = client.post("/payload", content=b'{"name": "a",\n  "x": ?}')
+
+        assert response.status_code == 422
+        [error] = response.json()["detail"]
+        assert error["type"] == "json_invalid"
+        assert error["loc"] == ["body", 2, 8]
+        assert error["ctx"]["byte_position"] == 21
 
 
 if __name__ == "__main__":
