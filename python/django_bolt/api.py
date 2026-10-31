@@ -3251,11 +3251,14 @@ class BoltAPI:
         jti = claims.get("jti")
         if not jti:
             # Without a JTI we cannot identify which token to check.
-            # Rejecting is safer than silently honoring.
+            # Rejecting is safer than silently honoring. Rust already rejects
+            # such a token when its backend has revocation, so no test reaches this.
+            # pragma: no mutate start
             raise HTTPException(
                 status_code=401,
                 detail="Token missing 'jti' claim required for revocation",
             )
+            # pragma: no mutate end
         revoked = await handler(jti, claims) if takes_claims else await handler(jti)
         if revoked:
             raise HTTPException(status_code=401, detail="Token has been revoked")
