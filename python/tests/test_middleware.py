@@ -8,7 +8,10 @@ Python middleware classes (TimingMiddleware, etc.) run for custom logic only.
 
 import asyncio
 import json
+import logging
+import re
 import time
+import uuid
 from typing import Annotated
 
 import jwt
@@ -18,7 +21,20 @@ from django.test import override_settings
 
 from django_bolt import BoltAPI, Router
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
-from django_bolt.middleware import DjangoMiddlewareStack, Middleware, cors, middleware, rate_limit, skip_middleware
+from django_bolt.exceptions import HTTPException
+from django_bolt.middleware import (
+    BaseMiddleware,
+    DjangoMiddlewareStack,
+    ErrorHandlerMiddleware,
+    LoggingMiddleware,
+    Middleware,
+    TimingMiddleware,
+    cors,
+    middleware,
+    rate_limit,
+    skip_middleware,
+)
+from django_bolt.middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
 from django_bolt.params import Cookie, Header
 from django_bolt.responses import HTML, JSON, PlainText
 from django_bolt.testing import TestClient
@@ -194,6 +210,152 @@ class TestGlobalMiddleware:
 
         assert api._middleware[0] is NoOpMiddleware
         assert api._middleware[1] is stack
+
+
+class _CallableInstance:
+    """A callable object that is not a function."""
+
+    def __call__(self, request, call_next): ...
+
+
+async def _plain_function(request, call_next): ...
+
+
+class TestMiddlewareEntryValidation:
+    """Registration rejects a middleware entry of the wrong kind, and the message names the level."""
+
+    @pytest.mark.parametrize("level", ["api", "router"])
+    @pytest.mark.parametrize(
+        ("entry", "message"),
+        [
+            (
+                _plain_function,
+                "{level} middleware does not accept middleware instances (function). "
+                "Pass middleware classes instead, e.g. middleware=[MyMiddleware].",
+            ),
+            (
+                _CallableInstance(),
+                "{level} middleware does not accept middleware instances (_CallableInstance). "
+                "Pass middleware classes instead, e.g. middleware=[MyMiddleware].",
+            ),
+            (
+                CustomTestMiddleware(_plain_function),
+                "{level} middleware does not accept middleware instances (CustomTestMiddleware). "
+                "Pass middleware classes instead, e.g. middleware=[MyMiddleware].",
+            ),
+            (
+                FunctionMiddlewareSpec(_plain_function),
+                "{level} middleware does not support function-style middleware. "
+                "Use middleware classes or DjangoMiddleware/DjangoMiddlewareStack wrappers.",
+            ),
+            (
+                42,
+                "Unsupported {level} middleware entry: 42. "
+                "Expected middleware class, DjangoMiddleware wrapper, dict config, "
+                "or function middleware (route-level only).",
+            ),
+        ],
+        ids=["function", "callable-object", "middleware-instance", "function-spec", "not-callable"],
+    )
+    def test_global_and_router_levels_reject_the_entry(self, level, entry, message):
+        def build():
+            if level == "api":
+                BoltAPI(middleware=[entry])
+            else:
+                Router(middleware=[entry])
+
+        with pytest.raises(TypeError) as raised:
+            build()
+
+        assert str(raised.value) == message.format(level=level)
+
+    def test_each_kind_of_entry_stays_in_the_list_in_order(self):
+        """A kind of entry that the function accepts does not stop the loop."""
+        stack = DjangoMiddlewareStack([CustomTestMiddleware])
+        spec = FunctionMiddlewareSpec(_plain_function)
+        entry = {"type": "rate_limit", "rps": 1, "burst": 2, "key": "ip"}
+
+        normalized = normalize_middleware_specs(
+            [spec, CustomTestMiddleware, stack, entry, _plain_function, CustomTestMiddleware],
+            context="route",
+            allow_function_middleware=True,
+        )
+
+        assert normalized[:4] == [spec, CustomTestMiddleware, stack, entry]
+        assert normalized[4] == FunctionMiddlewareSpec(_plain_function)
+        assert normalized[5] is CustomTestMiddleware
+
+    def test_route_level_rejects_a_callable_object(self):
+        with pytest.raises(TypeError, match=r"^route middleware does not accept middleware instances"):
+            middleware(_CallableInstance(), CustomTestMiddleware)(lambda: None)
+
+    def test_route_level_rejects_a_single_callable_object_with_the_route_name(self):
+        with pytest.raises(
+            TypeError, match=r"^route middleware does not accept middleware instances \(_CallableInstance\)"
+        ):
+            middleware(_CallableInstance())
+
+    def test_route_level_wraps_a_function_a_bound_method_and_a_builtin(self):
+        class Holder:
+            async def method_middleware(self, request, call_next): ...
+
+        specs = normalize_middleware_specs(
+            [_plain_function, Holder().method_middleware, len], context="route", allow_function_middleware=True
+        )
+
+        assert [type(spec) for spec in specs] == [FunctionMiddlewareSpec] * 3
+        assert [spec.func for spec in specs][::2] == [_plain_function, len]
+
+    def test_a_bound_method_runs_as_route_middleware(self):
+        events = []
+
+        class Holder:
+            async def method_middleware(self, request, call_next):
+                events.append("method")
+                return await call_next(request)
+
+        api = BoltAPI()
+
+        @api.get("/method")
+        @middleware(Holder().method_middleware)
+        async def method_route():
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            assert client.get("/method").json() == {"ok": True}
+
+        assert events == ["method"]
+
+    def test_one_decorator_takes_a_function_and_a_class_in_order(self):
+        events = []
+
+        async def function_middleware(request, call_next):
+            events.append("function")
+            return await call_next(request)
+
+        class ClassMiddleware(Middleware):
+            async def process_request(self, request):
+                events.append("class")
+                return await self.get_response(request)
+
+        api = BoltAPI()
+
+        @api.get("/mixed")
+        @middleware(function_middleware, ClassMiddleware)
+        async def mixed_route():
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            assert client.get("/mixed").json() == {"ok": True}
+
+        assert events == ["function", "class"]
+
+    def test_dict_entries_pass_through_unchanged(self):
+        entry = {"type": "rate_limit", "rps": 1, "burst": 2, "key": "ip"}
+
+        assert normalize_middleware_specs([entry, CustomTestMiddleware], context="api") == [entry, CustomTestMiddleware]
+        assert normalize_middleware_specs(None, context="api") == []
+        assert normalize_middleware_specs([], context="api") == []
 
 
 class TestRouterMiddlewareContract:
@@ -893,6 +1055,197 @@ def test_python_middleware_replaces_the_content_type_in_any_letter_case():
 
     assert response.headers.get_list("content-type") == ["text/csv"]
     assert response.text == "<p>x</p>"
+
+
+class StateTag(BaseMiddleware):
+    """Add a header to each response that this middleware handles."""
+
+    exclude_paths = ["/static/*", "/api/**", "/exact", "/v1.0/ping"]
+    exclude_methods = ["post"]
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.headers["X-Handled"] = "yes"
+        return response
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "handled"),
+    [
+        ("GET", "/static/app.css", False),
+        ("GET", "/static/css/app.css", True),
+        ("GET", "/api/a/b/c", False),
+        ("GET", "/exact", False),
+        ("GET", "/exactly", True),
+        ("GET", "/prefix/exact", True),
+        ("GET", "/v1.0/ping", False),
+        ("GET", "/v1x0/ping", True),
+        ("GET", "/other", True),
+        ("POST", "/other", False),
+        ("PUT", "/other", True),
+    ],
+)
+def test_base_middleware_skips_the_excluded_paths_and_methods(method, path, handled):
+    """A request that matches an exclusion goes to the next layer. Other requests run the middleware."""
+    api = BoltAPI(middleware=[StateTag])
+    for route in ("/static/app.css", "/static/css/app.css", "/api/a/b/c", "/exact", "/exactly", "/prefix/exact"):
+        api.get(route)(lambda: {"ok": True})
+    for route in ("/v1.0/ping", "/v1x0/ping", "/other"):
+        api.get(route)(lambda: {"ok": True})
+    api.post("/other")(lambda: {"ok": True})
+    api.put("/other")(lambda: {"ok": True})
+
+    with TestClient(api) as client:
+        response = client.request(method, path)
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert ("x-handled" in response.headers) is handled
+
+
+class TimingState(msgspec.Struct):
+    request_id: str
+    start_time: float
+
+
+def test_timing_middleware_sets_the_request_id_and_the_response_time():
+    """The request ID is the same in request.state and in the header. The ID is new for each request."""
+    api = BoltAPI(middleware=[TimingMiddleware])
+
+    @api.get("/timing")
+    async def timing(request) -> TimingState:
+        await asyncio.sleep(0.05)
+        return TimingState(request_id=request.state["request_id"], start_time=request.state["start_time"])
+
+    with TestClient(api) as client:
+        first = client.get("/timing")
+        second = client.get("/timing")
+
+    for response in (first, second):
+        assert response.status_code == 200
+        request_id = response.headers["x-request-id"]
+        assert response.json()["request_id"] == request_id
+        assert str(uuid.UUID(request_id, version=4)) == request_id
+        assert re.fullmatch(r"\d+\.\d{4}s", response.headers["x-response-time"])
+        assert 0.05 <= float(response.headers["x-response-time"].removesuffix("s")) < 1
+        assert response.json()["start_time"] > 0
+    assert first.headers["x-request-id"] != second.headers["x-request-id"]
+
+
+class RecordingLogging(LoggingMiddleware):
+    """A LoggingMiddleware that writes to a list, with all options on."""
+
+    records: list = []
+
+    def __init__(self, get_response):
+        logger = logging.getLogger("test_middleware.recording_logging")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.handlers = [_ListHandler(type(self).records)]
+        super().__init__(get_response, logger=logger, log_body=True, log_headers=True, log_level=logging.WARNING)
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self, records: list):
+        super().__init__()
+        self._records = records
+
+    def emit(self, record):
+        self._records.append(record)
+
+
+def test_logging_middleware_logs_the_request_and_the_response():
+    """The middleware logs one request line and one response line at the level that the caller sets."""
+    RecordingLogging.records = []
+    api = BoltAPI(middleware=[RecordingLogging])
+
+    @api.post("/echo")
+    async def echo(request):
+        await asyncio.sleep(0.05)
+        return {"size": len(request.body)}
+
+    @api.get("/health")
+    async def health():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        response = client.post("/echo?page=2", content=b"12345", headers={"X-Probe": "1"})
+        client.get("/health")
+
+    assert response.json() == {"size": 5}
+    records = RecordingLogging.records
+    assert [record.levelno for record in records] == [logging.WARNING, logging.WARNING]
+    request_line, response_line = (record.getMessage() for record in records)
+    assert request_line.startswith("Request: ")
+    assert "'method': 'POST'" in request_line
+    assert "'path': '/echo'" in request_line
+    assert "'query': {'page': '2'}" in request_line
+    assert "'body_size': 5" in request_line
+    assert "'headers': {" in request_line
+    assert "'x-probe': '1'" in request_line
+    logged = re.fullmatch(r"Response: 200 for POST /echo \((\d+\.\d{4})s\)", response_line)
+    assert logged
+    assert 0.05 <= float(logged.group(1)) < 1
+
+
+def test_logging_middleware_logs_less_by_default(caplog):
+    """By default the middleware logs no headers and no body. It logs at INFO, and it skips /health."""
+    api = BoltAPI(middleware=[LoggingMiddleware])
+
+    @api.post("/echo")
+    async def echo(request):
+        return {"size": len(request.body)}
+
+    @api.get("/health")
+    async def health():
+        return {"ok": True}
+
+    with caplog.at_level(logging.INFO, logger="django_bolt.requests"), TestClient(api) as client:
+        client.post("/echo", content=b"12345", headers={"X-Probe": "1"})
+        client.get("/health")
+
+    records = [record for record in caplog.records if record.name == "django_bolt.requests"]
+    assert [record.levelno for record in records] == [logging.INFO, logging.INFO]
+    request_line = records[0].getMessage()
+    assert "'path': '/echo'" in request_line
+    assert "query" not in request_line
+    assert "body_size" not in request_line
+    assert "headers" not in request_line
+    assert "/health" not in request_line + records[1].getMessage()
+
+
+class DebugErrorHandler(ErrorHandlerMiddleware):
+    def __init__(self, get_response):
+        super().__init__(get_response, debug=True)
+
+
+@pytest.mark.parametrize("debug", [False, True], ids=["production", "debug"])
+def test_error_handler_middleware_answers_500_and_logs_an_unhandled_exception(debug, caplog):
+    """The 500 detail hides the error unless debug is on. An HTTPException keeps its status and is not logged."""
+    api = BoltAPI(middleware=[DebugErrorHandler if debug else ErrorHandlerMiddleware])
+
+    @api.get("/boom")
+    async def boom():
+        raise ValueError("secret detail")
+
+    @api.get("/teapot")
+    async def teapot():
+        raise HTTPException(418, "teapot")
+
+    with caplog.at_level(logging.ERROR, logger="django_bolt.errors"), TestClient(api) as client:
+        crash = client.get("/boom")
+        http_error = client.get("/teapot")
+
+    assert crash.status_code == 500
+    if debug:
+        assert "Traceback (most recent call last)" in crash.json()["detail"]
+        assert "ValueError: secret detail" in crash.json()["detail"]
+    else:
+        assert crash.json() == {"detail": "Internal Server Error"}
+    assert http_error.status_code == 418
+    assert http_error.json() == {"detail": "teapot"}
+    messages = [record.getMessage() for record in caplog.records if record.name == "django_bolt.errors"]
+    assert messages == ["Unhandled exception: secret detail"]
 
 
 if __name__ == "__main__":
