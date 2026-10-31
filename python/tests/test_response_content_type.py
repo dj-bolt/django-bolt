@@ -247,8 +247,15 @@ class Moved(Redirect):
         super().__init__(url, status_code=301)
 
 
-def test_subclass_of_a_response_type_serializes_as_its_base_type():
+class Download(FileResponse):
+    def __init__(self, path):
+        super().__init__(path, filename="download.txt")
+
+
+def test_subclass_of_a_response_type_serializes_as_its_base_type(tmp_path):
     """Bolt finds the response type of a subclass, and the route validates its data."""
+    data_file = tmp_path / "data.txt"
+    data_file.write_bytes(b"file body")
     api = BoltAPI()
 
     @api.get("/created", status_code=201)
@@ -276,6 +283,10 @@ def test_subclass_of_a_response_type_serializes_as_its_base_type():
     async def moved():
         return Moved("/new")
 
+    @api.get("/download")
+    async def download():
+        return Download(str(data_file))
+
     with TestClient(api) as client:
         for path, item_id in (("/created", 1), ("/created-sync", 2), ("/created-awaits", 3)):
             response = client.get(path)
@@ -294,3 +305,8 @@ def test_subclass_of_a_response_type_serializes_as_its_base_type():
         response = client.get("/moved", follow_redirects=False)
         assert response.status_code == 301
         assert response.headers["location"] == "/new"
+
+        response = client.get("/download")
+        assert response.status_code == 200
+        assert response.headers["content-disposition"] == 'attachment; filename="download.txt"'
+        assert response.content == b"file body"
