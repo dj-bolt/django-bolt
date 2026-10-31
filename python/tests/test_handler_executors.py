@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Depends
 from django_bolt.middleware import Middleware
 from django_bolt.testing import TestClient
 from tests.test_models import Article
@@ -380,3 +380,49 @@ def test_a_queryset_from_a_sync_handler_with_a_response_type(middleware):
         assert response.status_code == 500
         errors = response.json()["extra"]["validation_errors"]
         assert errors[0]["msg"].startswith("Response type mismatch: expected a single TitleRow"), errors
+
+
+def sync_label() -> str:
+    return "sync"
+
+
+async def async_label() -> str:
+    await asyncio.sleep(0)
+    return "async"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_the_general_executor_passes_every_argument():
+    """A handler that blocks, or a sync handler with an async dependency, takes the general executor."""
+    api = BoltAPI()
+
+    @api.get("/blocking/{item_id}")
+    def blocking(item_id: int, *, q: str):
+        return {"count": Article.objects.count(), "item": [item_id, q]}
+
+    @api.get("/blocking-dependency")
+    def blocking_dependency(*, q: str, label: str = Depends(sync_label)):
+        return {"count": Article.objects.count(), "item": [label, q]}
+
+    @api.get("/async-dependency/{item_id}")
+    def async_dependency(item_id: int, *, q: str, label: str = Depends(async_label)):
+        return {"item": [item_id, q, label]}
+
+    @api.get("/async-dependency-rows")
+    def async_dependency_rows(label: str = Depends(async_label)):
+        return titles()
+
+    Article.objects.create(title="One", content="First", author="A")
+    with TestClient(api) as client:
+        blocking_response = client.get("/blocking/7", params={"q": "bolt"})
+        missing = client.get("/blocking/7")
+        dependency = client.get("/blocking-dependency", params={"q": "bolt"})
+        async_response = client.get("/async-dependency/7", params={"q": "bolt"})
+        rows = client.get("/async-dependency-rows")
+
+    assert blocking_response.json() == {"count": 1, "item": [7, "bolt"]}
+    # Rust binds no argument, and the injector reports the missing parameter.
+    assert missing.status_code == 422, missing.text
+    assert dependency.json() == {"count": 1, "item": ["sync", "bolt"]}
+    assert async_response.json() == {"item": [7, "bolt", "async"]}
+    assert rows.json() == [{"title": "One"}]
