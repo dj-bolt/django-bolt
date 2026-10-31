@@ -132,6 +132,15 @@ def register_routes(api: BoltAPI) -> None:
     def sync_object_list(item_id: int, *, q: str) -> list[Item]:
         return [SimpleNamespace(id=item_id, q=q, in_task=in_task())]
 
+    @api.get("/sync/struct-from-dict/{item_id}")
+    def sync_struct_from_dict(item_id: int, *, q: str) -> Item:
+        return item_dict(item_id, q)
+
+    @api.get("/sync/struct-list-from-tuple/{item_id}")
+    def sync_struct_list_from_tuple(item_id: int, *, q: str) -> list[Item]:
+        # A tuple is not a list, so the slow path validates it.
+        return (item_dict(item_id, q),)
+
 
 ITEM = {"id": 7, "q": "bolt"}
 NO_TASK = {**ITEM, "in_task": False}
@@ -161,6 +170,8 @@ TASK = {**ITEM, "in_task": True}
         ("/sync/untyped-list/7", [NO_TASK]),
         ("/sync/untyped-struct/7", NO_TASK),
         ("/sync/object-list/7", [NO_TASK]),
+        ("/sync/struct-from-dict/7", NO_TASK),
+        ("/sync/struct-list-from-tuple/7", [NO_TASK]),
     ],
 )
 def test_each_executor_passes_positional_and_keyword_only_arguments(path, expected):
@@ -216,6 +227,18 @@ def register_no_param_routes(api: BoltAPI) -> None:
     def sync_struct_list() -> list[Item]:
         return [Item(id=1, q="none", in_task=in_task())]
 
+    @api.get("/sync/object-list")
+    def sync_object_list() -> list[Item]:
+        return [SimpleNamespace(id=1, q="none", in_task=in_task())]
+
+    @api.get("/sync/struct-from-dict")
+    def sync_struct_from_dict() -> Item:
+        return item_dict(1, "none")
+
+    @api.get("/sync/struct-list-from-tuple")
+    def sync_struct_list_from_tuple() -> list[Item]:
+        return (item_dict(1, "none"),)
+
 
 @pytest.mark.parametrize(
     ("path", "expected"),
@@ -229,6 +252,9 @@ def register_no_param_routes(api: BoltAPI) -> None:
         ("/sync/dict", {"id": 1, "q": "none", "in_task": False}),
         ("/sync/struct", {"id": 1, "q": "none", "in_task": False}),
         ("/sync/struct-list", [{"id": 1, "q": "none", "in_task": False}]),
+        ("/sync/object-list", [{"id": 1, "q": "none", "in_task": False}]),
+        ("/sync/struct-from-dict", {"id": 1, "q": "none", "in_task": False}),
+        ("/sync/struct-list-from-tuple", [{"id": 1, "q": "none", "in_task": False}]),
     ],
 )
 def test_each_executor_of_a_handler_with_no_parameters_keeps_the_response(path, expected):
@@ -263,11 +289,16 @@ SYNC_CASES = [
     ("/sync/untyped-list/7", [NO_TASK]),
     ("/sync/untyped-struct/7", NO_TASK),
     ("/sync/object-list/7", [NO_TASK]),
+    ("/sync/struct-from-dict/7", NO_TASK),
+    ("/sync/struct-list-from-tuple/7", [NO_TASK]),
     ("/sync/untyped", {"id": 1, "q": "none", "in_task": False}),
     ("/sync/untyped-list", [{"id": 1, "q": "none", "in_task": False}]),
     ("/sync/dict", {"id": 1, "q": "none", "in_task": False}),
     ("/sync/struct", {"id": 1, "q": "none", "in_task": False}),
     ("/sync/struct-list", [{"id": 1, "q": "none", "in_task": False}]),
+    ("/sync/object-list", [{"id": 1, "q": "none", "in_task": False}]),
+    ("/sync/struct-from-dict", {"id": 1, "q": "none", "in_task": False}),
+    ("/sync/struct-list-from-tuple", [{"id": 1, "q": "none", "in_task": False}]),
 ]
 
 
@@ -310,3 +341,42 @@ def test_a_queryset_from_a_sync_handler_loads(middleware):
 
     assert plain.json() == [{"title": "One"}], plain.text
     assert filtered.json() == [{"title": "One"}], filtered.text
+
+
+class TitleRow(msgspec.Struct):
+    title: str
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("middleware", [[], [PassThrough]], ids=["sync-dispatch", "async-executor"])
+def test_a_queryset_from_a_sync_handler_with_a_response_type(middleware):
+    """A list type loads the rows. A single Struct type gets the error that names the fix."""
+    api = BoltAPI(middleware=middleware)
+
+    @api.get("/rows")
+    def rows() -> list[TitleRow]:
+        return titles()
+
+    @api.get("/rows/{prefix}")
+    def some_rows(prefix: str, *, q: str) -> list[TitleRow]:
+        return titles(prefix)
+
+    @api.get("/row")
+    def row() -> TitleRow:
+        return titles()
+
+    @api.get("/row/{prefix}")
+    def some_row(prefix: str, *, q: str) -> TitleRow:
+        return titles(prefix)
+
+    Article.objects.create(title="One", content="First", author="A")
+    with TestClient(api) as client:
+        lists = [client.get(path, params={"q": "bolt"}) for path in ("/rows", "/rows/O")]
+        singles = [client.get(path, params={"q": "bolt"}) for path in ("/row", "/row/O")]
+
+    for response in lists:
+        assert response.json() == [{"title": "One"}], response.text
+    for response in singles:
+        assert response.status_code == 500
+        errors = response.json()["extra"]["validation_errors"]
+        assert errors[0]["msg"].startswith("Response type mismatch: expected a single TitleRow"), errors
