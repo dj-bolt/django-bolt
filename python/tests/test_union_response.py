@@ -374,6 +374,20 @@ def test_inline_list_path_reports_an_invalid_element():
         ]
 
 
+def test_list_route_that_returns_one_struct_gives_a_response_validation_error():
+    """A list route checks the shape of the result, not only the type of the Struct."""
+    api = BoltAPI()
+
+    @api.get("/rows")
+    async def rows() -> list[Row]:
+        return Row(id=1)
+
+    with TestClient(api) as client:
+        resp = client.get("/rows")
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "Response validation error"
+
+
 class Left(msgspec.Struct):
     left: int
 

@@ -13,7 +13,8 @@ import asyncio
 import pytest
 
 from django_bolt import JSON, BoltAPI
-from django_bolt.responses import File, FileResponse, PlainText, Redirect, Response
+from django_bolt.middleware import Middleware
+from django_bolt.responses import HTML, File, FileResponse, PlainText, Redirect, Response
 from django_bolt.testing import TestClient
 
 # Media types that take the integer-tag path, and the header Rust must emit.
@@ -176,3 +177,45 @@ def test_awaiting_handler_sends_a_file(tmp_path, response_class):
     assert response.status_code == 200
     assert response.headers["content-type"] == "text/plain"
     assert response.content == b"report"
+
+
+def test_html_keeps_its_custom_headers():
+    """A header of an HTML response reaches the client next to the HTML content type."""
+    api = BoltAPI()
+
+    @api.get("/page")
+    async def page():
+        return HTML("<p>hi</p>", headers={"X-Frame-Options": "DENY"})
+
+    with TestClient(api) as client:
+        response = client.get("/page")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.text == "<p>hi</p>"
+
+
+class UpperCaseBody(Middleware):
+    """Python middleware that edits the body with a method of bytes."""
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.body = response.body.upper()
+        return response
+
+
+@pytest.mark.parametrize("body_type", [bytearray, memoryview])
+def test_python_middleware_gets_bytes_like_content_as_bytes(body_type):
+    """The body of a Response is bytes, so a Python middleware can use the methods of bytes."""
+    api = BoltAPI(middleware=[UpperCaseBody])
+
+    @api.get("/raw")
+    async def raw():
+        return Response(body_type(b"raw"), media_type="application/octet-stream")
+
+    with TestClient(api) as client:
+        response = client.get("/raw")
+
+    assert response.status_code == 200
+    assert response.content == b"RAW"
