@@ -25,11 +25,15 @@ struct Bucket {
     limiter: Limiter,
     /// When the bucket was made. The log counts its seconds from here.
     created: Instant,
-    /// The second of the last log line, or `u64::MAX` before the first line.
-    logged_second: AtomicU64,
-    /// The rejections since that line that wrote no line.
-    unlogged: AtomicU64,
+    /// The state of the log line in one word, so the second and the count
+    /// change in one step. The high 32 bits hold the second of the last line
+    /// plus one, or 0 before the first line. The low 32 bits count the
+    /// rejections since that line that wrote none.
+    log: AtomicU64,
 }
+
+/// The count bits of `Bucket::log`.
+const UNLOGGED: u64 = u32::MAX as u64;
 
 /// A rejected request: the wait for the next request, and whether to log it.
 struct Rejection {
@@ -46,8 +50,7 @@ impl Bucket {
         Self {
             limiter,
             created,
-            logged_second: AtomicU64::new(u64::MAX),
-            unlogged: AtomicU64::new(0),
+            log: AtomicU64::new(0),
         }
     }
 
@@ -67,19 +70,27 @@ impl Bucket {
 
     /// Decide if a rejection at `now` writes a log line. The first rejection
     /// of each second does, so a flood writes one line per second for each
-    /// bucket. The line counts the rejections before it that wrote none.
+    /// bucket. The line counts the rejections before it that wrote none. The
+    /// stored second never goes back, so a late rejection of an earlier second
+    /// only adds to the count.
     fn log_at(&self, now: Instant) -> Option<u64> {
         let second = u64::from(now.duration_since(self.created)) / 1_000_000_000;
-        let last = self.logged_second.load(Ordering::Relaxed);
-        if last != second
-            && self
-                .logged_second
-                .compare_exchange(last, second, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            return Some(self.unlogged.swap(0, Ordering::Relaxed));
+        // A second fits in 32 bits for 136 years. A state below `line` holds
+        // an earlier second, with any count.
+        let line = (second + 1) << 32;
+        let mut state = self.log.load(Ordering::Relaxed);
+        while state < line {
+            match self
+                .log
+                .compare_exchange_weak(state, line, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(state & UNLOGGED),
+                Err(actual) => state = actual,
+            }
         }
-        self.unlogged.fetch_add(1, Ordering::Relaxed);
+        // One bucket cannot reject 2^32 requests in one second, so the count
+        // does not carry into the second.
+        self.log.fetch_add(1, Ordering::Relaxed);
         None
     }
 }
@@ -517,8 +528,11 @@ mod tests {
         assert_eq!(bucket.log_at(at(5_900_000_000)), None);
         // The next second logs, and counts the two rejections before it.
         assert_eq!(bucket.log_at(at(6_100_000_000)), Some(2));
+        // A late rejection of an earlier second writes no line. Second 6
+        // keeps its one line.
+        assert_eq!(bucket.log_at(at(5_900_000_000)), None);
         assert_eq!(bucket.log_at(at(6_200_000_000)), None);
-        assert_eq!(bucket.log_at(at(8_000_000_000)), Some(1));
+        assert_eq!(bucket.log_at(at(8_000_000_000)), Some(2));
         // The first second of a new bucket logs too.
         let fresh = Bucket::new(quota);
         assert_eq!(fresh.log_at(fresh.created), Some(0));
