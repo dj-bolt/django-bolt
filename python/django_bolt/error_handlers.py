@@ -214,11 +214,16 @@ def request_validation_error_handler(
 
 def response_validation_error_handler(
     exc: ResponseValidationError,
+    debug: bool = False,
 ) -> tuple[int, list[tuple[str, str]], bytes]:
     """Handle ResponseValidationError and convert to 500 response.
 
+    The errors name the model, the fields and the types of the handler. Thus
+    the response shows them only in debug mode. The server log always has them.
+
     Args:
         exc: ResponseValidationError instance
+        debug: Whether to include the validation errors in the response
 
     Returns:
         Tuple of (status_code, headers, body)
@@ -227,7 +232,7 @@ def response_validation_error_handler(
     return format_error_response(
         status_code=500,
         detail="Response validation error",
-        extra={"validation_errors": _format_validation_errors(exc.errors(), "response")},
+        extra={"validation_errors": _format_validation_errors(exc.errors(), "response")} if debug else None,
     )
 
 
@@ -314,6 +319,16 @@ def is_server_exception(exc: BaseException) -> bool:
     return not isinstance(exc, _CLIENT_ERROR_TYPES)
 
 
+def _resolve_debug(debug: bool | None) -> bool:
+    """Return ``debug``, or the Django DEBUG setting when ``debug`` is None."""
+    if debug is not None:
+        return debug
+    try:
+        return django_settings.DEBUG if django_settings and django_settings.configured else False
+    except (ImportError, AttributeError):
+        return False
+
+
 def handle_exception(
     exc: Exception,
     debug: bool | None = None,
@@ -331,18 +346,14 @@ def handle_exception(
         Tuple of (status_code, headers, body)
     """
     # Check Django's DEBUG setting dynamically only if debug is not explicitly set
-    if debug is None:
-        try:
-            debug = django_settings.DEBUG if django_settings and django_settings.configured else False
-        except (ImportError, AttributeError):
-            debug = False
+    debug = _resolve_debug(debug)
 
     if isinstance(exc, HTTPException):
         return http_exception_handler(exc)
     elif isinstance(exc, RequestValidationError):
         return request_validation_error_handler(exc)
     elif isinstance(exc, ResponseValidationError):
-        return response_validation_error_handler(exc)
+        return response_validation_error_handler(exc, debug=debug)
     elif isinstance(exc, ValidationException):
         # Generic validation exception
         return request_validation_error_handler(RequestValidationError(exc.errors()))
@@ -431,6 +442,7 @@ class BoltError(msgspec.Struct, frozen=True, kw_only=True):
             "payload_too_large", "response_validation" or "internal_error".
         detail: A message for a human. Bolt does not put internal data, such as a file path, in it.
         errors: The field errors. Each one is a dict with "loc", "msg" and "type", and some have "ctx".
+            A "response_validation" error has none when DEBUG is off.
         headers: The headers that the error needs, for example WWW-Authenticate
             or Retry-After. Bolt adds them to the response of the formatter.
         extra: The ``extra`` of an HTTPException, or ``{"retry_after": n}`` for
@@ -525,8 +537,13 @@ def problem_details(error: BoltError, request: Any) -> Response:
     return Response(body, status_code=error.status, media_type="application/problem+json")
 
 
-def bolt_error_from_exception(exc: BaseException) -> BoltError:
-    """Describe the error response for an exception, as ``handle_exception`` sends it."""
+def bolt_error_from_exception(exc: BaseException, debug: bool | None = None) -> BoltError:
+    """Describe the error response for an exception, as ``handle_exception`` sends it.
+
+    A formatter can send ``errors`` to the client. Thus a response validation
+    error has no ``errors`` unless ``debug`` is true. If ``debug`` is None, it
+    is the Django DEBUG setting. ``exception`` always has the errors.
+    """
     if isinstance(exc, HTTPException):
         return BoltError(
             status=exc.status_code,
@@ -541,7 +558,7 @@ def bolt_error_from_exception(exc: BaseException) -> BoltError:
             status=500,
             kind="response_validation",
             detail="Response validation error",
-            errors=_format_validation_errors(exc.errors(), "response"),
+            errors=_format_validation_errors(exc.errors(), "response") if _resolve_debug(debug) else [],
             exception=exc,
         )
     if isinstance(exc, ValidationException):
@@ -633,7 +650,8 @@ def _log_formatted_error(error: BoltError) -> None:
     It does not log an HTTPException.
     """
     if error.kind == "response_validation":
-        _log_response_validation_error(error.exception, error.errors)
+        # error.errors is empty when DEBUG is off, so the log reads the exception.
+        _log_response_validation_error(error.exception, _format_validation_errors(error.exception.errors(), "response"))
     elif DjangoSuspiciousOperation is not None and isinstance(error.exception, DjangoSuspiciousOperation):
         _log_suspicious_operation(error.exception)
     elif (

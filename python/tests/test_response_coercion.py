@@ -82,7 +82,9 @@ def _validation_message(response) -> str:
 # Function scope: each test registers the routes, so a mutation tool sees
 # each test reach the compiled coercers.
 @pytest.fixture
-def client():
+def client(settings):
+    # The 500 shows the validation errors only when DEBUG is on. These tests read them.
+    settings.DEBUG = True
     api = BoltAPI()
 
     @api.get("/struct/dict")
