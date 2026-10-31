@@ -2299,15 +2299,67 @@ def test_django_middleware_keeps_a_304_without_a_content_type():
 class OwnHtmlResponse(Middleware):
     """Python middleware that answers with its own response, which has no headers."""
 
+    response_type = "html"
+
     async def process_request(self, request):
         await self.get_response(request)
-        return MiddlewareResponse(200, {}, b"<p>own</p>", "html")
+        return MiddlewareResponse(200, {}, b"<p>own</p>", type(self).response_type)
 
 
-def test_django_middleware_keeps_the_content_type_of_a_middleware_response_type():
-    """A MiddlewareResponse with no headers gets the content type of its type."""
+class OwnUnknownTypeResponse(OwnHtmlResponse):
+    """The same, with a response type that Rust does not know."""
+
+    response_type = "custom"
+
+
+@pytest.mark.parametrize(
+    ("middleware", "content_type"),
+    [
+        (OwnHtmlResponse, "text/html; charset=utf-8"),
+        (OwnUnknownTypeResponse, "application/octet-stream"),
+    ],
+    ids=["html", "unknown-type"],
+)
+def test_django_middleware_keeps_the_content_type_of_a_middleware_response_type(middleware, content_type):
+    """A MiddlewareResponse with no headers gets the content type that Rust gives its type."""
+    responses = []
+    for django_middleware in (None, ["django.middleware.clickjacking.XFrameOptionsMiddleware"]):
+        api = BoltAPI(middleware=[middleware], django_middleware=django_middleware)
+
+        @api.get("/page")
+        async def page() -> dict:
+            return {"a": 1}
+
+        with TestClient(api) as client:
+            responses.append(client.get("/page"))
+    without_django, with_django = responses
+
+    assert with_django.headers.get("x-frame-options") == "DENY"
+    assert without_django.headers.get("content-type") == content_type
+    assert with_django.headers.get("content-type") == content_type
+    assert with_django.content == without_django.content == b"<p>own</p>"
+
+
+class BytesLikeBody(Middleware):
+    """Python middleware that sets a bytes-like body that is not bytes."""
+
+    body_type = bytearray
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.body = type(self).body_type(b"abc")
+        return response
+
+
+class MemoryViewBody(BytesLikeBody):
+    body_type = memoryview
+
+
+@pytest.mark.parametrize("middleware", [BytesLikeBody, MemoryViewBody], ids=["bytearray", "memoryview"])
+def test_django_middleware_keeps_a_bytes_like_body(middleware):
+    """A bytearray or memoryview body reaches the client as its bytes, not as its repr."""
     api = BoltAPI(
-        middleware=[OwnHtmlResponse],
+        middleware=[middleware],
         django_middleware=["django.middleware.clickjacking.XFrameOptionsMiddleware"],
     )
 
@@ -2319,8 +2371,7 @@ def test_django_middleware_keeps_the_content_type_of_a_middleware_response_type(
         response = client.get("/page")
 
     assert response.headers.get("x-frame-options") == "DENY"
-    assert response.headers.get("content-type") == "text/html; charset=utf-8"
-    assert response.content == b"<p>own</p>"
+    assert response.content == b"abc"
 
 
 @pytest.mark.parametrize(("path", "body"), [("/bytearray", b"abc"), ("/number", b"42")])

@@ -33,14 +33,26 @@ _META_TAG_TO_RESPONSE_TYPE = {
 }
 
 # The Content-Type of each built-in response type, as Rust sends it
-# (ResponseType::content_type in crates/bolt-core/src/response_meta.rs).
-# Rust sends no Content-Type for the other types.
+# (ResponseType in crates/bolt-core/src/response_meta.rs).
 _RESPONSE_TYPE_CONTENT_TYPES = {
     "json": "application/json",
     "html": "text/html; charset=utf-8",
     "plaintext": "text/plain; charset=utf-8",
     "octetstream": "application/octet-stream",
 }
+# Rust sends no Content-Type for these types.
+_RESPONSE_TYPES_WITHOUT_CONTENT_TYPE = frozenset(("empty", "redirect", "file", "streaming"))
+
+
+def _response_type_content_type(response_type: str) -> str | None:
+    """Return the Content-Type that Rust sends for a response type, or None.
+
+    Rust reads a response type that it does not know as octetstream.
+    """
+    if response_type in _RESPONSE_TYPES_WITHOUT_CONTENT_TYPE:
+        return None
+    return _RESPONSE_TYPE_CONTENT_TYPES.get(response_type, "application/octet-stream")
+
 
 # Raw cookie tuple type (matches serialization.py CookieTuple)
 CookieTuple = tuple[str, str, str, int | None, str | None, str | None, bool, bool, str | None]
@@ -133,7 +145,7 @@ class MiddlewareResponse:
             if response_type is None:
                 raise TypeError(f"Unknown response meta tag {meta!r}")
             # The tag carries the Content-Type. Middleware reads it from the headers.
-            content_type = _RESPONSE_TYPE_CONTENT_TYPES.get(response_type)
+            content_type = _response_type_content_type(response_type)
             headers = {"content-type": content_type} if content_type is not None else {}
             return cls(status_code, headers, body, response_type, None, body_kind=body_kind)
 
