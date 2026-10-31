@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import msgspec
 import pytest
 from msgspec import structs as msgspec_structs
 
@@ -383,3 +384,30 @@ def test_async_route_loads_an_existing_relation_that_its_field_type_does_not_sho
         resp = client.get("/users")
         assert resp.status_code == 200, resp.text
         assert resp.json() == [{"id": user.pk, "profile": profile.pk}]
+
+
+class ProfileHolder(msgspec.Struct):
+    """A plain Struct that holds a model instance."""
+
+    user: Any
+
+
+class ProfileHolderSerializer(Serializer):
+    user: UserProfileIdSerializer
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_serializer_route_loads_a_relation_of_a_model_in_a_returned_struct():
+    """A plain Struct can hold a model with an unloaded relation. The async route loads it."""
+    user = User.objects.create(username="holder", email="holder@example.com", password_hash="x")
+    profile = UserProfile.objects.create(user=user, bio="hello")
+    api = BoltAPI()
+
+    @api.get("/holder")
+    async def get_holder() -> ProfileHolderSerializer:
+        return ProfileHolder(user=await User.objects.aget(pk=user.pk))
+
+    with TestClient(api) as client:
+        resp = client.get("/holder")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"user": {"id": user.pk, "profile": profile.pk}}

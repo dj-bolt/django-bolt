@@ -912,15 +912,17 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
 
         # The async validator awaits only for a QuerySet or a model instance. A
-        # dict or a Struct gets the same result from the sync validator.
+        # dict gets the same result from the sync validator, and so does a
+        # Struct on a route with no serializer.
         if isinstance(result, dict):
             return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, list):
             return await _serialize_json_payload_async(prepare_list(result), current_status, validator_async)
         if struct_first and isinstance(result, msgspec.Struct):
-            if not is_serializer_response:
-                result = _convert_serializers(result)
-            return _serialize_json_payload_sync(result, current_status, validator_sync)
+            if is_serializer_response:
+                # A plain Struct can hold a model with a relation to load.
+                return await _serialize_json_payload_async(result, current_status, validator_async)
+            return _serialize_json_payload_sync(_convert_serializers(result), current_status, validator_sync)
         if isinstance(result, (bytes, bytearray)):
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
