@@ -537,7 +537,7 @@ def test_mismatched_body_is_not_validated():
 
 
 # ============================================================================
-# An undeclared status in a sync (status, data) tuple keeps that status
+# An undeclared status in a (status, data) tuple keeps that status
 # ============================================================================
 
 
@@ -548,7 +548,7 @@ def test_mismatched_body_is_not_validated():
         ("/dict", "application/json", b'{"a":1}'),
     ],
 )
-def test_sync_tuple_with_an_undeclared_status_keeps_that_status(path, content_type, body):
+def test_a_tuple_with_an_undeclared_status_keeps_that_status(path, content_type, body):
     """The catch-all entry encodes the data, and the tuple status stays.
 
     The status of the catch-all entry is the route default, 200. A declared
@@ -564,12 +564,21 @@ def test_sync_tuple_with_an_undeclared_status_keeps_that_status(path, content_ty
     def data():
         return 418, {"a": 1}
 
-    with TestClient(api) as client:
-        response = client.get(path)
+    @api.get("/async/text", response_model={200: OkSchema})
+    async def async_text():
+        return 418, "teapot"
 
-    assert response.status_code == 418
-    assert response.headers["content-type"] == content_type
-    assert response.content == body
+    @api.get("/async/dict", response_model={200: OkSchema})
+    async def async_data():
+        return 418, {"a": 1}
+
+    with TestClient(api) as client:
+        responses = [client.get(path), client.get(f"/async{path}")]
+
+    for response in responses:
+        assert response.status_code == 418
+        assert response.headers["content-type"] == content_type
+        assert response.content == body
 
 
 # ============================================================================
@@ -764,7 +773,7 @@ def test_a_blocking_multi_response_handler_runs_with_its_dependencies_on_one_poo
     api = BoltAPI()
 
     @api.get("/count", response_model={200: dict})
-    def count(label: str, dependency_thread: str = Depends(thread_name)):
+    def count(*, label: str, dependency_thread: str = Depends(thread_name)):
         return 200, {
             "count": Article.objects.count(),
             "label": label,
