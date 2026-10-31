@@ -16,6 +16,7 @@ from uuid import UUID
 import msgspec
 import pytest
 from bolt_mcp import MCP, mount_mcp
+from django.core.exceptions import DisallowedHost, PermissionDenied
 from django.core.management.base import CommandError
 from django.db.models import QuerySet
 from django.utils.safestring import SafeString
@@ -24,14 +25,15 @@ from msgspec import Meta
 from django_bolt import BoltAPI
 from django_bolt.auth import AllowAny, IsAuthenticated, JWTAuthentication
 from django_bolt.error_handlers import BoltError, problem_details
-from django_bolt.exceptions import HTTPException
+from django_bolt.exceptions import HTTPException, RequestValidationError, ResponseValidationError
 from django_bolt.management.commands.runbolt import Command
 from django_bolt.middleware import rate_limit, skip_middleware
 from django_bolt.param_functions import Form
-from django_bolt.responses import JSON, FileResponse, PlainText, Response
+from django_bolt.responses import HTML, JSON, FileResponse, PlainText, Response
 from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
 
+from .test_exception_log_policy import _allow_file_paths
 from .test_models import Article
 
 
@@ -252,6 +254,45 @@ def test_suspicious_operation_400_reaches_the_formatter(settings, caplog):
     ]
 
 
+@pytest.mark.parametrize("formatter", [None, _record], ids=["default", "formatter"])
+def test_suspicious_operation_security_record_has_the_message_the_exception_and_the_status(settings, caplog, formatter):
+    """Django logs a SuspiciousOperation as an ERROR record with status_code 400. Bolt does the same."""
+    settings.ALLOWED_HOSTS = ["example.com"]
+    api = BoltAPI(error_formatter=formatter)
+
+    @api.get("/absolute")
+    async def absolute(request) -> dict:
+        return {"uri": request.build_absolute_uri()}
+
+    with caplog.at_level(logging.ERROR, logger="django.security.DisallowedHost"), TestClient(api) as client:
+        response = client.get("/absolute", headers={"Host": "evil.example"})
+
+    assert response.status_code == 400
+    [record] = [record for record in caplog.records if record.name == "django.security.DisallowedHost"]
+    assert record.levelno == logging.ERROR
+    assert record.getMessage().startswith("Invalid HTTP_HOST header: 'evil.example'")
+    assert record.status_code == 400
+    assert isinstance(record.exc_info[1], DisallowedHost)
+
+
+@pytest.mark.parametrize(("debug", "detail"), [(False, "Bad Request"), (True, "Invalid HTTP_HOST header")])
+def test_suspicious_operation_detail_shows_the_message_only_in_debug_mode(settings, debug, detail):
+    """The message of a SuspiciousOperation can name the input of the client. Production hides it."""
+    settings.DEBUG = debug
+    settings.ALLOWED_HOSTS = ["example.com"]
+    api = BoltAPI()
+
+    @api.get("/absolute")
+    async def absolute(request) -> dict:
+        return {"uri": request.build_absolute_uri()}
+
+    with TestClient(api) as client:
+        response = client.get("/absolute", headers={"Host": "evil.example"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith(detail)
+
+
 @pytest.mark.parametrize(("trusted_proxies", "port"), [([], "80"), (["127.0.0.1"], "443")])
 def test_formatter_request_takes_the_scheme_from_a_trusted_proxy_only(settings, trusted_proxies, port):
     """The request of a Rust core error follows BOLT_TRUSTED_PROXIES, as a handler request does."""
@@ -274,10 +315,117 @@ def test_response_validation_500_reaches_the_formatter(recorded, caplog, setting
     assert response.status_code == 500
     data = response.json()
     assert data["kind"] == "response_validation"
-    assert data["errors"]
-    logged = [record.getMessage() for record in caplog.records if record.name == "django_bolt.error_handlers"]
-    assert len(logged) == 1
-    assert logged[0].startswith("Response Validation Error:")
+    assert data["detail"] == "Response validation error"
+    assert data["exception"] == "ResponseValidationError"
+    [error] = data["errors"]
+    assert error["loc"] == ["response"]
+    assert error["type"] == "validation_error"
+    records = [record for record in caplog.records if record.name == "django_bolt.error_handlers"]
+    assert len(records) == 1
+    # The record is the one that Bolt writes without a formatter: the errors, and the exception.
+    assert records[0].getMessage() == (
+        f"Response Validation Error: Handler returned invalid response. Errors: {[error]}"
+    )
+    assert isinstance(records[0].exc_info[1], ResponseValidationError)
+
+
+def test_http_exception_with_another_status_has_the_http_error_kind():
+    api = BoltAPI(error_formatter=_record)
+
+    @api.get("/teapot")
+    async def teapot() -> dict:
+        raise HTTPException(418, "Short and stout")
+
+    with TestClient(api) as client:
+        response = client.get("/teapot")
+
+    assert response.status_code == 418
+    data = response.json()
+    assert (data["kind"], data["detail"]) == ("http_error", "Short and stout")
+
+
+@pytest.mark.parametrize(("message", "detail"), [("no access", "no access"), ("", "Permission denied")])
+def test_permission_denied_reaches_the_formatter_as_forbidden(message, detail):
+    api = BoltAPI(error_formatter=_record)
+
+    @api.get("/denied")
+    async def denied() -> dict:
+        raise PermissionDenied(message)
+
+    with TestClient(api) as client:
+        response = client.get("/denied")
+
+    assert response.status_code == 403
+    data = response.json()
+    assert (data["kind"], data["detail"], data["exception"]) == ("forbidden", detail, "PermissionDenied")
+    assert (data["errors"], data["headers"], data["extra"]) == ([], {}, None)
+
+
+def test_file_response_out_of_the_allowed_dirs_reaches_the_formatter_as_forbidden(settings, monkeypatch, tmp_path):
+    public = tmp_path / "public"
+    public.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret")
+    _allow_file_paths(settings, monkeypatch, public)
+    api = BoltAPI(error_formatter=_record)
+
+    @api.get("/outside")
+    async def outside_file():
+        return FileResponse(str(outside))
+
+    with TestClient(api) as client:
+        response = client.get("/outside")
+
+    assert response.status_code == 403
+    data = response.json()
+    # The exception text has the path of the file. The detail for the client does not.
+    assert (data["kind"], data["detail"], data["exception"]) == (
+        "forbidden",
+        "Permission denied",
+        "ResponseFileNotAllowed",
+    )
+    assert str(tmp_path) not in response.text
+
+
+def test_request_validation_error_of_a_handler_gives_each_error_a_location_under_body():
+    api = BoltAPI(error_formatter=_record)
+
+    @api.get("/invalid")
+    async def invalid() -> dict:
+        raise RequestValidationError(
+            [{"loc": ["body", "a"], "msg": "m", "type": "t"}, "plain text", msgspec.ValidationError("Bad - at `$.x`")]
+        )
+
+    with TestClient(api) as client:
+        response = client.get("/invalid")
+
+    assert response.status_code == 422
+    data = response.json()
+    assert (data["kind"], data["detail"]) == ("validation", "Request validation failed")
+    assert data["errors"] == [
+        {"loc": ["body", "a"], "msg": "m", "type": "t"},
+        {"loc": ["body"], "msg": "plain text", "type": "validation_error"},
+        {"loc": ["body", "x"], "msg": "Bad", "type": "validation_error"},
+    ]
+
+
+def test_response_validation_error_of_a_handler_gives_each_error_a_location_under_response():
+    api = BoltAPI(error_formatter=_record)
+
+    @api.get("/invalid")
+    async def invalid() -> dict:
+        raise ResponseValidationError(["plain text", msgspec.ValidationError("Bad - at `$.id`")])
+
+    with TestClient(api) as client:
+        response = client.get("/invalid")
+
+    assert response.status_code == 500
+    data = response.json()
+    assert data["kind"] == "response_validation"
+    assert data["errors"] == [
+        {"loc": ["response"], "msg": "plain text", "type": "validation_error"},
+        {"loc": ["response", "id"], "msg": "Bad", "type": "validation_error"},
+    ]
 
 
 # --- The built-in RFC 9457 formatter ---------------------------------------
@@ -358,6 +506,56 @@ def test_formatter_can_return_plain_text():
     assert python_error.text == "409 conflict"
 
 
+def test_formatter_can_return_html():
+    def formatter(error: BoltError, request) -> HTML:
+        return HTML(f"<p>{error.kind}</p>", status_code=error.status)
+
+    with TestClient(_routes(BoltAPI(error_formatter=formatter))) as client:
+        rust_error = client.get("/nowhere")
+        python_error = client.get("/conflict")
+
+    assert (rust_error.status_code, rust_error.text) == (404, "<p>not_found</p>")
+    assert rust_error.headers["content-type"] == "text/html; charset=utf-8"
+    assert (python_error.status_code, python_error.text) == (409, "<p>conflict</p>")
+    assert python_error.headers["content-type"] == "text/html; charset=utf-8"
+
+
+def test_formatter_content_type_header_replaces_the_content_type():
+    def formatter(error: BoltError, request) -> JSON:
+        return JSON({"kind": error.kind}, status_code=error.status, headers={"Content-Type": "application/vnd.x+json"})
+
+    with TestClient(_routes(BoltAPI(error_formatter=formatter))) as client:
+        rust_error = client.get("/nowhere")
+        python_error = client.get("/conflict")
+
+    assert rust_error.headers.get_list("content-type") == ["application/vnd.x+json"]
+    assert python_error.headers.get_list("content-type") == ["application/vnd.x+json"]
+
+
+def test_error_content_type_header_does_not_replace_the_content_type_of_the_formatter():
+    api = BoltAPI(error_formatter=_record)
+
+    @api.get("/typed-header")
+    async def typed_header() -> dict:
+        raise HTTPException(409, "Already exists", headers={"Content-Type": "text/plain", "X-Reason": "dup"})
+
+    with TestClient(api) as client:
+        response = client.get("/typed-header")
+
+    assert response.headers.get_list("content-type") == ["application/json"]
+    assert response.headers["x-reason"] == "dup"
+
+
+@pytest.mark.parametrize("status", [400, 599])
+def test_formatter_can_return_a_status_at_the_ends_of_the_error_range(status):
+    def formatter(error: BoltError, request) -> JSON:
+        return JSON({"kind": error.kind}, status_code=status)
+
+    with TestClient(_routes(BoltAPI(error_formatter=formatter))) as client:
+        assert client.get("/nowhere").status_code == status
+        assert client.get("/conflict").status_code == status
+
+
 def test_formatter_can_return_an_int_enum_status_and_a_str_subclass_header():
     def formatter(error: BoltError, request) -> JSON:
         return JSON(
@@ -372,29 +570,60 @@ def test_formatter_can_return_an_int_enum_status_and_a_str_subclass_header():
     assert (python_error.status_code, python_error.headers["x-kind"]) == (409, "conflict")
 
 
+def _formatter_with_a_cookie(error: BoltError, _request) -> JSON:
+    response = JSON({}, status_code=error.status)
+    response.set_cookie("session", "x")
+    return response
+
+
+_STATUS_RANGE = "error_formatter must return a status from 400 to 599, not "
+_RETURN_TYPES = "error_formatter must return Response, JSON, PlainText or HTML, not "
+
+
 @pytest.mark.parametrize(
-    "formatter",
+    ("formatter", "reason"),
     [
-        pytest.param(lambda _error, _request: 1 / 0, id="raises"),
-        pytest.param(lambda _error, _request: {"not": "a response"}, id="wrong-type"),
+        pytest.param(lambda _error, _request: 1 / 0, "division by zero", id="raises"),
+        pytest.param(_formatter_with_a_cookie, "error_formatter cannot set cookies on an error response", id="cookie"),
+        # A float is not a status, even when its value is 404.0.
+        pytest.param(
+            lambda error, _request: JSON({}, status_code=float(error.status)),
+            _STATUS_RANGE + "404.0",
+            id="float-status",
+        ),
+        pytest.param(
+            lambda _error, _request: JSON({"kind": "x"}, status_code=600), _STATUS_RANGE + "600", id="status-600"
+        ),
+        pytest.param(lambda _error, _request: {"not": "a response"}, _RETURN_TYPES + "dict", id="wrong-type"),
         # A header value must be a str. An int such as Retry-After: 30 is a common mistake.
         pytest.param(
-            lambda error, _request: JSON({}, status_code=error.status, headers={"Retry-After": 30}), id="int-header"
+            lambda error, _request: JSON({}, status_code=error.status, headers={"Retry-After": 30}),
+            "error_formatter returned a value that is not valid for the header 'Retry-After': 30",
+            id="int-header",
         ),
         pytest.param(
             lambda error, _request: JSON({}, status_code=error.status, headers={"X-Detail": "a\nb"}),
+            r"error_formatter returned a value that is not valid for the header 'X-Detail': 'a\nb'",
             id="newline-header",
         ),
         pytest.param(
-            lambda error, _request: JSON({}, status_code=error.status, headers={"Bad Name": "x"}), id="bad-header-name"
+            lambda error, _request: JSON({}, status_code=error.status, headers={"Bad Name": "x"}),
+            "error_formatter returned a header name that is not valid: 'Bad Name'",
+            id="bad-header-name",
         ),
         # A 204 or a 304 has no body. Its body bytes would break a keep-alive connection.
-        pytest.param(lambda _error, _request: JSON({"kind": "x"}, status_code=204), id="status-204"),
-        pytest.param(lambda _error, _request: JSON({"kind": "x"}, status_code=302), id="status-302"),
-        pytest.param(lambda _error, _request: JSON({"kind": "x"}, status_code=1000), id="status-1000"),
+        pytest.param(
+            lambda _error, _request: JSON({"kind": "x"}, status_code=204), _STATUS_RANGE + "204", id="status-204"
+        ),
+        pytest.param(
+            lambda _error, _request: JSON({"kind": "x"}, status_code=302), _STATUS_RANGE + "302", id="status-302"
+        ),
+        pytest.param(
+            lambda _error, _request: JSON({"kind": "x"}, status_code=1000), _STATUS_RANGE + "1000", id="status-1000"
+        ),
     ],
 )
-def test_broken_formatter_logs_and_sends_the_default_error(formatter, caplog):
+def test_broken_formatter_logs_and_sends_the_default_error(formatter, reason, caplog):
     with (
         caplog.at_level(logging.ERROR, logger="django_bolt.error_handlers"),
         TestClient(_routes(BoltAPI(error_formatter=formatter))) as client,
@@ -406,7 +635,12 @@ def test_broken_formatter_logs_and_sends_the_default_error(formatter, caplog):
     assert python_error.status_code == 409
     assert python_error.json() == {"detail": "Already exists", "extra": {"id": 3}}
     failures = [record for record in caplog.records if "error_formatter failed" in record.getMessage()]
-    assert len(failures) == 2
+    assert [record.getMessage() for record in failures] == [
+        "error_formatter failed for a 404 not_found error. Bolt sends the default response.",
+        "error_formatter failed for a 409 conflict error. Bolt sends the default response.",
+    ]
+    # logger.exception() adds the exception of the formatter to each record. The text tells the fix.
+    assert str(failures[0].exc_info[1]) == reason
 
 
 def test_file_response_errors_reach_the_formatter(tmp_path):
