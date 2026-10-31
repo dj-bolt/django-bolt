@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import pytest
@@ -9,7 +10,7 @@ from django.http import HttpResponse
 
 from django_bolt import JSON, BoltAPI, Cookie, Response, StreamingResponse
 from django_bolt.cookies import make_delete_cookie
-from django_bolt.responses import HTML, PlainText, Redirect
+from django_bolt.responses import HTML, File, FileResponse, PlainText, Redirect
 from django_bolt.serialization import (
     compile_response_handlers,
     serialize_html_response,
@@ -540,3 +541,80 @@ class TestCookieSecurityValidation:
         assert "valid=" in set_cookie or "also_valid=" in set_cookie
         # Injection attempt should be blocked
         assert "injection" not in set_cookie
+
+
+class TestCookiesReachTheResponse:
+    """Each response kind sends its cookies in a Set-Cookie header."""
+
+    def test_streaming_response_sends_its_cookie(self):
+        api = BoltAPI()
+
+        @api.get("/stream")
+        def stream():
+            def gen():
+                yield "a"
+                yield "b"
+
+            return StreamingResponse(gen(), media_type="text/plain").set_cookie("s", "1")
+
+        with TestClient(api) as client:
+            response = client.get("/stream")
+
+        assert response.status_code == 200
+        assert response.content == b"ab"
+        assert response.headers["set-cookie"].startswith("s=1;")
+
+    def test_file_sends_its_cookie(self, tmp_path):
+        path = tmp_path / "report.txt"
+        path.write_bytes(b"file body")
+        api = BoltAPI()
+
+        @api.get("/file")
+        def file():
+            return File(str(path)).set_cookie("f", "1")
+
+        with TestClient(api) as client:
+            response = client.get("/file")
+
+        assert response.status_code == 200
+        assert response.content == b"file body"
+        assert response.headers["set-cookie"].startswith("f=1;")
+
+    def test_file_response_sends_its_cookie(self, tmp_path):
+        path = tmp_path / "report.txt"
+        path.write_bytes(b"file body")
+        api = BoltAPI()
+
+        @api.get("/file")
+        def file():
+            return FileResponse(str(path)).set_cookie("fr", "1")
+
+        with TestClient(api) as client:
+            response = client.get("/file")
+
+        assert response.status_code == 200
+        assert response.content == b"file body"
+        assert response.headers["set-cookie"].startswith("fr=1;")
+
+    @pytest.mark.parametrize("path", ["/sync", "/async"])
+    def test_json_keeps_its_headers_cookies_and_content_type(self, path):
+        """The async handler awaits, so it takes the async serializer, not the sync one."""
+        api = BoltAPI()
+
+        @api.get("/sync")
+        def sync_json():
+            return JSON({"a": 1}, headers={"X-A": "1"}).set_cookie("k", "v")
+
+        @api.get("/async")
+        async def async_json():
+            await asyncio.sleep(0)
+            return JSON({"a": 1}, headers={"X-A": "1"}).set_cookie("k", "v")
+
+        with TestClient(api) as client:
+            response = client.get(path)
+
+        assert response.status_code == 200
+        assert response.json() == {"a": 1}
+        assert response.headers["content-type"] == "application/json"
+        assert response.headers["x-a"] == "1"
+        assert response.headers["set-cookie"].startswith("k=v;")
