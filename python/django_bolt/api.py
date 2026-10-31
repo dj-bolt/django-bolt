@@ -2231,8 +2231,8 @@ class BoltAPI:
                                 else:
                                     coro.close()
                                     raise RuntimeError(
-                                        "Handler awaited unexpectedly in sync dispatch"
-                                    )  # pragma: no mutate
+                                        "Handler awaited unexpectedly in sync dispatch"  # pragma: no mutate (cannot suspend)
+                                    )
                                 try:
                                     return _encode(result)
                                 except TypeError:
@@ -2253,8 +2253,8 @@ class BoltAPI:
                                 else:
                                     coro.close()
                                     raise RuntimeError(
-                                        "Handler awaited unexpectedly in sync dispatch"
-                                    )  # pragma: no mutate
+                                        "Handler awaited unexpectedly in sync dispatch"  # pragma: no mutate (cannot suspend)
+                                    )
                                 if isinstance(result, dict):
                                     return _encode(result)
                                 if isinstance(result, list):
@@ -2276,8 +2276,8 @@ class BoltAPI:
                                 else:
                                     coro.close()
                                     raise RuntimeError(
-                                        "Handler awaited unexpectedly in sync dispatch"
-                                    )  # pragma: no mutate
+                                        "Handler awaited unexpectedly in sync dispatch"  # pragma: no mutate (cannot suspend)
+                                    )
                                 try:
                                     return _encode(result)
                                 except TypeError:
@@ -2299,8 +2299,8 @@ class BoltAPI:
                                 else:
                                     coro.close()
                                     raise RuntimeError(
-                                        "Handler awaited unexpectedly in sync dispatch"
-                                    )  # pragma: no mutate
+                                        "Handler awaited unexpectedly in sync dispatch"  # pragma: no mutate (cannot suspend)
+                                    )
                                 if isinstance(result, dict):
                                     return _encode(result)
                                 if isinstance(result, list):
@@ -2398,8 +2398,8 @@ class BoltAPI:
                                 else:
                                     coro.close()
                                     raise RuntimeError(
-                                        "Handler awaited unexpectedly in sync dispatch"
-                                    )  # pragma: no mutate
+                                        "Handler awaited unexpectedly in sync dispatch"  # pragma: no mutate (cannot suspend)
+                                    )
                                 if isinstance(result, _match_types):
                                     return _encode(result)
                                 return _finish(result)
@@ -2417,8 +2417,8 @@ class BoltAPI:
                                 else:
                                     coro.close()
                                     raise RuntimeError(
-                                        "Handler awaited unexpectedly in sync dispatch"
-                                    )  # pragma: no mutate
+                                        "Handler awaited unexpectedly in sync dispatch"  # pragma: no mutate (cannot suspend)
+                                    )
                                 if isinstance(result, _match_types):
                                     return _encode(result)
                                 return _finish(result)
