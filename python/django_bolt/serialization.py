@@ -170,13 +170,13 @@ def _convert_serializers(result: Any) -> Any:
     """
     # Check for Serializer instance using unique marker (not duck typing)
     # __is_bolt_serializer__ is defined on the Serializer base class
-    if getattr(result.__class__, "__is_bolt_serializer__", False) and hasattr(result, "dump"):
+    if getattr(result.__class__, "__is_bolt_serializer__", None) and hasattr(result, "dump"):
         return result.dump()
 
     # Handle list of Serializers
     if isinstance(result, list) and len(result) > 0:
         first = result[0]
-        if getattr(first.__class__, "__is_bolt_serializer__", False) and hasattr(first, "dump"):
+        if getattr(first.__class__, "__is_bolt_serializer__", None) and hasattr(first, "dump"):
             return [item.dump() for item in result]
 
     return result
@@ -262,7 +262,9 @@ def _render_response_body(content: Any, media_type: str) -> bytes:
     # One isinstance for the whole bytes-like family keeps the structured
     # content path to a single failed check.
     if isinstance(content, (bytes, bytearray, memoryview)):
-        return content if content.__class__ is bytes else bytes(content)
+        if content.__class__ is bytes:
+            return content
+        return bytes(content)
     if _is_json_media_type(media_type):
         return _json.encode(content)
     if isinstance(content, str):
@@ -358,7 +360,7 @@ def _dump_dict(serializer_cls: Any, value: dict, validate_dicts: bool) -> Any:
 
 
 def _is_serializer_instance(value: Any) -> bool:
-    return getattr(value.__class__, "__is_bolt_serializer__", False)
+    return getattr(value.__class__, "__is_bolt_serializer__", None)
 
 
 def _dump_one_sync(serializer_cls: Any, value: Any, validate_dicts: bool) -> Any:
@@ -445,25 +447,31 @@ def _compile_serializer_values_evaluators(serializer_cls: Any) -> tuple[Any, Any
     FieldError on first evaluation — that model is then permanently routed to
     the model-instance path (from_model) in this process."""
     field_names = tuple(serializer_cls.__struct_fields__)
-    # queryset.model -> True (values() works) / False (fall back to instances).
-    # Benign races under the GIL: both writers store the same verdict.
-    model_ok: dict[type, bool] = {}
+    # The models that values() cannot read. Benign races under the GIL: both
+    # writers add the same model.
+    instance_models: set[type] = set()
+
+    def dump_instances(queryset: QuerySet) -> list[Any]:
+        # Project here, on the ORM thread, so model properties may still
+        # query (an N+1, never SynchronousOnlyOperation on the loop).
+        # The route validator checks the dumped dicts later.
+        return _dump_many_sync(
+            serializer_cls,
+            list(queryset),
+            False,  # pragma: no mutate (None is also false)
+        )
 
     def evaluate_sync(queryset: QuerySet) -> list[Any]:
         queryset = serializer_cls._prepare_queryset(queryset)  # Config.annotations & co.
-        ok = model_ok.get(queryset.model)
-        if ok is False:
-            # Project here, on the ORM thread, so model properties may still
-            # query (an N+1, never SynchronousOnlyOperation on the loop).
-            return _dump_many_sync(serializer_cls, list(queryset), False)
+        if queryset.model in instance_models:
+            return dump_instances(queryset)
         try:
-            items = list(queryset.values(*field_names))
+            return list(queryset.values(*field_names))
         except FieldError:
             # Serializer field isn't a concrete column on this model.
-            model_ok[queryset.model] = False
-            return _dump_many_sync(serializer_cls, list(queryset), False)
-        model_ok[queryset.model] = True
-        return items
+            # The set only skips this values() call, which fails before it sends a query.
+            instance_models.add(queryset.model)  # pragma: no mutate
+            return dump_instances(queryset)
 
     async def evaluate_async(queryset: QuerySet) -> list[Any]:
         return await run_in_orm_executor(evaluate_sync, queryset)
@@ -512,16 +520,14 @@ def _compile_response_validator(meta: HandlerMetadata | dict[str, Any]) -> tuple
 
 
 def _compile_stream_item_validators(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
-    is_stream_annotation, item_type = meta["_stream_info"]
-    if (
-        not is_stream_annotation
-        or item_type is None
-        or item_type in _RAW_STREAM_CHUNK_TYPES
-        or not meta["validate_response"]
-        or not _response_validation_is_required(item_type)
-    ):
+    # A non-stream annotation and a stream with no item type have the item type
+    # None. Only a typed stream of JSON items uses the validator, so a stream of
+    # raw chunks never does.
+    _, item_type = meta["_stream_info"]
+    if not meta["validate_response"]:
         return None, None
-
+    if not _response_validation_is_required(item_type):
+        return None, None
     return compile_response_coercer(item_type)
 
 
@@ -648,12 +654,13 @@ async def _wrap_async_stream_chunks(content: Any, meta: HandlerMetadata):
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _serialize_sse_chunk(chunk: Any) -> bytes:
+def _serialize_sse_chunk(chunk: Any) -> bytes | bytearray | memoryview:
     """Serialize a single yielded item into SSE wire-format bytes."""
     if isinstance(chunk, (bytes, bytearray, memoryview)):
-        return bytes(chunk) if not isinstance(chunk, bytes) else chunk
+        # Rust converts a bytearray or a memoryview chunk, as for any stream.
+        return chunk
     if isinstance(chunk, str):
-        return chunk.encode("utf-8")
+        return chunk.encode()
     if isinstance(chunk, ServerSentEvent):
         if chunk.raw_data is not None:
             return format_sse_event(
@@ -689,11 +696,19 @@ def _to_stream_wire(stream_response: StreamingResponse) -> ResponseWireV1:
         else:
             stream_response.content = _wrap_sync_sse_chunks(stream_response.content)
 
-    custom_headers: dict[str, str] = {"content-type": stream_response.media_type}
+    # The meta builder finds the content type in any letter case. With a content
+    # type set, Rust does not use the response type.
+    custom_headers: dict[str, str] = {
+        "content-type": stream_response.media_type,  # pragma: no mutate
+    }
     if stream_response.headers:
         custom_headers.update(stream_response.headers)
     cookies = getattr(stream_response, "_cookies", None)
-    resp_meta = _build_response_meta("streaming", custom_headers, cookies)
+    resp_meta = _build_response_meta(
+        "streaming",  # pragma: no mutate
+        custom_headers,
+        cookies,
+    )
     return _wire_stream(stream_response.status_code, resp_meta, stream_response)
 
 
@@ -730,7 +745,7 @@ def _build_auto_streaming_response(
 
 def _is_bolt_serializer(t: Any) -> bool:
     """True if t opts into Bolt Serializer behaviour via __is_bolt_serializer__."""
-    return getattr(t, "__is_bolt_serializer__", False)
+    return getattr(t, "__is_bolt_serializer__", None)
 
 
 def _is_plain_struct(t: Any) -> bool:
@@ -740,11 +755,13 @@ def _is_plain_struct(t: Any) -> bool:
 
 def _union_of_plain_structs(t: Any) -> tuple[type, ...] | None:
     """If t is a Union of plain msgspec.Structs (optional None allowed), return the struct tuple."""
-    origin = get_origin(t)
+    # Only the inline path uses this check. A mutant on a marked line makes it
+    # return None, so the route takes the slow path, which gives the same response.
+    origin = get_origin(t)  # pragma: no mutate
     if origin not in (Union, types.UnionType):
         return None
-    args = [a for a in get_args(t) if a is not type(None)]
-    if not args or not all(_is_plain_struct(a) for a in args):
+    args = [a for a in get_args(t) if a is not type(None)]  # pragma: no mutate
+    if not args or not all(_is_plain_struct(a) for a in args):  # pragma: no mutate
         return None
     return tuple(args)
 
@@ -773,6 +790,11 @@ def _compile_inline_response_validator(
       - ``default_status_code == 204`` (None-body shortcut lives in the slow path)
       - ``is_multi_response`` (multi-status routes have their own dispatcher)
     """
+    # A mutant in a region below turns the inline path off, or turns it on for
+    # a route that gives the same response on both paths. No test can catch it:
+    # - A route with validate_response=False or a multi-response route never reads the result.
+    # - A response_class route or a 204 route encodes the same body on both paths.
+    # pragma: no mutate start
     if not meta["validate_response"]:
         return None
     if meta.get("response_class") is not None:
@@ -789,7 +811,9 @@ def _compile_inline_response_validator(
         return ("struct", (response_type,))
 
     union_structs = _union_of_plain_structs(response_type)
+    # pragma: no mutate end
     if union_structs is not None:
+        # pragma: no mutate start
         return ("struct", union_structs)
 
     if get_origin(response_type) is list:
@@ -799,6 +823,7 @@ def _compile_inline_response_validator(
             if _is_plain_struct(item_type) or _union_of_plain_structs(item_type) is not None:
                 return ("list", response_type)
 
+    # pragma: no mutate end
     return None
 
 
@@ -822,11 +847,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 _values_serializer_cls
             )
     model_projector = _compile_model_projector(meta)
-    inline_validator = _compile_inline_response_validator(meta)
+    # Without the inline path, the slow path gives the same response.
+    inline_validator = _compile_inline_response_validator(meta)  # pragma: no mutate
 
     meta["_stream_item_validator"] = stream_validator_sync
     meta["_stream_item_validator_async"] = stream_validator_async
-    meta["_inline_response_validator"] = inline_validator
+    meta["_inline_response_validator"] = inline_validator  # pragma: no mutate
     # The validators come in pairs: both are None, or neither is.
     meta["_has_response_validation"] = validator_sync is not None
 
@@ -1152,16 +1178,25 @@ def serialize_django_response(result: DjangoHttpResponse) -> ResponseWireV1:
     """
     # Handle redirects specially (HttpResponseRedirect, HttpResponsePermanentRedirect)
     if isinstance(result, DjangoHttpResponseRedirect):
-        headers: dict[str, str] = {"location": result.url}
+        # Rust lowercases header names, and the loop skips each Location from Django.
+        headers: dict[str, str] = {
+            "location": result.url,  # pragma: no mutate
+        }
         # Copy other headers from Django response
         for key, value in result.items():
             if key.lower() != "location":
                 headers[key] = value
         return _wire_bytes(result.status_code, _build_wire_meta("redirect", headers, None), b"")
 
-    # Generic Django HttpResponse - extract content and headers
+    # Generic Django HttpResponse - extract content and headers. Rust and the
+    # middleware bridges read an unknown response type as "octetstream".
     headers = dict(result.items())
-    return _wire_bytes(result.status_code, _build_wire_meta("octetstream", headers, None), result.content)
+    meta = _build_wire_meta(
+        "octetstream",  # pragma: no mutate
+        headers,
+        None,
+    )
+    return _wire_bytes(result.status_code, meta, result.content)
 
 
 def serialize_file_response(result: File) -> ResponseWireV1:
@@ -1172,15 +1207,22 @@ def serialize_file_response(result: File) -> ResponseWireV1:
     data = result.read_bytes()
     ctype = result.media_type or mimetypes.guess_type(result.path)[0] or "application/octet-stream"
 
-    # Build custom headers
-    custom_headers: dict[str, str] = {"content-type": ctype}
+    # The meta builder finds the content type in any letter case. With a content
+    # type set, Rust does not use the response type.
+    custom_headers: dict[str, str] = {
+        "content-type": ctype,  # pragma: no mutate
+    }
     if result.filename:
         custom_headers["content-disposition"] = f'attachment; filename="{result.filename}"'
     if result.headers:
         custom_headers.update(result.headers)
 
     cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_wire_meta("file", custom_headers, cookies)
+    resp_meta = _build_wire_meta(
+        "file",  # pragma: no mutate
+        custom_headers,
+        cookies,
+    )
     return _wire_bytes(result.status_code, resp_meta, data)
 
 
@@ -1191,9 +1233,10 @@ def serialize_file_streaming_response(result: FileResponse) -> ResponseWireV1:
     """
     ctype = result.media_type or mimetypes.guess_type(result.path)[0] or "application/octet-stream"
 
-    # Build custom headers
+    # The meta builder finds the content type in any letter case. With a content
+    # type set, Rust does not use the response type.
     custom_headers: dict[str, str] = {
-        "content-type": ctype,
+        "content-type": ctype,  # pragma: no mutate
     }
     if result.filename:
         custom_headers["content-disposition"] = f'attachment; filename="{result.filename}"'
@@ -1201,7 +1244,11 @@ def serialize_file_streaming_response(result: FileResponse) -> ResponseWireV1:
         custom_headers.update(result.headers)
 
     cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_wire_meta("file", custom_headers, cookies)
+    resp_meta = _build_wire_meta(
+        "file",  # pragma: no mutate
+        custom_headers,
+        cookies,
+    )
     return _wire_file(result.status_code, resp_meta, result.path)
 
 

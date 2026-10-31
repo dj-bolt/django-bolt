@@ -307,6 +307,7 @@ def test_sse_route_keeps_its_status_and_frames_every_event_field():
     async def events():
         async def gen():
             yield bytearray(b": raw\n\n")
+            yield memoryview(b": view\n\n")
             yield ServerSentEvent(raw_data="hello", event="update", id="7", retry=1000, comment="note")
             yield ServerSentEvent(data={"a": 1}, event="e", id="1", retry=500, comment="c")
             yield ServerSentEvent(comment="keepalive")
@@ -320,6 +321,7 @@ def test_sse_route_keeps_its_status_and_frames_every_event_field():
     assert response.headers["content-type"] == "text/event-stream"
     assert response.content == (
         b": raw\n\n"
+        b": view\n\n"
         b": note\nevent: update\ndata: hello\nid: 7\nretry: 1000\n\n"
         b': c\nevent: e\ndata: {"a":1}\nid: 1\nretry: 500\n\n'
         b": keepalive\n\n"
