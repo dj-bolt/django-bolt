@@ -807,6 +807,35 @@ def test_python_middleware_reads_the_content_type_of_a_built_in_response(path, c
     assert ContentTypeRecorder.seen == [[content_type] if content_type else []]
 
 
+class XmlContentType(Middleware):
+    """Read the Content-Type in one letter case, and set it in another."""
+
+    seen: list = []
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        type(self).seen.append(response.headers.get("CONTENT-TYPE"))
+        response.headers["content-type"] = "application/xml"
+        return response
+
+
+def test_python_middleware_headers_ignore_the_letter_case_of_a_name():
+    """The last write of a header wins, whatever letter case each write uses."""
+    XmlContentType.seen = []
+    # The first middleware runs last on the response.
+    api = BoltAPI(middleware=[XmlContentType, CsvContentType])
+
+    @api.get("/html")
+    async def html():
+        return HTML("<p>x</p>")
+
+    with TestClient(api) as client:
+        response = client.get("/html")
+
+    assert XmlContentType.seen == ["text/csv"]
+    assert response.headers.get_list("content-type") == ["application/xml"]
+
+
 def test_python_middleware_replaces_the_content_type_in_any_letter_case():
     """A Content-Type that middleware sets wins over the one of the response."""
     api = BoltAPI(middleware=[CsvContentType])
