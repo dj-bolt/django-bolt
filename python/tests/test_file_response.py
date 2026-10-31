@@ -5,7 +5,7 @@ import time
 import pytest
 
 from django_bolt import BoltAPI
-from django_bolt.responses import FileResponse
+from django_bolt.responses import File, FileResponse
 from django_bolt.testing import TestClient
 
 # Create test files once at module level
@@ -182,3 +182,59 @@ def test_file_performance_small_vs_large():
     assert elapsed < 5.0  # Should take less than 5 seconds for 100 requests
 
     print(f"Small file (100KB) - 100 requests: {elapsed:.3f}s ({100 / elapsed:.1f} RPS)")
+
+
+@pytest.mark.parametrize("response_class", [File, FileResponse])
+def test_file_with_an_unknown_extension_is_an_octet_stream(tmp_path, response_class):
+    """A path with no known extension falls back to application/octet-stream."""
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"\x00\x01")
+    api = BoltAPI()
+
+    @api.get("/blob")
+    def get_blob():
+        return response_class(str(blob))
+
+    with TestClient(api) as client:
+        response = client.get("/blob")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert response.content == b"\x00\x01"
+
+
+def test_file_sends_its_filename_and_extra_headers(tmp_path):
+    report = tmp_path / "report.txt"
+    report.write_bytes(b"report")
+    api = BoltAPI()
+
+    @api.get("/report")
+    def get_report():
+        return File(str(report), filename="r.txt", headers={"X-Extra": "1"})
+
+    with TestClient(api) as client:
+        response = client.get("/report")
+
+    assert response.status_code == 200
+    assert response.headers["content-disposition"] == 'attachment; filename="r.txt"'
+    assert response.headers["x-extra"] == "1"
+    assert response.content == b"report"
+
+
+@pytest.mark.parametrize("response_class", [File, FileResponse])
+def test_file_header_replaces_the_filename_disposition(tmp_path, response_class):
+    """A content-disposition header replaces the one that the filename gives."""
+    report = tmp_path / "report.txt"
+    report.write_bytes(b"report")
+    api = BoltAPI()
+
+    @api.get("/report")
+    def get_report():
+        return response_class(str(report), filename="r.txt", headers={"content-disposition": "inline"})
+
+    with TestClient(api) as client:
+        response = client.get("/report")
+
+    assert response.status_code == 200
+    assert response.headers.get_list("content-disposition") == ["inline"]
+    assert response.content == b"report"
