@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import msgspec
 import pytest
+from django.test import override_settings
 
 from django_bolt import BoltAPI, Depends
 from django_bolt.middleware import Middleware
@@ -370,7 +371,8 @@ def test_a_queryset_from_a_sync_handler_with_a_response_type(middleware):
         return titles(prefix)
 
     Article.objects.create(title="One", content="First", author="A")
-    with TestClient(api) as client:
+    # With DEBUG off, the body of a response validation error hides the errors.
+    with override_settings(DEBUG=True), TestClient(api) as client:
         lists = [client.get(path, params={"q": "bolt"}) for path in ("/rows", "/rows/O")]
         singles = [client.get(path, params={"q": "bolt"}) for path in ("/row", "/row/O")]
 
