@@ -323,6 +323,8 @@ async def test_websocket_buckets_follow_the_ipv6_prefix_setting():
             await connect("2001:db8:1:2::2")
         with override_settings(BOLT_RATE_LIMIT_IPV6_PREFIX=128):
             assert await connect("2001:db8:1:2::3") == "connected"
+            # Another address of the same /64 has its own bucket at /128.
+            assert await connect("2001:db8:1:2::4") == "connected"
             with pytest.raises(PermissionError, match="Rate limit exceeded"):
                 await connect("2001:db8:1:2::3")
 
