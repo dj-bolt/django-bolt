@@ -1535,3 +1535,2241 @@ fn parse_rust_arg_bindings(py_meta: &Bound<'_, PyDict>) -> Option<Vec<RustArgBin
         Some(bindings)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::middleware::auth::authenticate;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use jsonwebtoken::{Algorithm, EncodingKey, crypto, get_current_timestamp};
+    use std::ffi::CString;
+    use std::time::{Duration, Instant};
+
+    fn with_py<R>(test: impl FnOnce(Python<'_>) -> R) -> R {
+        Python::initialize();
+        Python::attach(test)
+    }
+
+    /// Evaluate a Python expression. `vars` are the names that it can read.
+    fn eval<'py>(
+        py: Python<'py>,
+        code: &str,
+        vars: &[(&str, Bound<'py, PyAny>)],
+    ) -> Bound<'py, PyAny> {
+        let globals = PyDict::new(py);
+        for (name, value) in vars {
+            globals.set_item(name, value).unwrap();
+        }
+        py.eval(&CString::new(code).unwrap(), Some(&globals), None)
+            .unwrap_or_else(|e| panic!("bad test code {code:?}: {e}"))
+    }
+
+    fn py_dict<'py>(py: Python<'py>, code: &str) -> Bound<'py, PyDict> {
+        eval(py, code, &[]).cast_into::<PyDict>().unwrap()
+    }
+
+    /// A middleware, backend or guard dict, as the parsers take it.
+    fn map(py: Python<'_>, code: &str) -> HashMap<String, Py<PyAny>> {
+        py_dict(py, code).extract().unwrap()
+    }
+
+    /// The text of the error: the exception class, a colon and the message.
+    fn error_of<T>(result: PyResult<T>) -> String {
+        result.err().expect("the call must fail").to_string()
+    }
+
+    // ---- RouteExecutionPlan ----
+
+    /// The plan in the order of the arguments of `from_parts`.
+    fn readings(plan: RouteExecutionPlan) -> [bool; 12] {
+        [
+            plan.needs_body(),
+            plan.needs_query(),
+            plan.needs_headers(),
+            plan.needs_cookies(),
+            plan.needs_form_parsing(),
+            plan.skip_cors(),
+            plan.skip_compression(),
+            plan.has_auth_or_guards(),
+            plan.has_rate_limit(),
+            plan.can_sync_dispatch(),
+            plan.is_async(),
+            plan.can_lane_dispatch(),
+        ]
+    }
+
+    fn only(index: usize) -> [bool; 12] {
+        let mut flags = [false; 12];
+        flags[index] = true;
+        flags
+    }
+
+    fn plan_of(f: [bool; 12]) -> RouteExecutionPlan {
+        RouteExecutionPlan::from_parts(
+            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11],
+        )
+    }
+
+    #[test]
+    fn an_empty_plan_has_no_flag() {
+        assert_eq!(readings(plan_of([false; 12])), [false; 12]);
+        assert_eq!(readings(RouteExecutionPlan::default()), [false; 12]);
+    }
+
+    #[test]
+    fn each_plan_argument_sets_only_its_own_flag() {
+        for index in 0..12 {
+            assert_eq!(readings(plan_of(only(index))), only(index), "flag {index}");
+        }
+    }
+
+    #[test]
+    fn a_plan_keeps_all_flags_when_all_are_set() {
+        assert_eq!(readings(plan_of([true; 12])), [true; 12]);
+    }
+
+    // ---- RateLimitKey and the config defaults ----
+
+    #[test]
+    fn only_an_identity_key_needs_the_auth_context() {
+        assert!(!RateLimitKey::Ip.needs_identity());
+        assert!(!RateLimitKey::Header("x-tenant".into()).needs_identity());
+        assert!(RateLimitKey::User.needs_identity());
+        assert!(RateLimitKey::ApiKey.needs_identity());
+    }
+
+    #[test]
+    fn the_default_rate_limit_is_100_per_second_with_burst_200_by_address() {
+        let config = RateLimitConfig::default();
+        assert_eq!((config.rps, config.burst), (100, 200));
+        assert_eq!(config.key, RateLimitKey::Ip);
+    }
+
+    #[test]
+    fn the_default_cors_config_allows_no_origin_and_sets_the_header_values() {
+        let config = CorsConfig::default();
+        assert!(config.origins.is_empty() && config.origin_regexes.is_empty());
+        assert!(config.compiled_origin_regexes.is_empty() && config.origin_set.is_empty());
+        assert!(!config.allow_all_origins && !config.credentials);
+        assert_eq!(
+            config.methods,
+            ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"]
+        );
+        assert_eq!(
+            config.methods_str,
+            "GET, POST, PUT, PATCH, DELETE, OPTIONS, QUERY"
+        );
+        assert_eq!(config.headers, ["Content-Type", "Authorization"]);
+        assert_eq!(config.headers_str, "Content-Type, Authorization");
+        assert!(config.expose_headers.is_empty());
+        assert_eq!(config.expose_headers_str, "");
+        assert_eq!(
+            (config.max_age, config.max_age_str.as_str()),
+            (3600, "3600")
+        );
+        assert_eq!(config.methods_header.unwrap(), config.methods_str.as_str());
+        assert_eq!(config.headers_header.unwrap(), config.headers_str.as_str());
+        assert!(config.expose_headers_header.is_none());
+        assert_eq!(config.max_age_header.unwrap(), "3600");
+    }
+
+    #[test]
+    fn the_default_compression_config_is_brotli_level_5() {
+        let config = CompressionConfig::default();
+        assert_eq!(config.backend, "brotli");
+        assert_eq!(config.minimum_size, 500);
+        assert!(config.gzip_fallback);
+        assert_eq!(
+            (
+                config.brotli_level,
+                config.brotli_lgwin,
+                config.gzip_level,
+                config.zstd_level
+            ),
+            (5, 14, 6, 3)
+        );
+    }
+
+    // ---- CorsConfig::from_django_settings ----
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn django_settings_with_only_origins_keep_the_default_header_values() {
+        let config = CorsConfig::from_django_settings(
+            strings(&["https://a.test", "https://b.test"]),
+            vec![],
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let default = CorsConfig::default();
+        assert_eq!(config.origins, ["https://a.test", "https://b.test"]);
+        assert!(config.origin_set.contains("https://a.test"));
+        assert!(config.origin_set.contains("https://b.test"));
+        assert_eq!(config.origin_set.len(), 2);
+        assert!(!config.allow_all_origins && !config.credentials);
+        assert_eq!(config.methods, default.methods);
+        assert_eq!(config.methods_str, default.methods_str);
+        assert_eq!(config.headers, default.headers);
+        assert_eq!(config.headers_str, default.headers_str);
+        assert!(config.expose_headers.is_empty() && config.expose_headers_header.is_none());
+        assert_eq!(config.max_age, 3600);
+        assert_eq!(config.max_age_str, "3600");
+        assert_eq!(config.max_age_header.unwrap(), "3600");
+    }
+
+    #[test]
+    fn django_settings_set_the_flags_and_the_listed_header_values() {
+        let config = CorsConfig::from_django_settings(
+            strings(&["*"]),
+            vec![],
+            true,
+            true,
+            Some(strings(&["GET", "POST"])),
+            Some(strings(&["X-One", "X-Two"])),
+            Some(strings(&["X-Out"])),
+            Some(120),
+        );
+        assert!(config.allow_all_origins && config.credentials);
+        assert_eq!(config.methods, ["GET", "POST"]);
+        assert_eq!(config.methods_str, "GET, POST");
+        assert_eq!(config.methods_header.unwrap(), "GET, POST");
+        assert_eq!(config.headers, ["X-One", "X-Two"]);
+        assert_eq!(config.headers_str, "X-One, X-Two");
+        assert_eq!(config.headers_header.unwrap(), "X-One, X-Two");
+        assert_eq!(config.expose_headers, ["X-Out"]);
+        assert_eq!(config.expose_headers_str, "X-Out");
+        assert_eq!(config.expose_headers_header.unwrap(), "X-Out");
+        assert_eq!((config.max_age, config.max_age_str.as_str()), (120, "120"));
+        assert_eq!(config.max_age_header.unwrap(), "120");
+    }
+
+    #[test]
+    fn django_settings_with_empty_expose_headers_send_no_expose_header() {
+        let config = CorsConfig::from_django_settings(
+            vec![],
+            vec![],
+            false,
+            false,
+            None,
+            None,
+            Some(vec![]),
+            Some(0),
+        );
+        assert!(config.expose_headers.is_empty());
+        assert_eq!(config.expose_headers_str, "");
+        assert!(config.expose_headers_header.is_none());
+        assert_eq!((config.max_age, config.max_age_str.as_str()), (0, "0"));
+        assert_eq!(config.max_age_header.unwrap(), "0");
+    }
+
+    #[test]
+    fn django_settings_compile_each_valid_origin_regex_and_drop_an_invalid_one() {
+        let patterns = strings(&[r"^https://\w+\.example\.com$", "(unclosed", r"^http://dev$"]);
+        let config = CorsConfig::from_django_settings(
+            vec![],
+            patterns.clone(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        // The strings keep all patterns. Only the valid ones compile.
+        assert_eq!(config.origin_regexes, patterns);
+        assert_eq!(config.compiled_origin_regexes.len(), 2);
+        assert!(config.compiled_origin_regexes[0].is_match("https://api.example.com"));
+        assert!(!config.compiled_origin_regexes[0].is_match("https://evil.test"));
+        assert!(config.compiled_origin_regexes[1].is_match("http://dev"));
+    }
+
+    // ---- parse_cors_config ----
+
+    fn cors(code: &str) -> PyResult<CorsConfig> {
+        with_py(|py| parse_cors_config(&map(py, code), py))
+    }
+
+    #[test]
+    fn a_cors_dict_with_no_key_gives_the_default_config() {
+        let config = cors("{'type': 'cors'}").unwrap();
+        let default = CorsConfig::default();
+        assert!(config.origins.is_empty() && config.origin_regexes.is_empty());
+        assert!(!config.allow_all_origins && !config.credentials);
+        assert_eq!(config.methods_str, default.methods_str);
+        assert_eq!(config.headers_str, default.headers_str);
+        assert_eq!(config.max_age, 3600);
+    }
+
+    #[test]
+    fn cors_origins_fill_the_list_and_the_set() {
+        let config = cors("{'origins': ['https://a.test', 'https://b.test']}").unwrap();
+        assert_eq!(config.origins, ["https://a.test", "https://b.test"]);
+        assert_eq!(config.origin_set.len(), 2);
+        assert!(config.origin_set.contains("https://a.test"));
+        assert!(config.origin_set.contains("https://b.test"));
+        assert!(!config.allow_all_origins);
+    }
+
+    #[test]
+    fn a_wildcard_origin_allows_all_origins() {
+        let config = cors("{'origins': ['https://a.test', '*']}").unwrap();
+        assert!(config.allow_all_origins);
+        assert!(config.origin_set.contains("*"));
+    }
+
+    #[test]
+    fn a_cors_origin_str_is_one_origin() {
+        let config = cors("{'origins': 'https://a.test'}").unwrap();
+        assert_eq!(config.origins, ["https://a.test"]);
+        assert!(config.origin_set.contains("https://a.test"));
+    }
+
+    #[test]
+    fn cors_origins_can_be_any_collection_of_str() {
+        let config =
+            cors("{'origins': ('https://a.test',), 'origin_regexes': {'^http://x$'}}").unwrap();
+        assert_eq!(config.origins, ["https://a.test"]);
+        assert_eq!(config.origin_regexes, ["^http://x$"]);
+    }
+
+    #[test]
+    fn cors_origins_of_none_keep_the_default() {
+        let config = cors("{'origins': None, 'origin_regexes': None}").unwrap();
+        assert!(config.origins.is_empty() && config.origin_regexes.is_empty());
+        assert!(config.origin_set.is_empty());
+    }
+
+    #[test]
+    fn cors_origins_of_the_wrong_type_stop_startup() {
+        assert_eq!(
+            error_of(cors("{'origins': 5}")),
+            "TypeError: cors origins must be a str or a collection of str"
+        );
+        assert_eq!(
+            error_of(cors("{'origins': ['https://a.test', 5]}")),
+            "TypeError: cors origins must be a str or a collection of str"
+        );
+        assert_eq!(
+            error_of(cors("{'origin_regexes': 5}")),
+            "TypeError: cors origin_regexes must be a str or a collection of str"
+        );
+        assert_eq!(
+            error_of(cors("{'origin_regexes': [b'x']}")),
+            "TypeError: cors origin_regexes must be a str or a collection of str"
+        );
+    }
+
+    #[test]
+    fn an_empty_origin_regex_stops_startup() {
+        assert_eq!(
+            error_of(cors("{'origin_regexes': ['^ok$', '']}")),
+            "ValueError: cors origin_regexes holds an empty pattern, which matches every origin"
+        );
+    }
+
+    #[test]
+    fn cors_origin_regexes_compile_and_an_invalid_one_is_dropped() {
+        let config =
+            cors(r"{'origin_regexes': ['^https://\\w+\\.example\\.com$', '(unclosed']}").unwrap();
+        assert_eq!(config.origin_regexes.len(), 2);
+        assert_eq!(config.compiled_origin_regexes.len(), 1);
+        assert!(config.compiled_origin_regexes[0].is_match("https://api.example.com"));
+        assert!(!config.compiled_origin_regexes[0].is_match("https://example.org"));
+    }
+
+    #[test]
+    fn cors_credentials_follow_a_bool() {
+        assert!(cors("{'credentials': True}").unwrap().credentials);
+        assert!(!cors("{'credentials': False}").unwrap().credentials);
+        assert!(!cors("{}").unwrap().credentials);
+    }
+
+    #[test]
+    fn cors_methods_headers_and_expose_headers_set_the_text_and_the_header_value() {
+        let config = cors(
+            "{'methods': ['GET', 'PUT'], 'headers': ['X-A', 'X-B'], 'expose_headers': ['X-C', 'X-D']}",
+        )
+        .unwrap();
+        assert_eq!(config.methods, ["GET", "PUT"]);
+        assert_eq!(config.methods_str, "GET, PUT");
+        assert_eq!(config.methods_header.unwrap(), "GET, PUT");
+        assert_eq!(config.headers, ["X-A", "X-B"]);
+        assert_eq!(config.headers_str, "X-A, X-B");
+        assert_eq!(config.headers_header.unwrap(), "X-A, X-B");
+        assert_eq!(config.expose_headers, ["X-C", "X-D"]);
+        assert_eq!(config.expose_headers_str, "X-C, X-D");
+        assert_eq!(config.expose_headers_header.unwrap(), "X-C, X-D");
+    }
+
+    #[test]
+    fn empty_cors_expose_headers_send_no_header_and_empty_methods_stay_empty() {
+        let config = cors("{'expose_headers': [], 'methods': [], 'headers': []}").unwrap();
+        assert!(config.expose_headers.is_empty());
+        assert_eq!(config.expose_headers_str, "");
+        assert!(config.expose_headers_header.is_none());
+        assert!(config.methods.is_empty() && config.headers.is_empty());
+        assert_eq!(config.methods_str, "");
+        assert_eq!(config.headers_str, "");
+    }
+
+    #[test]
+    fn cors_headers_of_none_keep_the_default() {
+        // `@cors` passes `headers=None` when the route sets no headers.
+        let config = cors("{'headers': None, 'methods': None, 'expose_headers': None}").unwrap();
+        let default = CorsConfig::default();
+        assert_eq!(config.headers_str, default.headers_str);
+        assert_eq!(config.methods_str, default.methods_str);
+        assert!(config.expose_headers.is_empty());
+        assert!(config.expose_headers_header.is_none());
+    }
+
+    #[test]
+    fn cors_max_age_sets_the_number_the_text_and_the_header_value() {
+        let config = cors("{'max_age': 86400}").unwrap();
+        assert_eq!(config.max_age, 86400);
+        assert_eq!(config.max_age_str, "86400");
+        assert_eq!(config.max_age_header.unwrap(), "86400");
+        let zero = cors("{'max_age': 0}").unwrap();
+        assert_eq!((zero.max_age, zero.max_age_str.as_str()), (0, "0"));
+    }
+
+    // ---- parse_rate_limit_config ----
+
+    fn rate_limit(code: &str) -> RateLimitConfig {
+        with_py(|py| parse_rate_limit_config(&map(py, code), py)).expect("a rate limit config")
+    }
+
+    #[test]
+    fn a_rate_limit_takes_the_rps_burst_and_key_of_the_dict() {
+        let config = rate_limit("{'type': 'rate_limit', 'rps': 10, 'burst': 25, 'key': 'user'}");
+        assert_eq!((config.rps, config.burst), (10, 25));
+        assert_eq!(config.key, RateLimitKey::User);
+    }
+
+    #[test]
+    fn a_rate_limit_without_burst_gets_twice_the_rps() {
+        let config = rate_limit("{'rps': 7}");
+        assert_eq!((config.rps, config.burst), (7, 14));
+    }
+
+    #[test]
+    fn a_rate_limit_without_rps_keeps_the_default_rps() {
+        let config = rate_limit("{'burst': 5}");
+        assert_eq!((config.rps, config.burst), (100, 5));
+        let none = rate_limit("{}");
+        assert_eq!((none.rps, none.burst), (100, 200));
+    }
+
+    #[test]
+    fn a_rate_limit_key_is_a_known_name_or_a_lowercase_header() {
+        assert_eq!(rate_limit("{'key': 'ip'}").key, RateLimitKey::Ip);
+        assert_eq!(rate_limit("{'key': 'IP'}").key, RateLimitKey::Ip);
+        assert_eq!(rate_limit("{'key': 'user'}").key, RateLimitKey::User);
+        assert_eq!(rate_limit("{'key': 'User'}").key, RateLimitKey::User);
+        assert_eq!(rate_limit("{'key': 'api_key'}").key, RateLimitKey::ApiKey);
+        assert_eq!(rate_limit("{'key': 'API_KEY'}").key, RateLimitKey::ApiKey);
+        assert_eq!(
+            rate_limit("{'key': 'X-Tenant-ID'}").key,
+            RateLimitKey::Header("x-tenant-id".to_string())
+        );
+    }
+
+    // ---- RouteMetadata::from_python ----
+
+    const REQUIRED: &str = "'method': 'GET', 'path': '/x', 'needs_body': False, \
+        'needs_query': False, 'needs_headers': False, 'needs_cookies': False, \
+        'needs_path_params': False, 'is_static_route': False, \
+        'needs_form_parsing': False, 'default_status_code': 200";
+
+    /// The metadata dict that Python registration builds, plus `extra`.
+    /// A key in `extra` replaces the key of the base.
+    fn route_dict<'py>(py: Python<'py>, extra: &str) -> Bound<'py, PyDict> {
+        py_dict(py, &format!("{{{REQUIRED}, {extra}}}"))
+    }
+
+    fn parse_route(extra: &str) -> PyResult<RouteMetadata> {
+        with_py(|py| RouteMetadata::from_python(&route_dict(py, extra), py))
+    }
+
+    fn route(extra: &str) -> RouteMetadata {
+        parse_route(extra).unwrap()
+    }
+
+    fn parse_route_without(key: &str) -> PyResult<RouteMetadata> {
+        with_py(|py| {
+            let dict = route_dict(py, "");
+            dict.del_item(key).unwrap();
+            RouteMetadata::from_python(&dict, py)
+        })
+    }
+
+    const FLAG_KEYS: [&str; 6] = [
+        "needs_body",
+        "needs_query",
+        "needs_headers",
+        "needs_cookies",
+        "needs_path_params",
+        "is_static_route",
+    ];
+
+    #[test]
+    fn a_route_with_every_flag_off_has_an_empty_plan() {
+        let meta = route("");
+        assert_eq!(readings(meta.plan), [false; 12]);
+        assert!(!meta.needs_path_params && !meta.is_static_route);
+        assert_eq!(meta.default_status_code, 200);
+        assert!(meta.auth_backends.is_empty() && meta.guards.is_empty());
+        assert!(meta.skip.is_empty());
+        assert!(meta.cors_config.is_none() && meta.rate_limit_config.is_none());
+        assert!(meta.rust_arg_bindings.is_none() && !meta.prebind_only);
+        assert!(meta.websocket_revocation_check.is_none());
+        assert_eq!(meta.max_upload_size, 1024 * 1024);
+        assert_eq!(meta.memory_spool_threshold, 1024 * 1024);
+    }
+
+    #[test]
+    fn a_request_flag_of_the_route_sets_only_its_plan_flag() {
+        for (index, key) in [
+            "needs_body",
+            "needs_query",
+            "needs_headers",
+            "needs_cookies",
+            "needs_form_parsing",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let meta = route(&format!("'{key}': True"));
+            assert_eq!(readings(meta.plan), only(index), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_path_param_and_static_flags_are_not_in_the_plan() {
+        let meta = route("'needs_path_params': True");
+        assert!(meta.needs_path_params && !meta.is_static_route);
+        let meta = route("'is_static_route': True");
+        assert!(!meta.needs_path_params && meta.is_static_route);
+    }
+
+    #[test]
+    fn a_missing_required_key_is_a_value_error_that_names_the_key_and_the_route() {
+        for key in FLAG_KEYS
+            .into_iter()
+            .chain(["needs_form_parsing", "default_status_code"])
+        {
+            assert_eq!(
+                error_of(parse_route_without(key)),
+                format!("ValueError: Route metadata for GET /x has no '{key}' key"),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_names_a_route_with_no_method_or_path_by_question_marks() {
+        let text = with_py(|py| {
+            let dict = route_dict(py, "'method': 5");
+            dict.del_item("path").unwrap();
+            dict.del_item("needs_body").unwrap();
+            error_of(RouteMetadata::from_python(&dict, py))
+        });
+        assert_eq!(
+            text,
+            "ValueError: Route metadata for ? ? has no 'needs_body' key"
+        );
+    }
+
+    #[test]
+    fn a_flag_that_is_not_a_bool_is_a_type_error() {
+        for key in FLAG_KEYS.into_iter().chain(["needs_form_parsing"]) {
+            for (value, name) in [("1", "int"), ("'yes'", "str"), ("None", "NoneType")] {
+                assert_eq!(
+                    error_of(parse_route(&format!("'{key}': {value}"))),
+                    format!(
+                        "TypeError: Route metadata '{key}' for GET /x must be a bool, got {name}"
+                    ),
+                    "{key} = {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_status_code_is_an_int_from_0_to_65535() {
+        assert_eq!(route("'default_status_code': 201").default_status_code, 201);
+        assert_eq!(route("'default_status_code': 0").default_status_code, 0);
+        assert_eq!(
+            route("'default_status_code': 65535").default_status_code,
+            65535
+        );
+        assert_eq!(
+            error_of(parse_route("'default_status_code': True")),
+            "TypeError: Route metadata 'default_status_code' for GET /x must be an int, got bool"
+        );
+        for (value, name) in [
+            ("65536", "int"),
+            ("-1", "int"),
+            ("'200'", "str"),
+            ("200.0", "float"),
+        ] {
+            assert_eq!(
+                error_of(parse_route(&format!("'default_status_code': {value}"))),
+                format!(
+                    "TypeError: Route metadata 'default_status_code' for GET /x must be an int from 0 to 65535, got {name}"
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_upload_sizes_default_to_one_megabyte_and_take_an_int_of_zero_or_more() {
+        let meta = route("'max_upload_size': 10, 'memory_spool_threshold': 20");
+        assert_eq!(
+            (meta.max_upload_size, meta.memory_spool_threshold),
+            (10, 20)
+        );
+        let meta = route("'max_upload_size': 0, 'memory_spool_threshold': 0");
+        assert_eq!((meta.max_upload_size, meta.memory_spool_threshold), (0, 0));
+        // A key that is None is not "missing": it is the wrong type.
+        for key in ["max_upload_size", "memory_spool_threshold"] {
+            for (value, name) in [
+                ("True", "bool"),
+                ("-1", "int"),
+                ("'1'", "str"),
+                ("None", "NoneType"),
+            ] {
+                assert_eq!(
+                    error_of(parse_route(&format!("'{key}': {value}"))),
+                    format!(
+                        "TypeError: Route metadata '{key}' must be an int of 0 or more, got {name}"
+                    ),
+                    "{key} = {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_skip_list_is_stored_in_lowercase_and_sets_the_skip_flags() {
+        let meta = route("'skip': ['CORS', 'Compression', 'Custom']");
+        assert_eq!(meta.skip.len(), 3);
+        assert!(meta.skip.contains("cors") && meta.skip.contains("compression"));
+        assert!(meta.skip.contains("custom"));
+        assert_eq!(readings(meta.plan)[5..7], [true, true]);
+
+        assert_eq!(readings(route("'skip': ['cors']").plan), only(5));
+        assert_eq!(readings(route("'skip': ['compression']").plan), only(6));
+        assert_eq!(readings(route("'skip': ['other']").plan), [false; 12]);
+        // A skip value that is not a list of str is ignored.
+        assert!(route("'skip': 'cors'").skip.is_empty());
+        assert!(route("'skip': None").skip.is_empty());
+    }
+
+    #[test]
+    fn the_dispatch_flags_are_optional_bools() {
+        assert_eq!(readings(route("'can_sync_dispatch': True").plan), only(9));
+        assert_eq!(readings(route("'is_async': True").plan), only(10));
+        assert_eq!(readings(route("'can_lane_dispatch': True").plan), only(11));
+        let off = route("'can_sync_dispatch': 'yes', 'is_async': 1, 'can_lane_dispatch': None");
+        assert_eq!(readings(off.plan), [false; 12]);
+        let all = route("'can_sync_dispatch': True, 'is_async': True, 'can_lane_dispatch': True");
+        assert_eq!(readings(all.plan)[9..], [true, true, true]);
+    }
+
+    #[test]
+    fn the_type_hints_of_each_source_stay_in_their_own_map() {
+        let meta = route(
+            "'path_types': {'id': 1}, 'query_types': {'page': 2}, \
+             'header_types': {'x-count': 3}, 'cookie_types': {'visits': 4}",
+        );
+        assert_eq!(meta.path_types.len(), 1);
+        assert_eq!(meta.path_types["id"], 1);
+        assert_eq!(meta.query_types.len(), 1);
+        assert_eq!(meta.query_types["page"], 2);
+        assert_eq!(meta.header_types.len(), 1);
+        assert_eq!(meta.header_types["x-count"], 3);
+        assert_eq!(meta.cookie_types.len(), 1);
+        assert_eq!(meta.cookie_types["visits"], 4);
+        let none = route("'path_types': 5, 'query_types': {'a': 'b'}");
+        assert!(none.path_types.is_empty() && none.query_types.is_empty());
+        assert!(none.header_types.is_empty() && none.cookie_types.is_empty());
+    }
+
+    #[test]
+    fn the_form_and_query_sequence_metadata_is_read() {
+        let meta = route(
+            "'form_type_hints': {'age': 1, 'tags': 5}, 'form_seq_fields': ['tags', 'ids'], \
+             'query_seq_fields': ['q']",
+        );
+        assert_eq!(meta.form_type_hints.len(), 2);
+        assert_eq!(meta.form_type_hints["age"], 1);
+        assert_eq!(meta.form_type_hints["tags"], 5);
+        assert_eq!(meta.form_seq_fields.len(), 2);
+        assert!(meta.form_seq_fields.contains("tags") && meta.form_seq_fields.contains("ids"));
+        assert_eq!(meta.query_seq_fields.len(), 1);
+        assert!(meta.query_seq_fields.contains("q"));
+        assert!(!meta.form_seq_fields.contains("q"));
+        let bad = route("'form_type_hints': 1, 'form_seq_fields': 2, 'query_seq_fields': 3");
+        assert!(bad.form_type_hints.is_empty());
+        assert!(bad.form_seq_fields.is_empty() && bad.query_seq_fields.is_empty());
+    }
+
+    #[test]
+    fn the_file_constraints_of_the_route_are_parsed() {
+        let meta =
+            route("'file_constraints': {'avatar': {'max_size': 10, 'allowed_types': ['image/*']}}");
+        assert_eq!(meta.file_constraints.len(), 1);
+        assert_eq!(meta.file_constraints["avatar"].max_size, Some(10));
+    }
+
+    #[test]
+    fn the_revocation_check_is_the_python_callable_or_none() {
+        assert!(route("").websocket_revocation_check.is_none());
+        assert!(
+            route("'websocket_revocation_check': None")
+                .websocket_revocation_check
+                .is_none()
+        );
+        with_py(|py| {
+            let check = eval(py, "lambda auth: False", &[]);
+            let dict = route_dict(py, "");
+            dict.set_item("websocket_revocation_check", &check).unwrap();
+            let meta = RouteMetadata::from_python(&dict, py).unwrap();
+            let stored = meta.websocket_revocation_check.unwrap();
+            assert!(stored.bind(py).is(&check));
+        });
+    }
+
+    #[test]
+    fn the_rust_arg_bindings_are_read_and_prebind_only_needs_them() {
+        let binding =
+            "{'source': 'query', 'lookup_key': 'q', 'arg_name': 'q', 'arg_kind': 'keyword'}";
+        let meta = route(&format!("'rust_arg_bindings': [{binding}]"));
+        assert_eq!(meta.rust_arg_bindings.as_ref().unwrap().len(), 1);
+        assert!(!meta.prebind_only);
+        let meta = route(&format!(
+            "'rust_arg_bindings': [{binding}], 'prebind_only': True"
+        ));
+        assert!(meta.prebind_only);
+        let meta = route(&format!(
+            "'rust_arg_bindings': [{binding}], 'prebind_only': 'yes'"
+        ));
+        assert!(!meta.prebind_only);
+        // With no bindings, prebind_only has nothing to bind.
+        let meta = route("'prebind_only': True");
+        assert!(meta.rust_arg_bindings.is_none() && !meta.prebind_only);
+    }
+
+    // ---- RouteMetadata::from_python: auth backends and guards ----
+
+    const JWT: &str = "{'type': 'jwt', 'secret': 'topsecret'}";
+
+    #[test]
+    fn auth_backends_are_parsed_in_order() {
+        let meta = route(&format!(
+            "'auth_backends': [{JWT}, {{'type': 'api_key', 'api_keys': ['k']}}, \
+             {{'type': 'session', 'cookie': 'sid'}}]"
+        ));
+        assert_eq!(meta.auth_backends.len(), 3);
+        assert!(matches!(meta.auth_backends[0], AuthBackend::JWT { .. }));
+        assert!(matches!(meta.auth_backends[1], AuthBackend::APIKey { .. }));
+        assert!(matches!(meta.auth_backends[2], AuthBackend::Session { .. }));
+        assert_eq!(readings(meta.plan), only(7));
+    }
+
+    #[test]
+    fn auth_backends_of_none_are_no_backends() {
+        let meta = route("'auth_backends': None");
+        assert!(meta.auth_backends.is_empty());
+        assert!(!meta.plan.has_auth_or_guards());
+        let meta = route("'auth_backends': []");
+        assert!(!meta.plan.has_auth_or_guards());
+    }
+
+    #[test]
+    fn auth_backends_that_are_not_a_list_of_dicts_stop_startup() {
+        for value in ["5", "'jwt'", "[1]", "[{1: 2}]"] {
+            let text = error_of(parse_route(&format!("'auth_backends': {value}")));
+            assert!(
+                text.starts_with("ValueError: Invalid 'auth_backends' route metadata: "),
+                "{value}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_auth_backend_stops_startup_and_does_not_leave_the_route_open() {
+        assert_eq!(
+            error_of(parse_route("'auth_backends': [{'type': 'jwt'}]")),
+            "ValueError: JWT auth backend missing 'secret'"
+        );
+        assert_eq!(
+            error_of(parse_route(&format!(
+                "'auth_backends': [{JWT}, {{'type': 'ldap'}}]"
+            ))),
+            "ValueError: Unknown auth backend type 'ldap'"
+        );
+    }
+
+    #[test]
+    fn guards_are_parsed_and_set_the_auth_plan_flag_when_they_can_reject() {
+        let meta = route("'guards': [{'type': 'is_authenticated'}]");
+        assert!(!meta.guards.is_empty() && meta.guards.is_enforcing());
+        assert_eq!(readings(meta.plan), only(7));
+
+        let meta = route("'guards': [{'type': 'allow_any'}]");
+        assert!(!meta.guards.is_empty() && !meta.guards.is_enforcing());
+        assert_eq!(readings(meta.plan), [false; 12]);
+
+        let meta = route("'guards': None");
+        assert!(meta.guards.is_empty());
+        assert_eq!(readings(meta.plan), [false; 12]);
+    }
+
+    #[test]
+    fn guards_that_are_not_a_list_of_dicts_stop_startup() {
+        for value in ["5", "'allow_any'", "[1]"] {
+            let text = error_of(parse_route(&format!("'guards': {value}")));
+            assert!(
+                text.starts_with("ValueError: Invalid 'guards' route metadata: "),
+                "{value}: {text}"
+            );
+        }
+        assert_eq!(
+            error_of(parse_route("'guards': [{'type': 'nope'}]")),
+            "ValueError: Unknown guard type 'nope'"
+        );
+    }
+
+    // ---- RouteMetadata::from_python: middleware ----
+
+    const ORIGIN_A: &str = "{'type': 'cors', 'origins': ['https://a.test'], 'credentials': True}";
+
+    #[test]
+    fn a_cors_middleware_gives_the_route_cors_config() {
+        let meta = route(&format!("'middleware': [{ORIGIN_A}]"));
+        let cors = meta.cors_config.unwrap();
+        assert_eq!(cors.origins, ["https://a.test"]);
+        assert!(cors.credentials);
+    }
+
+    #[test]
+    fn a_route_without_cors_middleware_has_no_cors_config() {
+        assert!(route("'middleware': []").cors_config.is_none());
+        assert!(
+            route("'middleware': [{'type': 'compression'}]")
+                .cors_config
+                .is_none()
+        );
+        // A middleware entry with a type that is not a str is skipped.
+        assert!(
+            route("'middleware': [{'type': 5, 'origins': ['x']}]")
+                .cors_config
+                .is_none()
+        );
+        assert!(
+            route("'middleware': [{'origins': ['x']}]")
+                .cors_config
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_last_cors_config_replaces_the_outer_one() {
+        let meta = route(
+            "'middleware': [{'type': 'cors', 'origins': ['https://a.test'], 'max_age': 10}, \
+             {'type': 'cors', 'origins': ['https://b.test'], 'max_age': 20}]",
+        );
+        let cors = meta.cors_config.unwrap();
+        assert_eq!(cors.origins, ["https://b.test"]);
+        assert!(cors.origin_set.contains("https://b.test"));
+        assert!(!cors.origin_set.contains("https://a.test"));
+        assert_eq!(cors.max_age, 20);
+    }
+
+    #[test]
+    fn an_inner_cors_config_with_no_origins_keeps_the_outer_allow_list() {
+        let meta = route(
+            "'middleware': [{'type': 'cors', 'origins': ['https://a.test'], 'origin_regexes': ['^http://x$']}, \
+             {'type': 'cors', 'credentials': True, 'max_age': 20}]",
+        );
+        let cors = meta.cors_config.unwrap();
+        // The allow list comes from the outer config.
+        assert_eq!(cors.origins, ["https://a.test"]);
+        assert!(cors.origin_set.contains("https://a.test"));
+        assert_eq!(cors.origin_regexes, ["^http://x$"]);
+        assert_eq!(cors.compiled_origin_regexes.len(), 1);
+        assert!(!cors.allow_all_origins);
+        // The other settings come from the inner config.
+        assert!(cors.credentials);
+        assert_eq!(cors.max_age, 20);
+    }
+
+    #[test]
+    fn an_inner_cors_config_keeps_the_wildcard_of_the_outer_one() {
+        let meta = route(
+            "'middleware': [{'type': 'cors', 'origins': ['*']}, {'type': 'cors', 'credentials': True}]",
+        );
+        let cors = meta.cors_config.unwrap();
+        assert!(cors.allow_all_origins);
+        assert!(cors.origin_set.contains("*"));
+    }
+
+    #[test]
+    fn an_inner_cors_config_with_only_patterns_does_not_take_the_outer_origins() {
+        let meta = route(
+            "'middleware': [{'type': 'cors', 'origins': ['*']}, \
+             {'type': 'cors', 'origin_regexes': ['^http://x$']}]",
+        );
+        let cors = meta.cors_config.unwrap();
+        assert!(cors.origins.is_empty() && cors.origin_set.is_empty());
+        assert!(!cors.allow_all_origins);
+        assert_eq!(cors.origin_regexes, ["^http://x$"]);
+    }
+
+    #[test]
+    fn an_inner_cors_config_with_only_origins_does_not_take_the_outer_patterns() {
+        let meta = route(
+            "'middleware': [{'type': 'cors', 'origin_regexes': ['^http://x$']}, \
+             {'type': 'cors', 'origins': ['https://b.test']}]",
+        );
+        let cors = meta.cors_config.unwrap();
+        assert_eq!(cors.origins, ["https://b.test"]);
+        assert!(cors.origin_regexes.is_empty() && cors.compiled_origin_regexes.is_empty());
+    }
+
+    #[test]
+    fn the_allow_list_passes_through_a_chain_of_cors_configs() {
+        let meta = route(
+            "'middleware': [{'type': 'cors', 'origins': ['https://a.test']}, \
+             {'type': 'cors', 'origins': ['https://b.test']}, {'type': 'cors', 'max_age': 5}]",
+        );
+        let cors = meta.cors_config.unwrap();
+        assert_eq!(cors.origins, ["https://b.test"]);
+        assert_eq!(cors.max_age, 5);
+    }
+
+    #[test]
+    fn an_outer_cors_config_with_no_origins_adds_none_to_the_inner_config() {
+        let meta = route(
+            "'middleware': [{'type': 'cors', 'max_age': 5}, \
+             {'type': 'cors', 'credentials': True}]",
+        );
+        let cors = meta.cors_config.unwrap();
+        assert!(cors.origins.is_empty() && cors.origin_regexes.is_empty());
+        assert!(cors.credentials);
+        assert_eq!(cors.max_age, 3600);
+    }
+
+    #[test]
+    fn a_bad_cors_config_stops_startup() {
+        assert_eq!(
+            error_of(parse_route(
+                "'middleware': [{'type': 'cors', 'origins': 5}]"
+            )),
+            "TypeError: cors origins must be a str or a collection of str"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_middleware_gives_the_route_rate_limit_config() {
+        let meta =
+            route("'middleware': [{'type': 'rate_limit', 'rps': 5, 'burst': 9, 'key': 'x-key'}]");
+        let limit = meta.rate_limit_config.unwrap();
+        assert_eq!((limit.rps, limit.burst), (5, 9));
+        assert_eq!(limit.key, RateLimitKey::Header("x-key".to_string()));
+        assert_eq!(readings(meta.plan), only(8));
+    }
+
+    #[test]
+    fn the_first_rate_limit_wins() {
+        let meta = route(
+            "'middleware': [{'type': 'rate_limit', 'rps': 5}, {'type': 'rate_limit', 'rps': 50}]",
+        );
+        assert_eq!(meta.rate_limit_config.unwrap().rps, 5);
+    }
+
+    #[test]
+    fn a_route_without_rate_limit_middleware_has_no_rate_limit() {
+        let meta = route("'middleware': [{'type': 'cors'}]");
+        assert!(meta.rate_limit_config.is_none());
+        assert!(!meta.plan.has_rate_limit());
+    }
+
+    #[test]
+    fn an_identity_rate_limit_key_needs_an_auth_backend() {
+        let user = "'middleware': [{'type': 'rate_limit', 'rps': 5, 'key': 'user'}]";
+        let api_key = "'middleware': [{'type': 'rate_limit', 'rps': 5, 'key': 'api_key'}]";
+        assert_eq!(
+            error_of(parse_route(user)),
+            "ValueError: @rate_limit(key=\"user\") needs an auth backend on the route or the API; \
+             without one there is no identity to count per. Use key=\"ip\" or a header name."
+        );
+        assert_eq!(
+            error_of(parse_route(api_key)),
+            "ValueError: @rate_limit(key=\"api_key\") needs an auth backend on the route or the API; \
+             without one there is no identity to count per. Use key=\"ip\" or a header name."
+        );
+        // Guards are not a backend.
+        let guarded = format!("{user}, 'guards': [{{'type': 'is_authenticated'}}]");
+        assert!(parse_route(&guarded).is_err());
+
+        let backend = format!("'auth_backends': [{JWT}]");
+        for key in [user, api_key] {
+            let meta = route(&format!("{key}, {backend}"));
+            assert!(meta.rate_limit_config.is_some());
+            assert_eq!(readings(meta.plan), {
+                let mut flags = only(7);
+                flags[8] = true;
+                flags
+            });
+        }
+    }
+
+    #[test]
+    fn an_address_or_header_rate_limit_key_needs_no_auth_backend() {
+        for key in ["ip", "X-Tenant"] {
+            let meta = route(&format!(
+                "'middleware': [{{'type': 'rate_limit', 'rps': 5, 'key': '{key}'}}]"
+            ));
+            assert!(meta.rate_limit_config.is_some());
+            assert!(meta.auth_backends.is_empty());
+        }
+    }
+
+    // ---- parse_auth_backend ----
+
+    fn backend(code: &str) -> PyResult<AuthBackend> {
+        with_py(|py| parse_auth_backend(&map(py, code), py))
+    }
+
+    /// The fields of a JWT backend, so a test can name only the ones it reads.
+    struct Jwt {
+        keys: JwtKeySource,
+        algorithms: Vec<Algorithm>,
+        header: String,
+        cookie: Option<String>,
+        audience: Option<String>,
+        issuer: Option<String>,
+        leeway: i64,
+        token_type: Option<String>,
+        require_jti: bool,
+        cookie_csrf: bool,
+    }
+
+    fn jwt(code: &str) -> Jwt {
+        match backend(code).unwrap() {
+            AuthBackend::JWT {
+                keys,
+                algorithms,
+                header,
+                cookie,
+                audience,
+                issuer,
+                leeway,
+                token_type,
+                require_jti,
+                cookie_csrf,
+            } => Jwt {
+                keys,
+                algorithms,
+                header,
+                cookie,
+                audience,
+                issuer,
+                leeway,
+                token_type,
+                require_jti,
+                cookie_csrf,
+            },
+            other => panic!("not a JWT backend: {other:?}"),
+        }
+    }
+
+    const KID_JWKS: &str = r#"{"keys":[{"kty":"oct","kid":"k1","k":"c2VjcmV0"},{"kty":"oct","kid":"k2","k":"c2VjcmV0"}]}"#;
+
+    #[test]
+    fn a_jwt_backend_with_only_a_secret_gets_the_defaults() {
+        let jwt = jwt("{'type': 'jwt', 'secret': 'topsecret'}");
+        assert!(matches!(jwt.keys, JwtKeySource::Static(_)));
+        assert_eq!(jwt.algorithms, [Algorithm::HS256]);
+        assert_eq!(jwt.header, "authorization");
+        assert_eq!((jwt.cookie, jwt.audience, jwt.issuer), (None, None, None));
+        assert_eq!(jwt.leeway, 60);
+        assert_eq!(jwt.token_type, None);
+        assert!(!jwt.require_jti);
+        assert!(jwt.cookie_csrf);
+    }
+
+    #[test]
+    fn a_jwt_backend_with_none_for_each_optional_field_gets_the_defaults() {
+        // `JWTAuthentication.to_metadata` sets these keys to None when unset.
+        let jwt = jwt(
+            "{'type': 'jwt', 'secret': 's', 'algorithms': None, 'header': None, \
+             'cookie': None, 'audience': None, 'issuer': None, 'leeway': None, \
+             'token_type': None, 'require_jti': None, 'cookie_csrf': None, 'jwks': None}",
+        );
+        assert!(matches!(jwt.keys, JwtKeySource::Static(_)));
+        assert_eq!(jwt.algorithms, [Algorithm::HS256]);
+        assert_eq!(jwt.header, "authorization");
+        assert_eq!(
+            (jwt.cookie, jwt.audience, jwt.issuer, jwt.token_type),
+            (None, None, None, None)
+        );
+        assert_eq!(jwt.leeway, 60);
+        assert!(!jwt.require_jti);
+        assert!(jwt.cookie_csrf);
+    }
+
+    #[test]
+    fn a_jwt_backend_takes_every_field_of_the_dict() {
+        let jwt = jwt(
+            "{'type': 'jwt', 'secret': 's', 'algorithms': ['HS384', 'HS512'], \
+             'header': 'x-token', 'cookie': 'access', 'audience': 'api', 'issuer': 'https://idp.test', \
+             'leeway': 5, 'token_type': 'refresh', 'require_jti': True, 'cookie_csrf': False}",
+        );
+        assert_eq!(jwt.algorithms, [Algorithm::HS384, Algorithm::HS512]);
+        assert_eq!(jwt.header, "x-token");
+        assert_eq!(jwt.cookie.as_deref(), Some("access"));
+        assert_eq!(jwt.audience.as_deref(), Some("api"));
+        assert_eq!(jwt.issuer.as_deref(), Some("https://idp.test"));
+        assert_eq!(jwt.leeway, 5);
+        assert_eq!(jwt.token_type.as_deref(), Some("refresh"));
+        assert!(jwt.require_jti);
+        assert!(!jwt.cookie_csrf);
+        let negative = self::jwt("{'type': 'jwt', 'secret': 's', 'leeway': -3}");
+        assert_eq!(negative.leeway, -3);
+    }
+
+    fn bearer(secret: &str) -> AHashMap<String, String> {
+        bearer_with(secret, r#"{"alg":"HS256"}"#)
+    }
+
+    /// A token for `kid` signed with the secret of the test JWKS.
+    fn bearer_kid(kid: &str) -> AHashMap<String, String> {
+        bearer_with("secret", &format!(r#"{{"alg":"HS256","kid":"{kid}"}}"#))
+    }
+
+    fn bearer_with(secret: &str, header_json: &str) -> AHashMap<String, String> {
+        let claims = format!(r#"{{"sub":"42","exp":{}}}"#, get_current_timestamp() + 3600);
+        let message = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header_json),
+            URL_SAFE_NO_PAD.encode(claims)
+        );
+        let signature = crypto::sign(
+            message.as_bytes(),
+            &EncodingKey::from_secret(secret.as_bytes()),
+            Algorithm::HS256,
+        )
+        .unwrap();
+        let mut headers = AHashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            format!("Bearer {message}.{signature}"),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_jwt_backend_verifies_with_the_secret_of_the_dict() {
+        let backends = [backend("{'type': 'jwt', 'secret': 'topsecret'}").unwrap()];
+        assert!(authenticate(&bearer("topsecret"), &backends).is_some());
+        assert!(authenticate(&bearer("other-secret"), &backends).is_none());
+    }
+
+    #[test]
+    fn a_jwt_backend_with_a_bad_algorithm_list_stops_startup() {
+        let text = error_of(backend(
+            "{'type': 'jwt', 'secret': 's', 'algorithms': ['HS999']}",
+        ));
+        assert!(
+            text.starts_with("ValueError: Unsupported JWT algorithm 'HS999'"),
+            "{text}"
+        );
+        let text = error_of(backend("{'type': 'jwt', 'secret': 's', 'algorithms': []}"));
+        assert_eq!(
+            text,
+            "ValueError: JWT auth backend requires at least one algorithm"
+        );
+        let text = error_of(backend(
+            "{'type': 'jwt', 'secret': 's', 'algorithms': ['HS256', 'RS256']}",
+        ));
+        assert!(text.starts_with("ValueError: JWT algorithms "), "{text}");
+        assert!(backend("{'type': 'jwt', 'secret': 's', 'algorithms': 'HS256'}").is_err());
+    }
+
+    #[test]
+    fn a_jwt_backend_needs_a_str_secret_when_it_has_no_jwks() {
+        assert_eq!(
+            error_of(backend("{'type': 'jwt'}")),
+            "ValueError: JWT auth backend missing 'secret'"
+        );
+        assert!(error_of(backend("{'type': 'jwt', 'secret': 5}")).starts_with("TypeError"));
+        assert!(error_of(backend("{'type': 'jwt', 'secret': None}")).starts_with("TypeError"));
+    }
+
+    #[test]
+    fn a_jwt_field_of_the_wrong_type_stops_startup_and_does_not_drop_the_backend() {
+        for field in [
+            "'header': 5",
+            "'cookie': 5",
+            "'audience': 5",
+            "'issuer': 5",
+            "'leeway': 'x'",
+            "'token_type': 5",
+            "'require_jti': 'yes'",
+            "'cookie_csrf': 'yes'",
+            "'jwks': 5",
+        ] {
+            let text = error_of(backend(&format!(
+                "{{'type': 'jwt', 'secret': 's', {field}}}"
+            )));
+            assert!(text.starts_with("TypeError"), "{field}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_jwks_document_gives_keys_by_kid_and_wins_over_the_secret() {
+        for secret in ["", "'secret': 's', "] {
+            let jwt = jwt(&format!(
+                "{{'type': 'jwt', {secret}'algorithms': ['HS256'], 'jwks': '{KID_JWKS}'}}"
+            ));
+            let JwtKeySource::Jwks(keys) = jwt.keys else {
+                panic!("expected a JWKS key source");
+            };
+            assert_eq!(keys.len(), 2);
+            assert!(keys.contains_key("k1") && keys.contains_key("k2"));
+        }
+    }
+
+    #[test]
+    fn a_bad_jwks_document_stops_startup() {
+        let text = error_of(backend(
+            "{'type': 'jwt', 'secret': 's', 'jwks': 'not json'}",
+        ));
+        assert!(
+            text.starts_with("ValueError: Invalid JWKS document for JWT auth"),
+            "{text}"
+        );
+    }
+
+    /// A JWT backend with a JWKS and a refresh callback that records its calls.
+    /// `extra` is more dict items. Returns the backend and the list of calls.
+    fn refreshing_backend<'py>(py: Python<'py>, extra: &str) -> (AuthBackend, Bound<'py, PyAny>) {
+        let calls = eval(py, "[]", &[]);
+        let refresh = eval(py, "lambda: calls.append(1)", &[("calls", calls.clone())]);
+        let dict = eval(
+            py,
+            &format!("{{'type': 'jwt', 'jwks': '{KID_JWKS}', 'jwks_refresh': refresh, {extra}}}"),
+            &[("refresh", refresh)],
+        )
+        .extract()
+        .unwrap();
+        (parse_auth_backend(&dict, py).unwrap(), calls)
+    }
+
+    fn has_refreshing_keys(backend: &AuthBackend) -> bool {
+        matches!(
+            backend,
+            AuthBackend::JWT {
+                keys: JwtKeySource::RefreshingJwks(_),
+                ..
+            }
+        )
+    }
+
+    /// Wait up to `wait` for `calls` to hold a call.
+    fn calls_within(py: Python<'_>, calls: &Bound<'_, PyAny>, wait: Duration) -> usize {
+        let deadline = Instant::now() + wait;
+        loop {
+            let count = calls.len().unwrap();
+            if count > 0 || Instant::now() >= deadline {
+                return count;
+            }
+            py.detach(|| std::thread::sleep(Duration::from_millis(5)));
+        }
+    }
+
+    #[test]
+    fn a_jwks_refresh_callback_makes_a_refreshing_key_source_that_verifies_by_kid() {
+        with_py(|py| {
+            let (backend, calls) = refreshing_backend(py, "'jwks_refresh_interval': 3600");
+            assert!(has_refreshing_keys(&backend));
+            let backends = [backend];
+            assert!(authenticate(&bearer_kid("k1"), &backends).is_some());
+            assert!(authenticate(&bearer_kid("k2"), &backends).is_some());
+            // The interval is not over and both kids are known: no fetch.
+            assert_eq!(calls_within(py, &calls, Duration::from_millis(200)), 0);
+        });
+    }
+
+    #[test]
+    fn the_jwks_refresh_interval_defaults_to_300_seconds() {
+        with_py(|py| {
+            for interval in ["'x': 0", "'jwks_refresh_interval': None"] {
+                let (backend, calls) = refreshing_backend(py, interval);
+                let backends = [backend];
+                assert!(authenticate(&bearer_kid("k1"), &backends).is_some());
+                // The 300 s default is far off, so no fetch starts.
+                assert_eq!(
+                    calls_within(py, &calls, Duration::from_millis(300)),
+                    0,
+                    "{interval}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn the_jwks_refresh_interval_of_the_dict_sets_the_fetch_time() {
+        with_py(|py| {
+            let (backend, calls) = refreshing_backend(py, "'jwks_refresh_interval': 0");
+            let backends = [backend];
+            assert!(authenticate(&bearer_kid("k1"), &backends).is_some());
+            assert_eq!(calls_within(py, &calls, Duration::from_secs(5)), 1);
+        });
+    }
+
+    #[test]
+    fn a_jwks_refresh_interval_of_the_wrong_type_stops_startup() {
+        with_py(|py| {
+            let refresh = eval(py, "lambda: None", &[]);
+            let dict = eval(
+                py,
+                &format!("{{'type': 'jwt', 'jwks': '{KID_JWKS}', 'jwks_refresh': refresh, 'jwks_refresh_interval': 'soon'}}"),
+                &[("refresh", refresh)],
+            )
+            .extract()
+            .unwrap();
+            assert!(error_of(parse_auth_backend(&dict, py)).starts_with("TypeError"));
+        });
+    }
+
+    #[test]
+    fn a_none_jwks_refresh_callback_keeps_the_fixed_key_source() {
+        let jwt = jwt(&format!(
+            "{{'type': 'jwt', 'jwks': '{KID_JWKS}', 'jwks_refresh': None, 'jwks_refresh_interval': 5}}"
+        ));
+        assert!(matches!(jwt.keys, JwtKeySource::Jwks(_)));
+    }
+
+    #[test]
+    fn an_api_key_backend_with_no_field_gets_the_defaults() {
+        let AuthBackend::APIKey {
+            api_keys,
+            header,
+            key_permissions,
+        } = backend("{'type': 'api_key'}").unwrap()
+        else {
+            panic!("expected an API key backend");
+        };
+        assert!(api_keys.find("anything").is_none());
+        assert_eq!(header, "x-api-key");
+        assert!(key_permissions.is_empty());
+        let AuthBackend::APIKey {
+            api_keys,
+            header,
+            key_permissions,
+        } = backend(
+            "{'type': 'api_key', 'api_keys': None, 'header': None, 'key_permissions': None}",
+        )
+        .unwrap()
+        else {
+            panic!("expected an API key backend");
+        };
+        assert!(api_keys.find("anything").is_none());
+        assert_eq!(header, "x-api-key");
+        assert!(key_permissions.is_empty());
+    }
+
+    #[test]
+    fn an_api_key_backend_takes_the_keys_header_and_permissions() {
+        let AuthBackend::APIKey {
+            api_keys,
+            header,
+            key_permissions,
+        } = backend(
+            "{'type': 'api_key', 'api_keys': ['k-one', 'k-two'], 'header': 'x-token', \
+             'key_permissions': {'k-one': ['read', 'write'], 'k-two': []}}",
+        )
+        .unwrap()
+        else {
+            panic!("expected an API key backend");
+        };
+        assert_eq!(api_keys.find("k-one"), Some("k-one"));
+        assert_eq!(api_keys.find("k-two"), Some("k-two"));
+        assert!(api_keys.find("k-three").is_none());
+        assert_eq!(header, "x-token");
+        assert_eq!(key_permissions.len(), 2);
+        assert_eq!(key_permissions["k-one"], ["read", "write"]);
+        assert!(key_permissions["k-two"].is_empty());
+    }
+
+    #[test]
+    fn an_api_key_field_of_the_wrong_type_stops_startup() {
+        for field in [
+            "'api_keys': 5",
+            "'api_keys': [1]",
+            "'header': 5",
+            "'key_permissions': 5",
+            "'key_permissions': {'k': 'read'}",
+        ] {
+            let text = error_of(backend(&format!("{{'type': 'api_key', {field}}}")));
+            assert!(text.starts_with("TypeError"), "{field}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_session_backend_needs_a_cookie_and_gets_csrf_on_and_no_redirect() {
+        let AuthBackend::Session {
+            cookie,
+            csrf,
+            login_redirect,
+        } = backend("{'type': 'session', 'cookie': 'sessionid'}").unwrap()
+        else {
+            panic!("expected a session backend");
+        };
+        assert_eq!(cookie, "sessionid");
+        assert!(csrf);
+        assert!(!login_redirect);
+    }
+
+    #[test]
+    fn a_session_backend_takes_the_csrf_and_redirect_flags() {
+        let AuthBackend::Session {
+            cookie,
+            csrf,
+            login_redirect,
+        } = backend("{'type': 'session', 'cookie': 'sid', 'csrf': False, 'login_redirect': True}")
+            .unwrap()
+        else {
+            panic!("expected a session backend");
+        };
+        assert_eq!(cookie, "sid");
+        assert!(!csrf);
+        assert!(login_redirect);
+    }
+
+    #[test]
+    fn a_bad_session_backend_stops_startup() {
+        assert_eq!(
+            error_of(backend("{'type': 'session'}")),
+            "ValueError: Session auth backend missing 'cookie'"
+        );
+        for field in [
+            "'cookie': 5",
+            "'cookie': 's', 'csrf': 'yes'",
+            "'cookie': 's', 'login_redirect': 1",
+        ] {
+            let text = error_of(backend(&format!("{{'type': 'session', {field}}}")));
+            assert!(text.starts_with("TypeError"), "{field}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_auth_backend_needs_a_known_str_type() {
+        assert_eq!(
+            error_of(backend("{'secret': 's'}")),
+            "ValueError: Auth backend metadata missing 'type'"
+        );
+        assert_eq!(
+            error_of(backend("{'type': 'basic'}")),
+            "ValueError: Unknown auth backend type 'basic'"
+        );
+        assert!(error_of(backend("{'type': 5}")).starts_with("TypeError"));
+    }
+
+    // ---- parse_guard and GuardCheck ----
+
+    fn guard(code: &str) -> PyResult<Guard> {
+        with_py(|py| parse_guard(&map(py, code), py))
+    }
+
+    /// The parts of a `Requires` guard.
+    fn requires(code: &str) -> (ClaimKey, Vec<serde_json::Value>, Quantifier, Option<String>) {
+        match guard(code).unwrap() {
+            Guard::Requires {
+                claim,
+                values,
+                quantifier,
+                denial,
+            } => (
+                claim,
+                values,
+                quantifier,
+                denial.map(|denial| denial.text.clone()),
+            ),
+            other => panic!("not a Requires guard: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_simple_guards_have_no_fields() {
+        assert!(matches!(
+            guard("{'type': 'allow_any'}").unwrap(),
+            Guard::AllowAny
+        ));
+        assert!(matches!(
+            guard("{'type': 'is_authenticated'}").unwrap(),
+            Guard::IsAuthenticated
+        ));
+    }
+
+    #[test]
+    fn a_guard_needs_a_known_str_type() {
+        assert_eq!(
+            error_of(guard("{}")),
+            "ValueError: Guard metadata missing 'type'"
+        );
+        assert_eq!(
+            error_of(guard("{'type': 'is_admin'}")),
+            "ValueError: Unknown guard type 'is_admin'"
+        );
+        assert!(error_of(guard("{'type': 1}")).starts_with("TypeError"));
+    }
+
+    #[test]
+    fn a_requires_guard_parses_the_claim_the_values_and_the_quantifier() {
+        let (claim, values, quantifier, denial) = requires(
+            "{'type': 'requires', 'claim': 'role', 'values': ['admin', 'staff'], 'quantifier': 1, 'message': None}",
+        );
+        assert_eq!(claim, ClaimKey::Extra("role".to_string()));
+        assert_eq!(
+            values,
+            [serde_json::json!("admin"), serde_json::json!("staff")]
+        );
+        assert_eq!(quantifier, Quantifier::All);
+        assert_eq!(denial, None);
+    }
+
+    #[test]
+    fn a_requires_guard_names_a_typed_claim_with_its_own_key() {
+        let (claim, ..) = requires(
+            "{'type': 'requires', 'claim': 'is_staff', 'values': [True], 'quantifier': 0, 'message': None}",
+        );
+        assert_eq!(claim, ClaimKey::IsStaff);
+        let (claim, ..) = requires(
+            "{'type': 'requires', 'claim': 'permissions', 'values': [], 'quantifier': 0, 'message': None}",
+        );
+        assert_eq!(claim, ClaimKey::Permissions);
+    }
+
+    #[test]
+    fn the_quantifier_numbers_are_any_all_and_none() {
+        for (number, expected) in [
+            (0, Quantifier::Any),
+            (1, Quantifier::All),
+            (2, Quantifier::None),
+        ] {
+            let (_, _, quantifier, _) = requires(&format!(
+                "{{'type': 'requires', 'claim': 'c', 'values': ['v'], 'quantifier': {number}, 'message': None}}"
+            ));
+            assert_eq!(quantifier, expected, "{number}");
+        }
+        assert_eq!(
+            error_of(guard(
+                "{'type': 'requires', 'claim': 'c', 'values': [], 'quantifier': 3, 'message': None}"
+            )),
+            "ValueError: requires guard 'c' has unknown quantifier 3"
+        );
+    }
+
+    #[test]
+    fn a_requires_message_becomes_the_denial_with_a_json_body() {
+        with_py(|py| {
+            let dict = map(
+                py,
+                "{'type': 'requires', 'claim': 'c', 'values': [], 'quantifier': 0, 'message': 'Staff only'}",
+            );
+            let Guard::Requires { denial, .. } = parse_guard(&dict, py).unwrap() else {
+                panic!("expected a Requires guard");
+            };
+            let denial = denial.unwrap();
+            assert_eq!(denial.text, "Staff only");
+            assert_eq!(&denial.body[..], br#"{"detail":"Staff only"}"#);
+        });
+    }
+
+    #[test]
+    fn a_requires_guard_with_a_missing_or_bad_field_stops_startup() {
+        let full = [
+            ("claim", "'c'"),
+            ("values", "[]"),
+            ("quantifier", "0"),
+            ("message", "None"),
+        ];
+        for (missing, _) in full {
+            let fields: Vec<String> = full
+                .iter()
+                .filter(|(key, _)| *key != missing)
+                .map(|(key, value)| format!("'{key}': {value}"))
+                .collect();
+            assert_eq!(
+                error_of(guard(&format!(
+                    "{{'type': 'requires', {}}}",
+                    fields.join(", ")
+                ))),
+                format!("ValueError: requires guard missing '{missing}'"),
+                "{missing}"
+            );
+        }
+        assert_eq!(
+            error_of(guard(
+                "{'type': 'requires', 'claim': '', 'values': [], 'quantifier': 0, 'message': None}"
+            )),
+            "ValueError: requires guard 'claim' must be a non-empty string"
+        );
+        for (key, bad) in [
+            ("claim", "5"),
+            ("values", "5"),
+            ("quantifier", "'any'"),
+            ("message", "5"),
+        ] {
+            let fields = full.map(|(k, v)| format!("'{k}': {}", if k == key { bad } else { v }));
+            let text = error_of(guard(&format!(
+                "{{'type': 'requires', {}}}",
+                fields.join(", ")
+            )));
+            assert!(text.starts_with("TypeError"), "{key}: {text}");
+        }
+    }
+
+    #[test]
+    fn requires_values_keep_their_json_type() {
+        let (_, values, ..) = requires(
+            "{'type': 'requires', 'claim': 'c', 'quantifier': 0, 'message': None, \
+             'values': [True, False, 1, 0, -7, 1.5, 2.0, 'text']}",
+        );
+        assert_eq!(
+            values,
+            [
+                serde_json::json!(true),
+                serde_json::json!(false),
+                serde_json::json!(1),
+                serde_json::json!(0),
+                serde_json::json!(-7),
+                serde_json::json!(1.5),
+                serde_json::json!(2.0),
+                serde_json::json!("text"),
+            ]
+        );
+        // A bool is not a number: `True` must not become 1.
+        assert!(values[0].is_boolean() && values[2].is_i64());
+        assert!(values[6].is_f64());
+    }
+
+    #[test]
+    fn a_requires_value_that_json_cannot_hold_stops_startup() {
+        for value in ["float('nan')", "float('inf')", "float('-inf')"] {
+            assert_eq!(
+                error_of(guard(&format!(
+                    "{{'type': 'requires', 'claim': 'c', 'quantifier': 0, 'message': None, 'values': [{value}]}}"
+                ))),
+                "ValueError: requires guard 'c' has a non-finite float value",
+                "{value}"
+            );
+        }
+        for value in ["None", "[1]", "b'x'", "{}"] {
+            assert_eq!(
+                error_of(guard(&format!(
+                    "{{'type': 'requires', 'claim': 'c', 'quantifier': 0, 'message': None, 'values': [{value}]}}"
+                ))),
+                "ValueError: requires guard 'c' values must be str, int, float, or bool",
+                "{value}"
+            );
+        }
+    }
+
+    fn guard_check(code: &str) -> GuardCheck {
+        with_py(|py| GuardCheck::new(py, eval(py, code, &[]).extract().unwrap()).unwrap())
+    }
+
+    /// Run the check: None when it allows, else the status and the body.
+    fn check(
+        guards: &GuardCheck,
+        user_id: Option<&str>,
+        is_staff: bool,
+        is_superuser: bool,
+        permissions: &[&str],
+    ) -> Option<(u16, Vec<u8>)> {
+        with_py(|py| {
+            guards
+                .check(
+                    py,
+                    user_id.map(str::to_string),
+                    is_staff,
+                    is_superuser,
+                    permissions.iter().map(|p| p.to_string()).collect(),
+                )
+                .map(|(status, body)| (status, body.as_bytes().to_vec()))
+        })
+    }
+
+    #[test]
+    fn a_guard_check_with_no_guards_allows_anyone() {
+        let guards = guard_check("[]");
+        assert_eq!(check(&guards, None, false, false, &[]), None);
+        assert_eq!(check(&guards, Some("1"), false, false, &[]), None);
+        let guards = guard_check("[{'type': 'allow_any'}]");
+        assert_eq!(check(&guards, None, false, false, &[]), None);
+    }
+
+    #[test]
+    fn a_guard_check_answers_401_to_an_anonymous_user() {
+        let guards = guard_check("[{'type': 'is_authenticated'}]");
+        assert_eq!(
+            check(&guards, None, false, false, &[]),
+            Some((401, ERROR_BODY_401.to_vec()))
+        );
+        assert_eq!(check(&guards, Some("7"), false, false, &[]), None);
+    }
+
+    #[test]
+    fn a_guard_check_answers_403_with_the_default_or_the_custom_body() {
+        let plain = guard_check(
+            "[{'type': 'requires', 'claim': 'is_staff', 'values': [True], 'quantifier': 0, 'message': None}]",
+        );
+        assert_eq!(
+            check(&plain, Some("7"), false, false, &[]),
+            Some((403, ERROR_BODY_403.to_vec()))
+        );
+        assert_eq!(check(&plain, Some("7"), true, false, &[]), None);
+
+        let custom = guard_check(
+            "[{'type': 'requires', 'claim': 'is_staff', 'values': [True], 'quantifier': 0, 'message': 'Staff only'}]",
+        );
+        assert_eq!(
+            check(&custom, Some("7"), false, false, &[]),
+            Some((403, br#"{"detail":"Staff only"}"#.to_vec()))
+        );
+        // An anonymous user has no credential: 401, not 403.
+        assert_eq!(
+            check(&custom, None, true, true, &["x"]),
+            Some((401, ERROR_BODY_401.to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_guard_check_reads_the_staff_superuser_and_permission_state_of_the_user() {
+        let staff = guard_check(
+            "[{'type': 'requires', 'claim': 'is_staff', 'values': [], 'quantifier': 0, 'message': None}]",
+        );
+        assert_eq!(check(&staff, Some("1"), true, false, &[]), None);
+        assert!(check(&staff, Some("1"), false, true, &[]).is_some());
+
+        let superuser = guard_check(
+            "[{'type': 'requires', 'claim': 'is_superuser', 'values': [], 'quantifier': 0, 'message': None}]",
+        );
+        assert_eq!(check(&superuser, Some("1"), false, true, &[]), None);
+        assert!(check(&superuser, Some("1"), true, false, &[]).is_some());
+
+        let permission = guard_check(
+            "[{'type': 'requires', 'claim': 'permissions', 'values': ['app.edit'], 'quantifier': 0, 'message': None}]",
+        );
+        assert_eq!(
+            check(
+                &permission,
+                Some("1"),
+                false,
+                false,
+                &["app.edit", "app.view"]
+            ),
+            None
+        );
+        assert!(check(&permission, Some("1"), false, false, &["app.view"]).is_some());
+        assert!(check(&permission, Some("1"), true, true, &[]).is_some());
+
+        let subject = guard_check(
+            "[{'type': 'requires', 'claim': 'sub', 'values': ['42'], 'quantifier': 0, 'message': None}]",
+        );
+        assert_eq!(check(&subject, Some("42"), false, false, &[]), None);
+        assert!(check(&subject, Some("43"), false, false, &[]).is_some());
+    }
+
+    #[test]
+    fn a_guard_check_runs_the_guards_in_order() {
+        let guards = guard_check(
+            "[{'type': 'is_authenticated'}, \
+              {'type': 'requires', 'claim': 'is_staff', 'values': [True], 'quantifier': 0, 'message': 'no'}]",
+        );
+        assert_eq!(check(&guards, None, false, false, &[]).unwrap().0, 401);
+        assert_eq!(check(&guards, Some("1"), false, false, &[]).unwrap().0, 403);
+        assert_eq!(check(&guards, Some("1"), true, false, &[]), None);
+    }
+
+    #[test]
+    fn a_bad_guard_stops_the_guard_check_build() {
+        with_py(|py| {
+            let guards = eval(py, "[{'type': 'is_authenticated'}, {'type': 'nope'}]", &[]);
+            assert_eq!(
+                error_of(GuardCheck::new(py, guards.extract().unwrap())),
+                "ValueError: Unknown guard type 'nope'"
+            );
+        });
+    }
+
+    // ---- parse_file_constraints ----
+
+    fn file_constraints(extra: &str) -> HashMap<String, FileFieldConstraints> {
+        route(&format!("'file_constraints': {extra}")).file_constraints
+    }
+
+    #[test]
+    fn file_constraints_read_each_limit_of_each_field() {
+        let constraints = file_constraints(
+            "{'avatar': {'max_size': 1000, 'min_size': 10, 'allowed_types': ['image/png', 'image/*'], 'max_files': 3}, \
+              'doc': {'max_size': 5}}",
+        );
+        assert_eq!(constraints.len(), 2);
+        let avatar = &constraints["avatar"];
+        assert_eq!(avatar.max_size, Some(1000));
+        assert_eq!(avatar.min_size, Some(10));
+        assert_eq!(
+            avatar.allowed_types.as_deref(),
+            Some(&strings(&["image/png", "image/*"])[..])
+        );
+        assert_eq!(avatar.max_files, Some(3));
+        let doc = &constraints["doc"];
+        assert_eq!(doc.max_size, Some(5));
+        assert!(doc.min_size.is_none() && doc.allowed_types.is_none() && doc.max_files.is_none());
+    }
+
+    #[test]
+    fn a_field_with_no_limit_is_kept_with_no_limit() {
+        let constraints = file_constraints("{'avatar': {}}");
+        let avatar = &constraints["avatar"];
+        assert!(avatar.max_size.is_none() && avatar.min_size.is_none());
+        assert!(avatar.allowed_types.is_none() && avatar.max_files.is_none());
+    }
+
+    #[test]
+    fn a_zero_file_limit_is_a_limit() {
+        let avatar = &file_constraints(
+            "{'avatar': {'max_size': 0, 'min_size': 0, 'max_files': 0}}",
+        )["avatar"];
+        assert_eq!(
+            (avatar.max_size, avatar.min_size, avatar.max_files),
+            (Some(0), Some(0), Some(0))
+        );
+    }
+
+    #[test]
+    fn a_file_limit_of_the_wrong_type_is_left_unset() {
+        let avatar = &file_constraints(
+            "{'avatar': {'max_size': 'big', 'min_size': -1, 'allowed_types': 'image/*', 'max_files': None}}",
+        )["avatar"];
+        assert!(avatar.max_size.is_none() && avatar.min_size.is_none());
+        assert!(avatar.allowed_types.is_none() && avatar.max_files.is_none());
+    }
+
+    #[test]
+    fn file_constraints_that_are_not_a_map_of_maps_are_ignored() {
+        assert!(file_constraints("5").is_empty());
+        assert!(file_constraints("{'avatar': 5}").is_empty());
+        assert!(file_constraints("None").is_empty());
+        assert!(route("").file_constraints.is_empty());
+    }
+
+    // ---- parse_rust_arg_bindings ----
+
+    fn bindings(code: &str) -> Option<Vec<RustArgBinding>> {
+        with_py(|py| {
+            parse_rust_arg_bindings(&py_dict(py, &format!("{{'rust_arg_bindings': {code}}}")))
+        })
+    }
+
+    fn entry(source: &str, key: &str, name: &str, kind: &str, rest: &str) -> String {
+        format!(
+            "{{'source': {source}, 'lookup_key': {key}, 'arg_name': {name}, 'arg_kind': {kind}{rest}}}"
+        )
+    }
+
+    fn one(source: &str, key: &str, name: &str, kind: &str, rest: &str) -> Option<RustArgBinding> {
+        let list = format!("[{}]", entry(source, key, name, kind, rest));
+        bindings(&list).map(|mut found| {
+            assert_eq!(found.len(), 1);
+            found.remove(0)
+        })
+    }
+
+    #[test]
+    fn no_binding_list_gives_no_plan() {
+        with_py(|py| {
+            assert!(parse_rust_arg_bindings(&py_dict(py, "{}")).is_none());
+            assert!(parse_rust_arg_bindings(&py_dict(py, "{'rust_arg_bindings': None}")).is_none());
+        });
+        assert!(bindings("[]").is_none());
+        assert!(bindings("5").is_none());
+        assert!(bindings("{'source': 'query'}").is_none());
+        assert!(bindings("(1,)").is_none());
+    }
+
+    #[test]
+    fn a_binding_reads_the_source_the_keys_and_the_kind() {
+        with_py(|py| {
+            let found = one("'query'", "'page-no'", "'page_no'", "'keyword'", "").unwrap();
+            assert_eq!(found.source, RustArgSource::Query);
+            assert_eq!(found.key, "page-no");
+            assert_eq!(found.arg_name.bind(py).to_str().unwrap(), "page_no");
+            assert!(!found.positional);
+            // The defaults of the older shape.
+            assert!(found.required);
+            assert!(!found.inject_none);
+        });
+    }
+
+    #[test]
+    fn each_source_name_gives_its_source() {
+        for (name, source) in [
+            ("path", RustArgSource::Path),
+            ("query", RustArgSource::Query),
+            ("header", RustArgSource::Header),
+            ("cookie", RustArgSource::Cookie),
+        ] {
+            let found = one(&format!("'{name}'"), "'k'", "'a'", "'keyword'", "").unwrap();
+            assert_eq!(found.source, source, "{name}");
+        }
+        for bad in ["'body'", "'Query'", "None", "5"] {
+            assert!(one(bad, "'k'", "'a'", "'keyword'", "").is_none(), "{bad}");
+        }
+        assert!(
+            bindings("[{'lookup_key': 'k', 'arg_name': 'a', 'arg_kind': 'keyword'}]").is_none()
+        );
+    }
+
+    #[test]
+    fn a_binding_needs_a_non_empty_lookup_key_and_arg_name() {
+        for bad in ["''", "None", "5"] {
+            assert!(
+                one("'path'", bad, "'a'", "'keyword'", "").is_none(),
+                "key {bad}"
+            );
+            assert!(
+                one("'path'", "'k'", bad, "'keyword'", "").is_none(),
+                "name {bad}"
+            );
+        }
+        assert!(bindings("[{'source': 'path', 'arg_name': 'a', 'arg_kind': 'keyword'}]").is_none());
+        assert!(
+            bindings("[{'source': 'path', 'lookup_key': 'k', 'arg_kind': 'keyword'}]").is_none()
+        );
+    }
+
+    #[test]
+    fn the_arg_kind_is_positional_or_keyword() {
+        let found = one("'path'", "'id'", "'id'", "'positional'", "").unwrap();
+        assert!(found.positional);
+        let found = one("'path'", "'id'", "'id'", "'keyword'", "").unwrap();
+        assert!(!found.positional);
+        for bad in ["'other'", "None", "5", "'Positional'"] {
+            assert!(one("'path'", "'id'", "'id'", bad, "").is_none(), "{bad}");
+        }
+        assert!(bindings("[{'source': 'path', 'lookup_key': 'k', 'arg_name': 'a'}]").is_none());
+    }
+
+    #[test]
+    fn a_binding_takes_the_required_and_inject_none_flags() {
+        let found = one(
+            "'query'",
+            "'q'",
+            "'q'",
+            "'keyword'",
+            ", 'required': False, 'inject_none': True",
+        )
+        .unwrap();
+        assert!(!found.required && found.inject_none);
+        let found = one(
+            "'query'",
+            "'q'",
+            "'q'",
+            "'keyword'",
+            ", 'required': True, 'inject_none': False",
+        )
+        .unwrap();
+        assert!(found.required && !found.inject_none);
+        // A flag of another type keeps the default.
+        let found = one(
+            "'query'",
+            "'q'",
+            "'q'",
+            "'keyword'",
+            ", 'required': 'no', 'inject_none': 'yes'",
+        )
+        .unwrap();
+        assert!(found.required && !found.inject_none);
+    }
+
+    #[test]
+    fn an_optional_positional_binding_voids_the_plan() {
+        // A skipped positional slot would shift the next positional argument.
+        assert!(
+            one(
+                "'path'",
+                "'a'",
+                "'a'",
+                "'positional'",
+                ", 'required': False"
+            )
+            .is_none()
+        );
+        assert!(one("'path'", "'a'", "'a'", "'keyword'", ", 'required': False").is_some());
+        assert!(one("'path'", "'a'", "'a'", "'positional'", ", 'required': True").is_some());
+    }
+
+    #[test]
+    fn bindings_keep_their_order_and_one_bad_entry_voids_the_plan() {
+        let good = |name: &str| {
+            entry(
+                "'header'",
+                &format!("'x-{name}'"),
+                &format!("'{name}'"),
+                "'keyword'",
+                "",
+            )
+        };
+        let found = bindings(&format!("[{}, {}, {}]", good("a"), good("b"), good("c"))).unwrap();
+        let keys: Vec<&str> = found.iter().map(|binding| binding.key.as_str()).collect();
+        assert_eq!(keys, ["x-a", "x-b", "x-c"]);
+
+        let bad = entry("'nowhere'", "'k'", "'a'", "'keyword'", "");
+        assert!(bindings(&format!("[{}, {bad}]", good("a"))).is_none());
+        assert!(bindings(&format!("[{bad}, {}]", good("a"))).is_none());
+        assert!(bindings(&format!("[{}, 5]", good("a"))).is_none());
+    }
+
+    #[test]
+    fn a_cloned_binding_has_the_same_fields() {
+        with_py(|py| {
+            let found = one(
+                "'cookie'",
+                "'sid'",
+                "'session'",
+                "'keyword'",
+                ", 'required': False, 'inject_none': True",
+            )
+            .unwrap();
+            let copy = found.clone();
+            assert_eq!(copy.source, RustArgSource::Cookie);
+            assert_eq!(copy.key, "sid");
+            assert!(copy.arg_name.bind(py).is(found.arg_name.bind(py)));
+            assert!(!copy.positional && !copy.required && copy.inject_none);
+            let positional = one("'path'", "'a'", "'a'", "'positional'", "")
+                .unwrap()
+                .clone();
+            assert!(positional.positional && positional.required && !positional.inject_none);
+        });
+    }
+
+    // ---- CompressionConfig::from_python_dict ----
+
+    fn compression(code: &str) -> PyResult<CompressionConfig> {
+        with_py(|py| CompressionConfig::from_python_dict(&eval(py, code, &[])))
+    }
+
+    const COMPRESSION: &str = "'backend': 'gzip', 'minimum_size': 256, 'gzip_fallback': False";
+
+    #[test]
+    fn compression_takes_the_required_fields_and_defaults_the_tuning_fields() {
+        let config = compression(&format!("{{{COMPRESSION}}}")).unwrap();
+        assert_eq!(config.backend, "gzip");
+        assert_eq!(config.minimum_size, 256);
+        assert!(!config.gzip_fallback);
+        assert_eq!(
+            (
+                config.brotli_level,
+                config.brotli_lgwin,
+                config.gzip_level,
+                config.zstd_level
+            ),
+            (5, 14, 6, 3)
+        );
+        let config =
+            compression("{'backend': 'zstd', 'minimum_size': 0, 'gzip_fallback': True}").unwrap();
+        assert_eq!(
+            (
+                config.backend.as_str(),
+                config.minimum_size,
+                config.gzip_fallback
+            ),
+            ("zstd", 0, true)
+        );
+    }
+
+    #[test]
+    fn compression_takes_each_tuning_field_into_its_own_level() {
+        let config = compression(&format!(
+            "{{{COMPRESSION}, 'brotli_level': 1, 'brotli_lgwin': 20, 'gzip_level': 8, 'zstd_level': 19}}"
+        ))
+        .unwrap();
+        assert_eq!(
+            (
+                config.brotli_level,
+                config.brotli_lgwin,
+                config.gzip_level,
+                config.zstd_level
+            ),
+            (1, 20, 8, 19)
+        );
+        // None is the same as a missing field.
+        let config = compression(&format!(
+            "{{{COMPRESSION}, 'brotli_level': None, 'brotli_lgwin': None, 'gzip_level': None, 'zstd_level': None}}"
+        ))
+        .unwrap();
+        assert_eq!(
+            (
+                config.brotli_level,
+                config.brotli_lgwin,
+                config.gzip_level,
+                config.zstd_level
+            ),
+            (5, 14, 6, 3)
+        );
+    }
+
+    #[test]
+    fn a_tuning_field_accepts_both_ends_of_its_range_and_no_value_beyond() {
+        for (key, lo, hi) in [
+            ("brotli_level", 0, 11),
+            ("brotli_lgwin", 10, 24),
+            ("gzip_level", 0, 9),
+            ("zstd_level", 1, 22),
+        ] {
+            for ok in [lo, hi] {
+                let config = compression(&format!("{{{COMPRESSION}, '{key}': {ok}}}")).unwrap();
+                let level = match key {
+                    "brotli_level" => config.brotli_level,
+                    "brotli_lgwin" => config.brotli_lgwin,
+                    "gzip_level" => config.gzip_level,
+                    _ => config.zstd_level,
+                };
+                assert_eq!(level, ok, "{key}");
+            }
+            for bad in [lo as i64 - 1, hi as i64 + 1] {
+                assert_eq!(
+                    error_of(compression(&format!("{{{COMPRESSION}, '{key}': {bad}}}"))),
+                    if bad < 0 {
+                        format!(
+                            "ValueError: CompressionConfig: '{key}' must be an int in [{lo}, {hi}]"
+                        )
+                    } else {
+                        format!(
+                            "ValueError: CompressionConfig: '{key}'={bad} out of range [{lo}, {hi}]"
+                        )
+                    },
+                    "{key} = {bad}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tuning_field_of_the_wrong_type_stops_startup() {
+        assert_eq!(
+            error_of(compression(&format!(
+                "{{{COMPRESSION}, 'brotli_level': 'high'}}"
+            ))),
+            "ValueError: CompressionConfig: 'brotli_level' must be an int in [0, 11]"
+        );
+        assert_eq!(
+            error_of(compression(&format!(
+                "{{{COMPRESSION}, 'zstd_level': 1.5}}"
+            ))),
+            "ValueError: CompressionConfig: 'zstd_level' must be an int in [1, 22]"
+        );
+    }
+
+    #[test]
+    fn a_none_required_compression_field_is_a_value_error_that_names_it() {
+        for key in ["backend", "minimum_size", "gzip_fallback"] {
+            let fields: Vec<String> = [
+                ("backend", "'gzip'"),
+                ("minimum_size", "256"),
+                ("gzip_fallback", "True"),
+            ]
+            .iter()
+            .map(|(k, v)| format!("'{k}': {}", if *k == key { "None" } else { v }))
+            .collect();
+            assert_eq!(
+                error_of(compression(&format!("{{{}}}", fields.join(", ")))),
+                format!("ValueError: CompressionConfig: required field '{key}' is missing"),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_required_compression_field_of_the_wrong_type_is_a_value_error() {
+        assert_eq!(
+            error_of(compression(
+                "{'backend': 5, 'minimum_size': 1, 'gzip_fallback': True}"
+            )),
+            "ValueError: CompressionConfig: 'backend' must be a string"
+        );
+        assert_eq!(
+            error_of(compression(
+                "{'backend': 'gzip', 'minimum_size': -1, 'gzip_fallback': True}"
+            )),
+            "ValueError: CompressionConfig: 'minimum_size' must be a non-negative int"
+        );
+        assert_eq!(
+            error_of(compression(
+                "{'backend': 'gzip', 'minimum_size': 'x', 'gzip_fallback': True}"
+            )),
+            "ValueError: CompressionConfig: 'minimum_size' must be a non-negative int"
+        );
+        assert_eq!(
+            error_of(compression(
+                "{'backend': 'gzip', 'minimum_size': 1, 'gzip_fallback': 'yes'}"
+            )),
+            "ValueError: CompressionConfig: 'gzip_fallback' must be a bool"
+        );
+    }
+
+    // ---- RouteMetadataStore ----
+
+    #[test]
+    fn a_metadata_store_gives_each_route_by_its_handler_id() {
+        let store = RouteMetadataStore::from_map(
+            [
+                (2usize, route("'default_status_code': 202")),
+                (5, route("'default_status_code': 205")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(store.get(2).unwrap().default_status_code, 202);
+        assert_eq!(store.get(5).unwrap().default_status_code, 205);
+        for missing in [0, 1, 3, 4, 6, 100] {
+            assert!(store.get(missing).is_none(), "{missing}");
+        }
+    }
+
+    #[test]
+    fn a_metadata_store_with_one_route_at_id_zero_finds_it() {
+        let store = RouteMetadataStore::from_map(
+            [(0usize, route("'default_status_code': 204"))]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(store.get(0).unwrap().default_status_code, 204);
+        assert!(store.get(1).is_none());
+    }
+
+    #[test]
+    fn an_empty_metadata_store_has_no_route() {
+        let store = RouteMetadataStore::from_map(AHashMap::new());
+        assert!(store.get(0).is_none());
+        assert!(RouteMetadataStore::default().get(0).is_none());
+    }
+}
