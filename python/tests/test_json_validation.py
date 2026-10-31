@@ -19,7 +19,7 @@ from django_bolt import BoltAPI
 from django_bolt._kwargs import create_body_extractor, get_msgspec_decoder
 from django_bolt._kwargs.extractors import _DECODER_CACHE
 from django_bolt.error_handlers import handle_exception, msgspec_validation_error_to_dict
-from django_bolt.exceptions import RequestValidationError
+from django_bolt.exceptions import RequestValidationError, parse_msgspec_decode_error
 from django_bolt.params import Body
 from django_bolt.testing import TestClient
 
@@ -198,6 +198,53 @@ class TestBodyOfNonStructType:
             wrong = client.post("/ids", content=b'["a"]', headers={"content-type": "application/json"})
             assert wrong.status_code == 422
             assert wrong.json()["detail"][0]["loc"] == ["body", "0"]
+
+
+class TestParseMsgspecDecodeError:
+    """Test the line and column of a JSON decode error."""
+
+    @staticmethod
+    def _parse(body: bytes) -> dict:
+        with pytest.raises(msgspec.DecodeError) as exc_info:
+            msgspec.json.decode(body)
+        return parse_msgspec_decode_error(exc_info.value, body)
+
+    def test_ascii_body_column(self):
+        """Test a body with ASCII text only."""
+        body = b'{"name": "hello", "x": }'
+        detail = self._parse(body)
+
+        assert detail["loc"] == ("body", 1, body.index(b"}") + 1)
+        assert detail["ctx"]["line"] == 1
+        assert detail["ctx"]["column"] == body.index(b"}") + 1
+
+    def test_column_counts_characters_not_bytes(self):
+        """Test multi-byte UTF-8 text before the error on the same line."""
+        text = '{"name": "héllo", "x": }'
+        body = text.encode()
+        detail = self._parse(body)
+
+        assert len(body) > len(text)
+        assert detail["loc"] == ("body", 1, text.index("}") + 1)
+        assert detail["ctx"]["column"] == text.index("}") + 1
+        assert detail["ctx"]["byte_position"] == body.index(b"}")
+        assert detail["msg"].endswith(f"\n  {text}\n  {' ' * text.index('}')}^")
+
+    def test_column_on_later_line_counts_characters(self):
+        """Test the line number and the column after a newline."""
+        line_before_error = '  "é€": '
+        body = f'{{"a": "é€",\n{line_before_error}}}'.encode()
+        detail = self._parse(body)
+
+        assert detail["loc"] == ("body", 2, len(line_before_error) + 1)
+        assert detail["ctx"]["line"] == 2
+
+    def test_multi_byte_text_on_earlier_line_does_not_shift_column(self):
+        """Test that multi-byte text on an earlier line changes only the line number."""
+        body = '{"a": "é",\n"b": }'.encode()
+        detail = self._parse(body)
+
+        assert detail["loc"] == ("body", 2, len('"b": ') + 1)
 
 
 class TestMsgspecStructValidation:
