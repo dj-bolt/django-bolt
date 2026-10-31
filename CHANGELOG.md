@@ -64,6 +64,10 @@ All notable changes to this project will be documented in this file.
 - **A rate limit logs one 429 line per second for each bucket** - Bolt wrote a line to stderr for each 429. Under a flood, that was one write for each rejected request, and the log grew without a limit. Now a bucket writes a line for its first 429 in each second. The line ends with `suppressed: N`, the number of 429s of that bucket since its last line that wrote no line.
 - **A response object or a Struct result costs less to serialize** - Bolt checked a response object against each response type in turn, and a `Response` was the eighth check. Now Bolt looks up its class. A Struct result went through the bytes, str, stream and QuerySet checks first. Now it takes the JSON path first. An async route also creates fewer coroutines for each response. A `Response` costs about 23% fewer instructions, and a Struct result about 36% fewer.
 
+### Security
+
+- **A Serializer inside a response value hides its write-only fields** - msgspec encodes each Struct natively. Thus a Serializer in a dict, a list, a tuple, a plain `Struct` field or a dataclass sent all of its fields. These include the `write_only` fields, for example a password. It also lost its computed fields. `JSON(serializer)`, `send_json()` of a WebSocket, stream chunks and server-sent events had the same problem. Now each Serializer in a response value gives its `dump()`. A Rust scan finds the Serializers, so a value with no Serializer gets no Python walk. A route whose return type cannot hold a Serializer, for example `list[Item]`, does not scan. An app with no `Serializer` subclass does not scan. `send_json()` now also encodes the types that an HTTP response encodes, for example `datetime`.
+
 ## [0.13.0]
 
 ### Added

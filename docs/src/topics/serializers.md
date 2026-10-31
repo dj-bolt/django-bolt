@@ -571,6 +571,14 @@ result = user.dump()
 # {'email': 'test@example.com'}  # password excluded
 ```
 
+A response gives the `dump()` of each Serializer that it holds. This is also true for a Serializer in a dict, a list, a `Struct` field or a dataclass:
+
+```python
+@api.post("/login")
+async def login(request) -> dict:
+    return {"user": user, "token": "..."}  # {"user": {"email": "test@example.com"}, ...}
+```
+
 ## Nested serializers
 
 ### Basic nesting

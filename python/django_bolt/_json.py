@@ -30,6 +30,9 @@ from uuid import UUID
 
 import msgspec
 
+from ._core import SerializerScanEncoder, find_serializer
+from ._serializer_dump import SCAN_KINDS, classify, dump_serializers
+
 T = TypeVar("T")
 
 # Default type encoders for non-JSON-native types
@@ -69,8 +72,8 @@ def default_serializer(value: Any) -> Any:
     Walks the MRO (Method Resolution Order) to support subclasses.
     Raises TypeError if type is unsupported.
 
-    Note: Serializer instances are handled in serialization.py before reaching
-    this hook, since msgspec.Struct is natively supported by msgspec.
+    Note: encode() dumps each Serializer before msgspec sees it, since
+    msgspec encodes a msgspec.Struct natively and never calls this hook for it.
     """
     # Walk MRO to support polymorphic types
     for base in value.__class__.__mro__[:-1]:  # Skip 'object'
@@ -88,8 +91,37 @@ _ENCODER = msgspec.json.Encoder(enc_hook=default_serializer)
 _DECODER = msgspec.json.Decoder()
 
 
+class ResponseEncoder:
+    """Hold the JSON encode function of a group of routes.
+
+    A route binds a holder when it registers and calls ``holder.encode``.
+    The function changes once, when the first Serializer subclass appears.
+    """
+
+    __slots__ = ("encode",)
+
+    def __init__(self, encode: Callable[[Any], bytes]) -> None:
+        self.encode = encode
+
+
+# For a route whose response type cannot hold a Serializer.
+PLAIN_ENCODER = ResponseEncoder(_ENCODER.encode)
+# For each other route, and for encode(). Before the first Serializer
+# subclass, no value can hold a Serializer, so this holder does not scan.
+RESPONSE_ENCODER = ResponseEncoder(_ENCODER.encode)
+_SCANNING_ENCODER = SerializerScanEncoder(_ENCODER.encode, SCAN_KINDS, classify, dump_serializers)
+
+
+def mark_serializers_defined() -> None:
+    """Make RESPONSE_ENCODER dump each Serializer in a value. Serializer subclasses call it."""
+    RESPONSE_ENCODER.encode = _SCANNING_ENCODER.encode
+
+
 def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
     """Encode a Python object to JSON bytes.
+
+    Each Bolt Serializer in the value gives its dump(). msgspec would encode
+    all of its fields, also the write-only fields.
 
     Args:
         value: Object to encode
@@ -102,12 +134,12 @@ def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
         TypeError: If value contains unsupported types
         msgspec.EncodeError: If encoding fails
     """
-    if serializer is not None:
-        # Custom serializer provided - use one-off encoder
-        return msgspec.json.encode(value, enc_hook=serializer)
-
-    # Use module-level singleton encoder with default serializer
-    return _ENCODER.encode(value)
+    if serializer is None:
+        return RESPONSE_ENCODER.encode(value)
+    # Custom serializer provided - use one-off encoder
+    if find_serializer(value, SCAN_KINDS, classify):
+        value = dump_serializers(value)
+    return msgspec.json.encode(value, enc_hook=serializer)
 
 
 def decode(value: bytes | str) -> Any:

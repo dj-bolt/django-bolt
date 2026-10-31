@@ -462,6 +462,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # so swallow them here instead of maintaining a hand-rolled allowlist
         # that would silently break each time msgspec adds a new struct option.
         super().__init_subclass__()
+        # From now on a response value can hold a Serializer. The JSON encoder
+        # then looks for one, because msgspec would send all of its fields.
+        _json.mark_serializers_defined()
         # Collect validators for this class
         cls.__field_validators__ = collect_field_validators(cls)
         cls.__model_validators__ = collect_model_validators(cls)

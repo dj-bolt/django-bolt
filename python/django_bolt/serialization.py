@@ -35,6 +35,7 @@ from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 
 from . import _json
 from ._kwargs import compile_response_coercer, compile_struct_row_readers
+from ._serializer_dump import annotation_excludes_serializer
 from .concurrency import run_in_orm_executor
 from .cookies import Cookie
 from .exceptions import ResponseValidationError, UnloadedRelationError
@@ -750,6 +751,19 @@ def _build_auto_streaming_response(
 def _is_bolt_serializer(t: Any) -> bool:
     """True if t opts into Bolt Serializer behaviour via __is_bolt_serializer__."""
     return getattr(t, "__is_bolt_serializer__", None)
+
+
+def response_encoder(meta: HandlerMetadata | dict[str, Any]) -> _json.ResponseEncoder:
+    """Return the JSON encoder holder for the fast path of a route.
+
+    If the response type of the route cannot hold a Serializer, the route
+    encodes with msgspec directly. Each other route dumps the Serializers
+    that the value holds, once the app has a Serializer subclass.
+    """
+    response_type = meta.get("response_type")
+    if response_type is not None and annotation_excludes_serializer(response_type):
+        return _json.PLAIN_ENCODER
+    return _json.RESPONSE_ENCODER
 
 
 def _is_plain_struct(t: Any) -> bool:
