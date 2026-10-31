@@ -30,8 +30,8 @@ from django.views.decorators.csrf import csrf_exempt
 from django_bolt import BoltAPI, Request
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, Middleware, TimingMiddleware
-from django_bolt.middleware_response import MiddlewareResponse
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
+from django_bolt.middleware_response import MiddlewareResponse
 from django_bolt.param_functions import Cookie, Header
 from django_bolt.responses import HTML, JSON, PlainText, Redirect, Response
 from django_bolt.testing import TestClient
@@ -2321,4 +2321,3 @@ def test_django_middleware_keeps_the_content_type_of_a_middleware_response_type(
     assert response.headers.get("x-frame-options") == "DENY"
     assert response.headers.get("content-type") == "text/html; charset=utf-8"
     assert response.content == b"<p>own</p>"
-
