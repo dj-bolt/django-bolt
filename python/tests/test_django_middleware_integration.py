@@ -29,7 +29,8 @@ from django.views.decorators.csrf import csrf_exempt
 
 from django_bolt import BoltAPI, Request
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
-from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, TimingMiddleware
+from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, Middleware, TimingMiddleware
+from django_bolt.middleware_response import MiddlewareResponse
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
 from django_bolt.param_functions import Cookie, Header
 from django_bolt.responses import HTML, JSON, PlainText, Redirect, Response
@@ -2293,3 +2294,31 @@ def test_django_middleware_keeps_a_304_without_a_content_type():
     assert response.status_code == 304
     assert "content-type" not in response.headers
     assert response.content == b""
+
+
+class OwnHtmlResponse(Middleware):
+    """Python middleware that answers with its own response, which has no headers."""
+
+    async def process_request(self, request):
+        await self.get_response(request)
+        return MiddlewareResponse(200, {}, b"<p>own</p>", "html")
+
+
+def test_django_middleware_keeps_the_content_type_of_a_middleware_response_type():
+    """A MiddlewareResponse with no headers gets the content type of its type."""
+    api = BoltAPI(
+        middleware=[OwnHtmlResponse],
+        django_middleware=["django.middleware.clickjacking.XFrameOptionsMiddleware"],
+    )
+
+    @api.get("/page")
+    async def page() -> dict:
+        return {"a": 1}
+
+    with TestClient(api) as client:
+        response = client.get("/page")
+
+    assert response.headers.get("x-frame-options") == "DENY"
+    assert response.headers.get("content-type") == "text/html; charset=utf-8"
+    assert response.content == b"<p>own</p>"
+
