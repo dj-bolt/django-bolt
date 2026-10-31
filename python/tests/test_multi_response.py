@@ -636,7 +636,8 @@ def test_a_bare_queryset_uses_the_type_of_the_default_status(is_async):
 
 def register_multi_routes(api: BoltAPI, prefix: str, is_async: bool) -> None:
     """Register multi-response routes, sync or async, under ``prefix``."""
-    responses = {200: OkSchema, 202: None}
+    # 203 has a plain type: its entry encodes the data with no conversion.
+    responses = {200: OkSchema, 202: None, 203: list[dict]}
 
     if is_async:
 
@@ -651,7 +652,7 @@ def register_multi_routes(api: BoltAPI, prefix: str, is_async: bool) -> None:
 
         @api.get(f"{prefix}/list", response_model=responses)
         async def listing():
-            return 200, [{"id": 1, "name": "One"}]
+            return 203, [{"id": 1, "name": "One"}]
 
         @api.get(f"{prefix}/args/{{item_id}}", response_model=responses)
         async def args(item_id: int, *, name: str):
@@ -669,7 +670,7 @@ def register_multi_routes(api: BoltAPI, prefix: str, is_async: bool) -> None:
 
         @api.get(f"{prefix}/list", response_model=responses)
         def listing():
-            return 200, [{"id": 1, "name": "One"}]
+            return 203, [{"id": 1, "name": "One"}]
 
         @api.get(f"{prefix}/args/{{item_id}}", response_model=responses)
         def args(item_id: int, *, name: str):
@@ -682,7 +683,7 @@ def register_multi_routes(api: BoltAPI, prefix: str, is_async: bool) -> None:
     [
         ("/no-type", 202, b""),
         ("/no-data", 202, b""),
-        ("/list", 200, b'[{"id":1,"name":"One"}]'),
+        ("/list", 203, b'[{"id":1,"name":"One"}]'),
         ("/args/7?name=Seven", 200, b'{"id":7,"name":"Seven"}'),
     ],
 )
@@ -778,3 +779,45 @@ def test_a_multi_response_handler_that_does_not_block_runs_off_the_pool():
         response = client.get("/thread")
 
     assert not response.json()["handler"].startswith("bolt_default"), response.json()
+
+
+class ArticleSerializer(Serializer):
+    id: int
+    title: str
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_serializer_entry_converts_model_instances(is_async):
+    """A Serializer type builds a converter even when the entry does not validate."""
+    api = BoltAPI()
+    responses = {200: list[ArticleSerializer], 404: ErrorSchema}
+
+    if is_async:
+
+        @api.get("/tuple", response_model=responses)
+        async def as_tuple():
+            return 200, [article async for article in Article.objects.all()]
+
+        @api.get("/json", response_model=responses)
+        async def as_json():
+            return JSON([article async for article in Article.objects.all()], status_code=200)
+
+    else:
+
+        @api.get("/tuple", response_model=responses)
+        def as_tuple():
+            return 200, list(Article.objects.all())
+
+        @api.get("/json", response_model=responses)
+        def as_json():
+            return JSON(list(Article.objects.all()), status_code=200)
+
+    article = Article.objects.create(title="One", content="First", author="A")
+    with TestClient(api) as client:
+        tuple_response = client.get("/tuple")
+        json_response = client.get("/json")
+
+    expected = [{"id": article.id, "title": "One"}]
+    assert (tuple_response.status_code, tuple_response.json()) == (200, expected), tuple_response.text
+    assert (json_response.status_code, json_response.json()) == (200, expected), json_response.text

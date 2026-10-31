@@ -2088,8 +2088,8 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        # Registration sets validate_response=False on each entry.
-                        if isinstance(data, (dict, list)):
+                        # A Serializer type converts its data even when the entry does not validate.
+                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
                             return await serialize_json_data(data, code)
@@ -2097,8 +2097,7 @@ class BoltAPI:
 
                 # JSON() with explicit status: pick schema by its status_code.
                 if isinstance(result, _JSONResponse):
-                    # The entries do not validate, so each one encodes a JSON() result the same way.
-                    entry = _lookup(result.status_code)  # pragma: no mutate
+                    entry = _lookup(result.status_code)
                     return await entry["_response_type_handler"](result)
 
                 # Bare dict/list or any other type: use the default status schema.
@@ -2112,8 +2111,8 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        # Registration sets validate_response=False on each entry.
-                        if isinstance(data, (dict, list)):
+                        # A Serializer type converts its data even when the entry does not validate.
+                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
                             return serialize_json_data_sync(data, code)
@@ -2121,8 +2120,7 @@ class BoltAPI:
 
                 # JSON() with explicit status: pick schema by its status_code.
                 if isinstance(result, _JSONResponse):
-                    # The entries do not validate, so each one encodes a JSON() result the same way.
-                    entry = _lookup(result.status_code)  # pragma: no mutate
+                    entry = _lookup(result.status_code)
                     return entry["_response_type_handler_sync"](result)
 
                 return serialize_response_sync(result, default_entry)
