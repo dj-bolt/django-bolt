@@ -33,6 +33,7 @@ from ..middleware_response import (
     _response_type_content_type,
     _split_content_type_headers,
 )
+from ..serialization import _BOLT_RESPONSE_TYPES, serialize_bolt_response
 
 try:
     from asgiref.sync import (
@@ -282,8 +283,6 @@ class DjangoMiddleware:
 
             # Await the async get_response directly - no bridging needed
             bolt_resp = await self.get_response(bolt_request)
-
-            ctx["bolt_response"] = bolt_resp
             return _to_django_response(bolt_resp)
 
         # Mark the bridge as a coroutine function so Django's MiddlewareMixin
@@ -352,7 +351,6 @@ class DjangoMiddleware:
                     # process_view can set request attributes for the handler.
                     _sync_request_attributes(django_request, bolt_request)
                 bolt_resp = drive_on_lane(self.get_response(bolt_request))
-                ctx["bolt_response"] = bolt_resp
                 return _to_django_response(bolt_resp)
 
             self._lane_instance = self.middleware_class(lane_get_response, **self.init_kwargs)
@@ -404,7 +402,6 @@ class DjangoMiddleware:
             # Set up per-request context for the get_response bridge
             ctx = {
                 "bolt_request": request,
-                "bolt_response": None,
                 "django_request": django_request,
             }
             token = _request_context.set(ctx)
@@ -444,18 +441,13 @@ def _noop_get_response(request):
     raise RuntimeError("Hook-based middleware should not call get_response")
 
 
-def _no_view_func(request):
-    """The view for a request that no route dispatched. It has no decorator flags."""
-
-
 def _view_callback(request: Request) -> Callable:
     """Return the view that ``process_view`` gets: the route handler, as Django gives the view.
 
     Django middleware reads the flags of view decorators on it, for example
     ``csrf_exempt`` (CsrfViewMiddleware) and ``login_required`` (LoginRequiredMiddleware).
     """
-    state = request.state
-    return state.get("_view_func", _no_view_func) if state else _no_view_func
+    return request.state["_view_func"]
 
 
 # Module-level constants to avoid allocation on hot path
@@ -552,13 +544,6 @@ class DjangoMiddlewareStack:
         "_response_phase_async",  # One thread hop for all response-phase hooks
         "_compatibility_chain",  # Correctness-first mixed hook/call-only path
         "_ordered_hook_middleware",  # Hook middleware in declared order
-        # Pre-computed for hot path (avoid hasattr/reversed in loops)
-        "_django_process_request",  # Middleware with process_request
-        "_django_process_response_reversed",  # Middleware with process_response (reversed)
-        "_django_process_view",  # Middleware with process_view
-        "_thirdparty_process_request",  # Third-party with process_request
-        "_thirdparty_process_response_reversed",  # Third-party with process_response (reversed)
-        "_thirdparty_process_view",  # Third-party with process_view
     )
 
     def __init__(self, middleware_classes: list):
@@ -586,13 +571,6 @@ class DjangoMiddlewareStack:
         self._response_phase_async = None
         self._compatibility_chain = None
         self._ordered_hook_middleware = []
-        # Pre-computed lists (populated in _create_middleware_instance)
-        self._django_process_request = []
-        self._django_process_response_reversed = []
-        self._django_process_view = []
-        self._thirdparty_process_request = []
-        self._thirdparty_process_response_reversed = []
-        self._thirdparty_process_view = []
 
     @property
     def supports_lane_dispatch(self) -> bool:
@@ -653,12 +631,6 @@ class DjangoMiddlewareStack:
         self._response_phase_async = None
         self._compatibility_chain = None
         self._ordered_hook_middleware = []
-        self._django_process_request = []
-        self._django_process_response_reversed = []
-        self._django_process_view = []
-        self._thirdparty_process_request = []
-        self._thirdparty_process_response_reversed = []
-        self._thirdparty_process_view = []
 
         call_only_classes = []
 
@@ -673,28 +645,6 @@ class DjangoMiddlewareStack:
                     self._thirdparty_hook_middleware.append(entry["instance"])
             else:
                 call_only_classes.append(middleware_class)
-
-        # Keep legacy categorized lists for introspection/tests.
-        self._django_process_request = [
-            instance for instance in self._django_hook_middleware if hasattr(instance, "process_request")
-        ]
-        self._django_process_view = [
-            instance for instance in self._django_hook_middleware if hasattr(instance, "process_view")
-        ]
-        self._django_process_response_reversed = list(
-            reversed([instance for instance in self._django_hook_middleware if hasattr(instance, "process_response")])
-        )
-        self._thirdparty_process_request = [
-            instance for instance in self._thirdparty_hook_middleware if hasattr(instance, "process_request")
-        ]
-        self._thirdparty_process_view = [
-            instance for instance in self._thirdparty_hook_middleware if hasattr(instance, "process_view")
-        ]
-        self._thirdparty_process_response_reversed = list(
-            reversed(
-                [instance for instance in self._thirdparty_hook_middleware if hasattr(instance, "process_response")]
-            )
-        )
 
         # A third-party hook can block, so it needs the request's thread. One hop
         # then runs all hooks of a phase, the Django built-in ones too.
@@ -774,7 +724,6 @@ class DjangoMiddlewareStack:
                 bolt_resp = drive_on_lane(self.get_response(bolt_request))
             else:
                 bolt_resp = async_to_sync(self.get_response)(bolt_request)
-            ctx["bolt_response"] = bolt_resp
 
             return _to_django_response(bolt_resp)
 
@@ -914,7 +863,6 @@ class DjangoMiddlewareStack:
         if self._compatibility_chain is not None:
             ctx = {
                 "bolt_request": request,
-                "bolt_response": None,
                 "django_request": django_request,
                 "entered_hook_entries": [],
             }
@@ -945,7 +893,6 @@ class DjangoMiddlewareStack:
         if self._call_middleware_chain_async is not None:
             ctx = {
                 "bolt_request": request,
-                "bolt_response": None,
                 "django_request": django_request,
             }
             token = _request_context.set(ctx)
@@ -1024,9 +971,6 @@ def _to_django_request(request: Request) -> HttpRequest:
     django_request._body = body
     if body:
         django_request._stream = io.BytesIO(body)
-
-    # Store reference to Bolt request for attribute sync
-    django_request._bolt_request = request
 
     return django_request
 
@@ -1179,10 +1123,14 @@ def _to_django_response(response: Response) -> HttpResponse:
     """Convert Bolt Response/MiddlewareResponse to Django HttpResponse.
 
     Also handles Django HttpResponse pass-through (from decorators like @login_required).
+    A Bolt response object, such as HTML or Redirect, becomes a MiddlewareResponse first.
     """
     # Fast path: if already a Django HttpResponse, return as-is
     if isinstance(response, HttpResponse):
         return response
+
+    if response.__class__ is not MiddlewareResponse and isinstance(response, _BOLT_RESPONSE_TYPES):
+        response = MiddlewareResponse.from_tuple(serialize_bolt_response(response))
 
     # Handle different response types
     preserved_body = _extract_preserved_body(response)
@@ -1198,8 +1146,6 @@ def _to_django_response(response: Response) -> HttpResponse:
             body = response.body
             # A middleware can set a bytearray or a memoryview. str() of it is its repr.
             content = bytes(body) if isinstance(body, (bytes, bytearray, memoryview)) else str(body).encode()
-    elif hasattr(response, "to_bytes"):
-        content = response.to_bytes()
     elif hasattr(response, "content"):
         content = response.content if isinstance(response.content, bytes) else str(response.content).encode()
     else:

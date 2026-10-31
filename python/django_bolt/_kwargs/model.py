@@ -35,7 +35,7 @@ from ..typing import (
 )
 from ..websocket import WebSocket as WebSocketType
 from .extractors import create_extractor_for_field
-from .runtime import extract_parameter_value, extract_path_params
+from .runtime import extract_path_params
 
 # Positional parameter kinds — resolved ONCE at registration. Injector plans
 # store a precomputed bool instead of re-checking inspect.Parameter kinds on
@@ -390,79 +390,6 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
     return meta
 
 
-async def build_handler_arguments(
-    meta: HandlerMetadata,
-    request: dict[str, Any],
-    handler_meta_dict: dict[int, HandlerMetadata],
-    compile_binder_fn: Callable,
-) -> tuple[list[Any], dict[str, Any]]:
-    """Build arguments for handler invocation."""
-    args: list[Any] = []
-    kwargs: dict[str, Any] = {}
-
-    # Access PyRequest mappings
-    params_map = request["params"]
-    query_map = request["query"]
-    headers_map = request.get("headers", _EMPTY_DICT)
-    cookies_map = request.get("cookies", _EMPTY_DICT)
-
-    # Form/multipart data is pre-parsed by Rust (type coerced and validated)
-    # Use request.form and request.files for pre-typed values
-    if meta.get("needs_form_parsing", False):
-        form_map = request.form
-        files_map = request.files
-    else:
-        form_map, files_map = _EMPTY_FORM_FILES
-
-    # Body decode cache
-    body_obj: Any = None
-    body_loaded: bool = False
-    dep_cache: dict[Any, Any] = {}
-
-    # Use FieldDefinition objects directly
-    fields = meta["fields"]
-    for field in fields:
-        if field.source == "request":
-            value = request
-        elif field.source == "dependency":
-            if field.dependency is None:
-                raise ValueError(f"Depends for parameter {field.name} requires a callable")
-            dep_fn = field.dependency.dependency
-            value = await resolve_dependency(
-                dep_fn,
-                field.dependency,
-                compile_dependency(dep_fn, handler_meta_dict, compile_binder_fn, meta["http_method"], meta["path"]),
-                request,
-                dep_cache,
-                params_map,
-                query_map,
-                headers_map,
-                cookies_map,
-            )
-        else:
-            value, body_obj, body_loaded = extract_parameter_value(
-                field,
-                request,
-                params_map,
-                query_map,
-                headers_map,
-                cookies_map,
-                form_map,
-                files_map,
-                meta,
-                body_obj,
-                body_loaded,
-            )
-
-        # Respect positional-only/keyword-only kinds
-        if field.kind in _POSITIONAL_KINDS:
-            args.append(value)
-        else:
-            kwargs[field.name] = value
-
-    return args, kwargs
-
-
 # Pre-allocated constants (zero alloc per request)
 _NO_PARAMS: tuple[tuple[()], dict[str, Any]] = ((), {})
 _EMPTY_DICT: dict[str, Any] = {}
@@ -483,8 +410,7 @@ def compile_argument_injector(
     Compile a specialized argument injector function for a handler.
 
     This function creates a closure that captures all parameter extraction logic
-    at route registration time, eliminating the overhead of build_handler_arguments()
-    at request time.
+    at route registration time.
 
     The compiled injector is stored in meta["injector"] and returns a tuple of
     (args, kwargs) ready for handler invocation.
@@ -498,7 +424,6 @@ def compile_argument_injector(
         Injector function that takes request dict and returns (args, kwargs)
 
     Performance benefits:
-        - Eliminates function call overhead (build_handler_arguments)
         - Pre-compiles all parameter extraction logic
         - Reduces branching with specialized paths for common cases
         - Better CPU cache locality with single inline function
@@ -632,7 +557,6 @@ def compile_argument_injector(
         _SRC_FORM_D = 5
         _SRC_FILE_D = 6
         _SRC_BODY_D = 7
-        _SRC_FALLBACK_D = 8
 
         _dep_source_map = {
             "request": _SRC_REQUEST_D,
@@ -647,7 +571,6 @@ def compile_argument_injector(
         }
 
         _dep_plan: list[tuple[int, Any, bool, str, bool, Any]] = []
-        _dep_fallback_fields: list[FieldDefinition] = []
         http_method = meta["http_method"]
         path = meta["path"]
 
@@ -656,7 +579,8 @@ def compile_argument_injector(
         handler_is_sync = not meta.get("is_async", True)
 
         for f in fields:
-            src_id = _dep_source_map.get(f.source, _SRC_FALLBACK_D)
+            # create_extractor_for_field rejected an unknown source at registration.
+            src_id = _dep_source_map[f.source]
             if src_id == _SRC_DEP:
                 dependency = f.dependency
                 # The extractor slot of a dependency holds its binding for this
@@ -671,16 +595,11 @@ def compile_argument_injector(
                 _dep_plan.append((src_id, dep_meta, f.kind in _POSITIONAL_KINDS, f.name, False, dependency))
             elif src_id == _SRC_REQUEST_D:
                 _dep_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False, None))
-            elif src_id == _SRC_FALLBACK_D or f.extractor is None:
-                _dep_plan.append((_SRC_FALLBACK_D, None, f.kind in _POSITIONAL_KINDS, f.name, False, None))
-                _dep_fallback_fields.append(f)
             elif src_id == _SRC_FORM_D:
                 needs_files = getattr(f.extractor, "needs_files_map", False)
                 _dep_plan.append((src_id, f.extractor, f.kind in _POSITIONAL_KINDS, f.name, needs_files, None))
             else:
                 _dep_plan.append((src_id, f.extractor, f.kind in _POSITIONAL_KINDS, f.name, False, None))
-
-        _dep_fallback_by_name = {f.name: f for f in _dep_fallback_fields}
 
         # Pre-compute which dep indices can be parallelized.
         # Only parallelize if there are 2+ async deps (otherwise gather overhead isn't worth it).
@@ -711,8 +630,6 @@ def compile_argument_injector(
                 else:
                     form_map, files_map = _EMPTY_FORM_FILES
 
-                body_obj: Any = None
-                body_loaded: bool = False
                 dep_cache: dict[Any, Any] = {}
                 args: list[Any] = []
                 kwargs: dict[str, Any] = {}
@@ -746,24 +663,9 @@ def compile_argument_injector(
                         value = extractor(form_map, files_map) if needs_files else extractor(form_map)
                     elif src_id == _SRC_FILE_D:
                         value = extractor(files_map)
-                    elif src_id == _SRC_BODY_D:
+                    else:  # _SRC_BODY_D
                         # A dependency with the same body type shares this decode.
                         value = decode_body_once(dep_cache, extractor, request["body"])
-                    else:
-                        field = _dep_fallback_by_name[name]
-                        value, body_obj, body_loaded = extract_parameter_value(
-                            field,
-                            request,
-                            params_map,
-                            query_map,
-                            headers_map,
-                            cookies_map,
-                            form_map,
-                            files_map,
-                            meta,
-                            body_obj,
-                            body_loaded,
-                        )
 
                     if positional:
                         args.append(value)
@@ -791,8 +693,6 @@ def compile_argument_injector(
             else:
                 form_map, files_map = _EMPTY_FORM_FILES
 
-            body_obj: Any = None
-            body_loaded: bool = False
             dep_cache: dict[Any, Any] = {}
 
             # For 2+ async deps, resolve them in parallel via asyncio.gather
@@ -863,24 +763,9 @@ def compile_argument_injector(
                     value = extractor(form_map, files_map) if needs_files else extractor(form_map)
                 elif src_id == _SRC_FILE_D:
                     value = extractor(files_map)
-                elif src_id == _SRC_BODY_D:
+                else:  # _SRC_BODY_D
                     # A dependency with the same body type shares this decode.
                     value = decode_body_once(dep_cache, extractor, request["body"])
-                else:
-                    field = _dep_fallback_by_name[name]
-                    value, body_obj, body_loaded = extract_parameter_value(
-                        field,
-                        request,
-                        params_map,
-                        query_map,
-                        headers_map,
-                        cookies_map,
-                        form_map,
-                        files_map,
-                        meta,
-                        body_obj,
-                        body_loaded,
-                    )
 
                 if positional:
                     args.append(value)
@@ -915,7 +800,6 @@ def compile_argument_injector(
     _SRC_FORM = 5
     _SRC_FILE = 6
     _SRC_BODY = 7
-    _SRC_FALLBACK = 8
 
     _SOURCE_MAP = {
         "request": _SRC_REQUEST,
@@ -930,23 +814,17 @@ def compile_argument_injector(
 
     # Pre-build extraction plan: (source_id, extractor, positional, name, needs_files)
     _extraction_plan: list[tuple[int, Any, bool, str, bool]] = []
-    _fallback_fields: list[FieldDefinition] = []  # Fields needing generic extraction
 
     for f in fields:
-        src_id = _SOURCE_MAP.get(f.source, _SRC_FALLBACK)
+        # create_extractor_for_field rejected an unknown source at registration.
+        src_id = _SOURCE_MAP[f.source]
         if src_id == _SRC_REQUEST:
             _extraction_plan.append((src_id, None, f.kind in _POSITIONAL_KINDS, f.name, False))
-        elif src_id == _SRC_FALLBACK or f.extractor is None:
-            _extraction_plan.append((_SRC_FALLBACK, None, f.kind in _POSITIONAL_KINDS, f.name, False))
-            _fallback_fields.append(f)
         elif src_id == _SRC_FORM:
             needs_files = getattr(f.extractor, "needs_files_map", False)
             _extraction_plan.append((src_id, f.extractor, f.kind in _POSITIONAL_KINDS, f.name, needs_files))
         else:
             _extraction_plan.append((src_id, f.extractor, f.kind in _POSITIONAL_KINDS, f.name, False))
-
-    # Pre-index fallback fields by name for O(1) lookup
-    _fallback_by_name = {f.name: f for f in _fallback_fields}
 
     def injector_full(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
         """Full injector with pre-compiled extraction plan."""
@@ -982,27 +860,11 @@ def compile_argument_injector(
                 value = extractor(form_map, files_map) if needs_files else extractor(form_map)
             elif src_id == _SRC_FILE:
                 value = extractor(files_map)
-            elif src_id == _SRC_BODY:
+            else:  # _SRC_BODY
                 if not body_loaded:
                     body_obj = extractor(request["body"])
                     body_loaded = True
                 value = body_obj
-            else:
-                # Fallback for unknown/no-extractor sources
-                field = _fallback_by_name[name]
-                value, body_obj, body_loaded = extract_parameter_value(
-                    field,
-                    request,
-                    params_map,
-                    query_map,
-                    headers_map,
-                    cookies_map,
-                    form_map,
-                    files_map,
-                    meta,
-                    body_obj,
-                    body_loaded,
-                )
 
             if positional:
                 args.append(value)

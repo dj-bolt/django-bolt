@@ -89,6 +89,9 @@ class HTTPException(BoltException):
     def __repr__(self) -> str:
         return f"{self.status_code} - {self.__class__.__name__} - {self.detail}"
 
+    def __str__(self) -> str:
+        return f"{self.status_code}: {self.detail}"
+
 
 class ValidationException(BoltException, ValueError):
     """Base exception for validation errors."""

@@ -1288,3 +1288,22 @@ _RESPONSE_SERIALIZERS: dict[type, Callable[[Any], ResponseWireV1]] = {
 }
 # The exact classes that the route handlers dispatch on.
 _RESPONSE_CLASSES = frozenset((JSON, ResponseClass, *_RESPONSE_SERIALIZERS))
+
+
+def serialize_bolt_response(result: Any) -> ResponseWireV1:
+    """Serialize a Bolt response object that no route handler serializes.
+
+    A Python middleware can return such an object. It has no route data, so
+    Bolt applies no response validation. ``result`` must be an instance of a
+    Bolt response type.
+    """
+    if (cls := result.__class__) is not JSON and cls not in _RESPONSE_CLASSES:  # pragma: no mutate
+        cls = _response_base_class(result)
+    if cls is JSON:
+        cookies = getattr(result, "_cookies", None)
+        return _wire_bytes(result.status_code, _build_wire_meta("json", result.headers, cookies), result.to_bytes())
+    if cls is ResponseClass:
+        cookies = getattr(result, "_cookies", None)
+        meta = _response_class_wire_meta(result.media_type, result.headers, cookies)
+        return _wire_bytes(result.status_code, meta, _render_response_body(result.content, result.media_type))
+    return _RESPONSE_SERIALIZERS[cls](result)

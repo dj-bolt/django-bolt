@@ -888,11 +888,10 @@ def create_extractor_for_field(field: FieldDefinition) -> Callable | None:
     elif source == "dependency":
         # Dependencies are handled specially in the injector
         return None
-    else:
-        # Fallback for unknown sources
-        if default is not inspect.Parameter.empty:
-            return lambda *_args, **_kwargs: default
-        return None
+    raise TypeError(
+        f"Parameter {name!r} has an unsupported source {source!r}. "
+        "Use one of: path, query, header, cookie, form, file, body."
+    )
 
 
 def compile_response_coercer(annotation: Any) -> tuple[Callable[[Any], Any], Callable[[Any], Any]]:
