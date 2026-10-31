@@ -33,7 +33,7 @@ from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, Midd
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
 from django_bolt.middleware_response import MiddlewareResponse
 from django_bolt.param_functions import Cookie, Header
-from django_bolt.responses import HTML, JSON, PlainText, Redirect, Response
+from django_bolt.responses import HTML, JSON, PlainText, Redirect, Response, StreamingResponse
 from django_bolt.testing import TestClient
 
 
@@ -2393,3 +2393,122 @@ def test_django_middleware_keeps_the_body_of_a_response(path, body):
     assert response.headers.get("x-frame-options") == "DENY"
     assert response.status_code == 200
     assert response.content == body
+
+
+class _SeenByDjangoMiddleware(MiddlewareMixin):
+    """Django middleware that marks each response that reaches its process_response."""
+
+    def process_response(self, request, response):
+        response["X-Seen"] = "yes"
+        return response
+
+
+def _answers_with(make_response) -> type[Middleware]:
+    """Return a Bolt middleware whose process_request answers with ``make_response()``."""
+
+    class AnswersWithResponseObject(Middleware):
+        async def process_request(self, request):
+            return make_response()
+
+    return AnswersWithResponseObject
+
+
+_BOLT_RESPONSE_CASES = {
+    "html": (
+        lambda: HTML("<p>x</p>", status_code=202, headers={"X-Own": "1"}),
+        202,
+        "text/html; charset=utf-8",
+        b"<p>x</p>",
+    ),
+    "plain": (lambda: PlainText("hi", status_code=201), 201, "text/plain; charset=utf-8", b"hi"),
+    "json": (lambda: JSON({"a": 1}, status_code=201), 201, "application/json", b'{"a":1}'),
+    "media-type": (
+        lambda: Response("<b>2</b>", media_type="application/xml", headers={"X-Own": "1"}),
+        200,
+        "application/xml",
+        b"<b>2</b>",
+    ),
+    "content-type-header": (
+        lambda: Response("<b>2</b>", media_type="application/xml", headers={"Content-Type": "text/xml"}),
+        200,
+        "text/xml",
+        b"<b>2</b>",
+    ),
+    "redirect": (lambda: Redirect("/elsewhere", headers={"X-Own": "1"}), 307, None, b""),
+}
+
+_DJANGO_MIDDLEWARE_WRAPPERS = [
+    pytest.param(lambda: DjangoMiddleware(_SeenByDjangoMiddleware), id="DjangoMiddleware"),
+    pytest.param(lambda: DjangoMiddlewareStack([_SeenByDjangoMiddleware]), id="DjangoMiddlewareStack"),
+]
+
+
+@pytest.mark.parametrize("wrapper", _DJANGO_MIDDLEWARE_WRAPPERS)
+@pytest.mark.parametrize("case", _BOLT_RESPONSE_CASES)
+def test_django_middleware_keeps_a_bolt_response_of_a_middleware(wrapper, case):
+    """A Bolt response object keeps its status, content type, body and headers behind Django middleware."""
+    make_response, status_code, content_type, body = _BOLT_RESPONSE_CASES[case]
+    api = BoltAPI(middleware=[wrapper(), _answers_with(make_response)])
+
+    @api.get("/page")
+    async def page() -> dict:
+        return {"a": 1}
+
+    with TestClient(api) as client:
+        response = client.get("/page", follow_redirects=False)
+
+    assert response.headers.get("x-seen") == "yes"
+    assert response.status_code == status_code
+    assert response.headers.get("content-type") == content_type
+    assert response.content == body
+    if case == "redirect":
+        assert response.headers.get("location") == "/elsewhere"
+    if case in {"html", "media-type", "redirect"}:
+        assert response.headers.get("x-own") == "1"
+
+
+@pytest.mark.parametrize("wrapper", _DJANGO_MIDDLEWARE_WRAPPERS)
+def test_django_middleware_keeps_the_cookies_of_a_bolt_response(wrapper):
+    """A cookie on a Bolt response object reaches the client behind Django middleware."""
+    api = BoltAPI(
+        middleware=[wrapper(), _answers_with(lambda: HTML("x").set_cookie("sid", "abc", httponly=True))],
+    )
+
+    @api.get("/page")
+    async def page() -> dict:
+        return {"a": 1}
+
+    with TestClient(api) as client:
+        response = client.get("/page")
+
+    assert response.headers.get("x-seen") == "yes"
+    assert response.headers.get("content-type") == "text/html; charset=utf-8"
+    assert response.cookies.get("sid") == "abc"
+    assert "httponly" in response.headers["set-cookie"].lower()
+
+
+def _two_chunks():
+    yield b"a"
+    yield b"b"
+
+
+@pytest.mark.parametrize("wrapper", _DJANGO_MIDDLEWARE_WRAPPERS)
+def test_django_middleware_streams_a_streaming_response_of_a_middleware(wrapper):
+    """A StreamingResponse of a middleware sends its chunks behind Django middleware.
+
+    Before, the client got the repr of the generator as JSON.
+    """
+    api = BoltAPI(
+        middleware=[wrapper(), _answers_with(lambda: StreamingResponse(_two_chunks(), media_type="text/plain"))],
+    )
+
+    @api.get("/page")
+    async def page() -> dict:
+        return {"a": 1}
+
+    with TestClient(api) as client:
+        response = client.get("/page")
+
+    assert response.status_code == 200
+    assert response.headers.get("content-type") == "text/plain"
+    assert response.content == b"ab"

@@ -33,6 +33,7 @@ from ..middleware_response import (
     _response_type_content_type,
     _split_content_type_headers,
 )
+from ..serialization import _BOLT_RESPONSE_TYPES, serialize_bolt_response
 
 try:
     from asgiref.sync import (
@@ -1179,10 +1180,14 @@ def _to_django_response(response: Response) -> HttpResponse:
     """Convert Bolt Response/MiddlewareResponse to Django HttpResponse.
 
     Also handles Django HttpResponse pass-through (from decorators like @login_required).
+    A Bolt response object, such as HTML or Redirect, becomes a MiddlewareResponse first.
     """
     # Fast path: if already a Django HttpResponse, return as-is
     if isinstance(response, HttpResponse):
         return response
+
+    if response.__class__ is not MiddlewareResponse and isinstance(response, _BOLT_RESPONSE_TYPES):
+        response = MiddlewareResponse.from_tuple(serialize_bolt_response(response))
 
     # Handle different response types
     preserved_body = _extract_preserved_body(response)
@@ -1198,8 +1203,6 @@ def _to_django_response(response: Response) -> HttpResponse:
             body = response.body
             # A middleware can set a bytearray or a memoryview. str() of it is its repr.
             content = bytes(body) if isinstance(body, (bytes, bytearray, memoryview)) else str(body).encode()
-    elif hasattr(response, "to_bytes"):
-        content = response.to_bytes()
     elif hasattr(response, "content"):
         content = response.content if isinstance(response.content, bytes) else str(response.content).encode()
     else:
