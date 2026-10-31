@@ -130,8 +130,9 @@ fn read_max_age_setting(
 }
 
 /// Read `BOLT_RATE_LIMIT_IPV6_PREFIX`: the prefix length of the network that a
-/// rate limit keys an IPv6 client on. `runbolt` and the test clients read it here.
-pub(crate) fn read_rate_limit_ipv6_prefix(settings: &DjangoSettings<'_>) -> PyResult<u8> {
+/// rate limit keys an IPv6 client on. `runbolt` and the test clients read it here,
+/// in `ServerConfig::read`.
+fn read_rate_limit_ipv6_prefix(settings: &DjangoSettings<'_>) -> PyResult<u8> {
     settings.int_up_to("BOLT_RATE_LIMIT_IPV6_PREFIX", 128, DEFAULT_IPV6_PREFIX)
 }
 

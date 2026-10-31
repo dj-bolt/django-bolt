@@ -27,17 +27,13 @@ use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::middleware::rate_limit::RateLimiters;
 use bolt_core::router::Router;
-use bolt_core::settings::DjangoSettings;
 use bolt_core::state::{
     AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS, find_websocket_mount_in_slice,
 };
 use bolt_websocket::WebSocketRouter;
 use bolt_websocket::handler::build_asgi_scope_from_parts;
 
-use crate::server::{
-    ServerConfig, configure_file_scopes, inject_global_cors, read_rate_limit_ipv6_prefix,
-    static_scope_prefix,
-};
+use crate::server::{ServerConfig, configure_file_scopes, inject_global_cors, static_scope_prefix};
 use bolt_core::request_pipeline::{
     EMPTY_TYPES, insert_header_line, query_sequences, set_declared_item, set_param_item,
     set_query_sequences,
@@ -254,17 +250,31 @@ pub struct TestAppState {
 }
 
 /// Rate-limit buckets that several test apps share. The WebSocket test client
-/// keeps one for each API.
+/// keeps one for each API. A test app reads `BOLT_RATE_LIMIT_IPV6_PREFIX`, and
+/// gets the buckets for that prefix. Thus a new prefix gives new buckets, as a
+/// restart of the server does.
 #[pyclass(frozen, name = "TestRateLimiters", module = "django_bolt._core")]
-pub struct TestRateLimiters(Arc<RateLimiters>);
+#[derive(Default)]
+pub struct TestRateLimiters(parking_lot::Mutex<Vec<Arc<RateLimiters>>>);
+
+impl TestRateLimiters {
+    /// The buckets for `ipv6_prefix`.
+    fn for_prefix(&self, ipv6_prefix: u8) -> Arc<RateLimiters> {
+        let mut sets = self.0.lock();
+        if let Some(set) = sets.iter().find(|set| set.ipv6_prefix() == ipv6_prefix) {
+            return Arc::clone(set);
+        }
+        let set = Arc::new(RateLimiters::new(ipv6_prefix));
+        sets.push(Arc::clone(&set));
+        set
+    }
+}
 
 #[pymethods]
 impl TestRateLimiters {
-    /// Read `BOLT_RATE_LIMIT_IPV6_PREFIX`, as `runbolt` does.
     #[new]
-    fn new(py: Python<'_>) -> PyResult<Self> {
-        let ipv6_prefix = read_rate_limit_ipv6_prefix(&DjangoSettings::load(py)?)?;
-        Ok(Self(Arc::new(RateLimiters::new(ipv6_prefix))))
+    fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -345,7 +355,7 @@ pub fn create_test_app(
         config,
         global_compression_config,
         rate_limiters: match rate_limiters {
-            Some(shared) => Arc::clone(&shared.get().0),
+            Some(shared) => shared.get().for_prefix(ipv6_prefix),
             None => Arc::new(RateLimiters::new(ipv6_prefix)),
         },
         error_renderer,

@@ -289,6 +289,11 @@ impl RateLimiters {
         }
     }
 
+    /// The prefix length of the network that an IPv6 client keys on.
+    pub fn ipv6_prefix(&self) -> u8 {
+        self.ipv6_prefix
+    }
+
     /// The key of a client address. An IPv6 client keys on its network, so it
     /// cannot get a fresh bucket for each address of that network. An IPv4
     /// client keys on its address.
@@ -609,6 +614,8 @@ mod tests {
 
     #[test]
     fn the_ipv6_prefix_sets_the_network() {
+        assert_eq!(RateLimiters::default().ipv6_prefix(), 64);
+        assert_eq!(RateLimiters::new(56).ipv6_prefix(), 56);
         let key = RateLimitKey::Ip;
         // 128 keys on the full address.
         let full = RateLimiters::new(128);
@@ -625,6 +632,15 @@ mod tests {
         assert!(request(&none, &key, "3fff::1", None).is_some());
         assert!(request(&none, &key, "203.0.113.7", None).is_none());
         assert!(request(&none, &key, "203.0.113.8", None).is_none());
+    }
+
+    #[test]
+    fn an_api_key_route_falls_back_to_the_ipv6_network() {
+        let limiters = RateLimiters::default();
+        let key = RateLimitKey::ApiKey;
+        // With no API key, the request counts on its /64 network.
+        assert!(request(&limiters, &key, "2001:db8:1:2::1", None).is_none());
+        assert!(request(&limiters, &key, "2001:db8:1:2::2", None).is_some());
     }
 
     #[test]

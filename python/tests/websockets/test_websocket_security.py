@@ -9,6 +9,7 @@ Tests security features that use the same infrastructure as HTTP:
 from __future__ import annotations
 
 import pytest
+from django.test import override_settings
 
 from django_bolt import BoltAPI, WebSocket
 from django_bolt.middleware import rate_limit
@@ -292,6 +293,38 @@ async def test_websocket_rate_limit_buckets_belong_to_one_api():
             api, "/ws/limited", cors_allowed_origins=["*"], read_django_settings=False
         ) as ws:
             assert await ws.receive_text() == "connected"
+
+
+@pytest.mark.asyncio
+async def test_websocket_buckets_follow_the_ipv6_prefix_setting():
+    """A new BOLT_RATE_LIMIT_IPV6_PREFIX gives new buckets, as a restart of the server does."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/limited")
+    @rate_limit(rps=1, burst=1)
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    async def connect(address: str) -> str:
+        async with WebSocketTestClient(
+            api,
+            "/ws/limited",
+            headers={"X-Forwarded-For": address},
+            cors_allowed_origins=["*"],
+            read_django_settings=False,
+        ) as ws:
+            return await ws.receive_text()
+
+    with override_settings(BOLT_TRUSTED_PROXIES=["127.0.0.1"]):
+        assert await connect("2001:db8:1:2::1") == "connected"
+        # The default /64 holds the neighbour address.
+        with pytest.raises(PermissionError, match="Rate limit exceeded"):
+            await connect("2001:db8:1:2::2")
+        with override_settings(BOLT_RATE_LIMIT_IPV6_PREFIX=128):
+            assert await connect("2001:db8:1:2::3") == "connected"
+            with pytest.raises(PermissionError, match="Rate limit exceeded"):
+                await connect("2001:db8:1:2::3")
 
 
 @pytest.mark.asyncio
