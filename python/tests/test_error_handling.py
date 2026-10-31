@@ -77,6 +77,25 @@ class TestExceptions:
         assert "NotFound" in repr(exc)
         assert "User not found" in repr(exc)
 
+    @pytest.mark.parametrize(
+        ("exc", "expected"),
+        [
+            (NotFound(), "404: Not Found"),
+            (HTTPException(400, "bad"), "400: bad"),
+            (HTTPException(status_code=404), "404: Not Found"),
+            (BadRequest(detail="Missing id"), "400: Missing id"),
+            (InternalServerError(), "500: Internal Server Error"),
+        ],
+    )
+    def test_http_exception_str_shows_detail_once(self, exc, expected):
+        """Test str() of an HTTPException gives the status and the detail once."""
+        assert str(exc) == expected
+
+    def test_http_exception_str_in_traceback_text(self):
+        """Test the text of a raised HTTPException has the detail once."""
+        with pytest.raises(NotFound, match=r"^404: Not Found$"):
+            raise NotFound()
+
     def test_validation_exception(self):
         """Test ValidationException."""
         errors = [{"loc": ["body", "name"], "msg": "Field required", "type": "missing"}]
