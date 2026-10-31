@@ -140,11 +140,13 @@ def _loc_segments(path: str) -> list[str]:
     return [seg for seg in _RE_PATH_SPLIT.split(path.replace("]", "")) if seg and seg != "$"]
 
 
-def msgspec_validation_error_to_dict(error: msgspec.ValidationError) -> list[dict[str, Any]]:
+def msgspec_validation_error_to_dict(error: msgspec.ValidationError, root: str = "body") -> list[dict[str, Any]]:
     """Convert msgspec ValidationError to structured error list.
 
     Args:
         error: msgspec.ValidationError instance
+        root: The first item of each 'loc'. A request error has "body", and a
+            response error has "response".
 
     Returns:
         List of error dictionaries with 'loc', 'msg', 'type' fields
@@ -162,34 +164,35 @@ def msgspec_validation_error_to_dict(error: msgspec.ValidationError) -> list[dic
         suffix = error_msg[len(str(cause)) :]
         loc_match = _RE_AT_LOCATION.search(suffix)
         prefix = _loc_segments(loc_match.group(1)) if loc_match else []
-        return [{**err, "loc": ["body", *prefix, *err["loc"][1:]]} for err in cause.errors()]
+        return [{**err, "loc": [root, *prefix, *err["loc"][1:]]} for err in cause.errors()]
 
     # Try to extract field location with pre-compiled regex
     loc_match = _RE_AT_LOCATION.search(error_msg)
     if loc_match:
         msg_part = error_msg[: loc_match.start()]
-        loc_parts = ["body", *_loc_segments(loc_match.group(1))]
+        loc_parts = [root, *_loc_segments(loc_match.group(1))]
         return [{"loc": loc_parts, "msg": msg_part, "type": "validation_error"}]
 
     if "missing required field" in error_msg.lower():
         match = _RE_FIELD_NAME.search(error_msg)
         field = match.group(1) if match else "unknown"
-        return [{"loc": ["body", field], "msg": error_msg, "type": "missing_field"}]
+        return [{"loc": [root, field], "msg": error_msg, "type": "missing_field"}]
 
-    return [{"loc": ["body"], "msg": error_msg, "type": "validation_error"}]
+    return [{"loc": [root], "msg": error_msg, "type": "validation_error"}]
 
 
 def _format_validation_errors(errors: Any, loc: str) -> list[dict[str, Any]]:
     """Convert the errors of a validation exception to dicts with 'loc', 'msg' and 'type'.
 
-    ``loc`` is the location of an error that does not give one.
+    ``loc`` is the first item of the location of each error, and the whole
+    location of an error that does not give one.
     """
     formatted_errors = []
     for error in errors:
         if isinstance(error, dict):
             formatted_errors.append(error)
         elif isinstance(error, msgspec.ValidationError):
-            formatted_errors.extend(msgspec_validation_error_to_dict(error))
+            formatted_errors.extend(msgspec_validation_error_to_dict(error, loc))
         else:
             formatted_errors.append({"loc": [loc], "msg": str(error), "type": "validation_error"})
     return formatted_errors

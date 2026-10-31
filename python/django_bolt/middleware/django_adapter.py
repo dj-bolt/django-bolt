@@ -29,8 +29,8 @@ from ..middleware_response import (
     _BODY_BYTES,
     _BODY_FILE,
     _BODY_STREAM,
-    _RESPONSE_TYPE_CONTENT_TYPES,
     MiddlewareResponse,
+    _response_type_content_type,
     _split_content_type_headers,
 )
 
@@ -1195,7 +1195,9 @@ def _to_django_response(response: Response) -> HttpResponse:
             # into raw filesystem paths and drops streaming semantics).
             content = b""
         else:
-            content = response.body if isinstance(response.body, bytes) else str(response.body).encode()
+            body = response.body
+            # A middleware can set a bytearray or a memoryview. str() of it is its repr.
+            content = bytes(body) if isinstance(body, (bytes, bytearray, memoryview)) else str(body).encode()
     elif hasattr(response, "to_bytes"):
         content = response.to_bytes()
     elif hasattr(response, "content"):
@@ -1207,7 +1209,7 @@ def _to_django_response(response: Response) -> HttpResponse:
     headers = getattr(response, "headers", {})
     content_type, remaining_headers = _split_content_type_headers(headers)
     if content_type is None:
-        content_type = _RESPONSE_TYPE_CONTENT_TYPES.get(getattr(response, "_response_type", "json"))
+        content_type = _response_type_content_type(getattr(response, "_response_type", "json"))
 
     django_response = HttpResponse(content=content, status=status_code, content_type=content_type)
     if content_type is None:

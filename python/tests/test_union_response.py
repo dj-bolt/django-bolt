@@ -351,6 +351,11 @@ def test_inline_list_path_converts_a_later_object_by_attribute(api_kwargs):
             resp = client.get(path)
             assert resp.status_code == 200, (path, resp.text)
             assert resp.json() == ROWS_JSON, path
+        # The handler gets its query parameter also when the list takes the slow path.
+        for path in ("/trivial-query", "/awaits-query", "/sync-query"):
+            resp = client.get(path, params={"start": 4})
+            assert resp.status_code == 200, (path, resp.text)
+            assert resp.json() == [{"id": 4, "note": "default"}, {"id": 5, "note": "default"}], path
 
 
 def test_inline_list_path_reports_an_invalid_element():
@@ -365,7 +370,7 @@ def test_inline_list_path_reports_an_invalid_element():
         resp = client.get("/rows")
         assert resp.status_code == 500
         assert resp.json()["extra"]["validation_errors"] == [
-            {"loc": ["body", "1", "id"], "msg": "Expected `int`, got `str`", "type": "validation_error"}
+            {"loc": ["response", "1", "id"], "msg": "Expected `int`, got `str`", "type": "validation_error"}
         ]
 
 
@@ -452,3 +457,31 @@ def test_inline_list_path_reports_each_error_as_the_slow_path_does(api_kwargs):
         for path in ("/checked", "/checked-sync"):
             resp = client.get(path)
             assert (resp.status_code, resp.json()) == (500, slow_checked_body), path
+
+
+class RowSerializer(Serializer):
+    id: int
+
+
+def test_response_validation_error_locates_the_error_in_the_response():
+    """A response validation error has the root "response", not the root of the request body."""
+    api = BoltAPI()
+
+    @api.get("/list")
+    async def rows(request) -> list[Row]:
+        return [{"id": 1}, {"id": "x"}]
+
+    @api.get("/struct")
+    def row() -> Row:
+        return {"id": "x"}
+
+    @api.get("/serializer")
+    async def serialized() -> RowSerializer:
+        return {"id": "x"}
+
+    with TestClient(api) as client:
+        for path in ("/list", "/struct", "/serializer"):
+            resp = client.get(path)
+            assert resp.status_code == 500, path
+            errors = resp.json()["extra"]["validation_errors"]
+            assert [error["loc"][0] for error in errors] == ["response"], (path, errors)

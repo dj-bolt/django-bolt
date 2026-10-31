@@ -102,6 +102,13 @@ class UserProfileAsDictSerializer(Serializer):
     profile: dict | None
 
 
+class UserProfileIdSerializer(Serializer):
+    """A relation field that reads the primary key of the related object."""
+
+    id: int
+    profile: int | None
+
+
 @pytest.mark.django_db
 def test_from_model_plain_reverse_relation_prefetched_returns_nested_list():
     author = Author.objects.create(name="Alice", email="alice@example.com")
@@ -351,3 +358,28 @@ def test_async_route_loads_a_relation_that_its_field_type_does_not_show():
         resp = client.get("/users")
         assert resp.status_code == 200, resp.text
         assert resp.json() == [{"id": user.pk, "profile": None}]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_route_loads_an_existing_relation_that_its_field_type_does_not_show():
+    """An async route loads an existing profile that the query did not load."""
+    user = User.objects.create(username="owner", email="owner@example.com", password_hash="x")
+    profile = UserProfile.objects.create(user=user, bio="hello")
+    api = BoltAPI()
+
+    @api.get("/user")
+    async def get_user() -> UserProfileIdSerializer:
+        return await User.objects.aget(pk=user.pk)
+
+    @api.get("/users")
+    async def list_users() -> list[UserProfileIdSerializer]:
+        return [await User.objects.aget(pk=user.pk)]
+
+    with TestClient(api) as client:
+        resp = client.get("/user")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"id": user.pk, "profile": profile.pk}
+
+        resp = client.get("/users")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == [{"id": user.pk, "profile": profile.pk}]
