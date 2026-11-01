@@ -1289,6 +1289,41 @@ def test_a_container_that_overrides_its_iteration_gives_the_dump_of_its_serializ
     assert json.loads(_json.encode(value)) == expected
 
 
+class Event(Serializer, tag=True):
+    id: int
+
+
+class SignInEvent(Event):
+    password: str = field(write_only=True)
+
+
+class NoteEvent(Event):
+    text: str
+
+
+class PublicUser(Serializer):
+    id: int
+
+
+class PrivateUser(PublicUser):
+    password: str = field(write_only=True)
+
+
+@pytest.mark.parametrize(
+    ("base", "instances"),
+    [
+        (Event, [NoteEvent(id=1, text="hi"), SignInEvent(id=2, password=SECRET)]),
+        (PublicUser, [PrivateUser(id=1, password=SECRET)]),
+    ],
+    ids=["tagged-union", "subclass"],
+)
+def test_dump_many_of_subclass_instances_gives_the_dump_of_each_instance(base, instances):
+    """The fast path of the base class dumped each field of a subclass, also its write-only fields."""
+    dumped = base.dump_many(instances)
+    assert SECRET not in json.dumps(dumped)
+    assert dumped == [instance.dump() for instance in instances]
+
+
 def _reference(value: Any) -> Any:
     """Convert ``value`` the plain way: each Serializer gives its dump()."""
     if isinstance(value, Serializer):

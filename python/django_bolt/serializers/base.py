@@ -2402,6 +2402,20 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls._ensure_dump_ready()
         instances_list = instances if isinstance(instances, list) else list(instances)
 
+        # The paths below use the fields of cls. A subclass instance can have
+        # other fields, also write-only fields, so it gives its own dump.
+        for instance in instances_list:
+            if instance.__class__ is not cls:
+                return [
+                    instance.dump(
+                        exclude_none=exclude_none,
+                        exclude_unset=exclude_unset,
+                        exclude_defaults=exclude_defaults,
+                        by_alias=by_alias,
+                    )
+                    for instance in instances_list
+                ]
+
         # FAST PATH: use msgspec native methods (significantly faster than Python iteration)
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
             if cls.__orm_state_check_fields__:
