@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 from datetime import date
 from decimal import Decimal
@@ -556,6 +557,16 @@ class TestUploadFileValidation:
     def test_file_size_below_zero_fails_loudly(self, name):
         with pytest.raises(ValueError, match=f"^File {name} must be 0 or more, got -1$"):
             File(**{name: -1})
+
+    @pytest.mark.parametrize("name", ["max_size", "min_size", "max_files"])
+    def test_file_limit_too_large_for_rust_fails_loudly(self, name):
+        """Rust reads a limit as a usize. It ignored a larger int, and the limit was gone."""
+        value = sys.maxsize + 1
+        with pytest.raises(ValueError, match=f"^File {name} must be {sys.maxsize} or less, got {value}$"):
+            File(**{name: value})
+
+    def test_largest_file_limit_is_valid(self):
+        assert File(max_size=sys.maxsize).max_size == sys.maxsize
 
     @pytest.mark.parametrize("value", [0, -1])
     def test_max_files_below_one_fails_loudly(self, value):

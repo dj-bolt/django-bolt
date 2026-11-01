@@ -6,6 +6,7 @@ Provides explicit parameter source annotations and validation metadata.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -330,6 +331,9 @@ def _file_limit(name: str, value: Any, minimum: int) -> int | None:
         raise TypeError(f"File {name} must be an int, got {type(value).__name__} {value!r}")
     if value < minimum:
         raise ValueError(f"File {name} must be {minimum} or more, got {value}")
+    # Rust reads a limit as a usize and ignores a larger int. sys.maxsize fits a usize.
+    if value > sys.maxsize:
+        raise ValueError(f"File {name} must be {sys.maxsize} or less, got {value}")
     return value
 
 
