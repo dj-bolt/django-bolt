@@ -2176,14 +2176,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 return msgspec.to_builtins(self)
             return msgspec_structs.asdict(self)
 
-        # SLOW PATH: Need special handling.
+        # SLOW PATH: Need special handling. The specs with no field filter are ready after _ensure_dump_ready.
         return self._dump_impl(
             exclude_none=exclude_none,
             exclude_unset=exclude_unset,
             exclude_defaults=exclude_defaults,
             by_alias=by_alias,
-            include_fields=None,
-            exclude_fields=None,
+            field_specs=cls._dump_field_specs,
+            computed_specs=cls._computed_dump_specs,
         )
 
     def _dump_impl(
