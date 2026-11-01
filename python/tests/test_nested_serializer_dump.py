@@ -23,9 +23,10 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from django_bolt import BoltAPI, EventSourceResponse, ServerSentEvent, WebSocket, _json
+from django_bolt import BoltAPI, EventSourceResponse, ServerSentEvent, StreamingResponse, WebSocket, _json
 from django_bolt._core import find_serializer
 from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, annotation_excludes_serializer, classify
+from django_bolt.exceptions import HTTPException
 from django_bolt.responses import JSON, Response
 from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.testing import TestClient, WebSocketTestClient
@@ -820,6 +821,90 @@ def test_the_json_of_a_serializer_view_gives_the_dump_of_each_serializer_in_it(p
 
     with TestClient(api) as test_client:
         _check(test_client.get(path), expected)
+
+
+class Login(Serializer, repr_omit_defaults=True):
+    """A Serializer with each kind of field that dump() does not send."""
+
+    id: int
+    password: str = field(write_only=True)
+    token: str = ""
+    internal: str = field(exclude=True, default="i")
+    name: str = "anon"
+    links: list[Any] = []
+
+    class Config:
+        write_only = {"token"}
+
+
+def test_the_repr_of_a_serializer_leaves_out_the_fields_that_dump_does_not_send():
+    assert repr(account()) == "Account(id=1)"
+    assert str(account()) == "Account(id=1)"
+    assert repr({"user": [account()]}) == "{'user': [Account(id=1)]}"
+    assert repr(Login(id=1, password=SECRET, token=SECRET, internal=SECRET)) == "Login(id=1)"
+    assert repr(Login(id=2, password=SECRET, name="bob")) == "Login(id=2, name='bob')"
+    assert list(Login(id=2, password=SECRET, name="bob").__rich_repr__()) == [("id", 2), ("name", "bob")]
+    # A cycle gives "...", as in the repr of msgspec.
+    login = Login(id=3, password=SECRET)
+    login.links.append(login)
+    assert repr(login) == "Login(id=3, links=[...])"
+    # A Serializer that hides no field keeps the repr of msgspec.
+    assert repr(Public(id=1)) == "Public(id=1)"
+
+
+@pytest.fixture(scope="module")
+def str_client():
+    api = BoltAPI()
+
+    @api.get("/gen")
+    def gen():
+        # No Iterator[...] annotation: Bolt sends str() of each chunk.
+        yield {"user": account()}
+
+    @api.get("/agen")
+    async def agen():
+        yield account()
+
+    @api.get("/streaming-response")
+    def streaming_response():
+        return StreamingResponse(iter([account()]), media_type="text/plain")
+
+    @api.get("/text-json")
+    def text_json():
+        # Bolt does not read text/json as a JSON media type, so it sends str(content).
+        return Response({"user": account()}, media_type="text/json")
+
+    @api.get("/http-exception")
+    def http_exception():
+        raise HTTPException(409, detail={"error": "email taken", "user": account()})
+
+    with TestClient(api) as test_client:
+        yield test_client
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/gen", "{'user': Account(id=1)}"),
+        ("/agen", "Account(id=1)"),
+        ("/streaming-response", "Account(id=1)"),
+        ("/text-json", "{'user': Account(id=1)}"),
+    ],
+    ids=["gen", "agen", "streaming-response", "text-json"],
+)
+def test_a_value_that_bolt_sends_as_its_str_never_shows_a_write_only_value(str_client, path, body):
+    response = str_client.get(path)
+    assert response.status_code == 200
+    assert SECRET not in response.text
+    assert response.text == body
+
+
+def test_the_detail_of_an_http_exception_never_shows_a_write_only_value(str_client):
+    """HTTPException keeps str(detail) for a detail that is not a str, as before."""
+    response = str_client.get("/http-exception")
+    assert response.status_code == 409
+    assert SECRET not in response.text
+    assert response.json() == {"detail": "{'error': 'email taken', 'user': Account(id=1)}"}
 
 
 def test_a_deeply_nested_response_fails_as_before():

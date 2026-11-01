@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import logging
 import re
+import reprlib
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import UnionType
@@ -69,6 +70,8 @@ T = TypeVar("T", bound="Serializer")
 _MISSING = object()
 _USE_DEFAULT = object()
 _STRUCT_META = type(msgspec.Struct)
+_STRUCT_REPR = msgspec.Struct.__repr__
+_STRUCT_RICH_REPR = msgspec.Struct.__rich_repr__
 _MODEL_VALUE_NOOP_TYPES = (str, int, float, bool, bytes, type(None))
 
 
@@ -427,6 +430,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __computed_fields__: ClassVar[dict[str, ComputedFieldConfig]] = {}
     __read_only_fields__: ClassVar[frozenset[str]] = frozenset()
     __write_only_fields__: ClassVar[frozenset[str]] = frozenset()
+    # The fields that dump() never sends: write-only and excluded fields.
+    __hidden_fields__: ClassVar[frozenset[str]] = frozenset()
     __source_mapping__: ClassVar[dict[str, str]] = {}  # API field name -> source attribute
     __field_sets__: ClassVar[dict[str, list[str]]] = {}  # Named field sets for use() method
 
@@ -652,6 +657,30 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls.__literal_fields__ = literal_fields
         cls.__has_serializer_fields__ = has_serializer_fields
 
+    @reprlib.recursive_repr()
+    def __repr__(self) -> str:
+        """Return the repr of msgspec without the fields that dump() never sends.
+
+        Bolt sends str() of a value on some paths, for example for a chunk of a
+        stream with no item type. A log can show the repr too.
+        """
+        cls = self.__class__
+        cls._ensure_dump_ready()
+        hidden = cls.__hidden_fields__
+        if not hidden:
+            return _STRUCT_REPR(self)
+        fields = ", ".join(f"{name}={value!r}" for name, value in _STRUCT_RICH_REPR(self) if name not in hidden)
+        return f"{cls.__name__}({fields})"
+
+    def __rich_repr__(self) -> Iterable[tuple[str, Any]]:
+        """Give the fields for the repr of rich, without the fields that dump() never sends."""
+        cls = self.__class__
+        cls._ensure_dump_ready()
+        hidden = cls.__hidden_fields__
+        for item in _STRUCT_RICH_REPR(self):
+            if item[0] not in hidden:
+                yield item
+
     def __post_init__(self) -> None:
         """
         Run all field and model validators after struct initialization.
@@ -788,6 +817,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             and not cls.__nested_fields__
             and not cls.__has_serializer_fields__
             and not any(cfg.exclude for cfg in cls.__field_configs__.values())
+        )
+        cls.__hidden_fields__ = cls.__write_only_fields__ | frozenset(
+            field_name for field_name, config in cls.__field_configs__.items() if config.exclude
         )
         cls.__orm_state_check_fields__ = tuple(
             field_name

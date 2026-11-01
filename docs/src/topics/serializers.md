@@ -579,6 +579,12 @@ async def login(request) -> dict:
     return {"user": user, "token": "..."}  # {"user": {"email": "test@example.com"}, ...}
 ```
 
+The repr of a Serializer leaves out the fields that `dump()` does not send. Thus `str()` of the value and a log line do not show the password:
+
+```python
+repr(user)  # UserCreateSerializer(email='test@example.com')
+```
+
 ## Nested serializers
 
 ### Basic nesting
