@@ -37,6 +37,48 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// The stack size of the threads that this module starts with the default size.
+///
+/// Python code runs on these threads: Actix workers, request lanes, Tokio
+/// runtime threads, sync streaming threads and test workers. CPython sizes
+/// its C recursion limit for the 8 MiB stack of a main thread.
+const THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Give each thread that this module starts with the default size a stack of
+/// `THREAD_STACK_SIZE`.
+///
+/// The default Rust stack is 2 MiB. CPython 3.12 and 3.13 stop C recursion at
+/// a fixed depth, and msgspec needs about 3 MiB of stack to get there. Deep
+/// JSON on a 2 MiB thread thus overflowed the stack, and the process got
+/// SIGSEGV. Actix has no setting for the stack of its worker threads. The
+/// standard library reads `RUST_MIN_STACK` when it starts its first thread of
+/// the default size, and keeps the value. Thus set the variable, start one
+/// thread, and remove the variable. Do this before any other thread starts.
+/// A `RUST_MIN_STACK` value from the user stays in effect.
+fn set_default_thread_stack_size() -> PyResult<()> {
+    if std::env::var_os("RUST_MIN_STACK").is_some() {
+        return Ok(());
+    }
+    // SAFETY: No thread of this module runs yet. Native code on other threads
+    // can read the environment at the same time. `os.putenv` has the same
+    // race, and Python code (runbolt too) calls it at any time.
+    unsafe { std::env::set_var("RUST_MIN_STACK", THREAD_STACK_SIZE.to_string()) };
+    let started = std::thread::Builder::new().spawn(|| {});
+    // SAFETY: As for `set_var` above.
+    unsafe { std::env::remove_var("RUST_MIN_STACK") };
+    started
+        .and_then(|thread| {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("the thread panicked"))
+        })
+        .map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "could not set the thread stack size: {err}"
+            ))
+        })
+}
+
 // `gil_used = false` attests that this module is safe to run with the GIL
 // disabled (free-threaded CPython, PEP 703). Without the attestation the
 // interpreter re-enables the GIL at import and prints a RuntimeWarning.
@@ -46,6 +88,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // stream, or connection.
 #[pymodule(gil_used = false)]
 fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    set_default_thread_stack_size()?;
     m.add_function(wrap_pyfunction!(response_helpers::format_cookie_date, m)?)?;
     m.add_function(wrap_pyfunction!(
         response_helpers::resolve_response_file,
