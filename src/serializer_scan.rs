@@ -121,7 +121,8 @@ fn type_lookup<'py>(
 /// the fields of a Struct from the slots that the class had when it was
 /// made, as msgspec encodes them. Only a Struct has a kind that is an exact
 /// tuple, and a Struct needs msgspec, so the scan has the function for each
-/// Struct. The tests of this module have no msgspec.
+/// Struct. The tests of this module block msgspec, because plain classes
+/// stand for Structs there.
 fn astuple(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
     static ASTUPLE: pyo3::sync::PyOnceLock<Option<Py<PyAny>>> = pyo3::sync::PyOnceLock::new();
     ASTUPLE
@@ -1163,6 +1164,12 @@ mod tests {
 
     const FIXTURES: &std::ffi::CStr = c"
 import collections
+import sys
+
+# Plain classes stand for Structs here, and msgspec.structs.astuple rejects
+# them. Block it, so that the tests do not depend on what the interpreter can
+# import: `uv run cargo test` finds msgspec, a plain `cargo test` does not.
+sys.modules['msgspec.structs'] = None
 
 Pair = collections.namedtuple('Pair', 'left right')
 
