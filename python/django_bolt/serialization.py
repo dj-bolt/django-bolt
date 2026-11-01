@@ -379,7 +379,13 @@ def _dump_status_dict(serializer_cls: Any, value: dict) -> Any:
         serializer_cls._ensure_dump_ready()
         hidden = serializer_cls.__hidden_fields__
         rename_map = serializer_cls.__rename_map__
-        hidden_keys = hidden | {rename_map.get(name, name) for name in hidden}
+        field_configs = serializer_cls.__field_configs__
+        # A hidden field can have three keys: its name, its wire name and its alias.
+        hidden_keys = (
+            hidden
+            | {rename_map.get(name, name) for name in hidden}
+            | {config.alias for name, config in field_configs.items() if name in hidden and config.alias}
+        )
         return {key: item for key, item in value.items() if key not in hidden_keys}
     return instance.dump()
 

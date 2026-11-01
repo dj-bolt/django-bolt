@@ -947,8 +947,21 @@ class CamelAccountSchema(Serializer, rename="camel"):
     password_hash: str = field(write_only=True)
 
 
+class AliasAccountSchema(Serializer):
+    """``dump(by_alias=True)`` names the write-only field ``pwd``."""
+
+    id: int
+    password: str = field(write_only=True, alias="pwd")
+
+
 ACCOUNT_DUMP = {"id": 1, "label": "account-1"}
-_ACCOUNT_RESPONSES = {200: AccountSchema, 201: list[AccountSchema], 202: CamelAccountSchema, 404: ErrorSchema}
+_ACCOUNT_RESPONSES = {
+    200: AccountSchema,
+    201: list[AccountSchema],
+    202: CamelAccountSchema,
+    203: AliasAccountSchema,
+    404: ErrorSchema,
+}
 
 
 @pytest.fixture(scope="module", params=[False, True], ids=["sync", "async"])
@@ -962,6 +975,7 @@ def account_client(request):
         "/list": (201, [body, {"id": 2, "password": SECRET}]),
         "/mismatched": (200, {"wrong_field": "no id", "password": SECRET}),
         "/camel-mismatched": (202, {"userId": "not-an-int", "passwordHash": SECRET, "password_hash": SECRET}),
+        "/alias-mismatched": (203, {"id": "not-an-int", "pwd": SECRET}),
     }
     for path, result in bodies.items():
         if request.param:
@@ -1003,6 +1017,7 @@ def test_a_serializer_entry_gives_the_dump_of_a_dict_body(account_client, path, 
     [
         ("/mismatched", 200, {"wrong_field": "no id"}),
         ("/camel-mismatched", 202, {"userId": "not-an-int"}),
+        ("/alias-mismatched", 203, {"id": "not-an-int"}),
     ],
 )
 def test_a_dict_body_that_does_not_fit_its_serializer_entry_has_no_write_only_field(
