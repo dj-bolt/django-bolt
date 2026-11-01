@@ -586,7 +586,7 @@ class TestTokenCreateDefaults:
         assert (plain.is_staff, plain.is_admin) == (False, False)
 
     def test_a_staff_token_does_not_pass_requires_is_admin(self):
-        """Requires("is_admin") refuses a token of a staff user who is not an admin."""
+        """Requires("is_admin") refuses a staff token. Requires("is_staff") allows a staff token and an admin token."""
         secret = "admin-implies-staff-secret"
         api = BoltAPI()
 
@@ -594,11 +594,18 @@ class TestTokenCreateDefaults:
         async def admin_only():
             return {"ok": True}
 
+        @api.get("/staff-only", auth=[JWTAuthentication(secret=secret)], guards=[Requires("is_staff")])
+        async def staff_only():
+            return {"ok": True}
+
         staff = Token.create(sub="1", is_staff=True).encode(secret)
         admin = Token.create(sub="1", is_admin=True).encode(secret)
         with TestClient(api) as client:
             assert client.get("/admin-only", headers={"Authorization": f"Bearer {staff}"}).status_code == 403
             assert client.get("/admin-only", headers={"Authorization": f"Bearer {admin}"}).status_code == 200
+            # An admin is also staff.
+            assert client.get("/staff-only", headers={"Authorization": f"Bearer {admin}"}).status_code == 200
+            assert client.get("/staff-only", headers={"Authorization": f"Bearer {staff}"}).status_code == 200
 
 
 class TestTokenToDictClaims:
