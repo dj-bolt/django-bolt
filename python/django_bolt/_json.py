@@ -16,6 +16,7 @@ from collections.abc import Callable
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
+from functools import partial
 from ipaddress import (
     IPv4Address,
     IPv4Interface,
@@ -76,6 +77,11 @@ def dump_held_serializers(value: Any) -> Any:
     return value
 
 
+def _dump_hook_result(hook: Callable[[Any], Any], value: Any) -> Any:
+    """Call the encoder hook of encode(). msgspec encodes its result natively, so dump each Serializer in it."""
+    return dump_held_serializers(hook(value))
+
+
 def default_serializer(value: Any) -> Any:
     """Transform values non-natively supported by msgspec.
 
@@ -91,7 +97,10 @@ def default_serializer(value: Any) -> Any:
     for base in value.__class__.__mro__[:-1]:  # Skip 'object'
         encoder = DEFAULT_TYPE_ENCODERS.get(base)
         if encoder is not None:
-            return dump_held_serializers(encoder(value))
+            result = encoder(value)
+            if find_serializer(result, SCAN_KINDS, classify, SCAN_OFFSETS):
+                return dump_serializers(result)
+            return result
 
     raise TypeError(f"Unsupported type: {type(value)!r}")
 
@@ -151,12 +160,7 @@ def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
     # Custom serializer provided - use one-off encoder
     if find_serializer(value, SCAN_KINDS, classify, SCAN_OFFSETS):
         value = dump_serializers(value)
-
-    # msgspec encodes the result of the hook natively. Thus dump each Serializer in it.
-    def enc_hook(item: Any) -> Any:
-        return dump_held_serializers(serializer(item))
-
-    return msgspec.json.encode(value, enc_hook=enc_hook)
+    return msgspec.json.encode(value, enc_hook=partial(_dump_hook_result, serializer))
 
 
 def decode(value: bytes | str) -> Any:
