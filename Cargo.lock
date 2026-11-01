@@ -940,6 +940,7 @@ dependencies = [
  "notify",
  "once_cell",
  "parking_lot",
+ "proptest",
  "pyo3",
  "pyo3-async-runtimes",
  "pyo3-build-config",

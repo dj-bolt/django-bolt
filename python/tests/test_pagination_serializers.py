@@ -8,14 +8,17 @@ or return type annotation for efficient batch serialization.
 from __future__ import annotations
 
 import builtins
+import datetime
+import decimal
+import uuid
 
 import msgspec
 import pytest
 
 from django_bolt import BoltAPI, CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
-from django_bolt.serializers import Serializer
+from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.testing import TestClient
-from django_bolt.views import ViewSet
+from django_bolt.views import ReadOnlyModelViewSet, ViewSet
 
 from .test_models import Article, Author, BlogPost
 
@@ -741,6 +744,205 @@ def test_viewset_cursor_pagination_with_serializer(sample_articles):
 
         assert page_count == 5  # 25 items / 5 per page
         assert len(all_ids) == 25
+
+
+# ============================================================================
+# Tests: Dict items have the fields of the item Serializer, without its hidden fields
+# ============================================================================
+
+SECRET = "s3cret-value"
+
+
+class ArticleSecretSerializer(Serializer):
+    """``content`` is write-only, so a page must not send it."""
+
+    id: int
+    title: str
+    content: str = field(write_only=True)
+
+    @computed_field
+    def headline(self) -> str:
+        return self.title.upper()
+
+
+@pytest.fixture(params=[True, False], ids=["validated", "not-validated"])
+def dict_items_client(request, db):
+    articles = [Article.objects.create(title=f"a{i}", content=SECRET, author="x") for i in range(3)]
+    api = BoltAPI(validate_response=request.param)
+
+    @api.get("/values", response_model=list[ArticleSecretSerializer])
+    @paginate(PageNumberPagination)
+    async def values_route(request):
+        return Article.objects.order_by("id").values()
+
+    @api.get("/dicts")
+    @paginate(LimitOffsetPagination)
+    async def dicts_route(request) -> list[ArticleSecretSerializer]:
+        return [{"id": article.id, "title": article.title, "content": SECRET} for article in articles]
+
+    @api.get("/invalid-dicts")
+    @paginate(PageNumberPagination)
+    async def invalid_dicts_route(request) -> list[ArticleSecretSerializer]:
+        return [{"id": "not-an-int", "content": SECRET}]
+
+    @api.get("/partial-values", response_model=list[ArticleSecretSerializer])
+    @paginate(PageNumberPagination)
+    async def partial_values_route(request):
+        # The row does not select the write-only column.
+        return Article.objects.order_by("id").values("id", "title")
+
+    @api.viewset("/viewset")
+    class ArticleValuesViewSet(ReadOnlyModelViewSet):
+        queryset = Article.objects.order_by("id").values()
+        serializer_class = ArticleSecretSerializer
+        pagination_class = PageNumberPagination
+
+    @api.viewset("/partial-viewset")
+    class ArticlePartialValuesViewSet(ReadOnlyModelViewSet):
+        queryset = Article.objects.order_by("id").values("id", "title")
+        serializer_class = ArticleSecretSerializer
+        pagination_class = PageNumberPagination
+
+    expected = [{"id": article.id, "title": article.title} for article in articles]
+    with TestClient(api) as client:
+        yield client, expected
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("path", ["/values", "/dicts", "/viewset", "/partial-values", "/partial-viewset"])
+def test_a_paginated_dict_item_has_the_fields_of_the_item_serializer_without_its_hidden_fields(dict_items_client, path):
+    """Bolt does not convert a dict item. It keeps the fields of the Serializer, without the write-only fields."""
+    client, expected = dict_items_client
+    response = client.get(path)
+    assert response.status_code == 200, response.text
+    assert SECRET not in response.text
+    assert response.json()["items"] == expected
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_paginated_dict_item_that_does_not_fit_the_item_serializer_goes_out_as_it_is(dict_items_client):
+    """Bolt does not validate a dict item. A field that the item does not have is null."""
+    client, _ = dict_items_client
+    response = client.get("/invalid-dicts")
+    assert response.status_code == 200, response.text
+    assert response.json()["items"] == [{"id": "not-an-int", "title": None}]
+
+
+class ArticleCamelSerializer(Serializer, rename="camel"):
+    """The wire name of ``is_published`` is ``isPublished``. A ``values()`` row has the Python name."""
+
+    id: int
+    title: str
+    is_published: bool
+    content: str = field(write_only=True)
+
+
+@pytest.fixture
+def camel_dict_items_client(db):
+    articles = [Article.objects.create(title=f"a{i}", content=SECRET, author="x") for i in range(2)]
+    api = BoltAPI()
+
+    @api.get("/values", response_model=list[ArticleCamelSerializer])
+    @paginate(PageNumberPagination)
+    async def values_route(request):
+        return Article.objects.order_by("id").values()
+
+    @api.get("/dicts")
+    @paginate(LimitOffsetPagination)
+    async def dicts_route(request) -> list[ArticleCamelSerializer]:
+        return [
+            {"id": article.id, "title": article.title, "is_published": False, "content": SECRET} for article in articles
+        ]
+
+    @api.viewset("/viewset")
+    class ArticleCamelValuesViewSet(ReadOnlyModelViewSet):
+        queryset = Article.objects.order_by("id").values()
+        serializer_class = ArticleCamelSerializer
+        pagination_class = PageNumberPagination
+
+    expected = [{"id": article.id, "title": article.title, "is_published": False} for article in articles]
+    with TestClient(api) as client:
+        yield client, expected
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("path", ["/values", "/dicts", "/viewset"])
+def test_a_paginated_dict_item_keeps_the_python_names_of_a_renamed_item_serializer(camel_dict_items_client, path):
+    """A dict item keeps the Python names of the fields, as a ``values()`` row has them."""
+    client, expected = camel_dict_items_client
+    response = client.get(path)
+    assert response.status_code == 200, response.text
+    assert SECRET not in response.text
+    assert response.json()["items"] == expected
+
+
+class PriceSerializer(Serializer):
+    """A ``values()`` row gives a UUID, a Decimal and a datetime for these fields."""
+
+    id: str
+    price: float
+    created: str
+    cost: decimal.Decimal = field(write_only=True)
+
+
+class OwnerSerializer(Serializer):
+    id: int
+    password: str = field(write_only=True)
+
+
+class ArticleOwnersSerializer(Serializer):
+    """Its nested fields hold a Serializer with a write-only field."""
+
+    id: int
+    content: str = field(write_only=True)
+    owners: dict[str, OwnerSerializer] = {}
+    editor: OwnerSerializer | None = None
+
+
+_ROW_PAGES = {
+    "/prices": (
+        [
+            {
+                "id": uuid.UUID(int=1),
+                "price": decimal.Decimal("9.50"),
+                "created": datetime.datetime(2026, 1, 1),
+                "cost": decimal.Decimal("3.10"),
+            }
+        ],
+        [{"id": "00000000-0000-0000-0000-000000000001", "price": "9.50", "created": "2026-01-01T00:00:00"}],
+    ),
+    "/owners": (
+        [{"id": 1, "owners": {"lead": {"id": 2, "password": SECRET}}, "editor": {"id": 3, "password": SECRET}}],
+        [{"id": 1, "owners": {"lead": {"id": 2}}, "editor": {"id": 3}}],
+    ),
+}
+
+
+@pytest.fixture(scope="module", params=[True, False], ids=["validated", "not-validated"])
+def row_page_client(request):
+    api = BoltAPI(validate_response=request.param)
+
+    @api.get("/prices")
+    @paginate(PageNumberPagination)
+    async def prices(request) -> list[PriceSerializer]:
+        return _ROW_PAGES["/prices"][0]
+
+    @api.get("/owners")
+    @paginate(LimitOffsetPagination)
+    async def owners(request) -> list[ArticleOwnersSerializer]:
+        return _ROW_PAGES["/owners"][0]
+
+    with TestClient(api) as client:
+        yield client
+
+
+@pytest.mark.parametrize("path", list(_ROW_PAGES))
+def test_a_paginated_dict_item_keeps_its_values_and_loses_the_nested_hidden_fields(row_page_client, path):
+    """Bolt does not convert the values of a row. A nested Serializer type loses its hidden fields."""
+    response = row_page_client.get(path)
+    assert response.status_code == 200, response.text
+    assert SECRET not in response.text
+    assert response.json()["items"] == _ROW_PAGES[path][1]
 
 
 if __name__ == "__main__":

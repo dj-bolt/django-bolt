@@ -134,6 +134,9 @@ bolt-mcp = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [profile.release]
 codegen-units = 1        # Better optimization (single codegen unit allows more inlining)
 debug = false            # No debug symbols in release

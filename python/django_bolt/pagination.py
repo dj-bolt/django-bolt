@@ -32,6 +32,7 @@ from typing import Any, Generic, TypeVar, get_args, get_origin
 import msgspec
 
 from . import _json
+from ._hidden_fields import project_dict_rows
 from .concurrency import run_in_orm_executor
 from .exceptions import UnloadedRelationError
 
@@ -231,6 +232,7 @@ class PaginationBase(ABC):
 
         Supports:
         - Bolt Serializer: from_model() + dump_many() (fastest)
+        - Bolt Serializer with dict items: the fields of the Serializer, without the hidden fields
         - msgspec.Struct: msgspec.structs.asdict() for each item
         - Fallback: _model_to_dict() for backwards compatibility
 
@@ -248,9 +250,13 @@ class PaginationBase(ABC):
             return [self._model_to_dict(item) for item in items]
 
         # Check if items are already dicts (e.g., from values() queryset)
-        # In this case, just extract the fields we need
         first_item = items[0]
         if isinstance(first_item, dict):
+            if getattr(self.serializer_class, "__is_bolt_serializer__", False):
+                # Bolt does not convert a dict item, because a values() row need not
+                # fit the Serializer. The item keeps the fields that dump() sends.
+                # A nested value loses its hidden fields too.
+                return project_dict_rows(self.serializer_class, items)
             # Items are dicts - extract only the fields declared in serializer
             if hasattr(self.serializer_class, "__struct_fields__"):
                 fields = self.serializer_class.__struct_fields__

@@ -571,6 +571,24 @@ result = user.dump()
 # {'email': 'test@example.com'}  # password excluded
 ```
 
+A response gives the `dump()` of each Serializer that it holds. This is also true for a Serializer in a dict, a list, a `Struct` field, a dataclass or an attrs object:
+
+```python
+@api.post("/login")
+async def login(request) -> dict:
+    return {"user": user, "token": "..."}  # {"user": {"email": "test@example.com"}, ...}
+```
+
+Bolt finds each Serializer where msgspec encodes it. For a dataclass, this includes each key of `__dataclass_fields__` that the object holds. For an attrs object, it includes each public attribute and slot, also a cached property. A Serializer that hides nothing keeps the encoding of msgspec, also with `array_like` or `omit_defaults`.
+
+Bolt scans the value before msgspec encodes it. Do not let another thread change a container of the response value during the response. A Serializer that the thread adds after the scan goes out with all of its fields.
+
+The repr of a Serializer leaves out the fields that `dump()` does not send. Thus `str()` of the value and a log line do not show the password:
+
+```python
+repr(user)  # UserCreateSerializer(email='test@example.com')
+```
+
 ## Nested serializers
 
 ### Basic nesting

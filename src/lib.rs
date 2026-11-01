@@ -8,6 +8,7 @@ mod handler;
 mod normalize;
 mod response_body;
 mod response_helpers;
+mod serializer_scan;
 mod server;
 mod testing;
 
@@ -36,6 +37,69 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// The stack size of the threads that this module starts with the default size.
+///
+/// Python code runs on these threads: Actix workers, request lanes, Tokio
+/// runtime threads, sync streaming threads and test workers. CPython sizes
+/// its C recursion limit for the 8 MiB stack of a main thread.
+const THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Give each thread that this module starts with the default size a stack of
+/// `THREAD_STACK_SIZE`.
+///
+/// The default Rust stack is 2 MiB. CPython 3.12 and 3.13 stop C recursion at
+/// a fixed depth, and msgspec needs about 3 MiB of stack to get there. Deep
+/// JSON on a 2 MiB thread thus overflowed the stack, and the process got
+/// SIGSEGV. Actix has no setting for the stack of its worker threads. The
+/// standard library reads `RUST_MIN_STACK` when it starts its first thread of
+/// the default size, and keeps the value. Thus set the variable, start one
+/// thread, and restore the variable. Do this before any other thread starts.
+/// This module links its own copy of the standard library, so a thread of
+/// another extension module does not set the value for it.
+/// A `RUST_MIN_STACK` int from the user stays in effect.
+///
+/// CPython 3.14 and later check the stack itself, and raise RecursionError
+/// before it overflows. There, the default size stays: a larger stack would
+/// only let each thread keep more memory after a deep request.
+fn set_default_thread_stack_size(py: Python<'_>) -> PyResult<()> {
+    if py.version_info() >= (3, 14) {
+        return Ok(());
+    }
+    let previous = std::env::var_os("RUST_MIN_STACK");
+    // The standard library ignores a value that is not an int, and uses 2 MiB.
+    // Such a value thus gets `THREAD_STACK_SIZE` too.
+    if previous
+        .as_deref()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.parse::<usize>().is_ok())
+    {
+        return Ok(());
+    }
+    // SAFETY: No thread of this module runs yet. Native code on other threads
+    // can read the environment at the same time. `os.putenv` has the same
+    // race, and Python code (runbolt too) calls it at any time.
+    unsafe { std::env::set_var("RUST_MIN_STACK", THREAD_STACK_SIZE.to_string()) };
+    let started = std::thread::Builder::new().spawn(|| {});
+    // SAFETY: As for `set_var` above. The environment gets back the value of the user.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("RUST_MIN_STACK", value),
+            None => std::env::remove_var("RUST_MIN_STACK"),
+        }
+    };
+    started
+        .and_then(|thread| {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("the thread panicked"))
+        })
+        .map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "could not set the thread stack size: {err}"
+            ))
+        })
+}
+
 // `gil_used = false` attests that this module is safe to run with the GIL
 // disabled (free-threaded CPython, PEP 703). Without the attestation the
 // interpreter re-enables the GIL at import and prints a RuntimeWarning.
@@ -44,7 +108,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // or a `Mutex`. Every `#[pyclass]` is `frozen` or belongs to one request,
 // stream, or connection.
 #[pymodule(gil_used = false)]
-fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    set_default_thread_stack_size(py)?;
     m.add_function(wrap_pyfunction!(response_helpers::format_cookie_date, m)?)?;
     m.add_function(wrap_pyfunction!(
         response_helpers::resolve_response_file,
@@ -54,6 +119,8 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         response_helpers::populate_response_cookies,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(serializer_scan::find_serializer, m)?)?;
+    m.add_class::<serializer_scan::SerializerScanEncoder>()?;
     use crate::dev_reload::run_dev_reloader;
     use crate::server::{
         register_asgi_mounts, register_middleware_metadata, register_routes,

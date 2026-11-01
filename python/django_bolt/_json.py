@@ -16,6 +16,7 @@ from collections.abc import Callable
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
+from functools import partial
 from ipaddress import (
     IPv4Address,
     IPv4Interface,
@@ -29,6 +30,9 @@ from typing import Any, TypeVar
 from uuid import UUID
 
 import msgspec
+
+from ._core import SerializerScanEncoder, find_serializer
+from ._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, classify, dump_serializers
 
 T = TypeVar("T")
 
@@ -63,20 +67,44 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
 }
 
 
+def dump_held_serializers(value: Any) -> Any:
+    """Return ``value`` with the dump of each Serializer that it holds.
+
+    The Rust scan runs first. A value with no Serializer comes back as it is.
+    """
+    if find_serializer(value, SCAN_KINDS, classify, SCAN_OFFSETS):
+        return dump_serializers(value)
+    return value
+
+
+def _dump_hook_result(hook: Callable[[Any], Any], value: Any) -> Any:
+    """Call the encoder hook of encode(). msgspec encodes its result natively, so dump each Serializer in it."""
+    return dump_held_serializers(hook(value))
+
+
 def default_serializer(value: Any) -> Any:
     """Transform values non-natively supported by msgspec.
 
     Walks the MRO (Method Resolution Order) to support subclasses.
     Raises TypeError if type is unsupported.
 
-    Note: Serializer instances are handled in serialization.py before reaching
-    this hook, since msgspec.Struct is natively supported by msgspec.
+    Note: encode() dumps each Serializer before msgspec sees it, since
+    msgspec encodes a msgspec.Struct natively and never calls this hook for it.
+    msgspec encodes the result of the hook natively too, so the hook dumps
+    each Serializer in its result.
     """
     # Walk MRO to support polymorphic types
     for base in value.__class__.__mro__[:-1]:  # Skip 'object'
         encoder = DEFAULT_TYPE_ENCODERS.get(base)
         if encoder is not None:
-            return encoder(value)
+            result = encoder(value)
+            # Most encoders give a str, an int or a float, which cannot hold a Serializer.
+            cls = result.__class__
+            if cls is str or cls is int or cls is float:
+                return result
+            if find_serializer(result, SCAN_KINDS, classify, SCAN_OFFSETS):
+                return dump_serializers(result)
+            return result
 
     raise TypeError(f"Unsupported type: {type(value)!r}")
 
@@ -88,8 +116,35 @@ _ENCODER = msgspec.json.Encoder(enc_hook=default_serializer)
 _DECODER = msgspec.json.Decoder()
 
 
+class ResponseEncoder:
+    """Hold the JSON encode function of the routes.
+
+    A route binds the holder when it registers and calls ``holder.encode``.
+    The function changes once, when the first Serializer subclass appears.
+    """
+
+    __slots__ = ("encode",)
+
+    def __init__(self, encode: Callable[[Any], bytes]) -> None:
+        self.encode = encode
+
+
+# For each route, and for encode(). Before the first Serializer subclass, no
+# value can hold a Serializer, so this holder does not scan.
+RESPONSE_ENCODER = ResponseEncoder(_ENCODER.encode)
+_SCANNING_ENCODER = SerializerScanEncoder(_ENCODER.encode, SCAN_KINDS, classify, dump_serializers, SCAN_OFFSETS)
+
+
+def mark_serializers_defined() -> None:
+    """Make RESPONSE_ENCODER dump each Serializer in a value. Serializer subclasses call it."""
+    RESPONSE_ENCODER.encode = _SCANNING_ENCODER.encode
+
+
 def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
     """Encode a Python object to JSON bytes.
+
+    Each Bolt Serializer in the value gives its dump(). msgspec would encode
+    all of its fields, also the write-only fields.
 
     Args:
         value: Object to encode
@@ -102,12 +157,12 @@ def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
         TypeError: If value contains unsupported types
         msgspec.EncodeError: If encoding fails
     """
-    if serializer is not None:
-        # Custom serializer provided - use one-off encoder
-        return msgspec.json.encode(value, enc_hook=serializer)
-
-    # Use module-level singleton encoder with default serializer
-    return _ENCODER.encode(value)
+    if serializer is None:
+        return RESPONSE_ENCODER.encode(value)
+    # Custom serializer provided - use one-off encoder
+    if find_serializer(value, SCAN_KINDS, classify, SCAN_OFFSETS):
+        value = dump_serializers(value)
+    return msgspec.json.encode(value, enc_hook=partial(_dump_hook_result, serializer))
 
 
 def decode(value: bytes | str) -> Any:
@@ -154,4 +209,4 @@ def decode_typed[T](
     return msgspec.json.decode(value, type=target_type, strict=strict)
 
 
-__all__ = ["encode", "decode", "decode_typed", "DEFAULT_TYPE_ENCODERS", "default_serializer"]
+__all__ = ["encode", "decode", "decode_typed", "DEFAULT_TYPE_ENCODERS", "default_serializer", "dump_held_serializers"]

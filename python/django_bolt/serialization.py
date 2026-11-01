@@ -34,6 +34,7 @@ from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 
 from . import _json
+from ._hidden_fields import without_hidden_fields
 from ._kwargs import compile_response_coercer, compile_struct_row_readers
 from .concurrency import run_in_orm_executor
 from .cookies import Cookie
@@ -356,10 +357,13 @@ def _annotation_may_need_relation_load(annotation: Any) -> bool:
     return get_origin(annotation) in {list, tuple, set, frozenset}
 
 
-def _dump_dict(serializer_cls: Any, value: dict, validate_dicts: bool) -> Any:
-    """Validate already-serialized dicts only when response validation is on."""
-    if not validate_dicts:
-        return value
+def _keep_dict(serializer_cls: Any, value: dict) -> Any:
+    """Return the dict of a route that does not validate its response, as it is."""
+    return value
+
+
+def _convert_dict(serializer_cls: Any, value: dict) -> Any:
+    """Validate the dict, and give the dump of the Serializer."""
     return msgspec.convert(value, serializer_cls).dump()
 
 
@@ -367,23 +371,23 @@ def _is_serializer_instance(value: Any) -> bool:
     return getattr(value.__class__, "__is_bolt_serializer__", None)
 
 
-def _dump_one_sync(serializer_cls: Any, value: Any, validate_dicts: bool) -> Any:
+def _dump_one_sync(serializer_cls: Any, value: Any, dump_dict: Any) -> Any:
     if value is None:
         return value
     if _is_serializer_instance(value):
         return value.dump()
     if isinstance(value, dict):
-        return _dump_dict(serializer_cls, value, validate_dicts)
+        return dump_dict(serializer_cls, value)
     return serializer_cls.from_model(value).dump()
 
 
-async def _dump_one_async(serializer_cls: Any, value: Any, validate_dicts: bool) -> Any:
+async def _dump_one_async(serializer_cls: Any, value: Any, dump_dict: Any) -> Any:
     if value is None:
         return value
     if _is_serializer_instance(value):
         return value.dump()
     if isinstance(value, dict):
-        return _dump_dict(serializer_cls, value, validate_dicts)
+        return dump_dict(serializer_cls, value)
     # The fields cannot show every relation: a field with a column type can
     # name one. Thus try from_model() first, and load on UnloadedRelationError.
     try:
@@ -393,24 +397,24 @@ async def _dump_one_async(serializer_cls: Any, value: Any, validate_dicts: bool)
     return (await serializer_cls.afrom_model(value)).dump()
 
 
-def _dump_many_sync(serializer_cls: Any, items: list[Any] | tuple[Any, ...], validate_dicts: bool) -> list[Any]:
+def _dump_many_sync(serializer_cls: Any, items: list[Any] | tuple[Any, ...], dump_dict: Any) -> list[Any]:
     if not items:
         return []
     first = items[0]
     if isinstance(first, dict):
-        return [_dump_dict(serializer_cls, item, validate_dicts) for item in items]
+        return [dump_dict(serializer_cls, item) for item in items]
     if _is_serializer_instance(first):
         return [item.dump() for item in items]
     instances = [serializer_cls.from_model(item) for item in items]
     return serializer_cls.dump_many(instances)
 
 
-async def _dump_many_async(serializer_cls: Any, items: list[Any] | tuple[Any, ...], validate_dicts: bool) -> list[Any]:
+async def _dump_many_async(serializer_cls: Any, items: list[Any] | tuple[Any, ...], dump_dict: Any) -> list[Any]:
     if not items:
         return []
     first = items[0]
     if isinstance(first, dict):
-        return [_dump_dict(serializer_cls, item, validate_dicts) for item in items]
+        return [dump_dict(serializer_cls, item) for item in items]
     if _is_serializer_instance(first):
         return [item.dump() for item in items]
     try:
@@ -459,11 +463,7 @@ def _compile_serializer_values_evaluators(serializer_cls: Any) -> tuple[Any, Any
         # Project here, on the ORM thread, so model properties may still
         # query (an N+1, never SynchronousOnlyOperation on the loop).
         # The route validator checks the dumped dicts later.
-        return _dump_many_sync(
-            serializer_cls,
-            list(queryset),
-            False,  # pragma: no mutate (None is also false)
-        )
+        return _dump_many_sync(serializer_cls, list(queryset), _keep_dict)
 
     def evaluate_sync(queryset: QuerySet) -> list[Any]:
         queryset = serializer_cls._prepare_queryset(queryset)  # Config.annotations & co.
@@ -483,27 +483,30 @@ def _compile_serializer_values_evaluators(serializer_cls: Any) -> tuple[Any, Any
     return evaluate_sync, evaluate_async
 
 
-def _compile_serializer_response_handlers(serializer_cls: Any, many: bool, validate_dicts: bool) -> tuple[Any, Any]:
-    """Compile normalizers that render model/queryset output via the serializer."""
+def _compile_serializer_response_handlers(serializer_cls: Any, many: bool, dump_dict: Any) -> tuple[Any, Any]:
+    """Compile normalizers that render model/queryset output via the serializer.
+
+    ``dump_dict(serializer_cls, value)`` gives the output for a dict value.
+    """
     if many:
 
         def normalize_sync(value: Any) -> Any:
             if not isinstance(value, (list, tuple)):
                 return value
-            return _dump_many_sync(serializer_cls, value, validate_dicts)
+            return _dump_many_sync(serializer_cls, value, dump_dict)
 
         async def normalize_async(value: Any) -> Any:
             if not isinstance(value, (list, tuple)):
                 return value
-            return await _dump_many_async(serializer_cls, value, validate_dicts)
+            return await _dump_many_async(serializer_cls, value, dump_dict)
 
         return normalize_sync, normalize_async
 
     def normalize_sync(value: Any) -> Any:
-        return _dump_one_sync(serializer_cls, value, validate_dicts)
+        return _dump_one_sync(serializer_cls, value, dump_dict)
 
     async def normalize_async(value: Any) -> Any:
-        return await _dump_one_async(serializer_cls, value, validate_dicts)
+        return await _dump_one_async(serializer_cls, value, dump_dict)
 
     return normalize_sync, normalize_async
 
@@ -515,7 +518,15 @@ def _compile_response_validator(meta: HandlerMetadata | dict[str, Any]) -> tuple
 
     serializer_cls, many = _response_serializer_info(response_type)
     if serializer_cls is not None:
-        return _compile_serializer_response_handlers(serializer_cls, many, validate_dicts=meta["validate_response"])
+        if meta["validate_response"]:
+            dump_dict = _convert_dict
+        elif meta.get("_status_entry"):
+            # Bolt does not convert a dict body of a status code. It sends the
+            # dict without the fields that dump() never sends.
+            dump_dict = without_hidden_fields
+        else:
+            dump_dict = _keep_dict
+        return _compile_serializer_response_handlers(serializer_cls, many, dump_dict)
 
     if not meta["validate_response"]:
         return None, None

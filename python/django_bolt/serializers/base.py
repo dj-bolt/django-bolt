@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import logging
 import re
+import reprlib
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import UnionType
@@ -38,6 +39,8 @@ from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
 
 from django_bolt import _json
+from django_bolt._core import find_serializer
+from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, classify, dump_serializers
 from django_bolt.error_handlers import msgspec_validation_error_to_dict
 from django_bolt.exceptions import (
     RequestValidationError,
@@ -68,6 +71,8 @@ T = TypeVar("T", bound="Serializer")
 _MISSING = object()
 _USE_DEFAULT = object()
 _STRUCT_META = type(msgspec.Struct)
+_STRUCT_REPR = msgspec.Struct.__repr__
+_STRUCT_RICH_REPR = msgspec.Struct.__rich_repr__
 _MODEL_VALUE_NOOP_TYPES = (str, int, float, bool, bytes, type(None))
 
 
@@ -157,6 +162,20 @@ def _iter_field_defaults(cls: type) -> list[tuple[str, Any]]:
         if 0 <= field_idx < num_fields:
             result.append((fields[field_idx], default_val))
     return result
+
+
+def _with_dumped_fields(instance: Serializer, values: tuple[Any, ...]) -> Serializer:
+    """Return a copy of ``instance`` whose fields hold the dump of each Serializer in them.
+
+    ``values`` gives the field values of ``instance``. The copy keeps the type
+    of the instance, so ``msgspec.to_builtins`` still applies its rename, tag
+    and omit_defaults. ``to_builtins`` converts a Serializer with all of its
+    fields, also the write-only fields.
+    """
+    clone = msgspec.Struct.__copy__(instance)
+    for name, value in zip(instance.__struct_fields__, dump_serializers(values), strict=True):
+        msgspec_structs.force_setattr(clone, name, value)
+    return clone
 
 
 def _build_rename_map(cls: type[msgspec.Struct]) -> dict[str, str]:
@@ -412,6 +431,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __computed_fields__: ClassVar[dict[str, ComputedFieldConfig]] = {}
     __read_only_fields__: ClassVar[frozenset[str]] = frozenset()
     __write_only_fields__: ClassVar[frozenset[str]] = frozenset()
+    # The fields that dump() never sends: write-only and excluded fields.
+    __hidden_fields__: ClassVar[frozenset[str]] = frozenset()
     __source_mapping__: ClassVar[dict[str, str]] = {}  # API field name -> source attribute
     __field_sets__: ClassVar[dict[str, list[str]]] = {}  # Named field sets for use() method
 
@@ -463,6 +484,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # so swallow them here instead of maintaining a hand-rolled allowlist
         # that would silently break each time msgspec adds a new struct option.
         super().__init_subclass__()
+        # From now on a response value can hold a Serializer. The JSON encoder
+        # then looks for one, because msgspec would send all of its fields.
+        _json.mark_serializers_defined()
         # Collect validators for this class
         cls.__field_validators__ = collect_field_validators(cls)
         cls.__model_validators__ = collect_model_validators(cls)
@@ -634,6 +658,30 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls.__literal_fields__ = literal_fields
         cls.__has_serializer_fields__ = has_serializer_fields
 
+    @reprlib.recursive_repr()
+    def __repr__(self) -> str:
+        """Return the repr of msgspec without the fields that dump() never sends.
+
+        Bolt sends str() of a value on some paths, for example for a chunk of a
+        stream with no item type. A log can show the repr too.
+        """
+        cls = self.__class__
+        cls._ensure_dump_ready()
+        hidden = cls.__hidden_fields__
+        if not hidden:
+            return _STRUCT_REPR(self)
+        fields = ", ".join(f"{name}={value!r}" for name, value in _STRUCT_RICH_REPR(self) if name not in hidden)
+        return f"{cls.__name__}({fields})"
+
+    def __rich_repr__(self) -> Iterable[tuple[str, Any]]:
+        """Give the fields for the repr of rich, without the fields that dump() never sends."""
+        cls = self.__class__
+        cls._ensure_dump_ready()
+        hidden = cls.__hidden_fields__
+        for item in _STRUCT_RICH_REPR(self):
+            if item[0] not in hidden:
+                yield item
+
     def __post_init__(self) -> None:
         """
         Run all field and model validators after struct initialization.
@@ -770,6 +818,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             and not cls.__nested_fields__
             and not cls.__has_serializer_fields__
             and not any(cfg.exclude for cfg in cls.__field_configs__.values())
+        )
+        cls.__hidden_fields__ = cls.__write_only_fields__ | frozenset(
+            field_name for field_name, config in cls.__field_configs__.items() if config.exclude
         )
         cls.__orm_state_check_fields__ = tuple(
             field_name
@@ -2178,17 +2229,21 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # to_builtins handles rename and tag injection natively; asdict is
             # cheaper when neither applies, so keep the split for the common case.
             if cls.__has_rename__ or cls.__tag_value__ is not None:
+                # A field can hold a Serializer that is not a nested field. The Rust scan finds it.
+                values = msgspec_structs.astuple(self)
+                if find_serializer(values, SCAN_KINDS, classify, SCAN_OFFSETS):
+                    return msgspec.to_builtins(_with_dumped_fields(self, values))
                 return msgspec.to_builtins(self)
             return msgspec_structs.asdict(self)
 
-        # SLOW PATH: Need special handling.
+        # SLOW PATH: Need special handling. The specs with no field filter are ready after _ensure_dump_ready.
         return self._dump_impl(
             exclude_none=exclude_none,
             exclude_unset=exclude_unset,
             exclude_defaults=exclude_defaults,
             by_alias=by_alias,
-            include_fields=None,
-            exclude_fields=None,
+            field_specs=cls._dump_field_specs,
+            computed_specs=cls._computed_dump_specs,
         )
 
     def _dump_impl(
@@ -2355,14 +2410,35 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls._ensure_dump_ready()
         instances_list = instances if isinstance(instances, list) else list(instances)
 
+        # The paths below use the fields of cls. A subclass instance can have
+        # other fields, also write-only fields, so it gives its own dump.
+        for instance in instances_list:
+            if instance.__class__ is not cls:
+                return [
+                    instance.dump(
+                        exclude_none=exclude_none,
+                        exclude_unset=exclude_unset,
+                        exclude_defaults=exclude_defaults,
+                        by_alias=by_alias,
+                    )
+                    for instance in instances_list
+                ]
+
         # FAST PATH: use msgspec native methods (significantly faster than Python iteration)
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
             if cls.__orm_state_check_fields__:
                 for instance in instances_list:
                     instance._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
             if cls.__has_rename__ or cls.__tag_value__ is not None:
-                _to_builtins = msgspec.to_builtins
-                return [_to_builtins(instance) for instance in instances_list]
+                # A field can hold a Serializer that is not a nested field. One scan finds it.
+                _astuple = msgspec_structs.astuple
+                all_values = [_astuple(instance) for instance in instances_list]
+                if find_serializer(all_values, SCAN_KINDS, classify, SCAN_OFFSETS):
+                    instances_list = [
+                        _with_dumped_fields(instance, values)
+                        for instance, values in zip(instances_list, all_values, strict=True)
+                    ]
+                return msgspec.to_builtins(instances_list)
             _asdict = msgspec_structs.asdict
             return [_asdict(instance) for instance in instances_list]
 
@@ -2583,7 +2659,9 @@ class SerializerView(Iterable[T]):
             exclude_defaults=exclude_defaults,
             by_alias=by_alias,
         )
-        return msgspec.json.encode(data)
+        # The dump can keep a Serializer in a field that is not a nested field.
+        # _json.encode gives its dump. msgspec alone sends all of its fields.
+        return _json.encode(data)
 
     def dump_many_json(
         self,
@@ -2602,4 +2680,4 @@ class SerializerView(Iterable[T]):
             exclude_defaults=exclude_defaults,
             by_alias=by_alias,
         )
-        return msgspec.json.encode(data)
+        return _json.encode(data)

@@ -257,6 +257,20 @@ export DJANGO_BOLT_EXECUTOR_THREADS=16
 
 The value must be an int of `1` or more.
 
+### RUST_MIN_STACK
+
+Stack size, in bytes, of the threads that Bolt starts. Python code runs on these threads: Actix workers, request lanes, Tokio runtime threads, sync streaming threads and the test workers of `TestClient`.
+
+```bash
+export RUST_MIN_STACK=16777216
+```
+
+**Default:** `8388608` (8 MiB) on Python 3.12 and 3.13, the stack of a Python main thread on Linux and macOS. On Python 3.14 and later, the Rust default of 2 MiB.
+
+Do not set a smaller value on Python 3.12 or 3.13. There, msgspec needs about 3 MiB of stack to decode JSON at the C recursion limit. With less stack, deeply nested JSON stops the process with `SIGSEGV`. With 8 MiB, the decoder raises `RecursionError`, and a request body that is too deep gets `422`. Python 3.14 checks the stack itself, so Bolt does not set a size there.
+
+The Rust standard library in Bolt reads this variable once, when Python imports Bolt. Set it before the import, for example in the environment of the process. A later change has no effect. A value that is not an int gets the default.
+
 ## File serving settings
 
 ### BOLT_ALLOWED_FILE_PATHS
@@ -539,3 +553,4 @@ api = BoltAPI(
 | `DJANGO_BOLT_ORM_THREADS` | `int` (env var) | `1` (SQLite) or `4` | Threads in the ORM pool of each process |
 | `DJANGO_BOLT_LANE_IDLE_SECONDS` | `float` (env var) | `10` | Idle time after which a request lane stops |
 | `DJANGO_BOLT_EXECUTOR_THREADS` | `int` (env var) | CPU count + 4 (max `32`) | Threads in the shared executor pool of each process |
+| `RUST_MIN_STACK` | `int` (env var) | `8388608` (8 MiB) on Python 3.12 and 3.13 | Stack size in bytes of the threads that Bolt starts |

@@ -787,6 +787,28 @@ def create_body_extractor(name: str, annotation: Any) -> Callable:
         return _build_body_extractor(annotation)
 
 
+def _too_deep(body_bytes: bytes) -> RequestValidationError:
+    """Return the 422 error for a body that the decoder cannot read: its nesting is too deep.
+
+    msgspec uses C stack for each level of nesting. It raises ``RecursionError``
+    before the stack overflows. The client sent the nesting, so it gets a 422.
+    """
+    return RequestValidationError(
+        errors=[{"type": "json_invalid", "loc": ("body",), "msg": "JSON is nested too deeply"}],
+        body=body_bytes,
+    )
+
+
+def _raised_by_decoder(error: RecursionError) -> bool:
+    """Return whether the decoder itself raised ``error``, with no Python frame below the decode.
+
+    A frame below it is application code, for example a ``__post_init__``
+    that recurses. Such an error is a fault of the app, so it stays a 500.
+    """
+    traceback = error.__traceback__
+    return traceback is not None and traceback.tb_next is None
+
+
 def _build_body_extractor(annotation: Any) -> Callable:
     if is_msgspec_struct(annotation):
         decoder = get_msgspec_decoder(annotation)
@@ -805,6 +827,10 @@ def _build_body_extractor(annotation: Any) -> Callable:
                     errors=[error_detail],
                     body=body_bytes,
                 ) from e
+            except RecursionError as e:
+                if not _raised_by_decoder(e):
+                    raise
+                raise _too_deep(body_bytes) from e
     else:
         # Fallback to generic msgspec decode
         def extract(body_bytes: bytes) -> Any:
@@ -821,6 +847,10 @@ def _build_body_extractor(annotation: Any) -> Callable:
                     errors=[error_detail],
                     body=body_bytes,
                 ) from e
+            except RecursionError as e:
+                if not _raised_by_decoder(e):
+                    raise
+                raise _too_deep(body_bytes) from e
 
     return extract
 
