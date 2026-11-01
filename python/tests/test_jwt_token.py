@@ -10,7 +10,9 @@ from datetime import UTC, datetime, timedelta, timezone
 import jwt as pyjwt
 import pytest
 
-from django_bolt.auth import Token
+from django_bolt import BoltAPI
+from django_bolt.auth import JWTAuthentication, Requires, Token
+from django_bolt.testing import TestClient
 
 
 class TestTokenCreation:
@@ -574,10 +576,36 @@ class TestTokenCreateDefaults:
 
         assert token.aud == "my-api"
 
-    def test_staff_implies_admin(self):
-        assert Token.create(sub="user123", is_staff=True).is_admin is True
-        assert Token.create(sub="user123", is_admin=True).is_admin is True
-        assert Token.create(sub="user123", is_admin=True).is_staff is False
+    def test_admin_implies_staff(self):
+        """An admin is also staff. A staff user is not an admin."""
+        admin = Token.create(sub="user123", is_admin=True)
+        assert (admin.is_staff, admin.is_admin) == (True, True)
+        staff = Token.create(sub="user123", is_staff=True)
+        assert (staff.is_staff, staff.is_admin) == (True, False)
+        plain = Token.create(sub="user123")
+        assert (plain.is_staff, plain.is_admin) == (False, False)
+
+    def test_a_staff_token_does_not_pass_requires_is_admin(self):
+        """Requires("is_admin") refuses a staff token. Requires("is_staff") allows a staff token and an admin token."""
+        secret = "admin-implies-staff-secret"
+        api = BoltAPI()
+
+        @api.get("/admin-only", auth=[JWTAuthentication(secret=secret)], guards=[Requires("is_admin")])
+        async def admin_only():
+            return {"ok": True}
+
+        @api.get("/staff-only", auth=[JWTAuthentication(secret=secret)], guards=[Requires("is_staff")])
+        async def staff_only():
+            return {"ok": True}
+
+        staff = Token.create(sub="1", is_staff=True).encode(secret)
+        admin = Token.create(sub="1", is_admin=True).encode(secret)
+        with TestClient(api) as client:
+            assert client.get("/admin-only", headers={"Authorization": f"Bearer {staff}"}).status_code == 403
+            assert client.get("/admin-only", headers={"Authorization": f"Bearer {admin}"}).status_code == 200
+            # An admin is also staff.
+            assert client.get("/staff-only", headers={"Authorization": f"Bearer {admin}"}).status_code == 200
+            assert client.get("/staff-only", headers={"Authorization": f"Bearer {staff}"}).status_code == 200
 
 
 class TestTokenToDictClaims:

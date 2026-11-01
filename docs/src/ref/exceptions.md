@@ -201,7 +201,7 @@ When validation fails, Django-Bolt returns structured errors with these types:
 
 | Type | Description | Example Message |
 |------|-------------|-----------------|
-| `missing_field` | Required field not provided | `Object missing required field 'price'` |
+| `missing_field` | Required field not provided, at any depth | `Object missing required field 'price'` |
 | `validation_error` | Type mismatch or Meta constraint violation | `Expected 'int', got 'str'` |
 | `json_invalid` | Malformed JSON | `Invalid JSON at line 2, column 5` |
 | `value_error` | Custom `@field_validator` or `@model_validator` failure | `Invalid email format` |
@@ -214,10 +214,12 @@ The `loc` field indicates where the error occurred:
 |----------|--------|---------|
 | Request body | `["body", "field"]` | `["body", "email"]` |
 | Nested field | `["body", "user", "name"]` | `["body", "address", "city"]` |
-| Array item | `["body", 0, "field"]` | `["body", 0, "id"]` |
+| Array item | `["body", "0", "field"]` | `["body", "0", "id"]` |
 | Query param | `["query", "param"]` | `["query", "page"]` |
 | Path param | `["path", "param"]` | `["path", "user_id"]` |
 | Header | `["header", "name"]` | `["header", "authorization"]` |
+
+The `loc` of a `missing_field` error ends with the name of the missing field, also in a nested struct or in an array item. The `msg` names the field and has no path. The index of an array item in `loc` is a string, such as `"0"`.
 
 ### Example Validation Errors
 
@@ -235,6 +237,24 @@ The `loc` field indicates where the error occurred:
 }
 ```
 
+**Missing field in a nested struct:**
+
+For `User(name: str, address: Address)` and `Address(city: str, zip: str)`, the body `{"name": "Ada", "address": {"city": "Paris"}}` gives:
+
+```json
+{
+    "detail": [
+        {
+            "loc": ["body", "address", "zip"],
+            "msg": "Object missing required field `zip`",
+            "type": "missing_field"
+        }
+    ]
+}
+```
+
+For a list of `Address` items, `{"items": [{"city": "Paris"}]}` gives `"loc": ["body", "items", "0", "zip"]`.
+
 **Type mismatch:**
 
 ```json
@@ -242,7 +262,7 @@ The `loc` field indicates where the error occurred:
     "detail": [
         {
             "loc": ["body", "age"],
-            "msg": "Expected `int`, got `str` - at `$.age`",
+            "msg": "Expected `int`, got `str`",
             "type": "validation_error"
         }
     ]
