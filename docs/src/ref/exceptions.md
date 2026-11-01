@@ -214,12 +214,12 @@ The `loc` field indicates where the error occurred:
 |----------|--------|---------|
 | Request body | `["body", "field"]` | `["body", "email"]` |
 | Nested field | `["body", "user", "name"]` | `["body", "address", "city"]` |
-| Array item | `["body", 0, "field"]` | `["body", 0, "id"]` |
+| Array item | `["body", "0", "field"]` | `["body", "0", "id"]` |
 | Query param | `["query", "param"]` | `["query", "page"]` |
 | Path param | `["path", "param"]` | `["path", "user_id"]` |
 | Header | `["header", "name"]` | `["header", "authorization"]` |
 
-The `loc` of a `missing_field` error ends with the name of the missing field, also in a nested struct or in an array item. The `msg` names the field and has no path.
+The `loc` of a `missing_field` error ends with the name of the missing field, also in a nested struct or in an array item. The `msg` names the field and has no path. The index of an array item in `loc` is a string, such as `"0"`.
 
 ### Example Validation Errors
 
