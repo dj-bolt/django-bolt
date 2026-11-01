@@ -11,21 +11,25 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
-import uuid
+import subprocess
+import sys
+import textwrap
 from collections.abc import Iterator
-from datetime import datetime
-from decimal import Decimal
-from typing import Annotated, Any, Literal, NewType, TypeVar
+from pathlib import Path
+from typing import Any
 
 import attrs
 import msgspec
 import pytest
+from django.contrib.auth.models import User
 from hypothesis import given
 from hypothesis import strategies as st
 
+import django_bolt
 from django_bolt import BoltAPI, EventSourceResponse, ServerSentEvent, WebSocket, _json
 from django_bolt._core import find_serializer
-from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, annotation_excludes_serializer, classify
+from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, classify
+from django_bolt.exceptions import SerializationError
 from django_bolt.responses import JSON, Response
 from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.testing import TestClient, WebSocketTestClient
@@ -190,6 +194,62 @@ class Role(enum.Enum):
 @attrs.define
 class AttrsBox:
     inner: Any
+
+
+class CamelEnvelope(Serializer, rename="camel"):
+    """A Serializer with no write-only field of its own, so its dump() uses msgspec directly.
+
+    Nothing checks the type of ``data``, so it can hold a Serializer too.
+    """
+
+    request_id: str
+    data: int
+
+
+class TaggedPublic(Serializer, tag=True):
+    id: int
+
+
+class OmitDefaults(Serializer, omit_defaults=True):
+    """msgspec leaves out a default value, and dump() keeps it."""
+
+    id: int
+    note: str = "n"
+
+
+class ArrayLike(Serializer, array_like=True):
+    """msgspec encodes a JSON array, and dump() gives a dict."""
+
+    id: int
+
+
+class OwnDump(Serializer):
+    """A dump() of its own gives the JSON, and its result can hold a Serializer."""
+
+    id: int
+
+    def dump(self, **kwargs: Any) -> Any:
+        return [self.id, account()]
+
+
+class Related(Serializer):
+    """dump() checks that a field of this type holds no QuerySet or manager."""
+
+    rows: Any
+
+
+class _IdentityEq(type):
+    """A metaclass with __eq__ and no __hash__, so its classes cannot be dict keys."""
+
+    def __eq__(cls, other):
+        return cls is other
+
+    __hash__ = None
+
+
+@dataclasses.dataclass
+class Unhashable(metaclass=_IdentityEq):
+    item: Any
 
 
 DUMPED = {"id": 1, "label": "user-1"}
@@ -365,6 +425,27 @@ def client():
     def untyped_enum_value():
         return {"role": Role.ADMIN}
 
+    @api.get("/untyped/serializer-with-rename")
+    def untyped_serializer_with_rename():
+        return {"envelope": CamelEnvelope(request_id="r", data=account())}
+
+    @api.get("/untyped/unhashable-type")
+    def untyped_unhashable_type():
+        return {"plain": Unhashable(item=1), "account": account()}
+
+    @api.get("/untyped/unhashable-type-holds-serializer")
+    def untyped_unhashable_type_holds_serializer():
+        return {"held": Unhashable(item=account())}
+
+    # A str or None annotation gets no response validator.
+    @api.get("/novalidator/str")
+    def novalidator_str() -> str:
+        return {"user": account()}
+
+    @api.get("/novalidator/none")
+    def novalidator_none() -> None:
+        return {"user": account()}
+
     @api.get("/untyped/attrs")
     def untyped_attrs():
         return [AttrsBox(inner=1), AttrsBox(inner=account())]
@@ -524,6 +605,139 @@ def test_a_serializer_as_the_value_of_an_enum_member_gives_its_dump(client):
     assert json.loads(_json.encode({"role": Role.ADMIN}, serializer=str)) == {"role": DUMPED}
 
 
+def test_a_serializer_in_a_serializer_with_rename_gives_its_dump(client):
+    """The outer Serializer encodes as its dump(), so the scan reads its fields as a Struct."""
+    _check(client.get("/untyped/serializer-with-rename"), {"envelope": {"requestId": "r", "data": DUMPED}})
+
+
+def test_a_type_that_cannot_be_a_dict_key_still_encodes(client):
+    _check(client.get("/untyped/unhashable-type"), {"plain": {"item": 1}, "account": DUMPED})
+
+
+def test_a_type_that_cannot_be_a_dict_key_and_holds_a_serializer_fails_closed(client):
+    """copy.copy hashes the class, so the dump cannot copy the object: a 500, with no secret."""
+    response = client.get("/untyped/unhashable-type-holds-serializer")
+    assert response.status_code == 500
+    assert SECRET not in response.text
+
+
+@pytest.mark.parametrize("path", ["/novalidator/str", "/novalidator/none"])
+def test_a_route_with_no_response_validator_dumps_each_serializer(client, path):
+    _check(client.get(path), {"user": DUMPED})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Public(id=1), CamelEnvelope(request_id="r", data=[1, "x"]), TaggedPublic(id=1), OmitDefaults(id=1), ArrayLike(id=1)],
+    ids=lambda value: type(value).__name__,
+)
+def test_a_serializer_with_no_serializer_inside_encodes_as_its_dump(value):
+    assert _json.encode(value) == _json._ENCODER.encode(value.dump())
+
+
+def test_a_serializer_with_its_own_dump_gives_that_dump_with_each_serializer_dumped():
+    assert json.loads(_json.encode({"value": OwnDump(id=1)})) == {"value": [1, DUMPED]}
+
+
+def test_a_serializer_that_holds_a_queryset_fails_as_its_dump_fails():
+    with pytest.raises(SerializationError, match="from_model"):
+        _json.encode({"value": Related(rows=User.objects.none())})
+
+
+_PACKAGE_ROOT = str(Path(django_bolt.__file__).resolve().parents[1])
+
+
+def _run_in_subprocess(code: str) -> subprocess.CompletedProcess:
+    """Run ``code`` in a new interpreter, so that a crash or a large allocation stays out of this process."""
+    prelude = textwrap.dedent(
+        f"""
+        import sys
+        sys.path.insert(0, {_PACKAGE_ROOT!r})
+        import django
+        from django.conf import settings
+        settings.configure(INSTALLED_APPS=["django_bolt"], SECRET_KEY="x" * 40)
+        django.setup()
+        """
+    )
+    return subprocess.run(
+        [sys.executable, "-c", prelude + textwrap.dedent(code)], capture_output=True, text=True, timeout=300
+    )
+
+
+def test_a_type_equal_to_another_type_does_not_take_its_field_offsets():
+    """Two distinct types can compare equal. The scan must not read one type with the offsets of the other."""
+    result = _run_in_subprocess(
+        """
+        from typing import Any
+        import msgspec
+        from django_bolt import _json
+        from django_bolt.serializers import Serializer, field
+
+        class Account(Serializer):
+            id: int
+            password: str = field(write_only=True)
+
+        class EqualByName(msgspec.StructMeta):
+            def __eq__(cls, other):
+                return isinstance(other, type) and cls.__name__ == other.__name__
+
+            def __hash__(cls):
+                return hash(cls.__name__)
+
+        def make(count):
+            namespace = {"__annotations__": {f"f{i}": Any for i in range(count)}}
+            namespace.update({f"f{i}": None for i in range(count)})
+            return EqualByName("Row", (msgspec.Struct,), namespace)
+
+        small, big = make(1), make(64)
+        _json.encode([big()])
+        rows = [small() for _ in range(50000)]
+        rows.append(small(f0=Account(id=1, password="s3cret-value")))
+        body = _json.encode(rows)
+        print("leak" if b"s3cret-value" in body else "clean", body.endswith(b'{"f0":{"id":1}}]'))
+        """
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.split() == ["clean", "True"]
+
+
+def test_a_deep_value_next_to_a_serializer_encodes():
+    """The dump goes only into the items that hold a Serializer, so a deep plain item needs no Python recursion."""
+    deep: list[Any] = []
+    for _ in range(2000):
+        deep = [deep]
+    encoded = json.loads(_json.encode({"account": account(), "data": deep}))
+    assert encoded["account"] == DUMPED
+    assert SECRET not in json.dumps(encoded["account"])
+
+
+def test_a_cyclic_value_fails_without_a_large_scan():
+    """msgspec fails at once on a cycle. The scan must not first fill memory in proportion to the fan-out."""
+    result = _run_in_subprocess(
+        """
+        import resource
+        from django_bolt import _json
+        from django_bolt.serializers import Serializer
+
+        class Account(Serializer):
+            id: int
+
+        parent = {"children": []}
+        parent["children"].extend({"id": index, "parent": parent} for index in range(3000))
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        try:
+            _json.encode(parent)
+        except RecursionError:
+            print("RecursionError")
+        print((resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) // 1024)
+        """
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    error, growth_mb = result.stdout.split()
+    assert error == "RecursionError"
+    assert int(growth_mb) < 64
+
+
 def test_a_serializer_in_an_attrs_field_gives_its_dump(client):
     _check(client.get("/untyped/attrs"), [{"inner": 1}, {"inner": DUMPED}])
 
@@ -668,31 +882,6 @@ def test_a_deeply_nested_response_fails_as_before():
         _check(test_client.get("/ok"), {"account": DUMPED})
 
 
-class Color(enum.Enum):
-    RED = "red"
-
-
-@pytest.mark.parametrize(
-    "annotation",
-    [int, str, type(None), int | None, list[int], dict[str, int], tuple[int, ...], Literal["a"]]
-    + [Annotated[int, "doc"], Color, datetime, uuid.UUID, Decimal],
-    ids=repr,
-)
-def test_a_leaf_annotation_cannot_hold_a_serializer(annotation):
-    assert annotation_excludes_serializer(annotation)
-
-
-@pytest.mark.parametrize(
-    "annotation",
-    [Any, dict, list, object, UserOut, Account, list[UserOut], dict[str, Any], int | UserOut, Page[int], Role]
-    + [TypeVar("T"), NewType("UserId", int)],
-    ids=repr,
-)
-def test_a_class_or_an_open_annotation_can_hold_a_serializer(annotation):
-    """Nothing checks the fields of a Struct, so a Struct type is not a leaf, also with leaf arguments."""
-    assert not annotation_excludes_serializer(annotation)
-
-
 def _reference(value: Any) -> Any:
     """Convert ``value`` the plain way: each Serializer gives its dump()."""
     if isinstance(value, Serializer):
@@ -711,8 +900,12 @@ def _reference(value: Any) -> Any:
 
 
 def _holds_serializer(value: Any) -> bool:
-    if isinstance(value, Serializer):
+    """Return whether ``value`` holds a Serializer whose dump() differs from the encoding of msgspec."""
+    if isinstance(value, Account):
         return True
+    if isinstance(value, Public):
+        # Public has no write-only or computed field, so the scan reads it as a Struct.
+        return False
     if isinstance(value, dict):
         return any(_holds_serializer(item) for item in value.values())
     if isinstance(value, (list, tuple)):

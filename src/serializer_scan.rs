@@ -5,7 +5,7 @@
 //! scans the value first. It calls the Python dump only when the scan finds a
 //! Serializer, so a value with no Serializer costs one native pass.
 
-use pyo3::exceptions::PyAttributeError;
+use pyo3::exceptions::{PyAttributeError, PyRecursionError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{
@@ -13,11 +13,16 @@ use pyo3::types::{
     PyTuple,
 };
 
-/// The deepest level that the scan visits. At this level the scan answers
-/// true, and the Python walk then meets the recursion limit, as msgspec does.
-/// The scan keeps its own stack, so a deep or cyclic value cannot overflow
-/// the thread stack.
+/// The deepest level that the scan visits. At this level the scan raises
+/// RecursionError, as msgspec does for such a value. The scan keeps its own
+/// stack, so a deep or cyclic value cannot overflow the thread stack.
 const MAX_DEPTH: usize = 10_000;
+
+/// The stack length from which the scan visits each object only once. Only
+/// a cycle or a shared object comes back, and it holds the same values. A
+/// cycle with a large fan-out thus stops before it fills the memory. A
+/// smaller value pays nothing for the check.
+const DEDUP_STACK: usize = 100_000;
 
 /// A value of an exact builtin type that cannot hold a Serializer.
 #[inline]
@@ -60,13 +65,50 @@ fn is_scalar_subclass(value: &Bound<'_, PyAny>) -> bool {
 /// The number of leaf types that one scan keeps.
 const LEAF_TYPES: usize = 8;
 
+/// A hasher for object addresses. An address is already unique, so one
+/// multiply spreads it over the bits that the hash table reads.
+#[derive(Default)]
+struct AddressHasher(u64);
+
+impl std::hash::Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.0 = (value as u64 >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+type AddressSet = std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHasher>>;
+
 /// The slot offsets of the fields of a type, which `find_serializer` keeps
 /// in its `offsets` dict. The scan reads each field at its offset with no
 /// attribute lookup.
+///
+/// The dict compares its keys with `__eq__`, and a metaclass can make two
+/// distinct types equal. Thus the entry records its type, and the scan uses
+/// the offsets only for that exact type.
 #[pyclass(frozen)]
 pub struct FieldOffsets {
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
     offsets: Box<[ffi::Py_ssize_t]>,
+    #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
+    owner: usize,
+}
+
+impl FieldOffsets {
+    /// Return the offsets if this entry belongs to `item_type`.
+    #[cfg(not(Py_GIL_DISABLED))]
+    fn for_type(&self, item_type: *mut ffi::PyTypeObject) -> Option<&[ffi::Py_ssize_t]> {
+        (self.owner == item_type as usize).then_some(&self.offsets)
+    }
 }
 
 /// The layout of a member descriptor (`PyMemberDescrObject`) in CPython 3.12
@@ -174,6 +216,13 @@ struct Scan<'a, 'py> {
     /// Whether the scan can read lists and member descriptors in place.
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
     layouts: bool,
+    /// Whether the stack reached `DEDUP_STACK` in this scan.
+    dedup: bool,
+    /// From then on, the addresses of the objects that the scan visited, with
+    /// a strong reference to each, so that no other object can take an
+    /// address during the scan.
+    seen: AddressSet,
+    seen_refs: Vec<Bound<'py, PyAny>>,
 }
 
 impl<'a, 'py> Scan<'a, 'py> {
@@ -318,12 +367,16 @@ impl<'a, 'py> Scan<'a, 'py> {
         let Ok(cached) = cached.cast::<FieldOffsets>() else {
             return false;
         };
-        if generic_only && !uses_generic_getattr(item_type.as_ptr().cast()) {
+        let type_ptr: *mut ffi::PyTypeObject = item_type.as_ptr().cast();
+        let Some(offsets) = cached.get().for_type(type_ptr) else {
+            return false;
+        };
+        if generic_only && !uses_generic_getattr(type_ptr) {
             return false;
         }
-        self.set_struct_type(item_type.as_ptr().cast());
         self.struct_offsets.clear();
-        self.struct_offsets.extend_from_slice(&cached.get().offsets);
+        self.struct_offsets.extend_from_slice(offsets);
+        self.set_struct_type(type_ptr);
         true
     }
 
@@ -442,14 +495,21 @@ impl<'a, 'py> Scan<'a, 'py> {
             return Ok(None);
         };
         let item_type = item.get_type();
-        if let Some(cached) = cache.get_item(&item_type)? {
-            if generic_only && !uses_generic_getattr(item_type.as_type_ptr()) {
+        let type_ptr = item_type.as_type_ptr();
+        let cached = match cache.get_item(&item_type) {
+            Ok(cached) => cached,
+            // A type whose metaclass has __eq__ and no __hash__ cannot be a key.
+            Err(err) if err.is_instance_of::<PyTypeError>(item.py()) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        if let Some(cached) = cached {
+            if generic_only && !uses_generic_getattr(type_ptr) {
                 return Ok(None);
             }
             return Ok(cached
                 .cast::<FieldOffsets>()
                 .ok()
-                .map(|cached| cached.get().offsets.to_vec()));
+                .and_then(|cached| cached.get().for_type(type_ptr).map(<[_]>::to_vec)));
         }
         let offsets = if self.layouts {
             read_field_offsets(item, names, generic_only)?
@@ -461,6 +521,7 @@ impl<'a, 'py> Scan<'a, 'py> {
                 Some(offsets) => {
                     let cached = FieldOffsets {
                         offsets: offsets.clone().into_boxed_slice(),
+                        owner: type_ptr as usize,
                     };
                     cache.set_item(&item_type, Py::new(item.py(), cached)?)?;
                 }
@@ -621,9 +682,15 @@ impl<'a, 'py> Scan<'a, 'py> {
             self.add_leaf_type(item_type.as_type_ptr());
             return Ok(false);
         }
-        let kind = match self.kinds.get_item(&item_type)? {
-            Some(kind) => kind,
-            None => self.classify.call1((&item_type,))?,
+        let kind = match self.kinds.get_item(&item_type) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => self.classify.call1((&item_type,))?,
+            // A type whose metaclass has __eq__ and no __hash__ cannot be a
+            // key, so it gets its kind each time.
+            Err(err) if err.is_instance_of::<PyTypeError>(item.py()) => {
+                self.classify.call1((&item_type,))?
+            }
+            Err(err) => return Err(err),
         };
         if kind.is_none() {
             self.add_leaf_type(item_type.as_type_ptr());
@@ -808,14 +875,33 @@ pub fn find_serializer<'py>(
         layouts: layouts_known(value.py()),
         #[cfg(Py_GIL_DISABLED)]
         layouts: false,
+        dedup: false,
+        seen: AddressSet::default(),
+        seen_refs: Vec::new(),
     };
     if scan.visit(value, 1)? {
         return Ok(true);
     }
     while let Some((item, depth)) = scan.stack.pop() {
-        if depth >= MAX_DEPTH || scan.visit(&item, depth + 1)? {
+        if depth >= MAX_DEPTH {
+            return Err(PyRecursionError::new_err(
+                "maximum recursion depth exceeded while scanning the response for a Serializer",
+            ));
+        }
+        if !scan.dedup && scan.stack.len() < DEDUP_STACK {
+            if scan.visit(&item, depth + 1)? {
+                return Ok(true);
+            }
+            continue;
+        }
+        scan.dedup = true;
+        if !scan.seen.insert(item.as_ptr() as usize) {
+            continue;
+        }
+        if scan.visit(&item, depth + 1)? {
             return Ok(true);
         }
+        scan.seen_refs.push(item);
     }
     Ok(false)
 }
@@ -1232,6 +1318,91 @@ KINDS[Shadowed] = ('inner', 'tag')
     }
 
     #[test]
+    fn a_type_equal_to_another_type_does_not_take_its_offsets() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = fixtures(py);
+            // The offsets dict compares types with __eq__. These two types are
+            // equal, and the small one must not be read with the offsets of the
+            // big one.
+            let code = c"
+class EqualByName(type):
+    def __eq__(cls, other):
+        return isinstance(other, type) and cls.__name__ == other.__name__
+    def __hash__(cls):
+        return hash(cls.__name__)
+
+def make(count):
+    names = tuple(f'f{index}' for index in range(count))
+    def init(self, *values):
+        for name, value in zip(names, values):
+            setattr(self, name, value)
+    return EqualByName('Row', (), {'__slots__': names, '__init__': init})
+
+Small = make(1)
+Big = make(16)
+KINDS[Small] = ('f0',)
+KINDS[Big] = tuple(f'f{index}' for index in range(16))
+";
+            py.run(code, Some(&module.dict()), None).unwrap();
+            let offsets = PyDict::new(py);
+            let big = eval(&module, "[Big(*range(16))]");
+            assert!(!scan_with_offsets(&module, &big, &offsets).unwrap());
+            let small = eval(
+                &module,
+                "[Small(1) for _ in range(1000)] + [Small(Secret())]",
+            );
+            assert!(scan_with_offsets(&module, &small, &offsets).unwrap());
+            let plain = eval(&module, "[Small(1) for _ in range(1000)]");
+            assert!(!scan_with_offsets(&module, &plain, &offsets).unwrap());
+        });
+    }
+
+    #[test]
+    fn a_type_that_cannot_be_a_dict_key_gets_its_kind_each_time() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = fixtures(py);
+            let code = c"
+class IdentityEq(type):
+    def __eq__(cls, other):
+        return cls is other
+    __hash__ = None
+
+class Box(metaclass=IdentityEq):
+    __slots__ = ('inner',)
+    def __init__(self, inner):
+        self.inner = inner
+
+def classify_box(tp):
+    calls.append(tp)
+    return ('inner',) if tp is Box else classify(tp)
+";
+            py.run(code, Some(&module.dict()), None).unwrap();
+            let kinds = module
+                .getattr("kinds")
+                .unwrap()
+                .call0()
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            let classify = module.getattr("classify_box").unwrap();
+            let offsets = PyDict::new(py);
+            for (expr, found) in [
+                ("[Box(1), Box(2)]", false),
+                ("[Box(1), Box(Secret())]", true),
+            ] {
+                let value = eval(&module, expr);
+                assert_eq!(
+                    find_serializer(&value, &kinds, &classify, Some(&offsets)).unwrap(),
+                    found,
+                    "{expr}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn a_classify_error_reaches_the_caller() {
         Python::initialize();
         Python::attach(|py| {
@@ -1245,7 +1416,7 @@ KINDS[Shadowed] = ('inner', 'tag')
     }
 
     #[test]
-    fn a_value_deeper_than_the_limit_counts_as_found() {
+    fn a_value_deeper_than_the_limit_raises_recursion_error() {
         Python::initialize();
         Python::attach(|py| {
             let module = fixtures(py);
@@ -1253,9 +1424,27 @@ KINDS[Shadowed] = ('inner', 'tag')
             for _ in 0..MAX_DEPTH {
                 deep = PyList::new(py, [deep]).unwrap().into_any();
             }
-            assert!(scan(&module, &deep).unwrap());
+            let is_recursion_error = |err: PyErr| err.is_instance_of::<PyRecursionError>(py);
+            assert!(is_recursion_error(scan(&module, &deep).unwrap_err()));
+            // A cycle with a small fan-out reaches the depth limit.
             let cyclic = eval(&module, "(lambda a: (a.append(a), a)[1])([])");
-            assert!(scan(&module, &cyclic).unwrap());
+            assert!(is_recursion_error(scan(&module, &cyclic).unwrap_err()));
+            let cyclic_with_secret = eval(
+                &module,
+                "(lambda a: (a.append(a), a.append(Secret()), a)[2])([])",
+            );
+            assert!(scan(&module, &cyclic_with_secret).unwrap());
+            // A cycle with a large fan-out fills the stack first. From
+            // DEDUP_STACK the scan visits each object once, so it ends.
+            let code = c"
+parent = {'children': []}
+parent['children'].extend({'id': index, 'parent': parent} for index in range(2000))
+parent_with_secret = {'children': [], 'secret': [Secret()]}
+parent_with_secret['children'].extend({'id': index, 'parent': parent_with_secret} for index in range(2000))
+";
+            py.run(code, Some(&module.dict()), None).unwrap();
+            assert!(!scan(&module, &eval(&module, "parent")).unwrap());
+            assert!(scan(&module, &eval(&module, "parent_with_secret")).unwrap());
 
             let mut shallow = PyList::empty(py).into_any();
             for _ in 0..MAX_DEPTH - 1 {

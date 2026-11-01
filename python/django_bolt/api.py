@@ -28,6 +28,7 @@ from django.core.handlers.asgi import ASGIHandler
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
 
+from . import _json
 from ._kwargs import (
     compile_argument_injector,
     compile_binder,
@@ -96,7 +97,6 @@ from .serialization import (
     _infer_wire_response_type,
     _wire_bytes,
     compile_response_handlers,
-    response_encoder,
     serialize_json_data,
     serialize_json_data_sync,
     serialize_response,
@@ -184,7 +184,7 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
     A dict result skips the serializer when the route validates no response.
     A QuerySet result loads on the ORM pool, through ``_sync_finisher``.
     """
-    encoder = response_encoder(meta)
+    encoder = _json.RESPONSE_ENCODER
     finish = _sync_finisher(meta, defer)
 
     if meta["_has_response_validation"]:
@@ -2199,7 +2199,7 @@ class BoltAPI:
             if not has_response_validation:
                 # A route whose response type cannot hold a Serializer binds the
                 # msgspec encoder directly. Each other route dumps its Serializers.
-                _encoder = response_encoder(meta)
+                _encoder = _json.RESPONSE_ENCODER
                 _meta_json = _RESPONSE_META_JSON
 
                 # Pre-compute at registration time whether _convert_serializers can be
@@ -2371,7 +2371,7 @@ class BoltAPI:
             # uniformly.
             _inline_spec = meta.get("_inline_response_validator")
             if _inline_spec is not None:
-                _encoder = response_encoder(meta)
+                _encoder = _json.RESPONSE_ENCODER
                 _meta_json = _RESPONSE_META_JSON
                 _inline_kind, _inline_match = _inline_spec
                 # A mutant of a marked line in the inline fast path only sends the
@@ -2584,7 +2584,7 @@ class BoltAPI:
             _is_no_params_sync = meta.get("handler_pattern") is HandlerPattern.NO_PARAMS  # pragma: no mutate
 
             if not has_response_validation:
-                _encoder = response_encoder(meta)
+                _encoder = _json.RESPONSE_ENCODER
                 _meta_json = _RESPONSE_META_JSON
 
                 # The variants without the conversion only skip a no-op call. A mutant
@@ -2702,7 +2702,7 @@ class BoltAPI:
             # Sync-handler inline-encoding fast path (mirrors async branch above).
             _inline_spec = meta.get("_inline_response_validator")
             if _inline_spec is not None:
-                _encoder = response_encoder(meta)
+                _encoder = _json.RESPONSE_ENCODER
                 _meta_json = _RESPONSE_META_JSON
                 _inline_kind, _inline_match = _inline_spec
                 # A mutant of a marked line in the inline fast path only sends the

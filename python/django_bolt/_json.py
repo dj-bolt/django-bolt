@@ -92,9 +92,9 @@ _DECODER = msgspec.json.Decoder()
 
 
 class ResponseEncoder:
-    """Hold the JSON encode function of a group of routes.
+    """Hold the JSON encode function of the routes.
 
-    A route binds a holder when it registers and calls ``holder.encode``.
+    A route binds the holder when it registers and calls ``holder.encode``.
     The function changes once, when the first Serializer subclass appears.
     """
 
@@ -104,10 +104,8 @@ class ResponseEncoder:
         self.encode = encode
 
 
-# For a route whose response type cannot hold a Serializer.
-PLAIN_ENCODER = ResponseEncoder(_ENCODER.encode)
-# For each other route, and for encode(). Before the first Serializer
-# subclass, no value can hold a Serializer, so this holder does not scan.
+# For each route, and for encode(). Before the first Serializer subclass, no
+# value can hold a Serializer, so this holder does not scan.
 RESPONSE_ENCODER = ResponseEncoder(_ENCODER.encode)
 _SCANNING_ENCODER = SerializerScanEncoder(_ENCODER.encode, SCAN_KINDS, classify, dump_serializers, SCAN_OFFSETS)
 
