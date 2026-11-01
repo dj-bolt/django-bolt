@@ -76,6 +76,7 @@ fn has_fields(item_type: &Bound<'_, PyAny>) -> PyResult<bool> {
 ///
 /// A metaclass can override these attributes for its classes. The getset
 /// descriptors of `type` read the fields of the type object instead.
+#[cfg(not(Py_GIL_DISABLED))]
 fn type_getset<'py>(
     py: Python<'py>,
     cell: &'static pyo3::sync::PyOnceLock<Py<PyAny>>,
@@ -92,6 +93,7 @@ fn type_getset<'py>(
 
 /// Return the attribute `name` of `item_type` as the type lookup finds it
 /// in the dicts of its MRO, or None. A metaclass cannot change the result.
+#[cfg(not(Py_GIL_DISABLED))]
 fn type_lookup<'py>(
     item_type: &Bound<'py, PyType>,
     name: &Bound<'py, PyString>,
@@ -133,13 +135,9 @@ fn astuple(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
         .map(|function| function.bind(py))
 }
 
-/// Return the `__dict__` of `item` if its type uses the attribute lookup of
-/// `object` and the object has a dict. msgspec reads a dataclass field from
-/// this dict first.
+/// Return the `__dict__` of `item`, or None if it has no dict. msgspec reads
+/// a dataclass field from this dict first.
 fn instance_dict<'py>(item: &Bound<'py, PyAny>) -> Option<Bound<'py, PyDict>> {
-    if !uses_generic_getattr(item.get_type().as_type_ptr()) {
-        return None;
-    }
     // SAFETY: `item` is a live object. The call gives a new reference or null.
     let dict = unsafe {
         Bound::from_owned_ptr_or_err(
@@ -316,6 +314,9 @@ struct Scan<'a, 'py> {
     /// address during the scan.
     seen: AddressSet,
     seen_refs: Vec<Bound<'py, PyAny>>,
+    /// For each dataclass or attrs type in this scan, whether msgspec reads
+    /// its fields from `__dict__` first. The reference keeps the type alive.
+    dict_first: Vec<(Bound<'py, PyType>, bool)>,
 }
 
 impl<'a, 'py> Scan<'a, 'py> {
@@ -763,6 +764,24 @@ impl<'a, 'py> Scan<'a, 'py> {
         true
     }
 
+    /// `reads_dict_first` for `item_type`, once per type in this scan. The
+    /// type of an object can change between scans, so the rule does not stay.
+    fn reads_dict_first(
+        &mut self,
+        item_type: &Bound<'py, PyType>,
+        names: &Bound<'py, PyTuple>,
+    ) -> PyResult<bool> {
+        if let Some((_, dict_first)) = self.dict_first.iter().find(|(seen, _)| seen.is(item_type)) {
+            return Ok(*dict_first);
+        }
+        let dict_first = reads_dict_first(item_type, names)?;
+        // A value with many dataclass types gets the rule each time past this many.
+        if self.dict_first.len() < LEAF_TYPES * 8 {
+            self.dict_first.push((item_type.clone(), dict_first));
+        }
+        Ok(dict_first)
+    }
+
     /// Put the children of `item` on the stack at `depth`. Return true if
     /// `item` is a Serializer.
     fn visit(&mut self, item: &Bound<'py, PyAny>, depth: usize) -> PyResult<bool> {
@@ -823,13 +842,20 @@ impl<'a, 'py> Scan<'a, 'py> {
         // msgspec reads a field of a dataclass or an attrs class from the
         // `__dict__` of the object first, if the type uses the lookup of
         // `object`. Otherwise it uses `getattr`.
-        let dict = if slots { None } else { instance_dict(item) };
+        let dict = if !slots
+            && uses_generic_getattr(item_type.as_type_ptr())
+            && self.reads_dict_first(&item_type, names)?
+        {
+            instance_dict(item)
+        } else {
+            None
+        };
         for name in names.iter() {
             let name = name.cast::<PyString>()?;
             let child = match &dict {
                 Some(dict) => match dict.get_item(name)? {
                     Some(child) => Ok(child),
-                    None => slot_value(item, name),
+                    None => descriptor_value(item, name),
                 },
                 None if slots => generic_getattr(item, name),
                 None => item.getattr(name),
@@ -874,23 +900,51 @@ fn generic_getattr<'py>(
     }
 }
 
-/// Read the field `name` of an object with a `__dict__` that does not hold
-/// it. msgspec reads such a field only from a slot, so the type must have a
-/// member descriptor for it. Otherwise the result is an AttributeError, and
-/// the field is skipped.
-fn slot_value<'py>(
+/// Read the field `name` of an object whose `__dict__` does not hold it.
+///
+/// msgspec then reads the attribute of the type only if it is a descriptor,
+/// such as a slot or a property. It skips a plain default value. Otherwise
+/// the result is an AttributeError, and the caller skips the field.
+fn descriptor_value<'py>(
     item: &Bound<'py, PyAny>,
     name: &Bound<'py, PyString>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let py = item.py();
-    match type_lookup(&item.get_type(), name)? {
-        Some(descriptor)
-            if descriptor.get_type().as_type_ptr() == &raw mut ffi::PyMemberDescr_Type =>
-        {
-            descriptor.call_method1(pyo3::intern!(py, "__get__"), (item, item.get_type()))
-        }
-        _ => Err(PyAttributeError::new_err(name.clone().unbind())),
+    let item_type = item.get_type();
+    let attribute = item_type.getattr(name)?;
+    if descriptor_slot(&attribute, ffi::Py_tp_descr_get).is_null() {
+        return Err(PyAttributeError::new_err(name.clone().unbind()));
     }
+    attribute.call_method1(pyo3::intern!(item.py(), "__get__"), (item, item_type))
+}
+
+/// The slot `slot` of the type of `attribute`, for example `tp_descr_set`.
+fn descriptor_slot(attribute: &Bound<'_, PyAny>, slot: std::ffi::c_int) -> *mut std::ffi::c_void {
+    // SAFETY: the type of a live object is alive, and the slot read runs no Python code.
+    unsafe { ffi::PyType_GetSlot(attribute.get_type().as_type_ptr(), slot) }
+}
+
+/// Whether msgspec reads the fields `names` of an instance of `item_type`
+/// from its `__dict__` first, where `getattr` would give another value.
+///
+/// For a type with the attribute lookup of `object`, only a data descriptor
+/// on the type, such as a property or a slot, comes before the dict for
+/// `getattr`. A plain class attribute is a default value: `getattr` gives it,
+/// msgspec skips it, and it holds no Serializer, as a dataclass forbids a
+/// default that cannot be hashed.
+fn reads_dict_first(item_type: &Bound<'_, PyType>, names: &Bound<'_, PyTuple>) -> PyResult<bool> {
+    let py = item_type.py();
+    for name in names.iter() {
+        match item_type.getattr(name.cast::<PyString>()?) {
+            Ok(attribute) => {
+                if !descriptor_slot(&attribute, ffi::Py_tp_descr_set).is_null() {
+                    return Ok(true);
+                }
+            }
+            Err(err) if err.is_instance_of::<PyAttributeError>(py) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(false)
 }
 
 /// The maximum number of types in an `offsets` cache, as for the kinds.
@@ -1025,6 +1079,7 @@ pub fn find_serializer<'py>(
         dedup: false,
         seen: AddressSet::default(),
         seen_refs: Vec::new(),
+        dict_first: Vec::new(),
     };
     if scan.visit(value, 1)? {
         return Ok(true);

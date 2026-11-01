@@ -1468,6 +1468,18 @@ def _property_owner_box() -> PropertyOwnerBox:
     return box
 
 
+@dataclasses.dataclass(slots=True)
+class SlotOwner:
+    owner: Any = None
+
+
+@dataclasses.dataclass
+class SlotOwnerWithDict(SlotOwner):
+    """Its instances have a __dict__ for ``note``, and ``owner`` stays in the slot of the base."""
+
+    note: int = 1
+
+
 def _label(label_type: type) -> Any:
     label = label_type("text")
     label.owner = account()
@@ -1486,8 +1498,9 @@ def _admin_role() -> LabelRole:
         (lambda: [_label(AttrsLabelWithOwner)], [{"owner": DUMPED}]),
         (lambda: [_admin_role()], [{"owner": DUMPED}]),
         (lambda: [_property_owner_box()], [{"owner": DUMPED}]),
+        (lambda: [SlotOwnerWithDict(owner=account())], [{"owner": DUMPED, "note": 1}]),
     ],
-    ids=["str-dataclass", "str-attrs", "enum-of-str-dataclass", "dataclass-field-behind-a-property"],
+    ids=["str-dataclass", "str-attrs", "enum-of-str-dataclass", "dataclass-field-behind-a-property", "slot-and-dict"],
 )
 def test_a_field_that_msgspec_encodes_gives_the_dump_of_its_serializer(make, expected):
     """The scan and the dump read each field where msgspec reads it."""

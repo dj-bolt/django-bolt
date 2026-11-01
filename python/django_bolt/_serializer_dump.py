@@ -28,7 +28,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 import itertools
-import types
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -211,30 +210,39 @@ def _items(value: list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]) -> An
     return iter(value)
 
 
-_TYPE_MRO = type.__dict__["__mro__"]
-_TYPE_DICT = type.__dict__["__dict__"]
+# For each dataclass or attrs type, by id: (the type, whether msgspec reads its fields from __dict__ first).
+# The entry keeps the type alive, so no other type can take its id.
+_DICT_FIRST: dict[int, tuple[type, bool]] = {}
 
 
-def _type_lookup(tp: type, name: str) -> Any:
-    """Return the attribute ``name`` of ``tp`` from the dicts of its MRO, or ``_MISSING``.
+def _reads_dict_first(cls: type, names: tuple[str, ...]) -> bool:
+    """Return whether msgspec reads the fields ``names`` from ``__dict__`` first, where getattr gives another value.
 
-    The getsets of ``type`` give the real MRO and dicts: a metaclass can override ``__mro__``.
+    Only a data descriptor on the type, such as a property or a slot, comes
+    before the dict for getattr. A plain class attribute is a default: getattr
+    gives it, msgspec skips it, and a dataclass default holds no Serializer.
     """
-    for base in _TYPE_MRO.__get__(tp):
-        namespace = _TYPE_DICT.__get__(base)
-        if name in namespace:
-            return namespace[name]
-    return _MISSING
+    entry = _DICT_FIRST.get(id(cls))
+    if entry is not None and entry[0] is cls:
+        return entry[1]
+    dict_first = cls.__getattribute__ is object.__getattribute__ and any(
+        hasattr(type(attribute), "__set__")
+        for attribute in (getattr(cls, name, None) for name in names)
+        if attribute is not None
+    )
+    if len(_DICT_FIRST) < _SCAN_KINDS_LIMIT:
+        _DICT_FIRST[id(cls)] = (cls, dict_first)
+    return dict_first
 
 
-def _instance_dict(value: Any) -> dict[str, Any] | None:
+def _instance_dict(value: Any, names: tuple[str, ...]) -> dict[str, Any] | None:
     """Return the ``__dict__`` that msgspec reads the fields of ``value`` from, or None.
 
     msgspec reads a dataclass or an attrs field from the ``__dict__`` of the
-    object if the type uses the attribute lookup of ``object``. Otherwise it
-    uses ``getattr``.
+    object if the type uses the attribute lookup of ``object``. The result
+    differs from getattr only for a type in ``_reads_dict_first``.
     """
-    if value.__class__.__getattribute__ is not object.__getattribute__:
+    if not _reads_dict_first(value.__class__, names):
         return None
     try:
         return object.__getattribute__(value, "__dict__")
@@ -245,22 +253,20 @@ def _instance_dict(value: Any) -> dict[str, Any] | None:
 def _read_field(value: Any, name: str, instance_dict: dict[str, Any] | None) -> Any:
     """Return the field ``name`` of a dataclass or an attrs object as msgspec reads it, or ``_MISSING``.
 
-    With a dict, msgspec reads the dict first. A field that the dict does not
-    hold comes from its slot, if the type has one. Without a dict, msgspec
-    uses ``getattr``.
+    With a dict, msgspec reads the dict first. For a field that the dict does
+    not hold, it reads the attribute of the type only if that is a
+    descriptor, such as a slot or a property. Without a dict, msgspec uses
+    ``getattr``.
     """
-    if instance_dict is None:
-        try:
-            return getattr(value, name)
-        except AttributeError:
-            return _MISSING
-    if name in instance_dict:
-        return instance_dict[name]
-    descriptor = _type_lookup(value.__class__, name)
-    if type(descriptor) is not types.MemberDescriptorType:
-        return _MISSING
     try:
-        return descriptor.__get__(value, value.__class__)
+        if instance_dict is None:
+            return getattr(value, name)
+        if name in instance_dict:
+            return instance_dict[name]
+        cls = value.__class__
+        attribute = getattr(cls, name)
+        get = getattr(type(attribute), "__get__", None)
+        return _MISSING if get is None else get(attribute, value, cls)
     except AttributeError:
         return _MISSING
 
@@ -272,7 +278,9 @@ def _write_field(clone: Any, name: str, new_item: Any, instance_dict: dict[str, 
     elif name in instance_dict:
         instance_dict[name] = new_item
     else:
-        _type_lookup(clone.__class__, name).__set__(clone, new_item)
+        # The descriptor that gave the value, such as a slot. A descriptor with no setter raises.
+        attribute = getattr(clone.__class__, name)
+        type(attribute).__set__(attribute, clone, new_item)
 
 
 def _dump(value: Any, depth: int) -> Any:
@@ -315,7 +323,7 @@ def _dump(value: Any, depth: int) -> Any:
         # as astuple does, also when a property now hides the field.
         fields = zip(kind, msgspec.structs.astuple(value), strict=True)
     else:
-        instance_dict = _instance_dict(value)
+        instance_dict = _instance_dict(value, kind)
         fields = ((name, _read_field(value, name, instance_dict)) for name in kind)
     changes = {}
     for name, item in fields:
@@ -342,7 +350,7 @@ def _dump(value: Any, depth: int) -> Any:
             f"{cls.__qualname__}.__copy__ returns the object itself. "
             "Bolt cannot dump the Serializer that it holds without a change to the object."
         )
-    clone_dict = _instance_dict(clone)
+    clone_dict = _instance_dict(clone, kind)
     for name, new_item in changes.items():
         # A field that does not give back the dumped value still holds the
         # Serializer for msgspec. dump_serializers then finds it and raises.
