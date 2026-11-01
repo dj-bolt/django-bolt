@@ -94,13 +94,19 @@ struct ListLayout {
 }
 
 /// Return whether this Python has the layouts of `ListLayout` and
-/// `MemberDescr`. The check runs once. The version must be 3.15 or older,
-/// and a sample list must read the same in place as through the C API.
+/// `MemberDescr`. The check runs once. The runtime must be CPython 3.15 or
+/// older, and a sample list must read the same in place as through the C API.
 #[cfg(not(Py_GIL_DISABLED))]
 fn layouts_known(py: Python<'_>) -> bool {
     static KNOWN: pyo3::sync::PyOnceLock<bool> = pyo3::sync::PyOnceLock::new();
     *KNOWN.get_or_init(py, || {
-        if py.version_info() >= (3, 16) {
+        let is_cpython = py
+            .import("sys")
+            .and_then(|sys| sys.getattr("implementation"))
+            .and_then(|implementation| implementation.getattr("name"))
+            .and_then(|name| name.extract::<String>())
+            .is_ok_and(|name| name == "cpython");
+        if !is_cpython || py.version_info() >= (3, 16) {
             return false;
         }
         let Ok(sample) = PyList::new(py, [1, 2, 3]) else {
@@ -117,6 +123,16 @@ fn layouts_known(py: Python<'_>) -> bool {
                 })
         }
     })
+}
+
+/// Return whether `item_type` uses the attribute lookup of `object`. msgspec
+/// reads a dataclass field with `getattr` when the class has a lookup of its
+/// own, so only such a class can have its slots read in place.
+#[cfg(not(Py_GIL_DISABLED))]
+fn uses_generic_getattr(item_type: *mut ffi::PyTypeObject) -> bool {
+    // SAFETY: `item_type` is a live type, and the slot read runs no Python code.
+    let getattro = unsafe { ffi::PyType_GetSlot(item_type, ffi::Py_tp_getattro) };
+    getattro == ffi::PyObject_GenericGetAttr as *mut std::ffi::c_void
 }
 
 /// What the scan does with a child.
@@ -240,7 +256,7 @@ impl<'a, 'py> Scan<'a, 'py> {
         #[cfg(not(Py_GIL_DISABLED))]
         if switch_struct
             && kind.is_instance_of::<PyTuple>()
-            && self.use_cached_offsets(&item_type_object)
+            && self.use_cached_offsets(&item_type_object, !kind.is_exact_instance_of::<PyTuple>())
         {
             return Want::Fields;
         }
@@ -289,8 +305,10 @@ impl<'a, 'py> Scan<'a, 'py> {
 
     /// Make `item_type` the `struct_type` if the `offsets` cache holds its
     /// offsets. `visit` fills the cache from the first instance of a type.
+    /// With `generic_only`, the type must still use the attribute lookup of
+    /// `object`: an app can give a class its own lookup after a scan.
     #[cfg(not(Py_GIL_DISABLED))]
-    fn use_cached_offsets(&mut self, item_type: &Bound<'py, PyAny>) -> bool {
+    fn use_cached_offsets(&mut self, item_type: &Bound<'py, PyAny>, generic_only: bool) -> bool {
         let Some(cache) = self.offsets else {
             return false;
         };
@@ -300,6 +318,9 @@ impl<'a, 'py> Scan<'a, 'py> {
         let Ok(cached) = cached.cast::<FieldOffsets>() else {
             return false;
         };
+        if generic_only && !uses_generic_getattr(item_type.as_ptr().cast()) {
+            return false;
+        }
         self.set_struct_type(item_type.as_ptr().cast());
         self.struct_offsets.clear();
         self.struct_offsets.extend_from_slice(&cached.get().offsets);
@@ -422,6 +443,9 @@ impl<'a, 'py> Scan<'a, 'py> {
         };
         let item_type = item.get_type();
         if let Some(cached) = cache.get_item(&item_type)? {
+            if generic_only && !uses_generic_getattr(item_type.as_type_ptr()) {
+                return Ok(None);
+            }
             return Ok(cached
                 .cast::<FieldOffsets>()
                 .ok()
@@ -685,12 +709,8 @@ fn read_field_offsets(
 ) -> PyResult<Option<Vec<ffi::Py_ssize_t>>> {
     let py = item.py();
     let item_type = item.get_type();
-    if generic_only {
-        // SAFETY: `item_type` is a live type.
-        let getattro = unsafe { ffi::PyType_GetSlot(item_type.as_type_ptr(), ffi::Py_tp_getattro) };
-        if getattro != ffi::PyObject_GenericGetAttr as *mut std::ffi::c_void {
-            return Ok(None);
-        }
+    if generic_only && !uses_generic_getattr(item_type.as_type_ptr()) {
+        return Ok(None);
     }
     let basicsize: ffi::Py_ssize_t = item_type
         .getattr(pyo3::intern!(py, "__basicsize__"))?

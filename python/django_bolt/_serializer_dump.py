@@ -224,4 +224,10 @@ def dump_serializers(value: Any) -> Any:
             )
     for name, new_item in changes.items():
         set_attribute(clone, name, new_item)
+        # msgspec reads this field with getattr, so the clone must give back the dumped value.
+        if not is_struct and getattr(clone, name) is not new_item:
+            raise TypeError(
+                f"{type(value).__qualname__}.{name} does not give back the value that Bolt sets. "
+                "Bolt cannot dump the Serializer that it holds."
+            )
     return clone

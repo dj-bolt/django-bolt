@@ -145,6 +145,32 @@ class SelfCopy(msgspec.Struct):
         return self
 
 
+@dataclasses.dataclass(slots=True)
+class Stubborn:
+    """A dataclass whose ``getattr`` gives a new Serializer whatever its slot holds."""
+
+    inner: Any
+
+    def __getattribute__(self, name):
+        if name == "inner":
+            return account()
+        return object.__getattribute__(self, name)
+
+
+@dataclasses.dataclass(slots=True)
+class Late:
+    """A dataclass that gets its own attribute lookup after its first scan."""
+
+    inner: Any
+
+
+def _late_getattribute(self, name):
+    value = object.__getattribute__(self, name)
+    if name == "inner" and value == "swap":
+        return account()
+    return value
+
+
 @dataclasses.dataclass
 class SelfCopyBox:
     """A dataclass whose ``__copy__`` gives the object itself."""
@@ -508,6 +534,43 @@ def test_a_dataclass_field_is_read_with_getattr_as_msgspec_reads_it(client):
 
 def test_a_struct_field_is_read_from_its_slot_as_msgspec_reads_it(client):
     _check(client.get("/read/masked-struct"), [{"inner": 1}, {"inner": DUMPED}])
+
+
+def test_a_dataclass_whose_getattr_ignores_the_dumped_value_fails_closed():
+    """msgspec reads the field with getattr, so the clone must give back the dumped value."""
+    api = BoltAPI()
+
+    @api.get("/stubborn")
+    def stubborn_route():
+        return [Stubborn(inner=1)]
+
+    with TestClient(api) as test_client:
+        response = test_client.get("/stubborn")
+        assert response.status_code == 500
+        assert SECRET not in response.text
+
+
+def test_a_dataclass_that_gets_its_own_lookup_after_a_scan_is_read_with_getattr():
+    """The cached slot offsets of a class apply only while the class keeps the generic lookup."""
+    api = BoltAPI()
+
+    @api.get("/late")
+    def late_route():
+        return [Late(inner="swap")]
+
+    @api.get("/late-one")
+    def late_one_route():
+        return JSON(Late(inner="swap"))
+
+    with TestClient(api) as test_client:
+        _check(test_client.get("/late"), [{"inner": "swap"}])
+        Late.__getattribute__ = _late_getattribute
+        try:
+            # In a list, the scan reads the cached offsets of the child. Alone, it reads those of the value.
+            _check(test_client.get("/late"), [{"inner": DUMPED}])
+            _check(test_client.get("/late-one"), {"inner": DUMPED})
+        finally:
+            del Late.__getattribute__
 
 
 def test_a_copy_that_gives_the_object_itself_does_not_change_the_value_of_the_handler():
