@@ -1851,8 +1851,8 @@ class BoltAPI:
                 field_names_map = meta.get("response_field_names_map", {})
                 handler_default_status = meta["default_status_code"]
                 # Per-status bodies are encoded as-is, never validated.
-                # The dict documents the schema only. A Serializer type gives
-                # the dump of a dict body that fits it (see _dump_status_dict).
+                # The dict documents the schema only. A Serializer type sends a
+                # dict body without its hidden fields (see without_hidden_fields).
                 response_map = meta["response_map"]
                 if ... not in response_map:
                     response_map = {**response_map, ...: Any}

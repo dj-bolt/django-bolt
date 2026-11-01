@@ -9,7 +9,9 @@ and OpenAPI documentation.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import threading
+from typing import Annotated, TypedDict
 
 import msgspec
 import pytest
@@ -22,7 +24,7 @@ from django_bolt.serialization import (
     serialize_response,
     serialize_response_sync,
 )
-from django_bolt.serializers import Serializer, computed_field, field
+from django_bolt.serializers import Serializer, computed_field, field, field_validator, model_validator
 from django_bolt.testing import TestClient
 from tests.test_models import Article
 
@@ -962,7 +964,6 @@ class AliasAccountSchema(Serializer):
     password: str = field(write_only=True, alias="pwd")
 
 
-ACCOUNT_DUMP = {"id": 1, "label": "account-1"}
 _ACCOUNT_RESPONSES = {
     200: AccountSchema,
     201: list[AccountSchema],
@@ -1011,14 +1012,14 @@ def account_client(request):
 @pytest.mark.parametrize(
     ("path", "status", "expected"),
     [
-        ("/tuple", 200, ACCOUNT_DUMP),
-        ("/bare", 200, ACCOUNT_DUMP),
-        ("/json", 200, ACCOUNT_DUMP),
-        ("/list", 201, [ACCOUNT_DUMP, {"id": 2, "label": "account-2"}]),
+        ("/tuple", 200, {"id": 1}),
+        ("/bare", 200, {"id": 1}),
+        ("/json", 200, {"id": 1}),
+        ("/list", 201, [{"id": 1}, {"id": 2}]),
     ],
 )
-def test_a_serializer_entry_gives_the_dump_of_a_dict_body(account_client, path, status, expected):
-    """A dict body gives the dump of the Serializer: no write-only field, and the computed fields."""
+def test_a_serializer_entry_sends_a_dict_body_without_its_hidden_fields(account_client, path, status, expected):
+    """Bolt does not convert a dict body to the Serializer. The body has no write-only field and no computed field."""
     response = account_client.get(path)
     assert response.status_code == status, response.text
     assert SECRET not in response.text
@@ -1044,3 +1045,232 @@ def test_a_dict_body_that_does_not_fit_its_serializer_entry_has_no_write_only_fi
     assert response.status_code == status, response.text
     assert SECRET not in response.text
     assert response.json() == expected
+
+
+# ============================================================================
+# A dict body is not converted: no validator, no type conversion, no default
+# ============================================================================
+
+
+class TitleCheckSchema(Serializer):
+    """Its validators change the title and read the database."""
+
+    id: int
+    title: str
+    secret: str = field(write_only=True)
+
+    @field_validator("title")
+    @classmethod
+    def lower_title(cls, value: str) -> str:
+        return value.lower()
+
+    @model_validator
+    def title_is_unique(self):
+        if Article.objects.filter(title=self.title).exclude(pk=self.id).exists():
+            raise ValueError("title taken")
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_dict_body_does_not_run_the_validators_of_its_serializer_entry(is_async):
+    """The validators run on input only. A dict body goes out with its own values."""
+    api = BoltAPI()
+    responses = {201: TitleCheckSchema, 400: ErrorSchema}
+
+    if is_async:
+
+        @api.post("/articles", response_model=responses)
+        async def create_article():
+            article = await Article.objects.acreate(title="Mixed Case", content=SECRET, author="A")
+            return 201, {"id": article.id, "title": article.title, "secret": SECRET}
+
+    else:
+
+        @api.post("/articles", response_model=responses)
+        def create_article():
+            article = Article.objects.create(title="Mixed Case", content=SECRET, author="A")
+            return 201, {"id": article.id, "title": article.title, "secret": SECRET}
+
+    with TestClient(api) as client:
+        response = client.post("/articles")
+
+    article = Article.objects.get()
+    assert (response.status_code, response.json()) == (201, {"id": article.id, "title": "Mixed Case"})
+
+
+class CamelPrefsSchema(Serializer, rename="camel"):
+    """Each field has a default, so a dict with the Python names fits the Serializer."""
+
+    user_id: int = 0
+    dark_mode: bool = False
+    page_size: int = 20
+    api_token: str = field(write_only=True, default="")
+
+
+class TokenAccountSchema(Serializer):
+    id: int
+    token: str = field(write_only=True)
+
+
+class LeadSchema(Serializer):
+    """msgspec.convert() cannot take an untagged union of two Structs."""
+
+    name: str
+    lead: AccountSchema | TokenAccountSchema | None = None
+
+
+@dataclasses.dataclass
+class AccountBox:
+    owner: AccountSchema
+
+
+class AccountEntry(TypedDict):
+    owner: AccountSchema
+
+
+class AccountCard(msgspec.Struct, rename="camel"):
+    owner_account: AccountSchema
+    note: str = ""
+
+
+type AccountTree = dict[str, AccountTree] | AccountSchema
+
+
+class TeamSchema(Serializer):
+    """Each field holds AccountSchema at another position."""
+
+    name: str
+    by_role: dict[str, AccountSchema] = {}
+    pinned: dict[str, Annotated[AccountSchema, msgspec.Meta(title="pinned")]] = {}
+    tree: AccountTree | None = None
+    pair: tuple[AccountSchema, ...] = ()
+    fixed: tuple[int, AccountSchema] | None = None
+    groups: list[list[AccountSchema]] = []
+    unique: frozenset[AccountSchema] = frozenset()
+    tagged: set[AccountSchema] = set()
+    card: AccountCard | None = None
+    box: AccountBox | None = None
+    entry: AccountEntry | None = None
+    later: LaterSchema | None = None
+    note: str = field(exclude=True, default="")
+
+
+class LaterSchema(Serializer):
+    """TeamSchema refers to this class before its definition."""
+
+    id: int
+    pin: str = field(write_only=True)
+
+
+class TreeNodeSchema(Serializer):
+    """Each child is a TreeNodeSchema."""
+
+    name: str
+    secret: str = field(write_only=True)
+    children: list[TreeNodeSchema] = []
+
+
+_ACCOUNT = {"id": 1, "password": SECRET}
+_KEPT_ACCOUNT = {"id": 1}
+# ``name`` is None, so the body does not fit its Serializer.
+_HIDDEN_FIELD_BODIES = {
+    "/camel-defaults": (
+        200,
+        {"user_id": 7, "dark_mode": True, "page_size": 50, "api_token": SECRET},
+        {"user_id": 7, "dark_mode": True, "page_size": 50},
+    ),
+    "/camel-wire-names": (
+        200,
+        {"userId": 7, "apiToken": SECRET},
+        {"userId": 7},
+    ),
+    "/union": (
+        201,
+        {"name": "x", "lead": {"id": 1, "password": SECRET, "token": SECRET}},
+        {"name": "x", "lead": _KEPT_ACCOUNT},
+    ),
+    "/dict-values": (
+        202,
+        {"name": None, "note": SECRET, "by_role": {"owner": _ACCOUNT}},
+        {"name": None, "by_role": {"owner": _KEPT_ACCOUNT}},
+    ),
+    "/annotated": (
+        202,
+        {"name": None, "pinned": {"owner": _ACCOUNT}},
+        {"name": None, "pinned": {"owner": _KEPT_ACCOUNT}},
+    ),
+    "/recursive-type-alias": (
+        202,
+        {"name": None, "tree": {"a": {"b": _ACCOUNT}}},
+        {"name": None, "tree": {"a": {"b": _KEPT_ACCOUNT}}},
+    ),
+    "/tuple": (
+        202,
+        {"name": None, "pair": [_ACCOUNT, _ACCOUNT]},
+        {"name": None, "pair": [_KEPT_ACCOUNT, _KEPT_ACCOUNT]},
+    ),
+    "/fixed-tuple": (202, {"name": None, "fixed": [7, _ACCOUNT]}, {"name": None, "fixed": [7, _KEPT_ACCOUNT]}),
+    "/list-of-lists": (202, {"name": None, "groups": [[_ACCOUNT]]}, {"name": None, "groups": [[_KEPT_ACCOUNT]]}),
+    "/frozenset": (202, {"name": None, "unique": [_ACCOUNT]}, {"name": None, "unique": [_KEPT_ACCOUNT]}),
+    "/set": (202, {"name": None, "tagged": [_ACCOUNT]}, {"name": None, "tagged": [_KEPT_ACCOUNT]}),
+    "/struct": (
+        202,
+        {"name": None, "card": {"ownerAccount": _ACCOUNT, "owner_account": _ACCOUNT, "note": "n"}},
+        {"name": None, "card": {"ownerAccount": _KEPT_ACCOUNT, "owner_account": _KEPT_ACCOUNT, "note": "n"}},
+    ),
+    "/dataclass": (202, {"name": None, "box": {"owner": _ACCOUNT}}, {"name": None, "box": {"owner": _KEPT_ACCOUNT}}),
+    "/typed-dict": (
+        202,
+        {"name": None, "entry": {"owner": _ACCOUNT}},
+        {"name": None, "entry": {"owner": _KEPT_ACCOUNT}},
+    ),
+    "/forward-reference": (202, {"name": None, "later": {"id": 3, "pin": SECRET}}, {"name": None, "later": {"id": 3}}),
+    "/self-reference": (
+        203,
+        {
+            "name": None,
+            "secret": SECRET,
+            "children": [{"name": "c", "secret": SECRET, "children": [{"name": "d", "secret": SECRET}]}],
+        },
+        {"name": None, "children": [{"name": "c", "children": [{"name": "d"}]}]},
+    ),
+    "/list-entry": (207, [{"name": None, "pair": [_ACCOUNT]}], [{"name": None, "pair": [_KEPT_ACCOUNT]}]),
+}
+_HIDDEN_FIELD_RESPONSES = {
+    200: CamelPrefsSchema,
+    201: LeadSchema,
+    202: TeamSchema,
+    203: TreeNodeSchema,
+    207: list[TeamSchema],
+    404: ErrorSchema,
+}
+
+
+@pytest.fixture(scope="module", params=[False, True], ids=["sync", "async"])
+def hidden_field_client(request):
+    api = BoltAPI()
+    for path, (status, body, _) in _HIDDEN_FIELD_BODIES.items():
+        if request.param:
+
+            async def handler(status=status, body=body):
+                await asyncio.sleep(0)
+                return status, body
+
+        else:
+
+            def handler(status=status, body=body):
+                return status, body
+
+        api.get(path, response_model=_HIDDEN_FIELD_RESPONSES)(handler)
+
+    with TestClient(api) as client:
+        yield client
+
+
+@pytest.mark.parametrize("path", list(_HIDDEN_FIELD_BODIES))
+def test_a_dict_body_loses_the_hidden_keys_at_each_serializer_position(hidden_field_client, path):
+    """Bolt sends the dict as it is, without the hidden keys of each Serializer type in the annotations."""
+    status, _, expected = _HIDDEN_FIELD_BODIES[path]
+    response = hidden_field_client.get(path)
+    assert (response.status_code, response.json()) == (status, expected), response.text
+    assert SECRET not in response.text

@@ -34,6 +34,7 @@ from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 
 from . import _json
+from ._hidden_fields import without_hidden_fields
 from ._kwargs import compile_response_coercer, compile_struct_row_readers
 from .concurrency import run_in_orm_executor
 from .cookies import Cookie
@@ -366,59 +367,6 @@ def _convert_dict(serializer_cls: Any, value: dict) -> Any:
     return msgspec.convert(value, serializer_cls).dump()
 
 
-def _dump_status_dict(serializer_cls: Any, value: dict) -> Any:
-    """Give the dump of the Serializer for a per-status body.
-
-    Bolt does not validate a per-status body. A dict that does not fit the
-    Serializer goes out as it is, but without the fields that dump() never sends.
-    """
-    try:
-        instance = msgspec.convert(value, serializer_cls)
-    except msgspec.ValidationError:
-        # Not an error: the body of a status code is not validated.
-        return _without_hidden_fields(serializer_cls, value)
-    return instance.dump()
-
-
-def _without_hidden_fields(serializer_cls: Any, value: Any) -> Any:
-    """Return the dict ``value`` without the fields that dump() never sends.
-
-    The function also goes into each nested Serializer field, so a nested dict
-    loses its hidden fields too. Any other value comes back as it is.
-    """
-    if not isinstance(value, dict):
-        return value
-    serializer_cls._ensure_dump_ready()
-    hidden = serializer_cls.__hidden_fields__
-    rename_map = serializer_cls.__rename_map__
-    field_configs = serializer_cls.__field_configs__
-    # A field can have three keys: its name, its wire name and its alias.
-    hidden_keys = (
-        hidden
-        | {rename_map.get(name, name) for name in hidden}
-        | {config.alias for name, config in field_configs.items() if name in hidden and config.alias}
-    )
-    nested_by_key = {
-        key: spec.nested
-        for spec in serializer_cls._dump_field_specs
-        if spec.nested is not None
-        for key in (spec.field_name, spec.output_key, spec.alias)
-        if key is not None
-    }
-    result = {}
-    for key, item in value.items():
-        if key in hidden_keys:
-            continue
-        nested = nested_by_key.get(key)
-        if nested is not None:
-            if nested.many and isinstance(item, (list, tuple)):
-                item = [_without_hidden_fields(nested.serializer_class, element) for element in item]
-            else:
-                item = _without_hidden_fields(nested.serializer_class, item)
-        result[key] = item
-    return result
-
-
 def _is_serializer_instance(value: Any) -> bool:
     return getattr(value.__class__, "__is_bolt_serializer__", None)
 
@@ -573,8 +521,9 @@ def _compile_response_validator(meta: HandlerMetadata | dict[str, Any]) -> tuple
         if meta["validate_response"]:
             dump_dict = _convert_dict
         elif meta.get("_status_entry"):
-            # A Serializer type converts its data even when the entry does not validate.
-            dump_dict = _dump_status_dict
+            # Bolt does not convert a dict body of a status code. It sends the
+            # dict without the fields that dump() never sends.
+            dump_dict = without_hidden_fields
         else:
             dump_dict = _keep_dict
         return _compile_serializer_response_handlers(serializer_cls, many, dump_dict)

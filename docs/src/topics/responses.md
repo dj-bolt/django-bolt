@@ -475,7 +475,7 @@ async def create_user(body: UserCreate) -> User:
 
 `response_model` also accepts a dict mapping status codes to types. Each code gets its own OpenAPI response entry. Bolt encodes the body as-is and does not validate it.
 
-A Serializer type gives its `dump()`, also for a dict body. Thus the body has the computed fields and not the write-only fields. A dict that does not fit the Serializer goes out as-is, without the write-only and excluded fields.
+A Serializer type gives the `dump()` of a Serializer or a model instance. Bolt does not convert a dict body to the Serializer. The dict goes out as-is, without the write-only and excluded fields. This also applies to each Serializer type in the annotations, for example in `list[Account]`, `dict[str, Account]` or a `Struct` field. The validators of the Serializer do not run, and the body gets no computed fields.
 
 ```python
 import msgspec
