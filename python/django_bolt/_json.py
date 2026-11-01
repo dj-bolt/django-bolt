@@ -66,6 +66,16 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
 }
 
 
+def dump_held_serializers(value: Any) -> Any:
+    """Return ``value`` with the dump of each Serializer that it holds.
+
+    The Rust scan runs first. A value with no Serializer comes back as it is.
+    """
+    if find_serializer(value, SCAN_KINDS, classify, SCAN_OFFSETS):
+        return dump_serializers(value)
+    return value
+
+
 def default_serializer(value: Any) -> Any:
     """Transform values non-natively supported by msgspec.
 
@@ -74,12 +84,14 @@ def default_serializer(value: Any) -> Any:
 
     Note: encode() dumps each Serializer before msgspec sees it, since
     msgspec encodes a msgspec.Struct natively and never calls this hook for it.
+    msgspec encodes the result of the hook natively too, so the hook dumps
+    each Serializer in its result.
     """
     # Walk MRO to support polymorphic types
     for base in value.__class__.__mro__[:-1]:  # Skip 'object'
         encoder = DEFAULT_TYPE_ENCODERS.get(base)
         if encoder is not None:
-            return encoder(value)
+            return dump_held_serializers(encoder(value))
 
     raise TypeError(f"Unsupported type: {type(value)!r}")
 
@@ -139,7 +151,12 @@ def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
     # Custom serializer provided - use one-off encoder
     if find_serializer(value, SCAN_KINDS, classify, SCAN_OFFSETS):
         value = dump_serializers(value)
-    return msgspec.json.encode(value, enc_hook=serializer)
+
+    # msgspec encodes the result of the hook natively. Thus dump each Serializer in it.
+    def enc_hook(item: Any) -> Any:
+        return dump_held_serializers(serializer(item))
+
+    return msgspec.json.encode(value, enc_hook=enc_hook)
 
 
 def decode(value: bytes | str) -> Any:
@@ -186,4 +203,4 @@ def decode_typed[T](
     return msgspec.json.decode(value, type=target_type, strict=strict)
 
 
-__all__ = ["encode", "decode", "decode_typed", "DEFAULT_TYPE_ENCODERS", "default_serializer"]
+__all__ = ["encode", "decode", "decode_typed", "DEFAULT_TYPE_ENCODERS", "default_serializer", "dump_held_serializers"]

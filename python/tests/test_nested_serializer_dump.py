@@ -646,6 +646,43 @@ def test_an_encode_with_a_custom_hook_gives_the_dump_of_each_serializer():
     assert json.loads(_json.encode({"account": account()}, serializer=str)) == {"account": DUMPED}
 
 
+class Owner:
+    """A type that msgspec cannot encode. msgspec calls the encoder hook for it."""
+
+    def __init__(self, pk: int) -> None:
+        self.pk = pk
+
+
+# msgspec encodes the return value of a hook natively, after the scan.
+_HOOK_RESULTS = {
+    "serializer": (lambda owner: Account(id=owner.pk, password=SECRET), DUMPED),
+    "list": (lambda owner: [Account(id=owner.pk, password=SECRET)], [DUMPED]),
+    "struct": (lambda owner: Envelope(account=Account(id=owner.pk, password=SECRET)), {"account": DUMPED, "note": "n"}),
+}
+
+
+@pytest.mark.parametrize("result", _HOOK_RESULTS)
+def test_a_serializer_that_a_default_type_encoder_returns_gives_its_dump(monkeypatch, result):
+    hook, expected = _HOOK_RESULTS[result]
+    monkeypatch.setitem(_json.DEFAULT_TYPE_ENCODERS, Owner, hook)
+    api = BoltAPI()
+
+    @api.get("/owner")
+    def owner_route():
+        return {"owner": Owner(1)}
+
+    with TestClient(api) as test_client:
+        _check(test_client.get("/owner"), {"owner": expected})
+
+
+@pytest.mark.parametrize("result", _HOOK_RESULTS)
+def test_a_serializer_that_a_custom_hook_returns_gives_its_dump(result):
+    hook, expected = _HOOK_RESULTS[result]
+    encoded = _json.encode({"owner": Owner(1)}, serializer=hook)
+    assert SECRET.encode() not in encoded
+    assert json.loads(encoded) == {"owner": expected}
+
+
 def test_a_deeply_nested_response_fails_as_before():
     """A value deeper than the recursion limit gives a 500 and the worker keeps serving."""
     api = BoltAPI()
