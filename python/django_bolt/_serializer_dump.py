@@ -28,6 +28,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import itertools
+import types
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -64,12 +65,26 @@ class AttributeNames(tuple):
 _ENUM_VALUE = AttributeNames(("_value_",))
 
 
+def _is_leaf_value(value: Any) -> bool:
+    """Return whether ``value`` cannot hold a Serializer.
+
+    msgspec encodes the fields of a dataclass or an attrs class, also of a
+    subclass of str or int, so such a value is not a leaf.
+    """
+    if value is None:
+        return True
+    if not isinstance(value, _LEAF_TYPES):
+        return False
+    tp = value.__class__
+    return not (hasattr(tp, "__dataclass_fields__") or hasattr(tp, "__attrs_attrs__"))
+
+
 def _enum_is_leaf(tp: type[Enum]) -> bool:
     """Return whether each member value of ``tp`` is None or a leaf.
 
     The members of an Enum do not change after the class is made.
     """
-    return all(member._value_ is None or isinstance(member._value_, _LEAF_TYPES) for member in tp.__members__.values())
+    return all(_is_leaf_value(member._value_) for member in tp.__members__.values())
 
 
 def _is_serializer_class(tp: Any) -> bool:
@@ -196,6 +211,70 @@ def _items(value: list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]) -> An
     return iter(value)
 
 
+_TYPE_MRO = type.__dict__["__mro__"]
+_TYPE_DICT = type.__dict__["__dict__"]
+
+
+def _type_lookup(tp: type, name: str) -> Any:
+    """Return the attribute ``name`` of ``tp`` from the dicts of its MRO, or ``_MISSING``.
+
+    The getsets of ``type`` give the real MRO and dicts: a metaclass can override ``__mro__``.
+    """
+    for base in _TYPE_MRO.__get__(tp):
+        namespace = _TYPE_DICT.__get__(base)
+        if name in namespace:
+            return namespace[name]
+    return _MISSING
+
+
+def _instance_dict(value: Any) -> dict[str, Any] | None:
+    """Return the ``__dict__`` that msgspec reads the fields of ``value`` from, or None.
+
+    msgspec reads a dataclass or an attrs field from the ``__dict__`` of the
+    object if the type uses the attribute lookup of ``object``. Otherwise it
+    uses ``getattr``.
+    """
+    if value.__class__.__getattribute__ is not object.__getattribute__:
+        return None
+    try:
+        return object.__getattribute__(value, "__dict__")
+    except AttributeError:
+        return None
+
+
+def _read_field(value: Any, name: str, instance_dict: dict[str, Any] | None) -> Any:
+    """Return the field ``name`` of a dataclass or an attrs object as msgspec reads it, or ``_MISSING``.
+
+    With a dict, msgspec reads the dict first. A field that the dict does not
+    hold comes from its slot, if the type has one. Without a dict, msgspec
+    uses ``getattr``.
+    """
+    if instance_dict is None:
+        try:
+            return getattr(value, name)
+        except AttributeError:
+            return _MISSING
+    if name in instance_dict:
+        return instance_dict[name]
+    descriptor = _type_lookup(value.__class__, name)
+    if type(descriptor) is not types.MemberDescriptorType:
+        return _MISSING
+    try:
+        return descriptor.__get__(value, value.__class__)
+    except AttributeError:
+        return _MISSING
+
+
+def _write_field(clone: Any, name: str, new_item: Any, instance_dict: dict[str, Any] | None) -> None:
+    """Set the field ``name`` of ``clone`` where msgspec reads it: see _read_field."""
+    if instance_dict is None:
+        object.__setattr__(clone, name, new_item)
+    elif name in instance_dict:
+        instance_dict[name] = new_item
+    else:
+        _type_lookup(clone.__class__, name).__set__(clone, new_item)
+
+
 def _dump(value: Any, depth: int) -> Any:
     """Return ``value`` with the dump of each Serializer in place of the Serializer. See dump_serializers."""
     if isinstance(value, dict):
@@ -214,11 +293,13 @@ def _dump(value: Any, depth: int) -> Any:
                 dumped_list = list(itertools.islice(_items(value), index))
                 dumped_list.append(new_item)
         return value if dumped_list is None else dumped_list
-    if value is None or isinstance(value, (str, int, float, bytes, bytearray)):
+    # Identity compares: a subclass of a scalar type can be a dataclass, whose fields msgspec encodes.
+    cls = value.__class__
+    if cls is str or cls is int or cls is float or cls is bool or cls is bytes or value is None:
         return value
     kind = _kind_of_instance(value)
     if kind is _MISSING:
-        kind = classify(value.__class__)
+        kind = classify(cls)
     if kind is None:
         return value
     if kind is True:
@@ -229,16 +310,19 @@ def _dump(value: Any, depth: int) -> Any:
         new_item = _dump_item(item, depth)
         return value if new_item is item else new_item
     is_struct = kind.__class__ is tuple
-    # msgspec reads a Struct field from its slot, so a __getattribute__ of the type does not apply.
-    get_attribute = object.__getattribute__ if is_struct else getattr
+    if is_struct:
+        # msgspec reads a Struct field from the slot that the class had when it was made,
+        # as astuple does, also when a property now hides the field.
+        fields = zip(kind, msgspec.structs.astuple(value), strict=True)
+    else:
+        instance_dict = _instance_dict(value)
+        fields = ((name, _read_field(value, name, instance_dict)) for name in kind)
     changes = {}
-    for name in kind:
-        try:
-            item = get_attribute(value, name)
-        except AttributeError:
+    for name, item in fields:
+        item_cls = item.__class__
+        if item_cls is str or item_cls is int or item_cls is float or item_cls is bool or item is None:
             continue
-        cls = item.__class__
-        if cls is str or cls is int or cls is float or cls is bool or item is None:
+        if item is _MISSING:
             continue
         new_item = _dump_item(item, depth)
         if new_item is not item:
@@ -249,23 +333,20 @@ def _dump(value: Any, depth: int) -> Any:
     if is_struct:
         # The copy of msgspec itself: a __copy__ of the type could return the value.
         clone = msgspec.Struct.__copy__(value)
-        set_attribute = msgspec.structs.force_setattr
-    else:
-        clone = copy.copy(value)
-        set_attribute = object.__setattr__
-        if clone is value:
-            raise TypeError(
-                f"{type(value).__qualname__}.__copy__ returns the object itself. "
-                "Bolt cannot dump the Serializer that it holds without a change to the object."
-            )
+        for name, new_item in changes.items():
+            msgspec.structs.force_setattr(clone, name, new_item)
+        return clone
+    clone = copy.copy(value)
+    if clone is value:
+        raise TypeError(
+            f"{cls.__qualname__}.__copy__ returns the object itself. "
+            "Bolt cannot dump the Serializer that it holds without a change to the object."
+        )
+    clone_dict = _instance_dict(clone)
     for name, new_item in changes.items():
-        set_attribute(clone, name, new_item)
-        # msgspec reads this field with getattr, so the clone must give back the dumped value.
-        if not is_struct and getattr(clone, name) is not new_item:
-            raise TypeError(
-                f"{type(value).__qualname__}.{name} does not give back the value that Bolt sets. "
-                "Bolt cannot dump the Serializer that it holds."
-            )
+        # A field that does not give back the dumped value still holds the
+        # Serializer for msgspec. dump_serializers then finds it and raises.
+        _write_field(clone, name, new_item, clone_dict)
     return clone
 
 

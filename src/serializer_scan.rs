@@ -10,7 +10,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString,
-    PyTuple,
+    PyTuple, PyType,
 };
 
 /// The deepest level that the scan visits. At this level the scan raises
@@ -62,6 +62,97 @@ fn is_scalar_subclass(value: &Bound<'_, PyAny>) -> bool {
         || value.is_instance_of::<PyByteArray>()
 }
 
+/// Whether `item_type` is a dataclass or an attrs class. msgspec encodes the
+/// fields of such a class, also when it is a subclass of a scalar type.
+fn has_fields(item_type: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = item_type.py();
+    Ok(
+        item_type.hasattr(pyo3::intern!(py, "__dataclass_fields__"))?
+            || item_type.hasattr(pyo3::intern!(py, "__attrs_attrs__"))?,
+    )
+}
+
+/// The getset descriptor `name` of `type` itself, for example `__mro__`.
+///
+/// A metaclass can override these attributes for its classes. The getset
+/// descriptors of `type` read the fields of the type object instead.
+fn type_getset<'py>(
+    py: Python<'py>,
+    cell: &'static pyo3::sync::PyOnceLock<Py<PyAny>>,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    cell.get_or_try_init(py, || {
+        py.get_type::<PyType>()
+            .getattr(pyo3::intern!(py, "__dict__"))?
+            .get_item(name)
+            .map(Bound::unbind)
+    })
+    .map(|getset| getset.bind(py).clone())
+}
+
+/// Return the attribute `name` of `item_type` as the type lookup finds it
+/// in the dicts of its MRO, or None. A metaclass cannot change the result.
+fn type_lookup<'py>(
+    item_type: &Bound<'py, PyType>,
+    name: &Bound<'py, PyString>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    static MRO: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    static DICT: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    let py = item_type.py();
+    let get = pyo3::intern!(py, "__get__");
+    let mro = type_getset(py, &MRO, "__mro__")?.call_method1(get, (item_type,))?;
+    let dict_getset = type_getset(py, &DICT, "__dict__")?;
+    for base in mro.cast::<PyTuple>()?.iter() {
+        let namespace = dict_getset.call_method1(get, (&base,))?;
+        let value = namespace.call_method1(pyo3::intern!(py, "get"), (name,))?;
+        if !value.is_none() {
+            return Ok(Some(value));
+        }
+        if namespace.contains(name)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+/// The function `msgspec.structs.astuple`, or None without msgspec. It reads
+/// the fields of a Struct from the slots that the class had when it was
+/// made, as msgspec encodes them. Only a Struct has a kind that is an exact
+/// tuple, and a Struct needs msgspec, so the scan has the function for each
+/// Struct. The tests of this module have no msgspec.
+fn astuple(py: Python<'_>) -> Option<&Bound<'_, PyAny>> {
+    static ASTUPLE: pyo3::sync::PyOnceLock<Option<Py<PyAny>>> = pyo3::sync::PyOnceLock::new();
+    ASTUPLE
+        .get_or_init(py, || {
+            py.import("msgspec.structs")
+                .and_then(|module| module.getattr("astuple"))
+                .map(Bound::unbind)
+                .ok()
+        })
+        .as_ref()
+        .map(|function| function.bind(py))
+}
+
+/// Return the `__dict__` of `item` if its type uses the attribute lookup of
+/// `object` and the object has a dict. msgspec reads a dataclass field from
+/// this dict first.
+fn instance_dict<'py>(item: &Bound<'py, PyAny>) -> Option<Bound<'py, PyDict>> {
+    if !uses_generic_getattr(item.get_type().as_type_ptr()) {
+        return None;
+    }
+    // SAFETY: `item` is a live object. The call gives a new reference or null.
+    let dict = unsafe {
+        Bound::from_owned_ptr_or_err(
+            item.py(),
+            ffi::PyObject_GenericGetDict(item.as_ptr(), std::ptr::null_mut()),
+        )
+    };
+    match dict {
+        Ok(dict) => dict.cast_into::<PyDict>().ok(),
+        Err(_) => None,
+    }
+}
+
 /// The number of leaf types that one scan keeps.
 const LEAF_TYPES: usize = 8;
 
@@ -99,15 +190,18 @@ type AddressSet = std::collections::HashSet<usize, std::hash::BuildHasherDefault
 pub struct FieldOffsets {
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
     offsets: Box<[ffi::Py_ssize_t]>,
+    /// The type of the offsets, as a strong reference. The dict can keep
+    /// another key that is equal to it, so the entry itself keeps the type
+    /// alive: no other type can then take its address.
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
-    owner: usize,
+    owner: Py<PyAny>,
 }
 
 impl FieldOffsets {
     /// Return the offsets if this entry belongs to `item_type`.
     #[cfg(not(Py_GIL_DISABLED))]
     fn for_type(&self, item_type: *mut ffi::PyTypeObject) -> Option<&[ffi::Py_ssize_t]> {
-        (self.owner == item_type as usize).then_some(&self.offsets)
+        (self.owner.as_ptr() == item_type.cast()).then_some(&self.offsets)
     }
 }
 
@@ -170,7 +264,6 @@ fn layouts_known(py: Python<'_>) -> bool {
 /// Return whether `item_type` uses the attribute lookup of `object`. msgspec
 /// reads a dataclass field with `getattr` when the class has a lookup of its
 /// own, so only such a class can have its slots read in place.
-#[cfg(not(Py_GIL_DISABLED))]
 fn uses_generic_getattr(item_type: *mut ffi::PyTypeObject) -> bool {
     // SAFETY: `item_type` is a live type, and the slot read runs no Python code.
     let getattro = unsafe { ffi::PyType_GetSlot(item_type, ffi::Py_tp_getattro) };
@@ -345,6 +438,13 @@ impl<'a, 'py> Scan<'a, 'py> {
                 || is_subtype(&raw mut ffi::PyFloat_Type)
                 || is_subtype(&raw mut ffi::PyByteArray_Type)
             {
+                // msgspec encodes the fields of a dataclass or an attrs
+                // class, also of a subclass of a scalar type. An error goes
+                // to `visit`, which gets the kind and raises it.
+                let type_object = Bound::from_borrowed_ptr(self.kinds.py(), item_type.cast());
+                if has_fields(&type_object).unwrap_or(true) {
+                    return None;
+                }
                 self.add_leaf_type(item_type);
                 return Some(Want::Skip);
             }
@@ -521,7 +621,7 @@ impl<'a, 'py> Scan<'a, 'py> {
                 Some(offsets) => {
                     let cached = FieldOffsets {
                         offsets: offsets.clone().into_boxed_slice(),
-                        owner: type_ptr as usize,
+                        owner: item_type.clone().into_any().unbind(),
                     };
                     cache.set_item(&item_type, Py::new(item.py(), cached)?)?;
                 }
@@ -678,7 +778,7 @@ impl<'a, 'py> Scan<'a, 'py> {
             return Ok(false);
         }
         let item_type = item.get_type();
-        if is_scalar_subclass(item) {
+        if is_scalar_subclass(item) && !has_fields(&item_type)? {
             self.add_leaf_type(item_type.as_type_ptr());
             return Ok(false);
         }
@@ -711,12 +811,28 @@ impl<'a, 'py> Scan<'a, 'py> {
             unsafe { self.push_fields(item.py(), item.as_ptr(), depth) };
             return Ok(false);
         }
+        if slots && let Some(astuple) = astuple(item.py()) {
+            // msgspec reads a Struct field from the slot that the class had
+            // when it was made, also when a property now hides the field.
+            let values = astuple.call1((item,))?;
+            for child in values.cast::<PyTuple>()?.iter() {
+                self.push(child, depth);
+            }
+            return Ok(false);
+        }
+        // msgspec reads a field of a dataclass or an attrs class from the
+        // `__dict__` of the object first, if the type uses the lookup of
+        // `object`. Otherwise it uses `getattr`.
+        let dict = if slots { None } else { instance_dict(item) };
         for name in names.iter() {
             let name = name.cast::<PyString>()?;
-            let child = if slots {
-                generic_getattr(item, name)
-            } else {
-                item.getattr(name)
+            let child = match &dict {
+                Some(dict) => match dict.get_item(name)? {
+                    Some(child) => Ok(child),
+                    None => slot_value(item, name),
+                },
+                None if slots => generic_getattr(item, name),
+                None => item.getattr(name),
             };
             match child {
                 Ok(child) => self.push(child, depth),
@@ -758,6 +874,25 @@ fn generic_getattr<'py>(
     }
 }
 
+/// Read the field `name` of an object with a `__dict__` that does not hold
+/// it. msgspec reads such a field only from a slot, so the type must have a
+/// member descriptor for it. Otherwise the result is an AttributeError, and
+/// the field is skipped.
+fn slot_value<'py>(
+    item: &Bound<'py, PyAny>,
+    name: &Bound<'py, PyString>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let py = item.py();
+    match type_lookup(&item.get_type(), name)? {
+        Some(descriptor)
+            if descriptor.get_type().as_type_ptr() == &raw mut ffi::PyMemberDescr_Type =>
+        {
+            descriptor.call_method1(pyo3::intern!(py, "__get__"), (item, item.get_type()))
+        }
+        _ => Err(PyAttributeError::new_err(name.clone().unbind())),
+    }
+}
+
 /// The maximum number of types in an `offsets` cache, as for the kinds.
 #[cfg(not(Py_GIL_DISABLED))]
 const MAX_CACHED_TYPES: usize = 4096;
@@ -779,26 +914,38 @@ fn read_field_offsets(
     if generic_only && !uses_generic_getattr(item_type.as_type_ptr()) {
         return Ok(None);
     }
-    let basicsize: ffi::Py_ssize_t = item_type
-        .getattr(pyo3::intern!(py, "__basicsize__"))?
+    // The getset of `type` reads the real size: a metaclass can override
+    // `__basicsize__`.
+    static BASICSIZE: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    let basicsize: ffi::Py_ssize_t = type_getset(py, &BASICSIZE, "__basicsize__")?
+        .call_method1(pyo3::intern!(py, "__get__"), (&item_type,))?
         .extract()?;
     let pointer_size = std::mem::size_of::<*mut ffi::PyObject>() as ffi::Py_ssize_t;
     let header_size = std::mem::size_of::<ffi::PyObject>() as ffi::Py_ssize_t;
     let mut offsets = Vec::with_capacity(names.len());
     for name in names.iter() {
         let name = name.cast::<PyString>()?;
-        let descriptor = match item_type.getattr(name) {
-            Ok(descriptor) => descriptor,
-            Err(err) if err.is_instance_of::<PyAttributeError>(py) => return Ok(None),
-            Err(err) => return Err(err),
+        // The lookup in the dicts of the MRO, not `getattr`: a metaclass can
+        // give any object for a name.
+        let Some(descriptor) = type_lookup(&item_type, name)? else {
+            return Ok(None);
         };
         if descriptor.get_type().as_type_ptr() != &raw mut ffi::PyMemberDescr_Type {
             return Ok(None);
         }
         // SAFETY: the object is a member descriptor, and `MemberDescr` is its
         // layout on the Python versions that the caller checked.
-        let member = unsafe { (*descriptor.as_ptr().cast::<MemberDescr>()).d_member };
-        if member.is_null() {
+        let (member, owner) = unsafe {
+            let descriptor = descriptor.as_ptr().cast::<MemberDescr>();
+            ((*descriptor).d_member, (*descriptor).d_type)
+        };
+        // The descriptor must belong to a base of the type, so its offset is
+        // inside the layout of the instance.
+        // SAFETY: both are live types, and the check runs no Python code.
+        if member.is_null()
+            || owner.is_null()
+            || unsafe { ffi::PyType_IsSubtype(item_type.as_type_ptr(), owner) } == 0
+        {
             return Ok(None);
         }
         // SAFETY: a live member descriptor points to its member definition.

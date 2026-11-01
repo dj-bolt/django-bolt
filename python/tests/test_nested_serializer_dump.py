@@ -1324,6 +1324,218 @@ def test_dump_many_of_subclass_instances_gives_the_dump_of_each_instance(base, i
     assert dumped == [instance.dump() for instance in instances]
 
 
+_LYING_METACLASS_SCAN = """
+import ctypes, dataclasses
+from typing import Any
+from django_bolt._core import find_serializer
+from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, classify
+
+Huge = type("Huge", (), {"__slots__": tuple(f"s{i:04d}" for i in range(4096))})
+target = {}
+
+class Lying(type):
+    @property
+    def __basicsize__(cls):
+        return 1 << 40
+
+    @property
+    def f(cls):
+        if "descriptor" not in target:
+            raise AttributeError("f")
+        return target["descriptor"]
+
+@dataclasses.dataclass
+class Row(metaclass=Lying):
+    f: Any
+
+rows = [Row(None) for _ in range(2000)]
+ids = [id(row) for row in rows]
+gaps = [b - a for a, b in zip(ids, ids[1:])]
+stride = max(set(gaps), key=gaps.count)
+pair = next(i for i in range(len(ids) - 1) if ids[i + 1] - ids[i] == stride)
+first, second = rows[pair], rows[pair + 1]
+marker = object()
+second.f = marker
+delta = next(d for d in range(-64, 512, 8) if ctypes.c_void_p.from_address(id(second) + d).value == id(marker))
+second.f = None
+offset = id(second) - id(first) + delta
+target["descriptor"] = Huge.__dict__[f"s{(offset - 16) // 8:04d}"]
+# The first scan can cache the offset: the word past `first` holds None, as `first.f` does.
+print(find_serializer([first], SCAN_KINDS, classify, SCAN_OFFSETS))
+# Then that word holds a pointer that no object has.
+none_pointer = ctypes.c_void_p.from_address(id(second) + delta).value
+ctypes.c_void_p.from_address(id(second) + delta).value = 0x4141414141414141
+print(find_serializer([first], SCAN_KINDS, classify, SCAN_OFFSETS))
+ctypes.c_void_p.from_address(id(second) + delta).value = none_pointer
+"""
+
+
+def test_a_metaclass_that_gives_a_false_size_or_descriptor_does_not_move_a_field_offset():
+    """The size and the descriptor come from the type object, so no offset can point past the instance."""
+    result = _run_in_subprocess(_LYING_METACLASS_SCAN)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.split() == ["False", "False"]
+
+
+_FLAKY_EQUALITY_SCAN = """
+import dataclasses, gc
+from typing import Any
+from django_bolt._core import find_serializer
+from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, classify
+
+class Flaky(type):
+    answers = []
+
+    def __eq__(cls, other):
+        if cls is other:
+            return True
+        if not isinstance(other, Flaky):
+            return NotImplemented
+        if Flaky.answers:
+            return Flaky.answers.pop(0)
+        return cls.__name__ == other.__name__
+
+    def __hash__(cls):
+        return hash(cls.__name__)
+
+def row_type(bases, own):
+    namespace = {"__slots__": tuple(own), "__annotations__": {name: Any for name in own}}
+    return dataclasses.dataclass(Flaky("Row", bases, namespace))
+
+wide_fields = tuple(f"w{i:02d}" for i in range(12))
+Wide = dataclasses.dataclass(type("Wide", (), {"__slots__": wide_fields, "__annotations__": dict.fromkeys(wide_fields, Any)}))
+
+small = row_type((), ["f"])
+find_serializer(small(None), SCAN_KINDS, classify, SCAN_OFFSETS)
+big = row_type((Wide,), ["f"])
+# The lookup misses the equal key, and the store puts the offsets of big under it.
+Flaky.answers[:] = [False, True]
+find_serializer(big(*([None] * 13)), SCAN_KINDS, classify, SCAN_OFFSETS)
+address = id(big)
+del big
+gc.collect()
+keep = []
+for _ in range(200):
+    candidate = row_type((), ["f"])
+    keep.append(candidate)
+    if id(candidate) == address:
+        break
+rows = [candidate(None) for _ in range(5000)]
+spray = [b"A" * 40 for _ in range(5000)]
+print(find_serializer(rows, SCAN_KINDS, classify, SCAN_OFFSETS))
+"""
+
+
+def test_cached_field_offsets_keep_their_type_alive():
+    """No new type can take the address of a type whose offsets the cache holds."""
+    result = _run_in_subprocess(_FLAKY_EQUALITY_SCAN)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.split() == ["False"]
+
+
+@dataclasses.dataclass
+class LabelWithOwner(str):
+    """A dataclass that subclasses str: msgspec encodes its fields."""
+
+    owner: Any = None
+
+
+@attrs.define(slots=False)
+class AttrsLabelWithOwner(str):
+    owner: Any = None
+
+
+class LabelRole(enum.Enum):
+    ADMIN = LabelWithOwner("admin")
+
+
+@dataclasses.dataclass
+class OwnerBox:
+    owner: Any = None
+
+
+class PropertyOwnerBox(OwnerBox):
+    """msgspec reads the field from __dict__, not through the property, which cannot be set."""
+
+    @property
+    def owner(self):
+        return None
+
+
+def _property_owner_box() -> PropertyOwnerBox:
+    box = PropertyOwnerBox.__new__(PropertyOwnerBox)
+    box.__dict__["owner"] = account()
+    return box
+
+
+def _label(label_type: type) -> Any:
+    label = label_type("text")
+    label.owner = account()
+    return label
+
+
+def _admin_role() -> LabelRole:
+    LabelRole.ADMIN.value.owner = account()
+    return LabelRole.ADMIN
+
+
+@pytest.mark.parametrize(
+    ("make", "expected"),
+    [
+        (lambda: [_label(LabelWithOwner)], [{"owner": DUMPED}]),
+        (lambda: [_label(AttrsLabelWithOwner)], [{"owner": DUMPED}]),
+        (lambda: [_admin_role()], [{"owner": DUMPED}]),
+        (lambda: [_property_owner_box()], [{"owner": DUMPED}]),
+    ],
+    ids=["str-dataclass", "str-attrs", "enum-of-str-dataclass", "dataclass-field-behind-a-property"],
+)
+def test_a_field_that_msgspec_encodes_gives_the_dump_of_its_serializer(make, expected):
+    """The scan and the dump read each field where msgspec reads it."""
+    assert json.loads(_json.encode(make())) == expected
+
+
+class OwnerStruct(msgspec.Struct):
+    owner: Any
+
+
+class PropertyOwnerStruct(OwnerStruct):
+    """msgspec reads the slot of the field, not the property."""
+
+    @property
+    def owner(self):
+        return None
+
+
+def test_a_struct_field_behind_a_property_fails_closed():
+    """msgspec encodes the slot. The dump cannot set it through the property, so the encode fails."""
+    value = [PropertyOwnerStruct(account())]
+    assert SECRET.encode() in msgspec.json.encode(value)
+    assert find_serializer(value, SCAN_KINDS, classify, SCAN_OFFSETS)
+    with pytest.raises(AttributeError):
+        _json.encode(value)
+
+
+class SideEffect(Serializer):
+    """Its computed field adds a Serializer to a list that the dump has already passed."""
+
+    id: int
+
+    @computed_field
+    def note(self) -> str:
+        SIDE_EFFECT_LIST.append(account())
+        return "n"
+
+
+SIDE_EFFECT_LIST: list[Any] = []
+
+
+def test_a_serializer_that_the_dump_adds_behind_itself_fails_closed():
+    """The dump scans its result again, so msgspec never gets a Serializer that the walk did not see."""
+    SIDE_EFFECT_LIST.clear()
+    with pytest.raises(TypeError, match="still holds a Serializer"):
+        _json.encode({"items": SIDE_EFFECT_LIST, "event": SideEffect(id=1)})
+
+
 def _reference(value: Any) -> Any:
     """Convert ``value`` the plain way: each Serializer gives its dump()."""
     if isinstance(value, Serializer):
