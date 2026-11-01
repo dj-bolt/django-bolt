@@ -813,5 +813,53 @@ def test_a_paginated_dict_item_that_does_not_fit_the_item_serializer_is_a_respon
     assert SECRET not in response.text
 
 
+class ArticleCamelSerializer(Serializer, rename="camel"):
+    """The wire name of ``is_published`` is ``isPublished``. A ``values()`` row has the Python name."""
+
+    id: int
+    title: str
+    is_published: bool
+    content: str = field(write_only=True)
+
+
+@pytest.fixture
+def camel_dict_items_client(db):
+    articles = [Article.objects.create(title=f"a{i}", content=SECRET, author="x") for i in range(2)]
+    api = BoltAPI()
+
+    @api.get("/values", response_model=list[ArticleCamelSerializer])
+    @paginate(PageNumberPagination)
+    async def values_route(request):
+        return Article.objects.order_by("id").values()
+
+    @api.get("/dicts")
+    @paginate(LimitOffsetPagination)
+    async def dicts_route(request) -> list[ArticleCamelSerializer]:
+        return [
+            {"id": article.id, "title": article.title, "is_published": False, "content": SECRET} for article in articles
+        ]
+
+    @api.viewset("/viewset")
+    class ArticleCamelValuesViewSet(ReadOnlyModelViewSet):
+        queryset = Article.objects.order_by("id").values()
+        serializer_class = ArticleCamelSerializer
+        pagination_class = PageNumberPagination
+
+    expected = [{"id": article.id, "title": article.title, "isPublished": False} for article in articles]
+    with TestClient(api) as client:
+        yield client, expected
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("path", ["/values", "/dicts", "/viewset"])
+def test_a_paginated_dict_item_with_python_names_fits_a_renamed_item_serializer(camel_dict_items_client, path):
+    """A dict item keeps the Python names of the fields, as before. The page gives the wire names of the dump."""
+    client, expected = camel_dict_items_client
+    response = client.get(path)
+    assert response.status_code == 200, response.text
+    assert SECRET not in response.text
+    assert response.json()["items"] == expected
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

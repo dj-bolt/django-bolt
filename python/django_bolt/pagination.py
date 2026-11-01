@@ -255,6 +255,12 @@ class PaginationBase(ABC):
             if getattr(serializer_class, "__is_bolt_serializer__", False):
                 # A dict gives the dump of the Serializer, as on a route with no
                 # pagination. The dump leaves out the write-only fields.
+                serializer_class._ensure_dump_ready()
+                rename_map = serializer_class.__rename_map__
+                if rename_map:
+                    # A dict item has the Python names of the fields, as a values() row has.
+                    # msgspec.convert reads the wire names.
+                    items = [{rename_map.get(key, key): value for key, value in item.items()} for item in items]
                 try:
                     instances = msgspec.convert(items, list[serializer_class])
                 except msgspec.ValidationError as exc:
