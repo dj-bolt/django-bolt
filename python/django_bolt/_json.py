@@ -98,6 +98,10 @@ def default_serializer(value: Any) -> Any:
         encoder = DEFAULT_TYPE_ENCODERS.get(base)
         if encoder is not None:
             result = encoder(value)
+            # Most encoders give a str, an int or a float, which cannot hold a Serializer.
+            cls = result.__class__
+            if cls is str or cls is int or cls is float:
+                return result
             if find_serializer(result, SCAN_KINDS, classify, SCAN_OFFSETS):
                 return dump_serializers(result)
             return result
