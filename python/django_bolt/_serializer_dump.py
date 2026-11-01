@@ -25,7 +25,6 @@ as much as a leaf check.
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import dataclasses
 import itertools
@@ -126,11 +125,12 @@ def _kind_of(tp: type) -> Any:
 def classify(tp: type) -> Any:
     """Return the kind of ``tp`` for the scan, and keep it in SCAN_KINDS."""
     kind = _kind_of(tp)
-    if len(SCAN_KINDS) < _SCAN_KINDS_LIMIT:
-        # A class whose metaclass has __eq__ and no __hash__ cannot be a key.
-        # It gets its kind again each time.
-        with contextlib.suppress(TypeError):
-            SCAN_KINDS[tp] = kind
+    metaclass = type(tp)
+    # A dict finds a key by equality. A metaclass with its own __eq__ or __hash__
+    # can make two classes equal, and one would get the kind of the other. Such a
+    # class, or one that cannot be a key, gets its kind again each time.
+    if metaclass.__eq__ is type.__eq__ and metaclass.__hash__ is type.__hash__ and len(SCAN_KINDS) < _SCAN_KINDS_LIMIT:
+        SCAN_KINDS[tp] = kind
     return kind
 
 

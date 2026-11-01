@@ -621,6 +621,40 @@ def test_a_type_that_cannot_be_a_dict_key_and_holds_a_serializer_fails_closed(cl
     assert SECRET not in response.text
 
 
+class _EqualByName(type):
+    """A metaclass whose classes are equal, with the same hash, when they have the same name."""
+
+    def __eq__(cls, other):
+        return isinstance(other, _EqualByName) and cls.__name__ == other.__name__
+
+    def __hash__(cls):
+        return hash(cls.__name__)
+
+
+def _named_box(holds_a_field: bool) -> type:
+    if holds_a_field:
+
+        @dataclasses.dataclass
+        class NamedBox(metaclass=_EqualByName):
+            inner: Any
+
+    else:
+
+        @dataclasses.dataclass
+        class NamedBox(metaclass=_EqualByName):
+            pass
+
+    return NamedBox
+
+
+def test_a_type_equal_to_a_type_with_no_field_still_gives_the_dump_of_its_serializer():
+    """The kind of a type must come from the type itself, not from a type that is only equal to it."""
+    empty, holder = _named_box(False), _named_box(True)
+    assert empty == holder and hash(empty) == hash(holder)
+    assert _json.encode({"empty": empty()}) == b'{"empty":{}}'
+    assert json.loads(_json.encode({"box": holder(inner=account())})) == {"box": {"inner": DUMPED}}
+
+
 @pytest.mark.parametrize("path", ["/novalidator/str", "/novalidator/none"])
 def test_a_route_with_no_response_validator_dumps_each_serializer(client, path):
     _check(client.get(path), {"user": DUMPED})
