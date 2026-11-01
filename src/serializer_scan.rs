@@ -1804,6 +1804,15 @@ def make(**fields):
                 ("[make(_hidden=Secret())]", false),
                 ("[make(public=Secret())]", true),
                 ("[make(_private=Secret())]", false),
+                ("[make(**{'1': Secret()})]", true),
+                (
+                    "[(lambda o: (o.__dict__.__setitem__(1, Secret()), o)[1])(make())]",
+                    false,
+                ),
+                (
+                    "[(lambda o: (o.__dict__.__setitem__(Text('key'), Secret()), o)[1])(make())]",
+                    false,
+                ),
                 ("[make(extra=1, public=[2, Empty()])]", false),
                 ("[make()]", false),
             ] {
