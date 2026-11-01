@@ -377,6 +377,13 @@ struct Scan<'a, 'py> {
     hot_plans: [usize; HOT_TYPES],
     #[cfg(not(Py_GIL_DISABLED))]
     next_hot: usize,
+    /// The type and the offsets of each plan in `hot_plans`, as raw parts of
+    /// the plans. `refresh_hot` makes them again after each change to
+    /// `hot_plans` or `plans`, so they always point into live plans.
+    #[cfg(not(Py_GIL_DISABLED))]
+    hot: [HotType; HOT_TYPES],
+    #[cfg(not(Py_GIL_DISABLED))]
+    hot_count: usize,
     /// The cache of the field offsets of Struct types, keyed by type.
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
     offsets: Option<&'a Bound<'py, PyDict>>,
@@ -420,10 +427,13 @@ const HOT_TYPES: usize = 4;
 #[cfg(not(Py_GIL_DISABLED))]
 struct Skipper<'s> {
     leaf_types: &'s [*mut ffi::PyTypeObject; LEAF_TYPES],
-    hot: [(*mut ffi::PyTypeObject, &'s [ffi::Py_ssize_t]); HOT_TYPES],
-    /// The number of entries of `hot` in use, from the start.
-    hot_count: usize,
+    hot: &'s [HotType],
 }
+
+/// A type that the scan read at offsets: the type, and the start and the
+/// length of its offsets in its plan.
+#[cfg(not(Py_GIL_DISABLED))]
+type HotType = (*mut ffi::PyTypeObject, *const ffi::Py_ssize_t, usize);
 
 #[cfg(not(Py_GIL_DISABLED))]
 impl Skipper<'_> {
@@ -434,26 +444,30 @@ impl Skipper<'_> {
     /// `child` points to a live object, and the thread holds the GIL.
     #[inline(always)]
     unsafe fn skips(&self, child: *mut ffi::PyObject) -> bool {
-        // SAFETY: the caller keeps `child` alive. The plan of `hot_type`
-        // checked each offset against its layout. The reads run no Python code.
+        // SAFETY: the caller keeps `child` alive. Each entry of `hot` points
+        // into a live plan, which checked each offset against the layout of
+        // its type. The reads run no Python code.
         unsafe {
             if is_skipped(child, self.leaf_types) {
                 return true;
             }
             let child_type = ffi::Py_TYPE(child);
-            let Some((_, offsets)) = self.hot[..self.hot_count]
+            let Some((_, start, count)) = self
+                .hot
                 .iter()
-                .find(|(hot_type, _)| *hot_type == child_type)
+                .find(|(hot_type, _, _)| *hot_type == child_type)
             else {
                 return false;
             };
-            offsets.iter().all(|offset| {
-                let field = *child
-                    .cast::<u8>()
-                    .offset(*offset)
-                    .cast::<*mut ffi::PyObject>();
-                field.is_null() || is_skipped(field, self.leaf_types)
-            })
+            std::slice::from_raw_parts(*start, *count)
+                .iter()
+                .all(|offset| {
+                    let field = *child
+                        .cast::<u8>()
+                        .offset(*offset)
+                        .cast::<*mut ffi::PyObject>();
+                    field.is_null() || is_skipped(field, self.leaf_types)
+                })
         }
     }
 }
@@ -478,6 +492,19 @@ impl<'a, 'py> Scan<'a, 'py> {
         }
         self.leaf_types[self.next_leaf] = item_type;
         self.next_leaf = (self.next_leaf + 1) % LEAF_TYPES;
+    }
+
+    /// Make the `hot` table again from `hot_plans` and the current plans.
+    #[cfg(not(Py_GIL_DISABLED))]
+    fn refresh_hot(&mut self) {
+        self.hot_count = 0;
+        for index in self.hot_plans {
+            if let Some((hot_type, Plan::Offsets(offsets))) = self.plans.get(index) {
+                self.hot[self.hot_count] =
+                    (hot_type.as_type_ptr(), offsets.as_ptr(), offsets.len());
+                self.hot_count += 1;
+            }
+        }
     }
 
     /// Put `frame` on the stack. At `MAX_DEPTH` frames, raise RecursionError,
@@ -507,20 +534,9 @@ impl<'a, 'py> Scan<'a, 'py> {
         loop {
             let leaf_types = &self.leaf_types;
             #[cfg(not(Py_GIL_DISABLED))]
-            let skipper = {
-                let mut hot = [(std::ptr::null_mut(), &[][..]); HOT_TYPES];
-                let mut hot_count = 0;
-                for index in self.hot_plans {
-                    if let Some((hot_type, Plan::Offsets(offsets))) = self.plans.get(index) {
-                        hot[hot_count] = (hot_type.as_type_ptr(), &offsets[..]);
-                        hot_count += 1;
-                    }
-                }
-                Skipper {
-                    leaf_types,
-                    hot,
-                    hot_count,
-                }
+            let skipper = Skipper {
+                leaf_types,
+                hot: &self.hot[..self.hot_count],
             };
             #[cfg(Py_GIL_DISABLED)]
             let skipper = *leaf_types;
@@ -550,9 +566,16 @@ impl<'a, 'py> Scan<'a, 'py> {
                 }
                 Frame::List(list, index) => next_list_item(py, list, index, &skipper, self.layouts),
                 Frame::Tuple(tuple, index) => next_tuple_item(py, tuple, index, &skipper),
-                Frame::Iter(iter) => match iter.next() {
-                    Some(child) => Some(child?),
-                    None => None,
+                Frame::Iter(iter) => loop {
+                    match iter.next() {
+                        Some(child) => {
+                            let child = child?;
+                            if !is_exact_leaf(&child) {
+                                break Some(child);
+                            }
+                        }
+                        None => break None,
+                    }
                 },
                 Frame::Values { next, .. } => {
                     if *next < self.values.len() {
@@ -570,15 +593,22 @@ impl<'a, 'py> Scan<'a, 'py> {
         }
     }
 
-    /// Look at `item`: skip it, put a frame for it on the stack, or return
-    /// true if it is a Serializer. The scan holds a strong reference to
-    /// `item`, so the Python code of a kind lookup cannot free it.
+    /// Look at `item`, which is not an exact leaf: skip it, put a frame for
+    /// it on the stack, or return true if it is a Serializer. The scan holds
+    /// a strong reference to `item`, so the Python code of a kind lookup
+    /// cannot free it.
     fn enter(&mut self, item: Bound<'py, PyAny>) -> PyResult<bool> {
-        if is_exact_leaf(&item) {
-            return Ok(false);
-        }
         // SAFETY: `item` is alive, so its type is alive. The read runs no Python code.
         let type_ptr = unsafe { ffi::Py_TYPE(item.as_ptr()) };
+        #[cfg(not(Py_GIL_DISABLED))]
+        if type_ptr == &raw mut ffi::PyDict_Type {
+            self.push_frame(Frame::Dict(item, 0))?;
+            return Ok(false);
+        }
+        if type_ptr == &raw mut ffi::PyList_Type {
+            self.push_frame(Frame::List(item, 0))?;
+            return Ok(false);
+        }
         if is_exact_container_type(type_ptr) {
             self.push_container(item)?;
             return Ok(false);
@@ -630,6 +660,9 @@ impl<'a, 'py> Scan<'a, 'py> {
             let index = self.next_plan;
             self.plans[index] = (item_type.clone(), plan);
             self.next_plan = (index + 1) % PLAN_TYPES;
+            // The old plan of this entry is gone: no hot entry may point into it.
+            #[cfg(not(Py_GIL_DISABLED))]
+            self.refresh_hot();
             index
         };
         self.read_fields(&item, index)
@@ -842,6 +875,7 @@ impl<'a, 'py> Scan<'a, 'py> {
         if matches!(self.plans[index].1, Plan::Offsets(_)) && !self.hot_plans.contains(&index) {
             self.hot_plans[self.next_hot] = index;
             self.next_hot = (self.next_hot + 1) % HOT_TYPES;
+            self.refresh_hot();
         }
         let start = self.values.len();
         let Scan {
@@ -1391,6 +1425,10 @@ pub fn find_serializer<'py>(
         hot_plans: [usize::MAX; HOT_TYPES],
         #[cfg(not(Py_GIL_DISABLED))]
         next_hot: 0,
+        #[cfg(not(Py_GIL_DISABLED))]
+        hot: [(std::ptr::null_mut(), std::ptr::null(), 0); HOT_TYPES],
+        #[cfg(not(Py_GIL_DISABLED))]
+        hot_count: 0,
         offsets,
         #[cfg(not(Py_GIL_DISABLED))]
         layouts: layouts_known(value.py()),
