@@ -316,7 +316,7 @@ enum Plan<'py> {
     /// The fields are object slots at these offsets: a Struct, or a dataclass
     /// whose objects have no `__dict__` and whose fields are plain slots.
     #[cfg(not(Py_GIL_DISABLED))]
-    Offsets(Box<[ffi::Py_ssize_t]>),
+    Offsets(std::rc::Rc<[ffi::Py_ssize_t]>),
     /// A Struct whose fields the scan cannot read in place.
     Struct(Bound<'py, PyTuple>),
     /// A dataclass. msgspec reads each key of `__dataclass_fields__`.
@@ -377,13 +377,12 @@ struct Scan<'a, 'py> {
     hot_plans: [usize; HOT_TYPES],
     #[cfg(not(Py_GIL_DISABLED))]
     next_hot: usize,
-    /// The type and the offsets of each plan in `hot_plans`, as raw parts of
-    /// the plans. `refresh_hot` makes them again after each change to
-    /// `hot_plans` or `plans`, so they always point into live plans.
+    /// The type and the offsets of each plan in `hot_plans`. Each entry owns
+    /// its type and its offsets, so it stays valid when its plan goes.
+    /// `refresh_hot` makes the entries again after a change to `hot_plans`
+    /// or `plans`.
     #[cfg(not(Py_GIL_DISABLED))]
-    hot: [HotType; HOT_TYPES],
-    #[cfg(not(Py_GIL_DISABLED))]
-    hot_count: usize,
+    hot: Vec<HotType<'py>>,
     /// The cache of the field offsets of Struct types, keyed by type.
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
     offsets: Option<&'a Bound<'py, PyDict>>,
@@ -425,18 +424,17 @@ const HOT_TYPES: usize = 4;
 /// also of a few types such as a tagged union, thus costs a few pointer
 /// reads for each item.
 #[cfg(not(Py_GIL_DISABLED))]
-struct Skipper<'s> {
+struct Skipper<'s, 'py> {
     leaf_types: &'s [*mut ffi::PyTypeObject; LEAF_TYPES],
-    hot: &'s [HotType],
+    hot: &'s [HotType<'py>],
 }
 
-/// A type that the scan read at offsets: the type, and the start and the
-/// length of its offsets in its plan.
+/// A type that the scan read at offsets, and its offsets.
 #[cfg(not(Py_GIL_DISABLED))]
-type HotType = (*mut ffi::PyTypeObject, *const ffi::Py_ssize_t, usize);
+type HotType<'py> = (Bound<'py, PyType>, std::rc::Rc<[ffi::Py_ssize_t]>);
 
 #[cfg(not(Py_GIL_DISABLED))]
-impl Skipper<'_> {
+impl Skipper<'_, '_> {
     /// Whether the loop skips `child`.
     ///
     /// # Safety
@@ -444,30 +442,28 @@ impl Skipper<'_> {
     /// `child` points to a live object, and the thread holds the GIL.
     #[inline(always)]
     unsafe fn skips(&self, child: *mut ffi::PyObject) -> bool {
-        // SAFETY: the caller keeps `child` alive. Each entry of `hot` points
-        // into a live plan, which checked each offset against the layout of
-        // its type. The reads run no Python code.
+        // SAFETY: the caller keeps `child` alive. Each entry of `hot` holds
+        // its type and the offsets that its plan checked against the layout
+        // of that type. The reads run no Python code.
         unsafe {
             if is_skipped(child, self.leaf_types) {
                 return true;
             }
             let child_type = ffi::Py_TYPE(child);
-            let Some((_, start, count)) = self
+            let Some((_, offsets)) = self
                 .hot
                 .iter()
-                .find(|(hot_type, _, _)| *hot_type == child_type)
+                .find(|(hot_type, _)| hot_type.as_type_ptr() == child_type)
             else {
                 return false;
             };
-            std::slice::from_raw_parts(*start, *count)
-                .iter()
-                .all(|offset| {
-                    let field = *child
-                        .cast::<u8>()
-                        .offset(*offset)
-                        .cast::<*mut ffi::PyObject>();
-                    field.is_null() || is_skipped(field, self.leaf_types)
-                })
+            offsets.iter().all(|offset| {
+                let field = *child
+                    .cast::<u8>()
+                    .offset(*offset)
+                    .cast::<*mut ffi::PyObject>();
+                field.is_null() || is_skipped(field, self.leaf_types)
+            })
         }
     }
 }
@@ -497,12 +493,10 @@ impl<'a, 'py> Scan<'a, 'py> {
     /// Make the `hot` table again from `hot_plans` and the current plans.
     #[cfg(not(Py_GIL_DISABLED))]
     fn refresh_hot(&mut self) {
-        self.hot_count = 0;
+        self.hot.clear();
         for index in self.hot_plans {
             if let Some((hot_type, Plan::Offsets(offsets))) = self.plans.get(index) {
-                self.hot[self.hot_count] =
-                    (hot_type.as_type_ptr(), offsets.as_ptr(), offsets.len());
-                self.hot_count += 1;
+                self.hot.push((hot_type.clone(), offsets.clone()));
             }
         }
     }
@@ -536,7 +530,7 @@ impl<'a, 'py> Scan<'a, 'py> {
             #[cfg(not(Py_GIL_DISABLED))]
             let skipper = Skipper {
                 leaf_types,
-                hot: &self.hot[..self.hot_count],
+                hot: &self.hot,
             };
             #[cfg(Py_GIL_DISABLED)]
             let skipper = *leaf_types;
@@ -660,7 +654,7 @@ impl<'a, 'py> Scan<'a, 'py> {
             let index = self.next_plan;
             self.plans[index] = (item_type.clone(), plan);
             self.next_plan = (index + 1) % PLAN_TYPES;
-            // The old plan of this entry is gone: no hot entry may point into it.
+            // The entry has a new type: the hot table follows it.
             #[cfg(not(Py_GIL_DISABLED))]
             self.refresh_hot();
             index
@@ -765,7 +759,7 @@ impl<'a, 'py> Scan<'a, 'py> {
         if names.is_exact_instance_of::<PyTuple>() {
             #[cfg(not(Py_GIL_DISABLED))]
             if let Some(offsets) = self.struct_offsets(item, item_type, &names)? {
-                return Ok(Plan::Offsets(offsets));
+                return Ok(Plan::Offsets(offsets.into()));
             }
             return Ok(Plan::Struct(names));
         }
@@ -792,7 +786,7 @@ impl<'a, 'py> Scan<'a, 'py> {
             && self.layouts
             && let Some(offsets) = read_field_offsets(item, &names, true)?
         {
-            return Ok(Plan::Offsets(offsets.into_boxed_slice()));
+            return Ok(Plan::Offsets(offsets.into()));
         }
         let mut descriptors = Vec::with_capacity(names.len());
         for name in names.iter() {
@@ -1046,7 +1040,7 @@ fn next_list_item<'py>(
     py: Python<'py>,
     list: &Bound<'py, PyAny>,
     index: &mut ffi::Py_ssize_t,
-    #[cfg(not(Py_GIL_DISABLED))] skipper: &Skipper<'_>,
+    #[cfg(not(Py_GIL_DISABLED))] skipper: &Skipper<'_, '_>,
     #[cfg(Py_GIL_DISABLED)] leaf_types: &[*mut ffi::PyTypeObject; LEAF_TYPES],
     layouts: bool,
 ) -> Option<Bound<'py, PyAny>> {
@@ -1101,7 +1095,7 @@ fn next_tuple_item<'py>(
     py: Python<'py>,
     tuple: &Bound<'py, PyAny>,
     index: &mut ffi::Py_ssize_t,
-    #[cfg(not(Py_GIL_DISABLED))] skipper: &Skipper<'_>,
+    #[cfg(not(Py_GIL_DISABLED))] skipper: &Skipper<'_, '_>,
     #[cfg(Py_GIL_DISABLED)] leaf_types: &[*mut ffi::PyTypeObject; LEAF_TYPES],
 ) -> Option<Bound<'py, PyAny>> {
     // SAFETY: the frame holds the tuple. The checks before the new reference
@@ -1426,9 +1420,7 @@ pub fn find_serializer<'py>(
         #[cfg(not(Py_GIL_DISABLED))]
         next_hot: 0,
         #[cfg(not(Py_GIL_DISABLED))]
-        hot: [(std::ptr::null_mut(), std::ptr::null(), 0); HOT_TYPES],
-        #[cfg(not(Py_GIL_DISABLED))]
-        hot_count: 0,
+        hot: Vec::new(),
         offsets,
         #[cfg(not(Py_GIL_DISABLED))]
         layouts: layouts_known(value.py()),
@@ -1802,6 +1794,44 @@ KINDS[Plain] = Attributes(('inner',))
             &classify,
             Some(offsets),
         )
+    }
+
+    #[test]
+    fn more_types_than_the_plan_table_holds_keep_their_own_offsets() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = fixtures(py);
+            // 24 slotted types: the plan table holds 16, so the scan replaces
+            // plans while the list loops read the last types in place.
+            let code = c"
+types = []
+for index in range(24):
+    cls = type(f'Slotted{index}', (), {'__slots__': ('pad' * (index % 3), 'inner') if index % 3 else ('inner',)})
+    KINDS[cls] = ('inner',)
+    types.append(cls)
+
+def make(index, inner):
+    obj = types[index]()
+    obj.inner = inner
+    return obj
+
+clean = [make(index % 24, index) for index in range(240)]
+late = clean + [make(5, Secret())]
+early = [make(3, Secret())] + clean
+";
+            py.run(code, Some(&module.dict()), None).unwrap();
+            let offsets = PyDict::new(py);
+            for _ in 0..3 {
+                for (expr, expected) in [("clean", false), ("late", true), ("early", true)] {
+                    let value = eval(&module, expr);
+                    assert_eq!(
+                        scan_with_offsets(&module, &value, &offsets).unwrap(),
+                        expected,
+                        "{expr}"
+                    );
+                }
+            }
+        });
     }
 
     #[test]
