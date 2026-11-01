@@ -1344,7 +1344,8 @@ class Lying(type):
             raise AttributeError("f")
         return target["descriptor"]
 
-@dataclasses.dataclass
+# Slots keep `second.f` inside `second`. On 3.12 the values of an instance dict are a separate block.
+@dataclasses.dataclass(slots=True)
 class Row(metaclass=Lying):
     f: Any
 
@@ -1359,7 +1360,7 @@ second.f = marker
 delta = next(d for d in range(-64, 512, 8) if ctypes.c_void_p.from_address(id(second) + d).value == id(marker))
 second.f = None
 offset = id(second) - id(first) + delta
-target["descriptor"] = Huge.__dict__[f"s{(offset - 16) // 8:04d}"]
+target["descriptor"] = Huge.__dict__[f"s{(offset - object.__basicsize__) // 8:04d}"]
 # The first scan can cache the offset: the word past `first` holds None, as `first.f` does.
 print(find_serializer([first], SCAN_KINDS, classify, SCAN_OFFSETS))
 # Then that word holds a pointer that no object has.
