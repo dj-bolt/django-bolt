@@ -2605,7 +2605,9 @@ class SerializerView(Iterable[T]):
             exclude_defaults=exclude_defaults,
             by_alias=by_alias,
         )
-        return msgspec.json.encode(data)
+        # The dump can keep a Serializer in a field that is not a nested field.
+        # _json.encode gives its dump. msgspec alone sends all of its fields.
+        return _json.encode(data)
 
     def dump_many_json(
         self,
@@ -2624,4 +2626,4 @@ class SerializerView(Iterable[T]):
             exclude_defaults=exclude_defaults,
             by_alias=by_alias,
         )
-        return msgspec.json.encode(data)
+        return _json.encode(data)

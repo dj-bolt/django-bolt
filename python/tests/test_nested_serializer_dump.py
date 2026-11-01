@@ -787,6 +787,41 @@ def test_dump_gives_the_dump_of_each_serializer_in_its_fields(case):
     assert SECRET.encode() in _json._ENCODER.encode(value)
 
 
+class ReviewedPost(Serializer):
+    """The dump of a view keeps the Serializers in ``reviewers``: it is not a nested field."""
+
+    id: int
+    internal_note: str = field(write_only=True)
+    reviewers: dict[str, Account]
+    extra: Any = None
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/view-json", {"id": 1, "reviewers": {"lead": DUMPED}}),
+        ("/view-many-json", [{"id": 1, "reviewers": {"lead": DUMPED}}]),
+    ],
+)
+def test_the_json_of_a_serializer_view_gives_the_dump_of_each_serializer_in_it(path, expected):
+    api = BoltAPI()
+    card = ReviewedPost.only("id", "reviewers")
+
+    def reviewed_post() -> ReviewedPost:
+        return ReviewedPost(id=1, internal_note=SECRET, reviewers={"lead": account()})
+
+    @api.get("/view-json")
+    def view_json():
+        return Response(card.dump_json(reviewed_post()), media_type="application/json")
+
+    @api.get("/view-many-json")
+    def view_many_json():
+        return Response(ReviewedPost.exclude("extra").dump_many_json([reviewed_post()]), media_type="application/json")
+
+    with TestClient(api) as test_client:
+        _check(test_client.get(path), expected)
+
+
 def test_a_deeply_nested_response_fails_as_before():
     """A value deeper than the recursion limit gives a 500 and the worker keeps serving."""
     api = BoltAPI()
