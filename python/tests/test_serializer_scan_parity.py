@@ -20,6 +20,7 @@ import sys
 import textwrap
 import weakref
 from dataclasses import InitVar
+from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -372,6 +373,152 @@ def test_the_hidden_field_plans_do_not_keep_serializers_that_an_app_makes_at_run
     gc.collect()
     assert len(_hidden_fields._STRIPPERS) <= 512
     assert sum(ref() is not None for ref in refs) <= 512
+
+
+# Classes that a metaclass makes equal. A dict finds a key by equality, so each
+# cache entry holds its class and counts only for that class itself.
+
+
+class EqualByName(type):
+    """Two classes with the same name are equal and have the same hash."""
+
+    def __eq__(cls, other: object) -> bool:
+        return isinstance(other, type) and cls.__name__ == other.__name__
+
+    def __hash__(cls) -> int:
+        return hash(cls.__name__)
+
+
+class SerializerEqualByName(type(Serializer)):
+    __eq__ = EqualByName.__eq__
+    __hash__ = EqualByName.__hash__
+
+
+def _equal_serializers(name: str) -> tuple[type[Serializer], type[Serializer]]:
+    """Return two equal Serializer classes: the first sends the password, the second hides it."""
+    annotations = {"id": int, "password": str}
+    shown = SerializerEqualByName(name, (Serializer,), {"__annotations__": annotations})
+    hidden = SerializerEqualByName(
+        name, (Serializer,), {"__annotations__": annotations, "password": field(write_only=True)}
+    )
+    assert shown == hidden
+    return shown, hidden
+
+
+class Shade(Enum):
+    DARK = "dark"
+
+
+def _posing_as(target: type) -> type:
+    """Return a metaclass whose classes are equal to ``target`` and have its hash."""
+
+    class Posing(type):
+        def __eq__(cls, other: object) -> bool:
+            return other is target or other is cls
+
+        def __hash__(cls) -> int:
+            return hash(target)
+
+    return Posing
+
+
+class Stored:
+    """A data descriptor that keeps the value under another key of the ``__dict__``."""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.key = f"_{name}"
+
+    def __get__(self, obj: Any, cls: type | None = None) -> Any:
+        return None if obj is None else obj.__dict__.get(self.key)
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        obj.__dict__[self.key] = value
+
+
+def test_a_serializer_that_equals_another_class_keeps_its_own_hidden_fields():
+    """The plan of a class with no hidden field must not serve an equal class with a write-only field."""
+    shown, hidden = _equal_serializers("EqualAccount")
+    api = BoltAPI()
+
+    @api.get("/shown", response_model={200: shown})
+    def shown_route():
+        return 200, {"id": 1, "password": SECRET}
+
+    @api.get("/hidden", response_model={200: hidden})
+    def hidden_route():
+        return 200, {"id": 1, "password": SECRET}
+
+    with TestClient(api) as test_client:
+        assert test_client.get("/shown").json() == {"id": 1, "password": SECRET}
+        _check(test_client.get("/hidden"), {"id": 1})
+
+
+def test_a_dict_row_of_a_serializer_that_equals_another_class_keeps_its_own_projection():
+    """Pagination projects each dict row onto the fields of the Serializer, without its hidden fields."""
+    shown, hidden = _equal_serializers("EqualRow")
+    rows = [{"id": 1, "password": SECRET}]
+    assert _hidden_fields.project_dict_rows(shown, rows) == rows
+    assert _hidden_fields.project_dict_rows(hidden, rows) == [{"id": 1}]
+
+
+def test_a_class_that_equals_a_leaf_type_is_scanned_with_its_own_kind():
+    """A dataclass that poses as an Enum with leaf values must not get the kind of the Enum."""
+    sneaky = dataclasses.dataclass(_posing_as(Shade)("Sneaky", (), {"__annotations__": {"owner": Any}}))
+    api = BoltAPI()
+
+    @api.get("/shade")
+    def shade_route():
+        return {"shade": Shade.DARK}
+
+    @api.get("/sneaky")
+    def sneaky_route():
+        return {"item": sneaky(owner=account())}
+
+    with TestClient(api) as test_client:
+        _check(test_client.get("/shade"), {"shade": "dark"})
+        _check(test_client.get("/sneaky"), {"item": {"owner": DUMPED}})
+
+
+def test_a_dataclass_that_equals_another_dataclass_is_read_with_its_own_rule():
+    """The dump reads a data descriptor field of the second class, as msgspec reads it."""
+    plain = dataclasses.dataclass(EqualByName("Box", (), {"__annotations__": {"owner": Any}}))
+    stored = dataclasses.dataclass(EqualByName("Box", (), {"__annotations__": {"owner": Any}, "owner": Stored()}))
+    assert plain == stored
+    api = BoltAPI()
+
+    @api.get("/plain")
+    def plain_route():
+        return [plain(owner=account())]
+
+    @api.get("/stored")
+    def stored_route():
+        return [stored(owner=account())]
+
+    with TestClient(api) as test_client:
+        _check(test_client.get("/plain"), [{"owner": DUMPED}])
+        _check(test_client.get("/stored"), [{"owner": DUMPED}])
+
+
+def test_an_attrs_class_that_equals_another_attrs_class_is_read_with_its_own_slots():
+    """The dump reads the public slot of the base of the second class, as msgspec reads it."""
+    first = attrs.define(EqualByName("Badge", (), {"__annotations__": {"owner": Any}}))
+    second = attrs.define(EqualByName("Badge", (PlainSlotBase,), {"__annotations__": {"owner": Any}}))
+    assert first == second
+    api = BoltAPI()
+
+    @api.get("/first")
+    def first_route():
+        return [first(owner=account())]
+
+    @api.get("/second")
+    def second_route():
+        item = second(owner=None)
+        item.extra = account()
+        return [item]
+
+    with TestClient(api) as test_client:
+        _check(test_client.get("/first"), [{"owner": DUMPED}])
+        _check(test_client.get("/second"), [{"owner": None, "extra": DUMPED}])
 
 
 _PACKAGE_ROOT = str(Path(django_bolt.__file__).resolve().parents[1])

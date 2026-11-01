@@ -5,7 +5,8 @@ its write-only fields and lost its computed fields. ``_json.encode`` asks the
 Rust scan ``find_serializer`` whether a value holds a Serializer. Only then
 does ``dump_serializers`` rebuild the value with the dump of each Serializer.
 
-The scan reads the kind of each type from ``SCAN_KINDS``:
+The scan reads the kind of each type from ``SCAN_KINDS``. An entry holds its
+type and its kind, and counts only for that type itself. The kind is one of:
 
 - ``None``: the scan does not look into a value of the type.
 - ``True``: the type is a Serializer whose dump() differs from the
@@ -39,22 +40,19 @@ from uuid import UUID
 
 import msgspec
 
+from ._class_cache import MISSING, recall, remember
 from ._core import find_serializer
 
 # The types of values that cannot hold a Serializer. An Enum is a leaf only
 # when each member value is a leaf: see _enum_is_leaf.
 _LEAF_TYPES = (str, int, float, bytes, bytearray, memoryview, datetime, date, time, timedelta, UUID, Decimal)
 
-SCAN_KINDS: dict[type, Any] = {}
+# The kind of each type, as (type, kind): see _class_cache. The Rust scan also
+# uses an entry only for its own type.
+SCAN_KINDS: dict[type, tuple[type, Any]] = {}
 # The slot offsets of the fields of each Struct type. The Rust scan fills it.
 SCAN_OFFSETS: dict[type, Any] = {}
 
-# The maximum number of types in each cache. When a cache is full, its oldest
-# type goes: a dict keeps the order of insertion. Thus the caches keep a
-# bounded number of types alive when an app makes types at runtime.
-_CACHE_LIMIT = 512
-
-_MISSING = object()
 _MEMBER_DESCRIPTOR = types.MemberDescriptorType
 
 
@@ -127,12 +125,12 @@ _TYPE_DICT = type.__dict__["__dict__"]
 
 
 def _type_lookup(tp: type, name: str) -> Any:
-    """Return the attribute ``name`` of ``tp`` from the dicts of its MRO, or ``_MISSING``."""
+    """Return the attribute ``name`` of ``tp`` from the dicts of its MRO, or ``MISSING``."""
     for base in _TYPE_MRO.__get__(tp):
         namespace = _TYPE_DICT.__get__(base)
         if name in namespace:
             return namespace[name]
-    return _MISSING
+    return MISSING
 
 
 def _field_names(tp: type) -> tuple[str, ...] | None:
@@ -164,36 +162,21 @@ def _kind_of(tp: type) -> Any:
     return _field_names(tp)
 
 
-def _remember(cache: dict[Any, Any], key: Any, value: Any) -> None:
-    """Keep ``value`` in ``cache``. When the cache is full, its oldest entry goes."""
-    if len(cache) >= _CACHE_LIMIT:
-        try:
-            del cache[next(iter(cache))]
-        except (KeyError, RuntimeError, StopIteration):
-            # Another thread changed the cache. It is a cache, so the entry stays out.
-            return
-    cache[key] = value
-
-
 def classify(tp: type) -> Any:
     """Return the kind of ``tp`` for the scan, and keep it in SCAN_KINDS."""
     kind = _kind_of(tp)
     metaclass = type(tp)
-    # A dict finds a key by equality. A metaclass with its own __eq__ or __hash__
-    # can make two classes equal, and one would get the kind of the other. Such a
-    # class, or one that cannot be a key, gets its kind again each time.
+    # A metaclass with its own __eq__ or __hash__ can make two classes equal.
+    # Their entries would then replace each other in the cache. Such a class
+    # gets its kind again each time.
     if metaclass.__eq__ is type.__eq__ and metaclass.__hash__ is type.__hash__:
-        _remember(SCAN_KINDS, tp, kind)
+        remember(SCAN_KINDS, tp, kind)
     return kind
 
 
 def _kind_of_instance(value: Any) -> Any:
-    """Return the kind of the class of ``value``, or ``_MISSING`` if SCAN_KINDS does not hold it."""
-    try:
-        return SCAN_KINDS.get(value.__class__, _MISSING)
-    except TypeError:
-        # A class that cannot be a key: see classify.
-        return _MISSING
+    """Return the kind of the class of ``value``, or ``MISSING`` if SCAN_KINDS does not hold it."""
+    return recall(SCAN_KINDS, value.__class__)
 
 
 # The walk asks the Rust scan before it goes into an item only at the first
@@ -252,9 +235,9 @@ def _items(value: list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]) -> An
 # The read rule of each dataclass type: (whether it uses the attribute lookup of
 # object, the data descriptor of each name or None). An entry can be old: then
 # the dump reads a field where msgspec does not, and dump_serializers fails closed.
-_DATACLASS_RULES: dict[type, tuple[bool, tuple[Any, ...]]] = {}
+_DATACLASS_RULES: dict[type, tuple[type, tuple[bool, tuple[Any, ...]]]] = {}
 # The member descriptors of the public object slots of each attrs type.
-_OBJECT_SLOTS: dict[type, tuple[Any, ...]] = {}
+_OBJECT_SLOTS: dict[type, tuple[type, tuple[Any, ...]]] = {}
 
 # Where a field value comes from, and thus where the dump writes its new value.
 _IN_DICT = 0
@@ -264,7 +247,7 @@ _BY_GETATTR = 2
 
 def _uses_generic_getattr(cls: type) -> bool:
     """Return whether ``cls`` uses the attribute lookup of ``object``, with no ``__getattr__``."""
-    return cls.__getattribute__ is object.__getattribute__ and _type_lookup(cls, "__getattr__") is _MISSING
+    return cls.__getattribute__ is object.__getattribute__ and _type_lookup(cls, "__getattr__") is MISSING
 
 
 def _is_data_descriptor(attribute: Any) -> bool:
@@ -276,15 +259,15 @@ def _is_data_descriptor(attribute: Any) -> bool:
 
 
 def _dataclass_rule(cls: type, names: tuple[str, ...]) -> tuple[bool, tuple[Any, ...]]:
-    rule = _DATACLASS_RULES.get(cls)
-    if rule is None:
+    rule = recall(_DATACLASS_RULES, cls)
+    if rule is MISSING:
         generic = _uses_generic_getattr(cls)
         descriptors = []
         for name in names:
-            attribute = _type_lookup(cls, name) if generic else _MISSING
-            descriptors.append(attribute if attribute is not _MISSING and _is_data_descriptor(attribute) else None)
+            attribute = _type_lookup(cls, name) if generic else MISSING
+            descriptors.append(attribute if attribute is not MISSING and _is_data_descriptor(attribute) else None)
         rule = (generic, tuple(descriptors))
-        _remember(_DATACLASS_RULES, cls, rule)
+        remember(_DATACLASS_RULES, cls, rule)
     return rule
 
 
@@ -327,8 +310,8 @@ def _dataclass_fields(value: Any, names: tuple[str, ...]) -> list[tuple[int, Any
 
 def _object_slots(cls: type) -> tuple[Any, ...]:
     """Return the member descriptors of the public object slots of ``cls`` and its bases."""
-    slots = _OBJECT_SLOTS.get(cls)
-    if slots is None:
+    slots = recall(_OBJECT_SLOTS, cls)
+    if slots is MISSING:
         found = []
         owner: type | None = cls
         while owner is not None:
@@ -341,7 +324,7 @@ def _object_slots(cls: type) -> tuple[Any, ...]:
                     found.append(attribute)
             owner = owner.__base__
         slots = tuple(found)
-        _remember(_OBJECT_SLOTS, cls, slots)
+        remember(_OBJECT_SLOTS, cls, slots)
     return slots
 
 
@@ -405,7 +388,7 @@ def _dump(value: Any, depth: int) -> Any:
     if cls is str or cls is int or cls is float or cls is bool or cls is bytes or value is None:
         return value
     kind = _kind_of_instance(value)
-    if kind is _MISSING:
+    if kind is MISSING:
         kind = classify(cls)
     if kind is None:
         return value
@@ -449,8 +432,8 @@ def _dump(value: Any, depth: int) -> Any:
             "Bolt cannot dump the Serializer that it holds without a change to the object."
         )
     for where, key, item in fields:
-        new_item = changes.get((where, key), _MISSING)
-        if new_item is not _MISSING:
+        new_item = changes.get((where, key), MISSING)
+        if new_item is not MISSING:
             # A field that does not give back the dumped value still holds the
             # Serializer for msgspec. dump_serializers then finds it and raises.
             _write_field(clone, where, key, new_item)

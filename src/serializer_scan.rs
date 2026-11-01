@@ -618,9 +618,16 @@ impl<'a, 'py> Scan<'a, 'py> {
             return Ok(false);
         }
         let item_type = item.get_type();
-        let kind = match self.kinds.get_item(&item_type) {
-            Ok(Some(kind)) => kind,
-            Ok(None) => {
+        let cached = match self.kinds.get_item(&item_type) {
+            Ok(entry) => entry.and_then(|entry| own_kind(entry, &item_type)),
+            // A type whose metaclass has __eq__ and no __hash__ cannot be a
+            // key, so it gets its kind each time.
+            Err(err) if err.is_instance_of::<PyTypeError>(self.py) => None,
+            Err(err) => return Err(err),
+        };
+        let kind = match cached {
+            Some(kind) => kind,
+            None => {
                 // `classify` never gets a container or a scalar subclass, so
                 // only a type that `kinds` does not hold needs these checks.
                 if self.enter_by_flags(&item, &item_type)? {
@@ -628,15 +635,6 @@ impl<'a, 'py> Scan<'a, 'py> {
                 }
                 self.classify.call1((&item_type,))?
             }
-            // A type whose metaclass has __eq__ and no __hash__ cannot be a
-            // key, so it gets its kind each time.
-            Err(err) if err.is_instance_of::<PyTypeError>(self.py) => {
-                if self.enter_by_flags(&item, &item_type)? {
-                    return Ok(false);
-                }
-                self.classify.call1((&item_type,))?
-            }
-            Err(err) => return Err(err),
         };
         if kind.is_none() {
             self.add_leaf_type(type_ptr);
@@ -1369,10 +1367,27 @@ fn holds_only_scalars(value: &Bound<'_, PyAny>) -> bool {
     false
 }
 
+/// Return the kind in the `kinds` entry `entry`, if the entry is for `item_type`.
+///
+/// An entry is a `(type, kind)` tuple. A dict finds a key by equality, and a
+/// metaclass can make two types equal. Thus an entry counts only for its own
+/// type, and any other entry is a miss.
+fn own_kind<'py>(
+    entry: Bound<'py, PyAny>,
+    item_type: &Bound<'py, PyType>,
+) -> Option<Bound<'py, PyAny>> {
+    let entry = entry.cast_into_exact::<PyTuple>().ok()?;
+    if entry.len() != 2 || !entry.get_borrowed_item(0).ok()?.is(item_type) {
+        return None;
+    }
+    entry.get_item(1).ok()
+}
+
 /// Return whether `value` holds an object whose kind marks a Serializer.
 ///
 /// The scan visits the items of dicts, lists, tuples, sets and frozensets.
-/// For each other object, `kinds` maps its type to a kind:
+/// For each other object, `kinds` maps its type to a `(type, kind)` tuple.
+/// The scan uses an entry only for the type that it holds. A kind is one of:
 ///
 /// - `None`: the scan does not visit the object.
 /// - a tuple of field names: the fields of a Struct, which the scan reads
@@ -1525,7 +1540,7 @@ class Attributes(tuple):
     pass
 
 calls = []
-KINDS = {Holder: ('inner', 'missing')}
+KINDS = {Holder: (Holder, ('inner', 'missing'))}
 
 def classify(tp):
     calls.append(tp)
@@ -1535,7 +1550,7 @@ def classify(tp):
         kind = ('inner', 'missing')
     else:
         kind = None
-    KINDS[tp] = kind
+    KINDS[tp] = (tp, kind)
     return kind
 
 def kinds():
@@ -1627,6 +1642,55 @@ def kinds():
             assert!(!scan(&module, &value).unwrap());
             let calls = eval(&module, "[tp.__name__ for tp in calls]");
             assert_eq!(calls.extract::<Vec<String>>().unwrap(), vec!["Empty"]);
+        });
+    }
+
+    #[test]
+    fn a_kinds_entry_counts_only_for_its_own_type() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = fixtures(py);
+            // These classes are equal to Empty and have its hash, so a dict
+            // lookup finds the entry of Empty for them.
+            let code = c"
+class PosingAsEmpty(type):
+    def __eq__(cls, other):
+        return other is Empty or other is cls
+    def __hash__(cls):
+        return hash(Empty)
+
+class Hidden(metaclass=PosingAsEmpty):
+    pass
+
+class HiddenDict(dict, metaclass=PosingAsEmpty):
+    pass
+
+KINDS[Empty] = (Empty, None)
+classify_others = classify
+
+def classify(tp):
+    return True if tp is Hidden else classify_others(tp)
+";
+            py.run(code, Some(&module.dict()), None).unwrap();
+            assert!(
+                eval(&module, "KINDS[Hidden] == (Empty, None)")
+                    .is_truthy()
+                    .unwrap()
+            );
+            for expr in [
+                "Hidden()",
+                "[Empty(), Hidden()]",
+                "HiddenDict(a=Secret())",
+                "{'k': HiddenDict(a=[Secret()])}",
+            ] {
+                assert!(scan(&module, &eval(&module, expr)).unwrap(), "{expr}");
+            }
+            // This sets the entry of Empty. An entry that is not a
+            // (type, kind) pair is a miss too.
+            py.run(c"KINDS[Hidden] = None", Some(&module.dict()), None)
+                .unwrap();
+            assert!(eval(&module, "KINDS[Empty] is None").is_truthy().unwrap());
+            assert!(scan(&module, &eval(&module, "Hidden()")).unwrap());
         });
     }
 
@@ -1745,10 +1809,10 @@ class Plain:
     def __init__(self, inner):
         self.inner = inner
 
-KINDS[Masked] = ('inner',)
-KINDS[MaskedFields] = Attributes(('inner',))
-KINDS[Lazy] = Attributes(('inner',))
-KINDS[Plain] = Attributes(('inner',))
+KINDS[Masked] = (Masked, ('inner',))
+KINDS[MaskedFields] = (MaskedFields, Attributes(('inner',)))
+KINDS[Lazy] = (Lazy, Attributes(('inner',)))
+KINDS[Plain] = (Plain, Attributes(('inner',)))
 ";
             py.run(code, Some(&module.dict()), None).unwrap();
             for offsets in [None, Some(PyDict::new(py))] {
@@ -1807,7 +1871,7 @@ KINDS[Plain] = Attributes(('inner',))
 types = []
 for index in range(24):
     cls = type(f'Slotted{index}', (), {'__slots__': ('pad' * (index % 3), 'inner') if index % 3 else ('inner',)})
-    KINDS[cls] = ('inner',)
+    KINDS[cls] = (cls, ('inner',))
     types.append(cls)
 
 def make(index, inner):
@@ -1854,8 +1918,8 @@ class Obj(SlotBase):
 class Gone(SlotBase):
     pass
 
-KINDS[Obj] = ObjectKind()
-KINDS[Gone] = ObjectKind()
+KINDS[Obj] = (Obj, ObjectKind())
+KINDS[Gone] = (Gone, ObjectKind())
 
 def make(**fields):
     obj = Obj()
@@ -1941,8 +2005,8 @@ class OwnLookup:
     def __getattr__(self, name):
         raise LookupError(name)
 
-KINDS[Row] = Attributes(('actor', 'price', 'plain', 'computed', 'missing'))
-KINDS[OwnLookup] = Attributes(('inner',))
+KINDS[Row] = (Row, Attributes(('actor', 'price', 'plain', 'computed', 'missing')))
+KINDS[OwnLookup] = (OwnLookup, Attributes(('inner',)))
 
 def row(**fields):
     item = Row()
@@ -1989,8 +2053,8 @@ class Shadowed:
     def tag(self):
         return Secret()
 
-KINDS[Slotted] = ('inner', 'tag')
-KINDS[Shadowed] = ('inner', 'tag')
+KINDS[Slotted] = (Slotted, ('inner', 'tag'))
+KINDS[Shadowed] = (Shadowed, ('inner', 'tag'))
 ";
             py.run(code, Some(&module.dict()), None).unwrap();
             let offsets = PyDict::new(py);
@@ -2053,8 +2117,15 @@ def make(count):
 
 Small = make(1)
 Big = make(16)
-KINDS[Small] = ('f0',)
-KINDS[Big] = tuple(f'f{index}' for index in range(16))
+classify_others = classify
+
+# The two types share one kinds entry, so the kind of each comes from here.
+def classify(tp):
+    if tp is Small:
+        return ('f0',)
+    if tp is Big:
+        return tuple(f'f{index}' for index in range(16))
+    return classify_others(tp)
 ";
             py.run(code, Some(&module.dict()), None).unwrap();
             let offsets = PyDict::new(py);

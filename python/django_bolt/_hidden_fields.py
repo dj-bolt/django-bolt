@@ -10,7 +10,8 @@ dataclass or a TypedDict also loses its hidden keys. A value that is not a
 dict or a list stays as it is. The response encoder dumps each Serializer
 instance.
 
-Bolt makes the plan of a class once, at its first use, and keeps it.
+Bolt makes the plan of a class at its first use. A cache of ``_class_cache``
+keeps it.
 """
 
 from __future__ import annotations
@@ -26,32 +27,18 @@ from typing import Annotated, Any, ForwardRef, Literal, Union, get_args, get_ori
 
 import msgspec
 
+from ._class_cache import MISSING, recall, remember
+
 Stripper = Callable[[Any], Any]
 
-_MISSING = object()
-
-# The maximum number of classes in each cache. When a cache is full, its
-# oldest class goes: a dict keeps the order of insertion. Thus the caches keep
-# a bounded number of classes alive when an app makes classes at runtime.
-_CACHE_LIMIT = 512
-
-
-def _remember(cache: dict[Any, Any], key: Any, value: Any) -> None:
-    """Keep ``value`` in ``cache``. When the cache is full, its oldest entry goes."""
-    if len(cache) >= _CACHE_LIMIT:
-        try:
-            del cache[next(iter(cache))]
-        except (KeyError, RuntimeError, StopIteration):
-            # Another thread changed the cache. It is a cache, so the entry stays out.
-            return
-    cache[key] = value
-
-
-# The plan of each class: a function that removes the hidden keys, or None
-# when the class has no hidden key at any position.
-_STRIPPERS: dict[type, Stripper | None] = {}
+# The plan of each class: the class, and a function that removes the hidden
+# keys or None when the class has no hidden key at any position.
+_STRIPPERS: dict[type, tuple[type, Stripper | None]] = {}
 # The projection of a dict row onto the fields of each Serializer.
-_ROW_PROJECTORS: dict[type, Callable[[list[Any]], list[dict[Any, Any]]]] = {}
+_ROW_PROJECTORS: dict[type, tuple[type, Callable[[list[Any]], list[dict[Any, Any]]]]] = {}
+# During a build, the plan of each class or type alias, by id: (the key, its plan).
+# An id finds only the object itself, also for two classes that are equal.
+Building = dict[int, tuple[Any, "Stripper | None"]]
 
 # The origins of the annotations whose values have one item type.
 _SEQUENCE_ORIGINS = frozenset(
@@ -91,8 +78,8 @@ def without_hidden_fields(serializer_cls: Any, value: Any) -> Any:
     The function does not change ``value``. It gives a new dict or list for
     each level that it goes into.
     """
-    strip = _STRIPPERS.get(serializer_cls, _MISSING)
-    if strip is _MISSING:
+    strip = recall(_STRIPPERS, serializer_cls)
+    if strip is MISSING:
         strip = _plan(serializer_cls)
     return value if strip is None else strip(value)
 
@@ -104,29 +91,29 @@ def project_dict_rows(serializer_cls: Any, rows: list[Any]) -> list[dict[Any, An
     A field that the row does not have is None. A nested value loses its
     hidden keys, as in ``without_hidden_fields``.
     """
-    project = _ROW_PROJECTORS.get(serializer_cls)
-    if project is None:
+    project = recall(_ROW_PROJECTORS, serializer_cls)
+    if project is MISSING:
         project = _build_row_projector(serializer_cls)
-        _remember(_ROW_PROJECTORS, serializer_cls, project)
+        remember(_ROW_PROJECTORS, serializer_cls, project)
     return project(rows)
 
 
 def _plan(cls: type) -> Stripper | None:
-    building: dict[Any, Stripper | None] = {}
+    building: Building = {}
     stripper = _class_stripper(cls, building)
     _publish(building)
     return stripper
 
 
-def _publish(building: dict[Any, Stripper | None]) -> None:
+def _publish(building: Building) -> None:
     """Keep the plan of each class that a complete build made."""
-    for key, stripper in building.items():
+    for key, stripper in building.values():
         if isinstance(key, type):
-            _remember(_STRIPPERS, key, stripper)
+            remember(_STRIPPERS, key, stripper)
 
 
 def _build_row_projector(cls: Any) -> Callable[[list[Any]], list[dict[Any, Any]]]:
-    building: dict[Any, Stripper | None] = {}
+    building: Building = {}
     _, fields = _class_fields(cls) or (frozenset(), [])
     names = tuple(name for name, _, _ in fields)
     parts = tuple(
@@ -155,31 +142,32 @@ def _build_row_projector(cls: Any) -> Callable[[list[Any]], list[dict[Any, Any]]
     return project_nested
 
 
-def _guarded(key: Any, building: dict[Any, Stripper | None], build: Callable[[], Stripper | None]) -> Stripper | None:
+def _guarded(key: Any, building: Building, build: Callable[[], Stripper | None]) -> Stripper | None:
     """Build the plan of ``key`` once, also when ``key`` refers to itself.
 
     During the build, a reference to ``key`` gets a function that calls the
     plan when the build is complete. Thus a self reference does not recurse
     without end.
     """
-    stripper = building.get(key, _MISSING)
-    if stripper is not _MISSING:
-        return stripper
+    entry = building.get(id(key))
+    if entry is not None:
+        return entry[1]
     cell: list[Stripper] = []
 
     def forward(value: Any) -> Any:
         return cell[0](value)
 
-    building[key] = forward
+    # The entry holds the key, so no other object can take its id during the build.
+    building[id(key)] = (key, forward)
     stripper = build()
     cell.append(_keep if stripper is None else stripper)
-    building[key] = stripper
+    building[id(key)] = (key, stripper)
     return stripper
 
 
-def _class_stripper(cls: type, building: dict[Any, Stripper | None]) -> Stripper | None:
-    stripper = _STRIPPERS.get(cls, _MISSING)
-    if stripper is not _MISSING:
+def _class_stripper(cls: type, building: Building) -> Stripper | None:
+    stripper = recall(_STRIPPERS, cls)
+    if stripper is not MISSING:
         return stripper
 
     def build() -> Stripper | None:
@@ -300,7 +288,7 @@ def _holds_forward_ref(annotation: Any) -> bool:
     return any(_holds_forward_ref(arg) for arg in args)
 
 
-def _annotation_stripper(annotation: Any, owner: type, building: dict[Any, Stripper | None]) -> Stripper | None:
+def _annotation_stripper(annotation: Any, owner: type, building: Building) -> Stripper | None:
     """Return the plan for a value of the type ``annotation``, or None when no key is hidden in it.
 
     An annotation that the plan does not know gets None, so its value stays as it is.
