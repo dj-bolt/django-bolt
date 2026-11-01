@@ -26,10 +26,10 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 import django_bolt
-from django_bolt import BoltAPI, EventSourceResponse, ServerSentEvent, WebSocket, _json
+from django_bolt import BoltAPI, EventSourceResponse, ServerSentEvent, StreamingResponse, WebSocket, _json
 from django_bolt._core import find_serializer
 from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, classify
-from django_bolt.exceptions import SerializationError
+from django_bolt.exceptions import HTTPException, SerializationError
 from django_bolt.responses import JSON, Response
 from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.testing import TestClient, WebSocketTestClient
@@ -864,6 +864,266 @@ async def test_a_serializer_sent_on_a_websocket_gives_its_dump():
 
 def test_an_encode_with_a_custom_hook_gives_the_dump_of_each_serializer():
     assert json.loads(_json.encode({"account": account()}, serializer=str)) == {"account": DUMPED}
+
+
+class Owner:
+    """A type that msgspec cannot encode. msgspec calls the encoder hook for it."""
+
+    def __init__(self, pk: int) -> None:
+        self.pk = pk
+
+
+# msgspec encodes the return value of a hook natively, after the scan.
+_HOOK_RESULTS = {
+    "serializer": (lambda owner: Account(id=owner.pk, password=SECRET), DUMPED),
+    "list": (lambda owner: [Account(id=owner.pk, password=SECRET)], [DUMPED]),
+    "struct": (lambda owner: Envelope(account=Account(id=owner.pk, password=SECRET)), {"account": DUMPED, "note": "n"}),
+}
+
+
+@pytest.mark.parametrize("result", _HOOK_RESULTS)
+def test_a_serializer_that_a_default_type_encoder_returns_gives_its_dump(monkeypatch, result):
+    hook, expected = _HOOK_RESULTS[result]
+    monkeypatch.setitem(_json.DEFAULT_TYPE_ENCODERS, Owner, hook)
+    api = BoltAPI()
+
+    @api.get("/owner")
+    def owner_route():
+        return {"owner": Owner(1)}
+
+    with TestClient(api) as test_client:
+        _check(test_client.get("/owner"), {"owner": expected})
+
+
+@pytest.mark.parametrize("result", _HOOK_RESULTS)
+def test_a_serializer_that_a_custom_hook_returns_gives_its_dump(result):
+    hook, expected = _HOOK_RESULTS[result]
+    encoded = _json.encode({"owner": Owner(1)}, serializer=hook)
+    assert SECRET.encode() not in encoded
+    assert json.loads(encoded) == {"owner": expected}
+
+
+# A Serializer with rename= or tag= dumps with msgspec.to_builtins when it has
+# no write-only, computed or nested field of its own. A field of these
+# Serializers is not a nested field, but it can hold a Serializer.
+
+
+class CamelEnvelope(Serializer, rename="camel"):
+    request_id: str
+    data: Any
+
+
+class TaggedEnvelope(Serializer, tag=True):
+    data: Any
+
+
+class CamelTeam(Serializer, rename="camel"):
+    team_name: str
+    members_by_role: dict[str, Account]
+    pair: tuple[Account, ...] = ()
+
+
+class OmittingEnvelope(Serializer, rename="camel", omit_defaults=True):
+    inner_data: Any = None
+    note_text: str = "n"
+
+
+class CamelPost(Serializer, rename="camel"):
+    """``author`` names a class below, so the type hints fail at class creation."""
+
+    post_id: int
+    author: LaterAccount
+
+
+class LaterAccount(Serializer):
+    id: int
+    password: str = field(write_only=True)
+
+
+class CamelComment(Serializer, rename="camel"):
+    """The self reference makes the type hints fail at class creation."""
+
+    comment_id: int
+    author: Account
+    replies: list[CamelComment] = []
+
+
+_DUMP_CASES = {
+    "any": (lambda: CamelEnvelope(request_id="r", data=account()), {"requestId": "r", "data": DUMPED}),
+    "tag": (lambda: TaggedEnvelope(data=[account()]), {"type": "TaggedEnvelope", "data": [DUMPED]}),
+    "dict-and-tuple": (
+        lambda: CamelTeam(team_name="t", members_by_role={"owner": account()}, pair=(account(),)),
+        {"teamName": "t", "membersByRole": {"owner": DUMPED}, "pair": [DUMPED]},
+    ),
+    "omit-defaults": (lambda: OmittingEnvelope(inner_data=account()), {"innerData": DUMPED}),
+    "forward-ref": (
+        lambda: CamelPost(post_id=1, author=LaterAccount(id=1, password=SECRET)),
+        {"postId": 1, "author": {"id": 1}},
+    ),
+    "self-ref": (
+        lambda: CamelComment(comment_id=1, author=account(), replies=[CamelComment(comment_id=2, author=account())]),
+        {"commentId": 1, "author": DUMPED, "replies": [{"commentId": 2, "author": DUMPED, "replies": []}]},
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def dump_client():
+    api = BoltAPI()
+
+    @api.get("/dump/{name}")
+    def dump_route(name: str):
+        return _DUMP_CASES[name][0]()
+
+    @api.get("/dump-typed/envelope")
+    async def dump_typed_envelope() -> CamelEnvelope:
+        return CamelEnvelope(request_id="r", data=account())
+
+    @api.get("/dump-typed/teams")
+    def dump_typed_teams() -> list[CamelTeam]:
+        return [CamelTeam(team_name="t", members_by_role={"owner": account()})]
+
+    with TestClient(api) as test_client:
+        yield test_client
+
+
+@pytest.mark.parametrize("case", _DUMP_CASES)
+def test_a_serializer_in_a_field_of_a_renamed_or_tagged_serializer_gives_its_dump(dump_client, case):
+    _check(dump_client.get(f"/dump/{case}"), _DUMP_CASES[case][1])
+
+
+def test_a_typed_route_dumps_the_serializer_in_a_field_of_its_serializer(dump_client):
+    _check(dump_client.get("/dump-typed/envelope"), {"requestId": "r", "data": DUMPED})
+    _check(dump_client.get("/dump-typed/teams"), [{"teamName": "t", "membersByRole": {"owner": DUMPED}, "pair": []}])
+
+
+@pytest.mark.parametrize("case", _DUMP_CASES)
+def test_dump_gives_the_dump_of_each_serializer_in_its_fields(case):
+    factory, expected = _DUMP_CASES[case]
+    value = factory()
+    assert value.dump() == expected
+    assert type(value).dump_many([value, factory()]) == [expected, expected]
+    # The dump does not change the value: it still holds the Serializer.
+    assert SECRET.encode() in _json._ENCODER.encode(value)
+
+
+class ReviewedPost(Serializer):
+    """The dump of a view keeps the Serializers in ``reviewers``: it is not a nested field."""
+
+    id: int
+    internal_note: str = field(write_only=True)
+    reviewers: dict[str, Account]
+    extra: Any = None
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/view-json", {"id": 1, "reviewers": {"lead": DUMPED}}),
+        ("/view-many-json", [{"id": 1, "reviewers": {"lead": DUMPED}}]),
+    ],
+)
+def test_the_json_of_a_serializer_view_gives_the_dump_of_each_serializer_in_it(path, expected):
+    api = BoltAPI()
+    card = ReviewedPost.only("id", "reviewers")
+
+    def reviewed_post() -> ReviewedPost:
+        return ReviewedPost(id=1, internal_note=SECRET, reviewers={"lead": account()})
+
+    @api.get("/view-json")
+    def view_json():
+        return Response(card.dump_json(reviewed_post()), media_type="application/json")
+
+    @api.get("/view-many-json")
+    def view_many_json():
+        return Response(ReviewedPost.exclude("extra").dump_many_json([reviewed_post()]), media_type="application/json")
+
+    with TestClient(api) as test_client:
+        _check(test_client.get(path), expected)
+
+
+class Login(Serializer, repr_omit_defaults=True):
+    """A Serializer with each kind of field that dump() does not send."""
+
+    id: int
+    password: str = field(write_only=True)
+    token: str = ""
+    internal: str = field(exclude=True, default="i")
+    name: str = "anon"
+    links: list[Any] = []
+
+    class Config:
+        write_only = {"token"}
+
+
+def test_the_repr_of_a_serializer_leaves_out_the_fields_that_dump_does_not_send():
+    assert repr(account()) == "Account(id=1)"
+    assert str(account()) == "Account(id=1)"
+    assert repr({"user": [account()]}) == "{'user': [Account(id=1)]}"
+    assert repr(Login(id=1, password=SECRET, token=SECRET, internal=SECRET)) == "Login(id=1)"
+    assert repr(Login(id=2, password=SECRET, name="bob")) == "Login(id=2, name='bob')"
+    assert list(Login(id=2, password=SECRET, name="bob").__rich_repr__()) == [("id", 2), ("name", "bob")]
+    # A cycle gives "...", as in the repr of msgspec.
+    login = Login(id=3, password=SECRET)
+    login.links.append(login)
+    assert repr(login) == "Login(id=3, links=[...])"
+    # A Serializer that hides no field keeps the repr of msgspec.
+    assert repr(Public(id=1)) == "Public(id=1)"
+
+
+@pytest.fixture(scope="module")
+def str_client():
+    api = BoltAPI()
+
+    @api.get("/gen")
+    def gen():
+        # No Iterator[...] annotation: Bolt sends str() of each chunk.
+        yield {"user": account()}
+
+    @api.get("/agen")
+    async def agen():
+        yield account()
+
+    @api.get("/streaming-response")
+    def streaming_response():
+        return StreamingResponse(iter([account()]), media_type="text/plain")
+
+    @api.get("/text-json")
+    def text_json():
+        # Bolt does not read text/json as a JSON media type, so it sends str(content).
+        return Response({"user": account()}, media_type="text/json")
+
+    @api.get("/http-exception")
+    def http_exception():
+        raise HTTPException(409, detail={"error": "email taken", "user": account()})
+
+    with TestClient(api) as test_client:
+        yield test_client
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/gen", "{'user': Account(id=1)}"),
+        ("/agen", "Account(id=1)"),
+        ("/streaming-response", "Account(id=1)"),
+        ("/text-json", "{'user': Account(id=1)}"),
+    ],
+    ids=["gen", "agen", "streaming-response", "text-json"],
+)
+def test_a_value_that_bolt_sends_as_its_str_never_shows_a_write_only_value(str_client, path, body):
+    response = str_client.get(path)
+    assert response.status_code == 200
+    assert SECRET not in response.text
+    assert response.text == body
+
+
+def test_the_detail_of_an_http_exception_never_shows_a_write_only_value(str_client):
+    """HTTPException keeps str(detail) for a detail that is not a str, as before."""
+    response = str_client.get("/http-exception")
+    assert response.status_code == 409
+    assert SECRET not in response.text
+    assert response.json() == {"detail": "{'error': 'email taken', 'user': Account(id=1)}"}
 
 
 def test_a_deeply_nested_response_fails_as_before():

@@ -22,7 +22,7 @@ from django_bolt.serialization import (
     serialize_response,
     serialize_response_sync,
 )
-from django_bolt.serializers import Serializer
+from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.testing import TestClient
 from tests.test_models import Article
 
@@ -868,3 +868,88 @@ def test_a_serializer_entry_converts_model_instances(is_async):
     assert (tuple_response.status_code, tuple_response.json()) == (200, expected), tuple_response.text
     assert (json_response.status_code, json_response.json()) == (200, expected), json_response.text
     assert (created_response.status_code, created_response.json()) == (201, [{"title": "One"}]), created_response.text
+
+
+SECRET = "s3cret-value"
+
+
+class AccountSchema(Serializer):
+    id: int
+    password: str = field(write_only=True)
+
+    @computed_field
+    def label(self) -> str:
+        return f"account-{self.id}"
+
+
+class CamelAccountSchema(Serializer, rename="camel"):
+    user_id: int
+    password_hash: str = field(write_only=True)
+
+
+ACCOUNT_DUMP = {"id": 1, "label": "account-1"}
+_ACCOUNT_RESPONSES = {200: AccountSchema, 201: list[AccountSchema], 202: CamelAccountSchema, 404: ErrorSchema}
+
+
+@pytest.fixture(scope="module", params=[False, True], ids=["sync", "async"])
+def account_client(request):
+    api = BoltAPI()
+    body = {"id": 1, "password": SECRET}
+    bodies = {
+        "/tuple": (200, body),
+        "/bare": body,
+        "/json": JSON(body, status_code=200),
+        "/list": (201, [body, {"id": 2, "password": SECRET}]),
+        "/mismatched": (200, {"wrong_field": "no id", "password": SECRET}),
+        "/camel-mismatched": (202, {"userId": "not-an-int", "passwordHash": SECRET, "password_hash": SECRET}),
+    }
+    for path, result in bodies.items():
+        if request.param:
+
+            async def handler(result=result):
+                await asyncio.sleep(0)
+                return result
+
+        else:
+
+            def handler(result=result):
+                return result
+
+        api.get(path, response_model=_ACCOUNT_RESPONSES)(handler)
+
+    with TestClient(api) as client:
+        yield client
+
+
+@pytest.mark.parametrize(
+    ("path", "status", "expected"),
+    [
+        ("/tuple", 200, ACCOUNT_DUMP),
+        ("/bare", 200, ACCOUNT_DUMP),
+        ("/json", 200, ACCOUNT_DUMP),
+        ("/list", 201, [ACCOUNT_DUMP, {"id": 2, "label": "account-2"}]),
+    ],
+)
+def test_a_serializer_entry_gives_the_dump_of_a_dict_body(account_client, path, status, expected):
+    """A dict body gives the dump of the Serializer: no write-only field, and the computed fields."""
+    response = account_client.get(path)
+    assert response.status_code == status, response.text
+    assert SECRET not in response.text
+    assert response.json() == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "status", "expected"),
+    [
+        ("/mismatched", 200, {"wrong_field": "no id"}),
+        ("/camel-mismatched", 202, {"userId": "not-an-int"}),
+    ],
+)
+def test_a_dict_body_that_does_not_fit_its_serializer_entry_has_no_write_only_field(
+    account_client, path, status, expected
+):
+    """Bolt does not validate the body. It sends the dict, but not the write-only fields."""
+    response = account_client.get(path)
+    assert response.status_code == status, response.text
+    assert SECRET not in response.text
+    assert response.json() == expected
