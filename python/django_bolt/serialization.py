@@ -376,18 +376,47 @@ def _dump_status_dict(serializer_cls: Any, value: dict) -> Any:
         instance = msgspec.convert(value, serializer_cls)
     except msgspec.ValidationError:
         # Not an error: the body of a status code is not validated.
-        serializer_cls._ensure_dump_ready()
-        hidden = serializer_cls.__hidden_fields__
-        rename_map = serializer_cls.__rename_map__
-        field_configs = serializer_cls.__field_configs__
-        # A hidden field can have three keys: its name, its wire name and its alias.
-        hidden_keys = (
-            hidden
-            | {rename_map.get(name, name) for name in hidden}
-            | {config.alias for name, config in field_configs.items() if name in hidden and config.alias}
-        )
-        return {key: item for key, item in value.items() if key not in hidden_keys}
+        return _without_hidden_fields(serializer_cls, value)
     return instance.dump()
+
+
+def _without_hidden_fields(serializer_cls: Any, value: Any) -> Any:
+    """Return the dict ``value`` without the fields that dump() never sends.
+
+    The function also goes into each nested Serializer field, so a nested dict
+    loses its hidden fields too. Any other value comes back as it is.
+    """
+    if not isinstance(value, dict):
+        return value
+    serializer_cls._ensure_dump_ready()
+    hidden = serializer_cls.__hidden_fields__
+    rename_map = serializer_cls.__rename_map__
+    field_configs = serializer_cls.__field_configs__
+    # A field can have three keys: its name, its wire name and its alias.
+    hidden_keys = (
+        hidden
+        | {rename_map.get(name, name) for name in hidden}
+        | {config.alias for name, config in field_configs.items() if name in hidden and config.alias}
+    )
+    nested_by_key = {
+        key: spec.nested
+        for spec in serializer_cls._dump_field_specs
+        if spec.nested is not None
+        for key in (spec.field_name, spec.output_key, spec.alias)
+        if key is not None
+    }
+    result = {}
+    for key, item in value.items():
+        if key in hidden_keys:
+            continue
+        nested = nested_by_key.get(key)
+        if nested is not None:
+            if nested.many and isinstance(item, (list, tuple)):
+                item = [_without_hidden_fields(nested.serializer_class, element) for element in item]
+            else:
+                item = _without_hidden_fields(nested.serializer_class, item)
+        result[key] = item
+    return result
 
 
 def _is_serializer_instance(value: Any) -> bool:

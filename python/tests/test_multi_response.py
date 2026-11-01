@@ -947,6 +947,14 @@ class CamelAccountSchema(Serializer, rename="camel"):
     password_hash: str = field(write_only=True)
 
 
+class ProfileSchema(Serializer):
+    """Its nested fields hold Serializers with a write-only field."""
+
+    name: str
+    account: AccountSchema
+    friends: list[AccountSchema] = []
+
+
 class AliasAccountSchema(Serializer):
     """``dump(by_alias=True)`` names the write-only field ``pwd``."""
 
@@ -960,6 +968,8 @@ _ACCOUNT_RESPONSES = {
     201: list[AccountSchema],
     202: CamelAccountSchema,
     203: AliasAccountSchema,
+    206: ProfileSchema,
+    207: list[ProfileSchema],
     404: ErrorSchema,
 }
 
@@ -976,6 +986,9 @@ def account_client(request):
         "/mismatched": (200, {"wrong_field": "no id", "password": SECRET}),
         "/camel-mismatched": (202, {"userId": "not-an-int", "passwordHash": SECRET, "password_hash": SECRET}),
         "/alias-mismatched": (203, {"id": "not-an-int", "pwd": SECRET}),
+        "/nested-mismatched": (206, {"name": None, "account": {"id": 1, "password": SECRET}}),
+        "/nested-list-mismatched": (206, {"account": {"id": 1}, "friends": [{"id": 2, "password": SECRET}]}),
+        "/many-mismatched": (207, [{"name": None, "account": {"id": 1, "password": SECRET}}]),
     }
     for path, result in bodies.items():
         if request.param:
@@ -1018,6 +1031,9 @@ def test_a_serializer_entry_gives_the_dump_of_a_dict_body(account_client, path, 
         ("/mismatched", 200, {"wrong_field": "no id"}),
         ("/camel-mismatched", 202, {"userId": "not-an-int"}),
         ("/alias-mismatched", 203, {"id": "not-an-int"}),
+        ("/nested-mismatched", 206, {"name": None, "account": {"id": 1}}),
+        ("/nested-list-mismatched", 206, {"account": {"id": 1}, "friends": [{"id": 2}]}),
+        ("/many-mismatched", 207, [{"name": None, "account": {"id": 1}}]),
     ],
 )
 def test_a_dict_body_that_does_not_fit_its_serializer_entry_has_no_write_only_field(
