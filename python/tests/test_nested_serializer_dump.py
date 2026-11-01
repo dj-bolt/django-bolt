@@ -628,7 +628,13 @@ def test_a_route_with_no_response_validator_dumps_each_serializer(client, path):
 
 @pytest.mark.parametrize(
     "value",
-    [Public(id=1), CamelEnvelope(request_id="r", data=[1, "x"]), TaggedPublic(id=1), OmitDefaults(id=1), ArrayLike(id=1)],
+    [
+        Public(id=1),
+        CamelEnvelope(request_id="r", data=[1, "x"]),
+        TaggedPublic(id=1),
+        OmitDefaults(id=1),
+        ArrayLike(id=1),
+    ],
     ids=lambda value: type(value).__name__,
 )
 def test_a_serializer_with_no_serializer_inside_encodes_as_its_dump(value):
