@@ -25,6 +25,7 @@ PYTHON_ROOT = Path(__file__).resolve().parents[1]
 
 _DEEP_JSON_ON_TEST_WORKERS = """
 import json
+import sys
 
 import django
 from django.conf import settings
@@ -35,8 +36,10 @@ django.setup()
 from django_bolt.testing import TestClient
 from tests.integration.apps.deep_json import api, lane_api
 
-# This depth fits the stack of the main thread. It overflowed a 2 MiB stack.
-DEEP = 7_000
+# On Python 3.12 and 3.13, this depth overflowed a 2 MiB stack. Bolt gives its
+# threads 8 MiB there. Python 3.14 checks the stack itself, so the threads keep
+# 2 MiB, and a smaller depth fits them.
+DEEP = 7_000 if sys.version_info < (3, 14) else 2_000
 # No thread stack holds this depth. The decoder raises RecursionError.
 TOO_DEEP = 100_000
 

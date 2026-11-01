@@ -8,12 +8,16 @@ with SIGSEGV. Only a real server runs requests on Actix worker threads.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from .apps import app_module
 
-# This depth fits the stack of the main thread. It overflowed a 2 MiB stack.
-DEEP = 7_000
+# On Python 3.12 and 3.13, this depth overflowed a 2 MiB stack. Bolt gives its
+# threads 8 MiB there. Python 3.14 checks the stack itself, so the threads keep
+# 2 MiB, and a smaller depth fits them.
+DEEP = 7_000 if sys.version_info < (3, 14) else 2_000
 # No thread stack holds this depth. The decoder raises RecursionError.
 TOO_DEEP = 100_000
 
