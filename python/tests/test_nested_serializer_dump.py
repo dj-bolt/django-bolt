@@ -11,9 +11,11 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
+import logging
 import subprocess
 import sys
 import textwrap
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -1180,6 +1182,111 @@ def test_a_deeply_nested_response_fails_as_before():
         assert response.status_code == 500
         assert SECRET not in response.text
         _check(test_client.get("/ok"), {"account": DUMPED})
+
+
+@dataclasses.dataclass
+class TreePad:
+    """The scan reads a dataclass field with an attribute lookup, so each pad costs the most."""
+
+    width: int = 0
+    height: int = 0
+
+
+class TreeNode(msgspec.Struct, omit_defaults=True):
+    """A body type that a client can nest: each node can hold a Serializer."""
+
+    child: TreeNode | None = None
+    pads: list[TreePad] = []
+    owner: Account | None = None
+
+
+def _tree_body(depth: int, pads: int) -> bytes:
+    """Return a tree ``depth`` nodes deep with ``pads`` pads at each node and the Serializer at the bottom."""
+    body = '{"owner":{"id":1,"password":"' + SECRET + '"}}'
+    pad_list = '"pads":[' + ",".join(["{}"] * pads) + "]"
+    for _ in range(depth):
+        body = '{"child":' + body + "," + pad_list + "}"
+    return body.encode()
+
+
+@pytest.fixture(scope="module")
+def tree_client():
+    api = BoltAPI()
+
+    @api.post("/tree")
+    def tree(data: TreeNode):
+        return data
+
+    with TestClient(api, raise_server_exceptions=False) as test_client:
+        yield test_client
+
+
+def _post_tree(test_client, depth: int, pads: int):
+    return test_client.post("/tree", content=_tree_body(depth, pads), headers={"content-type": "application/json"})
+
+
+def test_a_serializer_deep_in_a_tree_that_the_handler_returns_gives_its_dump(tree_client):
+    response = _post_tree(tree_client, 300, 10)
+    assert response.status_code == 200, response.text
+    assert SECRET not in response.text
+    node = response.json()
+    for _ in range(300):
+        node = node["child"]
+    assert node == {"owner": DUMPED}
+
+
+def test_a_serializer_deep_in_a_tree_costs_time_linear_in_the_size_of_the_tree(tree_client):
+    """Each level of the dump scanned the whole subtree below it again, so a 1 MB body held the GIL for 20 s."""
+    start = time.process_time()
+    response = _post_tree(tree_client, 3000, 100)
+    elapsed = time.process_time() - start
+    # The tree is deeper than the dump can go, so the response fails closed.
+    assert response.status_code == 500
+    assert SECRET not in response.text
+    assert elapsed < 10, f"the dump took {elapsed:.1f} s of CPU"
+
+
+def test_a_serializer_too_deep_to_dump_logs_a_short_error(tree_client, caplog):
+    """The error of the dump names the cause. Its traceback has no frame for each level of the value."""
+    caplog.set_level(logging.ERROR)
+    response = _post_tree(tree_client, 600, 0)
+    assert response.status_code == 500
+    logged = "\n".join(logging.Formatter().format(record) for record in caplog.records)
+    assert "nested too deeply" in logged
+    assert len(logged) < 20_000, f"{len(logged)} bytes of log for one request"
+
+
+class HidingDict(dict):
+    """A dict whose methods hide its entries. msgspec reads the storage of a dict."""
+
+    def items(self):
+        return iter(())
+
+    def keys(self):
+        return iter(())
+
+    def __iter__(self):
+        return iter(())
+
+
+class HidingList(list):
+    """A list whose iterator hides its items. msgspec reads the storage of a list."""
+
+    def __iter__(self):
+        return iter(())
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ({"wrap": HidingDict(plain=1, account=account())}, {"wrap": {"plain": 1, "account": DUMPED}}),
+        ({"rows": HidingList([account()])}, {"rows": [DUMPED]}),
+        ({"rows": HidingList([1, account()])}, {"rows": [1, DUMPED]}),
+    ],
+    ids=["dict-items", "list-iter", "list-iter-after-a-leaf"],
+)
+def test_a_container_that_overrides_its_iteration_gives_the_dump_of_its_serializer(value, expected):
+    assert json.loads(_json.encode(value)) == expected
 
 
 def _reference(value: Any) -> Any:

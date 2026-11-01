@@ -143,61 +143,75 @@ def _kind_of_instance(value: Any) -> Any:
         return _MISSING
 
 
-def _dump_item(item: Any) -> Any:
+# The walk asks the Rust scan before it goes into an item only at the first
+# levels. Below them it goes into each item. Thus the scans cost at most this
+# many passes over the value, also when a client nests a Serializer deep in
+# data that the handler returns.
+_SCAN_DEPTH = 8
+
+
+def _dump_item(item: Any, depth: int) -> Any:
     """Return ``item`` with its Serializers dumped, or ``item`` itself if it holds none.
 
     The walk skips each str, int, float, bool and None item before the call.
-    A Serializer or a leaf costs one kind lookup. Each other item asks the
-    Rust scan first, so the walk goes only into the items that hold a
-    Serializer.
+    A Serializer or a leaf costs one kind lookup. Above ``_SCAN_DEPTH``, each
+    other item asks the Rust scan first, so the walk goes only into the items
+    that hold a Serializer.
     """
     kind = _kind_of_instance(item)
     if kind is True:
         dumped = item.dump()
-        return _dump_dict(dumped) if dumped.__class__ is dict else dump_serializers(dumped)
-    if kind is None or not find_serializer(item, SCAN_KINDS, classify, SCAN_OFFSETS):
+        return _dump_dict(dumped, depth) if dumped.__class__ is dict else _dump(dumped, depth)
+    if kind is None:
         return item
-    return dump_serializers(item)
+    if depth < _SCAN_DEPTH and not find_serializer(item, SCAN_KINDS, classify, SCAN_OFFSETS):
+        return item
+    return _dump(item, depth + 1)
 
 
-def _dump_dict(value: dict[Any, Any]) -> dict[Any, Any]:
+def _dump_dict(value: dict[Any, Any], depth: int) -> dict[Any, Any]:
     """Return ``value``, or a copy with the dump of each Serializer that it holds."""
     dumped: dict[Any, Any] | None = None
-    for key, item in value.items():
+    # dict.items reads the storage, as msgspec and the scan do. A subclass can override items().
+    for key, item in dict.items(value):
         # Identity compares, not a set: a set would hash the class, and some classes cannot be hashed.
         cls = item.__class__
         if cls is str or cls is int or cls is float or cls is bool or item is None:
             continue
-        new_item = _dump_item(item)
+        new_item = _dump_item(item, depth)
         if new_item is not item:
             if dumped is None:
-                dumped = dict(value)
+                # The storage again: dict.copy and dict() of a subclass call its keys() or __iter__.
+                dumped = dict(dict.items(value))
             dumped[key] = new_item
     return value if dumped is None else dumped
 
 
-def dump_serializers(value: Any) -> Any:
-    """Return ``value`` with the dump of each Serializer in place of the Serializer.
+def _items(value: list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]) -> Any:
+    """Return an iterator over the storage of ``value``, as msgspec reads it. A subclass can override __iter__."""
+    if isinstance(value, list):
+        return list.__iter__(value)
+    if isinstance(value, tuple):
+        return tuple.__iter__(value)
+    return iter(value)
 
-    The function goes only into the items that hold a Serializer, as the
-    Rust scan tells, and copies only the containers on the path to a
-    Serializer. A tuple, set or frozenset on that path becomes a list, which
-    msgspec encodes as the same JSON array.
-    """
+
+def _dump(value: Any, depth: int) -> Any:
+    """Return ``value`` with the dump of each Serializer in place of the Serializer. See dump_serializers."""
     if isinstance(value, dict):
-        return _dump_dict(value)
+        return _dump_dict(value, depth)
     if isinstance(value, (list, tuple, set, frozenset)):
         dumped_list: list[Any] | None = None
-        for index, item in enumerate(value):
+        for index, item in enumerate(_items(value)):
             cls = item.__class__
             if cls is str or cls is int or cls is float or cls is bool or item is None:
                 new_item = item
             else:
-                new_item = _dump_item(item)
+                new_item = _dump_item(item, depth)
             if dumped_list is not None:
                 dumped_list.append(new_item)
             elif new_item is not item:
-                dumped_list = list(itertools.islice(value, index))
+                dumped_list = list(itertools.islice(_items(value), index))
                 dumped_list.append(new_item)
         return value if dumped_list is None else dumped_list
     if value is None or isinstance(value, (str, int, float, bytes, bytearray)):
@@ -208,11 +222,11 @@ def dump_serializers(value: Any) -> Any:
     if kind is None:
         return value
     if kind is True:
-        return dump_serializers(value.dump())
+        return _dump(value.dump(), depth)
     if kind is _ENUM_VALUE:
         # The dumped value gives the JSON that msgspec gives for the member.
         item = value._value_
-        new_item = _dump_item(item)
+        new_item = _dump_item(item, depth)
         return value if new_item is item else new_item
     is_struct = kind.__class__ is tuple
     # msgspec reads a Struct field from its slot, so a __getattribute__ of the type does not apply.
@@ -226,7 +240,7 @@ def dump_serializers(value: Any) -> Any:
         cls = item.__class__
         if cls is str or cls is int or cls is float or cls is bool or item is None:
             continue
-        new_item = _dump_item(item)
+        new_item = _dump_item(item, depth)
         if new_item is not item:
             changes[name] = new_item
     if not changes:
@@ -253,3 +267,24 @@ def dump_serializers(value: Any) -> Any:
                 "Bolt cannot dump the Serializer that it holds."
             )
     return clone
+
+
+def dump_serializers(value: Any) -> Any:
+    """Return ``value`` with the dump of each Serializer in place of the Serializer.
+
+    The function goes only into the items that hold a Serializer, as the
+    Rust scan tells, and copies only the containers on the path to a
+    Serializer. A tuple, set or frozenset on that path becomes a list, which
+    msgspec encodes as the same JSON array.
+
+    The result is scanned again. If it still holds a Serializer, the function
+    raises ``TypeError``, so msgspec never encodes the write-only fields.
+    """
+    try:
+        dumped = _dump(value, 0)
+    except RecursionError:
+        # A short error: the traceback of the walk would hold a frame for each level.
+        raise RecursionError("A Serializer is nested too deeply in the value for Bolt to dump it.") from None
+    if find_serializer(dumped, SCAN_KINDS, classify, SCAN_OFFSETS):
+        raise TypeError(f"The value still holds a Serializer after its dump: {type(value).__qualname__}.")
+    return dumped
