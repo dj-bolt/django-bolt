@@ -29,7 +29,7 @@ import msgspec
 import pytest
 
 import django_bolt
-from django_bolt import BoltAPI, _json
+from django_bolt import BoltAPI, _hidden_fields, _json
 from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS
 from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.testing import TestClient
@@ -355,6 +355,23 @@ def test_the_scan_caches_do_not_keep_classes_that_an_app_makes_at_runtime():
     assert len(SCAN_KINDS) <= 512
     assert len(SCAN_OFFSETS) <= 512
     assert alive <= 1024
+
+
+def test_the_hidden_field_plans_do_not_keep_serializers_that_an_app_makes_at_runtime():
+    """A dict body loses its hidden keys with a plan for each Serializer. The plans keep a bounded number of classes."""
+    refs = []
+    for index in range(1500):
+        cls = type(
+            f"RuntimeAccount{index}",
+            (Serializer,),
+            {"__annotations__": {"id": int, "password": str}, "password": field(write_only=True)},
+        )
+        assert _hidden_fields.without_hidden_fields(cls, {"id": 1, "password": SECRET}) == {"id": 1}
+        refs.append(weakref.ref(cls))
+        del cls
+    gc.collect()
+    assert len(_hidden_fields._STRIPPERS) <= 512
+    assert sum(ref() is not None for ref in refs) <= 512
 
 
 _PACKAGE_ROOT = str(Path(django_bolt.__file__).resolve().parents[1])

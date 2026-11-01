@@ -30,9 +30,22 @@ Stripper = Callable[[Any], Any]
 
 _MISSING = object()
 
-# The maximum number of classes in each cache. A class past it gets its plan
-# again on each use. This keeps memory bounded when an app makes classes at runtime.
-_CACHE_LIMIT = 4096
+# The maximum number of classes in each cache. When a cache is full, its
+# oldest class goes: a dict keeps the order of insertion. Thus the caches keep
+# a bounded number of classes alive when an app makes classes at runtime.
+_CACHE_LIMIT = 512
+
+
+def _remember(cache: dict[Any, Any], key: Any, value: Any) -> None:
+    """Keep ``value`` in ``cache``. When the cache is full, its oldest entry goes."""
+    if len(cache) >= _CACHE_LIMIT:
+        try:
+            del cache[next(iter(cache))]
+        except (KeyError, RuntimeError, StopIteration):
+            # Another thread changed the cache. It is a cache, so the entry stays out.
+            return
+    cache[key] = value
+
 
 # The plan of each class: a function that removes the hidden keys, or None
 # when the class has no hidden key at any position.
@@ -94,8 +107,7 @@ def project_dict_rows(serializer_cls: Any, rows: list[Any]) -> list[dict[Any, An
     project = _ROW_PROJECTORS.get(serializer_cls)
     if project is None:
         project = _build_row_projector(serializer_cls)
-        if len(_ROW_PROJECTORS) < _CACHE_LIMIT:
-            _ROW_PROJECTORS[serializer_cls] = project
+        _remember(_ROW_PROJECTORS, serializer_cls, project)
     return project(rows)
 
 
@@ -109,8 +121,8 @@ def _plan(cls: type) -> Stripper | None:
 def _publish(building: dict[Any, Stripper | None]) -> None:
     """Keep the plan of each class that a complete build made."""
     for key, stripper in building.items():
-        if isinstance(key, type) and len(_STRIPPERS) < _CACHE_LIMIT:
-            _STRIPPERS[key] = stripper
+        if isinstance(key, type):
+            _remember(_STRIPPERS, key, stripper)
 
 
 def _build_row_projector(cls: Any) -> Callable[[list[Any]], list[dict[Any, Any]]]:
