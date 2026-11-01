@@ -8,10 +8,13 @@ that calls the original handler.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import inspect
 import re
 from collections.abc import Callable, Iterable
 from typing import Any
+
+from django_bolt.serialization import _compile_response_validator
 
 from . import schema
 from .registry import ToolDef
@@ -43,6 +46,30 @@ def _tool_name(handler: Callable, method: str, path: str) -> str:
     """Default MCP tool name: the handler's function name, else a path slug."""
     name = getattr(handler, "__name__", None)
     return name if name and not name.startswith("<") else _slug(method, path)
+
+
+def _with_response_model(handler: Callable, meta: dict[str, Any]) -> Callable:
+    """Return ``handler``, or a wrapper that gives its result to the response model of the route.
+
+    The HTTP route sends what the response model gives, for example the dump of
+    a Serializer without its write-only fields. The tool must not send more.
+    """
+    validate_sync, validate_async = _compile_response_validator(meta)
+    if validate_sync is None:
+        return handler
+    if inspect.iscoroutinefunction(handler):
+
+        @functools.wraps(handler)
+        async def validated_async(**kwargs: Any) -> Any:
+            return await validate_async(await handler(**kwargs))
+
+        return validated_async
+
+    @functools.wraps(handler)
+    def validated(**kwargs: Any) -> Any:
+        return validate_sync(handler(**kwargs))
+
+    return validated
 
 
 def expose_routes(
@@ -122,7 +149,7 @@ def expose_routes(
         mcp.add_tool(
             ToolDef(
                 name=name,
-                fn=handler,
+                fn=_with_response_model(handler, meta) if meta else handler,
                 description=description,
                 args_struct=args_struct,
                 input_schema=schema.input_schema_for(args_struct),

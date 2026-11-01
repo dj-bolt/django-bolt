@@ -261,6 +261,8 @@ async def get_item(item_id: int) -> dict:
     return {"id": item_id}
 ```
 
+The tool result goes through the response model of the route, as the HTTP response does. Thus a route with `-> Account` or `response_model=list[Account]` sends the dump of the Serializer, without its write-only fields.
+
 A handler that isn't a route on the API, that takes `File`/`Form` parameters (can't be represented as JSON tool arguments), or whose name collides with another tool raises `ValueError` rather than being silently dropped or shadowed.
 
 For deliberate bulk selection, call `expose_routes` directly before mounting:

@@ -129,6 +129,16 @@ def _serializer_server():
     def get_account(account_id: int) -> Account:
         return Account(id=account_id, password=SECRET)
 
+    @api.get("/accounts-as-dicts", response_model=list[Account])
+    @expose_as_tool(name="list_account_dicts")
+    def list_account_dicts():
+        return [{"id": 1, "password": SECRET}]
+
+    @api.get("/account-as-dict/{account_id}")
+    @expose_as_tool(name="get_account_dict")
+    async def get_account_dict(account_id: int) -> Account:
+        return {"id": account_id, "password": SECRET}
+
     @mcp.tool
     async def list_accounts() -> list[Account]:
         """List the accounts."""
@@ -150,8 +160,10 @@ def _serializer_server():
         ("get_account", {"account_id": 1}, DUMPED, DUMPED),
         ("list_accounts", {}, [DUMPED], {"result": [DUMPED]}),
         ("hold_account", {}, {"account": DUMPED}, {"account": DUMPED}),
+        ("list_account_dicts", {}, [DUMPED], {"result": [DUMPED]}),
+        ("get_account_dict", {"account_id": 1}, DUMPED, DUMPED),
     ],
-    ids=["serializer", "list", "struct"],
+    ids=["serializer", "list", "struct", "route-response-model-sync", "route-return-type-async"],
 )
 def test_a_serializer_in_a_tool_result_gives_its_dump(name, arguments, payload, structured):
     """A tool result gives the dump of each Serializer, as the HTTP route does."""
