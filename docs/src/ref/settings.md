@@ -269,7 +269,7 @@ export RUST_MIN_STACK=16777216
 
 Do not set a smaller value. On Python 3.12 and 3.13, msgspec needs about 3 MiB of stack to decode JSON at the C recursion limit. With less stack, deeply nested JSON stops the process with `SIGSEGV`. With 8 MiB, the decoder raises `RecursionError`, and a request body that is too deep gets `422`.
 
-Bolt does not read this variable. The Rust standard library reads it when Python imports Bolt, and ignores a value that is not an int.
+The Rust standard library in Bolt reads this variable once, when Python imports Bolt. Set it before the import, for example in the environment of the process. A later change has no effect. A value that is not an int gets the default.
 
 ## File serving settings
 

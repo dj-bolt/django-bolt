@@ -47,7 +47,7 @@ def test_deep_json_body_is_decoded_on_a_worker_and_a_lane(deep_json_server):
 
 
 @pytest.mark.server_integration
-@pytest.mark.parametrize("path", ["/body", "/lane/body"])
+@pytest.mark.parametrize("path", ["/body", "/dict-body", "/lane/body"])
 def test_too_deep_json_body_gets_422_and_the_server_keeps_serving(deep_json_server, path):
     response = post(deep_json_server, path, TOO_DEEP)
 

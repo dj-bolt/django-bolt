@@ -53,10 +53,19 @@ const THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// SIGSEGV. Actix has no setting for the stack of its worker threads. The
 /// standard library reads `RUST_MIN_STACK` when it starts its first thread of
 /// the default size, and keeps the value. Thus set the variable, start one
-/// thread, and remove the variable. Do this before any other thread starts.
-/// A `RUST_MIN_STACK` value from the user stays in effect.
+/// thread, and restore the variable. Do this before any other thread starts.
+/// This module links its own copy of the standard library, so a thread of
+/// another extension module does not set the value for it.
+/// A `RUST_MIN_STACK` int from the user stays in effect.
 fn set_default_thread_stack_size() -> PyResult<()> {
-    if std::env::var_os("RUST_MIN_STACK").is_some() {
+    let previous = std::env::var_os("RUST_MIN_STACK");
+    // The standard library ignores a value that is not an int, and uses 2 MiB.
+    // Such a value thus gets `THREAD_STACK_SIZE` too.
+    if previous
+        .as_deref()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.parse::<usize>().is_ok())
+    {
         return Ok(());
     }
     // SAFETY: No thread of this module runs yet. Native code on other threads
@@ -64,8 +73,13 @@ fn set_default_thread_stack_size() -> PyResult<()> {
     // race, and Python code (runbolt too) calls it at any time.
     unsafe { std::env::set_var("RUST_MIN_STACK", THREAD_STACK_SIZE.to_string()) };
     let started = std::thread::Builder::new().spawn(|| {});
-    // SAFETY: As for `set_var` above.
-    unsafe { std::env::remove_var("RUST_MIN_STACK") };
+    // SAFETY: As for `set_var` above. The environment gets back the value of the user.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("RUST_MIN_STACK", value),
+            None => std::env::remove_var("RUST_MIN_STACK"),
+        }
+    };
     started
         .and_then(|thread| {
             thread

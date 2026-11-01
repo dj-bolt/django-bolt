@@ -7,7 +7,7 @@ an Actix worker thread. ``lane_api`` decodes on a request lane.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 import msgspec
 from django.utils.deprecation import MiddlewareMixin
@@ -15,6 +15,7 @@ from django.utils.deprecation import MiddlewareMixin
 from django_bolt import BoltAPI, Request
 from django_bolt.concurrency import in_lane_mode
 from django_bolt.middleware import DjangoMiddlewareStack
+from django_bolt.params import Body
 
 
 class Payload(msgspec.Struct):
@@ -32,6 +33,12 @@ async def health():
 @api.post("/body")
 def body(data: Payload):
     """Bolt decodes the body before the handler runs."""
+    return {"ok": True}
+
+
+@api.post("/dict-body")
+def dict_body(data: Annotated[dict[str, Any], Body()]):
+    """A body that is not a Struct takes the generic decode of Bolt."""
     return {"ok": True}
 
 
