@@ -523,7 +523,7 @@ impl<'a, 'py> Scan<'a, 'py> {
                 }
             };
             #[cfg(Py_GIL_DISABLED)]
-            let skipper = leaf_types;
+            let skipper = *leaf_types;
             let Some(frame) = self.frames.last_mut() else {
                 return Ok(None);
             };
