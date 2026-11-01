@@ -14,7 +14,8 @@ import re
 from collections.abc import Callable, Iterable
 from typing import Any
 
-from django_bolt.serialization import _compile_response_validator
+from django_bolt.responses import HTML, JSON, PlainText, Response
+from django_bolt.serialization import _RESPONSE_INSTANCE_TYPES, _compile_response_validator
 
 from . import schema
 from .registry import ToolDef
@@ -48,28 +49,102 @@ def _tool_name(handler: Callable, method: str, path: str) -> str:
     return name if name and not name.startswith("<") else _slug(method, path)
 
 
-def _with_response_model(handler: Callable, meta: dict[str, Any]) -> Callable:
-    """Return ``handler``, or a wrapper that gives its result to the response model of the route.
+def _validator(meta: dict[str, Any], is_async: bool) -> Callable | None:
+    """Return the validator that the HTTP route applies for ``meta``, or None."""
+    validator_sync, validator_async = _compile_response_validator(meta)
+    return validator_async if is_async else validator_sync
 
-    The HTTP route sends what the response model gives, for example the dump of
-    a Serializer without its write-only fields. The tool must not send more.
+
+def _response_body(result: Any, validate: Callable | None, status: int) -> tuple[Any, Callable | None]:
+    """Return the body of ``result`` and the validator that the HTTP route applies to it.
+
+    The HTTP route validates the data of ``JSON`` and ``Response`` only when its
+    status is ``status``, the status of the response model. A response object
+    with no JSON body, for example a file or a stream, stays as it is.
     """
-    validate_sync, validate_async = _compile_response_validator(meta)
-    if validate_sync is None:
-        return handler
-    if inspect.iscoroutinefunction(handler):
+    if isinstance(result, JSON):
+        return result.data, validate if result.status_code == status else None
+    if isinstance(result, Response):
+        content = result.content
+        if result.status_code != status or isinstance(content, (bytes, bytearray, memoryview)):
+            return content, None
+        return content, validate
+    if isinstance(result, PlainText):
+        return result.text, None
+    if isinstance(result, HTML):
+        return result.html, None
+    if isinstance(result, _RESPONSE_INSTANCE_TYPES):
+        return result, None
+    return result, validate
+
+
+def _compile_body_picker(meta: dict[str, Any], is_async: bool) -> Callable[[Any], tuple[int | None, Any, Any]]:
+    """Return a function that gives ``(status, body, validator)`` for a handler result.
+
+    The function selects the response model as the HTTP route does. ``status``
+    is the code of a ``(status, data)`` tuple, else None.
+    """
+    if not meta.get("is_multi_response"):
+        validate = _validator(meta, is_async)
+        default_status = meta["default_status_code"]
+
+        def pick_single(result: Any) -> tuple[int | None, Any, Any]:
+            return (None, *_response_body(result, validate, default_status))
+
+        return pick_single
+
+    # Each entry: (validator, status of the response model, the entry sends no body).
+    entries = {
+        code: (_validator(entry, is_async), entry["default_status_code"], entry["response_type"] is None)
+        for code, entry in meta["_resolved_metas"].items()
+    }
+    catch_all = entries[...]
+    default_validate, default_status, _ = entries.get(meta["default_status_code"], catch_all)
+
+    def pick_multi(result: Any) -> tuple[int | None, Any, Any]:
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], int):
+            code, data = result
+            validate, _, no_body = entries.get(code, catch_all)
+            if no_body or data is None:
+                return code, None, None
+            return code, data, validate
+        if isinstance(result, JSON):
+            validate, status, _ = entries.get(result.status_code, catch_all)
+            return (None, *_response_body(result, validate, status))
+        return (None, *_response_body(result, default_validate, default_status))
+
+    return pick_multi
+
+
+def _with_response_model(handler: Callable, meta: dict[str, Any]) -> Callable:
+    """Return a wrapper that gives the body that the HTTP route sends for the result of ``handler``.
+
+    The wrapper takes the data out of a ``(status, data)`` tuple or a response
+    object. It then applies the response model of that status, as the HTTP
+    route does. For example, a Serializer loses its write-only fields. A tuple
+    gives ``[status, body]``.
+    """
+    is_async = inspect.iscoroutinefunction(handler)
+    pick = _compile_body_picker(meta, is_async)
+    if is_async:
 
         @functools.wraps(handler)
-        async def validated_async(**kwargs: Any) -> Any:
-            return await validate_async(await handler(**kwargs))
+        async def filtered_async(**kwargs: Any) -> Any:
+            status, body, validate = pick(await handler(**kwargs))
+            if validate is not None:
+                body = await validate(body)
+            return body if status is None else [status, body]
 
-        return validated_async
+        return filtered_async
 
     @functools.wraps(handler)
-    def validated(**kwargs: Any) -> Any:
-        return validate_sync(handler(**kwargs))
+    def filtered(**kwargs: Any) -> Any:
+        status, body, validate = pick(handler(**kwargs))
+        if validate is not None:
+            body = validate(body)
+        return body if status is None else [status, body]
 
-    return validated
+    return filtered
 
 
 def expose_routes(

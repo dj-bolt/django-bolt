@@ -263,6 +263,8 @@ async def get_item(item_id: int) -> dict:
 
 The tool result goes through the response model of the route, as the HTTP response does. Thus a route with `-> Account` or `response_model=list[Account]` sends the dump of the Serializer, without its write-only fields.
 
+The tool gives the body that the HTTP response sends. For a `(status, data)` tuple, the result is `[status, body]`. The body goes through the type of that status in `response_model={code: type}`. For a `JSON` or `Response` object, the result is its body. For `PlainText` or `HTML`, the result is its text.
+
 A handler that isn't a route on the API, that takes `File`/`Form` parameters (can't be represented as JSON tool arguments), or whose name collides with another tool raises `ValueError` rather than being silently dropped or shadowed.
 
 For deliberate bulk selection, call `expose_routes` directly before mounting:
