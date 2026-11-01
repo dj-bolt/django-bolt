@@ -11,7 +11,7 @@ from typing import Any
 
 import msgspec
 
-from django_bolt._json import default_serializer
+from django_bolt._json import default_serializer, dump_held_serializers
 from django_bolt._json import encode as json_encode
 
 from .registry import ToolDef
@@ -43,7 +43,9 @@ def to_call_tool_result(result: Any) -> dict[str, Any]:
             "isError": False,
             "resultType": RESULT_TYPE_COMPLETE,
         }
-    payload = msgspec.to_builtins(result, enc_hook=default_serializer)
+    # msgspec converts a Serializer with all of its fields, also the write-only
+    # fields. Thus each Serializer gives its dump first, as on the HTTP route.
+    payload = msgspec.to_builtins(dump_held_serializers(result), enc_hook=default_serializer)
     structured = payload if isinstance(payload, dict) else {"result": payload}
     text = json_encode(payload).decode()
     return {
