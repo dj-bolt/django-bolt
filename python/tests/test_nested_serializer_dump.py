@@ -683,6 +683,110 @@ def test_a_serializer_that_a_custom_hook_returns_gives_its_dump(result):
     assert json.loads(encoded) == {"owner": expected}
 
 
+# A Serializer with rename= or tag= dumps with msgspec.to_builtins when it has
+# no write-only, computed or nested field of its own. A field of these
+# Serializers is not a nested field, but it can hold a Serializer.
+
+
+class CamelEnvelope(Serializer, rename="camel"):
+    request_id: str
+    data: Any
+
+
+class TaggedEnvelope(Serializer, tag=True):
+    data: Any
+
+
+class CamelTeam(Serializer, rename="camel"):
+    team_name: str
+    members_by_role: dict[str, Account]
+    pair: tuple[Account, ...] = ()
+
+
+class OmittingEnvelope(Serializer, rename="camel", omit_defaults=True):
+    inner_data: Any = None
+    note_text: str = "n"
+
+
+class CamelPost(Serializer, rename="camel"):
+    """``author`` names a class below, so the type hints fail at class creation."""
+
+    post_id: int
+    author: LaterAccount
+
+
+class LaterAccount(Serializer):
+    id: int
+    password: str = field(write_only=True)
+
+
+class CamelComment(Serializer, rename="camel"):
+    """The self reference makes the type hints fail at class creation."""
+
+    comment_id: int
+    author: Account
+    replies: list[CamelComment] = []
+
+
+_DUMP_CASES = {
+    "any": (lambda: CamelEnvelope(request_id="r", data=account()), {"requestId": "r", "data": DUMPED}),
+    "tag": (lambda: TaggedEnvelope(data=[account()]), {"type": "TaggedEnvelope", "data": [DUMPED]}),
+    "dict-and-tuple": (
+        lambda: CamelTeam(team_name="t", members_by_role={"owner": account()}, pair=(account(),)),
+        {"teamName": "t", "membersByRole": {"owner": DUMPED}, "pair": [DUMPED]},
+    ),
+    "omit-defaults": (lambda: OmittingEnvelope(inner_data=account()), {"innerData": DUMPED}),
+    "forward-ref": (
+        lambda: CamelPost(post_id=1, author=LaterAccount(id=1, password=SECRET)),
+        {"postId": 1, "author": {"id": 1}},
+    ),
+    "self-ref": (
+        lambda: CamelComment(comment_id=1, author=account(), replies=[CamelComment(comment_id=2, author=account())]),
+        {"commentId": 1, "author": DUMPED, "replies": [{"commentId": 2, "author": DUMPED, "replies": []}]},
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def dump_client():
+    api = BoltAPI()
+
+    @api.get("/dump/{name}")
+    def dump_route(name: str):
+        return _DUMP_CASES[name][0]()
+
+    @api.get("/dump-typed/envelope")
+    async def dump_typed_envelope() -> CamelEnvelope:
+        return CamelEnvelope(request_id="r", data=account())
+
+    @api.get("/dump-typed/teams")
+    def dump_typed_teams() -> list[CamelTeam]:
+        return [CamelTeam(team_name="t", members_by_role={"owner": account()})]
+
+    with TestClient(api) as test_client:
+        yield test_client
+
+
+@pytest.mark.parametrize("case", _DUMP_CASES)
+def test_a_serializer_in_a_field_of_a_renamed_or_tagged_serializer_gives_its_dump(dump_client, case):
+    _check(dump_client.get(f"/dump/{case}"), _DUMP_CASES[case][1])
+
+
+def test_a_typed_route_dumps_the_serializer_in_a_field_of_its_serializer(dump_client):
+    _check(dump_client.get("/dump-typed/envelope"), {"requestId": "r", "data": DUMPED})
+    _check(dump_client.get("/dump-typed/teams"), [{"teamName": "t", "membersByRole": {"owner": DUMPED}, "pair": []}])
+
+
+@pytest.mark.parametrize("case", _DUMP_CASES)
+def test_dump_gives_the_dump_of_each_serializer_in_its_fields(case):
+    factory, expected = _DUMP_CASES[case]
+    value = factory()
+    assert value.dump() == expected
+    assert type(value).dump_many([value, factory()]) == [expected, expected]
+    # The dump does not change the value: it still holds the Serializer.
+    assert SECRET.encode() in _json._ENCODER.encode(value)
+
+
 def test_a_deeply_nested_response_fails_as_before():
     """A value deeper than the recursion limit gives a 500 and the worker keeps serving."""
     api = BoltAPI()

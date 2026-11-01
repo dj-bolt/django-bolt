@@ -38,6 +38,8 @@ from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
 
 from django_bolt import _json
+from django_bolt._core import find_serializer
+from django_bolt._serializer_dump import SCAN_KINDS, SCAN_OFFSETS, classify, dump_serializers
 from django_bolt.exceptions import (
     RequestValidationError,
     SerializationError,
@@ -156,6 +158,20 @@ def _iter_field_defaults(cls: type) -> list[tuple[str, Any]]:
         if 0 <= field_idx < num_fields:
             result.append((fields[field_idx], default_val))
     return result
+
+
+def _with_dumped_fields(instance: Serializer, values: tuple[Any, ...]) -> Serializer:
+    """Return a copy of ``instance`` whose fields hold the dump of each Serializer in them.
+
+    ``values`` gives the field values of ``instance``. The copy keeps the type
+    of the instance, so ``msgspec.to_builtins`` still applies its rename, tag
+    and omit_defaults. ``to_builtins`` converts a Serializer with all of its
+    fields, also the write-only fields.
+    """
+    clone = msgspec.Struct.__copy__(instance)
+    for name, value in zip(instance.__struct_fields__, dump_serializers(values), strict=True):
+        msgspec_structs.force_setattr(clone, name, value)
+    return clone
 
 
 def _build_rename_map(cls: type[msgspec.Struct]) -> dict[str, str]:
@@ -2173,6 +2189,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # to_builtins handles rename and tag injection natively; asdict is
             # cheaper when neither applies, so keep the split for the common case.
             if cls.__has_rename__ or cls.__tag_value__ is not None:
+                # A field can hold a Serializer that is not a nested field. The Rust scan finds it.
+                values = msgspec_structs.astuple(self)
+                if find_serializer(values, SCAN_KINDS, classify, SCAN_OFFSETS):
+                    return msgspec.to_builtins(_with_dumped_fields(self, values))
                 return msgspec.to_builtins(self)
             return msgspec_structs.asdict(self)
 
@@ -2356,8 +2376,15 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 for instance in instances_list:
                     instance._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
             if cls.__has_rename__ or cls.__tag_value__ is not None:
-                _to_builtins = msgspec.to_builtins
-                return [_to_builtins(instance) for instance in instances_list]
+                # A field can hold a Serializer that is not a nested field. One scan finds it.
+                _astuple = msgspec_structs.astuple
+                all_values = [_astuple(instance) for instance in instances_list]
+                if find_serializer(all_values, SCAN_KINDS, classify, SCAN_OFFSETS):
+                    instances_list = [
+                        _with_dumped_fields(instance, values)
+                        for instance, values in zip(instances_list, all_values, strict=True)
+                    ]
+                return msgspec.to_builtins(instances_list)
             _asdict = msgspec_structs.asdict
             return [_asdict(instance) for instance in instances_list]
 
