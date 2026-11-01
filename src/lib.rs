@@ -57,7 +57,14 @@ const THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// This module links its own copy of the standard library, so a thread of
 /// another extension module does not set the value for it.
 /// A `RUST_MIN_STACK` int from the user stays in effect.
-fn set_default_thread_stack_size() -> PyResult<()> {
+///
+/// CPython 3.14 and later check the stack itself, and raise RecursionError
+/// before it overflows. There, the default size stays: a larger stack would
+/// only let each thread keep more memory after a deep request.
+fn set_default_thread_stack_size(py: Python<'_>) -> PyResult<()> {
+    if py.version_info() >= (3, 14) {
+        return Ok(());
+    }
     let previous = std::env::var_os("RUST_MIN_STACK");
     // The standard library ignores a value that is not an int, and uses 2 MiB.
     // Such a value thus gets `THREAD_STACK_SIZE` too.
@@ -101,8 +108,8 @@ fn set_default_thread_stack_size() -> PyResult<()> {
 // or a `Mutex`. Every `#[pyclass]` is `frozen` or belongs to one request,
 // stream, or connection.
 #[pymodule(gil_used = false)]
-fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    set_default_thread_stack_size()?;
+fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    set_default_thread_stack_size(py)?;
     m.add_function(wrap_pyfunction!(response_helpers::format_cookie_date, m)?)?;
     m.add_function(wrap_pyfunction!(
         response_helpers::resolve_response_file,

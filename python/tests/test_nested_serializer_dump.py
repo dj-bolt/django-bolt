@@ -673,8 +673,10 @@ def test_a_route_with_no_response_validator_dumps_each_serializer(client, path):
     ],
     ids=lambda value: type(value).__name__,
 )
-def test_a_serializer_with_no_serializer_inside_encodes_as_its_dump(value):
-    assert _json.encode(value) == _json._ENCODER.encode(value.dump())
+def test_a_serializer_that_hides_nothing_encodes_as_msgspec_encodes_it(value):
+    """Such a Serializer keeps the encoding of msgspec: also with array_like or omit_defaults."""
+    assert _json.encode(value) == msgspec.json.encode(value)
+    assert _json.encode({"nested": [value]}) == msgspec.json.encode({"nested": [value]})
 
 
 def test_a_serializer_with_its_own_dump_gives_that_dump_with_each_serializer_dumped():
