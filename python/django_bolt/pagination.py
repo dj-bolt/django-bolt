@@ -32,8 +32,9 @@ from typing import Any, Generic, TypeVar, get_args, get_origin
 import msgspec
 
 from . import _json
+from ._hidden_fields import project_dict_rows
 from .concurrency import run_in_orm_executor
-from .exceptions import ResponseValidationError, UnloadedRelationError
+from .exceptions import UnloadedRelationError
 
 __all__ = [
     "PaginationBase",
@@ -231,7 +232,7 @@ class PaginationBase(ABC):
 
         Supports:
         - Bolt Serializer: from_model() + dump_many() (fastest)
-        - Bolt Serializer with dict items: msgspec.convert() + dump_many()
+        - Bolt Serializer with dict items: the fields of the Serializer, without the hidden fields
         - msgspec.Struct: msgspec.structs.asdict() for each item
         - Fallback: _model_to_dict() for backwards compatibility
 
@@ -251,21 +252,11 @@ class PaginationBase(ABC):
         # Check if items are already dicts (e.g., from values() queryset)
         first_item = items[0]
         if isinstance(first_item, dict):
-            serializer_class = self.serializer_class
-            if getattr(serializer_class, "__is_bolt_serializer__", False):
-                # A dict gives the dump of the Serializer, as on a route with no
-                # pagination. The dump leaves out the write-only fields.
-                serializer_class._ensure_dump_ready()
-                rename_map = serializer_class.__rename_map__
-                if rename_map:
-                    # A dict item has the Python names of the fields, as a values() row has.
-                    # msgspec.convert reads the wire names.
-                    items = [{rename_map.get(key, key): value for key, value in item.items()} for item in items]
-                try:
-                    instances = msgspec.convert(items, list[serializer_class])
-                except msgspec.ValidationError as exc:
-                    raise ResponseValidationError([exc]) from exc
-                return serializer_class.dump_many(instances)
+            if getattr(self.serializer_class, "__is_bolt_serializer__", False):
+                # Bolt does not convert a dict item, because a values() row need not
+                # fit the Serializer. The item keeps the fields that dump() sends.
+                # A nested value loses its hidden fields too.
+                return project_dict_rows(self.serializer_class, items)
             # Items are dicts - extract only the fields declared in serializer
             if hasattr(self.serializer_class, "__struct_fields__"):
                 fields = self.serializer_class.__struct_fields__
