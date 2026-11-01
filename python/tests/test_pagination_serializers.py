@@ -13,9 +13,9 @@ import msgspec
 import pytest
 
 from django_bolt import BoltAPI, CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
-from django_bolt.serializers import Serializer
+from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.testing import TestClient
-from django_bolt.views import ViewSet
+from django_bolt.views import ReadOnlyModelViewSet, ViewSet
 
 from .test_models import Article, Author, BlogPost
 
@@ -741,6 +741,76 @@ def test_viewset_cursor_pagination_with_serializer(sample_articles):
 
         assert page_count == 5  # 25 items / 5 per page
         assert len(all_ids) == 25
+
+
+# ============================================================================
+# Tests: Dict items give the dump of the item Serializer
+# ============================================================================
+
+SECRET = "s3cret-value"
+
+
+class ArticleSecretSerializer(Serializer):
+    """``content`` is write-only, so a page must not send it."""
+
+    id: int
+    title: str
+    content: str = field(write_only=True)
+
+    @computed_field
+    def headline(self) -> str:
+        return self.title.upper()
+
+
+@pytest.fixture
+def dict_items_client(db):
+    articles = [Article.objects.create(title=f"a{i}", content=SECRET, author="x") for i in range(3)]
+    api = BoltAPI()
+
+    @api.get("/values", response_model=list[ArticleSecretSerializer])
+    @paginate(PageNumberPagination)
+    async def values_route(request):
+        return Article.objects.order_by("id").values()
+
+    @api.get("/dicts")
+    @paginate(LimitOffsetPagination)
+    async def dicts_route(request) -> list[ArticleSecretSerializer]:
+        return [{"id": article.id, "title": article.title, "content": SECRET} for article in articles]
+
+    @api.get("/invalid-dicts")
+    @paginate(PageNumberPagination)
+    async def invalid_dicts_route(request) -> list[ArticleSecretSerializer]:
+        return [{"id": "not-an-int", "content": SECRET}]
+
+    @api.viewset("/viewset")
+    class ArticleValuesViewSet(ReadOnlyModelViewSet):
+        queryset = Article.objects.order_by("id").values()
+        serializer_class = ArticleSecretSerializer
+        pagination_class = PageNumberPagination
+
+    expected = [{"id": article.id, "title": article.title, "headline": article.title.upper()} for article in articles]
+    with TestClient(api) as client:
+        yield client, expected
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("path", ["/values", "/dicts", "/viewset"])
+def test_a_paginated_dict_item_gives_the_dump_of_the_item_serializer(dict_items_client, path):
+    """A dict item gives the same item as a route with no pagination: no write-only field."""
+    client, expected = dict_items_client
+    response = client.get(path)
+    assert response.status_code == 200, response.text
+    assert SECRET not in response.text
+    assert response.json()["items"] == expected
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_paginated_dict_item_that_does_not_fit_the_item_serializer_is_a_response_error(dict_items_client):
+    client, _ = dict_items_client
+    response = client.get("/invalid-dicts")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Response validation error"}
+    assert SECRET not in response.text
 
 
 if __name__ == "__main__":

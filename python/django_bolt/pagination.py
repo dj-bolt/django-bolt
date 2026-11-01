@@ -33,7 +33,7 @@ import msgspec
 
 from . import _json
 from .concurrency import run_in_orm_executor
-from .exceptions import UnloadedRelationError
+from .exceptions import ResponseValidationError, UnloadedRelationError
 
 __all__ = [
     "PaginationBase",
@@ -231,6 +231,7 @@ class PaginationBase(ABC):
 
         Supports:
         - Bolt Serializer: from_model() + dump_many() (fastest)
+        - Bolt Serializer with dict items: msgspec.convert() + dump_many()
         - msgspec.Struct: msgspec.structs.asdict() for each item
         - Fallback: _model_to_dict() for backwards compatibility
 
@@ -248,9 +249,17 @@ class PaginationBase(ABC):
             return [self._model_to_dict(item) for item in items]
 
         # Check if items are already dicts (e.g., from values() queryset)
-        # In this case, just extract the fields we need
         first_item = items[0]
         if isinstance(first_item, dict):
+            serializer_class = self.serializer_class
+            if getattr(serializer_class, "__is_bolt_serializer__", False):
+                # A dict gives the dump of the Serializer, as on a route with no
+                # pagination. The dump leaves out the write-only fields.
+                try:
+                    instances = msgspec.convert(items, list[serializer_class])
+                except msgspec.ValidationError as exc:
+                    raise ResponseValidationError([exc]) from exc
+                return serializer_class.dump_many(instances)
             # Items are dicts - extract only the fields declared in serializer
             if hasattr(self.serializer_class, "__struct_fields__"):
                 fields = self.serializer_class.__struct_fields__
