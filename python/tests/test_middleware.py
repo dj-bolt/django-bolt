@@ -141,6 +141,17 @@ class TestMiddlewareDecorators:
         with pytest.raises(TypeError, match="rate_limit rps must be an int of 1 or more"), TestClient(api):
             pass
 
+    def test_api_rate_limit_with_a_bad_value_stops_the_registration(self):
+        """A rate limit dict in the middleware of the API is checked in Rust too."""
+        api = BoltAPI(middleware=[{"type": "rate_limit", "rps": 0.5, "burst": 1, "key": "ip"}])
+
+        @api.get("/items")
+        async def list_items():
+            return {"ok": True}
+
+        with pytest.raises(TypeError, match="rate_limit rps must be an int of 1 or more"), TestClient(api):
+            pass
+
     def test_cors_decorator(self):
         """Test CORS decorator attaches metadata"""
         api = BoltAPI()
@@ -1358,7 +1369,7 @@ def test_bolt_builds_each_middleware_chain_one_time():
 
 def test_a_python_middleware_before_a_rust_middleware_runs():
     """A dict spec runs in Rust. The Python middleware before it in the list still runs."""
-    rate_limit_spec = {"type": "rate_limit", "rps": 1000, "burst": 1000, "key": "ip"}
+    rate_limit_spec = {"type": "rate_limit", "rps": 1, "burst": 1, "key": "ip"}
     api = BoltAPI(middleware=[TagMiddleware, rate_limit_spec])
     router = Router(prefix="/router", middleware=[RouterTagMiddleware])
 
@@ -1367,7 +1378,7 @@ def test_a_python_middleware_before_a_rust_middleware_runs():
         return {"ok": True}
 
     @router.get("/items")
-    @rate_limit(rps=1000)
+    @rate_limit(rps=1, burst=1)
     async def on_router():
         return {"ok": True}
 
@@ -1375,11 +1386,36 @@ def test_a_python_middleware_before_a_rust_middleware_runs():
 
     with TestClient(api) as client:
         api_response = client.get("/api")
+        api_statuses = [client.get("/api").status_code for _ in range(3)]
         router_response = client.get("/router/items")
+        router_statuses = [client.get("/router/items").status_code for _ in range(3)]
 
     assert (api_response.status_code, api_response.headers.get("x-api")) == (200, "tagged")
     assert router_response.status_code == 200
     assert (router_response.headers.get("x-api"), router_response.headers.get("x-router")) == ("tagged", "tagged")
+    # The Rust rate limit also runs. A burst of 1 refuses a request that comes
+    # less than one second after the last one. A slow runner can refill the
+    # bucket between two requests, so the check accepts one 429 of three.
+    assert 429 in api_statuses, api_statuses
+    assert 429 in router_statuses, router_statuses
+
+
+def test_a_route_rate_limit_limits_a_router_route_with_no_api_limit():
+    api = BoltAPI()
+    router = Router(prefix="/router")
+
+    @router.get("/items")
+    @rate_limit(rps=1, burst=1)
+    async def on_router():
+        return {"ok": True}
+
+    api.include_router(router)
+
+    with TestClient(api) as client:
+        statuses = [client.get("/router/items").status_code for _ in range(4)]
+
+    assert statuses[0] == 200
+    assert 429 in statuses[1:], statuses
 
 
 class WireTupleMiddleware(Middleware):

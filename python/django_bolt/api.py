@@ -1765,10 +1765,11 @@ class BoltAPI:
                     meta["is_multi_response"] = True
                     meta["response_map"] = response_model
 
-                    # Pre-compute field names for each code's type
+                    # Pre-compute field names for each code's type, and for
+                    # the ... entry, which serves each unlisted status.
                     field_names_map = {}
                     for code, resp_type in response_model.items():
-                        if resp_type is not None and code is not ...:
+                        if resp_type is not None:
                             resp_meta = extract_response_metadata(resp_type)
                             if "response_field_names" in resp_meta:
                                 field_names_map[code] = resp_meta["response_field_names"]
@@ -1872,6 +1873,16 @@ class BoltAPI:
             if meta["is_multi_response"]:
                 for entry in meta["_resolved_metas"].values():
                     compile_response_handlers(entry)
+                    # The data types that a (status, data) tuple encodes with no
+                    # handler. A Serializer type converts its data even when the
+                    # entry does not validate. The handler of an entry with row
+                    # fields converts a list of model instances to them.
+                    if entry["_has_response_validation"]:
+                        entry["_tuple_plain_types"] = ()
+                    elif "response_field_names" in entry:
+                        entry["_tuple_plain_types"] = (dict,)
+                    else:
+                        entry["_tuple_plain_types"] = (dict, list)
 
             # Compile optimized argument injector (once at registration time)
             # This pre-compiles all parameter extraction logic for maximum performance
@@ -1899,6 +1910,12 @@ class BoltAPI:
             meta["_has_route_python_middleware"] = any(
                 not isinstance(spec, dict) for spec in [*router_middleware, *route_middleware]
             )
+            # The API that runs the Python middleware of this route, or None. A
+            # mounted or merged API keeps this API: the route has its middleware.
+            if self._has_python_global_middleware or meta["_has_route_python_middleware"]:
+                meta["_middleware_api"] = self
+            else:
+                meta["_middleware_api"] = None
 
             self._handler_meta[handler_id] = meta
 
@@ -1927,6 +1944,9 @@ class BoltAPI:
             # subclasses share scheme "jwt" but can carry different get_user
             # overrides, so the scheme name cannot pick the loader.
             meta["_user_loaders"] = tuple(resolve_user_loader(backend) for backend in effective_auth_backends)
+            # Rust sets an auth context only for a route with a backend. The
+            # dispatch does not read the context for each other route.
+            meta["_has_auth_backends"] = bool(effective_auth_backends)
 
             revocation_handlers = _revocation_handlers(effective_auth_backends)
             meta["_revocation_handlers"] = revocation_handlers
@@ -2090,8 +2110,7 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        # A Serializer type converts its data even when the entry does not validate.
-                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
+                        if isinstance(data, entry["_tuple_plain_types"]):
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
                             return await serialize_json_data(data, code)
@@ -2113,8 +2132,7 @@ class BoltAPI:
                         response_type = entry["response_type"]
                         if response_type is None or data is None:
                             return _wire_bytes(code, _RESPONSE_META_EMPTY, b"")
-                        # A Serializer type converts its data even when the entry does not validate.
-                        if isinstance(data, (dict, list)) and not entry["_has_response_validation"]:
+                        if isinstance(data, entry["_tuple_plain_types"]):
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
                             return serialize_json_data_sync(data, code)
@@ -3327,11 +3345,6 @@ class BoltAPI:
             request: The request dictionary
             handler_id: Handler ID to lookup original API (for merged APIs)
         """
-        # For merged APIs, use the original API's middleware chain and logging
-        # This preserves per-API auth, middleware, and logging config (Litestar-style)
-        # Note: _handler_api_map is always initialized in __init__ (no hasattr needed)
-        original_api = self._handler_api_map.get(handler_id)
-
         try:
             # 1. Direct metadata access using handler_id (int key is faster than callable key)
             # Integer hashing is O(1) with minimal overhead vs callable hashing
@@ -3340,8 +3353,7 @@ class BoltAPI:
             # 2. Lazy user loading (Django pattern)
             # User is only loaded from DB when request.user is actually accessed
             # Skip setting user=None — PyRequest.user getter already returns None.
-            auth_context = request.get("auth")
-            if auth_context:
+            if meta["_has_auth_backends"] and (auth_context := request.get("auth")):
                 revocation_handlers = meta["_revocation_handlers"]
                 if revocation_handlers is not None:
                     await self._check_revocation(auth_context, revocation_handlers)
@@ -3358,23 +3370,14 @@ class BoltAPI:
                     if loaders is not None:
                         request["user"] = LazyUser(loaders, user_id, auth_context)
 
-            # 3. Check if we need to execute middleware
-            # Middleware runs for:
-            # - Global Python middleware on the owning app
-            # - Router/route Python middleware on this handler
-            middleware_owner = original_api if original_api is not None else self
-            has_python_global_middleware = middleware_owner._has_python_global_middleware
-            has_route_python_middleware = meta["_has_route_python_middleware"]
-            api_with_middleware = (
-                middleware_owner if (has_python_global_middleware or has_route_python_middleware) else None
-            )
-
-            if api_with_middleware:
-                # Execute through middleware chain (Django-style)
-                return await self._dispatch_with_middleware(handler, request, api_with_middleware, meta)
-            else:
-                # Fast path: no middleware, execute pre-compiled handler executor directly.
-                return await meta["_handler_executor"](handler, request)
+            # 3. Middleware runs for the global Python middleware of the API that
+            # registered the route, and for its router and route Python middleware.
+            # A merged API keeps the middleware chain of that API (Litestar-style).
+            middleware_api = meta["_middleware_api"]
+            if middleware_api is not None:
+                return await self._dispatch_with_middleware(handler, request, middleware_api, meta)
+            # Fast path: no middleware, execute pre-compiled handler executor directly.
+            return await meta["_handler_executor"](handler, request)
 
         except HTTPException as he:
             return self._handle_http_exception(he, request)
@@ -3424,8 +3427,7 @@ class BoltAPI:
         try:
             # Lazy user loading: only set when auth context has a user_id.
             # Skip setting user=None — PyRequest.user getter already returns None.
-            auth_context = request.get("auth")
-            if auth_context:
+            if meta["_has_auth_backends"] and (auth_context := request.get("auth")):
                 user_id = auth_context.get("user_id")
                 if user_id:
                     loaders = meta["_user_loaders"][auth_context["auth_backend_index"]]

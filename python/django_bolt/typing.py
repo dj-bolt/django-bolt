@@ -123,8 +123,8 @@ class HandlerMetadata(TypedDict, total=False):
     """Status code → response type mapping (when response_model is a dict).
     Keys are int status codes or ``...`` (Ellipsis) for catch-all."""
 
-    response_field_names_map: dict[int, list[str]]
-    """Per-status-code QuerySet field names"""
+    response_field_names_map: dict[int | types.EllipsisType, list[str]]
+    """Per-status-code QuerySet field names. The ``...`` key holds the fields of the catch-all type."""
 
     is_multi_response: bool
     """Whether this handler uses per-status-code response schemas"""

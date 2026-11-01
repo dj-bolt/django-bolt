@@ -340,8 +340,8 @@ def test_a_queryset_from_a_sync_handler_loads(middleware):
         plain = client.get("/titles")
         filtered = client.get("/titles/O", params={"q": "bolt"})
 
-    assert plain.json() == [{"title": "One"}], plain.text
-    assert filtered.json() == [{"title": "One"}], filtered.text
+    assert (plain.status_code, plain.json()) == (200, [{"title": "One"}]), plain.text
+    assert (filtered.status_code, filtered.json()) == (200, [{"title": "One"}]), filtered.text
 
 
 class TitleRow(msgspec.Struct):
