@@ -36,8 +36,9 @@ from uuid import UUID
 
 import msgspec
 
-# The types of values that cannot hold a Serializer.
-_LEAF_TYPES = (str, int, float, bytes, bytearray, memoryview, datetime, date, time, timedelta, UUID, Decimal, Enum)
+# The types of values that cannot hold a Serializer. An Enum is a leaf only
+# when each member value is a leaf: see _enum_is_leaf.
+_LEAF_TYPES = (str, int, float, bytes, bytearray, memoryview, datetime, date, time, timedelta, UUID, Decimal)
 
 # The generic origins whose arguments give the types of all their items.
 _CONTAINER_ORIGINS = frozenset(
@@ -75,6 +76,25 @@ class AttributeNames(tuple):
     __slots__ = ()
 
 
+# The kind of an Enum with a member value that is not a leaf. msgspec encodes
+# a member as its value, so the scan reads the value.
+_ENUM_VALUE = AttributeNames(("_value_",))
+
+
+def _enum_is_leaf(tp: type[Enum]) -> bool:
+    """Return whether each member value of ``tp`` is None or a leaf.
+
+    The members of an Enum do not change after the class is made.
+    """
+    return all(member._value_ is None or isinstance(member._value_, _LEAF_TYPES) for member in tp.__members__.values())
+
+
+def _is_leaf_class(tp: type) -> bool:
+    if issubclass(tp, _LEAF_TYPES):
+        return True
+    return issubclass(tp, Enum) and _enum_is_leaf(tp)
+
+
 def _is_serializer_class(tp: Any) -> bool:
     return bool(getattr(tp, "__is_bolt_serializer__", False))
 
@@ -100,15 +120,15 @@ def annotation_excludes_serializer(annotation: Any) -> bool:
     """Return whether ``annotation`` holds only leaf values, which cannot be a Serializer.
 
     A leaf is None, a str, a number, bytes, a date or time, a UUID, a
-    Decimal, an Enum or a Literal value. A container or a union of leaves is
-    a leaf type too. A Struct, dataclass or other class is not: nothing
+    Decimal or a Literal value, or an Enum whose member values are leaves. A
+    container or a union of leaves is a leaf type too. A Struct, dataclass or other class is not: nothing
     checks the types of its fields, so a field can hold a Serializer.
     """
     origin = get_origin(annotation)
     if origin is None:
         if annotation is type(None):
             return True
-        return isinstance(annotation, type) and issubclass(annotation, _LEAF_TYPES)
+        return isinstance(annotation, type) and _is_leaf_class(annotation)
     if origin is Literal:
         return True
     args = get_args(annotation)
@@ -122,6 +142,8 @@ def annotation_excludes_serializer(annotation: Any) -> bool:
 def _kind_of(tp: type) -> Any:
     if _is_serializer_class(tp):
         return True
+    if issubclass(tp, Enum):
+        return None if _enum_is_leaf(tp) else _ENUM_VALUE
     return _field_names(tp) or None
 
 
@@ -168,6 +190,11 @@ def dump_serializers(value: Any) -> Any:
         return value
     if kind is True:
         return dump_serializers(value.dump())
+    if kind is _ENUM_VALUE:
+        # The dumped value gives the JSON that msgspec gives for the member.
+        item = value._value_
+        new_item = dump_serializers(item)
+        return value if new_item is item else new_item
     is_struct = kind.__class__ is tuple
     # msgspec reads a Struct field from its slot, so a __getattribute__ of the type does not apply.
     get_attribute = object.__getattribute__ if is_struct else getattr

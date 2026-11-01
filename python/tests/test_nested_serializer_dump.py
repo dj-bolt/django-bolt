@@ -17,6 +17,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal, NewType, TypeVar
 
+import attrs
 import msgspec
 import pytest
 from hypothesis import given
@@ -152,6 +153,17 @@ class SelfCopyBox:
 
     def __copy__(self):
         return self
+
+
+class Role(enum.Enum):
+    """msgspec encodes an Enum member as its value, so a member value can be a Serializer."""
+
+    ADMIN = Account(id=1, password=SECRET)
+
+
+@attrs.define
+class AttrsBox:
+    inner: Any
 
 
 DUMPED = {"id": 1, "label": "user-1"}
@@ -323,6 +335,14 @@ def client():
     def trust_leaf_structs_then_serializer():
         return [Counted(n=1), Counted(n=2), account()]
 
+    @api.get("/untyped/enum-value")
+    def untyped_enum_value():
+        return {"role": Role.ADMIN}
+
+    @api.get("/untyped/attrs")
+    def untyped_attrs():
+        return [AttrsBox(inner=1), AttrsBox(inner=account())]
+
     # Types with their own attribute lookup.
     @api.get("/read/swapped-dataclass")
     def read_swapped_dataclass():
@@ -473,6 +493,15 @@ def test_a_serializer_after_structs_with_only_leaf_fields_gives_its_dump(client)
     _check(client.get("/trust/leaf-structs-then-serializer"), [{"n": 1}, {"n": 2}, DUMPED])
 
 
+def test_a_serializer_as_the_value_of_an_enum_member_gives_its_dump(client):
+    _check(client.get("/untyped/enum-value"), {"role": DUMPED})
+    assert json.loads(_json.encode({"role": Role.ADMIN}, serializer=str)) == {"role": DUMPED}
+
+
+def test_a_serializer_in_an_attrs_field_gives_its_dump(client):
+    _check(client.get("/untyped/attrs"), [{"inner": 1}, {"inner": DUMPED}])
+
+
 def test_a_dataclass_field_is_read_with_getattr_as_msgspec_reads_it(client):
     _check(client.get("/read/swapped-dataclass"), [{"inner": DUMPED}, {"inner": 1}])
 
@@ -592,7 +621,7 @@ def test_a_leaf_annotation_cannot_hold_a_serializer(annotation):
 
 @pytest.mark.parametrize(
     "annotation",
-    [Any, dict, list, object, UserOut, Account, list[UserOut], dict[str, Any], int | UserOut, Page[int]]
+    [Any, dict, list, object, UserOut, Account, list[UserOut], dict[str, Any], int | UserOut, Page[int], Role]
     + [TypeVar("T"), NewType("UserId", int)],
     ids=repr,
 )
