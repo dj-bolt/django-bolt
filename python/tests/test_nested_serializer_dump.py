@@ -108,6 +108,52 @@ class Counted(msgspec.Struct):
     n: int
 
 
+@dataclasses.dataclass(slots=True)
+class Swapped:
+    """A slotted dataclass whose ``getattr`` gives another object than its slot.
+
+    msgspec reads the fields of such a dataclass with ``getattr``.
+    """
+
+    inner: Any
+
+    def __getattribute__(self, name):
+        value = object.__getattribute__(self, name)
+        if name == "inner" and value == "swap":
+            return account()
+        return value
+
+
+class Masked(msgspec.Struct):
+    """msgspec reads a Struct field from its slot, also when ``getattr`` gives another object."""
+
+    inner: Any
+
+    def __getattribute__(self, name):
+        if name == "inner":
+            return "masked"
+        return msgspec.Struct.__getattribute__(self, name)
+
+
+class SelfCopy(msgspec.Struct):
+    """A Struct whose ``__copy__`` gives the object itself."""
+
+    inner: Any
+
+    def __copy__(self):
+        return self
+
+
+@dataclasses.dataclass
+class SelfCopyBox:
+    """A dataclass whose ``__copy__`` gives the object itself."""
+
+    inner: Any
+
+    def __copy__(self):
+        return self
+
+
 DUMPED = {"id": 1, "label": "user-1"}
 
 
@@ -277,6 +323,16 @@ def client():
     def trust_leaf_structs_then_serializer():
         return [Counted(n=1), Counted(n=2), account()]
 
+    # Types with their own attribute lookup.
+    @api.get("/read/swapped-dataclass")
+    def read_swapped_dataclass():
+        # The scan visits the last item first, so a plain instance comes last.
+        return [Swapped(inner="swap"), Swapped(inner=1)]
+
+    @api.get("/read/masked-struct")
+    def read_masked_struct():
+        return [Masked(inner=1), Masked(inner=account())]
+
     # Response classes.
     @api.get("/json/serializer")
     def json_serializer():
@@ -415,6 +471,37 @@ def test_a_serializer_in_an_int_field_gives_its_dump(client):
 
 def test_a_serializer_after_structs_with_only_leaf_fields_gives_its_dump(client):
     _check(client.get("/trust/leaf-structs-then-serializer"), [{"n": 1}, {"n": 2}, DUMPED])
+
+
+def test_a_dataclass_field_is_read_with_getattr_as_msgspec_reads_it(client):
+    _check(client.get("/read/swapped-dataclass"), [{"inner": DUMPED}, {"inner": 1}])
+
+
+def test_a_struct_field_is_read_from_its_slot_as_msgspec_reads_it(client):
+    _check(client.get("/read/masked-struct"), [{"inner": 1}, {"inner": DUMPED}])
+
+
+def test_a_copy_that_gives_the_object_itself_does_not_change_the_value_of_the_handler():
+    """A Struct gets the copy of msgspec. A dataclass gives a 500, and its Serializer stays."""
+    api = BoltAPI()
+    struct_value = SelfCopy(inner=account())
+    dataclass_value = SelfCopyBox(inner=account())
+
+    @api.get("/struct")
+    def struct_route():
+        return [struct_value]
+
+    @api.get("/dataclass")
+    def dataclass_route():
+        return [dataclass_value]
+
+    with TestClient(api) as test_client:
+        _check(test_client.get("/struct"), [{"inner": DUMPED}])
+        response = test_client.get("/dataclass")
+        assert response.status_code == 500
+        assert SECRET not in response.text
+    assert isinstance(struct_value.inner, Account)
+    assert isinstance(dataclass_value.inner, Account)
 
 
 def test_a_serializer_in_json_gives_its_dump(client):
@@ -559,9 +646,9 @@ _leaves = st.one_of(
 _values = st.recursive(
     _leaves,
     lambda children: st.one_of(
-        st.lists(children, max_size=4),
+        st.lists(children, max_size=12),
         st.lists(children, max_size=4).map(tuple),
-        st.dictionaries(st.text(max_size=3), children, max_size=4),
+        st.dictionaries(st.text(max_size=3), children, max_size=12),
         st.builds(Renamed, inner_value=children),
         st.builds(FrozenBox, item=children),
         st.builds(Counted, n=children),

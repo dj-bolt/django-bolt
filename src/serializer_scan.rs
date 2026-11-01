@@ -6,11 +6,11 @@
 //! Serializer, so a value with no Serializer costs one native pass.
 
 use pyo3::exceptions::PyAttributeError;
+use pyo3::ffi;
 use pyo3::prelude::*;
-#[cfg(Py_GIL_DISABLED)]
-use pyo3::types::PyList;
 use pyo3::types::{
-    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PySet, PyString, PyTuple,
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString,
+    PyTuple,
 };
 
 /// The deepest level that the scan visits. At this level the scan answers
@@ -29,22 +29,22 @@ fn is_exact_leaf(value: &Bound<'_, PyAny>) -> bool {
         || value.is_exact_instance_of::<PyFloat>()
 }
 
-/// `is_exact_leaf` for a borrowed pointer.
-///
-/// # Safety
-///
-/// `value` must point to a live Python object.
+/// Whether `item_type` is exactly str, int, float or bool.
 #[cfg(not(Py_GIL_DISABLED))]
-#[inline]
-unsafe fn is_exact_leaf_ptr(value: *mut pyo3::ffi::PyObject) -> bool {
-    use pyo3::ffi;
-    unsafe {
-        value == ffi::Py_None()
-            || ffi::PyUnicode_CheckExact(value) != 0
-            || ffi::PyLong_CheckExact(value) != 0
-            || ffi::PyBool_Check(value) != 0
-            || ffi::PyFloat_CheckExact(value) != 0
-    }
+#[inline(always)]
+fn is_exact_scalar_type(item_type: *mut ffi::PyTypeObject) -> bool {
+    item_type == &raw mut ffi::PyUnicode_Type
+        || item_type == &raw mut ffi::PyLong_Type
+        || item_type == &raw mut ffi::PyFloat_Type
+        || item_type == &raw mut ffi::PyBool_Type
+}
+
+/// Whether `item_type` is exactly dict, list or tuple.
+#[inline(always)]
+fn is_exact_container_type(item_type: *mut ffi::PyTypeObject) -> bool {
+    item_type == &raw mut ffi::PyDict_Type
+        || item_type == &raw mut ffi::PyList_Type
+        || item_type == &raw mut ffi::PyTuple_Type
 }
 
 /// A value of a subclass of a scalar type, for example a str Enum.
@@ -60,26 +60,63 @@ fn is_scalar_subclass(value: &Bound<'_, PyAny>) -> bool {
 /// The number of leaf types that one scan keeps.
 const LEAF_TYPES: usize = 8;
 
-/// The slot offsets of the fields of a Struct type, which `find_serializer`
-/// keeps in its `offsets` dict. A Struct reads each field at its offset with
-/// no attribute lookup.
+/// The slot offsets of the fields of a type, which `find_serializer` keeps
+/// in its `offsets` dict. The scan reads each field at its offset with no
+/// attribute lookup.
 #[pyclass(frozen)]
 pub struct FieldOffsets {
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
-    offsets: Box<[pyo3::ffi::Py_ssize_t]>,
+    offsets: Box<[ffi::Py_ssize_t]>,
 }
 
 /// The layout of a member descriptor (`PyMemberDescrObject`) in CPython 3.12
 /// to 3.15. The scan reads the offsets of a type from it only on these
-/// versions, and it checks each offset against `getattr` first.
+/// versions, and it checks each offset on an instance first.
 #[cfg(not(Py_GIL_DISABLED))]
 #[repr(C)]
 struct MemberDescr {
-    ob_base: pyo3::ffi::PyObject,
-    d_type: *mut pyo3::ffi::PyTypeObject,
-    d_name: *mut pyo3::ffi::PyObject,
-    d_qualname: *mut pyo3::ffi::PyObject,
-    d_member: *mut pyo3::ffi::PyMemberDef,
+    ob_base: ffi::PyObject,
+    d_type: *mut ffi::PyTypeObject,
+    d_name: *mut ffi::PyObject,
+    d_qualname: *mut ffi::PyObject,
+    d_member: *mut ffi::PyMemberDef,
+}
+
+/// The start of the layout of a list (`PyListObject`) on a GIL build of
+/// CPython 3.12 to 3.15. The scan reads the items of a list in place, as the
+/// `PyList_GET_ITEM` macro does.
+#[cfg(not(Py_GIL_DISABLED))]
+#[repr(C)]
+struct ListLayout {
+    ob_base: ffi::PyObject,
+    ob_size: ffi::Py_ssize_t,
+    ob_item: *mut *mut ffi::PyObject,
+}
+
+/// Return whether this Python has the layouts of `ListLayout` and
+/// `MemberDescr`. The check runs once. The version must be 3.15 or older,
+/// and a sample list must read the same in place as through the C API.
+#[cfg(not(Py_GIL_DISABLED))]
+fn layouts_known(py: Python<'_>) -> bool {
+    static KNOWN: pyo3::sync::PyOnceLock<bool> = pyo3::sync::PyOnceLock::new();
+    *KNOWN.get_or_init(py, || {
+        if py.version_info() >= (3, 16) {
+            return false;
+        }
+        let Ok(sample) = PyList::new(py, [1, 2, 3]) else {
+            return false;
+        };
+        let list = sample.as_ptr();
+        // SAFETY: `sample` is a live list of three items, and the reads stay
+        // inside it on a layout that matches `ListLayout`.
+        unsafe {
+            let layout = list.cast::<ListLayout>();
+            (*layout).ob_size == 3
+                && (0..3).all(|index| {
+                    *(*layout).ob_item.offset(index) == ffi::PyList_GetItem(list, index)
+                })
+        }
+    })
 }
 
 /// What the scan does with a child.
@@ -94,54 +131,81 @@ enum Want {
 }
 
 /// The state of one scan: the objects to visit, the last types that hold no
-/// Serializer, and the last Struct type with its field offsets.
+/// Serializer, and the last type whose fields the scan reads at offsets.
 struct Scan<'a, 'py> {
     stack: Vec<(Bound<'py, PyAny>, usize)>,
     kinds: &'a Bound<'py, PyDict>,
     classify: &'a Bound<'py, PyAny>,
     /// Types that `kinds` marks as leaves. A child of such a type is
     /// skipped with pointer compares, so a list of datetimes reads the kind
-    /// of `datetime` once. The value holds an instance of each type during
-    /// the scan, so the types stay alive.
-    leaf_types: [*mut pyo3::ffi::PyTypeObject; LEAF_TYPES],
+    /// of `datetime` once. The first `leaf_count` entries are strong
+    /// references: Python code can run during the scan, so a new type could
+    /// otherwise take the address of a freed type.
+    leaf_types: [*mut ffi::PyTypeObject; LEAF_TYPES],
+    leaf_count: usize,
     next_leaf: usize,
     /// The cache of field offsets, keyed by type. Without it, the scan reads
-    /// each field with `getattr`.
+    /// each field with an attribute lookup.
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
     offsets: Option<&'a Bound<'py, PyDict>>,
-    /// The last Struct type with known offsets. A child of this type has its
-    /// fields read in place, so it does not go on the stack.
+    /// The last type with known offsets, as a strong reference, or null. A
+    /// child of this type has its fields read in place, so it does not go on
+    /// the stack.
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
-    struct_type: *mut pyo3::ffi::PyTypeObject,
+    struct_type: *mut ffi::PyTypeObject,
     #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
-    struct_offsets: Vec<pyo3::ffi::Py_ssize_t>,
+    struct_offsets: Vec<ffi::Py_ssize_t>,
+    /// Whether the scan can read lists and member descriptors in place.
+    #[cfg_attr(Py_GIL_DISABLED, allow(dead_code))]
+    layouts: bool,
 }
 
 impl<'a, 'py> Scan<'a, 'py> {
     #[inline]
-    fn is_leaf_type(&self, item_type: *mut pyo3::ffi::PyTypeObject) -> bool {
+    fn is_leaf_type(&self, item_type: *mut ffi::PyTypeObject) -> bool {
         self.leaf_types.contains(&item_type)
     }
 
-    fn add_leaf_type(&mut self, item_type: *mut pyo3::ffi::PyTypeObject) {
+    /// Add `item_type`, the type of a live object, to `leaf_types`.
+    fn add_leaf_type(&mut self, item_type: *mut ffi::PyTypeObject) {
+        // SAFETY: the object keeps its type alive until the new reference
+        // exists. The entry to replace is a strong reference of the scan.
+        unsafe {
+            ffi::Py_IncRef(item_type.cast());
+            if self.leaf_count == LEAF_TYPES {
+                ffi::Py_DecRef(self.leaf_types[self.next_leaf].cast());
+            } else {
+                self.leaf_count += 1;
+            }
+        }
         self.leaf_types[self.next_leaf] = item_type;
         self.next_leaf = (self.next_leaf + 1) % LEAF_TYPES;
     }
 
+    /// Make `item_type`, the type of a live object, the `struct_type`.
+    #[cfg(not(Py_GIL_DISABLED))]
+    fn set_struct_type(&mut self, item_type: *mut ffi::PyTypeObject) {
+        // SAFETY: the object keeps its type alive until the new reference
+        // exists. A previous `struct_type` is a strong reference of the scan.
+        unsafe {
+            ffi::Py_IncRef(item_type.cast());
+            if !self.struct_type.is_null() {
+                ffi::Py_DecRef(self.struct_type.cast());
+            }
+        }
+        self.struct_type = item_type;
+    }
+
     /// Return what the scan does with an object of type `item_type` that is
     /// not an exact leaf. A type that `kinds` marks as a leaf joins
-    /// `leaf_types`. With `switch_struct`, a Struct type with cached offsets
+    /// `leaf_types`. With `switch_struct`, a type with cached offsets
     /// becomes `struct_type`. The kind lookup and `classify` can run Python
     /// code, so the caller holds a strong reference to the object.
     #[inline]
-    fn want(&mut self, item_type: *mut pyo3::ffi::PyTypeObject, switch_struct: bool) -> Want {
-        use pyo3::ffi;
+    fn want(&mut self, item_type: *mut ffi::PyTypeObject, switch_struct: bool) -> Want {
         // The exact builtin containers come first: they are the most common
         // children, and they take one pointer compare each.
-        if item_type == &raw mut ffi::PyDict_Type
-            || item_type == &raw mut ffi::PyList_Type
-            || item_type == &raw mut ffi::PyTuple_Type
-        {
+        if is_exact_container_type(item_type) {
             return Want::Visit;
         }
         if item_type == self.struct_type {
@@ -150,6 +214,45 @@ impl<'a, 'py> Scan<'a, 'py> {
         if self.is_leaf_type(item_type) {
             return Want::Skip;
         }
+        // SAFETY: `item_type` is the type of a live object, so it is alive.
+        let item_type_object =
+            unsafe { Bound::from_borrowed_ptr(self.kinds.py(), item_type.cast()) };
+        // An error goes to `visit`, which reads the kind again and raises it.
+        let kind = match self.kinds.get_item(&item_type_object) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => {
+                // `classify` never gets a container or a scalar subclass, so
+                // only a type that `kinds` does not hold needs these checks.
+                if let Some(want) = self.want_by_flags(item_type) {
+                    return want;
+                }
+                match self.classify.call1((&item_type_object,)) {
+                    Ok(kind) => kind,
+                    Err(_) => return Want::Visit,
+                }
+            }
+            Err(_) => return Want::Visit,
+        };
+        if kind.is_none() {
+            self.add_leaf_type(item_type);
+            return Want::Skip;
+        }
+        #[cfg(not(Py_GIL_DISABLED))]
+        if switch_struct
+            && kind.is_instance_of::<PyTuple>()
+            && self.use_cached_offsets(&item_type_object)
+        {
+            return Want::Fields;
+        }
+        #[cfg(Py_GIL_DISABLED)]
+        let _ = switch_struct;
+        // A Serializer, or a type with fields to read with an attribute lookup.
+        Want::Visit
+    }
+
+    /// Return what the scan does with a container or a scalar subclass of
+    /// type `item_type`, or None for any other type.
+    fn want_by_flags(&mut self, item_type: *mut ffi::PyTypeObject) -> Option<Want> {
         // SAFETY: `item_type` is the type of a live object, so it is alive.
         // The flag reads and the subtype checks run no Python code.
         unsafe {
@@ -166,7 +269,7 @@ impl<'a, 'py> Scan<'a, 'py> {
                 || is_subtype(&raw mut ffi::PySet_Type)
                 || is_subtype(&raw mut ffi::PyFrozenSet_Type)
             {
-                return Want::Visit;
+                return Some(Want::Visit);
             }
             // A subclass of a scalar type, for example a str Enum.
             if flags
@@ -178,36 +281,10 @@ impl<'a, 'py> Scan<'a, 'py> {
                 || is_subtype(&raw mut ffi::PyByteArray_Type)
             {
                 self.add_leaf_type(item_type);
-                return Want::Skip;
+                return Some(Want::Skip);
             }
         }
-        // SAFETY: `item_type` is the type of a live object, so it is alive.
-        let item_type_object =
-            unsafe { Bound::from_borrowed_ptr(self.kinds.py(), item_type.cast()) };
-        // An error goes to `visit`, which reads the kind again and raises it.
-        let kind = match self.kinds.get_item(&item_type_object) {
-            Ok(Some(kind)) => kind,
-            Ok(None) => match self.classify.call1((&item_type_object,)) {
-                Ok(kind) => kind,
-                Err(_) => return Want::Visit,
-            },
-            Err(_) => return Want::Visit,
-        };
-        if kind.is_none() {
-            self.add_leaf_type(item_type);
-            return Want::Skip;
-        }
-        #[cfg(not(Py_GIL_DISABLED))]
-        if switch_struct
-            && kind.is_instance_of::<PyTuple>()
-            && self.use_cached_offsets(&item_type_object)
-        {
-            return Want::Fields;
-        }
-        #[cfg(Py_GIL_DISABLED)]
-        let _ = switch_struct;
-        // A Serializer, or a type with fields to read with getattr.
-        Want::Visit
+        None
     }
 
     /// Make `item_type` the `struct_type` if the `offsets` cache holds its
@@ -223,7 +300,7 @@ impl<'a, 'py> Scan<'a, 'py> {
         let Ok(cached) = cached.cast::<FieldOffsets>() else {
             return false;
         };
-        self.struct_type = item_type.as_ptr().cast();
+        self.set_struct_type(item_type.as_ptr().cast());
         self.struct_offsets.clear();
         self.struct_offsets.extend_from_slice(&cached.get().offsets);
         true
@@ -250,6 +327,39 @@ impl<'a, 'py> Scan<'a, 'py> {
         }
     }
 
+    /// `push` for a child that a GIL loop reads as a borrowed pointer.
+    ///
+    /// The checks before the strong reference run no Python code, so the
+    /// child stays alive for them.
+    ///
+    /// # Safety
+    ///
+    /// The thread holds the GIL, and `child` points to a live object.
+    #[cfg(not(Py_GIL_DISABLED))]
+    #[inline(always)]
+    unsafe fn push_borrowed(&mut self, py: Python<'py>, child: *mut ffi::PyObject, depth: usize) {
+        unsafe {
+            let child_type = ffi::Py_TYPE(child);
+            // The checks go in the order of how common the types are in JSON.
+            if child_type == &raw mut ffi::PyUnicode_Type {
+                return;
+            }
+            if is_exact_container_type(child_type) {
+                self.stack
+                    .push((Bound::from_borrowed_ptr(py, child), depth));
+                return;
+            }
+            if is_exact_scalar_type(child_type) || child == ffi::Py_None() {
+                return;
+            }
+            if child_type == self.struct_type {
+                self.push_fields(py, child, depth);
+            } else if !self.is_leaf_type(child_type) {
+                self.push_non_leaf(Bound::from_borrowed_ptr(py, child), depth);
+            }
+        }
+    }
+
     /// Put the fields of `item`, an instance of `struct_type`, on the stack.
     ///
     /// A field that is not a leaf gets its kind here, so a `datetime` field
@@ -263,33 +373,32 @@ impl<'a, 'py> Scan<'a, 'py> {
     /// The thread holds the GIL, `item` is alive, and its type is
     /// `struct_type`.
     #[cfg(not(Py_GIL_DISABLED))]
-    unsafe fn push_fields(
-        &mut self,
-        py: Python<'py>,
-        item: *mut pyo3::ffi::PyObject,
-        depth: usize,
-    ) {
-        use pyo3::ffi;
+    unsafe fn push_fields(&mut self, py: Python<'py>, item: *mut ffi::PyObject, depth: usize) {
         // SAFETY: the caller keeps `item` alive until this reference exists.
         let item = unsafe { Bound::from_borrowed_ptr(py, item) };
         for index in 0..self.struct_offsets.len() {
             // SAFETY: `offsets_for` checked each offset against the layout of
-            // the type and against `getattr` of an instance. `item` is alive.
-            let field = unsafe {
+            // the type and against an instance. `item` is alive. The checks
+            // before the strong reference run no Python code.
+            let (field, field_type) = unsafe {
                 let field = *item
                     .as_ptr()
                     .cast::<u8>()
                     .offset(self.struct_offsets[index])
                     .cast::<*mut ffi::PyObject>();
-                if field.is_null()
-                    || is_exact_leaf_ptr(field)
-                    || self.is_leaf_type(ffi::Py_TYPE(field))
+                if field.is_null() {
+                    continue;
+                }
+                let field_type = ffi::Py_TYPE(field);
+                if is_exact_scalar_type(field_type)
+                    || field == ffi::Py_None()
+                    || self.is_leaf_type(field_type)
                 {
                     continue;
                 }
-                Bound::from_borrowed_ptr(py, field)
+                (Bound::from_borrowed_ptr(py, field), field_type)
             };
-            if self.want(field.get_type().as_type_ptr(), false) != Want::Skip {
+            if is_exact_container_type(field_type) || self.want(field_type, false) != Want::Skip {
                 self.stack.push((field, depth));
             }
         }
@@ -298,12 +407,16 @@ impl<'a, 'py> Scan<'a, 'py> {
     /// Return the slot offsets of the fields `names` of the type of `item`,
     /// or None if a field is not a plain slot. The result goes into the
     /// `offsets` cache, also when it is None.
+    ///
+    /// With `generic_only`, a type with its own attribute lookup gets None:
+    /// msgspec reads the fields of such a dataclass with `getattr`.
     #[cfg(not(Py_GIL_DISABLED))]
     fn offsets_for(
         &self,
         item: &Bound<'py, PyAny>,
         names: &Bound<'py, PyTuple>,
-    ) -> PyResult<Option<Vec<pyo3::ffi::Py_ssize_t>>> {
+        generic_only: bool,
+    ) -> PyResult<Option<Vec<ffi::Py_ssize_t>>> {
         let Some(cache) = self.offsets else {
             return Ok(None);
         };
@@ -314,7 +427,11 @@ impl<'a, 'py> Scan<'a, 'py> {
                 .ok()
                 .map(|cached| cached.get().offsets.to_vec()));
         }
-        let offsets = read_field_offsets(item, names)?;
+        let offsets = if self.layouts {
+            read_field_offsets(item, names, generic_only)?
+        } else {
+            None
+        };
         if cache.len() < MAX_CACHED_TYPES {
             match &offsets {
                 Some(offsets) => {
@@ -336,78 +453,121 @@ impl<'a, 'py> Scan<'a, 'py> {
     /// reference count change.
     #[cfg(not(Py_GIL_DISABLED))]
     fn push_items(&mut self, item: &Bound<'py, PyAny>, depth: usize) -> bool {
-        use pyo3::ffi;
         let py = item.py();
         let container = item.as_ptr();
-        // SAFETY: the thread holds the GIL. The leaf checks and the field
-        // reads of `push_fields` run no Python code, so the borrowed item
-        // stays alive for them. A kind lookup can run Python code: the
-        // metaclass of the item can hash in Python, and that code can change
-        // the container. Thus each item takes a strong reference before its
-        // lookup, the list loop reads the size again for each index, and it
-        // stops on a missing item.
+        // SAFETY: the thread holds the GIL, and the stack holds `item`.
         unsafe {
-            if ffi::PyDict_Check(container) != 0 {
-                let mut position: ffi::Py_ssize_t = 0;
-                let mut key = std::ptr::null_mut();
-                let mut value = std::ptr::null_mut();
-                // PyDict_Next checks its position against the current table,
-                // so a dict that changes during a lookup cannot crash it.
-                while ffi::PyDict_Next(container, &mut position, &mut key, &mut value) != 0 {
-                    if is_exact_leaf_ptr(value) || self.is_leaf_type(ffi::Py_TYPE(value)) {
-                        continue;
-                    }
-                    if ffi::Py_TYPE(value) == self.struct_type {
-                        self.push_fields(py, value, depth);
-                        continue;
-                    }
-                    let child = Bound::from_borrowed_ptr(py, value);
-                    self.push_non_leaf(child, depth);
-                }
-                return true;
-            }
-            let (size, get_item): (
-                unsafe extern "C" fn(*mut ffi::PyObject) -> ffi::Py_ssize_t,
-                unsafe extern "C" fn(*mut ffi::PyObject, ffi::Py_ssize_t) -> *mut ffi::PyObject,
-            ) = if ffi::PyList_Check(container) != 0 {
-                (ffi::PyList_Size, ffi::PyList_GetItem)
+            let container_type = ffi::Py_TYPE(container);
+            if container_type == &raw mut ffi::PyDict_Type {
+                self.push_dict_values(py, container, depth);
+            } else if container_type == &raw mut ffi::PyList_Type {
+                self.push_list_items(py, container, depth);
+            } else if container_type == &raw mut ffi::PyTuple_Type {
+                self.push_tuple_items(py, container, depth);
+            } else if ffi::PyDict_Check(container) != 0 {
+                self.push_dict_values(py, container, depth);
+            } else if ffi::PyList_Check(container) != 0 {
+                self.push_list_items(py, container, depth);
             } else if ffi::PyTuple_Check(container) != 0 {
-                (ffi::PyTuple_Size, ffi::PyTuple_GetItem)
+                self.push_tuple_items(py, container, depth);
             } else {
                 return false;
-            };
-            let mut index = 0;
-            while index < size(container) {
-                let child = get_item(container, index);
+            }
+        }
+        true
+    }
+
+    /// Put the values of `dict` on the stack.
+    ///
+    /// # Safety
+    ///
+    /// The thread holds the GIL, and `dict` is a live dict.
+    #[cfg(not(Py_GIL_DISABLED))]
+    unsafe fn push_dict_values(&mut self, py: Python<'py>, dict: *mut ffi::PyObject, depth: usize) {
+        unsafe {
+            let mut position: ffi::Py_ssize_t = 0;
+            let mut key = std::ptr::null_mut();
+            let mut value = std::ptr::null_mut();
+            // A kind lookup can run Python code that changes the dict.
+            // PyDict_Next checks its position against the current table, so
+            // such a change cannot crash it.
+            while ffi::PyDict_Next(dict, &mut position, &mut key, &mut value) != 0 {
+                self.push_borrowed(py, value, depth);
+            }
+        }
+    }
+
+    /// Put the items of `list` on the stack.
+    ///
+    /// A kind lookup can run Python code that changes the list. Thus the
+    /// loop reads the size and the item array again for each index.
+    ///
+    /// # Safety
+    ///
+    /// The thread holds the GIL, and `list` is a live list.
+    #[cfg(not(Py_GIL_DISABLED))]
+    unsafe fn push_list_items(&mut self, py: Python<'py>, list: *mut ffi::PyObject, depth: usize) {
+        let mut index = 0;
+        unsafe {
+            if self.layouts {
+                let layout = list.cast::<ListLayout>();
+                while index < (*layout).ob_size {
+                    let child = *(*layout).ob_item.offset(index);
+                    index += 1;
+                    self.push_borrowed(py, child, depth);
+                }
+                return;
+            }
+            while index < ffi::PyList_Size(list) {
+                let child = ffi::PyList_GetItem(list, index);
                 if child.is_null() {
-                    // The list became shorter during a kind lookup.
                     ffi::PyErr_Clear();
                     break;
                 }
                 index += 1;
-                if is_exact_leaf_ptr(child) || self.is_leaf_type(ffi::Py_TYPE(child)) {
-                    continue;
-                }
-                if ffi::Py_TYPE(child) == self.struct_type {
-                    self.push_fields(py, child, depth);
-                    continue;
-                }
-                let child = Bound::from_borrowed_ptr(py, child);
-                self.push_non_leaf(child, depth);
+                self.push_borrowed(py, child, depth);
             }
         }
-        true
+    }
+
+    /// Put the items of `tuple` on the stack. A tuple does not change, and
+    /// it holds its items.
+    ///
+    /// # Safety
+    ///
+    /// The thread holds the GIL, and `tuple` is a live tuple.
+    #[cfg(not(Py_GIL_DISABLED))]
+    unsafe fn push_tuple_items(
+        &mut self,
+        py: Python<'py>,
+        tuple: *mut ffi::PyObject,
+        depth: usize,
+    ) {
+        unsafe {
+            for index in 0..ffi::PyTuple_Size(tuple) {
+                let child = ffi::PyTuple_GetItem(tuple, index);
+                if child.is_null() {
+                    ffi::PyErr_Clear();
+                    break;
+                }
+                self.push_borrowed(py, child, depth);
+            }
+        }
     }
 
     /// Put the items of a dict, list or tuple on the stack. Return false for
     /// any other value.
     ///
     /// Without the GIL, another thread can change a container. The PyO3
-    /// iterators hold a strong reference to each item.
+    /// iterators hold a strong reference to each item. The dict iterator of
+    /// PyO3 panics when the size of the dict changes, so the loop reads a
+    /// copy of the values.
     #[cfg(Py_GIL_DISABLED)]
     fn push_items(&mut self, item: &Bound<'py, PyAny>, depth: usize) -> bool {
         if let Ok(dict) = item.cast::<PyDict>() {
-            dict.iter().for_each(|(_, child)| self.push(child, depth));
+            dict.values()
+                .iter()
+                .for_each(|child| self.push(child, depth));
         } else if let Ok(list) = item.cast::<PyList>() {
             list.iter().for_each(|child| self.push(child, depth));
         } else if let Ok(tuple) = item.cast::<PyTuple>() {
@@ -424,12 +584,12 @@ impl<'a, 'py> Scan<'a, 'py> {
         if self.push_items(item, depth) {
             return Ok(false);
         }
-        if let Ok(set) = item.cast::<PySet>() {
-            set.iter().for_each(|child| self.push(child, depth));
-            return Ok(false);
-        }
-        if let Ok(set) = item.cast::<PyFrozenSet>() {
-            set.iter().for_each(|child| self.push(child, depth));
+        if item.is_instance_of::<PySet>() || item.is_instance_of::<PyFrozenSet>() {
+            // The set iterator of PyO3 panics when the set changes during the
+            // loop. The iterator of Python raises a RuntimeError instead.
+            for child in item.try_iter()? {
+                self.push(child?, depth);
+            }
             return Ok(false);
         }
         let item_type = item.get_type();
@@ -448,16 +608,26 @@ impl<'a, 'py> Scan<'a, 'py> {
         let Ok(names) = kind.cast::<PyTuple>() else {
             return Ok(true);
         };
+        // A tuple names the fields of a Struct, which msgspec reads from
+        // their slots. A tuple subclass names the fields of another type,
+        // which msgspec reads with `getattr` if the type has its own lookup.
+        let slots = names.is_exact_instance_of::<PyTuple>();
         #[cfg(not(Py_GIL_DISABLED))]
-        if let Some(offsets) = self.offsets_for(item, names)? {
-            self.struct_type = item_type.as_type_ptr();
+        if let Some(offsets) = self.offsets_for(item, names, !slots)? {
+            self.set_struct_type(item_type.as_type_ptr());
             self.struct_offsets = offsets;
             // SAFETY: the stack holds `item`, and its type is `struct_type`.
             unsafe { self.push_fields(item.py(), item.as_ptr(), depth) };
             return Ok(false);
         }
         for name in names.iter() {
-            match item.getattr(name.cast::<PyString>()?) {
+            let name = name.cast::<PyString>()?;
+            let child = if slots {
+                generic_getattr(item, name)
+            } else {
+                item.getattr(name)
+            };
+            match child {
                 Ok(child) => self.push(child, depth),
                 // msgspec skips an attribute that the object does not have.
                 Err(err) if err.is_instance_of::<PyAttributeError>(item.py()) => {}
@@ -468,25 +638,60 @@ impl<'a, 'py> Scan<'a, 'py> {
     }
 }
 
+impl Drop for Scan<'_, '_> {
+    fn drop(&mut self) {
+        // SAFETY: the scan holds a strong reference to each of these types.
+        unsafe {
+            for item_type in &self.leaf_types[..self.leaf_count] {
+                ffi::Py_DecRef(item_type.cast());
+            }
+            if !self.struct_type.is_null() {
+                ffi::Py_DecRef(self.struct_type.cast());
+            }
+        }
+    }
+}
+
+/// Read the attribute `name` of `item` with the lookup of `object`, which
+/// does not call a `__getattribute__` or `__getattr__` of the type.
+fn generic_getattr<'py>(
+    item: &Bound<'py, PyAny>,
+    name: &Bound<'py, PyString>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // SAFETY: both arguments are live objects.
+    unsafe {
+        Bound::from_owned_ptr_or_err(
+            item.py(),
+            ffi::PyObject_GenericGetAttr(item.as_ptr(), name.as_ptr()),
+        )
+    }
+}
+
 /// The maximum number of types in an `offsets` cache, as for the kinds.
 #[cfg(not(Py_GIL_DISABLED))]
 const MAX_CACHED_TYPES: usize = 4096;
 
 /// Read the slot offset of each field of the type of `item` from its member
-/// descriptor. Return None if a field is not a plain object slot, or if the
-/// Python version is not one whose descriptor layout `MemberDescr` matches.
-/// Each offset must give the object that `getattr` gives on `item`.
+/// descriptor. Return None if a field is not a plain object slot. The caller
+/// checks that the Python version has the `MemberDescr` layout.
+///
+/// Each offset must give the object that the lookup of `object` gives on
+/// `item`. With `generic_only`, the type must also use that lookup itself.
 #[cfg(not(Py_GIL_DISABLED))]
 fn read_field_offsets(
     item: &Bound<'_, PyAny>,
     names: &Bound<'_, PyTuple>,
-) -> PyResult<Option<Vec<pyo3::ffi::Py_ssize_t>>> {
-    use pyo3::ffi;
+    generic_only: bool,
+) -> PyResult<Option<Vec<ffi::Py_ssize_t>>> {
     let py = item.py();
-    if py.version_info() >= (3, 16) {
-        return Ok(None);
-    }
     let item_type = item.get_type();
+    if generic_only {
+        // SAFETY: `item_type` is a live type.
+        let getattro = unsafe { ffi::PyType_GetSlot(item_type.as_type_ptr(), ffi::Py_tp_getattro) };
+        if getattro != ffi::PyObject_GenericGetAttr as *mut std::ffi::c_void {
+            return Ok(None);
+        }
+    }
     let basicsize: ffi::Py_ssize_t = item_type
         .getattr(pyo3::intern!(py, "__basicsize__"))?
         .extract()?;
@@ -504,7 +709,7 @@ fn read_field_offsets(
             return Ok(None);
         }
         // SAFETY: the object is a member descriptor, and `MemberDescr` is its
-        // layout on the Python versions checked above.
+        // layout on the Python versions that the caller checked.
         let member = unsafe { (*descriptor.as_ptr().cast::<MemberDescr>()).d_member };
         if member.is_null() {
             return Ok(None);
@@ -528,7 +733,7 @@ fn read_field_offsets(
                 .offset(offset)
                 .cast::<*mut ffi::PyObject>()
         };
-        let same = match item.getattr(name) {
+        let same = match generic_getattr(item, name) {
             Ok(value) => value.as_ptr() == field,
             Err(err) if err.is_instance_of::<PyAttributeError>(py) => field.is_null(),
             Err(err) => return Err(err),
@@ -547,12 +752,16 @@ fn read_field_offsets(
 /// For each other object, `kinds` maps its type to a kind:
 ///
 /// - `None`: the scan does not visit the object.
-/// - a tuple of attribute names: the scan visits these attributes.
+/// - a tuple of field names: the scan reads these fields from their slots,
+///   as msgspec does for a Struct.
+/// - an instance of a tuple subclass: the scan reads these attributes as
+///   msgspec does for a dataclass. It reads a slot in place only if the type
+///   has no attribute lookup of its own.
 /// - any other value (Python gives `True`): the object is a Serializer.
 ///
 /// `classify(type)` gives the kind of a type that `kinds` does not hold.
-/// `offsets`, if given, keeps the slot offsets of the fields of each Struct
-/// type, so the scan reads them without an attribute lookup.
+/// `offsets`, if given, keeps the slot offsets of the fields of each type,
+/// so the scan reads them without an attribute lookup.
 #[pyfunction]
 #[pyo3(signature = (value, kinds, classify, offsets=None))]
 pub fn find_serializer<'py>(
@@ -570,10 +779,15 @@ pub fn find_serializer<'py>(
         kinds,
         classify,
         leaf_types: [std::ptr::null_mut(); LEAF_TYPES],
+        leaf_count: 0,
         next_leaf: 0,
         offsets,
         struct_type: std::ptr::null_mut(),
         struct_offsets: Vec::new(),
+        #[cfg(not(Py_GIL_DISABLED))]
+        layouts: layouts_known(value.py()),
+        #[cfg(Py_GIL_DISABLED)]
+        layouts: false,
     };
     if scan.visit(value, 1)? {
         return Ok(true);
@@ -663,6 +877,9 @@ class Empty:
 class Text(str):
     pass
 
+class Attributes(tuple):
+    pass
+
 calls = []
 KINDS = {Holder: ('inner', 'missing')}
 
@@ -723,6 +940,10 @@ def kinds():
                 "{'s': SetOf([Secret()])}",
                 "[FrozenOf([Secret()])]",
                 "Holder(collections.OrderedDict(a=[Secret()]))",
+                // A dict of 8 or more values: the scan reads a copy of its values.
+                "{**{str(i): i for i in range(20)}, 'z': Secret()}",
+                "collections.OrderedDict({**{str(i): [i] for i in range(9)}, 'z': (Secret(),)})",
+                "[*range(20), Secret()]",
             ] {
                 assert!(scan(&module, &eval(&module, expr)).unwrap(), "{expr}");
             }
@@ -746,6 +967,7 @@ def kinds():
                 "[Empty(), {'e': Empty()}]",
                 "Holder(1)",
                 "Holder(Empty())",
+                "{str(i): [i, {'k': Empty()}] for i in range(20)}",
             ] {
                 assert!(!scan(&module, &eval(&module, expr)).unwrap(), "{expr}");
             }
@@ -807,6 +1029,110 @@ by_key = {'a': Item(), 'b': Item()}
             assert_eq!(items.len().unwrap(), 0);
             let by_key = eval(&module, "by_key");
             assert!(!scan(&module, &by_key).unwrap());
+        });
+    }
+
+    #[test]
+    fn a_dict_or_a_set_that_changes_during_a_kind_lookup_does_not_crash_the_scan() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = fixtures(py);
+            let code = c"
+class Clearing(type):
+    def __hash__(cls):
+        small.clear()
+        large.clear()
+        members.clear()
+        return type.__hash__(cls)
+
+class Item(metaclass=Clearing):
+    pass
+
+small = {'a': Item(), 'b': Item(), 'c': [Secret()]}
+large = {**{str(i): Item() for i in range(10)}, 'z': [Secret()]}
+members = {Item(), Item(), Item()}
+";
+            py.run(code, Some(&module.dict()), None).unwrap();
+            for name in ["small", "large"] {
+                let value = eval(&module, name);
+                scan(&module, &value).unwrap();
+                assert_eq!(value.len().unwrap(), 0, "{name}");
+            }
+            // Python raises an error for a set that changes during a loop.
+            py.run(
+                c"members = {Item(), Item(), Item()}",
+                Some(&module.dict()),
+                None,
+            )
+            .unwrap();
+            let members = eval(&module, "members");
+            let err = scan(&module, &members).unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+        });
+    }
+
+    #[test]
+    fn a_struct_kind_reads_slots_and_an_attribute_kind_reads_with_getattr() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = fixtures(py);
+            // msgspec reads the fields of a Struct from their slots. It reads
+            // the fields of a dataclass with getattr if the class has its own
+            // lookup. A tuple kind stands for a Struct, a tuple subclass for a
+            // dataclass.
+            let code = c"
+class Masked:
+    __slots__ = ('inner',)
+    def __init__(self, inner):
+        self.inner = inner
+    def __getattribute__(self, name):
+        return 1 if name == 'inner' else object.__getattribute__(self, name)
+
+class MaskedFields(Masked):
+    __slots__ = ()
+
+class Lazy:
+    __slots__ = ('inner',)
+    def __getattr__(self, name):
+        return Secret()
+
+class Plain:
+    __slots__ = ('inner',)
+    def __init__(self, inner):
+        self.inner = inner
+
+KINDS[Masked] = ('inner',)
+KINDS[MaskedFields] = Attributes(('inner',))
+KINDS[Lazy] = Attributes(('inner',))
+KINDS[Plain] = Attributes(('inner',))
+";
+            py.run(code, Some(&module.dict()), None).unwrap();
+            for offsets in [None, Some(PyDict::new(py))] {
+                let run = |expr: &str| {
+                    let value = eval(&module, expr);
+                    match &offsets {
+                        Some(offsets) => scan_with_offsets(&module, &value, offsets).unwrap(),
+                        None => scan(&module, &value).unwrap(),
+                    }
+                };
+                assert!(run("[Masked(1), Masked(Secret())]"));
+                assert!(!run("[MaskedFields(1), MaskedFields(Secret())]"));
+                assert!(run("[Lazy(), Lazy()]"));
+                assert!(!run("[Plain(1), Plain(Empty())]"));
+                assert!(run("[Plain(1), Plain([Secret()])]"));
+            }
+            // A dataclass with its own lookup keeps getattr, a plain one reads slots.
+            #[cfg(not(Py_GIL_DISABLED))]
+            {
+                let offsets = PyDict::new(py);
+                for expr in ["[Lazy()]", "[Plain(1)]"] {
+                    scan_with_offsets(&module, &eval(&module, expr), &offsets).unwrap();
+                }
+                let lazy = offsets.get_item(eval(&module, "Lazy")).unwrap().unwrap();
+                assert!(lazy.is_none());
+                let plain = offsets.get_item(eval(&module, "Plain")).unwrap().unwrap();
+                assert!(plain.cast::<FieldOffsets>().is_ok());
+            }
         });
     }
 
@@ -1011,9 +1337,11 @@ KINDS[Shadowed] = ('inner', 'tag')
         ];
         leaf.prop_recursive(5, 48, 5, |inner| {
             prop_oneof![
-                prop::collection::vec(inner.clone(), 0..5).prop_map(Tree::List),
+                prop::collection::vec(inner.clone(), 0..12).prop_map(Tree::List),
                 prop::collection::vec(inner.clone(), 0..5).prop_map(Tree::Tuple),
-                prop::collection::btree_map("[a-z]{1,3}", inner.clone(), 0..5).prop_map(Tree::Dict),
+                // From 8 values, the scan reads a copy of the values of a dict.
+                prop::collection::btree_map("[a-z]{1,3}", inner.clone(), 0..12)
+                    .prop_map(Tree::Dict),
                 inner.prop_map(|item| Tree::Holder(Box::new(item))),
             ]
         })

@@ -9,12 +9,16 @@ The scan reads the kind of each type from ``SCAN_KINDS``:
 
 - ``None``: the scan does not look into a value of the type.
 - ``True``: the type is a Serializer.
-- a tuple of attribute names: the scan looks into these attributes.
+- a tuple of field names: the fields of a Struct. msgspec reads them from
+  their slots, so the scan and the dump do too.
+- an ``AttributeNames`` tuple: the fields of a dataclass or an attrs class.
+  msgspec reads them with ``getattr`` when the class has its own attribute
+  lookup, so the scan and the dump use ``getattr``.
 
 The kind of a Struct, dataclass or attrs class lists each of its fields.
 Nothing checks the type of a field, so an ``int`` field can hold a
-Serializer too. For a Struct, the Rust scan reads the fields at their slot
-offsets, which costs about as much as a leaf check.
+Serializer too. The Rust scan reads a slot at its offset, which costs about
+as much as a leaf check.
 """
 
 from __future__ import annotations
@@ -65,6 +69,12 @@ _SCAN_KINDS_LIMIT = 4096
 _MISSING = object()
 
 
+class AttributeNames(tuple):
+    """The fields of a dataclass or an attrs class, which msgspec reads with ``getattr``."""
+
+    __slots__ = ()
+
+
 def _is_serializer_class(tp: Any) -> bool:
     return bool(getattr(tp, "__is_bolt_serializer__", False))
 
@@ -72,15 +82,17 @@ def _is_serializer_class(tp: Any) -> bool:
 def _field_names(tp: type) -> tuple[str, ...] | None:
     """Return the attribute of each field that msgspec encodes, or None.
 
+    A Struct gives a tuple, and a dataclass or an attrs class gives an
+    ``AttributeNames`` tuple.
     None means that msgspec does not encode the fields of the type, so no
     field can hold a Serializer that msgspec sends.
     """
     if issubclass(tp, msgspec.Struct):
         return tp.__struct_fields__
     if dataclasses.is_dataclass(tp):
-        return tuple(field.name for field in dataclasses.fields(tp))
+        return AttributeNames(field.name for field in dataclasses.fields(tp))
     if (attributes := getattr(tp, "__attrs_attrs__", None)) is not None:
-        return tuple(attribute.name for attribute in attributes)
+        return AttributeNames(attribute.name for attribute in attributes)
     return None
 
 
@@ -156,10 +168,14 @@ def dump_serializers(value: Any) -> Any:
         return value
     if kind is True:
         return dump_serializers(value.dump())
+    is_struct = kind.__class__ is tuple
+    # msgspec reads a Struct field from its slot, so a __getattribute__ of the type does not apply.
+    get_attribute = object.__getattribute__ if is_struct else getattr
     changes = {}
     for name in kind:
-        item = getattr(value, name, _MISSING)
-        if item is _MISSING:
+        try:
+            item = get_attribute(value, name)
+        except AttributeError:
             continue
         new_item = dump_serializers(item)
         if new_item is not item:
@@ -167,8 +183,18 @@ def dump_serializers(value: Any) -> Any:
     if not changes:
         return value
     # A copy keeps the encoding options of the type: rename, tag, omit_defaults.
-    clone = copy.copy(value)
-    set_attribute = msgspec.structs.force_setattr if isinstance(value, msgspec.Struct) else object.__setattr__
+    if is_struct:
+        # The copy of msgspec itself: a __copy__ of the type could return the value.
+        clone = msgspec.Struct.__copy__(value)
+        set_attribute = msgspec.structs.force_setattr
+    else:
+        clone = copy.copy(value)
+        set_attribute = object.__setattr__
+        if clone is value:
+            raise TypeError(
+                f"{type(value).__qualname__}.__copy__ returns the object itself. "
+                "Bolt cannot dump the Serializer that it holds without a change to the object."
+            )
     for name, new_item in changes.items():
         set_attribute(clone, name, new_item)
     return clone
