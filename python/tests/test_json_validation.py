@@ -55,6 +55,92 @@ class UserWithNested(msgspec.Struct):
     address: NestedAddress
 
 
+class _Address(msgspec.Struct):
+    city: str
+    zip: str
+
+
+class _Person(msgspec.Struct):
+    name: str
+    address: _Address
+
+
+class _Company(msgspec.Struct):
+    name: str
+    owner: _Person
+
+
+class _Order(msgspec.Struct):
+    name: str
+    items: list[_Address]
+
+
+class TestNestedValidationErrorBodies:
+    """The 422 body of a nested error has the same type and a full loc as a top-level error."""
+
+    @staticmethod
+    def _post(path: str, body: dict) -> list[dict]:
+        api = BoltAPI()
+
+        @api.post("/people")
+        async def people(person: _Person):
+            return {"name": person.name}
+
+        @api.post("/companies")
+        async def companies(company: _Company):
+            return {"name": company.name}
+
+        @api.post("/orders")
+        async def orders(order: _Order):
+            return {"name": order.name}
+
+        with TestClient(api) as client:
+            response = client.post(path, json=body)
+        assert response.status_code == 422, response.text
+        return response.json()["detail"]
+
+    def test_top_level_missing_field_is_unchanged(self):
+        assert self._post("/people", {"address": {"city": "a", "zip": "1"}}) == [
+            {"loc": ["body", "name"], "msg": "Object missing required field `name`", "type": "missing_field"}
+        ]
+
+    def test_nested_missing_field_has_the_missing_field_type_and_its_full_loc(self):
+        assert self._post("/people", {"name": "x", "address": {"city": "a"}}) == [
+            {"loc": ["body", "address", "zip"], "msg": "Object missing required field `zip`", "type": "missing_field"}
+        ]
+
+    def test_doubly_nested_missing_field(self):
+        body = {"name": "c", "owner": {"name": "o", "address": {"zip": "1"}}}
+        assert self._post("/companies", body) == [
+            {
+                "loc": ["body", "owner", "address", "city"],
+                "msg": "Object missing required field `city`",
+                "type": "missing_field",
+            }
+        ]
+
+    def test_missing_field_in_a_list_item_names_the_index(self):
+        body = {"name": "x", "items": [{"city": "a", "zip": "1"}, {"city": "b"}]}
+        assert self._post("/orders", body) == [
+            {
+                "loc": ["body", "items", "1", "zip"],
+                "msg": "Object missing required field `zip`",
+                "type": "missing_field",
+            }
+        ]
+
+    def test_nested_type_mismatch_is_unchanged(self):
+        assert self._post("/people", {"name": "x", "address": {"city": 5, "zip": "1"}}) == [
+            {"loc": ["body", "address", "city"], "msg": "Expected `str`, got `int`", "type": "validation_error"}
+        ]
+
+    def test_type_mismatch_in_a_list_item_names_the_index(self):
+        body = {"name": "x", "items": [{"city": "a", "zip": 1}]}
+        assert self._post("/orders", body) == [
+            {"loc": ["body", "items", "0", "zip"], "msg": "Expected `str`, got `int`", "type": "validation_error"}
+        ]
+
+
 class TestInvalidJSONParsing:
     """Test invalid JSON body parsing and error handling."""
 

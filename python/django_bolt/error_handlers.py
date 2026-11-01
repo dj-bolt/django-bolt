@@ -101,7 +101,7 @@ def http_exception_handler(exc: HTTPException) -> tuple[int, list[tuple[str, str
 
 # Pre-compiled regex patterns for validation error parsing
 _RE_AT_LOCATION = re.compile(r" - at `(.+?)`$")
-_RE_FIELD_NAME = re.compile(r"`(\w+)`")
+_RE_MISSING_FIELD = re.compile(r"Object missing required field `(.+)`")
 _RE_PATH_SPLIT = re.compile(r"[.\[]")
 
 
@@ -136,17 +136,25 @@ def msgspec_validation_error_to_dict(error: msgspec.ValidationError, root: str =
         prefix = _loc_segments(loc_match.group(1)) if loc_match else []
         return [{**err, "loc": [root, *prefix, *err["loc"][1:]]} for err in cause.errors()]
 
-    # Try to extract field location with pre-compiled regex
+    # msgspec appends " - at `$.path`" to the error of a nested value. The
+    # path names the parent of a missing field, so the loc adds the field name.
     loc_match = _RE_AT_LOCATION.search(error_msg)
     if loc_match:
         msg_part = error_msg[: loc_match.start()]
         loc_parts = [root, *_loc_segments(loc_match.group(1))]
+    else:
+        msg_part = error_msg
+        loc_parts = [root]
+
+    missing_match = _RE_MISSING_FIELD.fullmatch(msg_part)
+    if missing_match:
+        return [{"loc": [*loc_parts, missing_match.group(1)], "msg": msg_part, "type": "missing_field"}]
+
+    if loc_match:
         return [{"loc": loc_parts, "msg": msg_part, "type": "validation_error"}]
 
     if "missing required field" in error_msg.lower():
-        match = _RE_FIELD_NAME.search(error_msg)
-        field = match.group(1) if match else "unknown"
-        return [{"loc": [root, field], "msg": error_msg, "type": "missing_field"}]
+        return [{"loc": [root, "unknown"], "msg": error_msg, "type": "missing_field"}]
 
     return [{"loc": [root], "msg": error_msg, "type": "validation_error"}]
 
