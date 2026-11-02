@@ -244,3 +244,22 @@ def test_values_pk_alias_is_used_for_automatic_tie_breaking():
         else:
             pytest.fail("PK alias cursor did not terminate")
     assert len(ids) == len(set(ids)) == 24
+
+
+@pytest.mark.django_db(transaction=True)
+def test_invalid_annotated_cursor_value_returns_first_page():
+    """Untrusted keyset values must not bubble up as ORM 500 errors."""
+    _seed()
+    api = _api(("nullable_sort", "id"), "nullable", page_size=2)
+    malformed = {
+        "t": "keyset-v1",
+        "v": ["not-an-integer", 1],
+    }
+    encoded = base64.b64encode(json.dumps(malformed).encode()).decode()
+    with TestClient(api) as client:
+        first = client.get("/cursor-explicit")
+        invalid = client.get("/cursor-explicit?cursor=" + quote(encoded, safe=""))
+    assert first.status_code == 200, first.text
+    assert invalid.status_code == 200, invalid.text
+    assert invalid.json()["items"] == first.json()["items"]
+    assert invalid.json()["next_cursor"] == first.json()["next_cursor"]
