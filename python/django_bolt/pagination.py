@@ -726,6 +726,17 @@ class CursorPagination(PaginationBase):
                 raise ValueError("CursorPagination projection must include its ordering field(s)")
 
         pk_projected = not selected or bool({pk_field.name, pk_field.attname, "pk"}.intersection(selected))
+        if projected and not grouped and not pk_projected and not auto_pk:
+            # A projected nullable JSON value cannot tell SQL NULL from JSON null
+            # unless the result also identifies a source row for a boundary probe.
+            if any(
+                is_json and (not output.concrete or output.null or name != output.attname)
+                for name, _, _, output, is_json in terms
+            ):
+                raise ValueError(
+                    "Explicit JSONField ordering with nullable values requires "
+                    "a projected PK, or a non-JSON typed ordering key"
+                )
         needs_hidden_pk = projected and (auto_pk or single_pk) and not pk_projected and not grouped
         hidden_pk = "_bolt_cursor_pk"
         if needs_hidden_pk:
@@ -764,10 +775,12 @@ class CursorPagination(PaginationBase):
             return getattr(row, name)
 
         async def is_json_null_at(pk: Any, field_name: str, output_field: Any) -> bool:
-            if pk is None:
-                raise ValueError("JSONField cursor cannot distinguish SQL NULL from JSON null without a row key")
+            # A direct NOT NULL JSONField stores a Python None as JSON null.
+            # No lookup or projected PK is required in this unambiguous case.
             if output_field.concrete and not output_field.null and field_name == output_field.attname:
                 return True
+            if pk is None:
+                raise ValueError("JSONField cursor cannot distinguish SQL NULL from JSON null without a row key")
             return await run_in_orm_executor(
                 lambda: queryset.filter(
                     pk=pk, **{field_name: Value(None, output_field=output_field)}
@@ -798,7 +811,9 @@ class CursorPagination(PaginationBase):
                 for i, term in enumerate(terms):
                     if i in cursor.json_nulls:
                         values[i] = _CURSOR_JSON_NULL
-                    elif values[i] is not None and term[3].concrete:
+                    elif values[i] is not None and not term[4]:
+                        # Also validate annotations; their output fields are not
+                        # necessarily concrete model columns.
                         values[i] = term[3].to_python(values[i])
                 cursor = _KeysetCursor(tuple(values), cursor.json_nulls)
             except (ValueError, TypeError, OverflowError, ValidationError):
@@ -851,7 +866,7 @@ class CursorPagination(PaginationBase):
             # Historical scalar cursors cannot identify the exact row in a tie.
             name, _, descending, output, _ = terms[0]
             try:
-                if output.concrete:
+                if output.get_internal_type() != "JSONField":
                     cursor = output.to_python(cursor)
                 ordered = ordered.filter(**{f"{name}__{'lt' if descending else 'gt'}": cursor})
             except (ValueError, TypeError, OverflowError, ValidationError):
