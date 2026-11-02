@@ -179,3 +179,68 @@ def test_explicit_single_column_does_not_append_pk():
     assert values["t"] == "keyset-v1"
     assert len(values["v"]) == 1
     assert len(_walk(("title",))) == 24
+
+
+@pytest.mark.django_db(transaction=True)
+def test_default_pk_values_projection_uses_hidden_pk_without_leaking_it():
+    _seed()
+    api = BoltAPI()
+
+    class Page(CursorPagination):
+        ordering = "-id"
+        page_size = 3
+
+    @api.get("/hidden-pk")
+    @paginate(Page)
+    async def entries(request):
+        return Article.objects.filter(title__startswith=PREFIX).values("title")
+
+    cursor, titles = None, []
+    with TestClient(api) as client:
+        for _ in range(10):
+            url = "/hidden-pk" + ("?cursor=" + quote(cursor, safe="") if cursor else "")
+            response = client.get(url)
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert all(set(row) == {"title"} for row in body["items"])
+            titles.extend(row["title"] for row in body["items"])
+            if not body["has_next"]:
+                break
+            cursor = body["next_cursor"]
+            assert cursor
+        else:
+            pytest.fail("Default PK cursor did not terminate")
+
+    assert len(titles) == len(set(titles)) == 24
+
+
+@pytest.mark.django_db(transaction=True)
+def test_values_pk_alias_is_used_for_automatic_tie_breaking():
+    _seed()
+    api = BoltAPI()
+
+    class Page(CursorPagination):
+        ordering = "author"
+        page_size = 2
+
+    @api.get("/alias-pk")
+    @paginate(Page)
+    async def entries(request):
+        return Article.objects.filter(title__startswith=PREFIX).values("pk", "author")
+
+    ids, cursor = [], None
+    with TestClient(api) as client:
+        for _ in range(20):
+            url = "/alias-pk" + ("?cursor=" + quote(cursor, safe="") if cursor else "")
+            response = client.get(url)
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert all(set(row) == {"pk", "author"} for row in body["items"])
+            ids.extend(row["pk"] for row in body["items"])
+            if not body["has_next"]:
+                break
+            cursor = body["next_cursor"]
+            assert cursor
+        else:
+            pytest.fail("PK alias cursor did not terminate")
+    assert len(ids) == len(set(ids)) == 24
