@@ -705,7 +705,9 @@ class CursorPagination(PaginationBase):
                     group_keys[0] != resolved and getattr(group_keys[0], "refs", None) != terms[0][0]
                 ):
                     raise ValueError("GROUP BY ordering must identify each projected group")
-            elif (set(queryset.query.annotation_select) | set(queryset.query.extra_select)) - {terms[0][0], terms[0][1]}:
+            elif (
+                set(queryset.query.annotation_select) | set(queryset.query.extra_select)
+            ) - {terms[0][0], terms[0][1]}:
                 raise ValueError("DISTINCT with additional selected expressions needs explicit tuple ordering")
         if grouped and any(t[4] for t in terms):
             # Neither SQL NULL nor JSON null has a row PK for a grouped result.
@@ -747,7 +749,13 @@ class CursorPagination(PaginationBase):
                     return row[-1]
                 if is_flat and not needs_hidden_pk:
                     return row
-                key = next((x for x in (name, alias, "pk" if name == pk_field.attname else "") if x in result_fields), None)
+                key = next(
+                    (
+                        x for x in (name, alias, "pk" if name == pk_field.attname else "")
+                        if x in result_fields
+                    ),
+                    None,
+                )
                 if key is None:
                     raise ValueError(f"Ordering field {name} is not in values_list()")
                 return row[result_fields.index(key)]
@@ -817,7 +825,11 @@ class CursorPagination(PaginationBase):
                 and len(terms) > 1
                 and len({t[2] for t in terms}) == 1
                 and all(v is not None and v is not _CURSOR_JSON_NULL for v in values)
-                and all((not t[3].null and t[0] not in queryset.query.annotations) or features.nulls_order_largest == t[2] for t in terms)
+                and all(
+                    (not t[3].null and t[0] not in queryset.query.annotations)
+                    or features.nulls_order_largest == t[2]
+                    for t in terms
+                )
             ):
                 # B-tree-friendly row comparison for non-null, equal-direction keys.
                 row = Tuple(*(F(t[0]) for t in terms))
