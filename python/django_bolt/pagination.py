@@ -720,7 +720,7 @@ class CursorPagination(PaginationBase):
             missing = [
                 t for t in terms
                 if t[0] not in selected and t[1] not in selected
-                and not (t[0] in {pk_field.attname, pk_field.name} and (auto_pk or single_pk))
+                and not (t[0] in {pk_field.attname, pk_field.name} and (auto_pk or single_pk) and not grouped)
             ]
             if missing:
                 raise ValueError("CursorPagination projection must include all explicit ordering fields")
@@ -773,14 +773,19 @@ class CursorPagination(PaginationBase):
             )
 
         if isinstance(cursor, _CompositeCursor):
-            if len(terms) != 2 or not auto_pk:
-                cursor = None
-            else:
+            try:
+                if len(terms) != 2 or not auto_pk:
+                    raise ValueError("Legacy composite cursor does not match ordering")
+                legacy_pk = pk_field.to_python(cursor.pk)
+                if legacy_pk is None:
+                    raise ValueError("Missing legacy cursor PK")
                 val = cursor.value
-                if val is None and terms[0][4] and await is_json_null_at(cursor.pk, terms[0][0], terms[0][3]):
-                    cursor = _KeysetCursor((None, cursor.pk), (0,))
+                if val is None and terms[0][4] and await is_json_null_at(legacy_pk, terms[0][0], terms[0][3]):
+                    cursor = _KeysetCursor((None, legacy_pk), (0,))
                 else:
-                    cursor = _KeysetCursor((val, cursor.pk), ())
+                    cursor = _KeysetCursor((val, legacy_pk), ())
+            except (ValueError, TypeError, OverflowError, ValidationError):
+                cursor = None
         if isinstance(cursor, _KeysetCursor):
             try:
                 if len(cursor.values) != len(terms) or any(
@@ -869,7 +874,7 @@ class CursorPagination(PaginationBase):
                 for t in terms
             ]
             last_pk = (
-                last.get(pk_field.attname, last.get(hidden_pk))
+                last.get("pk", last.get(pk_field.attname, last.get(hidden_pk)))
                 if is_values else
                 last[-1] if is_values_list and needs_hidden_pk else
                 read_value(last, pk_field.attname, pk_field.name, result_fields)
