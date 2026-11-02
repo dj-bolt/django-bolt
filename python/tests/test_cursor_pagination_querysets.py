@@ -577,3 +577,27 @@ def test_typed_json_sort_allows_sql_null_json_null_and_ties(descending):
     finally:
         with connection.schema_editor() as schema_editor:
             schema_editor.delete_model(_JSONOrderingProbe)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projection", ["values", "tuple", "flat", "annotation"])
+async def test_explicit_nullable_json_without_pk_fails_before_evaluation(projection):
+    """A nullable JSON cursor needs a row key to distinguish SQL and JSON null."""
+    queryset = _JSONOrderingProbe.objects.all()
+    ordering = "payload"
+    if projection == "values":
+        queryset = queryset.values("payload")
+    elif projection == "tuple":
+        queryset = queryset.values_list("payload")
+    elif projection == "flat":
+        queryset = queryset.values_list("payload", flat=True)
+    else:
+        queryset = queryset.annotate(json_sort=F("payload")).values("json_sort")
+        ordering = "json_sort"
+
+    class Explicit(CursorPagination):
+        pass
+
+    Explicit.ordering = (ordering,)
+    with pytest.raises(ValueError, match="projected PK"):
+        await Explicit().paginate_queryset(queryset, {"query": {}})
