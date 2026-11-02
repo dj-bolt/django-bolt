@@ -656,6 +656,8 @@ class CursorPagination(PaginationBase):
             name = token[1:] if descending else token
             if "__" in name:
                 raise ValueError("CursorPagination ordering does not support related-field traversals")
+            if name == "pk":
+                name = pk_field.attname
             try:
                 field = pk_field if name == "pk" else queryset.model._meta.get_field(name)
             except FieldDoesNotExist:
@@ -797,7 +799,7 @@ class CursorPagination(PaginationBase):
                     after = Q(**{f"{name}__isnull": False}) if null_first else None
                 else:
                     after = Q(**{f"{name}__{'lt' if descending else 'gt'}": bound})
-                    if output.null and not null_first:
+                    if (output.null or name in queryset.query.annotations) and not null_first:
                         after |= Q(**{f"{name}__isnull": True})
                 if after is not None:
                     parts.append(prefix & after)
@@ -809,7 +811,7 @@ class CursorPagination(PaginationBase):
                 and len(terms) > 1
                 and len({t[2] for t in terms}) == 1
                 and all(v is not None and v is not _CURSOR_JSON_NULL for v in values)
-                and all(not t[3].null or features.nulls_order_largest == t[2] for t in terms)
+                and all((not t[3].null and t[0] not in queryset.query.annotations) or features.nulls_order_largest == t[2] for t in terms)
             ):
                 # B-tree-friendly row comparison for non-null, equal-direction keys.
                 row = Tuple(*(F(t[0]) for t in terms))
