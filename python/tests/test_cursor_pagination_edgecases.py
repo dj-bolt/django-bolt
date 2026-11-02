@@ -262,30 +262,16 @@ def test_composite_cursor_on_pk_ordering_starts_from_first_page():
     assert response.json()["has_next"] is True
 
 
-@pytest.mark.django_db(transaction=True)
-def test_union_values_first_page_retains_legacy_support():
-    """UNION supports first-page slicing; Django rejects filter() on later pages."""
-    _seed()
-    api = BoltAPI()
+@pytest.mark.asyncio
+async def test_union_is_rejected_before_returning_unusable_next_cursor():
+    """A combined queryset cannot filter the second page in Django ORM."""
+    qs_a = Article.objects.filter(author="A").order_by().values("author")
+    qs_b = Article.objects.filter(author="B").order_by().values("author")
+    queryset = qs_a.union(qs_b)
 
     class Page(CursorPagination):
         ordering = "author"
         page_size = 1
 
-    @api.get("/cursor-union")
-    @paginate(Page)
-    async def list_articles(request):
-        # Article.Meta.ordering applies inside UNION unless explicitly cleared.
-        # SQLite rejects ORDER BY in compound-query operands.
-        items = Article.objects.filter(author="A", title__startswith=PREFIX).order_by().values("author")
-        others = Article.objects.filter(author="B", title__startswith=PREFIX).order_by().values("author")
-        return items.union(others)
-
-    with TestClient(api) as client:
-        response = client.get("/cursor-union")
-    assert response.status_code == 200, response.text
-    assert response.json()["items"] == [{"author": "A"}]
-    assert response.json()["has_next"] is True
-    # The legacy response emits a cursor, but its continuation is not supported:
-    # Django does not allow filter() on a queryset after union().
-    assert response.json()["next_cursor"] is not None
+    with pytest.raises(ValueError, match="cannot seek through combined QuerySets"):
+        await Page().paginate_queryset(queryset, {"query": {}})
