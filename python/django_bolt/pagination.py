@@ -704,14 +704,14 @@ class CursorPagination(PaginationBase):
                 if group_keys is True or len(group_keys) != 1 or (
                     group_keys[0] != resolved and getattr(group_keys[0], "refs", None) != terms[0][0]
                 ):
-                    raise ValueError("GROUP BY ordering must identify each projected group")
+                    raise ValueError("GROUP BY ordering must match the grouped key or use explicit tuple ordering")
             elif (
                 set(queryset.query.annotation_select) | set(queryset.query.extra_select)
             ) - {terms[0][0], terms[0][1]}:
-                raise ValueError("DISTINCT with additional selected expressions needs explicit tuple ordering")
+                raise ValueError("DISTINCT with extra selected columns needs explicit tuple ordering")
         if grouped and any(t[4] for t in terms):
             # Neither SQL NULL nor JSON null has a row PK for a grouped result.
-            raise ValueError("JSONField grouping needs an explicit non-JSON unique ordering key")
+            raise ValueError("JSONField ordering on grouped/distinct results needs a non-JSON unique ordering key")
 
         if auto_pk:
             terms.append((pk_field.attname, pk_field.attname, terms[0][2], pk_field, False))
@@ -723,7 +723,7 @@ class CursorPagination(PaginationBase):
                 and not (t[0] in {pk_field.attname, pk_field.name} and (auto_pk or single_pk) and not grouped)
             ]
             if missing:
-                raise ValueError("CursorPagination projection must include all explicit ordering fields")
+                raise ValueError("CursorPagination projection must include its ordering field(s)")
 
         pk_projected = not selected or bool({pk_field.name, pk_field.attname, "pk"}.intersection(selected))
         needs_hidden_pk = projected and (auto_pk or single_pk) and not pk_projected and not grouped
