@@ -571,11 +571,10 @@ class LimitOffsetPagination(PaginationBase):
         )
 
 
-
 class CursorPagination(PaginationBase):
     """Keyset pagination with automatic model-PK ties or explicit ordering.
 
-    A string ordering adds a PK tie-breaker for ordinary model rows.
+    A string ordering adds a PK tie-breaker unless a safe unique field is known.
     A tuple ordering uses exactly the fields supplied by the developer.
     Cursors use the existing base64-JSON API; historical scalar cursors
     and earlier composite cursors remain readable.
@@ -655,7 +654,10 @@ class CursorPagination(PaginationBase):
             descending = token.startswith("-")
             name = token[1:] if descending else token
             if "__" in name:
-                raise ValueError("CursorPagination ordering does not support related-field traversals")
+                raise ValueError(
+                    "CursorPagination ordering must be a concrete field or annotation; "
+                    "related-field traversals are not supported"
+                )
             if name == "pk":
                 name = pk_field.attname
             try:
@@ -681,7 +683,8 @@ class CursorPagination(PaginationBase):
                     name = field.attname
                 output_field = field
             is_json = output_field.get_internal_type() == "JSONField"
-            terms.append((name, token.lstrip("-"), descending, output_field, is_json))
+            projection_alias = field.name if field is not None and field.is_relation else token.lstrip("-")
+            terms.append((name, projection_alias, descending, output_field, is_json))
 
         iterable = getattr(queryset, "_iterable_class", None)
         is_values = iterable is ValuesIterable
@@ -692,7 +695,24 @@ class CursorPagination(PaginationBase):
         selected = tuple(getattr(queryset, "_fields", None) or ())
         grouped = projected and bool(queryset.query.distinct or queryset.query.group_by)
         single_pk = len(terms) == 1 and terms[0][0] in {pk_field.name, pk_field.attname}
-        auto_pk = not explicit and not single_pk and not grouped
+        # A concrete NOT NULL model field with unique=True already defines
+        # an unambiguous cursor boundary; appending PK costs an extra sort key.
+        # Never assume uniqueness for expressions, JSON, joins or projections
+        # with DISTINCT/GROUP BY. A database-only unique index isn't enough
+        # unless the model also declares the constraint.
+        sort_field = terms[0][3]
+        unique_ordering = (
+            not explicit
+            and not single_pk
+            and not grouped
+            and terms[0][0] not in queryset.query.annotations
+            and sort_field.concrete
+            and sort_field.unique
+            and not sort_field.null
+            and not terms[0][4]
+            and all(join.join_type is None for join in queryset.query.alias_map.values())
+        )
+        auto_pk = not explicit and not single_pk and not grouped and not unique_ordering
 
         if grouped and not explicit and not single_pk:
             # A single projected/grouping key uniquely identifies its result.
@@ -701,13 +721,16 @@ class CursorPagination(PaginationBase):
             if queryset.query.group_by:
                 group_keys = queryset.query.group_by
                 resolved = queryset.query.resolve_ref(terms[0][0])
-                if group_keys is True or len(group_keys) != 1 or (
-                    group_keys[0] != resolved and getattr(group_keys[0], "refs", None) != terms[0][0]
+                if (
+                    group_keys is True
+                    or len(group_keys) != 1
+                    or (group_keys[0] != resolved and getattr(group_keys[0], "refs", None) != terms[0][0])
                 ):
                     raise ValueError("GROUP BY ordering must match the grouped key or use explicit tuple ordering")
-            elif (
-                set(queryset.query.annotation_select) | set(queryset.query.extra_select)
-            ) - {terms[0][0], terms[0][1]}:
+            elif (set(queryset.query.annotation_select) | set(queryset.query.extra_select)) - {
+                terms[0][0],
+                terms[0][1],
+            }:
                 raise ValueError("DISTINCT with extra selected columns needs explicit tuple ordering")
         if grouped and any(t[4] for t in terms):
             # Neither SQL NULL nor JSON null has a row PK for a grouped result.
@@ -717,26 +740,34 @@ class CursorPagination(PaginationBase):
             terms.append((pk_field.attname, pk_field.attname, terms[0][2], pk_field, False))
         ordering = tuple(("-" if t[2] else "") + t[0] for t in terms)
         if projected and selected:
+            projected_keys = set(selected) | set(queryset.query.annotation_select) | set(queryset.query.extra_select)
             missing = [
-                t for t in terms
-                if t[0] not in selected and t[1] not in selected
+                t
+                for t in terms
+                if t[0] not in projected_keys
+                and t[1] not in projected_keys
                 and not (t[0] in {pk_field.attname, pk_field.name} and (auto_pk or single_pk) and not grouped)
             ]
             if missing:
                 raise ValueError("CursorPagination projection must include its ordering field(s)")
 
         pk_projected = not selected or bool({pk_field.name, pk_field.attname, "pk"}.intersection(selected))
-        if projected and not grouped and not pk_projected and not auto_pk:
-            # A projected nullable JSON value cannot tell SQL NULL from JSON null
-            # unless the result also identifies a source row for a boundary probe.
-            if any(
+        # A projected nullable JSON value cannot tell SQL NULL from JSON null
+        # unless the result also identifies a source row for a boundary probe.
+        if (
+            projected
+            and not grouped
+            and not pk_projected
+            and not auto_pk
+            and any(
                 is_json and (not output.concrete or output.null or name != output.attname)
                 for name, _, _, output, is_json in terms
-            ):
-                raise ValueError(
-                    "Explicit JSONField ordering with nullable values requires "
-                    "a projected PK, or a non-JSON typed ordering key"
-                )
+            )
+        ):
+            raise ValueError(
+                "Explicit JSONField ordering with nullable values requires "
+                "a projected PK, or a non-JSON typed ordering key"
+            )
         needs_hidden_pk = projected and (auto_pk or single_pk) and not pk_projected and not grouped
         hidden_pk = "_bolt_cursor_pk"
         if needs_hidden_pk:
@@ -763,10 +794,7 @@ class CursorPagination(PaginationBase):
                 if is_flat and not needs_hidden_pk:
                     return row
                 key = next(
-                    (
-                        x for x in (name, alias, "pk" if name == pk_field.attname else "")
-                        if x in result_fields
-                    ),
+                    (x for x in (name, alias, "pk" if name == pk_field.attname else "") if x in result_fields),
                     None,
                 )
                 if key is None:
@@ -782,10 +810,25 @@ class CursorPagination(PaginationBase):
             if pk is None:
                 raise ValueError("JSONField cursor cannot distinguish SQL NULL from JSON null without a row key")
             return await run_in_orm_executor(
-                lambda: queryset.filter(
-                    pk=pk, **{field_name: Value(None, output_field=output_field)}
-                ).exists()
+                lambda: queryset.filter(pk=pk, **{field_name: Value(None, output_field=output_field)}).exists()
             )
+
+        # Accept cursors issued before the unique-field optimization. The
+        # second (PK) component is redundant once uniqueness is established.
+        if unique_ordering and isinstance(cursor, _CompositeCursor):
+            try:
+                if pk_field.to_python(cursor.pk) is None:
+                    raise ValueError("Missing legacy cursor PK")
+                cursor = cursor.value
+            except (ValueError, TypeError, OverflowError, ValidationError):
+                cursor = None
+        if unique_ordering and isinstance(cursor, _KeysetCursor) and len(cursor.values) == 2 and not cursor.json_nulls:
+            try:
+                if pk_field.to_python(cursor.values[1]) is None:
+                    raise ValueError("Missing former tie-breaker PK")
+                cursor = cursor.values[0]
+            except (ValueError, TypeError, OverflowError, ValidationError):
+                cursor = None
 
         if isinstance(cursor, _CompositeCursor):
             try:
@@ -803,9 +846,7 @@ class CursorPagination(PaginationBase):
                 cursor = None
         if isinstance(cursor, _KeysetCursor):
             try:
-                if len(cursor.values) != len(terms) or any(
-                    not terms[i][4] for i in cursor.json_nulls
-                ):
+                if len(cursor.values) != len(terms) or any(not terms[i][4] for i in cursor.json_nulls):
                     raise ValueError("Wrong cursor ordering shape")
                 values = list(cursor.values)
                 for i, term in enumerate(terms):
@@ -825,7 +866,7 @@ class CursorPagination(PaginationBase):
             features = connections[queryset.db].features
             prefix = Q()
             parts = []
-            for term, value in zip(terms, values):
+            for term, value in zip(terms, values, strict=True):
                 name, alias, descending, output, is_json = term
                 null_first = features.nulls_order_largest == descending
                 sql_null = value is None
@@ -848,8 +889,7 @@ class CursorPagination(PaginationBase):
                 and len({t[2] for t in terms}) == 1
                 and all(v is not None and v is not _CURSOR_JSON_NULL for v in values)
                 and all(
-                    (not t[3].null and t[0] not in queryset.query.annotations)
-                    or features.nulls_order_largest == t[2]
+                    (not t[3].null and t[0] not in queryset.query.annotations) or features.nulls_order_largest == t[2]
                     for t in terms
                 )
             ):
@@ -868,7 +908,12 @@ class CursorPagination(PaginationBase):
             try:
                 if output.get_internal_type() != "JSONField":
                     cursor = output.to_python(cursor)
-                ordered = ordered.filter(**{f"{name}__{'lt' if descending else 'gt'}": cursor})
+                after = Q(**{f"{name}__{'lt' if descending else 'gt'}": cursor})
+                if grouped and (output.null or name in queryset.query.annotations):
+                    nulls_first = connections[queryset.db].features.nulls_order_largest == descending
+                    if not nulls_first:
+                        after |= Q(**{f"{name}__isnull": True})
+                ordered = ordered.filter(after)
             except (ValueError, TypeError, OverflowError, ValidationError):
                 cursor = None
                 ordered = queryset.order_by(*ordering)
@@ -886,23 +931,23 @@ class CursorPagination(PaginationBase):
                 + tuple(f.attname for f in queryset.model._meta.concrete_fields)
                 + tuple(queryset.query.annotation_select)
             )
-            values = [
-                read_value(last, t[0], t[1], result_fields)
-                for t in terms
-            ]
+            values = [read_value(last, t[0], t[1], result_fields) for t in terms]
             last_pk = (
                 last.get("pk", last.get(pk_field.attname, last.get(hidden_pk)))
-                if is_values else
-                last[-1] if is_values_list and needs_hidden_pk else
-                read_value(last, pk_field.attname, pk_field.name, result_fields)
-                if is_values_list and pk_projected else
-                last.pk if not projected else None
+                if is_values
+                else last[-1]
+                if is_values_list and needs_hidden_pk
+                else read_value(last, pk_field.attname, pk_field.name, result_fields)
+                if is_values_list and pk_projected
+                else last.pk
+                if not projected
+                else None
             )
             json_nulls = []
             for i, term in enumerate(terms):
                 if term[4] and values[i] is None and await is_json_null_at(last_pk, term[0], term[3]):
                     json_nulls.append(i)
-            if not explicit and len(terms) == 1 and values[0] is not None and not json_nulls:
+            if not explicit and (single_pk or unique_ordering) and values[0] is not None and not json_nulls:
                 next_cursor = self._encode_cursor(values[0])
             else:
                 next_cursor = self._encode_cursor(values, kind="keyset-v1", json_nulls=tuple(json_nulls))
@@ -928,6 +973,7 @@ class CursorPagination(PaginationBase):
             page_size=page_size,
             next_cursor=next_cursor,
         )
+
 
 def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     """

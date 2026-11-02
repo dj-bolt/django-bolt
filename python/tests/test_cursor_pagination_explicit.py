@@ -10,8 +10,7 @@ from django.db.models import Case, Count, IntegerField, Value, When
 from django_bolt import BoltAPI, CursorPagination, paginate
 from django_bolt.testing import TestClient
 
-from .test_models import Article
-
+from .test_models import Article, User
 
 PREFIX = "cursor-explicit-"
 
@@ -68,9 +67,7 @@ def _walk(ordering, projection="model", page_size=3):
     results, cursor = [], None
     with TestClient(_api(ordering, projection, page_size)) as client:
         for _ in range(60):
-            url = "/cursor-explicit" + (
-                "?cursor=" + quote(cursor, safe="") if cursor is not None else ""
-            )
+            url = "/cursor-explicit" + ("?cursor=" + quote(cursor, safe="") if cursor is not None else "")
             response = client.get(url)
             assert response.status_code == 200, response.text
             payload = response.json()
@@ -89,11 +86,7 @@ def _walk(ordering, projection="model", page_size=3):
 def test_multi_key_models_match_database_order(ordering):
     _seed()
     actual = [row["id"] for row in _walk(ordering)]
-    expected = list(
-        Article.objects.filter(title__startswith=PREFIX)
-        .order_by(*ordering)
-        .values_list("id", flat=True)
-    )
+    expected = list(Article.objects.filter(title__startswith=PREFIX).order_by(*ordering).values_list("id", flat=True))
     assert actual == expected
 
 
@@ -263,3 +256,86 @@ def test_invalid_annotated_cursor_value_returns_first_page():
     assert invalid.status_code == 200, invalid.text
     assert invalid.json()["items"] == first.json()["items"]
     assert invalid.json()["next_cursor"] == first.json()["next_cursor"]
+
+
+UNIQUE_PREFIX = "cursor-unique-opt-"
+
+
+def _seed_unique_users():
+    User.objects.bulk_create(
+        [
+            User(
+                username=f"{UNIQUE_PREFIX}{i:03d}",
+                email=f"cursor-unique-opt-{i:03d}@example.invalid",
+                password_hash="test-only",
+            )
+            for i in range(12)
+        ]
+    )
+
+
+def _unique_api(ordering, projection="model"):
+    api = BoltAPI()
+
+    class UniquePage(CursorPagination):
+        page_size = 3
+
+    UniquePage.ordering = ordering
+
+    @api.get("/cursor-unique-opt")
+    @paginate(UniquePage)
+    async def users(request):
+        queryset = User.objects.filter(username__startswith=UNIQUE_PREFIX)
+        return queryset.values("username", "email") if projection == "values" else queryset
+
+    return api
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("ordering", ["username", "-username"])
+@pytest.mark.parametrize("projection", ["model", "values"])
+def test_unique_field_scalar_cursor_traverses_all_rows(ordering, projection):
+    _seed_unique_users()
+    expected = list(
+        User.objects.filter(username__startswith=UNIQUE_PREFIX).order_by(ordering).values_list("username", flat=True)
+    )
+    seen = []
+    cursor = None
+    with TestClient(_unique_api(ordering, projection)) as client:
+        for _ in range(12):
+            url = "/cursor-unique-opt"
+            if cursor is not None:
+                url += "?cursor=" + quote(cursor, safe="")
+            response = client.get(url)
+            assert response.status_code == 200, response.text
+            body = response.json()
+            seen.extend(row["username"] for row in body["items"])
+            if projection == "values":
+                assert all(set(row) == {"username", "email"} for row in body["items"])
+            if not body["has_next"]:
+                break
+            cursor = body["next_cursor"]
+            decoded = json.loads(base64.b64decode(cursor))
+            assert set(decoded) == {"v"}
+            assert isinstance(decoded["v"], str)
+        else:
+            pytest.fail("Unique-field cursor did not terminate")
+    assert seen == expected
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("legacy_kind", ["keyset-v1", "composite-v2"])
+def test_unique_field_accepts_previous_composite_cursor(legacy_kind):
+    _seed_unique_users()
+    queryset = User.objects.filter(username__startswith=UNIQUE_PREFIX).order_by("username")
+    boundary = queryset.first()
+    if legacy_kind == "keyset-v1":
+        envelope = {"t": "keyset-v1", "v": [boundary.username, boundary.pk]}
+    else:
+        envelope = {"t": "composite-v2", "v": {"value": boundary.username, "pk": boundary.pk}}
+    cursor = base64.b64encode(json.dumps(envelope).encode()).decode()
+    with TestClient(_unique_api("username")) as client:
+        response = client.get("/cursor-unique-opt?cursor=" + quote(cursor, safe=""))
+    assert response.status_code == 200, response.text
+    expected = list(queryset.values_list("username", flat=True))[1:4]
+    assert [row["username"] for row in response.json()["items"]] == expected

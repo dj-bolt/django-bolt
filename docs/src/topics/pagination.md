@@ -84,15 +84,18 @@ Query: `/articles?cursor=eyJ2IjoxMDB9`
 
 Cursor pagination requires a **stable, unique ordering of the result rows**.
 For ordinary model QuerySets, a single ordering string automatically adds the
-model primary key as a tie-breaker:
+model primary key as a tie-breaker unless a safe unique field is known:
 
 ```python
 class ArticlePagination(CursorPagination):
     ordering = "-created_at"  # SQL: ORDER BY created_at DESC, id DESC
 ```
 
-The default `ordering = "-id"` remains a fast single-key path, and its existing
-scalar cursor format is unchanged.
+The default `ordering = "-id"` remains a fast single-key path. A concrete,
+non-null, non-JSON model field declared `unique=True` also uses one ordering
+key and a scalar cursor, provided the query has no joins that can multiply
+source rows. A UNIQUE index that exists only in the database is not inferred
+from model metadata. Earlier two-key cursors for such a field remain accepted.
 
 For advanced queries, a **tuple** makes the ordering fully explicit. Bolt does
 not append the primary key; provide enough keys to uniquely identify each
