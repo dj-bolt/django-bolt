@@ -80,39 +80,79 @@ async def list_articles(request) -> list[ArticleSerializer]:
 
 Query: `/articles?cursor=eyJ2IjoxMDB9`
 
-### Ordering ties and cursor stability
+### Ordering and cursor stability
 
-For non-primary-key ordering, `CursorPagination` uses the primary key to break
-sorting ties, so a page boundary cannot skip rows sharing an ordering value.
-Treat cursor strings as opaque. Bolt still accepts old scalar cursors.
-An old scalar cursor cannot identify one row among equal ordering values.
+Cursor pagination requires a **stable, unique ordering of the result rows**.
+For ordinary model QuerySets, a single ordering string automatically adds the
+model primary key as a tie-breaker:
 
-For `.values()` and `.values_list()`, include the ordering field in
-the projection. Foreign-key ordering compares the stored ID, not the related
-model. Bolt may read a hidden primary key without returning it.
+```python
+class ArticlePagination(CursorPagination):
+    ordering = "-created_at"  # SQL: ORDER BY created_at DESC, id DESC
+```
 
-Single-key `DISTINCT` and `GROUP BY` projections support cursor pagination
-when their ordering field uniquely identifies each result.
-Bolt raises `ValueError` for other grouped or distinct projections.
-It also rejects `DISTINCT` projections with extra selected annotations
-when they could silently drop rows. Pagination supports SQL `NULL` ordering
-values.
-JSONField ordering also supports JSON `null` and SQL `NULL`. Django returns
-both as Python `None`, so Bolt marks JSON-null cursors separately.
-It checks the boundary row only when its ordering value is `None`.
-This avoids extra database queries on ordinary pages and preserves older
-JSON object cursors.
+The default `ordering = "-id"` remains a fast single-key path, and its existing
+scalar cursor format is unchanged.
 
-For projected `DISTINCT` or `GROUP BY` results, Bolt rejects JSONField
-ordering because the projected row has no reliable primary-key tie-breaker.
-Use a typed scalar annotation if you need a unique JSON-derived ordering key.
+For advanced queries, a **tuple** makes the ordering fully explicit. Bolt does
+not append the primary key; provide enough keys to uniquely identify each
+*result row* (not necessarily a source model):
 
-Combined querysets such as `union()` support the first page.
-Django disallows `filter()` after `union()`, so these querysets cannot
-use `next_cursor` to fetch another page.
+```python
+class ReportPagination(CursorPagination):
+    page_size = 20
+    ordering = ("category", "brand")  # No implicit PK
 
-On large PostgreSQL tables, a suitable B-tree index on the ordering field and
-primary key can help seek efficiently through deep pages.
+# The combination (category, brand) identifies each result:
+report = Product.objects.values("category", "brand").annotate(total=Count("id"))
+```
+
+A one-element tuple such as `("price",)` also opts out of automatic PK
+tie-breaking. It is **only safe if the selected key is unique**. Mixing
+directions, for example `("category", "-created_at", "id")`, is supported.
+Changing the ordering between requests invalidates existing cursor positions.
+Cursor pagination does not provide a snapshot across concurrent updates to
+ordering fields.
+
+For `values()` and `values_list()`, include the explicitly selected ordering
+fields in the projection. In the automatic mode, Bolt can select a hidden PK
+without exposing it in the response. Foreign keys use the stored `author_id`
+value rather than fetching the related object; when related-model ordering
+would change the meaning, use `author_id` explicitly.
+
+For `DISTINCT` and `GROUP BY` projections, automatic PK tie-breaking
+could change the meaning of the SQL result. Bolt preserves the original
+single-key grouped/distinct behavior when the result key is unique, and
+accepts explicit tuples for multi-key projections. **The developer must ensure
+the whole tuple uniquely identifies each result row.** An aggregate may be
+used as an ordering key, but additional grouped keys may be needed to avoid
+ties. Unsupported projection shapes report a clear error rather than
+silently losing rows.
+
+SQL `NULL` is a valid cursor position. For JSONField ordering, top-level JSON
+`null` and SQL `NULL` can both deserialize to Python `None`, so Bolt
+distinguishes them only when a page boundary requires it. This may cost one
+additional query on nullable JSONField boundaries; regular pages do not
+incur that query. JSONField grouped/distinct ordering without a reliable
+row key is not supported.
+
+The API still has **one opaque `cursor`/ `next_cursor` mechanism**, not
+separate pagination classes or query parameters. New non-PK positions use
+one internal keyset format; legacy scalar and previously emitted composite
+cursors remain accepted. Legacy scalar cursors cannot resume *inside* a
+group of tied ordering values.
+
+Django does not permit applying `filter()` after
+`union()`, `intersection()`, or `difference()`. Such combined QuerySets
+are rejected up front instead of emitting a `next_cursor` that cannot
+fetch the next page. Use page-number/limit-offset pagination or refactor
+the combined query if it must be paginated.
+
+For deep PostgreSQL pages, a B-tree index aligned with the selected ordering
+columns (including the PK in automatic mode) is recommended. Bolt uses
+row-value comparisons for compatible equal-direction, non-null boundaries
+and a NULL-aware lexicographic predicate otherwise. This does not require
+a separate count query.
 
 ## Specifying the Serializer
 
