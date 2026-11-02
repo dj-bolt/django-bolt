@@ -459,9 +459,9 @@ def test_json_null_and_sql_null_cursor_cross_page_boundaries(descending, kind, s
                     break
                 assert cursor, "has_next=True without a usable next cursor"
                 payload = json.loads(base64.b64decode(cursor))
-                if payload.get("t") == "composite-json-null-v1":
+                if payload.get("t") == "keyset-v1" and 0 in payload.get("j", []):
                     tagged_nulls += 1
-                    assert payload["v"]["pk"] in json_null_ids
+                    assert payload["v"][-1] in json_null_ids
             else:
                 pytest.fail("JSON cursor traversal did not terminate")
 
