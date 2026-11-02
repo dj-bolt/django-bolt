@@ -1,7 +1,9 @@
 //! WebSocket router for matching paths to handlers
 
 use ahash::AHashMap;
+use bolt_core::state::{WebSocketOriginPolicy, parse_websocket_origin_policy};
 use pyo3::prelude::*;
+use std::sync::Arc;
 
 /// WebSocket route definition
 pub struct WebSocketRoute {
@@ -11,6 +13,7 @@ pub struct WebSocketRoute {
     pub handler: Py<PyAny>,
     /// Pre-compiled parameter injector (passed from Python at registration time)
     pub injector: Option<Py<PyAny>>,
+    pub origin_policy: Arc<WebSocketOriginPolicy>,
 }
 
 /// WebSocket router for matching paths to handlers
@@ -47,12 +50,16 @@ impl WebSocketRouter {
         handler_id: usize,
         handler: Py<PyAny>,
         injector: Option<Py<PyAny>>,
+        origin_config: Option<&Bound<'_, PyAny>>,
+        py: Python<'_>,
     ) -> PyResult<()> {
+        let origin_policy = parse_websocket_origin_policy(py, origin_config)?;
         let route = WebSocketRoute {
             path: path.to_string(),
             handler_id,
             handler,
             injector,
+            origin_policy,
         };
 
         if !path.contains('{') {

@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
 
-use bolt_core::state::AsgiMount;
+use bolt_core::state::{AsgiMount, parse_websocket_origin_policy};
 
 /// Validate, normalize ordering, and de-duplicate ASGI mount configuration.
 pub fn validate_and_sort_asgi_mounts(
@@ -30,10 +30,18 @@ pub fn validate_and_sort_asgi_mounts(
             None => true,
         };
 
+        // A raw ASGI mount keeps the legacy global Origin protection.
+        let policy_config = app.bind(py).getattr_opt("_bolt_websocket_origin_policy")?;
+        let origin_policy = if policy_config.is_some() {
+            parse_websocket_origin_policy(py, Some(app.bind(py)))?
+        } else {
+            parse_websocket_origin_policy(py, None)?
+        };
         asgi_mounts.push(AsgiMount {
             prefix,
             app,
             websocket,
+            websocket_origin_policy: origin_policy,
         });
     }
 

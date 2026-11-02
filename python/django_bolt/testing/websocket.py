@@ -29,8 +29,10 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from django_bolt import BoltAPI, _core
+from django_bolt.api import _resolved_asgi_mounts
 from django_bolt.websocket import CloseCode, WebSocket
 from django_bolt.websocket.handlers import build_websocket_request, get_websocket_param_name
+from django_bolt.websocket.origin_policy import OriginOptions, resolve_origin_options
 
 # Each WebSocketTestClient is one connection with its own test app. The
 # connections to one API share its rate-limit buckets, as the connections to
@@ -148,13 +150,21 @@ class WebSocketTestClient:
             # Get pre-compiled injector from handler metadata (same as runbolt.py)
             meta = self.api._handler_meta.get(handler_id, {})
             injector = meta.get("injector")
-            ws_routes.append((path, handler_id, handler, injector))
+            ws_routes.append((
+                path, handler_id, handler, injector,
+                resolve_origin_options(
+                    self.api._websocket_origin_options.get(handler_id, OriginOptions()),
+                    read_settings=self._read_django_settings,
+                ),
+            ))
         if ws_routes:
             _core.register_test_websocket_routes(self._app_id, ws_routes)
 
         # Register ASGI mounts so an unmatched path can fall back to one
         if self.api._asgi_mounts:
-            _core.register_test_asgi_mounts(self._app_id, list(self.api._asgi_mounts))
+            _core.register_test_asgi_mounts(
+                self._app_id, _resolved_asgi_mounts(self.api._asgi_mounts, read_settings=self._read_django_settings)
+            )
 
         # Register middleware metadata for guards/auth
         if self.api._handler_middleware:
@@ -296,17 +306,35 @@ class WebSocketTestClient:
 
         self._requested_subprotocols = scope["subprotocols"]
 
+        # Match runbolt: native revocation happens after authentication/guards
+        # but before an optional custom Origin callback.
+        if not is_asgi_mount:
+            revocation_auth = scope.pop("_bolt_revocation_auth", None)
+            if revocation_auth is not None:
+                check = self.api._handler_middleware[handler_id]["websocket_revocation_check"]
+                if await check(revocation_auth):
+                    raise PermissionError("WebSocket connection denied: Token has been revoked")
+
+        # The Rust TestClient returns a validator only for the opt-in custom
+        # policy. Run it before the app can send websocket.accept.
+        custom_validator = scope.pop("_bolt_origin_validator", None)
+        if custom_validator is not None:
+            headers = {name.lower(): value for name, value in self.headers.items()}
+            if self.subprotocols:
+                headers["sec-websocket-protocol"] = ", ".join(self.subprotocols)
+            origin = headers.get("origin")
+            context = {"path": self.path, "query_string": self.query_string, "headers": headers}
+            try:
+                permitted = await asyncio.wait_for(custom_validator(origin, context), timeout=5.0)
+                if permitted is not True:
+                    raise PermissionError("Origin not allowed")
+            except Exception as exc:
+                raise PermissionError("Origin not allowed") from exc
+
         if is_asgi_mount:
             # A mounted app takes the raw triple. Its first receive gets websocket.connect.
             await self._start_handler(handler, [scope, self._receive, self._send], {})
             return self
-
-        # A revoked token fails the handshake, as the server checks before the upgrade.
-        revocation_auth = scope.pop("_bolt_revocation_auth", None)
-        if revocation_auth is not None:
-            check = self.api._handler_middleware[handler_id]["websocket_revocation_check"]
-            if await check(revocation_auth):
-                raise PermissionError("WebSocket connection denied: Token has been revoked")
 
         # Create WebSocket instance
         ws = WebSocket(scope, self._receive, self._send)

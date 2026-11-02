@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **WebSocket Origin policies per route and ASGI mount** - Configure `inherit` (existing CORS behavior), `allowlist`, `any`, or a sync/async `custom` validator. ASGI mounts may explicitly `delegate` validation to their application. `BOLT_WEBSOCKET_*` settings provide global defaults with per-endpoint overrides. Without new settings, Bolt retains the previous CORS Origin check and missing-Origin default. Bolt rejects invalid allowlist entries at startup, malformed Origins under `any`, and repeated Origin headers except on delegated mounts. Custom validators run before HTTP 101 and fail closed on errors or timeouts. They allow up to 64 pending checks and eight concurrent sync workers per process. Origin checks do not replace authentication. See [Origin policy and migration](docs/src/topics/websocket.md#origin-policy).
+
 - **`@cors(origin_regexes=[...])`** - A route can allow the origins that match a pattern, as `CORS_ALLOWED_ORIGIN_REGEXES` does for all routes. `@cors` needs `origins` or `origin_regexes`. An empty pattern raises `ValueError`, because it matches every origin. An origin or a pattern that is not a `str` raises `TypeError`.
 
 ### Fixed

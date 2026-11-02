@@ -28,6 +28,7 @@ use bolt_core::request_pipeline::{
 };
 use bolt_core::router::parse_query_string;
 use bolt_core::state::AppState;
+use bolt_core::state::WebSocketOriginPolicy;
 use bolt_core::type_coercion::TypeHints;
 use bolt_core::validation::{AuthGuardResult, validate_auth_and_guards};
 
@@ -634,12 +635,14 @@ pub enum WsTarget {
         handler_id: usize,
         path_params: AHashMap<String, String>,
         injector: Option<Py<PyAny>>,
+        origin_policy: Arc<WebSocketOriginPolicy>,
     },
     /// An ASGI application registered with `api.mount_asgi`. Receives the
     /// scope, receive, and send triple directly.
     AsgiMount {
         app: Py<PyAny>,
         mount_prefix: String,
+        origin_policy: Arc<WebSocketOriginPolicy>,
     },
 }
 
@@ -654,6 +657,92 @@ async fn token_revoked(check: &Py<PyAny>, auth_ctx: &AuthContext) -> PyResult<bo
     })?;
     let revoked = future.await?;
     Python::attach(|py| revoked.extract::<bool>(py))
+}
+
+// Custom-only admission: bounded pending handshakes even if the Python loop
+// cannot start promptly. The separate Python sync-worker budget survives a
+// cancelled handshake until its underlying blocking callback really finishes.
+const MAX_PENDING_CUSTOM_ORIGIN_CHECKS: usize = 64;
+static PENDING_CUSTOM_ORIGIN_CHECKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct PendingCustomOriginSlot;
+
+impl PendingCustomOriginSlot {
+    fn try_acquire() -> Option<Self> {
+        PENDING_CUSTOM_ORIGIN_CHECKS
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |pending| {
+                (pending < MAX_PENDING_CUSTOM_ORIGIN_CHECKS).then_some(pending + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for PendingCustomOriginSlot {
+    fn drop(&mut self) {
+        PENDING_CUSTOM_ORIGIN_CHECKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Run the optional Python validator before upgrading. Errors and timeouts
+/// fail closed. Other policies remain completely on the Rust fast path.
+async fn check_custom_origin(
+    policy: &WebSocketOriginPolicy,
+    origin: Option<&actix_web::http::header::HeaderValue>,
+    path: &str,
+    query: &str,
+    headers: &AHashMap<String, String>,
+) -> bool {
+    let WebSocketOriginPolicy::Custom { validator, .. } = policy else {
+        return true;
+    };
+    let Some(_pending_slot) = PendingCustomOriginSlot::try_acquire() else {
+        return false;
+    };
+    let admitted_at = tokio::time::Instant::now();
+    let origin = origin.and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let future = Python::attach(|py| -> PyResult<_> {
+        let context = PyDict::new(py);
+        context.set_item("path", path)?;
+        context.set_item("query_string", query)?;
+        let h = PyDict::new(py);
+        for (k, v) in headers {
+            h.set_item(k, v)?;
+        }
+        context.set_item("headers", h)?;
+        // Translate Rust admission time to Python's monotonic clock.
+        // Only custom policies incur this Python call.
+        let admission_time = py
+            .import("time")?
+            .call_method0("monotonic")?
+            .extract::<f64>()?
+            - admitted_at.elapsed().as_secs_f64();
+        let coro = validator.call1(py, (origin, context, admission_time))?;
+        let locals = bolt_loop::worker_task_locals(py)?;
+        pyo3_async_runtimes::into_future_with_locals(&locals, coro.bind(py).clone())
+    });
+    match future {
+        Ok(future) => {
+            match tokio::time::timeout_at(admitted_at + std::time::Duration::from_secs(5), future)
+                .await
+            {
+                Ok(Ok(value)) => Python::attach(|py| value.extract::<bool>(py).unwrap_or(false)),
+                Ok(Err(err)) => {
+                    eprintln!("[django-bolt] Custom WebSocket Origin validator failed: {err}");
+                    false
+                }
+                Err(_) => {
+                    eprintln!("[django-bolt] Custom WebSocket Origin validator timed out");
+                    false
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("[django-bolt] Custom WebSocket Origin validator failed: {err}");
+            false
+        }
+    }
 }
 
 /// HTTP handler for WebSocket upgrade with full Python integration
@@ -754,9 +843,26 @@ pub async fn handle_websocket_upgrade(
         }
     }
 
-    // Validate origin header (CORS-like protection for WebSocket)
-    // Uses same CORS config as HTTP requests
-    if !origin::validate_origin(req.headers().get(ORIGIN), state.global_cors_config.as_ref()) {
+    // Native routes and default mounts preserve Bolt's global Origin policy.
+    // An ASGI mount may explicitly choose a dedicated allowlist or delegate
+    // validation to its own middleware. No Python runs for this check.
+    let selected_origin_policy = match &target {
+        WsTarget::Route { origin_policy, .. } | WsTarget::AsgiMount { origin_policy, .. } => {
+            origin_policy
+        }
+    };
+    let repeated_origin = req.headers().get_all(ORIGIN).nth(1).is_some();
+    let origin_allowed = (!repeated_origin
+        || matches!(
+            selected_origin_policy.as_ref(),
+            WebSocketOriginPolicy::Delegate
+        ))
+        && origin::validate_mount_origin(
+            req.headers().get(ORIGIN),
+            state.global_cors_config.as_ref(),
+            selected_origin_policy,
+        );
+    if !origin_allowed {
         return Ok(HttpResponse::Forbidden()
             .content_type("application/json")
             .body(r#"{"detail":"Origin not allowed"}"#));
@@ -806,6 +912,25 @@ pub async fn handle_websocket_upgrade(
                 return Ok(bolt_core::responses::error_403_denial(denial.as_deref()));
             }
         }
+    }
+
+    // Evaluate optional Python custom policy after native auth/guards but
+    // before HTTP 101. Denied unauthenticated calls do not run Python.
+    if matches!(
+        selected_origin_policy.as_ref(),
+        WebSocketOriginPolicy::Custom { .. }
+    ) && !check_custom_origin(
+        selected_origin_policy,
+        req.headers().get(ORIGIN),
+        req.path(),
+        req.query_string(),
+        &headers,
+    )
+    .await
+    {
+        return Ok(HttpResponse::Forbidden()
+            .content_type("application/json")
+            .body(r#"{"detail":"Origin not allowed"}"#));
     }
 
     // The slot counts this connection until the handshake fails or the actor stops.

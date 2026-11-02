@@ -22,3 +22,6 @@ tokio = { workspace = true }
 urlencoding = { workspace = true }
 bolt-core = { workspace = true }
 bolt-loop = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

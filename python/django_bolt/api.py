@@ -11,7 +11,7 @@ import sys
 import threading
 from collections.abc import Callable, Collection, Sequence
 from contextlib import suppress
-from typing import Any, get_origin, get_type_hints
+from typing import Any, TypeVar, get_origin, get_type_hints
 
 # Django import - may fail if Django not configured
 try:
@@ -106,6 +106,15 @@ from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata, HandlerPattern
 from .views import APIView, ViewSet, _copy_route_middleware, _layer
 from .websocket import mark_websocket_handler
+from .websocket.origin_policy import (
+    MountOriginPolicy,
+    NativeOriginPolicy,
+    OriginOptions,
+    OriginValidator,
+    resolve_origin_options,
+)
+
+_WebSocketHandler = TypeVar("_WebSocketHandler", bound=Callable[..., Any])
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +278,37 @@ def _normalize_mount_prefix(path: str) -> str:
         raise ValueError(f"ASGI mount path must be static (no dynamic parameters), got: {mount_path}")
 
     return mount_path
+
+
+class _ConfiguredASGIMount:
+    """Hold per-mount options without mutating the underlying ASGI app."""
+
+    def __init__(self, app: Callable[..., Any], options: OriginOptions):
+        self._app = app
+        self._bolt_origin_options = options
+        self._bolt_http_only = getattr(app, "_bolt_http_only", False)
+
+    def __call__(self, scope, receive, send):
+        return self._app(scope, receive, send)
+
+
+def _resolved_asgi_mounts(mounts: list[tuple[str, Any]], *, read_settings: bool = True) -> list[tuple[str, Any]]:
+    """Compile all mount Origin settings once before giving them to Rust."""
+    resolved = []
+    for prefix, app in mounts:
+        options = getattr(app, "_bolt_origin_options", None)
+        original = app._app if isinstance(app, _ConfiguredASGIMount) else app
+        config = resolve_origin_options(options, read_settings=read_settings, asgi=True)
+        if config._bolt_websocket_origin_policy == "inherit" and config._bolt_websocket_allow_missing_origin:
+            resolved.append((prefix, original))
+        else:
+            wrapped = _ConfiguredASGIMount(original, options or OriginOptions())
+            wrapped._bolt_websocket_origin_policy = config._bolt_websocket_origin_policy
+            wrapped._bolt_websocket_allowed_origins = config._bolt_websocket_allowed_origins
+            wrapped._bolt_websocket_allow_missing_origin = config._bolt_websocket_allow_missing_origin
+            wrapped._bolt_websocket_origin_validator = config._bolt_websocket_origin_validator
+            resolved.append((prefix, wrapped))
+    return resolved
 
 
 def _validate_asgi_mount_conflicts(
@@ -541,6 +581,7 @@ class BoltAPI:
         # Handler IDs whose lane affinity error was logged with its fix, one time each.
         self._lane_affinity_hinted: set[int] = set()
         self._websocket_routes: list[tuple[str, int, Callable]] = []  # (path, handler_id, handler)
+        self._websocket_origin_options: dict[int, OriginOptions] = {}
         self._handlers: dict[int, Callable] = {}
         # OPTIMIZATION: Use handler_id (int) as key instead of callable
         # Integer hashing is O(1) with minimal overhead vs callable hashing
@@ -971,15 +1012,51 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         include_in_schema: bool | None = None,
-    ):
+        origin_policy: NativeOriginPolicy | None = None,
+        allowed_origins: list[str] | None = None,
+        allow_missing_origin: bool | None = None,
+        origin_validator: OriginValidator | str | None = None,
+    ) -> Callable[[_WebSocketHandler], _WebSocketHandler]:
         """
         Register a WebSocket endpoint with FastAPI-like syntax.
 
         ``tags`` sets the OpenAPI tags. Without it, the operation gets only the ``WebSocket`` tag.
         ``summary``, ``description`` and ``include_in_schema`` work as on HTTP routes.
 
+        Args:
+            path: URL path, with optional path parameters.
+            origin_policy: None uses BOLT_WEBSOCKET_ORIGIN_POLICY, default "inherit".
+                "inherit" checks global CORS origins and patterns.
+                "allowlist" checks allowed_origins independently of CORS.
+                "any" accepts any valid HTTP(S) Origin. Use with care for cookie authentication.
+                "custom" calls origin_validator. Native routes cannot use "delegate".
+            allowed_origins: Nonempty list of exact HTTP(S) origins for "allowlist".
+                Include ports where needed. Paths, wildcards, and "null" are invalid.
+                None uses BOLT_WEBSOCKET_ALLOWED_ORIGINS. Matching is case-sensitive.
+            allow_missing_origin: None uses BOLT_WEBSOCKET_ALLOW_MISSING_ORIGIN.
+                Without that setting, "inherit" permits absence; other policies reject it.
+                True still requires approval from a custom validator.
+            origin_validator: Callable or dotted import path, required for "custom".
+                Signature: (origin: str | None, context: OriginContext) -> bool | Awaitable[bool].
+                Context has path, query_string, and lower-case headers.
+                Sync callbacks run in a thread. Async callbacks run on the event loop.
+                Validation runs once before HTTP 101, after authentication and guards.
+                Exceptions, non-bool results, and a five-second timeout deny access.
+                None uses BOLT_WEBSOCKET_ORIGIN_VALIDATOR.
+
+        Origin checks do not authenticate clients. Non-browser clients can forge Origin.
+        Explicit options override the corresponding settings at registration or startup.
+        Invalid options raise ValueError or TypeError.
+
         Usage:
             from django_bolt.websocket import WebSocket
+
+            @api.websocket(
+                "/ws/trusted", origin_policy="allowlist",
+                allowed_origins=["https://app.example.com"],
+            )
+            async def trusted(websocket: WebSocket):
+                await websocket.accept()
 
             @api.websocket("/ws")
             async def websocket_endpoint(websocket: WebSocket):
@@ -1004,6 +1081,10 @@ class BoltAPI:
             summary=summary,
             description=description,
             include_in_schema=include_in_schema,
+            origin_policy=origin_policy,
+            allowed_origins=allowed_origins,
+            allow_missing_origin=allow_missing_origin,
+            origin_validator=origin_validator,
         )
 
     def _websocket_decorator(
@@ -1017,10 +1098,17 @@ class BoltAPI:
         summary: str | None = None,
         description: str | None = None,
         include_in_schema: bool | None = None,
-    ):
+        origin_policy: NativeOriginPolicy | None = None,
+        allowed_origins: list[str] | None = None,
+        allow_missing_origin: bool | None = None,
+        origin_validator: OriginValidator | str | None = None,
+    ) -> Callable[[_WebSocketHandler], _WebSocketHandler]:
         """Internal decorator for WebSocket routes."""
 
-        def decorator(fn: Callable) -> Callable:
+        def decorator(fn: _WebSocketHandler) -> _WebSocketHandler:
+            local_origin = OriginOptions(origin_policy, allowed_origins, allow_missing_origin, origin_validator)
+            if local_origin != OriginOptions():
+                resolve_origin_options(local_origin)
             # Ensure handler is async
             if not inspect.iscoroutinefunction(fn):
                 raise TypeError(f"WebSocket handler '{fn.__name__}' must be an async function")
@@ -1037,6 +1125,9 @@ class BoltAPI:
 
             # Store the route
             self._websocket_routes.append((full_path, handler_id, fn))
+            self._websocket_origin_options[handler_id] = OriginOptions(
+                origin_policy, allowed_origins, allow_missing_origin, origin_validator
+            )
             self._handlers[handler_id] = fn
 
             # Compile parameter binder for WebSocket (reuses HTTP binding logic)
@@ -3608,6 +3699,9 @@ class BoltAPI:
             self._next_handler_id += 1
 
             self._websocket_routes.append((new_path, new_handler_id, handler))
+            self._websocket_origin_options[new_handler_id] = app._websocket_origin_options.get(
+                handler_id, OriginOptions()
+            )
             self._handlers[new_handler_id] = handler
 
             # Copy handler metadata, layered as for HTTP routes above.
@@ -3646,26 +3740,86 @@ class BoltAPI:
         if child_formatter is not None:
             self._error_formatter = child_formatter
 
-    def mount_asgi(self, path: str, app: Callable[..., Any]) -> None:
-        """Mount an ASGI app at a static prefix (evaluated after Bolt route miss)."""
+    def mount_asgi(
+        self,
+        path: str,
+        app: Callable[..., Any],
+        *,
+        websocket_origin_policy: MountOriginPolicy | None = None,
+        websocket_allowed_origins: list[str] | None = None,
+        websocket_allow_missing_origin: bool | None = None,
+        websocket_origin_validator: OriginValidator | str | None = None,
+    ) -> None:
+        """Mount an ASGI app under a static URL prefix.
+
+        Args:
+            path: Static prefix. The longest matching mount receives unmatched routes.
+            app: ASGI callable with (scope, receive, send) arguments.
+            websocket_origin_policy: None uses BOLT_WEBSOCKET_ORIGIN_POLICY, default "inherit".
+                "inherit" checks global CORS; "allowlist" checks websocket_allowed_origins.
+                "any" accepts valid HTTP(S) origins. "custom" calls websocket_origin_validator.
+                "delegate" bypasses Bolt's Origin check. The app must validate Origin itself.
+            websocket_allowed_origins: Nonempty list of exact HTTP(S) origins for "allowlist".
+                Paths, wildcards, and "null" are invalid. Matching is case-sensitive.
+                None uses BOLT_WEBSOCKET_ALLOWED_ORIGINS.
+            websocket_allow_missing_origin: None uses BOLT_WEBSOCKET_ALLOW_MISSING_ORIGIN.
+                Otherwise, "inherit" permits absence; "allowlist", "any", and "custom" reject it.
+                True still requires custom approval. "delegate" ignores this option.
+            websocket_origin_validator: Callable or dotted import path, required for "custom".
+                Signature: (origin: str | None, context: OriginContext) -> bool | Awaitable[bool].
+                Context has the full request path, query_string, and lower-case headers.
+                Sync callbacks run in a thread. Async callbacks run on the event loop.
+                Validation runs once before HTTP 101. Failure or a five-second timeout denies access.
+                None uses BOLT_WEBSOCKET_ORIGIN_VALIDATOR.
+
+        Explicit options override corresponding settings at registration or startup.
+        Invalid options raise ValueError or TypeError. HTTP behavior stays with the app.
+        Mounted apps must enforce authentication and guards themselves.
+        Origin does not prove identity. Use "any" and "delegate" with care for cookie authentication.
+
+        Example:
+            api.mount_asgi(
+                "/chat", chat_app,
+                websocket_origin_policy="allowlist",
+                websocket_allowed_origins=["https://chat.example.com"],
+            )
+        """
         if not callable(app):
             raise TypeError(f"mount_asgi() expects a callable ASGI application, got {type(app).__name__}")
 
-        mount_path = _normalize_mount_prefix(path)
+        options = OriginOptions(
+            websocket_origin_policy, websocket_allowed_origins,
+            websocket_allow_missing_origin, websocket_origin_validator,
+        )
+        if options != OriginOptions():
+            resolve_origin_options(options, asgi=True)
 
+        mount_path = _normalize_mount_prefix(path)
         if self.prefix:
             if mount_path == "/":
                 mount_path = _normalize_mount_prefix(self.prefix)
             else:
                 mount_path = _normalize_mount_prefix(self.prefix + mount_path)
-
         if mount_path in self._asgi_mount_prefixes:
             raise ValueError(f"Duplicate ASGI mount prefix: {mount_path}")
 
+        # A no-options mount keeps the original ASGI callable; global config
+        # is resolved at server/test-client registration, not import time.
+        mounted_app = app if options == OriginOptions() else _ConfiguredASGIMount(app, options)
         self._asgi_mount_prefixes.add(mount_path)
-        self._asgi_mounts.append((mount_path, app))
+        self._asgi_mounts.append((mount_path, mounted_app))
 
-    def mount_django(self, path: str, app: Any | None = None, *, clear_root_path: bool = False) -> None:
+    def mount_django(
+        self,
+        path: str,
+        app: Any | None = None,
+        *,
+        clear_root_path: bool = False,
+        websocket_origin_policy: MountOriginPolicy | None = None,
+        websocket_allowed_origins: list[str] | None = None,
+        websocket_allow_missing_origin: bool | None = None,
+        websocket_origin_validator: OriginValidator | str | None = None,
+    ) -> None:
         """Mount Django's ASGI app at a path prefix (convenience wrapper over mount_asgi).
 
         Args:
@@ -3674,6 +3828,34 @@ class BoltAPI:
             clear_root_path: Set ``root_path=""`` before Django sees the scope.
                 Required when URL patterns already include the mount prefix
                 (e.g. ``/admin/...``).
+            websocket_origin_policy: None uses BOLT_WEBSOCKET_ORIGIN_POLICY, default "inherit".
+                "inherit" checks global CORS; "allowlist" checks websocket_allowed_origins.
+                "any" accepts valid HTTP(S) origins. "custom" calls websocket_origin_validator.
+                "delegate" bypasses Bolt's check. The app must validate Origin itself.
+            websocket_allowed_origins: Nonempty exact HTTP(S) origins for "allowlist".
+                None uses BOLT_WEBSOCKET_ALLOWED_ORIGINS. Paths and wildcards are invalid.
+                Matching is case-sensitive.
+            websocket_allow_missing_origin: None uses BOLT_WEBSOCKET_ALLOW_MISSING_ORIGIN.
+                Otherwise, "inherit" permits absence; "allowlist", "any", and "custom" reject it.
+                True still requires custom approval. "delegate" ignores this option.
+            websocket_origin_validator: Callable or dotted import path, required for "custom".
+                Signature: (origin: str | None, context: OriginContext) -> bool | Awaitable[bool].
+                Context has the full request path, query_string, and lower-case headers.
+                Sync and async callbacks run once before HTTP 101.
+                Sync callbacks use a thread. Failure or a five-second timeout denies access.
+                None uses BOLT_WEBSOCKET_ORIGIN_VALIDATOR.
+
+        Django's default ASGIHandler serves HTTP only. WebSocket options require a custom ASGI app.
+        Explicit options override corresponding settings. Invalid options raise ValueError or TypeError.
+        Mounted apps must enforce authentication and guards themselves. Origin does not prove identity.
+        Use "any" and "delegate" with care for cookie authentication.
+
+        Example:
+            api.mount_django(
+                "/chat", app=channels_app,
+                websocket_origin_policy="allowlist",
+                websocket_allowed_origins=["https://chat.example.com"],
+            )
         """
         asgi_app = app
         if asgi_app is None:
@@ -3697,7 +3879,14 @@ class BoltAPI:
         if isinstance(asgi_app, ASGIHandler):
             django_mount_wrapper._bolt_http_only = True
 
-        self.mount_asgi(path, django_mount_wrapper)
+        self.mount_asgi(
+            path,
+            django_mount_wrapper,
+            websocket_origin_policy=websocket_origin_policy,
+            websocket_allowed_origins=websocket_allowed_origins,
+            websocket_allow_missing_origin=websocket_allow_missing_origin,
+            websocket_origin_validator=websocket_origin_validator,
+        )
 
     def mount_mcp(
         self,

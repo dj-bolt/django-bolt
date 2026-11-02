@@ -240,7 +240,7 @@ Notes:
 
 ### WebSocket decorator
 
-#### @api.websocket(path, *, name=None, guards=None, auth=None, tags=None, summary=None, description=None, include_in_schema=None)
+#### @api.websocket(path, *, name=None, guards=None, auth=None, tags=None, summary=None, description=None, include_in_schema=None, origin_policy=None, allowed_origins=None, allow_missing_origin=None, origin_validator=None)
 
 Register a WebSocket endpoint. `tags` sets the OpenAPI tags. The default is `["WebSocket"]`.
 `summary`, `description` and `include_in_schema` work as on HTTP routes.
@@ -250,6 +250,18 @@ Register a WebSocket endpoint. `tags` sets the OpenAPI tags. The default is `["W
 async def websocket_handler(websocket: WebSocket):
     await websocket.accept()
 ```
+
+`origin_policy` accepts `"inherit"`, `"allowlist"`, `"any"`, or `"custom"`.
+`None` uses `BOLT_WEBSOCKET_ORIGIN_POLICY`, which defaults to `"inherit"`.
+Set `allowed_origins` to a nonempty exact list for `"allowlist"`.
+Set `origin_validator` to a sync or async callable, or its dotted path, for `"custom"`.
+Its signature is `(origin, context) -> bool | Awaitable[bool]`.
+Context contains `path`, `query_string`, and lower-case `headers`.
+`allow_missing_origin=None` uses settings, then the policy default.
+Only `"inherit"` permits missing Origin by default.
+Custom validation must approve a permitted missing Origin too.
+Validation runs before HTTP 101. Authentication and guards still apply.
+See [Origin policy](../topics/websocket.md#origin-policy) for examples and validation errors.
 
 ### API mounting
 
@@ -261,22 +273,26 @@ Mount another BoltAPI under a prefix.
 api.mount("/v1", v1_api)
 ```
 
-#### api.mount_asgi(path, app)
+#### api.mount_asgi(path, app, *, websocket_origin_policy=None, websocket_allowed_origins=None, websocket_allow_missing_origin=None, websocket_origin_validator=None)
 
-Mount an HTTP ASGI application under a static prefix.
+Mount an HTTP or WebSocket ASGI application under a static prefix.
+Unspecified Origin settings inherit the `BOLT_WEBSOCKET_*` settings (or the
+legacy CORS Origin policy if no new settings exist). Available policies are
+`"inherit"`, `"allowlist"`, `"any"`, `"custom"` and `"delegate"`.
+`"delegate"` transfers Origin protection to the mounted application;
+it must validate Origin itself. `"custom"` requires a sync or async Python
+validator returning bool. See [ASGI Mounts](../topics/asgi-mounts.md).
 
-See [ASGI Mounts](../topics/asgi-mounts.md) for full behavior, examples, and constraints.
+Mounted ASGI apps still own HTTP authentication and CORS behavior; the
+selected WebSocket Origin policy applies only at the handshake.
 
-Mounted ASGI apps are outside Bolt middleware/auth/CORS flow and currently use a buffered response bridge (not true streaming passthrough).
+#### api.mount_django(path, app=None, *, clear_root_path=False, websocket_origin_policy=None, websocket_allowed_origins=None, websocket_allow_missing_origin=None, websocket_origin_validator=None)
 
-#### api.mount_django(path, app=None, *, clear_root_path=False)
-
-Convenience wrapper for mounting Django's ASGI app (or a custom ASGI app) under a prefix.
-
-See [ASGI Mounts](../topics/asgi-mounts.md) for usage examples and dispatch/conflict rules.
-
-`mount_django()` inherits the same mount boundary and buffered-bridge behavior as `mount_asgi()`.
-Use `clear_root_path=True` when Django URL patterns already include the mount prefix.
+Convenience wrapper for mounting Django's ASGI app (or a custom ASGI app) under
+a prefix. It accepts the same optional WebSocket Origin policy settings as
+`mount_asgi`. See [ASGI Mounts](../topics/asgi-mounts.md).
+Use `clear_root_path=True` when Django URL patterns already include the
+mount prefix.
 
 ## Dependency injection
 

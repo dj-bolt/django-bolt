@@ -608,12 +608,19 @@ pub fn register_routes(
     reason = "PyO3 wire format: Python passes each WebSocket route as one tuple"
 )]
 pub fn register_websocket_routes(
-    _py: Python<'_>,
-    routes: Vec<(String, usize, Py<PyAny>, Option<Py<PyAny>>)>,
+    py: Python<'_>,
+    routes: Vec<(String, usize, Py<PyAny>, Option<Py<PyAny>>, Py<PyAny>)>,
 ) -> PyResult<()> {
     let mut router = WebSocketRouter::new();
-    for (path, handler_id, handler, injector) in routes {
-        router.register(&path, handler_id, handler, injector)?;
+    for (path, handler_id, handler, injector, origin_config) in routes {
+        router.register(
+            &path,
+            handler_id,
+            handler,
+            injector,
+            Some(origin_config.bind(py)),
+            py,
+        )?;
     }
     GLOBAL_WEBSOCKET_ROUTER.set(Arc::new(router)).map_err(|_| {
         pyo3::exceptions::PyRuntimeError::new_err("WebSocket router already initialized")
@@ -1097,6 +1104,7 @@ pub async fn websocket_upgrade_handler(
                 handler_id: route.handler_id,
                 path_params,
                 injector,
+                origin_policy: route.origin_policy.clone(),
             },
             state.get_ref().clone(),
         )
@@ -1154,10 +1162,15 @@ async fn websocket_not_found_handler(
     if let Some(mount) = find_websocket_mount(state.get_ref(), normalized_path) {
         let app = Python::attach(|py| mount.app.clone_ref(py));
         let mount_prefix = mount.prefix.clone();
+        let origin_policy = mount.websocket_origin_policy.clone();
         return handle_websocket_upgrade(
             req,
             stream,
-            WsTarget::AsgiMount { app, mount_prefix },
+            WsTarget::AsgiMount {
+                app,
+                mount_prefix,
+                origin_policy,
+            },
             state.get_ref().clone(),
         )
         .await;

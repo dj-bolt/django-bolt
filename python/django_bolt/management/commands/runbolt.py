@@ -23,8 +23,15 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
-from django_bolt.api import BoltAPI, _validate_asgi_mount_conflicts, _validate_mcp_mount_conflicts, serve_with_lifespan
+from django_bolt.api import (
+    BoltAPI,
+    _resolved_asgi_mounts,
+    _validate_asgi_mount_conflicts,
+    _validate_mcp_mount_conflicts,
+    serve_with_lifespan,
+)
 from django_bolt.concurrency import close_connections_and_pools
+from django_bolt.websocket.origin_policy import OriginOptions, resolve_origin_options
 from django_bolt.workers import MIB, WorkerSupervisor
 
 try:
@@ -960,7 +967,7 @@ class Command(BaseCommand):
 
         # Register HTTP ASGI mounts with Rust
         if merged_api._asgi_mounts:
-            _core.register_asgi_mounts(merged_api._asgi_mounts)
+            _core.register_asgi_mounts(_resolved_asgi_mounts(merged_api._asgi_mounts))
 
         # Register MCP mounts with Rust (rmcp protocol core)
         if merged_api._mcp_mounts:
@@ -972,7 +979,10 @@ class Command(BaseCommand):
             # Get pre-compiled injector from handler metadata (handler_id is already in the tuple)
             meta = merged_api._handler_meta.get(handler_id, {})
             injector = meta.get("injector")
-            ws_routes.append((path, handler_id, handler, injector))
+            ws_routes.append((
+                path, handler_id, handler, injector,
+                resolve_origin_options(merged_api._websocket_origin_options.get(handler_id, OriginOptions())),
+            ))
 
         if ws_routes:
             _core.register_websocket_routes(ws_routes)
@@ -1405,6 +1415,9 @@ class Command(BaseCommand):
 
                 route_map[ws_route_key] = api_path
                 merged._websocket_routes.append((path, new_ws_handler_id, ws_handler))
+                merged._websocket_origin_options[new_ws_handler_id] = api._websocket_origin_options.get(
+                    old_ws_handler_id, OriginOptions()
+                )
                 merged._handlers[new_ws_handler_id] = ws_handler
 
                 # Store reference to original API (or sub-app for mounted routes)

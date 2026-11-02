@@ -64,5 +64,27 @@ async def echo_app(scope, receive, send):
         await send({"type": "websocket.send", "text": f"echo:{text}"})
 
 
+async def origin_guarded_app(scope, receive, send):
+    """A delegated application that deliberately validates its own Origin."""
+    origins = [value for name, value in scope["headers"] if name == b"origin"]
+    if not origins or any(value != b"https://delegated.example" for value in origins):
+        await receive()
+        await send({"type": "websocket.close"})
+        return
+    if scope["query_string"] == b"report_origins":
+        await receive()
+        await send({"type": "websocket.accept"})
+        await send({"type": "websocket.send", "text": json.dumps([v.decode() for v in origins])})
+        return
+    await echo_app(scope, receive, send)
+
+
 api.mount_asgi("/mounted", echo_app)
+api.mount_asgi(
+    "/restricted",
+    echo_app,
+    websocket_origin_policy="allowlist",
+    websocket_allowed_origins=["https://restricted.example"],
+)
+api.mount_asgi("/delegated", origin_guarded_app, websocket_origin_policy="delegate")
 api.mount_django("/django")

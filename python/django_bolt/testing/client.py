@@ -23,8 +23,9 @@ from httpx import Response
 
 from django_bolt import BoltAPI, _core
 from django_bolt._bridge import make_bound_dispatch
-from django_bolt.api import _validate_asgi_mount_conflicts, _validate_mcp_mount_conflicts
+from django_bolt.api import _resolved_asgi_mounts, _validate_asgi_mount_conflicts, _validate_mcp_mount_conflicts
 from django_bolt.testing.dbshare import SharedConnections
+from django_bolt.websocket.origin_policy import OriginOptions, resolve_origin_options
 
 logger = logging.getLogger(__name__)
 
@@ -379,13 +380,21 @@ class TestClient(httpx.Client):
             # Get pre-compiled injector from handler metadata (same as runbolt.py)
             meta = api._handler_meta.get(handler_id, {})
             injector = meta.get("injector")
-            ws_routes.append((path, handler_id, handler, injector))
+            ws_routes.append((
+                path, handler_id, handler, injector,
+                resolve_origin_options(
+                    api._websocket_origin_options.get(handler_id, OriginOptions()),
+                    read_settings=read_django_settings,
+                ),
+            ))
         if ws_routes:
             _core.register_test_websocket_routes(self.app_id, ws_routes)
 
         # Register HTTP ASGI mounts
         if api._asgi_mounts:
-            _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
+            _core.register_test_asgi_mounts(
+                self.app_id, _resolved_asgi_mounts(api._asgi_mounts, read_settings=read_django_settings)
+            )
 
         # Register MCP mounts (served by the Rust rmcp core, like production)
         if api._mcp_mounts:
@@ -685,13 +694,21 @@ class AsyncTestClient(httpx.AsyncClient):
         for path, handler_id, handler in api._websocket_routes:
             meta = api._handler_meta.get(handler_id, {})
             injector = meta.get("injector")
-            ws_routes.append((path, handler_id, handler, injector))
+            ws_routes.append((
+                path, handler_id, handler, injector,
+                resolve_origin_options(
+                    api._websocket_origin_options.get(handler_id, OriginOptions()),
+                    read_settings=read_django_settings,
+                ),
+            ))
         if ws_routes:
             _core.register_test_websocket_routes(self.app_id, ws_routes)
 
         # Register HTTP ASGI mounts
         if api._asgi_mounts:
-            _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
+            _core.register_test_asgi_mounts(
+                self.app_id, _resolved_asgi_mounts(api._asgi_mounts, read_settings=read_django_settings)
+            )
 
         # Register MCP mounts (served by the Rust rmcp core, like production)
         if api._mcp_mounts:

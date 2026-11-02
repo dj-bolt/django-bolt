@@ -65,8 +65,8 @@ async def test_websocket_origin_denied():
 
 
 @pytest.mark.asyncio
-async def test_websocket_no_origin_same_origin_allowed():
-    """Test WebSocket without Origin header (same-origin request) is allowed."""
+async def test_websocket_missing_origin_allowed_for_non_browser_clients():
+    """Test that a client which omits Origin can connect without a CORS match."""
     api = BoltAPI()
 
     @api.websocket("/ws/echo")
@@ -74,7 +74,7 @@ async def test_websocket_no_origin_same_origin_allowed():
         await websocket.accept()
         await websocket.send_text("connected")
 
-    # No Origin header = same-origin request, should be allowed
+    # A missing Origin does not prove same-origin; non-browser clients may omit it.
     async with WebSocketTestClient(
         api,
         "/ws/echo",
@@ -153,8 +153,8 @@ async def test_websocket_no_cors_config_denies_cross_origin():
 
 
 @pytest.mark.asyncio
-async def test_websocket_no_cors_config_allows_same_origin():
-    """Test WebSocket without CORS config allows same-origin requests (no Origin header)."""
+async def test_websocket_no_cors_config_allows_missing_origin():
+    """Test that absent Origin is allowed even without a CORS config."""
     api = BoltAPI()
 
     @api.websocket("/ws/echo")
@@ -162,7 +162,7 @@ async def test_websocket_no_cors_config_allows_same_origin():
         await websocket.accept()
         await websocket.send_text("connected")
 
-    # No CORS config + no Origin header = same-origin, should be allowed
+    # No CORS config and missing Origin: policy permits non-browser clients.
     async with WebSocketTestClient(
         api,
         "/ws/echo",

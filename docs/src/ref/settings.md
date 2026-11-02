@@ -21,6 +21,45 @@ import os
 BOLT_MAX_UPLOAD_SIZE = int(os.environ["BOLT_MAX_UPLOAD_SIZE"])
 ```
 
+## WebSocket Origin settings
+
+Django Bolt reads the following global defaults from `settings.py` when
+registering WebSocket routes and ASGI mounts. Explicit endpoint options
+override the corresponding global options. They do not modify HTTP CORS.
+
+```python
+BOLT_WEBSOCKET_ORIGIN_POLICY = "allowlist"
+BOLT_WEBSOCKET_ALLOWED_ORIGINS = ["https://app.example.com"]
+BOLT_WEBSOCKET_ALLOW_MISSING_ORIGIN = False
+# For custom only:
+# BOLT_WEBSOCKET_ORIGIN_VALIDATOR = "myapp.security.check_ws_origin"
+```
+
+- **`BOLT_WEBSOCKET_ORIGIN_POLICY`**: `inherit` (default), `allowlist`,
+  `any`, or `custom`. ASGI mounts additionally support explicit `delegate`.
+  Without this setting, the historical CORS-derived WebSocket Origin check
+  is preserved, including allowing absent Origin.
+- **`BOLT_WEBSOCKET_ALLOWED_ORIGINS`**: nonempty list of exact HTTP(S)
+  origins, for `allowlist` mode.
+- **`BOLT_WEBSOCKET_ALLOW_MISSING_ORIGIN`**: optional bool. Defaults to
+  `True` for `inherit` and `False` for `allowlist`, `any`, and `custom`.
+  An allowed missing Origin never proves a client's identity.
+- **`BOLT_WEBSOCKET_ORIGIN_VALIDATOR`**: callable or dotted import path,
+  required for `custom`. Supports sync `def` and `async def`. Its
+  signature is `(origin, context) -> bool | Awaitable[bool]`; context has
+  `path`, `query_string`, and `headers`. Errors, non-boolean results, and
+  timeouts reject the handshake. See [Origin policy](../topics/websocket.md#custom-validation)
+  for resource limits and cancellation behavior.
+
+These options raise `ValueError` for invalid policy combinations or Origin entries.
+A non-boolean missing-Origin flag raises `TypeError`.
+They do not use the `ImproperlyConfigured` conversion described for other settings.
+Global `delegate` is invalid. Select it explicitly on each responsible mount.
+Custom validation has a five-second timeout and requires a boolean result.
+
+See [WebSocket Origin policy](../topics/websocket.md#origin-policy) for
+security considerations and per-route / per-mount examples.
+
 ## CORS settings
 
 ### CORS_ALLOWED_ORIGINS

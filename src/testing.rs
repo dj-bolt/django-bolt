@@ -27,6 +27,7 @@ use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::middleware::rate_limit::RateLimiters;
 use bolt_core::router::Router;
+use bolt_core::state::WebSocketOriginPolicy;
 use bolt_core::state::{
     AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS, find_websocket_mount_in_slice,
 };
@@ -456,17 +457,24 @@ pub fn register_test_routes(
     reason = "PyO3 wire format: Python passes each WebSocket route as one tuple"
 )]
 pub fn register_test_websocket_routes(
-    _py: Python<'_>,
+    py: Python<'_>,
     app_id: u64,
-    routes: Vec<(String, usize, Py<PyAny>, Option<Py<PyAny>>)>,
+    routes: Vec<(String, usize, Py<PyAny>, Option<Py<PyAny>>, Py<PyAny>)>,
 ) -> PyResult<()> {
     let entry = test_app(app_id)?;
 
     let mut app = entry.write();
 
     let mut ws_router = WebSocketRouter::new();
-    for (path, handler_id, handler, injector) in routes {
-        ws_router.register(&path, handler_id, handler, injector)?;
+    for (path, handler_id, handler, injector, origin_config) in routes {
+        ws_router.register(
+            &path,
+            handler_id,
+            handler,
+            injector,
+            Some(origin_config.bind(py)),
+            py,
+        )?;
     }
     app.websocket_router = Arc::new(ws_router);
     Ok(())
@@ -785,27 +793,12 @@ pub fn handle_test_websocket(
 
     // Convert headers to map, with the `Cookie` lines joined as in production
     let mut header_map: AHashMap<String, String> = AHashMap::with_capacity(headers.len());
+    let mut origin_count = 0;
     for (name, value) in headers.iter() {
-        insert_header_line(&mut header_map, &name.to_lowercase(), value);
-    }
-
-    // Origin validation for WebSocket
-    let origin = header_map.get("origin");
-    if let Some(origin_value) = origin {
-        // The production check. A value that no header can hold is denied too.
-        let origin_allowed = HeaderValue::from_str(origin_value).is_ok_and(|origin_header| {
-            bolt_websocket::origin::validate_origin(
-                Some(&origin_header),
-                app.config.global_cors_config.as_ref(),
-            )
-        });
-
-        if !origin_allowed {
-            return Err(pyo3::exceptions::PyPermissionError::new_err(format!(
-                "Origin not allowed: {}",
-                origin_value
-            )));
+        if name.eq_ignore_ascii_case("origin") {
+            origin_count += 1;
         }
+        insert_header_line(&mut header_map, &name.to_lowercase(), value);
     }
 
     // Normalize path
@@ -822,6 +815,39 @@ pub fn handle_test_websocket(
         None => {
             return match find_websocket_mount_in_slice(&app.asgi_mounts, normalized_path) {
                 Some(mount) => {
+                    let origin_value = header_map.get("origin");
+                    let allowed = match origin_value {
+                        Some(value) => HeaderValue::from_str(value).is_ok_and(|header| {
+                            bolt_websocket::origin::validate_mount_origin(
+                                Some(&header),
+                                app.config.global_cors_config.as_ref(),
+                                &mount.websocket_origin_policy,
+                            )
+                        }),
+                        None => bolt_websocket::origin::validate_mount_origin(
+                            None,
+                            app.config.global_cors_config.as_ref(),
+                            &mount.websocket_origin_policy,
+                        ),
+                    };
+                    if !allowed
+                        || (origin_count > 1
+                            && !matches!(
+                                mount.websocket_origin_policy.as_ref(),
+                                WebSocketOriginPolicy::Delegate
+                            ))
+                    {
+                        return Err(pyo3::exceptions::PyPermissionError::new_err(format!(
+                            "Origin not allowed: {}",
+                            origin_value.map(String::as_str).unwrap_or("<missing>")
+                        )));
+                    }
+                    // Custom callback runs asynchronously in WebSocketTestClient
+                    // before the mounted handler, matching the server's handshake.
+                    let custom = match mount.websocket_origin_policy.as_ref() {
+                        WebSocketOriginPolicy::Custom { validator, .. } => Some(validator),
+                        _ => None,
+                    };
                     // The scheme follows BOLT_TRUSTED_PROXIES, as on the server.
                     let secure = bolt_core::middleware::client_ip::resolve_scheme_with(
                         || header_map.get("x-forwarded-proto").map(String::as_str),
@@ -829,18 +855,29 @@ pub fn handle_test_websocket(
                         false,
                         &app.config.trusted_proxies,
                     ) == "https";
+                    // Preserve raw line order and repeated headers, as runbolt does.
+                    let scope_headers: Vec<(String, String)> = headers
+                        .iter()
+                        .map(|(name, value)| (name.to_lowercase(), value.clone()))
+                        .collect();
                     // Give the app the request path as sent, as the server does.
                     let scope = build_asgi_scope_from_parts(
                         py,
                         &mount.prefix,
                         &path,
                         query_string.as_deref().unwrap_or_default().as_bytes(),
-                        header_map
+                        scope_headers
                             .iter()
                             .map(|(name, value)| (name.as_str(), value.as_bytes())),
                         secure,
                         Some(("127.0.0.1".to_string(), 0)),
                     )?;
+                    if let Some(validator) = custom {
+                        scope
+                            .bind(py)
+                            .cast::<PyDict>()?
+                            .set_item("_bolt_origin_validator", validator.clone_ref(py))?;
+                    }
                     Ok((
                         true,
                         true,
@@ -854,6 +891,28 @@ pub fn handle_test_websocket(
             };
         }
     };
+
+    // Native route policy is compiled at registration, like production.
+    let origin = header_map.get("origin");
+    let allowed = match origin {
+        Some(value) => HeaderValue::from_str(value).is_ok_and(|h| {
+            bolt_websocket::origin::validate_mount_origin(
+                Some(&h),
+                app.config.global_cors_config.as_ref(),
+                &route.origin_policy,
+            )
+        }),
+        None => bolt_websocket::origin::validate_mount_origin(
+            None,
+            app.config.global_cors_config.as_ref(),
+            &route.origin_policy,
+        ),
+    };
+    if !allowed || origin_count > 1 {
+        return Err(pyo3::exceptions::PyPermissionError::new_err(
+            "Origin not allowed",
+        ));
+    }
 
     let handler_id = route.handler_id;
     let handler = route.handler.clone_ref(py);
@@ -986,6 +1045,9 @@ pub fn handle_test_websocket(
     let scope_dict = pyo3::types::PyDict::new(py);
     scope_dict.set_item("type", "websocket")?;
     scope_dict.set_item("path", &path)?;
+    if let WebSocketOriginPolicy::Custom { validator, .. } = route.origin_policy.as_ref() {
+        scope_dict.set_item("_bolt_origin_validator", validator.clone_ref(py))?;
+    }
     if let Some(context) = revocation_auth {
         scope_dict.set_item("_bolt_revocation_auth", context)?;
     }
