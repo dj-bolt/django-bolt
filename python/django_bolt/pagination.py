@@ -741,6 +741,8 @@ class CursorPagination(PaginationBase):
                     return row[name]
                 if alias in row:
                     return row[alias]
+                if name == pk_field.attname and "pk" in row:
+                    return row["pk"]
                 if needs_hidden_pk and name == pk_field.attname:
                     return row[hidden_pk]
                 raise ValueError(f"Ordering field {name} is not in values()")
