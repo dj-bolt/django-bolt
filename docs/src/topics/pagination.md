@@ -129,12 +129,18 @@ used as an ordering key, but additional grouped keys may be needed to avoid
 ties. Unsupported projection shapes report a clear error rather than
 silently losing rows.
 
-SQL `NULL` is a valid cursor position. For JSONField ordering, top-level JSON
-`null` and SQL `NULL` can both deserialize to Python `None`, so Bolt
-distinguishes them only when a page boundary requires it. This may cost one
-additional query on nullable JSONField boundaries; regular pages do not
-incur that query. JSONField grouped/distinct ordering without a reliable
-row key is not supported.
+SQL `NULL` is a valid cursor position. A JSONField may contain SQL `NULL`
+or JSON `null`; Django reads both as Python `None`. Bolt checks a nullable
+JSONField boundary only when it needs to distinguish them. This can add
+one query for each ambiguous JSON key at a page boundary. Ordinary pages
+need no extra query.
+
+For an explicit tuple over a nullable JSONField, projected results must
+include the primary key. Otherwise Bolt cannot identify the boundary row
+to distinguish SQL `NULL` from JSON `null`, so it raises `ValueError` before
+fetching data. A direct non-nullable JSONField needs no extra lookup.
+You can also order by a typed, non-JSON key. Bolt does not support JSONField
+ordering in grouped or distinct projections without a reliable row key.
 
 The API still has **one opaque `cursor`/ `next_cursor` mechanism**, not
 separate pagination classes or query parameters. New non-PK positions use
