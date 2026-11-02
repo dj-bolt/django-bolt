@@ -841,7 +841,7 @@ class CursorPagination(PaginationBase):
                 # B-tree-friendly row comparison for non-null, equal-direction keys.
                 row = Tuple(*(F(t[0]) for t in terms))
                 comparator = TupleLessThan if terms[0][2] else TupleGreaterThan
-                ordered = ordered.filter(comparator(row, values))
+                ordered = ordered.filter(comparator(row, tuple(values)))
             else:
                 after_any = parts[0]
                 for part in parts[1:]:
