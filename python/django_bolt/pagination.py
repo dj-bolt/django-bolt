@@ -713,7 +713,6 @@ class CursorPagination(PaginationBase):
 
         if auto_pk:
             terms.append((pk_field.attname, pk_field.attname, terms[0][2], pk_field, False))
-        term_names = tuple(t[0] for t in terms)
         ordering = tuple(("-" if t[2] else "") + t[0] for t in terms)
         if projected and selected:
             missing = [
@@ -736,8 +735,16 @@ class CursorPagination(PaginationBase):
 
         def read_value(row: Any, name: str, alias: str, result_fields: tuple[str, ...]) -> Any:
             if is_values:
-                return row[name] if name in row else row[alias]
+                if name in row:
+                    return row[name]
+                if alias in row:
+                    return row[alias]
+                if needs_hidden_pk and name == pk_field.attname:
+                    return row[hidden_pk]
+                raise ValueError(f"Ordering field {name} is not in values()")
             if is_values_list:
+                if needs_hidden_pk and name == pk_field.attname:
+                    return row[-1]
                 if is_flat and not needs_hidden_pk:
                     return row
                 key = next((x for x in (name, alias, "pk" if name == pk_field.attname else "") if x in result_fields), None)
@@ -786,7 +793,6 @@ class CursorPagination(PaginationBase):
         if isinstance(cursor, _KeysetCursor):
             values = cursor.values
             features = connections[queryset.db].features
-            null_parts = []
             prefix = Q()
             parts = []
             for term, value in zip(terms, values):
