@@ -390,7 +390,22 @@ auth_views.register(api)
 This adds `POST /auth/login`, `/auth/refresh`, `/auth/logout`, and
 `/auth/logout-all`. Supply `credential_validator=` when credentials are not a
 username/password pair; lower-level helpers remain available for fully custom
-flows.
+flows. If tokens are shared across services, scope issuance and refresh-token
+validation to an expected issuer and audience:
+
+```python
+JWTAuthViews(
+    store=store,
+    issuer="https://auth.example.com",
+    audience="erp-api",
+).register(api)
+```
+
+Both claims are optional. When configured, they are included in issued and
+rotated tokens and required on `/auth/refresh`, `/auth/logout`, and
+`/auth/logout-all`. Existing tokens without matching claims are rejected;
+configure the same values on any separate `JWTAuthentication` backends that
+verify these tokens. With neither option set, the default behavior is unchanged.
 
 !!! warning "JWTAuthViews requires a versioned, atomic revocation store"
 
