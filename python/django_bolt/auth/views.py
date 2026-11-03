@@ -48,6 +48,8 @@ class JWTAuthViews:
         secret: str | None = None,
         algorithm: str = "HS256",
         kid: str | None = None,
+        issuer: str | None = None,
+        audience: str | None = None,
         prefix: str = "/auth",
         access_cookie: str = "access_token",
         refresh_cookie: str = "refresh_token",
@@ -58,6 +60,8 @@ class JWTAuthViews:
         self.secret = secret
         self.algorithm = algorithm
         self.kid = kid
+        self.issuer = issuer
+        self.audience = audience
         self.prefix = prefix.rstrip("/")
         self.access_cookie = access_cookie
         self.refresh_cookie = refresh_cookie
@@ -112,9 +116,13 @@ class JWTAuthViews:
 
     def register(self, api: Any) -> None:
         """Attach the four lifecycle routes to a :class:`BoltAPI`."""
+        token_claims = {"iss": self.issuer, "aud": self.audience}
+        token_claims = {key: value for key, value in token_claims.items() if value is not None}
         refresh_auth = JWTAuthentication(
             secret=self.secret,
             algorithms=[self.algorithm],
+            issuer=self.issuer,
+            audience=self.audience,
             cookie=self.refresh_cookie,
             token_type="refresh",
             require_jti=True,
@@ -134,6 +142,7 @@ class JWTAuthViews:
                 kid=self.kid,
                 version=version,
                 method="pwd",
+                claims=token_claims or None,
             )
             return set_token_cookies(
                 JSON({"ok": True}),
@@ -159,6 +168,7 @@ class JWTAuthViews:
                     secret=self.secret,
                     algorithm=self.algorithm,
                     kid=self.kid,
+                    claims=token_claims or None,
                 )
             except TokenRotationError:
                 raise HTTPException(status_code=401, detail="Invalid token") from None
