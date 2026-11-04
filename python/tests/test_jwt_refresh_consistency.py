@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -146,3 +147,93 @@ async def test_logout_views_reject_invalid_versions(endpoint, version):
     assert exc.value.status_code == 401
     assert await store.get_user_version("user-1") == 0
     assert not await store.is_family_revoked(claims["fam"])
+
+
+@pytest.mark.asyncio
+async def test_session_cap_remains_absolute_after_slow_store_read(monkeypatch):
+    """Store latency must not move access expiry past the origin-session cap."""
+    clock = [1_800_000_000]
+    monkeypatch.setattr(tokens, "time", SimpleNamespace(time=lambda: clock[0]))
+    pair = create_token_pair("slow-user", secret=SECRET, oat=clock[0] - 90, refresh_ttl=120)
+    session_cap = pair.refresh_claims["oat"] + 100
+
+    class SlowStore(InMemoryRevocation):
+        async def get_user_version(self, user_id):
+            clock[0] += 5
+            return await super().get_user_version(user_id)
+
+    rotated = await rotate_refresh_token(
+        pair.refresh_claims,
+        store=SlowStore(),
+        secret=SECRET,
+        access_ttl=900,
+        refresh_ttl=120,
+        max_session_lifetime=100,
+    )
+    assert rotated.access_claims["exp"] <= session_cap
+    decoded = tokens.jwt.decode(
+        rotated.access_token,
+        SECRET,
+        algorithms=["HS256"],
+        options={"verify_exp": False, "verify_iat": False, "verify_nbf": False},
+    )
+    assert decoded["exp"] == rotated.access_claims["exp"]
+    assert decoded["exp"] <= session_cap
+
+
+@pytest.mark.asyncio
+async def test_expired_session_during_store_read_does_not_consume_refresh(monkeypatch):
+    """Fail closed before consume() when the session expires during a slow read."""
+    clock = [1_800_000_000]
+    monkeypatch.setattr(tokens, "time", SimpleNamespace(time=lambda: clock[0]))
+    pair = create_token_pair("expired-during-read", secret=SECRET)
+
+    class SlowStore(InMemoryRevocation):
+        async def get_user_version(self, user_id):
+            clock[0] += 6
+            return await super().get_user_version(user_id)
+
+    store = SlowStore()
+    with pytest.raises(TokenRotationError, match="maximum lifetime"):
+        await rotate_refresh_token(
+            pair.refresh_claims,
+            store=store,
+            secret=SECRET,
+            max_session_lifetime=5,
+        )
+    assert not await store.is_revoked(pair.refresh_claims["jti"])
+
+
+@pytest.mark.asyncio
+async def test_reuse_marker_deadline_is_measured_after_delayed_failure(monkeypatch):
+    """A late replay failure must cover successors from overlapping rotation."""
+    clock = [1_800_000_000]
+    monkeypatch.setattr(tokens, "time", SimpleNamespace(time=lambda: clock[0]))
+    ttl = 120
+    leeway = 60
+    pair = create_token_pair("replay-user", secret=SECRET, refresh_ttl=ttl)
+
+    class DelayedReplayStore(InMemoryRevocation):
+        def __init__(self):
+            super().__init__()
+            self.family_exp = None
+
+        async def consume(self, jti, *, exp=None):
+            clock[0] += 30
+            return False
+
+        async def revoke_family(self, fam, *, exp=None):
+            self.family_exp = exp
+            await super().revoke_family(fam, exp=exp)
+
+    store = DelayedReplayStore()
+    with pytest.raises(TokenRotationError, match="already used"):
+        await rotate_refresh_token(
+            pair.refresh_claims,
+            store=store,
+            secret=SECRET,
+            refresh_ttl=ttl,
+            leeway=leeway,
+        )
+    assert store.family_exp >= clock[0] + ttl + leeway
+    assert await store.is_family_revoked(pair.refresh_claims["fam"])

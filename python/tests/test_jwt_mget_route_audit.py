@@ -14,7 +14,13 @@ import pytest
 from django.core.cache.backends.redis import RedisCache
 from django.test import override_settings
 
-from django_bolt.auth import DjangoCacheRevocation, JWTAuthViews, create_token_pair
+from django_bolt.auth import (
+    DjangoCacheRevocation,
+    JWTAuthViews,
+    TokenRotationError,
+    create_token_pair,
+    rotate_refresh_token,
+)
 from django_bolt.exceptions import HTTPException
 
 pytestmark = pytest.mark.django_db
@@ -325,4 +331,49 @@ def test_inherited_rediscache_reads_primary_and_batches(monkeypatch):
             assert calls == [True]
         finally:
             client.delete(*keys)
+            cache.close()
+
+
+class _CustomUnderlyingStateReader(DjangoCacheRevocation):
+    def _get_revocation_state(self, key):
+        if ":fam:" in key:
+            return "revoked-by-custom-reader"
+        return super()._get_revocation_state(key)
+
+
+@pytest.mark.parametrize("endpoint", ["/auth/logout", "/auth/logout-all", "/auth/refresh"])
+def test_custom_underlying_revocation_reader_is_not_bypassed(endpoint):
+    """Custom lower-level revocation policy must bypass both MGET and Lua."""
+    pytest.importorskip("redis")
+    with override_settings(CACHES=_settings()):
+        store = _CustomUnderlyingStateReader(key_prefix=f"custom-underlying:{uuid.uuid4().hex}:")
+        cache = store.cache
+        client = cache._cache.get_client(write=True)
+        try:
+            client.ping()
+        except Exception as exc:
+            pytest.skip(f"Test Redis unavailable: {exc}")
+
+        user_id = "custom-underlying-policy-user"
+        claims = create_token_pair(user_id, secret=SECRET).refresh_claims
+        fam_key = cache.make_and_validate_key(f"{store.key_prefix}fam:{claims['fam']}")
+        ver_key = cache.make_and_validate_key(f"{store.key_prefix}ver:{user_id}")
+        jti_key = cache.make_and_validate_key(f"{store.key_prefix}{claims['jti']}")
+        try:
+            assert asyncio.run(store.get_refresh_state(claims["jti"], claims["fam"], user_id)) is None
+            assert asyncio.run(store.is_family_revoked(claims["fam"])) is True
+            if endpoint == "/auth/refresh":
+                with pytest.raises(TokenRotationError, match="family revoked"):
+                    asyncio.run(rotate_refresh_token(claims, store=store, secret=SECRET))
+            else:
+                routes = _Routes()
+                JWTAuthViews(store=store, secret=SECRET).register(routes)
+                with pytest.raises(HTTPException) as error:
+                    asyncio.run(routes.handlers[endpoint]({"context": {"auth_claims": claims, "user_id": user_id}}))
+                assert error.value.status_code == 401
+            assert client.get(fam_key) is None
+            assert client.get(ver_key) is None
+            assert client.get(jti_key) is None
+        finally:
+            client.delete(fam_key, ver_key, jti_key)
             cache.close()

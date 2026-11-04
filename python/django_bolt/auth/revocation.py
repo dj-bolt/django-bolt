@@ -365,7 +365,7 @@ class DjangoCacheRevocation(RevocationStore):
         # Do not bypass those policies with the optimized Redis read path.
         if any(
             getattr(getattr(self, name), "__func__", None) is not getattr(DjangoCacheRevocation, name)
-            for name in ("is_revoked", "is_family_revoked", "get_user_version")
+            for name in ("_get_revocation_state", "is_revoked", "is_family_revoked", "get_user_version")
         ):
             return None
 

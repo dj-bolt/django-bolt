@@ -288,6 +288,9 @@ async def rotate_refresh_token(
     if token_version != version:
         raise TokenRotationError("Refresh token version does not match current version")
 
+    if max_session_lifetime is not None and int(time.time()) >= parsed_oat + max_session_lifetime:
+        raise TokenRotationError("Session exceeded maximum lifetime")
+
     token_exp: int | None = None
     if rotate:
         try:
@@ -305,9 +308,10 @@ async def rotate_refresh_token(
         # family so the legitimate holder's chain dies too (reuse detection).
         if fam is not None:
             # The marker must outlive every descendant, not just this replayed
-            # token: a descendant minted from a later rotation can expire up to
-            # refresh_ttl from now, so retain the marker at least that long.
-            family_exp = max(now + refresh_ttl + leeway, consume_exp or 0)
+            # token: a descendant minted by a competing rotation can expire
+            # up to refresh_ttl after this replay is detected.
+            replay_detected_at = int(time.time())
+            family_exp = max(replay_detected_at + refresh_ttl + leeway, consume_exp or 0)
             await _revoke_family(store, fam, exp=family_exp)
         raise TokenRotationError("Refresh token revoked or already used")
 
@@ -356,6 +360,13 @@ async def rotate_refresh_token(
         version=version,
         oat=parsed_oat,
     )
+    if max_session_lifetime is not None:
+        session_expires_at = parsed_oat + max_session_lifetime
+        if pair.access_claims["iat"] >= session_expires_at:
+            raise TokenRotationError("Session exceeded maximum lifetime")
+        if pair.access_claims["exp"] > session_expires_at:
+            pair.access_claims["exp"] = session_expires_at
+            pair.access_token = jwt.encode(pair.access_claims, key, algorithm=algorithm, headers=headers)
     if fam is not None:
         pair.refresh_claims["fam"] = fam
         # A concurrent logout retains the family marker from its own time.
