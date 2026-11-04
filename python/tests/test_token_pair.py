@@ -700,7 +700,7 @@ class TestRotationDetails:
         with pytest.raises(TokenRotationError):
             await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, refresh_ttl=1000)
 
-        assert recorded["exp"] == pair.refresh_claims["exp"]
+        assert recorded["exp"] == pair.refresh_claims["exp"] + 60
 
 
 class TestRotationRejections:

@@ -186,3 +186,66 @@ def test_default_login_checks_the_django_user(settings):
     # The login passes the request of the client to Django, for backends that read it.
     assert len(recorded_requests) == 1
     assert recorded_requests[0] is not None
+
+
+ISSUER = "https://auth.example.com"
+AUDIENCE = "erp-api"
+
+
+@pytest.mark.parametrize(
+    ("issuer", "audience"),
+    [(ISSUER, AUDIENCE), (ISSUER, None), (None, AUDIENCE)],
+)
+def test_views_issue_and_rotate_scoped_refresh_tokens(issuer, audience):
+    with TestClient(_views_api(issuer=issuer, audience=audience, secure_cookies=False)) as client:
+        assert client.post("/auth/login", json=LOGIN).status_code == 200
+        original = jwt.decode(
+            client.cookies.get("refresh_token"),
+            SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+        assert original.get("iss") == issuer
+        assert original.get("aud") == audience
+
+        assert client.post("/auth/refresh", headers=NO_CSRF_ORIGIN).status_code == 200
+        rotated = jwt.decode(
+            client.cookies.get("refresh_token"),
+            SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+        assert rotated.get("iss") == issuer
+        assert rotated.get("aud") == audience
+        assert rotated["fam"] == original["fam"]
+        assert rotated["jti"] != original["jti"]
+        assert client.post("/auth/logout", headers=NO_CSRF_ORIGIN).status_code == 200
+
+
+@pytest.mark.parametrize("endpoint", ["/auth/refresh", "/auth/logout", "/auth/logout-all"])
+@pytest.mark.parametrize(
+    ("claim", "replacement"),
+    [("iss", None), ("iss", "https://other.example.com"), ("aud", None), ("aud", "other-api")],
+)
+def test_views_reject_wrong_or_missing_refresh_scope(endpoint, claim, replacement):
+    """Reject refresh credentials with missing or incorrect scope claims."""
+    api = _views_api(issuer=ISSUER, audience=AUDIENCE, secure_cookies=False)
+    with TestClient(api) as client:
+        assert client.post("/auth/login", json=LOGIN).status_code == 200
+        valid_token = client.cookies.get("refresh_token")
+        payload = jwt.decode(valid_token, SECRET, algorithms=["HS256"], issuer=ISSUER, audience=AUDIENCE)
+        if replacement is None:
+            payload.pop(claim)
+        else:
+            payload[claim] = replacement
+        invalid_token = jwt.encode(payload, SECRET, algorithm="HS256")
+
+        with TestClient(api) as other_client:
+            response = other_client.post(
+                endpoint,
+                headers={**NO_CSRF_ORIGIN, "Cookie": f"refresh_token={invalid_token}"},
+            )
+            assert response.status_code == 401
+
+        # A rejected request must not consume or invalidate the valid session.
+        assert client.post("/auth/refresh", headers=NO_CSRF_ORIGIN).status_code == 200

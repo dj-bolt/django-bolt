@@ -213,6 +213,9 @@ async def rotate_refresh_token(
     callers should return a uniform 401 to avoid an oracle).
     """
     _check_reserved(claims)
+    # Capture time before awaiting a store: a concurrent logout must retain
+    # its family marker through this request's replacement token expiry.
+    now = int(time.time())
     jti = refresh_claims.get("jti")
     if not isinstance(jti, str) or not jti:
         raise TokenRotationError("Refresh token missing jti")
@@ -220,21 +223,8 @@ async def rotate_refresh_token(
     fam = refresh_claims.get("fam")
     if rotate and (not isinstance(fam, str) or not fam):
         raise TokenRotationError("Rotating refresh token missing family id")
-    # A revoked family blocks both modes: family revocation is the "kill this
-    # session" switch, and a reusable (Mode B) token must not outlive it.
-    if isinstance(fam, str) and fam and await _is_family_revoked(store, fam):
-        raise TokenRotationError("Refresh token family revoked")
-
-    now = int(time.time())
     if leeway < 0:
         raise ValueError("leeway must be >= 0")
-
-    # Mode B deliberately keeps the refresh token reusable, so it checks only
-    # revocation state (jti here, family above). Mode A consumes atomically
-    # below, immediately before minting, after all other validation has
-    # succeeded.
-    if not rotate and await store.is_revoked(jti):
-        raise TokenRotationError("Refresh token revoked")
 
     user_id = refresh_claims.get("sub")
     if not isinstance(user_id, str) or not user_id:
@@ -266,16 +256,40 @@ async def rotate_refresh_token(
         # so clamp the new one to the session's remaining lifetime.
         effective_access_ttl = min(access_ttl, remaining_session)
 
-    version = await _user_version(store, user_id)
-    try:
-        token_version = int(refresh_claims.get("ver", 0))
-    except (TypeError, ValueError) as exc:
-        raise TokenRotationError("Refresh token has invalid version") from exc
+    token_version = refresh_claims.get("ver", 0)
+    if type(token_version) is not int or token_version < 0:
+        raise TokenRotationError("Refresh token has invalid version")
+
+    # Redis can obtain JTI/family/version together from the write primary.
+    # The optional capability returns None for other/custom backends.
+    batch_reader = getattr(store, "get_refresh_state", None)
+    state = (
+        await batch_reader(jti, fam if isinstance(fam, str) and fam else None, user_id)
+        if callable(batch_reader)
+        else None
+    )
+    if state is None:
+        if isinstance(fam, str) and fam and await _is_family_revoked(store, fam):
+            raise TokenRotationError("Refresh token family revoked")
+        if not rotate and await store.is_revoked(jti):
+            raise TokenRotationError("Refresh token revoked")
+        version = await _user_version(store, user_id)
+    else:
+        jti_revoked, family_revoked, version = state
+        if family_revoked:
+            raise TokenRotationError("Refresh token family revoked")
+        # For full rotation, let atomic consume() detect replay and burn the
+        # family. A read-only JTI rejection would silently skip reuse detection.
+        if not rotate and jti_revoked:
+            raise TokenRotationError("Refresh token revoked")
 
     # Require equality, not merely "not stale": a token from an ahead or
     # inconsistent version store must not survive later logout bumps.
     if token_version != version:
         raise TokenRotationError("Refresh token version does not match current version")
+
+    if max_session_lifetime is not None and int(time.time()) >= parsed_oat + max_session_lifetime:
+        raise TokenRotationError("Session exceeded maximum lifetime")
 
     token_exp: int | None = None
     if rotate:
@@ -288,15 +302,16 @@ async def rotate_refresh_token(
     # the consumed marker for that same window or a near-expiry token could be
     # replayed after its marker disappeared but while signature validation
     # still accepts it.
-    consume_exp = None if token_exp is None else max(token_exp, now + leeway)
+    consume_exp = None if token_exp is None else max(token_exp, now) + leeway
     if rotate and not await _consume(store, jti, exp=consume_exp):
         # A revoked-but-presented token under rotation is a replay: burn the
         # family so the legitimate holder's chain dies too (reuse detection).
         if fam is not None:
             # The marker must outlive every descendant, not just this replayed
-            # token: a descendant minted from a later rotation can expire up to
-            # refresh_ttl from now, so retain the marker at least that long.
-            family_exp = max(now + refresh_ttl, consume_exp or 0)
+            # token: a descendant minted by a competing rotation can expire
+            # up to refresh_ttl after this replay is detected.
+            replay_detected_at = int(time.time())
+            family_exp = max(replay_detected_at + refresh_ttl + leeway, consume_exp or 0)
             await _revoke_family(store, fam, exp=family_exp)
         raise TokenRotationError("Refresh token revoked or already used")
 
@@ -345,8 +360,18 @@ async def rotate_refresh_token(
         version=version,
         oat=parsed_oat,
     )
+    if max_session_lifetime is not None:
+        session_expires_at = parsed_oat + max_session_lifetime
+        if pair.access_claims["iat"] >= session_expires_at:
+            raise TokenRotationError("Session exceeded maximum lifetime")
+        if pair.access_claims["exp"] > session_expires_at:
+            pair.access_claims["exp"] = session_expires_at
+            pair.access_token = jwt.encode(pair.access_claims, key, algorithm=algorithm, headers=headers)
     if fam is not None:
         pair.refresh_claims["fam"] = fam
+        # A concurrent logout retains the family marker from its own time.
+        # Do not let a slow in-flight rotation extend the refresh expiry.
+        pair.refresh_claims["exp"] = min(pair.refresh_claims["exp"], now + refresh_ttl)
         pair.refresh_token = jwt.encode(pair.refresh_claims, key, algorithm=algorithm, headers=headers)
     return pair
 
