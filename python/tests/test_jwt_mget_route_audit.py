@@ -69,38 +69,54 @@ def test_each_logout_uses_one_primary_mget_and_no_individual_get(monkeypatch, en
     with override_settings(CACHES=_settings()):
         backend, original_client, routes, request, keys = _setup()
         get_client = backend.get_client
-        calls = {"mget": 0, "get": 0, "primary_mget": 0}
+        calls = {
+            "mget": 0,
+            "get": 0,
+            "evalsha": 0,
+            "eval": 0,
+            "primary_mget": 0,
+            "primary_evalsha": 0,
+            "primary_eval": 0,
+        }
+        tracked = set()
 
         def tracked_factory(*args, **kwargs):
             client = get_client(*args, **kwargs)
-            real_mget = client.mget
-            real_get = client.get
+            if id(client) in tracked:
+                return client
+            tracked.add(id(client))
+            write = kwargs.get("write") is True
 
-            def tracked_mget(*margs, **mkwargs):
-                calls["mget"] += 1
-                calls["primary_mget"] += kwargs.get("write") is True
-                return real_mget(*margs, **mkwargs)
+            def wrap(method, name):
+                def counted(*items, **opts):
+                    calls[name] += 1
+                    if write and name in ("mget", "evalsha", "eval"):
+                        calls[f"primary_{name}"] += 1
+                    return method(*items, **opts)
 
-            def tracked_get(*gargs, **gkwargs):
-                calls["get"] += 1
-                return real_get(*gargs, **gkwargs)
+                return counted
 
-            monkeypatch.setattr(client, "mget", tracked_mget)
-            monkeypatch.setattr(client, "get", tracked_get)
+            for name in ("mget", "get", "evalsha", "eval"):
+                monkeypatch.setattr(client, name, wrap(getattr(client, name), name))
             return client
 
         try:
             monkeypatch.setattr(backend, "get_client", tracked_factory)
             response = asyncio.run(routes.handlers[endpoint](request))
             assert response.status_code == 200
-            assert calls == {"mget": 1, "get": 0, "primary_mget": 1}
-
-            # Direct checks using the originally acquired client (unpatched),
-            # without influencing the Redis request counters.
+            assert calls["get"] == 0
             if endpoint == "/auth/logout":
+                # The MGET is now run inside server-side Lua, not via redis-py mget().
+                assert calls["mget"] == 0
+                assert calls["evalsha"] >= 1  # First call may retry NOSCRIPT.
+                assert calls["primary_evalsha"] >= 1
                 assert original_client.get(keys[0]) is not None
                 assert original_client.get(keys[1]) is None
             else:
+                assert calls["mget"] == 1
+                assert calls["primary_mget"] == 1
+                assert calls["eval"] == 1
+                assert calls["primary_eval"] == 1
                 assert original_client.get(keys[0]) is None
                 version_raw = original_client.get(keys[1])
                 assert backend._serializer.loads(version_raw) == 1
@@ -121,15 +137,19 @@ def test_mget_failure_never_performs_logout_mutation(monkeypatch, endpoint):
                 def unavailable(*_args, **_kwargs):
                     raise RuntimeError("simulated security read outage")
 
-                monkeypatch.setattr(client, "mget", unavailable)
+                # Logout uses Lua evalsha; logout-all still uses direct MGET.
+                if endpoint == "/auth/logout":
+                    monkeypatch.setattr(client, "evalsha", unavailable)
+                else:
+                    monkeypatch.setattr(client, "mget", unavailable)
             return client
 
         try:
             monkeypatch.setattr(backend, "get_client", failing_factory)
             with pytest.raises(RuntimeError, match="simulated security read outage"):
                 asyncio.run(routes.handlers[endpoint](request))
-            assert original_client.get(keys[0]) is None  # Family not revoked.
-            assert original_client.get(keys[1]) is None  # Version not bumped.
+            assert original_client.get(keys[0]) is None
+            assert original_client.get(keys[1]) is None
         finally:
             original_client.delete(*keys)
 
@@ -262,4 +282,47 @@ def test_custom_rediscache_get_policy_is_not_bypassed(endpoint):
             assert client.get(ver_key) is None
         finally:
             client.delete(fam_key, ver_key, jti_key)
+            cache.close()
+
+
+class _InheritedRedisCache(RedisCache):
+    pass
+
+
+def test_inherited_rediscache_reads_primary_and_batches(monkeypatch):
+    pytest.importorskip("redis")
+    settings = _settings()
+    settings["default"]["BACKEND"] = f"{__name__}._InheritedRedisCache"
+    with override_settings(CACHES=settings):
+        store = DjangoCacheRevocation(key_prefix=f"mget-subclass:{uuid.uuid4().hex}:")
+        cache = store.cache
+        backend = cache._cache
+        client = backend.get_client(write=True)
+        try:
+            client.ping()
+        except Exception as exc:
+            pytest.skip(f"Test Redis unavailable: {exc}")
+        pair = create_token_pair("subclass-user", secret=SECRET)
+        calls = []
+        original_get_client = backend.get_client
+
+        def tracking_client(*args, **kwargs):
+            calls.append(kwargs.get("write"))
+            return original_get_client(*args, **kwargs)
+
+        monkeypatch.setattr(backend, "get_client", tracking_client)
+        prefix = store.key_prefix
+        keys = [
+            cache.make_and_validate_key(f"{prefix}{pair.refresh_claims['jti']}"),
+            cache.make_and_validate_key(f"{prefix}fam:{pair.refresh_claims['fam']}"),
+            cache.make_and_validate_key(f"{prefix}ver:subclass-user"),
+        ]
+        try:
+            state = asyncio.run(
+                store.get_refresh_state(pair.refresh_claims["jti"], pair.refresh_claims["fam"], "subclass-user")
+            )
+            assert state == (False, False, 0)
+            assert calls == [True]
+        finally:
+            client.delete(*keys)
             cache.close()

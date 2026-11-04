@@ -213,6 +213,9 @@ async def rotate_refresh_token(
     callers should return a uniform 401 to avoid an oracle).
     """
     _check_reserved(claims)
+    # Capture time before awaiting a store: a concurrent logout must retain
+    # its family marker through this request's replacement token expiry.
+    now = int(time.time())
     jti = refresh_claims.get("jti")
     if not isinstance(jti, str) or not jti:
         raise TokenRotationError("Refresh token missing jti")
@@ -220,21 +223,8 @@ async def rotate_refresh_token(
     fam = refresh_claims.get("fam")
     if rotate and (not isinstance(fam, str) or not fam):
         raise TokenRotationError("Rotating refresh token missing family id")
-    # A revoked family blocks both modes: family revocation is the "kill this
-    # session" switch, and a reusable (Mode B) token must not outlive it.
-    if isinstance(fam, str) and fam and await _is_family_revoked(store, fam):
-        raise TokenRotationError("Refresh token family revoked")
-
-    now = int(time.time())
     if leeway < 0:
         raise ValueError("leeway must be >= 0")
-
-    # Mode B deliberately keeps the refresh token reusable, so it checks only
-    # revocation state (jti here, family above). Mode A consumes atomically
-    # below, immediately before minting, after all other validation has
-    # succeeded.
-    if not rotate and await store.is_revoked(jti):
-        raise TokenRotationError("Refresh token revoked")
 
     user_id = refresh_claims.get("sub")
     if not isinstance(user_id, str) or not user_id:
@@ -266,11 +256,32 @@ async def rotate_refresh_token(
         # so clamp the new one to the session's remaining lifetime.
         effective_access_ttl = min(access_ttl, remaining_session)
 
-    version = await _user_version(store, user_id)
-    try:
-        token_version = int(refresh_claims.get("ver", 0))
-    except (TypeError, ValueError) as exc:
-        raise TokenRotationError("Refresh token has invalid version") from exc
+    token_version = refresh_claims.get("ver", 0)
+    if type(token_version) is not int or token_version < 0:
+        raise TokenRotationError("Refresh token has invalid version")
+
+    # Redis can obtain JTI/family/version together from the write primary.
+    # The optional capability returns None for other/custom backends.
+    batch_reader = getattr(store, "get_refresh_state", None)
+    state = (
+        await batch_reader(jti, fam if isinstance(fam, str) and fam else None, user_id)
+        if callable(batch_reader)
+        else None
+    )
+    if state is None:
+        if isinstance(fam, str) and fam and await _is_family_revoked(store, fam):
+            raise TokenRotationError("Refresh token family revoked")
+        if not rotate and await store.is_revoked(jti):
+            raise TokenRotationError("Refresh token revoked")
+        version = await _user_version(store, user_id)
+    else:
+        jti_revoked, family_revoked, version = state
+        if family_revoked:
+            raise TokenRotationError("Refresh token family revoked")
+        # For full rotation, let atomic consume() detect replay and burn the
+        # family. A read-only JTI rejection would silently skip reuse detection.
+        if not rotate and jti_revoked:
+            raise TokenRotationError("Refresh token revoked")
 
     # Require equality, not merely "not stale": a token from an ahead or
     # inconsistent version store must not survive later logout bumps.
@@ -347,6 +358,9 @@ async def rotate_refresh_token(
     )
     if fam is not None:
         pair.refresh_claims["fam"] = fam
+        # A concurrent logout retains the family marker from its own time.
+        # Do not let a slow in-flight rotation extend the refresh expiry.
+        pair.refresh_claims["exp"] = min(pair.refresh_claims["exp"], now + refresh_ttl)
         pair.refresh_token = jwt.encode(pair.refresh_claims, key, algorithm=algorithm, headers=headers)
     return pair
 

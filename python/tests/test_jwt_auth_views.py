@@ -187,6 +187,7 @@ def test_default_login_checks_the_django_user(settings):
     assert len(recorded_requests) == 1
     assert recorded_requests[0] is not None
 
+
 ISSUER = "https://auth.example.com"
 AUDIENCE = "erp-api"
 

@@ -91,10 +91,9 @@ class JWTAuthViews:
         if not isinstance(fam, str) or not fam:
             raise HTTPException(status_code=401, detail="Invalid token")
 
-        try:
-            version = int(claims.get("ver", 0))
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=401, detail="Invalid token") from None
+        version = claims.get("ver", 0)
+        if type(version) is not int or version < 0:
+            raise HTTPException(status_code=401, detail="Invalid token")
 
         user_id = request["context"]["user_id"]
         batch_reader = getattr(self.store, "get_refresh_state", None)
@@ -189,19 +188,39 @@ class JWTAuthViews:
             summary="Log out",
         )
         async def logout(request: Any):
-            claims = await self._require_active_refresh(request)
+            claims = request["context"]["auth_claims"]
+            jti = claims.get("jti")
             fam = claims.get("fam")
-            if not isinstance(fam, str) or not fam:
+            version = claims.get("ver", 0)
+            if (
+                not isinstance(jti, str)
+                or not jti
+                or not isinstance(fam, str)
+                or not fam
+                or type(version) is not int
+                or version < 0
+            ):
                 raise HTTPException(status_code=401, detail="Invalid token")
-            # The refresh validator accepts a token for `leeway` seconds
-            # beyond `exp`. A refresh already in flight can also issue a
-            # descendant that expires later than the logging-out token.
-            # Keep the family block for the full possible successor lifetime.
             try:
                 token_exp = int(claims["exp"]) if claims.get("exp") is not None else 0
             except (TypeError, ValueError):
                 raise HTTPException(status_code=401, detail="Invalid token") from None
+            # Cover JWT leeway and descendants created by refresh requests in flight.
             expires_at = max(token_exp, int(time.time()) + DEFAULT_REFRESH_TTL) + refresh_auth.leeway
+
+            atomic_logout = getattr(self.store, "revoke_family_if_active", None)
+            if (
+                atomic_logout is not None
+                and getattr(self._require_active_refresh, "__func__", None) is JWTAuthViews._require_active_refresh
+            ):
+                result = await atomic_logout(jti, fam, request["context"]["user_id"], version, exp=expires_at)
+                if result is not None:
+                    if not result:
+                        raise HTTPException(status_code=401, detail="Invalid token")
+                    return self._clear_cookies(JSON({"ok": True}))
+
+            # Custom stores and custom cache policies keep the original path.
+            await self._require_active_refresh(request)
             await self.store.revoke_family(fam, exp=expires_at)
             return self._clear_cookies(JSON({"ok": True}))
 
@@ -216,7 +235,7 @@ class JWTAuthViews:
             claims = await self._require_active_refresh(request)
             try:
                 updated = await self.store.bump_user_version_if_current(
-                    request["context"]["user_id"], int(claims.get("ver", 0))
+                    request["context"]["user_id"], claims.get("ver", 0)
                 )
             except (AttributeError, NotImplementedError) as exc:
                 raise HTTPException(status_code=503, detail="Atomic global logout unavailable") from exc

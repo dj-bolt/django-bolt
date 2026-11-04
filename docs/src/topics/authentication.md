@@ -407,6 +407,28 @@ rotated tokens and required on `/auth/refresh`, `/auth/logout`, and
 configure the same values on any separate `JWTAuthentication` backends that
 verify these tokens. With neither option set, the default behavior is unchanged.
 
+Refresh revocation state is read from the Redis **primary**, not replicas,
+which may lag revocation writes. On the built-in RedisCache backend, refresh
+checks use one primary `MGET` when supported. Refresh rotation still consumes
+the JTI atomically.
+
+On the built-in Redis backend, `/auth/logout` uses an atomic Lua script to
+check JTI, family, and user version before revoking the family. Custom
+revocation stores and cache backends with overridden `get()` or `set()`
+methods retain their existing behavior.
+
+JWT `ver` must be a non-negative integer when present. Legacy signed refresh
+tokens without `ver` use version `0` and become invalid when the stored user
+version advances, for example after `/auth/logout-all`.
+
+Rotation caps replacement refresh-token expiry at request start plus its
+configured lifetime, keeping concurrent logout family markers effective
+through expiry plus validation leeway.
+
+Redis deployments must prevent eviction of revocation/version keys and
+configure suitable persistence and failover. Reading the primary cannot
+restore security state lost during failover.
+
 !!! warning "JWTAuthViews requires a versioned, atomic revocation store"
 
     For its cookie lifecycle, `JWTAuthViews` uses atomic refresh-token

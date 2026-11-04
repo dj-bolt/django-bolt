@@ -32,6 +32,22 @@ return 0
 """
 
 
+# Redis Primary-only atomic JWT Logout. Keep every check in one short script.
+# Keys: revoked JTI, revoked family, user version. The family key is written
+# only after all three conditions pass. ARGV[2] is Django's serialized "1".
+_REDIS_REVOKE_ACTIVE_FAMILY = """
+local state = redis.call('MGET', KEYS[1], KEYS[2], KEYS[3])
+if state[1] ~= false or state[2] ~= false then
+    return 0
+end
+if (state[3] or '0') ~= ARGV[1] then
+    return 0
+end
+redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+return 1
+"""
+
+
 def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS) -> int:
     """
     Seconds a revocation entry should live.
@@ -325,9 +341,8 @@ class DjangoCacheRevocation(RevocationStore):
         reused. Preserve the backend's configured serializer and cache key.
         """
         cache = self.cache
-        # A custom RedisCache may override get() with extra revocation policy.
-        # Bypass replica routing only for the unmodified built-in backend.
-        if cache.__class__ is RedisCache:
+        # Inherited RedisCache.get is safe to bypass; a custom get() is not.
+        if isinstance(cache, RedisCache) and type(cache).get is RedisCache.get:
             cache_key = cache.make_and_validate_key(key)
             backend = cache._cache
             raw = backend.get_client(cache_key, write=True).get(cache_key)
@@ -342,9 +357,8 @@ class DjangoCacheRevocation(RevocationStore):
         optional store capability, not a new RevocationStore requirement.
         """
         cache = self.cache
-        # Custom RedisCache subclasses may override get() with security policy;
-        # fall back to the public checks rather than bypassing those readers.
-        if cache.__class__ is not RedisCache:
+        # Respect custom get() overrides; inherited readers use primary MGET.
+        if not (isinstance(cache, RedisCache) and type(cache).get is RedisCache.get):
             return None
 
         # A custom store may override individual revocation/version checks.
@@ -469,6 +483,60 @@ class DjangoCacheRevocation(RevocationStore):
         key = cache.make_key(version_key)
         client = cache._cache.get_client(key, write=True)
         return bool(client.eval(_REDIS_COMPARE_AND_BUMP, 1, key, str(expected_version)))
+
+    async def revoke_family_if_active(
+        self,
+        jti: str,
+        fam: str,
+        user_id: str,
+        expected_version: int,
+        *,
+        exp: int | None = None,
+    ) -> bool | None:
+        """Atomically verify and revoke on standard Redis; None requests fallback.
+
+        Never bypass custom store readers/writers or custom RedisCache get/set.
+        The read and write use the same Redis primary, with no race between them.
+        """
+        cache = self.cache
+        if not isinstance(cache, RedisCache):
+            return None
+        if (
+            getattr(cache.get, "__func__", None) is not RedisCache.get
+            or getattr(cache.set, "__func__", None) is not RedisCache.set
+        ):
+            return None
+        for name in (
+            "_get_revocation_state",
+            "get_refresh_state",
+            "is_revoked",
+            "is_family_revoked",
+            "get_user_version",
+            "revoke_family",
+        ):
+            if getattr(getattr(self, name), "__func__", None) is not getattr(DjangoCacheRevocation, name):
+                return None
+        if not jti or not fam or type(expected_version) is not int or expected_version < 0:
+            raise ValueError("Invalid atomic JWT logout input")
+        ttl = _ttl_for(exp, self.default_ttl)
+        if ttl <= 0:
+            raise ValueError("Atomic JWT logout requires positive marker TTL")
+
+        keys = [
+            cache.make_and_validate_key(f"{self.key_prefix}{jti}"),
+            cache.make_and_validate_key(f"{self.key_prefix}fam:{fam}"),
+            cache.make_and_validate_key(f"{self.key_prefix}ver:{user_id}"),
+        ]
+        backend = cache._cache
+        client = backend.get_client(keys[0], write=True)
+        script = getattr(self, "_jwt_logout_script", None)
+        if script is None:
+            script = client.register_script(_REDIS_REVOKE_ACTIVE_FAMILY)
+            self._jwt_logout_script = script
+        # RedisCache.set() pickles strings. A raw '1' would violate that contract.
+        marker = backend._serializer.dumps("1")
+        # redis-py Script handles NOSCRIPT by loading and retrying after failover.
+        return bool(script(keys=keys, args=[str(expected_version), marker, ttl], client=client))
 
     async def revoke_family(self, fam: str, *, exp: int | None = None) -> None:
         key = f"{self.key_prefix}fam:{fam}"
