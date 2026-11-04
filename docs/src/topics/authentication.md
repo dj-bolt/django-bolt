@@ -407,10 +407,10 @@ rotated tokens and required on `/auth/refresh`, `/auth/logout`, and
 configure the same values on any separate `JWTAuthentication` backends that
 verify these tokens. With neither option set, the default behavior is unchanged.
 
-Refresh checks read revocation state from the Redis **primary**, not replicas,
-which may lag revocation writes. On the built-in RedisCache backend, refresh
-checks use one primary `MGET` when supported. Refresh rotation still consumes
-the JTI atomically.
+On the built-in RedisCache backend, refresh checks read revocation state from
+the Redis **primary**, not replicas, which may lag revocation writes. A custom
+`get()` override controls its own read source. The built-in backend uses one
+primary `MGET` when supported. Refresh rotation still consumes the JTI atomically.
 
 On the built-in Redis backend, `/auth/logout` uses an atomic Lua script to
 check JTI, family, and user version before revoking the family. Custom
