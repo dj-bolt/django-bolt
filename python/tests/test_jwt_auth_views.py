@@ -228,6 +228,7 @@ def test_views_issue_and_rotate_scoped_refresh_tokens(issuer, audience):
     [("iss", None), ("iss", "https://other.example.com"), ("aud", None), ("aud", "other-api")],
 )
 def test_views_reject_wrong_or_missing_refresh_scope(endpoint, claim, replacement):
+    """Reject refresh credentials with missing or incorrect scope claims."""
     api = _views_api(issuer=ISSUER, audience=AUDIENCE, secure_cookies=False)
     with TestClient(api) as client:
         assert client.post("/auth/login", json=LOGIN).status_code == 200

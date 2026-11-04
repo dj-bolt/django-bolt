@@ -53,6 +53,7 @@ def _run(handler, claims):
 
 @pytest.fixture
 def live_redis():
+    """Provide an isolated local Redis backend for Lua integration tests."""
     pytest.importorskip("redis")
     url = os.environ.get("DJANGO_BOLT_TEST_REDIS_URL")
     if not url:
@@ -99,6 +100,7 @@ def _assert_invalid(handler, claims):
 @pytest.mark.parametrize("endpoint", ["/auth/logout", "/auth/logout-all"])
 @pytest.mark.parametrize("prebumped", [False, True])
 def test_legacy_missing_version_preserves_zero_semantics(live_redis, endpoint, prebumped):
+    """Treat missing token versions as zero, including after a version bump."""
     store, client = live_redis
     claims = create_token_pair("missing-version-user", secret=SECRET).refresh_claims
     claims.pop("ver")
@@ -142,6 +144,7 @@ def test_lua_success_uses_django_serializer_and_long_enough_ttl(live_redis):
 
 @pytest.mark.parametrize("revoked_state", ["jti", "family", "version"])
 def test_lua_rejects_each_invalid_state_before_writing(live_redis, revoked_state):
+    """Reject invalid JTI, family, and version state before mutation."""
     store, client = live_redis
     claims = create_token_pair("lua-blocked-user", secret=SECRET).refresh_claims
     jti_key, fam_key, ver_key = _keys(store, claims)
@@ -198,6 +201,7 @@ class RecordWriterStore(DjangoCacheRevocation):
 
 @pytest.mark.parametrize("cls", [DenyFamilyStore, RecordWriterStore])
 def test_custom_store_security_and_writer_are_not_bypassed(live_redis, cls):
+    """Respect custom revocation checks and writes outside the Lua fast path."""
     _store, client = live_redis
     store = cls(key_prefix=_store.key_prefix)
     claims = create_token_pair("custom-store-user", secret=SECRET).refresh_claims
@@ -223,6 +227,7 @@ def test_custom_store_security_and_writer_are_not_bypassed(live_redis, cls):
 
 class PolicyCache(RedisCache):
     def get(self, key, default=None, version=None):
+        """Apply the custom family-revocation policy on cache reads."""
         if ":fam:" in key:
             return "blocked by custom policy"
         return super().get(key, default=default, version=version)
@@ -235,6 +240,7 @@ class PolicyWriteCache(RedisCache):
 
 @pytest.mark.parametrize("backend", [PolicyCache, PolicyWriteCache])
 def test_custom_rediscache_get_or_set_policy_is_respected(live_redis, backend):
+    """Preserve custom RedisCache read and write policies during logout."""
     store, _client = live_redis
     # override_settings clears cached Django cache connections on exit.
     with override_settings(
@@ -288,6 +294,7 @@ def test_backend_script_failure_does_not_fall_back_to_insecure_write(monkeypatch
 
 
 def test_many_simultaneous_logouts_have_exactly_one_winner(live_redis):
+    """Ensure only one concurrent logout can revoke the active family."""
     store, client = live_redis
     claims = create_token_pair("same-session-user", secret=SECRET).refresh_claims
     handler = _handler(store)
@@ -295,6 +302,7 @@ def test_many_simultaneous_logouts_have_exactly_one_winner(live_redis):
     gate = Barrier(threads)
 
     def attempt():
+        """Attempt a competing logout and return its HTTP status."""
         gate.wait(timeout=10)
         try:
             _run(handler, claims)
@@ -310,6 +318,7 @@ def test_many_simultaneous_logouts_have_exactly_one_winner(live_redis):
 
 
 def test_logout_vs_logout_all_security_under_race(live_redis):
+    """Keep revocation state consistent when logout races logout-all."""
     store, client = live_redis
     logout = _handler(store, "/auth/logout")
     logout_all = _handler(store, "/auth/logout-all")
@@ -318,6 +327,7 @@ def test_logout_vs_logout_all_security_under_race(live_redis):
         gate = Barrier(2)
 
         def attempt(handler, *, gate=gate, claims=claims):
+            """Run one logout handler at the barrier and capture its status."""
             gate.wait(timeout=10)
             try:
                 _run(handler, claims)

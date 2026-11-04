@@ -56,6 +56,7 @@ class JWTAuthViews:
         secure_cookies: bool = True,
         credential_validator: CredentialValidator | None = None,
     ) -> None:
+        """Configure JWT auth routes, token options, and cookie settings."""
         self.store = store
         self.secret = secret
         self.algorithm = algorithm
@@ -129,6 +130,7 @@ class JWTAuthViews:
 
         @api.post(f"{self.prefix}/login", tags=["auth"], summary="Log in")
         async def login(request: Any, credentials: LoginCredentials):
+            """Validate credentials and issue a new pair of session cookies."""
             user = await self.credential_validator(request, credentials)
             if user is None or not getattr(user, "is_active", True):
                 raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -160,6 +162,7 @@ class JWTAuthViews:
             summary="Refresh tokens",
         )
         async def refresh(request: Any):
+            """Rotate the active refresh token and replace the session cookies."""
             try:
                 pair = await rotate_refresh_token(
                     request["context"]["auth_claims"],
@@ -188,6 +191,7 @@ class JWTAuthViews:
             summary="Log out",
         )
         async def logout(request: Any):
+            """Revoke an active refresh family without accepting stale tokens."""
             claims = request["context"]["auth_claims"]
             jti = claims.get("jti")
             fam = claims.get("fam")
@@ -232,6 +236,7 @@ class JWTAuthViews:
             summary="Log out everywhere",
         )
         async def logout_all(request: Any):
+            """Advance the user version only for an active refresh token."""
             claims = await self._require_active_refresh(request)
             try:
                 updated = await self.store.bump_user_version_if_current(

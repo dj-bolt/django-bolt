@@ -24,6 +24,7 @@ pytestmark = pytest.mark.django_db
 
 
 def test_redis_atomic_compare_and_bump_under_concurrent_clients():
+    """Allow only one conditional version bump during a Redis race."""
     pytest.importorskip("redis")
     url = os.environ.get("DJANGO_BOLT_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
     cache_conf = {

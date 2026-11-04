@@ -20,6 +20,7 @@ from django_bolt.auth.revocation import DjangoCacheRevocation
 
 
 def _require_local_memcached():
+    """Skip the integration test when local Memcached is unavailable."""
     pytest.importorskip("pymemcache")
     try:
         with socket.create_connection(("127.0.0.1", 11211), timeout=1):
@@ -30,6 +31,7 @@ def _require_local_memcached():
 
 @pytest.mark.parametrize("initial_version", [0, 1], ids=["missing-key", "existing-key-cas"])
 def test_memcached_compare_and_bump_under_concurrent_clients(initial_version):
+    """Verify that concurrent clients cannot both advance one version."""
     _require_local_memcached()
     with override_settings(
         CACHES={

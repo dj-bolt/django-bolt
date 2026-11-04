@@ -231,6 +231,7 @@ class InMemoryRevocation(RevocationStore):
         return new_version
 
     async def bump_user_version_if_current(self, user_id: str, expected_version: int) -> bool:
+        """Advance the user version only when the expected version matches."""
         # No await in this critical section. InMemoryRevocation is documented
         # for a single process/event loop, not distributed production workers.
         key = str(user_id)
@@ -423,6 +424,7 @@ class DjangoCacheRevocation(RevocationStore):
         return bool(self.cache.add(key, "1", timeout=_ttl_for(exp, self.default_ttl)))
 
     async def get_user_version(self, user_id: str) -> int:
+        """Read the current user version from the revocation cache."""
         return int(self._get_revocation_state(f"{self.key_prefix}ver:{user_id}") or 0)
 
     async def bump_user_version(self, user_id: str) -> int:

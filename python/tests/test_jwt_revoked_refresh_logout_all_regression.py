@@ -29,10 +29,12 @@ class TestUser:
 
 
 def make_api():
+    """Build the auth API with an isolated in-memory revocation store."""
     store = InMemoryRevocation()
     api = BoltAPI()
 
     async def validate(request, credentials):
+        """Accept only valid test credentials."""
         return TestUser() if credentials.username == "alice" and credentials.password == "correct" else None
 
     JWTAuthViews(
@@ -45,6 +47,7 @@ def make_api():
 
 
 def test_rotated_out_refresh_token_cannot_logout_all():
+    """Reject a consumed token before it can invalidate all sessions."""
     api, store = make_api()
     with TestClient(api) as client:
         assert client.post("/auth/login", json=LOGIN).status_code == 200
@@ -69,6 +72,7 @@ def test_rotated_out_refresh_token_cannot_logout_all():
 
 
 def test_old_refresh_after_global_logout_cannot_invalidate_new_login():
+    """Keep a new login active when an older token attempts logout-all."""
     api, store = make_api()
     with TestClient(api) as client:
         assert client.post("/auth/login", json=LOGIN).status_code == 200

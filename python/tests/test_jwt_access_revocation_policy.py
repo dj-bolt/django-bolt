@@ -39,6 +39,7 @@ def _strict_handler(store):
     """Application-defined opt-in policy; not a new framework default."""
 
     async def revoked(jti, claims):
+        """Reject revoked JTIs, invalid claims, or stale user versions."""
         if await store.is_revoked(jti):
             return True
         user_id = claims.get("sub")
@@ -51,9 +52,11 @@ def _strict_handler(store):
 
 
 def _api(store):
+    """Register auth routes against the supplied test revocation store."""
     api = BoltAPI()
 
     async def validate(_request, credentials):
+        """Accept only the test user's expected credentials."""
         return _User() if credentials.username == "alice" and credentials.password == "correct" else None
 
     JWTAuthViews(

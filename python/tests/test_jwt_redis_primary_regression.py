@@ -32,6 +32,7 @@ class _Routes:
 
 @pytest.mark.asyncio
 async def test_lagging_redis_replica_cannot_hide_revoked_jti_family_or_version():
+    """Keep write-primary state authoritative despite stale read-side data."""
     pytest.importorskip("redis")
     primary_url = os.environ.get("DJANGO_BOLT_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
     lagging_url = os.environ.get("DJANGO_BOLT_TEST_REDIS_STALE_URL", "redis://127.0.0.1:6379/1")

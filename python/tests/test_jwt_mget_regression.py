@@ -49,6 +49,7 @@ def _redis_settings(url):
 
 
 def _require_redis(store):
+    """Skip Redis checks if the write-side client is unavailable."""
     pytest.importorskip("redis")
     try:
         client = store.cache._cache.get_client(write=True)
@@ -59,6 +60,7 @@ def _require_redis(store):
 
 
 def test_redis_mget_reads_revocation_version_and_family_from_primary(monkeypatch):
+    """Read JTI, family, and user version together from the Redis primary."""
     url = os.environ.get("DJANGO_BOLT_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
     with override_settings(CACHES=_redis_settings(url)):
         prefix = f"mget:{uuid.uuid4().hex}:"
@@ -127,6 +129,7 @@ def test_locmem_uses_fallback_checks_and_version_cas():
 
 
 def test_mget_read_errors_never_accept_refresh(monkeypatch):
+    """Fail closed when the primary batch read fails."""
     url = os.environ.get("DJANGO_BOLT_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
     with override_settings(CACHES=_redis_settings(url)):
         store = DjangoCacheRevocation(key_prefix=f"mget:{uuid.uuid4().hex}:")
@@ -140,6 +143,7 @@ def test_mget_read_errors_never_accept_refresh(monkeypatch):
             raise RuntimeError("simulated Redis read failure")
 
         def failing_primary_client(*args, **kwargs):
+            """Inject a failed batch read into primary Redis clients."""
             client = original_get_client(*args, **kwargs)
             if kwargs.get("write") is True:
                 monkeypatch.setattr(client, "mget", broken_mget)

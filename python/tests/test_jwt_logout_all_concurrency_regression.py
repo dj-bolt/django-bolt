@@ -54,6 +54,7 @@ class _CoordinatedStore(InMemoryRevocation):
         self.release_second_cas = asyncio.Event()
 
     async def get_user_version(self, user_id):
+        """Hold the first version reads to force a concurrent snapshot."""
         snapshot = await super().get_user_version(user_id)
         if self.read_count < 2:
             self.read_count += 1
@@ -63,6 +64,7 @@ class _CoordinatedStore(InMemoryRevocation):
         return snapshot
 
     async def bump_user_version_if_current(self, user_id, expected_version):
+        """Delay the second version update to expose a stale-request race."""
         self.cas_count += 1
         if self.cas_count == 2:
             self.second_cas_waiting.set()

@@ -51,6 +51,7 @@ def _settings():
 
 
 def _setup():
+    """Prepare Redis-backed auth routes and token keys for auditing."""
     pytest.importorskip("redis")
     store = DjangoCacheRevocation(key_prefix=f"mget-routes:{uuid.uuid4().hex}:")
     backend = store.cache._cache
@@ -72,6 +73,7 @@ def _setup():
 
 @pytest.mark.parametrize("endpoint", ["/auth/logout", "/auth/logout-all"])
 def test_each_logout_uses_one_primary_mget_and_no_individual_get(monkeypatch, endpoint):
+    """Count primary batch reads and avoid separate key reads in logout."""
     with override_settings(CACHES=_settings()):
         backend, original_client, routes, request, keys = _setup()
         get_client = backend.get_client
@@ -87,6 +89,7 @@ def test_each_logout_uses_one_primary_mget_and_no_individual_get(monkeypatch, en
         tracked = set()
 
         def tracked_factory(*args, **kwargs):
+            """Wrap each Redis client once to count backend operations."""
             client = get_client(*args, **kwargs)
             if id(client) in tracked:
                 return client
@@ -94,7 +97,9 @@ def test_each_logout_uses_one_primary_mget_and_no_individual_get(monkeypatch, en
             write = kwargs.get("write") is True
 
             def wrap(method, name):
+                """Instrument a Redis client method for operation counting."""
                 def counted(*items, **opts):
+                    """Count calls and mark operations sent to the write primary."""
                     calls[name] += 1
                     if write and name in ("mget", "evalsha", "eval"):
                         calls[f"primary_{name}"] += 1
@@ -132,11 +137,13 @@ def test_each_logout_uses_one_primary_mget_and_no_individual_get(monkeypatch, en
 
 @pytest.mark.parametrize("endpoint", ["/auth/logout", "/auth/logout-all"])
 def test_mget_failure_never_performs_logout_mutation(monkeypatch, endpoint):
+    """Reject logout without mutation when security-state reads fail."""
     with override_settings(CACHES=_settings()):
         backend, original_client, routes, request, keys = _setup()
         get_client = backend.get_client
 
         def failing_factory(*args, **kwargs):
+            """Inject a failure into the relevant Redis security operation."""
             client = get_client(*args, **kwargs)
             if kwargs.get("write") is True:
 
@@ -184,6 +191,7 @@ class _ExtraVersionPolicy(DjangoCacheRevocation):
     ids=["custom-jti", "custom-family", "custom-version"],
 )
 def test_subclass_security_overrides_not_skipped_by_mget(store_class, endpoint):
+    """Preserve custom store policies when the MGET path is available."""
     with override_settings(CACHES=_settings()):
         store = store_class(key_prefix=f"mget-custom:{uuid.uuid4().hex}:")
         backend = store.cache._cache
@@ -217,6 +225,7 @@ def test_subclass_security_overrides_not_skipped_by_mget(store_class, endpoint):
 @pytest.mark.parametrize("endpoint", ["/auth/logout", "/auth/logout-all"])
 @pytest.mark.parametrize("family", [None, "", 123, []], ids=["missing", "empty", "integer", "list"])
 def test_logout_rejects_invalid_family_before_store_access(monkeypatch, endpoint, family):
+    """Reject invalid family claims before any revocation-store call."""
     with override_settings(CACHES={"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}):
         store = DjangoCacheRevocation(key_prefix=f"mget-family:{uuid.uuid4().hex}:")
         routes = _Routes()
@@ -245,6 +254,7 @@ def test_logout_rejects_invalid_family_before_store_access(monkeypatch, endpoint
 # The built-in RedisCache must still use MGET on the write primary.
 class _CustomPolicyRedisCache(RedisCache):
     def get(self, key, default=None, version=None):
+        """Return the custom family-revocation policy for cache reads."""
         if ":fam:" in key:
             return "revoked-by-custom-cache-policy"
         return super().get(key, default=default, version=version)
@@ -252,6 +262,7 @@ class _CustomPolicyRedisCache(RedisCache):
 
 @pytest.mark.parametrize("endpoint", ["/auth/logout", "/auth/logout-all"])
 def test_custom_rediscache_get_policy_is_not_bypassed(endpoint):
+    """Honor a RedisCache get override on both logout routes."""
     pytest.importorskip("redis")
     settings = _settings()
     settings["default"]["BACKEND"] = f"{__name__}._CustomPolicyRedisCache"
@@ -296,6 +307,7 @@ class _InheritedRedisCache(RedisCache):
 
 
 def test_inherited_rediscache_reads_primary_and_batches(monkeypatch):
+    """Keep primary batching for RedisCache subclasses without overrides."""
     pytest.importorskip("redis")
     settings = _settings()
     settings["default"]["BACKEND"] = f"{__name__}._InheritedRedisCache"
@@ -336,6 +348,7 @@ def test_inherited_rediscache_reads_primary_and_batches(monkeypatch):
 
 class _CustomUnderlyingStateReader(DjangoCacheRevocation):
     def _get_revocation_state(self, key):
+        """Simulate a custom reader that marks the family as revoked."""
         if ":fam:" in key:
             return "revoked-by-custom-reader"
         return super()._get_revocation_state(key)

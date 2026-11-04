@@ -30,10 +30,12 @@ class User:
 
 
 def make_api():
+    """Build test auth routes with an in-memory revocation store."""
     api = BoltAPI()
     store = InMemoryRevocation()
 
     async def validate(request, credentials):
+        """Accept only the configured test credentials."""
         return User() if credentials.username == "alice" and credentials.password == "correct" else None
 
     JWTAuthViews(
@@ -53,6 +55,7 @@ def signed_without_version(token):
 
 @pytest.mark.parametrize("endpoint", ["/auth/refresh", "/auth/logout", "/auth/logout-all"])
 def test_legacy_versionless_refresh_has_version_zero_semantics(endpoint):
+    """Apply version-zero rules to legacy refresh tokens without ver."""
     api, store = make_api()
     with TestClient(api) as client:
         assert client.post("/auth/login", json=LOGIN).status_code == 200

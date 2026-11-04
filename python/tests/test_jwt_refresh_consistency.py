@@ -89,6 +89,7 @@ async def test_rotation_uses_one_batch_and_still_consumes_atomically():
 
 @pytest.mark.asyncio
 async def test_batch_jti_does_not_skip_replay_detection():
+    """Detect token replay even when batch reads report a consumed JTI."""
     store = BatchStore()
     pair = create_token_pair("user-1", secret=SECRET)
     await store.consume(pair.refresh_claims["jti"])
