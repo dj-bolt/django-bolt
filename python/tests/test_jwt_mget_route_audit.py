@@ -98,6 +98,7 @@ def test_each_logout_uses_one_primary_mget_and_no_individual_get(monkeypatch, en
 
             def wrap(method, name):
                 """Instrument a Redis client method for operation counting."""
+
                 def counted(*items, **opts):
                     """Count calls and mark operations sent to the write primary."""
                     calls[name] += 1
