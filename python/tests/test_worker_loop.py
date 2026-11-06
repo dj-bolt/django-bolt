@@ -118,6 +118,8 @@ def test_descriptor_watchers_accept_and_use_a_context():
             loop._add_writer(right, on_writable, context=context)
             await asyncio.wait_for(done.wait(), 5)
         finally:
+            loop._remove_reader(left)
+            loop._remove_writer(right)
             left.close()
             right.close()
         return seen
