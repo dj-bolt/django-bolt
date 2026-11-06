@@ -8,12 +8,16 @@ this test fails loudly if a future CPython moves them.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import socket
 import subprocess
 import sys
 
 import pytest
 
+from django_bolt import BoltAPI
 from django_bolt._worker_loop import _with_running_loop
+from django_bolt.testing import TestClient
 
 
 def test_with_running_loop_installs_and_restores():
@@ -83,3 +87,42 @@ def test_a_loop_uses_the_default_pool_of_the_moment():
     """A loop that outlives a pool must not keep it: run_in_executor(None) uses the current pool."""
     result = subprocess.run([sys.executable, "-c", _REPLACED_POOL], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_descriptor_watchers_accept_and_use_a_context():
+    """Python 3.15 transports call loop._add_reader/_add_writer with context=..."""
+    api = BoltAPI()
+    var = contextvars.ContextVar("var", default="unset")
+
+    @api.get("/watch")
+    async def watch():
+        loop = asyncio.get_running_loop()
+        left, right = socket.socketpair()
+        seen = {}
+        done = asyncio.Event()
+
+        def on_readable():
+            seen["reader"] = var.get()
+            loop._remove_reader(left)
+            done.set()
+
+        def on_writable():
+            seen["writer"] = var.get()
+            loop._remove_writer(right)
+            right.send(b"x")
+
+        context = contextvars.copy_context()
+        context.run(var.set, "watched")
+        try:
+            loop._add_reader(left, on_readable, context=context)
+            loop._add_writer(right, on_writable, context=context)
+            await asyncio.wait_for(done.wait(), 5)
+        finally:
+            left.close()
+            right.close()
+        return seen
+
+    with TestClient(api) as client:
+        response = client.get("/watch")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"reader": "watched", "writer": "watched"}
