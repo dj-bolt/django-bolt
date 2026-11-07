@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **`DjangoORMRevocation` keeps user versions** - `DjangoORMRevocation` had no `get_user_version` or `bump_user_version`. Thus `JWTAuthViews` could not use a database store: each login gave a 500. Now the store keeps the version of a user in one row of its model. Add `version = models.PositiveIntegerField(default=0)` to the model to use it. One `UPDATE` adds 1 to the version, so concurrent bumps do not lose a count. The row does not expire, so the cleanup task of expired rows keeps it.
+- **A database store for `JWTAuthViews`: `django_bolt.auth.revocation_db`** - Bolt now ships the table for `DjangoORMRevocation`. Add `"django_bolt.auth.revocation_db"` to `INSTALLED_APPS` and run `migrate`. Then `DjangoORMRevocation()` with no `model` uses it. Before, each project had to write its own model. `DjangoORMRevocation` also had no `get_user_version` or `bump_user_version`, so `JWTAuthViews` gave a 500 on each login with a database store. Now the store keeps the version of a user in the row `version:<user_id>`. One `UPDATE` adds 1 to the version, so concurrent bumps do not lose a count. The row does not expire, so the cleanup task of expired rows keeps it. A model of your own still works with `model=`, if it has the fields of the shipped model, including `version`.
 - **`@cors(origin_regexes=[...])`** - A route can allow the origins that match a pattern, as `CORS_ALLOWED_ORIGIN_REGEXES` does for all routes. `@cors` needs `origins` or `origin_regexes`. An empty pattern raises `ValueError`, because it matches every origin. An origin or a pattern that is not a `str` raises `TypeError`.
 
 ### Fixed

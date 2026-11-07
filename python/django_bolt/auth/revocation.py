@@ -361,39 +361,25 @@ class DjangoORMRevocation(RevocationStore):
     ⚠️  Slower than cache-based solutions (~1k-5k ops/sec vs 50k ops/sec).
     Only use if you don't have cache infrastructure.
 
-    Requires creating a model:
+    Add the app that has the table, then run ``python manage.py migrate``:
     ```python
-    # myapp/models.py
-    from django.db import models
-
-    class RevokedToken(models.Model):
-        jti = models.CharField(max_length=255, unique=True, db_index=True)
-        revoked_at = models.DateTimeField(auto_now_add=True)
-        expires_at = models.DateTimeField(db_index=True)
-        # Necessary for user versions (logout-all and JWTAuthViews).
-        version = models.PositiveIntegerField(default=0)
-
-        class Meta:
-            indexes = [
-                models.Index(fields=['jti']),
-                models.Index(fields=['expires_at']),
-            ]
+    INSTALLED_APPS = [
+        ...,
+        "django_bolt.auth.revocation_db",
+    ]
     ```
 
     The store keeps the version of a user in the row ``version:<user_id>``.
     That row does not expire, so the cleanup task below keeps it.
 
-    Then run migrations:
-    ```bash
-    python manage.py makemigrations
-    python manage.py migrate
-    ```
+    To use a model of your own, pass ``model="myapp.MyModel"``. The model must have
+    the fields of ``django_bolt.auth.revocation_db.models.RevokedToken``.
 
     Usage:
     ```python
     from django_bolt.auth.revocation import DjangoORMRevocation
 
-    revocation = DjangoORMRevocation(model='myapp.RevokedToken')
+    revocation = DjangoORMRevocation()
 
     auth = JWTAuthentication(
         secret=settings.SECRET_KEY,
@@ -414,6 +400,8 @@ class DjangoORMRevocation(RevocationStore):
     # Periodic task (celery, cron, etc.)
     from datetime import datetime, timezone
 
+    from django_bolt.auth.revocation_db.models import RevokedToken
+
     async def cleanup_expired_tokens():
         await RevokedToken.objects.filter(
             expires_at__lt=datetime.now(timezone.utc)
@@ -421,13 +409,13 @@ class DjangoORMRevocation(RevocationStore):
     ```
     """
 
-    def __init__(self, model: str, *, default_ttl: int = _DEFAULT_TTL_SECONDS):
+    def __init__(self, model: str = "bolt_revocation.RevokedToken", *, default_ttl: int = _DEFAULT_TTL_SECONDS):
         """
         Initialize ORM-based revocation.
 
         Args:
-            model: Two-part model path ``'app_label.ModelName'``
-                (e.g., ``'myapp.RevokedToken'``).
+            model: Two-part model path ``'app_label.ModelName'``. The default is the
+                model of ``django_bolt.auth.revocation_db``.
             default_ttl: Fallback retention (in seconds) used when a caller
                 invokes ``revoke(jti)`` without passing ``exp``. Defaults to
                 7 days. Per-call ``exp`` always wins over this.
