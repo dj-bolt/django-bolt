@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 from datetime import date
 from decimal import Decimal
@@ -14,7 +15,7 @@ import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files.base import File as DjangoFile
 
-from django_bolt import BoltAPI, UploadFile
+from django_bolt import BoltAPI, FileSize, UploadFile
 from django_bolt.datastructures import UploadFile as UploadFileClass
 from django_bolt.params import File, Form
 from django_bolt.testing import TestClient
@@ -540,6 +541,76 @@ class TestUploadFileValidation:
         """An empty list allowed each type. A list with no type must not do that."""
         with pytest.raises(ValueError, match="allows no file type"):
             File(allowed_types=allowed_types)
+
+    @pytest.mark.parametrize("name", ["max_size", "min_size", "max_files"])
+    @pytest.mark.parametrize(
+        ("value", "shown"),
+        [("big", "str 'big'"), ("10MB", "str '10MB'"), (1.5, "float 1.5"), (True, "bool True")],
+        ids=["str", "size-str", "float", "bool"],
+    )
+    def test_file_limit_of_the_wrong_type_fails_loudly(self, name, value, shown):
+        """Rust ignored a limit that is not an int. File(max_size="10MB") then set no limit."""
+        with pytest.raises(TypeError, match=f"^File {name} must be an int, got {shown}$"):
+            File(**{name: value})
+
+    @pytest.mark.parametrize("name", ["max_size", "min_size"])
+    def test_file_size_below_zero_fails_loudly(self, name):
+        with pytest.raises(ValueError, match=f"^File {name} must be 0 or more, got -1$"):
+            File(**{name: -1})
+
+    @pytest.mark.parametrize("name", ["max_size", "min_size", "max_files"])
+    def test_file_limit_too_large_for_rust_fails_loudly(self, name):
+        """Rust reads a limit as a usize. It ignored a larger int, and the limit was gone."""
+        value = sys.maxsize + 1
+        with pytest.raises(ValueError, match=f"^File {name} must be {sys.maxsize} or less, got {value}$"):
+            File(**{name: value})
+
+    def test_largest_file_limit_is_valid(self):
+        assert File(max_size=sys.maxsize).max_size == sys.maxsize
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_max_files_below_one_fails_loudly(self, value):
+        """A route with max_files=0 takes no file. That is a mistake, as an empty allowed_types is."""
+        with pytest.raises(ValueError, match=f"^File max_files must be 1 or more, got {value}$"):
+            File(max_files=value)
+
+    def test_min_size_above_max_size_fails_loudly(self):
+        """No file can be larger than max_size and smaller than min_size."""
+        with pytest.raises(ValueError, match=r"^File min_size 20 must not be above max_size 10$"):
+            File(min_size=20, max_size=10)
+
+    def test_file_limits_that_are_valid_still_work(self):
+        File()
+        File(max_size=None, min_size=None, max_files=None)
+        File(max_size=0, min_size=0, max_files=1)
+        File(min_size=10, max_size=10)
+        marker = File(max_size=FileSize.MB_1, min_size=1, max_files=3)
+        assert (marker.max_size, marker.min_size, marker.max_files) == (FileSize.MB_1, 1, 3)
+
+    def test_file_limits_of_a_valid_marker_apply_end_to_end(self):
+        api = BoltAPI()
+
+        @api.post("/upload")
+        async def upload(files: Annotated[list[UploadFile], File(max_size=8, min_size=2, max_files=2)]):
+            return {"count": len(files)}
+
+        client = TestClient(api)
+
+        response = client.post("/upload", files={"files": ("a.txt", b"12345678", "text/plain")})
+        assert response.status_code == 200
+        assert response.json() == {"count": 1}
+
+        response = client.post("/upload", files={"files": ("a.txt", b"123456789", "text/plain")})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_too_large"
+
+        response = client.post("/upload", files={"files": ("a.txt", b"1", "text/plain")})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_too_small"
+
+        response = client.post("/upload", files=[("files", (f"{i}.txt", b"abc", "text/plain")) for i in range(3)])
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "file_too_many"
 
     def test_max_size_validation_pass(self):
         """Test that file within max size passes."""

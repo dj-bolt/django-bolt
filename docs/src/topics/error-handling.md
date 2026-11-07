@@ -286,6 +286,14 @@ except msgspec.ValidationError as e:
     # [{"loc": [...], "msg": "...", "type": "..."}]
 ```
 
+A missing field has the type `missing_field` at any depth. Its `loc` ends with the field name. For a missing `zip` in the `address` struct, the error is:
+
+```python
+{"loc": ["body", "address", "zip"], "msg": "Object missing required field `zip`", "type": "missing_field"}
+```
+
+For an array item, `loc` has the index as a string, for example `["body", "items", "0", "zip"]`.
+
 ## Error response format
 
 All errors follow a consistent format:
