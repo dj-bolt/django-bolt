@@ -573,7 +573,7 @@ result = user.dump()
 
 ### Write-only fields in a response
 
-A response gives the `dump()` of each Serializer at a position of the declared response type. The declared type is the return annotation or `response_model`. A position can be a field of a `Struct`, a dataclass or a `TypedDict`, an item of a list or a tuple, a value of a dict, or a member of a union:
+A response gives the `dump()` of each Serializer at a position of the declared response type. The declared type is the return annotation or `response_model`. A position can be a field of a `Struct`, a dataclass or a `TypedDict`. It can also be an item of a list or a tuple, a value of a dict, or a member of a union:
 
 ```python
 import msgspec
