@@ -71,6 +71,11 @@ All notable changes to this project will be documented in this file.
 - **A response object or a Struct result costs less to serialize** - Bolt checked a response object against each response type in turn, and a `Response` was the eighth check. Now Bolt looks up its class. A Struct result went through the bytes, str, stream and QuerySet checks first. Now it takes the JSON path first. An async route also creates fewer coroutines for each response. A `Response` costs about 23% fewer instructions, and a Struct result about 36% fewer.
 - **The dispatch of a route with no auth costs less** - Bolt read the auth context of each request, also on a route with no auth backend. Now it reads the context only for a route with a backend. The async dispatch also found the API with the middleware of the route on each request. Now registration stores that API. For a route with no auth, the Python dispatch runs 4% to 14% fewer instructions. A route with auth runs about 3% fewer on the async dispatch, and about 1.5% more on the sync dispatch.
 
+### Security
+
+- **Actix Web has the fixes for five advisories** - The server now uses actix-web 4.18.2, actix-http 3.20.3 and actix-files 0.7.4. These versions fix RUSTSEC-2026-0446, a request smuggling attack through bad chunked trailers. They also fix three ways to use all memory with a compressed request body: RUSTSEC-2026-0447, RUSTSEC-2026-0448 and RUSTSEC-2026-0455. RUSTSEC-2026-0443 is also fixed: a Windows short name showed a hidden file. `Cargo.toml` now requires these versions or later.
+- **Bolt requires Django 5.2.19 or later** - Django 5.2.19, 6.0.10 and 6.1.3 fix six CVEs. Examples are memory exhaustion in `MultiPartParser` and password hashes that a view-only admin user can see. Upgrade Django to the latest patch of your series.
+
 ## [0.13.0]
 
 ### Added
