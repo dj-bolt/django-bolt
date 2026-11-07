@@ -35,6 +35,7 @@ from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 
 from . import _json
 from ._kwargs import compile_response_coercer, compile_struct_row_readers
+from ._response_dump import compile_serializer_dumper
 from .concurrency import run_in_orm_executor
 from .cookies import Cookie
 from .exceptions import ResponseValidationError, UnloadedRelationError
@@ -517,10 +518,37 @@ def _compile_response_validator(meta: HandlerMetadata | dict[str, Any]) -> tuple
     if serializer_cls is not None:
         return _compile_serializer_response_handlers(serializer_cls, many, validate_dicts=meta["validate_response"])
 
-    if not meta["validate_response"]:
-        return None, None
+    return _compile_type_validators(response_type, meta["validate_response"])
 
-    return compile_response_coercer(response_type)
+
+def _compile_type_validators(annotation: Any, validate: bool) -> tuple[Any, Any]:
+    """Return the validators of a declared type: the coercion if ``validate``, then the dump of each Serializer.
+
+    msgspec encodes a Serializer with all of its fields. Thus each Serializer
+    at a position of the type gives its dump(), also when the route does not
+    validate. Both validators are None when neither step applies.
+    """
+    dump = compile_serializer_dumper(annotation)
+    if not validate:
+        if dump is None:
+            return None, None
+
+        async def dump_async(value: Any) -> Any:
+            return dump(value)
+
+        return dump, dump_async
+
+    coerce_sync, coerce_async = compile_response_coercer(annotation)
+    if dump is None:
+        return coerce_sync, coerce_async
+
+    def validate_sync(value: Any) -> Any:
+        return dump(coerce_sync(value))
+
+    async def validate_async(value: Any) -> Any:
+        return dump(await coerce_async(value))
+
+    return validate_sync, validate_async
 
 
 def _compile_stream_item_validators(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
@@ -528,11 +556,9 @@ def _compile_stream_item_validators(meta: HandlerMetadata | dict[str, Any]) -> t
     # None. Only a typed stream of JSON items uses the validator, so a stream of
     # raw chunks never does.
     _, item_type = meta["_stream_info"]
-    if not meta["validate_response"]:
-        return None, None
     if not _response_validation_is_required(item_type):
         return None, None
-    return compile_response_coercer(item_type)
+    return _compile_type_validators(item_type, meta["validate_response"])
 
 
 def _compile_row_readers(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any] | None:
@@ -809,6 +835,10 @@ def _compile_inline_response_validator(
         return None
     response_type = meta.get("response_type")
     if response_type is None or response_type in _VALIDATION_NOOP_TYPES:
+        return None
+    # The inline path encodes the value directly, so a Serializer in it would
+    # send all of its fields. The slow path dumps it.
+    if compile_serializer_dumper(response_type) is not None:
         return None
 
     if _is_plain_struct(response_type):
