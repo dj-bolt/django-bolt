@@ -97,6 +97,10 @@ struct OwnedResponse {
     body: Vec<u8>,
 }
 
+/// What `complete` sends: a copy of the response, or the `size` of a
+/// `Response` that is smaller than v1. `dispatch` logs that size.
+type Completion = Result<OwnedResponse, usize>;
+
 /// The `complete` callback. It can run on any thread, so it only copies the
 /// response and sends it on a oneshot channel.
 unsafe extern "C" fn complete(token: *mut c_void, resp: *const abi::Response) {
@@ -104,14 +108,16 @@ unsafe extern "C" fn complete(token: *mut c_void, resp: *const abi::Response) {
         return;
     }
     // SAFETY: the contract gives back the token of one `call`, exactly once.
-    let tx = unsafe { Box::from_raw(token.cast::<oneshot::Sender<OwnedResponse>>()) };
+    let tx = unsafe { Box::from_raw(token.cast::<oneshot::Sender<Completion>>()) };
     if resp.is_null() {
         // The contract: a null response sends 500. Dropping the sender does it.
         return;
     }
     // SAFETY: `size` is the first field of every version.
-    if unsafe { (*resp).size } < std::mem::size_of::<abi::Response>() {
-        // A broken handler. Dropping the sender sends 500.
+    let size = unsafe { (*resp).size };
+    if size < std::mem::size_of::<abi::Response>() {
+        // An error means that the request is gone (client or timeout).
+        let _ = tx.send(Err(size));
         return;
     }
     // SAFETY: `resp` and its pointers are valid during this call, and the size
@@ -127,11 +133,11 @@ unsafe extern "C" fn complete(token: *mut c_void, resp: *const abi::Response) {
         .map(|p| unsafe { (p.name.as_bytes().to_vec(), p.value.as_bytes().to_vec()) })
         .collect();
     // An error means that the request is gone (client or timeout).
-    let _ = tx.send(OwnedResponse {
+    let _ = tx.send(Ok(OwnedResponse {
         status: resp.status,
         headers,
         body: unsafe { resp.body.as_bytes().to_vec() },
-    });
+    }));
 }
 
 /// A 500 that Bolt makes for a native route. The reason is logged here, one
@@ -194,7 +200,7 @@ pub async fn dispatch(
         Err(response) => return response,
     };
 
-    let (tx, rx) = oneshot::channel::<OwnedResponse>();
+    let (tx, rx) = oneshot::channel::<Completion>();
     {
         let headers: Vec<abi::Pair> = req
             .headers()
@@ -245,10 +251,17 @@ pub async fn dispatch(
     // end here and do not stay alive during the wait.
     drop(body);
     let out = match tokio::time::timeout(state.native_route_timeout, rx).await {
-        Ok(Ok(out)) => out,
+        Ok(Ok(Ok(out))) => out,
+        Ok(Ok(Err(size))) => {
+            return internal_error(format!(
+                "native handler '{}' sent a Response of {size} bytes; v1 has {} bytes",
+                handler_name(native),
+                std::mem::size_of::<abi::Response>()
+            ));
+        }
         Ok(Err(_)) => {
             return internal_error(format!(
-                "native handler '{}' completed without a valid response (a dropped responder, a panic, or a Response smaller than v1)",
+                "native handler '{}' completed without a response (a dropped responder or a panic)",
                 handler_name(native)
             ));
         }
@@ -294,10 +307,11 @@ pub async fn dispatch(
             ),
         }
     }
-    // HEAD, 204 and 304 have no body (RFC 9110). Actix writes the bytes that
-    // it gets, so a body would corrupt the next response on the connection.
+    // HEAD, 204, 205 and 304 have no body (RFC 9110). Actix writes the bytes
+    // that it gets, so a body would corrupt the next response on the connection.
     if req.method() == actix_web::http::Method::HEAD
         || status == StatusCode::NO_CONTENT
+        || status == StatusCode::RESET_CONTENT
         || status == StatusCode::NOT_MODIFIED
     {
         return response.finish();
@@ -313,7 +327,7 @@ mod tests {
     /// away, finds no receiver. That must only free the token.
     #[test]
     fn a_late_complete_frees_the_token() {
-        let (tx, rx) = oneshot::channel::<OwnedResponse>();
+        let (tx, rx) = oneshot::channel::<Completion>();
         drop(rx);
         let token = Box::into_raw(Box::new(tx)).cast::<c_void>();
         let resp = abi::Response {

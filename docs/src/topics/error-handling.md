@@ -329,7 +329,7 @@ An error formatter changes the body of each error response that the framework ma
   - 422 from path, query, header, cookie and form values.
   - 429 from rate limits.
   - A `FileResponse` whose file Rust cannot open or read when it sends the response.
-  - 500 and 504 that Bolt makes for a native route. A response of the native handler is not changed.
+  - 500 and 504 that Bolt makes for a native route. The formatter does not change a response of the native handler.
 - Python: request and response validation, `HTTPException`, and unhandled exceptions.
 
 Without a formatter, the errors keep their default body.
