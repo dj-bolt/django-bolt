@@ -7,6 +7,7 @@ import functools
 import inspect
 import logging
 import os
+import re
 import sys
 import threading
 from collections.abc import Callable, Collection, Sequence
@@ -302,6 +303,9 @@ def _validate_asgi_mount_conflicts(
 
 
 _HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY"})
+
+# A path parameter with a type, for example ``{id:int}``.
+_TYPED_PATH_PARAM = re.compile(r"\{\w+:(\w+)\}")
 
 
 def _validate_mcp_mount_conflicts(
@@ -3516,10 +3520,18 @@ class BoltAPI:
         middleware, authentication, guards, rate limits, dependency injection
         and the access log do not run. Global CORS and compression apply. A
         native route with the method and path of another route stops startup.
+        A path parameter type other than ``path`` raises ``ValueError``,
+        because Bolt does not check it for a native route.
         """
         method = method.upper()
         if method not in _HTTP_METHODS:
             raise ValueError(f"Unsupported HTTP method for a native route: {method}")
+        for param in _TYPED_PATH_PARAM.finditer(path):
+            if param.group(1) != "path":
+                raise ValueError(
+                    f"A native route does not check the type of {param.group(0)}. "
+                    "Remove the type, and check the value in the handler."
+                )
         # Check the capsule now, so a bad capsule stops startup before runbolt
         # starts its worker processes.
         _core.check_native_capsule(capsule)

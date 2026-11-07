@@ -56,9 +56,17 @@ fn handler_from_capsule(py: Python<'_>, capsule: &Py<PyAny>) -> PyResult<NativeH
     if ptr.is_null() {
         return Err(PyValueError::new_err("native handler capsule holds NULL"));
     }
-    // SAFETY: the capsule name guarantees the v1 layout, and the contract
-    // requires the struct to be static. CPython does not unload extension
-    // modules.
+    // SAFETY: `size` is the first field of every version. A capsule of this
+    // name points to at least that field.
+    let size = unsafe { (*ptr).size };
+    if size < std::mem::size_of::<abi::HandlerV1>() {
+        return Err(PyValueError::new_err(format!(
+            "native handler capsule is smaller than HandlerV1 ({size} < {} bytes)",
+            std::mem::size_of::<abi::HandlerV1>()
+        )));
+    }
+    // SAFETY: the size covers the v1 layout, and the contract requires the
+    // struct to be static. CPython does not unload extension modules.
     let handler: &'static abi::HandlerV1 = unsafe { &*ptr };
     let call = handler
         .call
@@ -101,7 +109,13 @@ unsafe extern "C" fn complete(token: *mut c_void, resp: *const abi::Response) {
         // The contract: a null response sends 500. Dropping the sender does it.
         return;
     }
-    // SAFETY: `resp` and its pointers are valid during this call.
+    // SAFETY: `size` is the first field of every version.
+    if unsafe { (*resp).size } < std::mem::size_of::<abi::Response>() {
+        // A broken handler. Dropping the sender sends 500.
+        return;
+    }
+    // SAFETY: `resp` and its pointers are valid during this call, and the size
+    // covers the v1 layout.
     let resp = unsafe { &*resp };
     let pairs: &[abi::Pair] = if resp.n_headers == 0 || resp.headers.is_null() {
         &[]
@@ -133,6 +147,29 @@ fn internal_error(reason: String) -> HttpResponse {
     })
 }
 
+/// The header limits of Python routes: at most 100 headers, and no value
+/// longer than `BOLT_MAX_HEADER_SIZE`. A Python route drops a value that is
+/// not ASCII, but a native route gets it, so the raw bytes count.
+#[expect(
+    clippy::result_large_err,
+    reason = "the error is the response to send, as for the request_pipeline helpers; the path is cold"
+)]
+fn check_header_limits(req: &HttpRequest, max_header_size: usize) -> Result<(), HttpResponse> {
+    const MAX_HEADERS: usize = 100;
+    // `HeaderMap::len` counts each value, so a repeated name counts each time.
+    if req.headers().len() > MAX_HEADERS {
+        return Err(responses::error_400_too_many_headers());
+    }
+    if req
+        .headers()
+        .iter()
+        .any(|(_, value)| value.len() > max_header_size)
+    {
+        return Err(responses::error_400_header_too_large(max_header_size));
+    }
+    Ok(())
+}
+
 /// Errors that Bolt makes (413, a bad header, 500 and 504) carry `ErrorInfo`
 /// for the error formatter. A response of the handler has none, so the
 /// formatter leaves it as it is.
@@ -143,10 +180,7 @@ pub async fn dispatch(
     path_params: Option<PathParams<'_>>,
     state: &AppState,
 ) -> HttpResponse {
-    // The header limits of Python routes, without a copy of the headers.
-    if let Err(response) =
-        bolt_core::request_pipeline::extract_cookie_header(req, state.max_header_size)
-    {
+    if let Err(response) = check_header_limits(req, state.max_header_size) {
         return response;
     }
     if crate::handler::content_length_exceeds_limit(
@@ -189,6 +223,7 @@ pub async fn dispatch(
             &state.trusted_proxies,
         );
         let request = abi::Request {
+            size: std::mem::size_of::<abi::Request>(),
             method: abi::Slice::from_bytes(req.method().as_str().as_bytes()),
             path: abi::Slice::from_bytes(req.path().as_bytes()),
             query: abi::Slice::from_bytes(req.query_string().as_bytes()),
@@ -213,7 +248,7 @@ pub async fn dispatch(
         Ok(Ok(out)) => out,
         Ok(Err(_)) => {
             return internal_error(format!(
-                "native handler '{}' completed without a response (a dropped responder or a panic)",
+                "native handler '{}' completed without a valid response (a dropped responder, a panic, or a Response smaller than v1)",
                 handler_name(native)
             ));
         }
@@ -223,7 +258,10 @@ pub async fn dispatch(
                 handler_name(native),
                 state.native_route_timeout.as_secs_f64()
             );
-            return error::with_error_info(HttpResponse::GatewayTimeout().finish(), || {
+            let response = HttpResponse::GatewayTimeout()
+                .content_type("application/json")
+                .body(r#"{"detail":"Gateway Timeout"}"#);
+            return error::with_error_info(response, || {
                 error::ErrorInfo::core("gateway_timeout", "The handler did not complete in time")
             });
         }
@@ -279,6 +317,7 @@ mod tests {
         drop(rx);
         let token = Box::into_raw(Box::new(tx)).cast::<c_void>();
         let resp = abi::Response {
+            size: std::mem::size_of::<abi::Response>(),
             status: 200,
             headers: std::ptr::null(),
             n_headers: 0,

@@ -47,6 +47,11 @@
 //!   when the client goes away.
 //! * Bolt sends 500 for a status outside 200-599. It drops a response header
 //!   that is not valid HTTP and logs it. The response body is buffered.
+//! * Each struct starts with `size`, the `size_of` of the struct in the
+//!   version of this crate that its author used. A later version adds fields
+//!   only at the end. Read a field that a later version adds only when `size`
+//!   covers it. Bolt refuses a [`HandlerV1`] smaller than v1 at startup. It
+//!   sends 500 for a [`Response`] smaller than v1.
 //! * A change to these types that is not compatible gets a new capsule name,
 //!   for example `django_bolt.native_handler.v2`.
 #![deny(missing_docs)]
@@ -117,6 +122,8 @@ unsafe fn pairs<'a>(ptr: *const Pair, len: usize) -> &'a [Pair] {
 /// The request that Bolt gives to `call`. Valid only during `call`.
 #[repr(C)]
 pub struct Request {
+    /// `size_of::<Request>()` in the version of this crate that Bolt uses.
+    pub size: usize,
     /// The method, for example `POST`.
     pub method: Slice,
     /// The path as received, still percent-encoded.
@@ -145,6 +152,9 @@ pub struct Request {
 /// The response that the handler gives to `complete`.
 #[repr(C)]
 pub struct Response {
+    /// `size_of::<Response>()` in the version of this crate that the handler
+    /// uses.
+    pub size: usize,
     /// The status, 200-599.
     pub status: u16,
     /// The headers.
@@ -169,6 +179,9 @@ pub type CallFn = unsafe extern "C" fn(
 /// The handler that the capsule points to.
 #[repr(C)]
 pub struct HandlerV1 {
+    /// `size_of::<HandlerV1>()` in the version of this crate that the handler
+    /// uses. [`HandlerV1::new`] sets it.
+    pub size: usize,
     /// Name for logs and errors. NUL-terminated and static.
     pub name: *const c_char,
     /// Handler state, given back to `call`. Static and thread-safe.
@@ -181,6 +194,7 @@ impl HandlerV1 {
     /// A handler with a static name, state and entry point.
     pub const fn new(name: &'static CStr, ctx: *mut c_void, call: CallFn) -> Self {
         HandlerV1 {
+            size: core::mem::size_of::<HandlerV1>(),
             name: name.as_ptr(),
             ctx,
             call: Some(call),
@@ -290,6 +304,7 @@ impl Responder {
             })
             .collect();
         let resp = Response {
+            size: core::mem::size_of::<Response>(),
             status,
             headers: pairs.as_ptr(),
             n_headers: pairs.len(),
@@ -422,6 +437,7 @@ mod tests {
             (0, Vec::new())
         } else {
             let resp = unsafe { &*resp };
+            assert_eq!(resp.size, core::mem::size_of::<Response>());
             (resp.status, unsafe { resp.body.as_bytes() }.to_vec())
         };
         SEEN.lock().unwrap().push((token as usize, status, body));
@@ -442,6 +458,7 @@ mod tests {
 
     fn request(headers: &[Pair], params: &[Pair]) -> Request {
         Request {
+            size: core::mem::size_of::<Request>(),
             method: Slice::from_bytes(b"POST"),
             path: Slice::from_bytes(b"/a/42"),
             query: Slice::EMPTY,
@@ -460,6 +477,11 @@ mod tests {
         let responder = unsafe { Responder::from_raw(record, token(1)) };
         responder.send(201, &[(b"x", b"y")], b"ok");
         assert_eq!(seen(1), vec![(201, b"ok".to_vec())]);
+    }
+
+    #[test]
+    fn handler_new_sets_the_size() {
+        assert_eq!(ECHO.size, core::mem::size_of::<HandlerV1>());
     }
 
     #[test]

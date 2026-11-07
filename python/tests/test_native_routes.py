@@ -78,8 +78,8 @@ def test_native_route_body_over_the_limit_is_refused(settings, content):
 
 @pytest.mark.parametrize(
     "headers",
-    [{"x-big": "x" * 200}, {f"x-{i}": "1" for i in range(101)}],
-    ids=["too-large", "too-many"],
+    [{"x-big": "x" * 200}, {"x-big": "é".encode() * 100}, {f"x-{i}": "1" for i in range(101)}],
+    ids=["too-large", "too-large-non-ascii", "too-many"],
 )
 def test_native_route_applies_the_header_limits(settings, headers):
     settings.BOLT_MAX_HEADER_SIZE = 100
@@ -114,11 +114,15 @@ def test_native_handler_outcomes(case, status, body):
         assert response.json() == body
 
 
-def test_null_response_is_a_server_error():
+@pytest.mark.parametrize("kind", ["null_response", "small_response"])
+def test_null_or_too_small_response_is_a_server_error(kind):
     api = BoltAPI()
-    api.native_route("GET", "/null", _core.native_test_capsule("null_response"))
+    api.native_route("GET", "/x", _core.native_test_capsule(kind))
     with TestClient(api) as client:
-        assert client.get("/null").status_code == 500
+        response = client.get("/x")
+
+    assert response.status_code == 500
+    assert response.json() == BOLT_500
 
 
 def test_head_response_has_no_body():
@@ -170,7 +174,11 @@ def test_invalid_response_header_is_dropped():
 def test_native_handler_that_does_not_complete_in_time_gets_504(settings):
     settings.BOLT_NATIVE_ROUTE_TIMEOUT = 0.1
     with TestClient(native_api()) as client:
-        assert client.get("/items/hang").status_code == 504
+        response = client.get("/items/hang")
+
+    assert response.status_code == 504
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "Gateway Timeout"}
 
 
 def test_trailing_slash_redirects_to_a_native_route_before_a_catch_all_mount():
@@ -324,6 +332,20 @@ def _capsule(name: bytes):
 OTHER_NAME = b"other.capsule"
 
 
+def test_native_route_refuses_a_typed_path_param():
+    with pytest.raises(ValueError, match=r"does not check the type of \{id:int\}"):
+        BoltAPI().native_route("GET", "/items/{id:int}", _core.native_test_capsule())
+
+
+def test_native_route_takes_a_path_param_of_type_path():
+    api = BoltAPI()
+    api.native_route("GET", "/files/{id:path}", _core.native_test_capsule())
+    with TestClient(api) as client:
+        response = client.get("/files/a/b")
+
+    assert response.json()["params"] == {"id": "a/b"}
+
+
 def test_native_route_needs_a_known_method():
     with pytest.raises(ValueError, match="Unsupported HTTP method"):
         BoltAPI().native_route("GTE", "/x", _core.native_test_capsule())
@@ -335,8 +357,9 @@ def test_native_route_needs_a_known_method():
         (object, TypeError, "native_handler.v1 capsule"),
         (lambda: _core.native_test_capsule("no_call"), ValueError, "no call function"),
         (lambda: _capsule(OTHER_NAME), TypeError, "native_handler.v1 capsule"),
+        (lambda: _core.native_test_capsule("too_small"), ValueError, "smaller than HandlerV1"),
     ],
-    ids=["not-a-capsule", "no-call", "other-name"],
+    ids=["not-a-capsule", "no-call", "other-name", "too-small"],
 )
 def test_invalid_capsule_is_refused_at_registration(capsule, error, message):
     with pytest.raises(error, match=message):

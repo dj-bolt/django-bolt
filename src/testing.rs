@@ -1288,8 +1288,32 @@ mod native_test_handler {
         unsafe { complete(token, std::ptr::null()) };
     }
 
+    /// Completes with a response whose `size` is smaller than v1.
+    unsafe extern "C" fn small_response(
+        _ctx: *mut c_void,
+        _req: *const abi::Request,
+        complete: abi::CompleteFn,
+        token: *mut c_void,
+    ) {
+        let resp = abi::Response {
+            size: 0,
+            status: 200,
+            headers: std::ptr::null(),
+            n_headers: 0,
+            body: abi::Slice::EMPTY,
+        };
+        // SAFETY: the token of this `call`, given back once.
+        unsafe { complete(token, &resp) };
+    }
+
     pub static NULL_RESPONSE: abi::HandlerV1 =
         abi::HandlerV1::new(c"bolt-test-null", std::ptr::null_mut(), null_response);
+    pub static SMALL_RESPONSE: abi::HandlerV1 =
+        abi::HandlerV1::new(c"bolt-test-small", std::ptr::null_mut(), small_response);
+    pub static TOO_SMALL: abi::HandlerV1 = abi::HandlerV1 {
+        size: 0,
+        ..abi::HandlerV1::new(c"bolt-test-too-small", std::ptr::null_mut(), null_response)
+    };
     pub static NO_CALL: abi::HandlerV1 = abi::HandlerV1 {
         call: None,
         ..abi::HandlerV1::new(c"bolt-test-no-call", std::ptr::null_mut(), null_response)
@@ -1297,14 +1321,16 @@ mod native_test_handler {
 }
 
 /// A `django_bolt.native_handler.v1` capsule for bolt's own tests. `kind` is
-/// `ok`, `null_response` or `no_call`.
+/// `ok`, `null_response`, `small_response`, `no_call` or `too_small`.
 #[pyfunction]
 #[pyo3(signature = (kind="ok"))]
 pub fn native_test_capsule(py: Python<'_>, kind: &str) -> PyResult<Py<PyAny>> {
     let handler: &'static bolt_native_abi::HandlerV1 = match kind {
         "ok" => &native_test_handler::ECHO,
         "null_response" => &native_test_handler::NULL_RESPONSE,
+        "small_response" => &native_test_handler::SMALL_RESPONSE,
         "no_call" => &native_test_handler::NO_CALL,
+        "too_small" => &native_test_handler::TOO_SMALL,
         _ => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown kind {kind}"

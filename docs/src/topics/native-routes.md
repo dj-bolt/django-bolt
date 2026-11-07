@@ -24,9 +24,11 @@ api.native_route("GET", "/native/users/{id}", my_extension.user_handler())
 
 A native route is a route of the normal router. The path syntax, the trailing slash rule, the mount prefix and the automatic `OPTIONS` response are the same as for a Python route. A static route matches before a route with a path parameter. This is also true when one of the routes is native.
 
+Bolt does not check the type of a path parameter for a native route. Thus `native_route()` refuses a type such as `{id:int}`. Use `{id}`, and check the value in the handler. `{rest:path}` is valid. It matches the rest of the path, with its slashes.
+
 `native_route()` checks the capsule. These stop startup:
 
-- A capsule with another name, or with no `call` function.
+- A capsule with another name, a capsule smaller than `HandlerV1`, or a capsule with no `call` function.
 - A native route with the method and path of another route.
 - A native route at the path of an ASGI mount or an MCP mount.
 
@@ -34,7 +36,7 @@ A native route is a route of the normal router. The path syntax, the trailing sl
 
 Bolt does these steps:
 
-- Apply `BOLT_MAX_HEADER_SIZE` and the limit of 100 headers.
+- Apply `BOLT_MAX_HEADER_SIZE` and the limit of 100 headers. The size limit applies to each raw value, also a value that is not ASCII.
 - Read the full body. A body larger than `BOLT_MAX_UPLOAD_SIZE` gets 413. As for a Python route, no timeout applies while the body arrives.
 - Resolve the client address and the scheme with `BOLT_TRUSTED_PROXIES`.
 - Apply the global CORS configuration and compression.
@@ -91,6 +93,7 @@ Rules for the handler:
 - The request gives all headers, also `authorization` and `cookie`. A header value can have bytes that are not UTF-8; Python routes do not get such a header.
 - Path parameters are percent-decoded one time. A value that does not decode to UTF-8 stays encoded, as for Python routes. Bolt does not limit the length of a path parameter; the URL limit applies. The path and the query are not decoded.
 - Bolt sends 500 for a status outside 200-599. It drops a response header that is not valid HTTP and logs it. The response body is buffered.
+- Each ABI struct starts with `size`. A later version of `bolt-native-abi` adds fields only at the end, so a handler and Bolt can use different minor versions. `handler!` and `Responder` set `size` for you.
 - A native route for `GET` does not answer `HEAD`. Register `HEAD` too if you need it.
 
 ## Test a native route
