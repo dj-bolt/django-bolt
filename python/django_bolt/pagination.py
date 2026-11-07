@@ -30,7 +30,8 @@ from functools import wraps
 from typing import Any, Generic, TypeVar, get_args, get_origin
 
 import msgspec
-from django.db.models import Q
+from django.db.models import F
+from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, TupleLessThan
 
 from . import _json
 from .concurrency import run_in_orm_executor
@@ -653,11 +654,13 @@ class CursorPagination(PaginationBase):
         if cursor_value is not None:
             # Descending order continues with smaller values, ascending with larger values.
             lookup = "lt" if is_descending else "gt"
-            after_cursor = Q(**{f"{ordering_field}__{lookup}": cursor_value})
             # A cursor from before the tie-breaker holds no primary key. It keeps the old filter.
             if tie_break and cursor_pk is not None:
-                after_cursor |= Q(**{ordering_field: cursor_value, f"pk__{lookup}": cursor_pk})
-            ordered_qs = ordered_qs.filter(after_cursor)
+                # A row comparison, (field, pk) > (value, pk), lets an index on (field, pk) seek.
+                after = TupleLessThan if is_descending else TupleGreaterThan
+                ordered_qs = ordered_qs.filter(after(Tuple(F(ordering_field), F("pk")), (cursor_value, cursor_pk)))
+            else:
+                ordered_qs = ordered_qs.filter(**{f"{ordering_field}__{lookup}": cursor_value})
 
         # Fetch page_size + 1 items to determine if there's a next page
         raw_items = await self._evaluate_queryset_slice(ordered_qs[: page_size + 1])
