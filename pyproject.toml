@@ -109,6 +109,7 @@ dev = [
     "psycopg-pool>=3.3", # the `pool` extra: recovery through the connection pool of Django (`just test-pg`)
     "django-tenants>=3.14", # request lane tests with real schemas (`just test-pg`)
     "django-allauth>=65.19", # session login through allauth, read by Bolt routes
+    "redis>=5.0", # Django RedisCache for the shared revocation store tests (`-m redis`)
     "hypothesis>=6.140",
 ]
 docs = [
