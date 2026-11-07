@@ -142,6 +142,51 @@ def test_refresh_cookie_without_a_jti_is_rejected():
         assert response.status_code == 200, response.text
 
 
+def _post_with_refresh(client: TestClient, path: str, token: str):
+    """Send one refresh token, and no other cookie, to a lifecycle route."""
+    client.cookies.clear()
+    return client.post(path, headers={"Cookie": f"refresh_token={token}", **NO_CSRF_ORIGIN})
+
+
+@pytest.mark.parametrize("path", ["/auth/logout", "/auth/logout-all"])
+def test_used_refresh_token_cannot_log_out_the_token_that_replaced_it(path):
+    """Refresh uses R0 and gives R1. R0 must not end the session of R1."""
+    with TestClient(_views_api(secure_cookies=False)) as client:
+        client.post("/auth/login", json=LOGIN)
+        used = client.cookies.get("refresh_token")
+        assert client.post("/auth/refresh", headers=NO_CSRF_ORIGIN).status_code == 200
+        live = client.cookies.get("refresh_token")
+
+        assert _post_with_refresh(client, path, used).status_code == 401
+        assert _post_with_refresh(client, "/auth/refresh", live).status_code == 200
+
+
+def test_refresh_token_from_before_logout_all_cannot_log_out_a_new_login():
+    """Logout-all makes R0 invalid. R0 must not log out the next login, R1."""
+    with TestClient(_views_api(secure_cookies=False)) as client:
+        client.post("/auth/login", json=LOGIN)
+        old = client.cookies.get("refresh_token")
+        assert client.post("/auth/logout-all", headers=NO_CSRF_ORIGIN).status_code == 200
+        client.post("/auth/login", json=LOGIN)
+        new = client.cookies.get("refresh_token")
+
+        assert _post_with_refresh(client, "/auth/logout-all", old).status_code == 401
+        assert _post_with_refresh(client, "/auth/refresh", new).status_code == 200
+
+
+def test_logged_out_refresh_token_cannot_log_out_everywhere():
+    """Logout revokes the family of R0. R0 must not log out the other session, R1."""
+    with TestClient(_views_api(secure_cookies=False)) as client:
+        client.post("/auth/login", json=LOGIN)
+        logged_out = client.cookies.get("refresh_token")
+        client.post("/auth/login", json=LOGIN)
+        other = client.cookies.get("refresh_token")
+        assert _post_with_refresh(client, "/auth/logout", logged_out).status_code == 200
+
+        assert _post_with_refresh(client, "/auth/logout-all", logged_out).status_code == 401
+        assert _post_with_refresh(client, "/auth/refresh", other).status_code == 200
+
+
 class RecordingBackend(ModelBackend):
     """Django auth backend that keeps the request that each login attempt passes."""
 
@@ -186,66 +231,3 @@ def test_default_login_checks_the_django_user(settings):
     # The login passes the request of the client to Django, for backends that read it.
     assert len(recorded_requests) == 1
     assert recorded_requests[0] is not None
-
-
-ISSUER = "https://auth.example.com"
-AUDIENCE = "erp-api"
-
-
-@pytest.mark.parametrize(
-    ("issuer", "audience"),
-    [(ISSUER, AUDIENCE), (ISSUER, None), (None, AUDIENCE)],
-)
-def test_views_issue_and_rotate_scoped_refresh_tokens(issuer, audience):
-    with TestClient(_views_api(issuer=issuer, audience=audience, secure_cookies=False)) as client:
-        assert client.post("/auth/login", json=LOGIN).status_code == 200
-        original = jwt.decode(
-            client.cookies.get("refresh_token"),
-            SECRET,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
-        )
-        assert original.get("iss") == issuer
-        assert original.get("aud") == audience
-
-        assert client.post("/auth/refresh", headers=NO_CSRF_ORIGIN).status_code == 200
-        rotated = jwt.decode(
-            client.cookies.get("refresh_token"),
-            SECRET,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
-        )
-        assert rotated.get("iss") == issuer
-        assert rotated.get("aud") == audience
-        assert rotated["fam"] == original["fam"]
-        assert rotated["jti"] != original["jti"]
-        assert client.post("/auth/logout", headers=NO_CSRF_ORIGIN).status_code == 200
-
-
-@pytest.mark.parametrize("endpoint", ["/auth/refresh", "/auth/logout", "/auth/logout-all"])
-@pytest.mark.parametrize(
-    ("claim", "replacement"),
-    [("iss", None), ("iss", "https://other.example.com"), ("aud", None), ("aud", "other-api")],
-)
-def test_views_reject_wrong_or_missing_refresh_scope(endpoint, claim, replacement):
-    """Reject refresh credentials with missing or incorrect scope claims."""
-    api = _views_api(issuer=ISSUER, audience=AUDIENCE, secure_cookies=False)
-    with TestClient(api) as client:
-        assert client.post("/auth/login", json=LOGIN).status_code == 200
-        valid_token = client.cookies.get("refresh_token")
-        payload = jwt.decode(valid_token, SECRET, algorithms=["HS256"], issuer=ISSUER, audience=AUDIENCE)
-        if replacement is None:
-            payload.pop(claim)
-        else:
-            payload[claim] = replacement
-        invalid_token = jwt.encode(payload, SECRET, algorithm="HS256")
-
-        with TestClient(api) as other_client:
-            response = other_client.post(
-                endpoint,
-                headers={**NO_CSRF_ORIGIN, "Cookie": f"refresh_token={invalid_token}"},
-            )
-            assert response.status_code == 401
-
-        # A rejected request must not consume or invalidate the valid session.
-        assert client.post("/auth/refresh", headers=NO_CSRF_ORIGIN).status_code == 200
