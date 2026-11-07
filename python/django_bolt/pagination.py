@@ -30,7 +30,7 @@ from functools import wraps
 from typing import Any, Generic, TypeVar, get_args, get_origin
 
 import msgspec
-from django.db.models import F
+from django.db.models import CompositePrimaryKey, F
 from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, TupleLessThan
 
 from . import _json
@@ -633,7 +633,8 @@ class CursorPagination(PaginationBase):
         """
         page_params = await self.get_page_params(request)
         cursor_value = page_params["cursor"]
-        cursor_pk = page_params["cursor_pk"]
+        # An override of get_page_params from before the tie-breaker returns no "cursor_pk".
+        cursor_pk = page_params.get("cursor_pk")
         page_size = page_params["page_size"]
 
         # Apply ordering
@@ -657,8 +658,15 @@ class CursorPagination(PaginationBase):
             # A cursor from before the tie-breaker holds no primary key. It keeps the old filter.
             if tie_break and cursor_pk is not None:
                 # A row comparison, (field, pk) > (value, pk), lets an index on (field, pk) seek.
+                # A composite primary key adds each of its columns, and the cursor holds a list.
+                if isinstance(pk_field, CompositePrimaryKey):
+                    pk_columns = [F(name) for name in pk_field.field_names]
+                    pk_values = tuple(cursor_pk)
+                else:
+                    pk_columns = [F("pk")]
+                    pk_values = (cursor_pk,)
                 after = TupleLessThan if is_descending else TupleGreaterThan
-                ordered_qs = ordered_qs.filter(after(Tuple(F(ordering_field), F("pk")), (cursor_value, cursor_pk)))
+                ordered_qs = ordered_qs.filter(after(Tuple(F(ordering_field), *pk_columns), (cursor_value, *pk_values)))
             else:
                 ordered_qs = ordered_qs.filter(**{f"{ordering_field}__{lookup}": cursor_value})
 

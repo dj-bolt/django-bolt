@@ -24,7 +24,7 @@ from django_bolt import (
 )
 from django_bolt.testing import TestClient
 
-from .test_models import Article, Author, BlogPost
+from .test_models import Article, Author, BlogPost, Release
 
 # ============================================================================
 # Schemas
@@ -794,8 +794,9 @@ def test_cursor_pagination_keeps_tied_rows_with_values_queryset(sample_articles)
 
 
 @pytest.mark.django_db(transaction=True)
-def test_cursor_pagination_values_queryset_without_primary_key_is_an_error(sample_articles):
+def test_cursor_pagination_values_queryset_without_primary_key_is_an_error(sample_articles, settings):
     """With no primary key in values(), the next cursor cannot break ties, so the page fails loudly."""
+    settings.DEBUG = True  # the 500 body then shows the exception
     api = BoltAPI()
 
     class AuthorCursorPagination(CursorPagination):
@@ -807,10 +808,66 @@ def test_cursor_pagination_values_queryset_without_primary_key_is_an_error(sampl
     async def list_articles(request):
         return Article.objects.values("title", "author")
 
-    with TestClient(api, raise_server_exceptions=False) as client:
+    with TestClient(api) as client:
         response = client.get("/articles")
 
     assert response.status_code == 500
+    assert "ValueError" in response.text
+    assert "needs the primary key" in response.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_keeps_tied_rows_with_a_composite_primary_key(db):
+    """A composite primary key breaks ties with all of its columns."""
+    for product in ("api", "cli", "web"):
+        for version in range(1, 5):
+            Release.objects.create(product=product, version=version, channel="stable" if version % 2 else "beta")
+    api = BoltAPI()
+
+    class ChannelCursorPagination(CursorPagination):
+        page_size = 4
+        ordering = "channel"
+
+    @api.get("/release-models")
+    @paginate(ChannelCursorPagination)
+    async def list_release_models(request):
+        return Release.objects.all()
+
+    expected = [f"{r.product}:{r.version}" for r in Release.objects.order_by("channel", "pk")]
+    with TestClient(api) as client:
+        pages = []
+        url = "/release-models"
+        while url:
+            data = client.get(url).json()
+            pages.extend(f"{item['product']}:{item['version']}" for item in data["items"])
+            url = f"/release-models?cursor={quote(data['next_cursor'])}" if data.get("next_cursor") else None
+
+    assert pages == expected
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_get_page_params_override_may_omit_cursor_pk(sample_articles):
+    """An override of get_page_params from before the tie-breaker returns no cursor_pk. Pages still load."""
+    api = BoltAPI()
+
+    class LegacyCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "author"
+
+        async def get_page_params(self, request):
+            params = await super().get_page_params(request)
+            return {"cursor": params["cursor"], "page_size": params["page_size"]}
+
+    @api.get("/articles")
+    @paginate(LegacyCursorPagination)
+    async def list_articles(request):
+        return Article.objects.all()
+
+    with TestClient(api) as client:
+        response = client.get("/articles")
+
+    assert response.status_code == 200
+    assert len(response.json()["items"]) == 3
 
 
 @pytest.mark.django_db(transaction=True)
