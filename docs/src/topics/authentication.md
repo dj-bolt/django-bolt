@@ -913,6 +913,11 @@ Requires a model with `jti` (unique, indexed) and `expires_at`
 `expires_at < now()`. Slower than cache-based stores; only use when you
 don't have a cache layer.
 
+For user versions (`bump_user_version()` and `JWTAuthViews`), add
+`version = models.PositiveIntegerField(default=0)` to the model. The store
+keeps each user version in a row that does not expire, so the cleanup task
+keeps it.
+
 ### Custom revocation handler
 
 Pass `revoked_token_handler=` to decide revocation with your own code.

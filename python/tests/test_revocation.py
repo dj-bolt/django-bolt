@@ -10,6 +10,8 @@ from django.core.cache import caches
 from django.core.cache.backends.locmem import LocMemCache
 from django.db import IntegrityError, connection, models
 
+from django_bolt import BoltAPI
+from django_bolt.auth import JWTAuthViews
 from django_bolt.auth.revocation import (
     _DEFAULT_TTL_SECONDS,
     DjangoCacheRevocation,
@@ -18,6 +20,7 @@ from django_bolt.auth.revocation import (
     RevocationStore,
     _ttl_for,
 )
+from django_bolt.testing import TestClient
 
 # ---------------------------------------------------------------------------
 # InMemoryRevocation
@@ -506,6 +509,7 @@ class RevokedTokenRow(models.Model):
     jti = models.CharField(max_length=255, unique=True)
     revoked_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()
+    version = models.PositiveIntegerField(default=0)
 
     class Meta:
         app_label = "django_bolt"
@@ -585,3 +589,61 @@ def test_orm_family_revocation_is_per_family(orm_store):
     assert asyncio.run(store.is_revoked("f")) is False
     assert asyncio.run(store.is_revoked("family:f")) is True
     assert _expires_in("family:f") == pytest.approx(FUTURE, abs=3)
+
+
+def test_orm_user_version_counts_each_logout_all(orm_store):
+    store = orm_store()
+
+    assert asyncio.run(store.get_user_version("u")) == 0
+    assert asyncio.run(store.bump_user_version("u")) == 1
+    assert asyncio.run(store.bump_user_version("u")) == 2
+
+    assert asyncio.run(store.get_user_version("u")) == 2
+    assert asyncio.run(store.get_user_version("v")) == 0
+    # A user version is not a revoked token.
+    assert asyncio.run(store.is_revoked("u")) is False
+
+
+def test_orm_user_version_survives_the_cleanup_task(orm_store):
+    """The documented cleanup task deletes expired rows. It must not set a version back to 0."""
+    store = orm_store()
+    asyncio.run(store.bump_user_version("u"))
+
+    RevokedTokenRow.objects.filter(expires_at__lt=datetime.now(UTC)).delete()
+
+    assert asyncio.run(store.get_user_version("u")) == 1
+
+
+class _ViewsUser:
+    pk = "orm-user"
+    is_active = True
+
+
+def test_jwt_auth_views_work_on_the_orm_store(orm_store):
+    """Login, refresh and logout-all work on a database store. Logout-all ends the old refresh token."""
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return _ViewsUser()
+
+    JWTAuthViews(
+        store=orm_store(),
+        secret="a-secure-test-secret-that-is-long-enough",
+        secure_cookies=False,
+        credential_validator=validate,
+    ).register(api)
+    login = {"username": "orm-user", "password": "any"}
+    no_csrf_origin = {"Sec-Fetch-Site": "none"}
+
+    with TestClient(api) as client:
+        assert client.post("/auth/login", json=login).status_code == 200
+        assert client.post("/auth/refresh", headers=no_csrf_origin).status_code == 200
+        old = client.cookies.get("refresh_token")
+        assert client.post("/auth/logout-all", headers=no_csrf_origin).status_code == 200
+
+        client.cookies.clear()
+        stale = client.post("/auth/refresh", headers={"Cookie": f"refresh_token={old}", **no_csrf_origin})
+        assert stale.status_code == 401
+
+        assert client.post("/auth/login", json=login).status_code == 200
+        assert client.post("/auth/refresh", headers=no_csrf_origin).status_code == 200

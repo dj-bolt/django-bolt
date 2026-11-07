@@ -13,8 +13,11 @@ from django.apps import apps
 from django.core.cache import caches
 from django.core.cache.backends.base import BaseCache
 from django.db import IntegrityError
+from django.db.models import F
 
 _DEFAULT_TTL_SECONDS = 86400 * 7  # 7 days — fallback when caller doesn't pass `exp`
+# A user version row must stay, so the cleanup task of expired rows must not find it.
+_NEVER_EXPIRES = datetime(9999, 1, 1, tzinfo=UTC)
 
 
 def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS) -> int:
@@ -367,6 +370,8 @@ class DjangoORMRevocation(RevocationStore):
         jti = models.CharField(max_length=255, unique=True, db_index=True)
         revoked_at = models.DateTimeField(auto_now_add=True)
         expires_at = models.DateTimeField(db_index=True)
+        # Necessary for user versions (logout-all and JWTAuthViews).
+        version = models.PositiveIntegerField(default=0)
 
         class Meta:
             indexes = [
@@ -374,6 +379,9 @@ class DjangoORMRevocation(RevocationStore):
                 models.Index(fields=['expires_at']),
             ]
     ```
+
+    The store keeps the version of a user in the row ``version:<user_id>``.
+    That row does not expire, so the cleanup task below keeps it.
 
     Then run migrations:
     ```bash
@@ -471,6 +479,20 @@ class DjangoORMRevocation(RevocationStore):
 
     async def is_family_revoked(self, fam: str) -> bool:
         return await self.is_revoked(f"family:{fam}")
+
+    async def get_user_version(self, user_id: str) -> int:
+        rows = self.model.objects.filter(jti=f"version:{user_id}")
+        return await rows.values_list("version", flat=True).afirst() or 0
+
+    async def bump_user_version(self, user_id: str) -> int:
+        """Add 1 to the user version in one ``UPDATE``, so concurrent bumps do not lose a count.
+
+        A concurrent bump can make the returned version larger than this bump alone.
+        """
+        key = f"version:{user_id}"
+        await self.model.objects.aget_or_create(jti=key, defaults={"expires_at": _NEVER_EXPIRES})
+        await self.model.objects.filter(jti=key).aupdate(version=F("version") + 1)
+        return await self.get_user_version(user_id)
 
 
 def create_revocation_handler(store: RevocationStore):
