@@ -163,10 +163,10 @@ class WorkerLoop(asyncio.SelectorEventLoop):
     # Handle bookkeeping mirrors selector_events so cancellation semantics
     # (a replaced or removed reader never fires) are identical.
 
-    def _add_reader(self, fd, callback, *args):
+    def _add_reader(self, fd, callback, *args, context=None):
         self._check_closed()
         fd_key = fd if isinstance(fd, int) else fd.fileno()
-        handle = asyncio.Handle(callback, args, self, None)
+        handle = asyncio.Handle(callback, args, self, context=context)
         previous = self._readers.get(fd_key)
         self._scheduler.add_reader(fd_key, handle)
         self._readers[fd_key] = handle
@@ -174,10 +174,10 @@ class WorkerLoop(asyncio.SelectorEventLoop):
             previous.cancel()
         return handle
 
-    def _add_writer(self, fd, callback, *args):
+    def _add_writer(self, fd, callback, *args, context=None):
         self._check_closed()
         fd_key = fd if isinstance(fd, int) else fd.fileno()
-        handle = asyncio.Handle(callback, args, self, None)
+        handle = asyncio.Handle(callback, args, self, context=context)
         previous = self._writers.get(fd_key)
         self._scheduler.add_writer(fd_key, handle)
         self._writers[fd_key] = handle
