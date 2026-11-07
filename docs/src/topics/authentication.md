@@ -392,6 +392,9 @@ This adds `POST /auth/login`, `/auth/refresh`, `/auth/logout`, and
 username/password pair; lower-level helpers remain available for fully custom
 flows.
 
+`/auth/logout` and `/auth/logout-all` accept only a refresh token that
+`/auth/refresh` also accepts. A used, revoked or old-version token gets a 401.
+
 ### Issuing a pair
 
 Call `create_token_pair()` once the user has proved who they are — by
