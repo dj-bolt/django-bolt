@@ -63,6 +63,7 @@ class _Field(NamedTuple):
     name: str
     encode_name: str
     annotation: Any
+    default: Any = msgspec.NODEFAULT
 
 
 class _Shape(NamedTuple):
@@ -138,9 +139,13 @@ def _key(annotation: Any) -> Any:
 def _normalize(annotation: Any) -> Any:
     """Remove the wrappers that do not change what msgspec encodes."""
     while True:
+        origin = get_origin(annotation)
         if isinstance(annotation, typing.TypeAliasType):
-            annotation = annotation.__value__
-        elif get_origin(annotation) in _WRAPPER_ORIGINS:
+            annotation = _alias_value(annotation, ())
+        elif isinstance(origin, typing.TypeAliasType):
+            # A generic alias with its arguments, for example Accounts[Account].
+            annotation = _alias_value(origin, get_args(annotation))
+        elif origin in _WRAPPER_ORIGINS:
             annotation = get_args(annotation)[0]
         elif isinstance(annotation, TypeVar):
             # A parameter with no value: msgspec reads it as Any.
@@ -149,11 +154,38 @@ def _normalize(annotation: Any) -> Any:
             return annotation
 
 
-def _type_hints(cls: type) -> dict[str, Any]:
+def _alias_value(alias: typing.TypeAliasType, args: tuple[Any, ...]) -> Any:
+    """Return the value of a ``type`` alias, with its parameters replaced by ``args``."""
     try:
-        return typing.get_type_hints(cls)
+        value = alias.__value__
+    except NameError as exc:
+        raise _UnresolvedTypeError(f"{alias.__name__}: {exc}") from exc
+    return _substitute(value, dict(zip(alias.__type_params__, args, strict=False)))
+
+
+def _substitute(hint: Any, mapping: dict[Any, Any]) -> Any:
+    """Replace each type parameter in ``hint`` with its value in ``mapping``."""
+    if not mapping or isinstance(hint, type):
+        return hint
+    if isinstance(hint, TypeVar):
+        return mapping.get(hint, hint)
+    params = getattr(hint, "__parameters__", ())
+    if not params:
+        return hint
+    return hint[tuple(mapping.get(param, param) for param in params)]
+
+
+def _type_hints(annotation: Any, cls: type) -> dict[str, Any]:
+    """Return the field types of ``cls``. The arguments of a generic ``annotation`` replace its parameters."""
+    try:
+        hints = typing.get_type_hints(cls)
     except NameError as exc:
         raise _UnresolvedTypeError(f"{cls.__qualname__}: {exc}") from exc
+    args = get_args(annotation)
+    if not args:
+        return hints
+    mapping = dict(zip(getattr(cls, "__parameters__", ()), args, strict=False))
+    return {name: _substitute(hint, mapping) for name, hint in hints.items()}
 
 
 def _shape(annotation: Any) -> _Shape:
@@ -192,17 +224,21 @@ def _class_shape(annotation: Any, cls: type) -> _Shape:
             infos = msgspec.structs.fields(annotation)
         except NameError as exc:
             raise _UnresolvedTypeError(f"{cls.__qualname__}: {exc}") from exc
-        return _fields_shape("struct", cls, tuple(_Field(info.name, info.encode_name, info.type) for info in infos))
+        return _fields_shape(
+            "struct", cls, tuple(_Field(info.name, info.encode_name, info.type, info.default) for info in infos)
+        )
     if dataclasses.is_dataclass(cls):
-        hints = _type_hints(cls)
+        hints = _type_hints(annotation, cls)
         return _fields_shape(
             "dataclass", cls, tuple(_Field(item.name, item.name, hints[item.name]) for item in dataclasses.fields(cls))
         )
-    if typing.is_typeddict(cls):
-        return _fields_shape("fields", cls, tuple(_Field(name, name, hint) for name, hint in _type_hints(cls).items()))
+    if issubclass(cls, dict) and hasattr(cls, "__total__"):
+        # A TypedDict of typing or of typing_extensions: msgspec uses this check.
+        hints = _type_hints(annotation, cls)
+        return _fields_shape("fields", cls, tuple(_Field(name, name, hint) for name, hint in hints.items()))
     if issubclass(cls, tuple) and hasattr(cls, "_fields"):
         # A NamedTuple: msgspec encodes it as an array.
-        hints = _type_hints(cls)
+        hints = _type_hints(annotation, cls)
         return _Shape("fixed", children=tuple(hints.get(name, Any) for name in cls._fields))
     return _LEAF
 
@@ -273,12 +309,12 @@ class _Compiler:
             options = tuple(dumper for item in shape.children if (dumper := self.compile(item)) is not None)
             return options[0] if len(options) == 1 else functools.partial(_dump_union, options)
         plan = tuple(
-            (index, field.name, field.encode_name, dumper)
+            (index, field.name, field.encode_name, field.default, dumper)
             for index, field in enumerate(shape.fields)
             if (dumper := self.compile(field.annotation)) is not None
         )
         if shape.kind == "struct":
-            return functools.partial(_dump_struct, shape.cls, plan)
+            return _struct_dumper(shape.cls, plan)
         if shape.kind == "dataclass":
             return functools.partial(_dump_dataclass, shape.cls, plan)
         return functools.partial(_dump_dict_fields, plan)
@@ -322,15 +358,39 @@ def _dump_mapping(item: Dumper, value: Any) -> Any:
 
 
 def _dump_union(options: tuple[Dumper, ...], value: Any) -> Any:
-    """Apply the first option that changes ``value``. Each option changes only a value of its own type."""
+    """Apply each option in turn.
+
+    An option dumps only the Serializers at its own positions, and keeps each
+    other value. Thus the options together dump each Serializer at a position
+    of any member of the union.
+    """
     for option in options:
-        result = option(value)
-        if result is not value:
-            return result
+        value = option(value)
     return value
 
 
-def _dump_dict_fields(plan: tuple[tuple[int, str, str, Dumper], ...], value: Any) -> Any:
+# A step of a field plan: (index, name, wire name, default, dumper).
+Plan = tuple[tuple[int, str, str, Any, Dumper], ...]
+
+
+def _dump_array_fields(plan: Plan, offset: int, value: Any) -> Any:
+    """Dump the fields of a list at the position of an ``array_like`` Struct."""
+    if not isinstance(value, (list, tuple)):
+        return value
+    dumped = None
+    for index, _, _, _, dump in plan:
+        position = index + offset
+        if position < len(value):
+            element = value[position]
+            new_element = dump(element)
+            if new_element is not element:
+                if dumped is None:
+                    dumped = list(value)
+                dumped[position] = new_element
+    return value if dumped is None else dumped
+
+
+def _dump_dict_fields(plan: Plan, value: Any) -> Any:
     """Dump the fields of a dict at the position of a Struct, a dataclass or a TypedDict.
 
     The keys of the dict are the wire names, or else the field names.
@@ -338,7 +398,7 @@ def _dump_dict_fields(plan: tuple[tuple[int, str, str, Dumper], ...], value: Any
     if not isinstance(value, dict):
         return value
     dumped = None
-    for _, name, encode_name, dump in plan:
+    for _, name, encode_name, _, dump in plan:
         key = encode_name if encode_name in value else name
         if key in value:
             element = value[key]
@@ -350,16 +410,30 @@ def _dump_dict_fields(plan: tuple[tuple[int, str, str, Dumper], ...], value: Any
     return value if dumped is None else dumped
 
 
-def _dump_struct(cls: type, plan: tuple[tuple[int, str, str, Dumper], ...], value: Any) -> Any:
+def _struct_dumper(cls: type, plan: Plan) -> Dumper:
+    config = cls.__struct_config__
+    if config.array_like:
+        # A list at the position of the Struct holds its fields in order, after the tag if any.
+        other = functools.partial(_dump_array_fields, plan, 0 if config.tag is None else 1)
+    else:
+        other = functools.partial(_dump_dict_fields, plan)
+    return functools.partial(_dump_struct, cls, plan, config.omit_defaults, other)
+
+
+def _dump_struct(cls: type, plan: Plan, omit_defaults: bool, other: Dumper, value: Any) -> Any:
+    """Dump the fields of a Struct. ``other`` dumps a value of another type, for example a dict."""
     if not isinstance(value, cls):
-        return _dump_dict_fields(plan, value)
+        return other(value)
     if value.__class__ is not cls:
         return _dumper_of_subclass(value.__class__)(value)
     # astuple reads the slots, as msgspec does.
     elements = msgspec.structs.astuple(value)
     clone = None
-    for index, name, _, dump in plan:
+    for index, name, _, default, dump in plan:
         element = elements[index]
+        if omit_defaults and element is default:
+            # msgspec omits a field that holds its default object, so the field sends nothing.
+            continue
         new_element = dump(element)
         if new_element is not element:
             if clone is None:
@@ -369,10 +443,10 @@ def _dump_struct(cls: type, plan: tuple[tuple[int, str, str, Dumper], ...], valu
     return value if clone is None else clone
 
 
-def _dataclass_changes(plan: tuple[tuple[int, str, str, Dumper], ...], value: Any) -> list[tuple[str, Any]]:
+def _dataclass_changes(plan: Plan, value: Any) -> list[tuple[str, Any]]:
     """Return (name, dumped value) for each field of a dataclass object that the dump changes."""
     changes = []
-    for _, name, _, dump in plan:
+    for _, name, _, _, dump in plan:
         try:
             element = getattr(value, name)
         except AttributeError:
@@ -384,7 +458,7 @@ def _dataclass_changes(plan: tuple[tuple[int, str, str, Dumper], ...], value: An
     return changes
 
 
-def _dump_dataclass(cls: type, plan: tuple[tuple[int, str, str, Dumper], ...], value: Any) -> Any:
+def _dump_dataclass(cls: type, plan: Plan, value: Any) -> Any:
     if not isinstance(value, cls):
         return _dump_dict_fields(plan, value)
     if value.__class__ is not cls:

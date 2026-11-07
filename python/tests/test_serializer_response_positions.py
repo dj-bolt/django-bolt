@@ -19,6 +19,7 @@ from typing import Annotated, Generic, NotRequired, TypedDict, TypeVar
 
 import msgspec
 import pytest
+import typing_extensions
 
 from django_bolt import BoltAPI
 from django_bolt.serializers import Serializer, computed_field, field
@@ -75,6 +76,35 @@ class Box:
 class Holder(TypedDict):
     account: Account
     extra: NotRequired[Annotated[Account, "doc"]]
+
+
+class ExtensionsHolder(typing_extensions.TypedDict):
+    account: Account
+
+
+type Accounts[X] = list[X]
+
+
+@dataclasses.dataclass
+class GenericBox(Generic[T]):  # noqa: UP046 - PEP 695 params do not resolve under PEP 563
+    item: T
+
+
+class Pair(msgspec.Struct, array_like=True):
+    n: int
+    account: Account
+
+
+class FrozenAccount(Serializer, frozen=True):
+    id: int
+    password: str = field(write_only=True)
+
+
+DEFAULT_ACCOUNT = FrozenAccount(id=0, password=SECRET)
+
+
+class WithDefault(msgspec.Struct, omit_defaults=True):
+    account: FrozenAccount = DEFAULT_ACCOUNT
 
 
 def account(i: int = 1) -> Account:
@@ -296,3 +326,68 @@ def test_type_with_no_serializer_keeps_its_output():
 
     assert get(api, "/plain") == [{"id": 1}]
     assert get(api, "/mapping") == {"a": 1}
+
+
+def test_generic_alias_dataclass_and_extensions_typed_dict():
+    api = BoltAPI()
+
+    @api.get("/alias", validate_response=False)
+    def alias() -> dict[str, Accounts[Account]]:
+        return {"a": [account()]}
+
+    @api.get("/generic-dataclass", validate_response=False)
+    def generic_dataclass() -> dict[str, GenericBox[Account]]:
+        return {"box": GenericBox(item=account())}
+
+    @api.get("/extensions-typed-dict", validate_response=False)
+    def extensions_typed_dict() -> ExtensionsHolder:
+        return {"account": account()}
+
+    assert get(api, "/alias") == {"a": [DUMPED]}
+    assert get(api, "/generic-dataclass") == {"box": {"item": DUMPED}}
+    assert get(api, "/extensions-typed-dict") == {"account": DUMPED}
+
+
+def test_union_of_alternatives_that_each_hold_a_serializer():
+    api = BoltAPI()
+
+    @api.get("/first", validate_response=False)
+    def first() -> tuple[Account, int] | tuple[int, Account]:
+        return (account(), 7)
+
+    @api.get("/second", validate_response=False)
+    def second() -> tuple[Account, int] | tuple[int, Account]:
+        return (7, account())
+
+    @api.get("/both", validate_response=False)
+    def both() -> tuple[Account, int] | tuple[Account, Account]:
+        return (account(), account(2))
+
+    assert get(api, "/first") == [DUMPED, 7]
+    assert get(api, "/second") == [7, DUMPED]
+    assert get(api, "/both") == [DUMPED, {"id": 2, "label": "user-2"}]
+
+
+def test_array_like_struct_as_a_list():
+    api = BoltAPI()
+
+    @api.get("/pair", validate_response=False)
+    def pair() -> Pair:
+        return [7, account()]  # type: ignore[return-value]
+
+    assert get(api, "/pair") == [7, DUMPED]
+
+
+def test_omit_defaults_still_omits_the_default_serializer():
+    api = BoltAPI()
+
+    @api.get("/default")
+    def default() -> WithDefault:
+        return WithDefault()
+
+    @api.get("/other")
+    def other() -> WithDefault:
+        return WithDefault(account=FrozenAccount(id=3, password=SECRET))
+
+    assert get(api, "/default") == {}
+    assert get(api, "/other") == {"account": {"id": 3}}
