@@ -40,7 +40,7 @@ jobs:
     # A full run takes about 10 minutes. A hung test must not hold a runner
     # until a new push cancels the run.
     timeout-minutes: 30
-    # The PostgreSQL tests skip without a DSN; the service lets them count.
+    # The PostgreSQL and Redis tests skip without a server; the services let them count.
     services:
       postgres:
         image: postgres:18
@@ -53,8 +53,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       DJANGO_BOLT_TEST_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      DJANGO_BOLT_TEST_REDIS_URL: redis://127.0.0.1:6379/0
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

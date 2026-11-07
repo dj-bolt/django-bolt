@@ -101,6 +101,7 @@ def pytest_configure(config):
                 "django.contrib.messages",
                 "django.contrib.staticfiles",
                 "django_bolt",
+                "django_bolt.auth.revocation_db",
             ],
             MIDDLEWARE=[
                 "django.middleware.security.SecurityMiddleware",

@@ -64,3 +64,28 @@ def postgres_database() -> Any:
                 (name,),
             )
             admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
+
+
+REDIS_URL_VARIABLE = "DJANGO_BOLT_TEST_REDIS_URL"
+
+
+@pytest.fixture
+def redis_cache_settings() -> str:
+    """Settings text for a Django Redis cache on the configured server.
+
+    Parallel tests use the same Redis server, so each test gets its own key prefix.
+    The tests skip without the URL variable.
+    """
+    url = os.environ.get(REDIS_URL_VARIABLE)
+    if not url:
+        pytest.skip(f"Set {REDIS_URL_VARIABLE} to run the Redis tests.")
+    prefix = f"bolt_test_{secrets.token_hex(6)}"
+    return (
+        "CACHES = {\n"
+        '    "default": {\n'
+        '        "BACKEND": "django.core.cache.backends.redis.RedisCache",\n'
+        f'        "LOCATION": {url!r},\n'
+        f'        "KEY_PREFIX": {prefix!r},\n'
+        "    }\n"
+        "}\n"
+    )
