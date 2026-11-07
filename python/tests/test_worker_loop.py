@@ -89,6 +89,7 @@ def test_a_loop_uses_the_default_pool_of_the_moment():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="WorkerLoop file-descriptor watching requires Unix")
 def test_descriptor_watchers_accept_and_use_a_context():
     """Python 3.15 transports call loop._add_reader/_add_writer with context=..."""
     api = BoltAPI()
