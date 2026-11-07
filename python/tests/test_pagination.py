@@ -5,6 +5,10 @@ Tests pagination with actual Django models, database queries, and HTTP requests.
 No mocking - tests the full integration stack.
 """
 
+import base64
+from datetime import UTC, datetime
+from urllib.parse import quote
+
 import msgspec
 import pytest
 
@@ -703,6 +707,132 @@ def test_cursor_pagination_ordering_by_title(sample_articles):
         assert len(data["items"]) == 10
         # First item should be "Article 1" (alphabetically first)
         assert data["items"][0]["title"] == "Article 1"
+
+
+def _walk_cursor_pages(client, path):
+    """Follow next_cursor from the first page to the last page. Return the item IDs in order."""
+    ids = []
+    url = path
+    for _ in range(100):
+        response = client.get(url)
+        assert response.status_code == 200, response.content
+        data = response.json()
+        ids.extend(item["id"] for item in data["items"])
+        cursor = data.get("next_cursor")
+        if cursor is None:
+            return ids
+        url = f"{path}?cursor={quote(cursor)}"
+    raise AssertionError("cursor pagination did not reach a last page")
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("ordering", ["author", "-author"])
+def test_cursor_pagination_keeps_rows_that_share_the_ordering_value(sample_articles, ordering):
+    """A page that ends inside a group of equal ordering values must not skip the rest of the group."""
+    api = BoltAPI()
+
+    class AuthorCursorPagination(CursorPagination):
+        page_size = 3  # 5 articles per author, so pages end inside a group
+        ordering = "author"
+
+    AuthorCursorPagination.ordering = ordering
+
+    @api.get("/articles")
+    @paginate(AuthorCursorPagination)
+    async def list_articles(request):
+        return Article.objects.all()
+
+    with TestClient(api) as client:
+        ids = _walk_cursor_pages(client, "/articles")
+
+    expected = list(
+        Article.objects.order_by(ordering, "-pk" if ordering.startswith("-") else "pk").values_list("pk", flat=True)
+    )
+    assert ids == expected
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_keeps_rows_with_equal_datetimes(sample_articles):
+    """Rows created in the same instant page through "-created_at" without gaps."""
+    Article.objects.filter(pk__lte=25).update(created_at=datetime(2026, 1, 1, 12, 0, 0, 123456, tzinfo=UTC))
+    Article.objects.filter(pk__gt=25).update(created_at=datetime(2026, 1, 2, tzinfo=UTC))
+    api = BoltAPI()
+
+    class CreatedCursorPagination(CursorPagination):
+        page_size = 7
+        ordering = "-created_at"
+
+    @api.get("/articles")
+    @paginate(CreatedCursorPagination)
+    async def list_articles(request):
+        return Article.objects.all()
+
+    with TestClient(api) as client:
+        ids = _walk_cursor_pages(client, "/articles")
+
+    assert ids == list(Article.objects.order_by("-created_at", "-pk").values_list("pk", flat=True))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_keeps_tied_rows_with_values_queryset(sample_articles):
+    """A values() queryset that includes the primary key pages through tied values without gaps."""
+    api = BoltAPI()
+
+    class AuthorCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "author"
+
+    @api.get("/articles")
+    @paginate(AuthorCursorPagination)
+    async def list_articles(request):
+        return Article.objects.values("id", "title", "author")
+
+    with TestClient(api) as client:
+        ids = _walk_cursor_pages(client, "/articles")
+
+    assert ids == list(Article.objects.order_by("author", "pk").values_list("pk", flat=True))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_values_queryset_without_primary_key_is_an_error(sample_articles):
+    """With no primary key in values(), the next cursor cannot break ties, so the page fails loudly."""
+    api = BoltAPI()
+
+    class AuthorCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "author"
+
+    @api.get("/articles")
+    @paginate(AuthorCursorPagination)
+    async def list_articles(request):
+        return Article.objects.values("title", "author")
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/articles")
+
+    assert response.status_code == 500
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_accepts_a_cursor_without_a_primary_key(sample_articles):
+    """A cursor issued before the tie-breaker existed holds only the ordering value. It still works."""
+    api = BoltAPI()
+
+    class AuthorCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "author"
+
+    @api.get("/articles")
+    @paginate(AuthorCursorPagination)
+    async def list_articles(request):
+        return Article.objects.all()
+
+    legacy_cursor = base64.b64encode(b'{"v":"Author 3"}').decode()
+    with TestClient(api) as client:
+        response = client.get(f"/articles?cursor={quote(legacy_cursor)}")
+
+    assert response.status_code == 200
+    assert [item["author"] for item in response.json()["items"]] == ["Author 4"] * 3
 
 
 @pytest.mark.django_db(transaction=True)

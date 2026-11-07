@@ -80,6 +80,10 @@ async def list_articles(request) -> list[ArticleSerializer]:
 
 Query: `/articles?cursor=eyJ2IjoxMDB9`
 
+The `ordering` field does not have to be unique. Bolt also orders by the primary key, so rows with equal values keep their place across pages. The cursor holds the value and the primary key of the last row. For an index, add the primary key after the ordering field, for example `models.Index(fields=["-created_at", "-id"])`.
+
+A `values()` queryset must include the primary key, for example `Article.objects.values("id", "title")`. Without it, the paginator cannot make the next cursor and raises `ValueError`.
+
 ## Specifying the Serializer
 
 Two equivalent ways to specify which serializer to use:
