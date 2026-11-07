@@ -8,8 +8,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from django.core.cache import caches
 from django.core.cache.backends.locmem import LocMemCache
-from django.db import IntegrityError, connection, models
+from django.core.management import call_command
+from django.db import IntegrityError
 
+from django_bolt import BoltAPI
+from django_bolt.auth import JWTAuthViews
 from django_bolt.auth.revocation import (
     _DEFAULT_TTL_SECONDS,
     DjangoCacheRevocation,
@@ -18,6 +21,8 @@ from django_bolt.auth.revocation import (
     RevocationStore,
     _ttl_for,
 )
+from django_bolt.auth.revocation_db.models import RevokedToken
+from django_bolt.testing import TestClient
 
 # ---------------------------------------------------------------------------
 # InMemoryRevocation
@@ -496,39 +501,24 @@ def test_cache_without_atomic_operations_is_rejected(settings, tmp_path, backend
 
 
 # ---------------------------------------------------------------------------
-# DjangoORMRevocation – behavior on a real model
+# DjangoORMRevocation – behavior on the model of the shipped app
 # ---------------------------------------------------------------------------
-
-
-class RevokedTokenRow(models.Model):
-    """The model that the docstring of ``DjangoORMRevocation`` asks the project to define."""
-
-    jti = models.CharField(max_length=255, unique=True)
-    revoked_at = models.DateTimeField(auto_now_add=True)
-    expires_at = models.DateTimeField()
-
-    class Meta:
-        app_label = "django_bolt"
 
 
 @pytest.fixture
 def orm_store(transactional_db):
-    """Build a ``DjangoORMRevocation`` factory on a real table. Drop the table after the test."""
-    table = RevokedTokenRow._meta.db_table
-    with connection.schema_editor() as schema_editor:
-        if table not in connection.introspection.table_names():
-            schema_editor.create_model(RevokedTokenRow)
-    try:
-        yield lambda **kwargs: DjangoORMRevocation(model="django_bolt.RevokedTokenRow", **kwargs)
-    finally:
-        with connection.schema_editor() as schema_editor:
-            if table in connection.introspection.table_names():
-                schema_editor.delete_model(RevokedTokenRow)
+    """Build a ``DjangoORMRevocation`` factory on the table of ``django_bolt.auth.revocation_db``."""
+    return lambda **kwargs: DjangoORMRevocation(**kwargs)
+
+
+def test_revocation_db_migrations_match_the_model(db):
+    """A model change without its migration fails here."""
+    call_command("makemigrations", "bolt_revocation", "--check", "--dry-run", verbosity=0)
 
 
 def _expires_in(jti: str) -> float:
     """Seconds from now until the stored ``expires_at`` of a row."""
-    row = RevokedTokenRow.objects.get(jti=jti)
+    row = RevokedToken.objects.get(jti=jti)
     return (row.expires_at - datetime.now(UTC)).total_seconds()
 
 
@@ -541,7 +531,7 @@ def test_orm_revoke_marks_only_that_token(orm_store):
 
     assert asyncio.run(store.is_revoked("a")) is True
     assert asyncio.run(store.is_revoked("b")) is False
-    assert RevokedTokenRow.objects.filter(jti="a").count() == 1
+    assert RevokedToken.objects.filter(jti="a").count() == 1
 
 
 def test_orm_consume_is_single_use_for_each_jti(orm_store):
@@ -551,7 +541,7 @@ def test_orm_consume_is_single_use_for_each_jti(orm_store):
     assert asyncio.run(store.consume("a")) is False
     assert asyncio.run(store.consume("b")) is True
     assert asyncio.run(store.is_revoked("a")) is True
-    assert RevokedTokenRow.objects.filter(jti="a").count() == 1
+    assert RevokedToken.objects.filter(jti="a").count() == 1
 
 
 @pytest.mark.parametrize(
@@ -585,3 +575,61 @@ def test_orm_family_revocation_is_per_family(orm_store):
     assert asyncio.run(store.is_revoked("f")) is False
     assert asyncio.run(store.is_revoked("family:f")) is True
     assert _expires_in("family:f") == pytest.approx(FUTURE, abs=3)
+
+
+def test_orm_user_version_counts_each_logout_all(orm_store):
+    store = orm_store()
+
+    assert asyncio.run(store.get_user_version("u")) == 0
+    assert asyncio.run(store.bump_user_version("u")) == 1
+    assert asyncio.run(store.bump_user_version("u")) == 2
+
+    assert asyncio.run(store.get_user_version("u")) == 2
+    assert asyncio.run(store.get_user_version("v")) == 0
+    # A user version is not a revoked token.
+    assert asyncio.run(store.is_revoked("u")) is False
+
+
+def test_orm_user_version_survives_the_cleanup_task(orm_store):
+    """The documented cleanup task deletes expired rows. It must not set a version back to 0."""
+    store = orm_store()
+    asyncio.run(store.bump_user_version("u"))
+
+    RevokedToken.objects.filter(expires_at__lt=datetime.now(UTC)).delete()
+
+    assert asyncio.run(store.get_user_version("u")) == 1
+
+
+class _ViewsUser:
+    pk = "orm-user"
+    is_active = True
+
+
+def test_jwt_auth_views_work_on_the_orm_store(orm_store):
+    """Login, refresh and logout-all work on a database store. Logout-all ends the old refresh token."""
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return _ViewsUser()
+
+    JWTAuthViews(
+        store=orm_store(),
+        secret="a-secure-test-secret-that-is-long-enough",
+        secure_cookies=False,
+        credential_validator=validate,
+    ).register(api)
+    login = {"username": "orm-user", "password": "any"}
+    no_csrf_origin = {"Sec-Fetch-Site": "none"}
+
+    with TestClient(api) as client:
+        assert client.post("/auth/login", json=login).status_code == 200
+        assert client.post("/auth/refresh", headers=no_csrf_origin).status_code == 200
+        old = client.cookies.get("refresh_token")
+        assert client.post("/auth/logout-all", headers=no_csrf_origin).status_code == 200
+
+        client.cookies.clear()
+        stale = client.post("/auth/refresh", headers={"Cookie": f"refresh_token={old}", **no_csrf_origin})
+        assert stale.status_code == 401
+
+        assert client.post("/auth/login", json=login).status_code == 200
+        assert client.post("/auth/refresh", headers=no_csrf_origin).status_code == 200

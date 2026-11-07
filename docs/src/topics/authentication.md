@@ -902,19 +902,41 @@ evicted before their TTL.
 
 ### Django ORM revocation
 
+Add the app that has the table, then run `python manage.py migrate`:
+
+```python
+INSTALLED_APPS = [
+    # ...
+    "django_bolt.auth.revocation_db",
+]
+```
+
 ```python
 from django_bolt.auth import DjangoORMRevocation
 
-store = DjangoORMRevocation(
-    model="myapp.RevokedToken",  # 'app_label.ModelName' — exactly two parts
-    default_ttl=86400 * 7,
-)
+store = DjangoORMRevocation(default_ttl=86400 * 7)
 ```
 
-Requires a model with `jti` (unique, indexed) and `expires_at`
-(indexed) fields. A periodic cleanup task should delete rows where
-`expires_at < now()`. Slower than cache-based stores; only use when you
+The store works with `JWTAuthViews`, including logout-all. A periodic
+cleanup task should delete expired rows:
+
+```python
+from datetime import UTC, datetime
+
+from django_bolt.auth.revocation_db.models import RevokedToken
+
+
+async def cleanup_expired_tokens():
+    await RevokedToken.objects.filter(expires_at__lt=datetime.now(UTC)).adelete()
+```
+
+The store keeps each user version in a row that does not expire, so the
+cleanup task keeps it. Slower than cache-based stores; only use when you
 don't have a cache layer.
+
+To use a model of your own, pass `model="myapp.MyModel"`. The model must
+have the fields of `RevokedToken`: `jti` (unique), `revoked_at`,
+`expires_at` and `version`.
 
 ### Custom revocation handler
 
