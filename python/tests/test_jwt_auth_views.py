@@ -142,6 +142,51 @@ def test_refresh_cookie_without_a_jti_is_rejected():
         assert response.status_code == 200, response.text
 
 
+def _post_with_refresh(client: TestClient, path: str, token: str):
+    """Send one refresh token, and no other cookie, to a lifecycle route."""
+    client.cookies.clear()
+    return client.post(path, headers={"Cookie": f"refresh_token={token}", **NO_CSRF_ORIGIN})
+
+
+@pytest.mark.parametrize("path", ["/auth/logout", "/auth/logout-all"])
+def test_used_refresh_token_cannot_log_out_the_token_that_replaced_it(path):
+    """Refresh uses R0 and gives R1. R0 must not end the session of R1."""
+    with TestClient(_views_api(secure_cookies=False)) as client:
+        client.post("/auth/login", json=LOGIN)
+        used = client.cookies.get("refresh_token")
+        assert client.post("/auth/refresh", headers=NO_CSRF_ORIGIN).status_code == 200
+        live = client.cookies.get("refresh_token")
+
+        assert _post_with_refresh(client, path, used).status_code == 401
+        assert _post_with_refresh(client, "/auth/refresh", live).status_code == 200
+
+
+def test_refresh_token_from_before_logout_all_cannot_log_out_a_new_login():
+    """Logout-all makes R0 invalid. R0 must not log out the next login, R1."""
+    with TestClient(_views_api(secure_cookies=False)) as client:
+        client.post("/auth/login", json=LOGIN)
+        old = client.cookies.get("refresh_token")
+        assert client.post("/auth/logout-all", headers=NO_CSRF_ORIGIN).status_code == 200
+        client.post("/auth/login", json=LOGIN)
+        new = client.cookies.get("refresh_token")
+
+        assert _post_with_refresh(client, "/auth/logout-all", old).status_code == 401
+        assert _post_with_refresh(client, "/auth/refresh", new).status_code == 200
+
+
+def test_logged_out_refresh_token_cannot_log_out_everywhere():
+    """Logout revokes the family of R0. R0 must not log out the other session, R1."""
+    with TestClient(_views_api(secure_cookies=False)) as client:
+        client.post("/auth/login", json=LOGIN)
+        logged_out = client.cookies.get("refresh_token")
+        client.post("/auth/login", json=LOGIN)
+        other = client.cookies.get("refresh_token")
+        assert _post_with_refresh(client, "/auth/logout", logged_out).status_code == 200
+
+        assert _post_with_refresh(client, "/auth/logout-all", logged_out).status_code == 401
+        assert _post_with_refresh(client, "/auth/refresh", other).status_code == 200
+
+
 class RecordingBackend(ModelBackend):
     """Django auth backend that keeps the request that each login attempt passes."""
 
