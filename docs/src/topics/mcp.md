@@ -103,11 +103,14 @@ Both sync and async functions are supported (sync tools run in a worker thread).
     title="Add numbers",              # optional human-readable title
     description="Add two integers",   # defaults to the docstring
     output_schema={...},              # optional JSON Schema for the result
+    meta={"ui": {"resourceUri": "ui://add/view.html"}},  # optional tool `_meta`
     guards=[Requires("permissions", "calc")],   # per-tool authorization (see below)
 )
 async def add(a: int, b: int) -> dict:
     return {"sum": a + b}
 ```
+
+`meta` is sent as the tool's `_meta` in `tools/list`. [MCP Apps](https://modelcontextprotocol.io/extensions/apps) read it: `ui.resourceUri` names the resource that renders the tool's results, and `ui.visibility: ["app"]` hides the tool from the model.
 
 **Return values** map as follows:
 

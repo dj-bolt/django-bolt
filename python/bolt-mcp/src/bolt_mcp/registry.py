@@ -21,6 +21,7 @@ class ToolDef:
     output_schema: dict[str, Any] | None = None
     annotations: dict[str, Any] | None = None  # MCP ToolAnnotations (readOnlyHint, ...)
     icons: list[dict[str, Any]] | None = None
+    meta: dict[str, Any] | None = None  # sent as the tool's `_meta` (e.g. MCP Apps `ui`)
     guards: list[Any] = field(default_factory=list)
     # Computed at registration:
     args_struct: Any = None
