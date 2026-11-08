@@ -95,6 +95,7 @@ def test_revoked_token_is_rejected_after_logout(api):
 
         rejected = client.get("/protected", headers=headers)
         assert rejected.status_code == 401, rejected.text
+        assert rejected.json() == {"detail": "Token has been revoked"}
 
 
 @pytest.mark.django_db

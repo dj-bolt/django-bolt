@@ -6,8 +6,8 @@
 //! more. A response with no `ErrorInfo` comes from a handler, and stays as it is.
 //! This code runs on error paths only.
 
-use actix_web::http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use actix_web::http::StatusCode;
+use actix_web::http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use actix_web::{HttpRequest, HttpResponse};
 use ahash::AHashMap;
 use pyo3::exceptions::PyValueError;
@@ -144,10 +144,10 @@ fn json_bytes<'py>(
 fn error_request(py: Python<'_>, req: &HttpRequest, state: &AppState) -> PyResult<PyRequest> {
     let mut headers: AHashMap<String, String> = AHashMap::with_capacity(16);
     for (name, value) in req.headers().iter().take(MAX_HEADERS) {
-        if let Ok(value) = value.to_str() {
-            if value.len() <= state.max_header_size {
-                insert_header_line(&mut headers, name.as_str(), value);
-            }
+        if let Ok(value) = value.to_str()
+            && value.len() <= state.max_header_size
+        {
+            insert_header_line(&mut headers, name.as_str(), value);
         }
     }
     let conn_host = headers.get("host").cloned().unwrap_or_default();

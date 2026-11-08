@@ -326,6 +326,27 @@ class TestDenialMessage:
         assert resp.json() == {"detail": 'Say "no" — \\ ok'}
 
 
+class TestRepr:
+    """The repr of a guard shows the call that builds it. Logs and error pages show it."""
+
+    def test_any_of_shows_claim_and_values(self):
+        assert repr(Requires("role", "admin", "staff")) == "Requires('role', 'admin', 'staff')"
+
+    def test_presence_check_shows_only_the_claim(self):
+        assert repr(Requires("role")) == "Requires('role')"
+
+    def test_all_of_shows_the_keyword(self):
+        assert repr(Requires("permissions", all_of=["a", "b"])) == "Requires('permissions', all_of=['a', 'b'])"
+
+    def test_none_of_shows_the_keyword(self):
+        assert repr(Requires("role", none_of=["banned"])) == "Requires('role', none_of=['banned'])"
+
+    def test_message_is_shown(self):
+        guard = Requires("role", "client", message="Clients only")
+
+        assert repr(guard) == "Requires('role', 'client', message='Clients only')"
+
+
 # --- Registration-time failures: never silently leave a route open ---------
 
 
@@ -375,6 +396,71 @@ class TestRegistrationFailures:
     def test_empty_message_rejected(self):
         with pytest.raises(ImproperlyConfigured, match="message"):
             Requires("role", "client", message="")
+
+    @pytest.mark.parametrize(
+        ("args", "kwargs", "message"),
+        [
+            (
+                ("permissions", "a"),
+                {"all_of": ["b"]},
+                "Requires() takes positional values (any-of), all_of=[...] (all-of), or none_of=[...] (none-of) "
+                "— not both. They are the same quantifier; guards are cumulative, so combine them as separate "
+                "guards.",
+            ),
+            (
+                ("permissions",),
+                {"all_of": "abc"},
+                "Requires() all_of must be a list/tuple of values, got 'abc'.",
+            ),
+            (
+                ("role",),
+                {"none_of": "abc"},
+                "Requires() none_of must be a list/tuple of values, got 'abc'.",
+            ),
+            (
+                ("permissions",),
+                {"all_of": []},
+                "Requires() all_of must not be empty — omit it for a presence check.",
+            ),
+            (
+                ("role",),
+                {"none_of": []},
+                "Requires() none_of must not be empty — omit it for a presence check.",
+            ),
+            (
+                ("role", {"nested": "dict"}),
+                {},
+                "Requires('role') got value {'nested': 'dict'} (dict); claim values must be str, int, float, or bool "
+                "so they can be compiled into the Rust guard at registration.",
+            ),
+            (
+                ("role", "client"),
+                {"message": ""},
+                "Requires() message must be a non-empty string, got ''.",
+            ),
+        ],
+        ids=[
+            "two-quantifiers",
+            "all-of-string",
+            "none-of-string",
+            "all-of-empty",
+            "none-of-empty",
+            "bad-value",
+            "message",
+        ],
+    )
+    def test_error_message_names_the_mistake(self, args, kwargs, message):
+        with pytest.raises(ImproperlyConfigured) as raised:
+            Requires(*args, **kwargs)
+
+        assert str(raised.value) == message
+
+    def test_message_is_kept_on_the_guard(self):
+        guard = Requires("role", "client", message="Clients only")
+
+        assert guard.message == "Clients only"
+        assert guard.to_metadata()["message"] == "Clients only"
+        assert Requires("role", "client").message is None
 
     def test_no_guard_base_class(self):
         """There is no class to subclass. A custom check is a named Requires."""

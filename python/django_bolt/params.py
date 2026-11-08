@@ -6,6 +6,7 @@ Provides explicit parameter source annotations and validation metadata.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -322,6 +323,20 @@ def Form(
     )
 
 
+def _file_limit(name: str, value: Any, minimum: int) -> int | None:
+    """Return a limit of File(). Raise for a value that is not None or an int of the minimum or more."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"File {name} must be an int, got {type(value).__name__} {value!r}")
+    if value < minimum:
+        raise ValueError(f"File {name} must be {minimum} or more, got {value}")
+    # Rust reads a limit as a usize and ignores a larger int. sys.maxsize fits a usize.
+    if value > sys.maxsize:
+        raise ValueError(f"File {name} must be {sys.maxsize} or less, got {value}")
+    return value
+
+
 def File(
     default: Any = ...,
     *,
@@ -339,11 +354,15 @@ def File(
         default: Default value (... for required)
         alias: Alternative form field name
         description: Parameter description
-        max_size: Maximum file size in bytes (e.g., 2_000_000 for 2MB)
-        min_size: Minimum file size in bytes
+        max_size: Maximum file size in bytes (e.g., 2_000_000 for 2MB). An int of 0 or more.
+        min_size: Minimum file size in bytes. An int of 0 or more, and not above max_size.
         allowed_types: Allowed MIME types, as a list, a tuple or another iterable of str
             (e.g., ["image/*", "application/pdf"]). A str raises TypeError.
-        max_files: Maximum number of files for list[UploadFile] parameters
+        max_files: Maximum number of files for list[UploadFile] parameters. An int of 1 or more.
+
+    Raises:
+        TypeError: A limit is not an int. Rust ignores such a limit, so the check is here.
+        ValueError: A limit is out of range, or min_size is above max_size.
 
     Returns:
         Param marker instance
@@ -355,6 +374,13 @@ def File(
         ):
             content = await avatar.read()
     """
+    # Check the limits here. Rust ignores a value of the wrong type, so a typo
+    # such as max_size="10MB" would remove the limit with no error.
+    max_size = _file_limit("max_size", max_size, 0)
+    min_size = _file_limit("min_size", min_size, 0)
+    max_files = _file_limit("max_files", max_files, 1)
+    if max_size is not None and min_size is not None and min_size > max_size:
+        raise ValueError(f"File min_size {min_size} must not be above max_size {max_size}")
     if allowed_types is not None:
         # A str is a sequence of characters. "image/*" would give "*", and "*" allows each type.
         # Make the tuple before the item check, so that a generator is read only one time.

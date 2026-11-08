@@ -1,15 +1,16 @@
 use actix_web::HttpResponse;
 use ahash::{AHashMap, RandomState};
 use dashmap::DashMap;
-use governor::clock::{Clock, DefaultClock};
+use governor::clock::{Clock, DefaultClock, Reference};
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use once_cell::sync::Lazy;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::metadata::{RateLimitConfig, RateLimitKey};
 use crate::middleware::auth::AuthContext;
@@ -17,6 +18,82 @@ use crate::response_builder;
 use crate::responses;
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+type Instant = <DefaultClock as Clock>::Instant;
+
+/// One bucket: its limiter, and the state of its 429 log line.
+struct Bucket {
+    limiter: Limiter,
+    /// When the bucket was made. The log counts its seconds from here.
+    created: Instant,
+    /// The state of the log line in one word, so the second and the count
+    /// change in one step. The high 32 bits hold the second of the last line
+    /// plus one, or 0 before the first line. The low 32 bits count the
+    /// rejections since that line that wrote none.
+    log: AtomicU64,
+}
+
+/// The count bits of `Bucket::log`.
+const UNLOGGED: u64 = u32::MAX as u64;
+
+/// A rejected request: the wait for the next request, and whether to log it.
+struct Rejection {
+    wait: Duration,
+    /// The number of rejections that wrote no line since the last line, or
+    /// `None` when this rejection writes no line.
+    log: Option<u64>,
+}
+
+impl Bucket {
+    fn new(quota: Quota) -> Self {
+        let limiter = RateLimiter::direct(quota);
+        let created = limiter.clock().now();
+        Self {
+            limiter,
+            created,
+            log: AtomicU64::new(0),
+        }
+    }
+
+    /// Take one request. The limiter reads its own clock, because a new clock
+    /// runs `cpuid` to select its source, and a virtual machine traps that
+    /// instruction.
+    #[inline]
+    fn take(&self) -> Result<(), Rejection> {
+        self.limiter.check().map_err(|not_until| {
+            let now = self.limiter.clock().now();
+            Rejection {
+                wait: not_until.wait_time_from(now),
+                log: self.log_at(now),
+            }
+        })
+    }
+
+    /// Decide if a rejection at `now` writes a log line. The first rejection
+    /// of each second does, so a flood writes one line per second for each
+    /// bucket. The line counts the rejections before it that wrote none. The
+    /// stored second never goes back, so a late rejection of an earlier second
+    /// only adds to the count.
+    fn log_at(&self, now: Instant) -> Option<u64> {
+        let second = u64::from(now.duration_since(self.created)) / 1_000_000_000;
+        // A second fits in 32 bits for 136 years. A state below `line` holds
+        // an earlier second, with any count.
+        let line = (second + 1) << 32;
+        let mut state = self.log.load(Ordering::Relaxed);
+        while state < line {
+            match self
+                .log
+                .compare_exchange_weak(state, line, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(state & UNLOGGED),
+                Err(actual) => state = actual,
+            }
+        }
+        // One bucket cannot reject 2^32 requests in one second, so the count
+        // does not carry into the second.
+        self.log.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
 
 /// Seeds the bucket hash once per process. A caller must not be able to pick
 /// a key that lands in another caller's bucket, so the map from key material
@@ -36,6 +113,8 @@ struct LimiterKey(u64);
 #[derive(Debug, Clone, Copy)]
 enum KeySource<'a> {
     Ip(IpAddr),
+    /// The network of an IPv6 client, with its prefix length.
+    Ipv6Network(Ipv6Addr, u8),
     Header(&'a str),
     Identity(&'a str),
     Unknown,
@@ -53,6 +132,7 @@ impl KeySource<'_> {
             KeySource::Header(value) => (1u8, value).hash(&mut hasher),
             KeySource::Identity(value) => (2u8, value).hash(&mut hasher),
             KeySource::Unknown => 3u8.hash(&mut hasher),
+            KeySource::Ipv6Network(network, _) => (4u8, network).hash(&mut hasher),
         }
         LimiterKey(hasher.finish())
     }
@@ -70,6 +150,7 @@ impl fmt::Display for KeySource<'_> {
         match self {
             // An address is not a credential, and is the useful thing to read.
             KeySource::Ip(ip) => ip.fmt(f),
+            KeySource::Ipv6Network(network, prefix) => write!(f, "{network}/{prefix}"),
             KeySource::Header(_) => write!(f, "header:{:016x}", self.bucket().0),
             KeySource::Identity(_) => write!(f, "identity:{:016x}", self.bucket().0),
             KeySource::Unknown => f.write_str("unknown"),
@@ -83,12 +164,26 @@ impl fmt::Display for KeySource<'_> {
 ///
 /// `runbolt` makes one for all workers. A test app makes its own, because
 /// each test app starts its handler ids at 0.
-#[derive(Default)]
 pub struct RateLimiters {
-    /// Keyed on handler id, quota and client key.
-    limiters: DashMap<(usize, u32, u32, LimiterKey), Arc<Limiter>>,
+    /// Keyed on handler id, quota and client key. The client key is already
+    /// a seeded hash, so the map hashes with ahash, not SipHash.
+    limiters: DashMap<(usize, u32, u32, LimiterKey), Arc<Bucket>, RandomState>,
     /// The number of limiters, for cleanup.
     count: AtomicUsize,
+    /// The prefix length of the network that an IPv6 client keys on, and its
+    /// mask. See `client`.
+    ipv6_prefix: u8,
+    ipv6_mask: u128,
+}
+
+/// The default of `BOLT_RATE_LIMIT_IPV6_PREFIX`. A provider gives one client a
+/// /64 or more, so a client can send from 2^64 addresses.
+pub const DEFAULT_IPV6_PREFIX: u8 = 64;
+
+impl Default for RateLimiters {
+    fn default() -> Self {
+        Self::new(DEFAULT_IPV6_PREFIX)
+    }
 }
 
 // SECURITY: Maximum number of rate limiters to prevent memory exhaustion
@@ -158,8 +253,9 @@ pub fn check_rate_limit(
     let burst = config.burst;
 
     // Determine the rate limit key
+    let client = || client_ip.map(|ip| limiters.client(*ip));
     let source = match &config.key {
-        RateLimitKey::Ip => client_ip.map(|ip| KeySource::Ip(*ip)),
+        RateLimitKey::Ip => client(),
         // Custom header key — already lowercased once at startup when the
         // RateLimitConfig was parsed (headers map stores lowercase names).
         // The value is hashed rather than stored, so its length is not capped:
@@ -170,10 +266,8 @@ pub fn check_rate_limit(
         // Identity keys run after authentication. A caller with no identity
         // is limited per client address, so an unauthenticated flood cannot
         // pick a fresh bucket per request.
-        RateLimitKey::User => identity_source(auth_ctx, client_ip, |_| true),
-        RateLimitKey::ApiKey => {
-            identity_source(auth_ctx, client_ip, |ctx| ctx.backend == "api_key")
-        }
+        RateLimitKey::User => identity(auth_ctx, |_| true).or_else(client),
+        RateLimitKey::ApiKey => identity(auth_ctx, |ctx| ctx.backend == "api_key").or_else(client),
     }
     .unwrap_or(KeySource::Unknown);
 
@@ -182,43 +276,41 @@ pub fn check_rate_limit(
     // line of a rejection.
     let key = (handler_id, rps, burst, source.bucket());
     let outcome = match limiters.limiters.get(&key) {
-        Some(limiter) => limiter.check(),
+        Some(bucket) => bucket.take(),
         None => {
             // SECURITY: Check if we've exceeded max limiters (prevent memory exhaustion)
             if limiters.count.load(Ordering::Relaxed) >= MAX_LIMITERS {
                 // Trigger cleanup of old limiters (simple LRU-style)
                 limiters.cleanup_old_limiters();
             }
-            limiters
-                .limiters
-                .entry(key)
-                .or_insert_with(|| {
-                    // Increment counter
-                    limiters.count.fetch_add(1, Ordering::Relaxed);
+            let bucket = limiters.limiters.entry(key).or_insert_with(|| {
+                // Increment counter
+                limiters.count.fetch_add(1, Ordering::Relaxed);
 
-                    // Use NonZero constructors properly
-                    let rps_nonzero = std::num::NonZeroU32::new(rps.max(1)).unwrap();
-                    let burst_nonzero = std::num::NonZeroU32::new(burst.max(1)).unwrap();
-                    let quota = Quota::per_second(rps_nonzero).allow_burst(burst_nonzero);
-                    Arc::new(RateLimiter::direct(quota))
-                })
-                .check()
+                // Use NonZero constructors properly
+                let rps_nonzero = std::num::NonZeroU32::new(rps.max(1)).unwrap();
+                let burst_nonzero = std::num::NonZeroU32::new(burst.max(1)).unwrap();
+                let quota = Quota::per_second(rps_nonzero).allow_burst(burst_nonzero);
+                Arc::new(Bucket::new(quota))
+            });
+            bucket.take()
         }
     };
 
     // Check rate limit
     match outcome {
         Ok(_) => None, // Request allowed
-        Err(not_until) => {
+        Err(rejection) => {
             // Calculate retry after in seconds
-            let wait_time = not_until.wait_time_from(DefaultClock::default().now());
-            let retry_after = wait_time.as_secs().max(1);
+            let retry_after = rejection.wait.as_secs().max(1);
 
-            // Log rate limit exceeded
-            eprintln!(
-                "[django-bolt] Rate limit exceeded: {} {} | key: {} | limit: {} rps (burst: {}) | retry after: {}s",
-                method, path, source, rps, burst, retry_after
-            );
+            // Log the first rejection of each second for this bucket.
+            if let Some(unlogged) = rejection.log {
+                eprintln!(
+                    "[django-bolt] Rate limit exceeded: {} {} | key: {} | limit: {} rps (burst: {}) | retry after: {}s | suppressed: {}",
+                    method, path, source, rps, burst, retry_after, unlogged
+                );
+            }
 
             let response = response_builder::build_rate_limit_response(
                 retry_after,
@@ -240,22 +332,50 @@ pub fn check_rate_limit(
     }
 }
 
-/// The authenticated identity when `accept` admits the backend, else the
-/// client address.
+/// The authenticated identity when `accept` admits the backend.
 #[inline]
-fn identity_source<'a>(
-    auth_ctx: Option<&'a AuthContext>,
-    client_ip: Option<&IpAddr>,
+fn identity(
+    auth_ctx: Option<&AuthContext>,
     accept: impl Fn(&AuthContext) -> bool,
-) -> Option<KeySource<'a>> {
+) -> Option<KeySource<'_>> {
     auth_ctx
         .filter(|ctx| accept(ctx))
         .and_then(|ctx| ctx.user_id.as_deref())
         .map(KeySource::Identity)
-        .or_else(|| client_ip.map(|ip| KeySource::Ip(*ip)))
 }
 
 impl RateLimiters {
+    /// Limiters that key an IPv6 client on its first `ipv6_prefix` bits. A
+    /// prefix of 128 or more keys on the full address.
+    pub fn new(ipv6_prefix: u8) -> Self {
+        Self {
+            limiters: DashMap::default(),
+            count: AtomicUsize::new(0),
+            ipv6_prefix,
+            // The host bits are `MAX >> prefix`. A prefix over 128 keeps all bits.
+            ipv6_mask: !(u128::MAX.checked_shr(u32::from(ipv6_prefix)).unwrap_or(0)),
+        }
+    }
+
+    /// The prefix length of the network that an IPv6 client keys on.
+    pub fn ipv6_prefix(&self) -> u8 {
+        self.ipv6_prefix
+    }
+
+    /// The key of a client address. An IPv6 client keys on its network, so it
+    /// cannot get a fresh bucket for each address of that network. An IPv4
+    /// client keys on its address.
+    #[inline]
+    fn client(&self, ip: IpAddr) -> KeySource<'static> {
+        match ip {
+            IpAddr::V6(v6) if self.ipv6_prefix < 128 => KeySource::Ipv6Network(
+                Ipv6Addr::from(u128::from(v6) & self.ipv6_mask),
+                self.ipv6_prefix,
+            ),
+            ip => KeySource::Ip(ip),
+        }
+    }
+
     /// Cleanup old rate limiters when limit is reached
     /// Simple strategy: remove 20% of limiters to make room for new ones
     fn cleanup_old_limiters(&self) {
@@ -397,6 +517,29 @@ mod tests {
     }
 
     #[test]
+    fn a_bucket_logs_the_first_rejection_of_each_second() {
+        use governor::nanos::Nanos;
+
+        let quota = Quota::per_second(std::num::NonZeroU32::new(1).unwrap());
+        let bucket = Bucket::new(quota);
+        let at = |nanos: u64| bucket.created + Nanos::from(nanos);
+        assert_eq!(bucket.log_at(at(5_200_000_000)), Some(0));
+        assert_eq!(bucket.log_at(at(5_700_000_000)), None);
+        assert_eq!(bucket.log_at(at(5_900_000_000)), None);
+        // The next second logs, and counts the two rejections before it.
+        assert_eq!(bucket.log_at(at(6_100_000_000)), Some(2));
+        // A late rejection of an earlier second writes no line. Second 6
+        // keeps its one line.
+        assert_eq!(bucket.log_at(at(5_900_000_000)), None);
+        assert_eq!(bucket.log_at(at(6_200_000_000)), None);
+        assert_eq!(bucket.log_at(at(8_000_000_000)), Some(2));
+        // The first second of a new bucket logs too.
+        let fresh = Bucket::new(quota);
+        assert_eq!(fresh.log_at(fresh.created), Some(0));
+        assert_eq!(fresh.log_at(fresh.created), None);
+    }
+
+    #[test]
     fn a_full_map_drops_a_fifth_of_its_limiters() {
         let limiters = RateLimiters::default();
         let config = RateLimitConfig {
@@ -406,7 +549,7 @@ mod tests {
         };
         // Fill the map. The entries share one limiter, so the fill stays fast.
         let quota = Quota::per_second(std::num::NonZeroU32::new(100).unwrap());
-        let shared = Arc::new(RateLimiter::direct(quota));
+        let shared = Arc::new(Bucket::new(quota));
         for n in 0..MAX_LIMITERS as u64 {
             limiters
                 .limiters
@@ -429,5 +572,198 @@ mod tests {
         let expected = MAX_LIMITERS - MAX_LIMITERS / 5 + 1;
         assert_eq!(limiters.limiters.len(), expected);
         assert_eq!(limiters.count.load(Ordering::Relaxed), expected);
+    }
+
+    /// The context of a request that `backend` authenticated as `user_id`.
+    fn identity(backend: &'static str, user_id: &str) -> AuthContext {
+        AuthContext {
+            user_id: Some(user_id.to_string()),
+            is_staff: false,
+            is_superuser: false,
+            backend: std::borrow::Cow::Borrowed(backend),
+            backend_index: Some(0),
+            claims: None,
+            permissions: std::collections::HashSet::new(),
+            cookie_csrf: false,
+        }
+    }
+
+    /// One request from `address` through both checks of a route that allows
+    /// one request, as the handler runs them. Returns the rejection.
+    fn request(
+        limiters: &RateLimiters,
+        key: &RateLimitKey,
+        address: &str,
+        auth_ctx: Option<&AuthContext>,
+    ) -> Option<HttpResponse> {
+        let config = RateLimitConfig {
+            rps: 1,
+            burst: 1,
+            key: key.clone(),
+        };
+        let headers = AHashMap::new();
+        let address = ip(address);
+        check_before_auth(limiters, 0, &headers, Some(&address), &config, "GET", "/").or_else(
+            || {
+                check_after_auth(
+                    limiters,
+                    0,
+                    &headers,
+                    Some(&address),
+                    auth_ctx,
+                    &config,
+                    "GET",
+                    "/",
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn a_user_key_limits_each_identity_after_auth() {
+        let limiters = RateLimiters::default();
+        let alice = identity("jwt", "7");
+        let bob = identity("jwt", "8");
+        let key = RateLimitKey::User;
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&alice)).is_none());
+
+        let rejected = request(&limiters, &key, "203.0.113.7", Some(&alice))
+            .expect("the second request of one identity is limited");
+        assert_eq!(rejected.status(), 429);
+        for (name, value) in [
+            ("retry-after", "1"),
+            ("x-ratelimit-limit", "1"),
+            ("x-ratelimit-burst", "1"),
+        ] {
+            assert_eq!(rejected.headers().get(name).unwrap(), value, "{name}");
+        }
+
+        // Another identity from the same address has its own bucket.
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&bob)).is_none());
+        // The bucket of an identity does not depend on the address.
+        assert!(request(&limiters, &key, "203.0.113.9", Some(&alice)).is_some());
+        // With no identity, the address is the key.
+        assert!(request(&limiters, &key, "203.0.113.9", None).is_none());
+        assert!(request(&limiters, &key, "203.0.113.9", None).is_some());
+        assert!(request(&limiters, &key, "203.0.113.10", None).is_none());
+    }
+
+    #[test]
+    fn each_check_runs_only_its_own_keys() {
+        let limiters = RateLimiters::default();
+        let config = |key| RateLimitConfig {
+            rps: 1,
+            burst: 1,
+            key,
+        };
+        let headers = AHashMap::new();
+        let address = ip("203.0.113.7");
+        let alice = identity("jwt", "7");
+        for _ in 0..3 {
+            // An address key runs before authentication, so the check after
+            // it never counts the request a second time.
+            let by_address = config(RateLimitKey::Ip);
+            assert!(
+                check_after_auth(
+                    &limiters,
+                    0,
+                    &headers,
+                    Some(&address),
+                    Some(&alice),
+                    &by_address,
+                    "GET",
+                    "/"
+                )
+                .is_none()
+            );
+            // An identity key needs the context, so the check before
+            // authentication leaves it alone.
+            let by_user = config(RateLimitKey::User);
+            assert!(
+                check_before_auth(&limiters, 1, &headers, Some(&address), &by_user, "GET", "/")
+                    .is_none()
+            );
+        }
+        assert_eq!(limiters.limiters.len(), 0);
+    }
+
+    #[test]
+    fn an_ipv6_client_keys_on_its_network() {
+        let limiters = RateLimiters::default();
+        let key = RateLimitKey::Ip;
+        assert!(request(&limiters, &key, "2001:db8:1:2::1", None).is_none());
+        // Another address of the same /64 shares the bucket.
+        assert!(request(&limiters, &key, "2001:db8:1:2:ffff::9", None).is_some());
+        // The next /64 is another network.
+        assert!(request(&limiters, &key, "2001:db8:1:3::1", None).is_none());
+
+        // A caller with no identity falls back to its network too.
+        let user = RateLimitKey::User;
+        assert!(request(&limiters, &user, "2001:db8:1:4::1", None).is_none());
+        assert!(request(&limiters, &user, "2001:db8:1:4::2", None).is_some());
+    }
+
+    #[test]
+    fn the_ipv6_prefix_sets_the_network() {
+        assert_eq!(RateLimiters::default().ipv6_prefix(), 64);
+        assert_eq!(RateLimiters::new(56).ipv6_prefix(), 56);
+        let key = RateLimitKey::Ip;
+        // 128 keys on the full address.
+        let full = RateLimiters::new(128);
+        assert!(request(&full, &key, "2001:db8::1", None).is_none());
+        assert!(request(&full, &key, "2001:db8::2", None).is_none());
+        // 48 puts the /64 networks of one /48 in one bucket.
+        let wide = RateLimiters::new(48);
+        assert!(request(&wide, &key, "2001:db8:1:1::1", None).is_none());
+        assert!(request(&wide, &key, "2001:db8:1:2::1", None).is_some());
+        assert!(request(&wide, &key, "2001:db8:2:1::1", None).is_none());
+        // 0 puts all IPv6 clients in one bucket. IPv4 still keys on the address.
+        let none = RateLimiters::new(0);
+        assert!(request(&none, &key, "2001:db8::1", None).is_none());
+        assert!(request(&none, &key, "3fff::1", None).is_some());
+        assert!(request(&none, &key, "203.0.113.7", None).is_none());
+        assert!(request(&none, &key, "203.0.113.8", None).is_none());
+    }
+
+    #[test]
+    fn an_api_key_route_falls_back_to_the_ipv6_network() {
+        let limiters = RateLimiters::default();
+        let key = RateLimitKey::ApiKey;
+        // With no API key, the request counts on its /64 network.
+        assert!(request(&limiters, &key, "2001:db8:1:2::1", None).is_none());
+        assert!(request(&limiters, &key, "2001:db8:1:2::2", None).is_some());
+    }
+
+    #[test]
+    fn the_log_label_names_the_ipv6_network() {
+        let limiters = RateLimiters::default();
+        let label = |limiters: &RateLimiters, address| limiters.client(ip(address)).to_string();
+        assert_eq!(
+            label(&limiters, "2001:db8:1:2:3:4:5:6"),
+            "2001:db8:1:2::/64"
+        );
+        assert_eq!(label(&limiters, "203.0.113.7"), "203.0.113.7");
+        assert_eq!(label(&RateLimiters::new(128), "2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn an_api_key_route_counts_only_api_key_identities() {
+        let limiters = RateLimiters::default();
+        let key = RateLimitKey::ApiKey;
+        // Two keys from one address have two buckets.
+        let first = identity("api_key", "apikey:aaa");
+        let second = identity("api_key", "apikey:bbb");
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&first)).is_none());
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&second)).is_none());
+        assert!(request(&limiters, &key, "203.0.113.7", Some(&first)).is_some());
+        // The bucket of an API key does not depend on the address.
+        assert!(request(&limiters, &key, "203.0.113.9", Some(&first)).is_some());
+
+        // A JWT is not an API key. Two JWT users from one address share the
+        // bucket of that address.
+        let alice = identity("jwt", "7");
+        let bob = identity("jwt", "8");
+        assert!(request(&limiters, &key, "203.0.113.9", Some(&alice)).is_none());
+        assert!(request(&limiters, &key, "203.0.113.9", Some(&bob)).is_some());
     }
 }

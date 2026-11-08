@@ -84,15 +84,15 @@ impl WebSocketRouter {
         }
 
         // Radix tree lookup only if we have dynamic routes
-        if self.has_dynamic_routes {
-            if let Ok(matched) = self.dynamic_router.at(path) {
-                let mut params = AHashMap::new();
-                for (key, value) in matched.params.iter() {
-                    params.insert(key.to_string(), value.to_string());
-                }
-                bolt_core::router::decode_path_params(&mut params);
-                return Some((matched.value, params));
+        if self.has_dynamic_routes
+            && let Ok(matched) = self.dynamic_router.at(path)
+        {
+            let mut params = AHashMap::new();
+            for (key, value) in matched.params.iter() {
+                params.insert(key.to_string(), value.to_string());
             }
+            bolt_core::router::decode_path_params(&mut params);
+            return Some((matched.value, params));
         }
 
         None

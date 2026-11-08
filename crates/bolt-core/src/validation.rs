@@ -1,6 +1,6 @@
 use crate::cookies::cookie_pairs;
-use crate::middleware::auth::{authenticate, session_context, AuthBackend, AuthContext};
-use crate::permissions::{evaluate_guards, GuardDenial, GuardResult, GuardSet};
+use crate::middleware::auth::{AuthBackend, AuthContext, authenticate, session_context};
+use crate::permissions::{GuardDenial, GuardResult, GuardSet, evaluate_guards};
 use actix_web::http::uri::Authority;
 /// Shared validation logic used by both production handler and test handler
 /// All functions marked #[inline(always)] for zero-cost abstraction
@@ -358,7 +358,7 @@ mod tests {
 
     fn api_key_backend() -> AuthBackend {
         AuthBackend::APIKey {
-            api_keys: ["k1".to_string()].into(),
+            api_keys: ["k1".to_string()].into_iter().collect(),
             header: "x-api-key".to_string(),
             key_permissions: [("k1".to_string(), vec!["read".to_string()])].into(),
         }

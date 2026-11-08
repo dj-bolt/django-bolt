@@ -36,7 +36,7 @@ CORS_ALLOWED_ORIGINS = [
 
 ### CORS_ALLOWED_ORIGIN_REGEXES
 
-List of regular expressions for allowed origins. An origin is allowed when it is in `CORS_ALLOWED_ORIGINS` or when a pattern matches it. A pattern can match a part of the origin, so start each pattern with `^` and end it with `$`. Bolt ignores an invalid pattern and writes a warning at startup.
+List of regular expressions for allowed origins. An origin is allowed when it is in `CORS_ALLOWED_ORIGINS` or when a pattern matches it. A pattern can match a part of the origin, so start each pattern with `^` and end it with `$`. Bolt ignores an invalid pattern and writes a warning at startup. A route with `@cors` uses its own origins and patterns in place of `CORS_ALLOWED_ORIGINS` and these patterns.
 
 ```python
 CORS_ALLOWED_ORIGIN_REGEXES = [
@@ -107,7 +107,7 @@ Bolt uses this list to find the canonical client address for
 
 - The list is empty. Bolt keys on the peer address of the connection and ignores every forwarding header.
 - The peer is not in the list. Bolt keys on the peer address. That peer is not a declared proxy, so its headers prove nothing.
-- The peer is in the list. Bolt reads `X-Forwarded-For` from the right and takes the first entry that is not a listed proxy. When every entry is a listed proxy, the client is inside your network and Bolt takes the leftmost entry. Without the header, Bolt falls back to a valid `X-Real-IP`, then the peer address. A malformed chain also falls back to the peer.
+- The peer is in the list. Bolt reads `X-Forwarded-For` from the right and takes the first entry that is not a listed proxy. When every entry is a listed proxy, the client is inside your network and Bolt takes the leftmost entry. Without the header, Bolt falls back to the last `X-Real-IP` line when it is a valid address, then the peer address. A malformed chain also falls back to the peer.
 
 Bolt uses the same list for the request scheme. Only a peer in the list can set the scheme with `X-Forwarded-Proto`. Bolt reads the rightmost value, because the proxy closest to Bolt adds it. A value other than `http` or `https` is ignored. From any other peer, the scheme is the scheme of the connection. Bolt does not end TLS, so that scheme is `http`. The scheme sets these values:
 
@@ -122,6 +122,18 @@ Both an address and a block are accepted. `127.0.0.1` matches one address. `10.0
 
 !!! warning "Set this when you run behind a proxy"
     A client sends `X-Forwarded-For` itself, and a proxy appends to it. Without this setting Bolt ignores the header, so every caller behind the proxy shares one bucket. With the setting, Bolt separates them again and a client cannot pick its own bucket. Behind a proxy that ends TLS, Bolt also needs this setting to see `https`.
+
+### BOLT_RATE_LIMIT_IPV6_PREFIX
+
+The prefix length of the network that a rate limit counts an IPv6 client on. The value is an int from 0 to 128. The default is 64.
+
+```python
+BOLT_RATE_LIMIT_IPV6_PREFIX = 64
+```
+
+A provider usually gives one client a /64 network or more. With a key of the full address, that client could send each request from a new address and get a new bucket. Thus `@rate_limit(key="ip")` counts an IPv6 client per /64 network. The address fallback of `key="user"` and `key="api_key"` does the same. An IPv4 client is counted per address.
+
+Set 128 to count each IPv6 address. Do this when clients that are not related share one /64, for example virtual machines of a cloud provider. Set a smaller value, such as 56 or 48, to count a larger network as one client. The 429 log line names the network, for example `2001:db8:1:2::/64`. `request.META["REMOTE_ADDR"]` keeps the full address. An invalid value raises `ImproperlyConfigured` at startup.
 
 ## File upload settings
 
@@ -157,6 +169,20 @@ BOLT_MAX_UPLOAD_SIZE = FileSize.MB_10
     **If you set `File(max_size=...)` higher than `BOLT_MAX_UPLOAD_SIZE`, the global limit always takes precedence.**
 
     This distinction is important for security and resource management. Always set `BOLT_MAX_UPLOAD_SIZE` to the maximum file size your server should ever accept, and use `File(max_size=...)` for endpoint-specific needs.
+
+## Native route settings
+
+### BOLT_NATIVE_ROUTE_TIMEOUT
+
+Maximum time (seconds) to wait for a native route handler to complete a request. At the limit, Bolt sends `504 Gateway Timeout`.
+
+```python
+BOLT_NATIVE_ROUTE_TIMEOUT = 30
+```
+
+**Default:** `30`
+
+The value must be more than 0. An int or a float is valid.
 
 ## ASGI mount settings
 
@@ -258,7 +284,9 @@ BOLT_ALLOWED_FILE_PATHS = [
 ]
 ```
 
-When set, `FileResponse` only serves files within these directories.
+The setting is a list or a tuple of absolute paths. Each path is a str or a `Path`. One str is not a list, so it stops startup with `ImproperlyConfigured`. A relative path, such as `""` or `"media"`, also stops startup. `None` or an empty list sets no limit.
+
+When set, `FileResponse` only serves files within these directories. For a path outside them, it raises `ResponseFileNotAllowed`, and Bolt answers 403. When the lookup of a path fails, Bolt follows its links, as `realpath` does, to the point where the lookup stops. Nothing exists below that point, so Bolt completes the path from there as text. When that path is outside these directories, Bolt answers 403, also when the path names no file. Thus a client cannot learn which regular files exist there, on Linux, macOS and Windows. A path can leave these directories with `..` and come back into them. Such a path can still show whether a directory, or a link into these directories, exists outside them.
 
 ## Static and media file serving
 
@@ -416,7 +444,7 @@ The `runbolt` management command accepts these options:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--host` | `0.0.0.0` | Bind address |
+| `--host` | `0.0.0.0` | Bind address: an IP address, an IPv6 address in brackets, or a host name. A host name binds its first IPv4 address, so `localhost` binds `127.0.0.1`. A host name that does not resolve stops startup. |
 | `--port` | `8000` | Bind port |
 | `--workers` | `1`, or the CPU count on free-threaded Python | Actix worker threads per process. Each thread runs Python handlers. |
 | `--processes` | `1` | Number of processes |
@@ -509,9 +537,10 @@ api = BoltAPI(
 | `CORS_ALLOW_HEADERS` | `list[str]` | `Content-Type`, `Authorization` | Allowed headers |
 | `CORS_EXPOSE_HEADERS` | `list[str]` | `[]` | Exposed headers |
 | `CORS_PREFLIGHT_MAX_AGE` | `int` | `3600` | Preflight cache (seconds) |
+| `BOLT_RATE_LIMIT_IPV6_PREFIX` | `int` | `64` | Network prefix that a rate limit counts an IPv6 client on |
 | `BOLT_MAX_UPLOAD_SIZE` | `int` | `1048576` | Max upload size (bytes) |
 | `BOLT_MEMORY_SPOOL_THRESHOLD` | `int` | `1048576` | Memory threshold before disk spooling (bytes) |
-| `BOLT_ALLOWED_FILE_PATHS` | `list[str]` | `None` | File serving whitelist |
+| `BOLT_ALLOWED_FILE_PATHS` | `list[str \| Path]` | `None` | File serving whitelist |
 | `BOLT_STATIC_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for static (`public`) |
 | `BOLT_MEDIA_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for media (`private`) |
 | `BOLT_LOG_QUEUE_SIZE` | `int` | `10000` | Max depth of the non-blocking log queue (records dropped when full) |
