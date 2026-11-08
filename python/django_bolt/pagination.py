@@ -30,6 +30,8 @@ from functools import wraps
 from typing import Any, Generic, TypeVar, get_args, get_origin
 
 import msgspec
+from django.db.models import CompositePrimaryKey, F
+from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, TupleLessThan
 
 from . import _json
 from .concurrency import run_in_orm_executor
@@ -563,7 +565,9 @@ class CursorPagination(PaginationBase):
         page_size: Default number of items per page (default: 100)
         max_page_size: Maximum allowed page size (default: 1000)
         page_size_query_param: Query param name for page size (default: "page_size")
-        ordering: Field to order by (default: "-id" for descending ID)
+        ordering: Field to order by (default: "-id" for descending ID).
+            The primary key breaks ties, so the field does not have to be unique.
+            A values() queryset must include the primary key.
     """
 
     page_size: int = 100
@@ -571,35 +575,36 @@ class CursorPagination(PaginationBase):
     page_size_query_param: str = "page_size"
     ordering: str = "-id"  # Default ordering field
 
-    def _encode_cursor(self, value: Any) -> str:
+    def _encode_cursor(self, value: Any, pk: Any = None) -> str:
         """
-        Encode cursor value to base64 string.
+        Encode cursor position to base64 string.
 
         Args:
-            value: Cursor value (typically an ID)
+            value: Ordering value of the last row
+            pk: Primary key of the last row. None when the ordering field is the primary key.
 
         Returns:
             Base64-encoded cursor string
         """
-        cursor_data = _json.encode({"v": value})
+        cursor_data = _json.encode({"v": value} if pk is None else {"v": value, "pk": pk})
         return base64.b64encode(cursor_data).decode("utf-8")
 
-    def _decode_cursor(self, cursor: str) -> Any:
+    def _decode_cursor(self, cursor: str) -> tuple[Any, Any]:
         """
-        Decode cursor string to value.
+        Decode cursor string to position.
 
         Args:
             cursor: Base64-encoded cursor string
 
         Returns:
-            Decoded cursor value
+            (ordering value, primary key). Each is None when the cursor does not hold it.
         """
         try:
             cursor_data = base64.b64decode(cursor.encode("utf-8"))
             data = msgspec.json.decode(cursor_data)
-            return data.get("v")
+            return data.get("v"), data.get("pk")
         except Exception:
-            return None
+            return None, None
 
     async def get_page_params(self, request: dict[str, Any]) -> dict[str, Any]:
         """Extract cursor and page_size from request."""
@@ -607,12 +612,12 @@ class CursorPagination(PaginationBase):
 
         # Get cursor (optional)
         cursor_str = query.get("cursor")
-        cursor_value = self._decode_cursor(cursor_str) if cursor_str else None
+        cursor_value, cursor_pk = self._decode_cursor(cursor_str) if cursor_str else (None, None)
 
         # Get page size
         page_size = self._get_page_size(request)
 
-        return {"cursor": cursor_value, "page_size": page_size}
+        return {"cursor": cursor_value, "cursor_pk": cursor_pk, "page_size": page_size}
 
     async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> Any:
         """
@@ -628,26 +633,42 @@ class CursorPagination(PaginationBase):
         """
         page_params = await self.get_page_params(request)
         cursor_value = page_params["cursor"]
+        # An override of get_page_params from before the tie-breaker returns no "cursor_pk".
+        cursor_pk = page_params.get("cursor_pk")
         page_size = page_params["page_size"]
 
         # Apply ordering
         ordering = self.ordering
         is_descending = ordering.startswith("-")
         ordering_field = ordering.lstrip("-")
+        pk_field = queryset.model._meta.pk
 
-        # Apply ordering to queryset
-        ordered_qs = queryset.order_by(ordering)
+        # Rows can share an ordering value. Order by the primary key too, so that
+        # a page that ends inside such a group continues at the next row.
+        tie_break = ordering_field not in ("pk", pk_field.name, pk_field.attname)
+        if tie_break:
+            ordered_qs = queryset.order_by(ordering, "-pk" if is_descending else "pk")
+        else:
+            ordered_qs = queryset.order_by(ordering)
 
         # Apply cursor filter if present
         if cursor_value is not None:
-            if is_descending:
-                # For descending order, we want items less than cursor
-                filter_kwargs = {f"{ordering_field}__lt": cursor_value}
+            # Descending order continues with smaller values, ascending with larger values.
+            lookup = "lt" if is_descending else "gt"
+            # A cursor from before the tie-breaker holds no primary key. It keeps the old filter.
+            if tie_break and cursor_pk is not None:
+                # A row comparison, (field, pk) > (value, pk), lets an index on (field, pk) seek.
+                # A composite primary key adds each of its columns, and the cursor holds a list.
+                if isinstance(pk_field, CompositePrimaryKey):
+                    pk_columns = [F(name) for name in pk_field.field_names]
+                    pk_values = tuple(cursor_pk)
+                else:
+                    pk_columns = [F("pk")]
+                    pk_values = (cursor_pk,)
+                after = TupleLessThan if is_descending else TupleGreaterThan
+                ordered_qs = ordered_qs.filter(after(Tuple(F(ordering_field), *pk_columns), (cursor_value, *pk_values)))
             else:
-                # For ascending order, we want items greater than cursor
-                filter_kwargs = {f"{ordering_field}__gt": cursor_value}
-
-            ordered_qs = ordered_qs.filter(**filter_kwargs)
+                ordered_qs = ordered_qs.filter(**{f"{ordering_field}__{lookup}": cursor_value})
 
         # Fetch page_size + 1 items to determine if there's a next page
         raw_items = await self._evaluate_queryset_slice(ordered_qs[: page_size + 1])
@@ -664,11 +685,21 @@ class CursorPagination(PaginationBase):
             # Items are raw (Django models or dicts from values()), get cursor value
             if isinstance(last_item, dict):
                 last_value = last_item.get(ordering_field)
+                last_pk = last_item.get(pk_field.attname, last_item.get("pk"))
             else:
                 last_value = getattr(last_item, ordering_field, None)
+                last_pk = getattr(last_item, "pk", None)
 
             if last_value is not None:
-                next_cursor = self._encode_cursor(last_value)
+                if not tie_break:
+                    next_cursor = self._encode_cursor(last_value)
+                elif last_pk is None:
+                    raise ValueError(
+                        f"CursorPagination ordering {ordering!r} needs the primary key "
+                        f"{pk_field.attname!r} in values() to continue after rows with equal values."
+                    )
+                else:
+                    next_cursor = self._encode_cursor(last_value, last_pk)
 
         # Serialize items using efficient batch serialization
         items = await self._serialize_items(raw_items)

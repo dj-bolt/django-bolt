@@ -2,11 +2,13 @@
 Test parameter validation and inference system.
 """
 
+from typing import Annotated
+
 import msgspec
 import pytest
 
 from django_bolt import BoltAPI
-from django_bolt.params import Body, Query
+from django_bolt.params import Body, Param, Query
 
 
 class UserCreate(msgspec.Struct):
@@ -181,3 +183,15 @@ def test_error_message_clarity():
     assert "Solutions:" in error_msg
     assert "POST/PUT/PATCH" in error_msg
     assert "Query()" in error_msg
+
+
+@pytest.mark.parametrize("default", [None, 5], ids=["required", "with-default"])
+def test_unknown_parameter_source_raises_at_registration(default):
+    """A marker with a source that Bolt does not know stops the route registration."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match="Parameter 'value' has an unsupported source 'cookies'"):
+
+        @api.get("/items")
+        async def handler(value: Annotated[int, Param(source="cookies")] = default):
+            return {"value": value}

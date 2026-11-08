@@ -199,13 +199,17 @@ class MCP:
         return register
 
     def tool_middleware(self, fn: ToolMiddleware) -> ToolMiddleware:
-        """Register an async middleware that runs around every ``tools/call``.
+        """Register an async middleware that runs around each allowed ``tools/call``.
+
+        Bolt rejects a call to an unknown tool, or a call that fails authentication
+        or the tool guards, in Rust. Middleware does not run for these calls.
 
         ``async def middleware(call: ToolCall, call_next) -> dict``: ``call`` has the
         tool name, the raw arguments, the request ``_meta`` and the principal, and
         ``await call_next()`` runs the tool and returns its CallToolResult dict
         (an exception in the tool is already an ``isError`` result). The middleware
-        returns that dict or another one. The first registered middleware runs
+        returns that dict or another one. Bolt adds ``resultType`` to a returned dict
+        that does not have it. The first registered middleware runs
         outermost. Register middleware before the server is mounted.
 
         When a tool asks a 2026-07-28 client for input (elicitation or sampling), the

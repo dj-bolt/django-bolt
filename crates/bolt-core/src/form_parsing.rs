@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use tempfile::NamedTempFile;
 
-use crate::type_coercion::{coerce_param, CoerceError, CoercedValue, TYPE_STRING};
+use crate::type_coercion::{CoerceError, CoercedValue, TYPE_STRING, coerce_param};
 
 /// Memory limit for in-memory file storage (1MB default)
 pub const DEFAULT_MEMORY_LIMIT: usize = 1024 * 1024;
@@ -457,16 +457,16 @@ pub async fn parse_multipart(
                 .push(file_info);
 
             // Validate max_files constraint
-            if let Some(constraints) = file_constraints.get(&field_name) {
-                if let Some(max_files) = constraints.max_files {
-                    let count = files_map.get(&field_name).map(|v| v.len()).unwrap_or(0);
-                    if count > max_files {
-                        return Err(ValidationError::too_many_files(
-                            &field_name,
-                            max_files,
-                            count,
-                        ));
-                    }
+            if let Some(constraints) = file_constraints.get(&field_name)
+                && let Some(max_files) = constraints.max_files
+            {
+                let count = files_map.get(&field_name).map(|v| v.len()).unwrap_or(0);
+                if count > max_files {
+                    return Err(ValidationError::too_many_files(
+                        &field_name,
+                        max_files,
+                        count,
+                    ));
                 }
             }
         } else {
@@ -617,32 +617,32 @@ fn validate_file(
     constraints: &FileFieldConstraints,
 ) -> Result<(), ValidationError> {
     // Check max_size
-    if let Some(max_size) = constraints.max_size {
-        if file.size > max_size {
-            return Err(ValidationError::file_too_large(
-                field_name, max_size, file.size,
-            ));
-        }
+    if let Some(max_size) = constraints.max_size
+        && file.size > max_size
+    {
+        return Err(ValidationError::file_too_large(
+            field_name, max_size, file.size,
+        ));
     }
 
     // Check min_size
-    if let Some(min_size) = constraints.min_size {
-        if file.size < min_size {
-            return Err(ValidationError::file_too_small(
-                field_name, min_size, file.size,
-            ));
-        }
+    if let Some(min_size) = constraints.min_size
+        && file.size < min_size
+    {
+        return Err(ValidationError::file_too_small(
+            field_name, min_size, file.size,
+        ));
     }
 
     // Check allowed_types with wildcard matching
-    if let Some(ref allowed_types) = constraints.allowed_types {
-        if !is_content_type_allowed(&file.content_type, allowed_types) {
-            return Err(ValidationError::invalid_content_type(
-                field_name,
-                allowed_types,
-                &file.content_type,
-            ));
-        }
+    if let Some(ref allowed_types) = constraints.allowed_types
+        && !is_content_type_allowed(&file.content_type, allowed_types)
+    {
+        return Err(ValidationError::invalid_content_type(
+            field_name,
+            allowed_types,
+            &file.content_type,
+        ));
     }
 
     Ok(())
@@ -889,10 +889,10 @@ mod tests {
     /// test fails for that (vulnerable) behavior.
     #[test]
     fn test_multipart_rejects_oversized_field_before_buffering() {
-        use actix_web::http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+        use actix_web::http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
         use std::collections::VecDeque;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let boundary = "TESTBOUNDARY";
         let chunk_size = 1000usize;
@@ -1011,7 +1011,7 @@ mod tests {
         file_constraints: &HashMap<String, FileFieldConstraints>,
         limits: &Limits,
     ) -> Result<FormParseResult, ValidationError> {
-        use actix_web::http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+        use actix_web::http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
         let mut body = parts.concat();
         body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
@@ -1098,7 +1098,7 @@ mod tests {
 
     #[test]
     fn multipart_text_field_stops_at_the_first_chunk_over_max_param_length() {
-        use actix_web::http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+        use actix_web::http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
         use std::collections::VecDeque;
 
         // One byte for each chunk, so the field grows by one byte at a time.
@@ -1230,6 +1230,77 @@ mod tests {
     }
 
     #[test]
+    fn multipart_file_of_its_min_size_is_accepted_and_one_less_byte_is_rejected() {
+        let constraints = HashMap::from([(
+            "doc".to_string(),
+            FileFieldConstraints {
+                min_size: Some(4),
+                ..FileFieldConstraints::default()
+            },
+        )]);
+
+        let accepted = parse_parts(
+            &[file_part("doc", "text/plain", b"abcd")],
+            &constraints,
+            &Limits::default(),
+        );
+        assert_eq!(accepted.unwrap().files_map["doc"][0].size, 4);
+
+        let rejected = parse_parts(
+            &[file_part("doc", "text/plain", b"abc")],
+            &constraints,
+            &Limits::default(),
+        );
+        assert_eq!(error_type(rejected), "file_too_small");
+    }
+
+    #[test]
+    fn multipart_field_with_its_max_files_is_accepted_and_one_more_file_is_rejected() {
+        let constraints = HashMap::from([(
+            "doc".to_string(),
+            FileFieldConstraints {
+                max_files: Some(2),
+                ..FileFieldConstraints::default()
+            },
+        )]);
+        let file = || file_part("doc", "text/plain", b"abc");
+
+        let accepted = parse_parts(&[file(), file()], &constraints, &Limits::default());
+        assert_eq!(accepted.unwrap().files_map["doc"].len(), 2);
+
+        let rejected = parse_parts(&[file(), file(), file()], &constraints, &Limits::default());
+        assert_eq!(error_type(rejected), "file_too_many");
+    }
+
+    #[test]
+    fn multipart_file_of_an_allowed_type_is_accepted_and_another_type_is_rejected() {
+        let constraints = HashMap::from([(
+            "doc".to_string(),
+            FileFieldConstraints {
+                allowed_types: Some(vec!["image/*".to_string()]),
+                ..FileFieldConstraints::default()
+            },
+        )]);
+
+        let accepted = parse_parts(
+            &[file_part("doc", "image/png", b"abc")],
+            &constraints,
+            &Limits::default(),
+        );
+        assert_eq!(
+            accepted.unwrap().files_map["doc"][0].content_type,
+            "image/png"
+        );
+
+        let rejected = parse_parts(
+            &[file_part("doc", "text/plain", b"abc")],
+            &constraints,
+            &Limits::default(),
+        );
+        assert_eq!(error_type(rejected), "file_invalid_content_type");
+    }
+
+    #[test]
     fn a_coercion_error_names_the_expected_type() {
         use crate::type_coercion::*;
 
@@ -1257,10 +1328,10 @@ mod tests {
 
     #[test]
     fn a_limited_payload_stops_a_part_header_that_never_ends() {
-        use actix_web::http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+        use actix_web::http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
         use std::collections::VecDeque;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let mut chunks: VecDeque<Bytes> = VecDeque::new();
         chunks.push_back(Bytes::from(format!(

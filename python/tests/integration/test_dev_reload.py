@@ -249,6 +249,7 @@ def test_runbolt_dev_exits_when_first_start_fails(make_server_project):
 
     assert process.returncode == 1, f"expected the worker's exit code to propagate\nstderr:\n{stderr}"
     assert "Address already in use" in stderr, stderr
+    assert "server failed to start (exit code 1)" in stderr, stderr
     assert "Waiting for changes" not in stderr, stderr
 
 

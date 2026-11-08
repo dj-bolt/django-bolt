@@ -1,12 +1,12 @@
 //! WebSocket upgrade handler with full Python integration
 
 use actix::Addr;
-use actix_web::http::header::{
-    HeaderMap, HeaderName, HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS,
-    SEC_WEBSOCKET_PROTOCOL, UPGRADE,
-};
 use actix_web::http::StatusCode;
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::http::header::{
+    CONNECTION, HeaderMap, HeaderName, HeaderValue, ORIGIN, SEC_WEBSOCKET_ACCEPT,
+    SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
+};
+use actix_web::{HttpRequest, HttpResponse, web};
 use actix_web_actors::ws;
 use ahash::AHashMap;
 use bolt_core::cookies::cookie_pairs;
@@ -18,23 +18,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 
-use bolt_core::metadata::{CorsConfig, RouteMetadata};
-use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
-use bolt_core::middleware::client_ip::{resolve_scheme, TrustedProxies};
+use bolt_core::metadata::RouteMetadata;
+use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
+use bolt_core::middleware::client_ip::{TrustedProxies, resolve_scheme};
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::request_pipeline::{
-    header_str, insert_header_line, query_sequences, set_declared_item, set_param_item,
-    set_query_sequences, EMPTY_TYPES,
+    EMPTY_TYPES, header_str, insert_header_line, query_sequences, set_declared_item,
+    set_param_item, set_query_sequences,
 };
 use bolt_core::router::parse_query_string;
 use bolt_core::state::AppState;
 use bolt_core::type_coercion::TypeHints;
-use bolt_core::validation::{validate_auth_and_guards, AuthGuardResult};
+use bolt_core::validation::{AuthGuardResult, validate_auth_and_guards};
 
 use super::actor::WebSocketActor;
 use super::config::WsConfig;
 use super::messages::{SendToClient, WsMessage};
-use super::{ConnectionSlot, ACTIVE_WS_CONNECTIONS};
+use super::origin;
+use super::{ACTIVE_WS_CONNECTIONS, ConnectionSlot};
 
 /// Cached Python imports - loaded once at first WebSocket connection
 static WS_CLASS: OnceCell<Py<PyAny>> = OnceCell::new();
@@ -516,13 +517,13 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                         .transpose()?
                         .flatten();
                     // RFC 6455: the server selects one of the subprotocols of the client.
-                    if let Some(ref selected) = subprotocol {
-                        if !state.subprotocols.contains(selected) {
-                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                                "Subprotocol '{}' was not requested by the client (requested: {:?})",
-                                selected, state.subprotocols
-                            )));
-                        }
+                    if let Some(ref selected) = subprotocol
+                        && !state.subprotocols.contains(selected)
+                    {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "Subprotocol '{}' was not requested by the client (requested: {:?})",
+                            selected, state.subprotocols
+                        )));
                     }
                     let headers = accept_headers(message)?;
                     let handshake = state.take_handshake().ok_or_else(|| {
@@ -622,80 +623,6 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
 
     let send_fn = SendFn { state };
     Ok(Py::new(py, send_fn)?.into_any())
-}
-
-/// Validate WebSocket origin header against CORS allowed origins
-/// Uses the same CORS configuration as HTTP requests (like FastAPI)
-///
-/// Security behavior:
-/// - If CORS is configured with allow_all_origins=true: allow all origins
-/// - If CORS is configured with specific origins: only allow those origins
-/// - If NO CORS is configured: DENY all cross-origin requests (fail-secure)
-/// - Same-origin requests (no Origin header) are always allowed
-fn validate_origin(req: &HttpRequest, state: &AppState) -> bool {
-    // Get origin header from request
-    let origin = match req.headers().get("origin") {
-        Some(v) => match v.to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("[django-bolt] WebSocket: Invalid Origin header encoding");
-                return false;
-            }
-        },
-        None => {
-            // No origin header - allow for same-origin requests
-            // (browsers don't send Origin for same-origin WebSocket connections)
-            return true;
-        }
-    };
-
-    // Check global CORS config (same as HTTP)
-    if let Some(ref cors_config) = state.global_cors_config {
-        return is_origin_allowed(origin, cors_config, &state.cors_origin_regexes);
-    }
-
-    // SECURITY: No CORS configured = deny all cross-origin requests
-    // This is a fail-secure default (unlike the old allow-all default)
-    eprintln!(
-        "[django-bolt] WebSocket: Rejecting cross-origin request from '{}' - no CORS configured. \
-        Set CORS_ALLOWED_ORIGINS in Django settings to allow WebSocket connections.",
-        origin
-    );
-    false
-}
-
-/// Check if an origin is allowed by the CORS configuration
-/// Reuses the same logic as HTTP CORS validation. The test client calls it too.
-pub fn is_origin_allowed(
-    origin: &str,
-    cors_config: &CorsConfig,
-    global_regexes: &[regex::Regex],
-) -> bool {
-    // Allow all origins if configured
-    if cors_config.allow_all_origins {
-        return true;
-    }
-
-    // O(1) exact match using HashSet
-    if cors_config.origin_set.contains(origin) {
-        return true;
-    }
-
-    // Check route-level regex patterns
-    if cors_config
-        .compiled_origin_regexes
-        .iter()
-        .any(|re| re.is_match(origin))
-    {
-        return true;
-    }
-
-    // Check global regex patterns
-    if global_regexes.iter().any(|re| re.is_match(origin)) {
-        return true;
-    }
-
-    false
 }
 
 /// What a WebSocket upgrade dispatches to.
@@ -800,85 +727,83 @@ pub async fn handle_websocket_upgrade(
     // Check rate limiting BEFORE origin validation (reuse HTTP rate limit).
     // Address and header keys run here; identity keys run after auth below.
     let mut client_ip = None;
-    if let Some(handler_id) = route_handler_id {
-        if let Some(route_meta) = state.route_metadata.get(handler_id) {
-            if let Some(ref rate_config) = route_meta.rate_limit_config {
-                if !matches!(
-                    rate_config.key,
-                    bolt_core::metadata::RateLimitKey::Header(_)
-                ) {
-                    client_ip = bolt_core::middleware::client_ip::resolve_from_headers(
-                        req.headers(),
-                        req.peer_addr().map(|address| address.ip()),
-                        &state.trusted_proxies,
-                    );
-                }
-                if let Some(response) = check_before_auth(
-                    &state.rate_limiters,
-                    handler_id,
-                    &headers,
-                    client_ip.as_ref(),
-                    rate_config,
-                    req.method().as_str(),
-                    req.path(),
-                ) {
-                    return Ok(response);
-                }
-            }
+    if let Some(handler_id) = route_handler_id
+        && let Some(route_meta) = state.route_metadata.get(handler_id)
+        && let Some(ref rate_config) = route_meta.rate_limit_config
+    {
+        if !matches!(
+            rate_config.key,
+            bolt_core::metadata::RateLimitKey::Header(_)
+        ) {
+            client_ip = bolt_core::middleware::client_ip::resolve_from_headers(
+                req.headers(),
+                req.peer_addr().map(|address| address.ip()),
+                &state.trusted_proxies,
+            );
+        }
+        if let Some(response) = check_before_auth(
+            &state.rate_limiters,
+            handler_id,
+            &headers,
+            client_ip.as_ref(),
+            rate_config,
+            req.method().as_str(),
+            req.path(),
+        ) {
+            return Ok(response);
         }
     }
 
     // Validate origin header (CORS-like protection for WebSocket)
     // Uses same CORS config as HTTP requests
-    if !validate_origin(&req, &state) {
+    if !origin::validate_origin(req.headers().get(ORIGIN), state.global_cors_config.as_ref()) {
         return Ok(HttpResponse::Forbidden()
             .content_type("application/json")
             .body(r#"{"detail":"Origin not allowed"}"#));
     }
 
     // Evaluate authentication and guards before upgrading
-    if let Some(handler_id) = route_handler_id {
-        if let Some(route_meta) = state.route_metadata.get(handler_id) {
-            match validate_auth_and_guards(&headers, &route_meta.auth_backends, &route_meta.guards)
-            {
-                AuthGuardResult::Allow(ctx) => {
-                    if let Some(ref rate_config) = route_meta.rate_limit_config {
-                        if let Some(response) = check_after_auth(
-                            &state.rate_limiters,
-                            handler_id,
-                            &headers,
-                            client_ip.as_ref(),
-                            ctx.as_ref(),
-                            rate_config,
-                            req.method().as_str(),
-                            req.path(),
-                        ) {
-                            return Ok(response);
+    if let Some(handler_id) = route_handler_id
+        && let Some(route_meta) = state.route_metadata.get(handler_id)
+    {
+        match validate_auth_and_guards(&headers, &route_meta.auth_backends, &route_meta.guards) {
+            AuthGuardResult::Allow(ctx) => {
+                if let Some(ref rate_config) = route_meta.rate_limit_config
+                    && let Some(response) = check_after_auth(
+                        &state.rate_limiters,
+                        handler_id,
+                        &headers,
+                        client_ip.as_ref(),
+                        ctx.as_ref(),
+                        rate_config,
+                        req.method().as_str(),
+                        req.path(),
+                    )
+                {
+                    return Ok(response);
+                }
+                // A revoked token fails the handshake, as on an HTTP route.
+                if let (Some(check), Some(auth_ctx)) =
+                    (route_meta.websocket_revocation_check.as_ref(), ctx.as_ref())
+                {
+                    match token_revoked(check, auth_ctx).await {
+                        Ok(false) => {}
+                        Ok(true) => return Ok(bolt_core::responses::error_401()),
+                        Err(e) => {
+                            eprintln!("[django-bolt] WebSocket revocation check error: {}", e);
+                            return Ok(HttpResponse::InternalServerError()
+                                .content_type("application/json")
+                                .body(r#"{"detail":"Revocation check failed"}"#));
                         }
                     }
-                    // A revoked token fails the handshake, as on an HTTP route.
-                    if let (Some(check), Some(auth_ctx)) =
-                        (route_meta.websocket_revocation_check.as_ref(), ctx.as_ref())
-                    {
-                        match token_revoked(check, auth_ctx).await {
-                            Ok(false) => {}
-                            Ok(true) => return Ok(bolt_core::responses::error_401()),
-                            Err(e) => {
-                                eprintln!("[django-bolt] WebSocket revocation check error: {}", e);
-                                return Ok(HttpResponse::InternalServerError()
-                                    .content_type("application/json")
-                                    .body(r#"{"detail":"Revocation check failed"}"#));
-                            }
-                        }
-                    }
                 }
-                // Registration refuses a session backend on a WebSocket route. Fail closed.
-                AuthGuardResult::Deferred(_) | AuthGuardResult::Unauthorized => {
-                    return Ok(bolt_core::responses::error_401());
-                }
-                AuthGuardResult::Forbidden(denial) => {
-                    return Ok(bolt_core::responses::error_403_denial(denial.as_deref()));
-                }
+            }
+            // Registration refuses a session backend on a WebSocket route. Fail closed.
+            AuthGuardResult::Deferred(_) | AuthGuardResult::Unauthorized => {
+                return Ok(bolt_core::responses::error_401());
+            }
+            AuthGuardResult::Forbidden(denial) => {
+                return Ok(bolt_core::responses::error_403_denial(denial.as_deref()));
             }
         }
     }
@@ -1031,7 +956,7 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
 
                         // Call handler with proper parameter injection
                         // Injector is pre-compiled at route registration and passed from router
-                        if let Some(ref inj) = injector {
+                        if let Some(inj) = injector {
                             // Use pre-compiled injector to extract parameters
                             // Sync injector - call directly
                             // Note: WebSocket handlers don't support async injectors (dependencies)

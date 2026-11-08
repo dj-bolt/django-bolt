@@ -40,7 +40,7 @@ jobs:
       fail-fast: false
       matrix:
         # The [[bin]] targets of fuzz/Cargo.toml.
-        target: [query_string, cookies, coerce_param, urlencoded_form, cookie_csrf]
+        target: [query_string, cookies, coerce_param, urlencoded_form, cookie_csrf, bind_addr]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

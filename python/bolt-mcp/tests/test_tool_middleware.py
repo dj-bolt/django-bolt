@@ -6,7 +6,7 @@ import pytest
 from _helpers import initialize, parse_rpc, post_rpc, post_rpc_modern
 from bolt_mcp import MCP, Context, ToolCall, mount_mcp
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, IsAuthenticated
 from django_bolt.testing import TestClient
 
 TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -146,3 +146,33 @@ def test_input_request_passes_through_middleware():
     assert result["resultType"] == "input_required"
     assert [c.name for c in calls] == ["confirm"]
     assert results == []
+
+
+def test_a_result_built_by_middleware_gets_result_type_complete():
+    async def block(call: ToolCall, call_next) -> dict:
+        return {"content": [{"type": "text", "text": "blocked"}], "isError": True}
+
+    with TestClient(_server(block)) as client:
+        resp = post_rpc_modern(client, "tools/call", {"name": "add", "arguments": {"a": 1, "b": 1}})
+        result = parse_rpc(resp)["result"]
+    assert result["resultType"] == "complete"
+    assert result["content"][0]["text"] == "blocked"
+
+
+def test_middleware_does_not_run_for_unknown_or_denied_tools():
+    record, calls, _ = _recorder()
+    api = BoltAPI()
+    mcp = MCP("middleware-guard-test")
+    mcp.tool_middleware(record)
+
+    @mcp.tool(guards=[IsAuthenticated()])
+    def purge_users() -> dict:
+        return {"purged": True}
+
+    mount_mcp(api, mcp)
+    with TestClient(api) as client:
+        denied = _legacy_call(client, "purge_users", {})
+        unknown = _legacy_call(client, "no_such_tool", {})
+    assert denied["isError"] is True
+    assert unknown["isError"] is True
+    assert calls == []

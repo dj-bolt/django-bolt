@@ -123,7 +123,7 @@ async def add(a: int, b: int) -> dict:
 
 ### Tool middleware
 
-`@mcp.tool_middleware` registers an async function that runs around every `tools/call`. It gets a `ToolCall` with the tool `name`, the raw `arguments`, the request `meta` (the `_meta` the client sent) and the `principal`, and `call_next()` runs the tool. MCP calls do not pass through Django or Bolt HTTP middleware, so this is where per-call logging, metrics and tracing go.
+`@mcp.tool_middleware` registers an async function that runs around each `tools/call` that passes authentication and the guards of the tool. Bolt rejects a call to an unknown or denied tool in Rust, before middleware runs. Thus a log or a metric from middleware does not show these calls. The function gets a `ToolCall` with the tool `name`, the raw `arguments`, the request `meta` (the `_meta` the client sent) and the `principal`, and `call_next()` runs the tool. MCP calls do not pass through Django or Bolt HTTP middleware, so this is where per-call logging, metrics and tracing go.
 
 ```python
 from opentelemetry import propagate, trace
@@ -141,9 +141,11 @@ async def trace_tool(call: ToolCall, call_next) -> dict:
         return result
 ```
 
-`call_next()` returns the `CallToolResult` dict, and a tool exception or an argument error is already an `isError` result there. The middleware returns that dict or another one. The first registered middleware runs outermost. Register middleware before the server is mounted.
+`call_next()` returns the `CallToolResult` dict, and a tool exception or an argument error is already an `isError` result there. The middleware returns that dict or another one. Bolt adds `"resultType": "complete"` to a returned dict that does not have it. The first registered middleware runs outermost. Register middleware before the server is mounted.
 
 When a tool asks a 2026-07-28 client for input (elicitation or sampling), the request passes up through the middleware as a `BaseException`. Let it propagate.
+
+The client sets `call.meta`, so do not trust it. For example, a client can send any `traceparent`. `call.principal` and `call.arguments` can hold tokens or personal data. Do not write them to a log as they are.
 
 ### Resource and prompt middleware
 

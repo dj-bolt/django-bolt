@@ -20,6 +20,9 @@ class ToolCall:
     validation. ``meta`` is the request ``_meta`` ({} when absent), including
     ``traceparent``/``tracestate`` when the client sends trace context.
     ``principal`` is the same dict ``bolt_mcp.principal`` returns.
+
+    The client sets ``meta``, so do not trust it. ``principal`` and ``arguments``
+    can hold tokens or personal data. Do not log them as they are.
     """
 
     name: str

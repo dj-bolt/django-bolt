@@ -626,6 +626,12 @@ async def upload(
     return {"filename": file.filename}
 ```
 
+`max_size` and `min_size` take an int of 0 or more, in bytes. `max_files` takes
+an int of 1 or more. A value of another type, such as `"10MB"`, a float or a
+`bool`, raises `TypeError`. A value out of range raises `ValueError`. So does a
+`min_size` above `max_size`. Each error is raised when you write the `File()`
+call. Omit a limit, or pass `None`, to set no limit.
+
 `allowed_types` takes a list, a tuple or another iterable of MIME type
 strings. A str such as `"image/*"` raises `TypeError`. An item that is not a
 str also raises `TypeError`. An empty iterable raises `ValueError`. Omit

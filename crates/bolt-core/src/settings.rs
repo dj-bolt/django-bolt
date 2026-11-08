@@ -103,6 +103,14 @@ impl<'py> DjangoSettings<'py> {
             .unwrap_or(default))
     }
 
+    /// Read an int setting from 0 to `max`.
+    pub fn int_up_to(&self, name: &str, max: u8, default: u8) -> PyResult<u8> {
+        let expected = format!("an int from 0 to {max}");
+        Ok(self
+            .int(name, &expected, |value: &u8| *value <= max)?
+            .unwrap_or(default))
+    }
+
     /// Read an int setting from 0 to `u32::MAX`, or None when it is missing.
     pub fn optional_u32(&self, name: &str) -> PyResult<Option<u32>> {
         self.int(name, "an int from 0 to 4294967295", |_| true)
@@ -113,14 +121,13 @@ impl<'py> DjangoSettings<'py> {
         let Some(value) = self.get(name)? else {
             return Ok(default);
         };
-        if !value.is_instance_of::<PyBool>() {
-            if let Ok(seconds) = value.extract::<f64>() {
-                if seconds > 0.0 {
-                    // try_from_secs_f64 also rejects NaN, infinity and overflow.
-                    if let Ok(duration) = Duration::try_from_secs_f64(seconds) {
-                        return Ok(duration);
-                    }
-                }
+        if !value.is_instance_of::<PyBool>()
+            && let Ok(seconds) = value.extract::<f64>()
+            && seconds > 0.0
+        {
+            // try_from_secs_f64 also rejects NaN, infinity and overflow.
+            if let Ok(duration) = Duration::try_from_secs_f64(seconds) {
+                return Ok(duration);
             }
         }
         Err(wrong_type(name, "a number more than 0", &value))
@@ -163,12 +170,11 @@ impl<'py> DjangoSettings<'py> {
         let Some(value) = self.get(name)? else {
             return Ok(None);
         };
-        if !value.is_instance_of::<PyBool>() {
-            if let Ok(number) = value.extract::<T>() {
-                if valid(&number) {
-                    return Ok(Some(number));
-                }
-            }
+        if !value.is_instance_of::<PyBool>()
+            && let Ok(number) = value.extract::<T>()
+            && valid(&number)
+        {
+            return Ok(Some(number));
         }
         Err(wrong_type(name, expected, &value))
     }

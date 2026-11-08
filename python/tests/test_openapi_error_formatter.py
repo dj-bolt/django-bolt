@@ -51,6 +51,11 @@ def vendor_error(error: BoltError, request) -> Response:
     return Response(body, status_code=error.status, media_type="application/vnd.error+json")
 
 
+@error_schema(ErrorBody)
+def json_error(error: BoltError, request) -> Response:
+    return Response({"code": error.kind, "message": error.detail}, status_code=error.status)
+
+
 def plain_error(error: BoltError, request) -> PlainText:
     return PlainText(error.detail, status_code=error.status)
 
@@ -226,6 +231,14 @@ def test_declared_error_schema_documents_the_422():
 
     assert invalid.headers["content-type"] == "application/vnd.error+json"
     msgspec.convert(invalid.json(), ErrorBody)
+
+
+def test_error_schema_media_type_is_json_by_default():
+    spec = _spec(_api(json_error, strict=True))
+
+    assert _responses(spec)["422"]["content"] == {
+        "application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}}
+    }
 
 
 def test_formatter_without_error_schema_documents_no_422_body():

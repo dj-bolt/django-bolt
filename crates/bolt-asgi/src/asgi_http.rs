@@ -1,8 +1,8 @@
 use actix_web::http::header::{self, HeaderName, HeaderValue};
 use actix_web::http::{Method, StatusCode, Version};
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{HttpRequest, HttpResponse, web};
 use bytes::Bytes;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
@@ -10,7 +10,7 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
 use bolt_core::error::handle_python_error;
 use bolt_core::middleware::client_ip::{self, TrustedProxies};
@@ -192,13 +192,14 @@ impl AsgiSend {
                 };
 
                 return pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                    if let Some(tx) = tx {
-                        if !body.is_empty() && tx.send(Bytes::from(body)).await.is_err() {
-                            log::debug!(
-                                "ASGI mount: body chunk dropped — receiver already closed \
+                    if let Some(tx) = tx
+                        && !body.is_empty()
+                        && tx.send(Bytes::from(body)).await.is_err()
+                    {
+                        log::debug!(
+                            "ASGI mount: body chunk dropped — receiver already closed \
                                      (request may have timed out or been cancelled)"
-                            );
-                        }
+                        );
                     }
                     Ok(())
                 });
@@ -207,7 +208,7 @@ impl AsgiSend {
                 return Err(PyValueError::new_err(format!(
                     "Unsupported ASGI message type: {}",
                     msg_type
-                )))
+                )));
             }
         }
 
@@ -308,18 +309,19 @@ fn parse_host_port(host: &str, scheme: &str) -> (String, u16) {
     };
 
     if let Some(bracket_end) = host.find(']') {
-        if host.len() > bracket_end + 2 && host.as_bytes()[bracket_end + 1] == b':' {
-            if let Ok(port) = host[bracket_end + 2..].parse::<u16>() {
-                return (host[..bracket_end + 1].to_string(), port);
-            }
+        if host.len() > bracket_end + 2
+            && host.as_bytes()[bracket_end + 1] == b':'
+            && let Ok(port) = host[bracket_end + 2..].parse::<u16>()
+        {
+            return (host[..bracket_end + 1].to_string(), port);
         }
         return (host[..bracket_end + 1].to_string(), default_port);
     }
 
-    if let Some((name, port)) = host.rsplit_once(':') {
-        if let Ok(parsed_port) = port.parse::<u16>() {
-            return (name.to_string(), parsed_port);
-        }
+    if let Some((name, port)) = host.rsplit_once(':')
+        && let Ok(parsed_port) = port.parse::<u16>()
+    {
+        return (name.to_string(), parsed_port);
     }
 
     (host.to_string(), default_port)

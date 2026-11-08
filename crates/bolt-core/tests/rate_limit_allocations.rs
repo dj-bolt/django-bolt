@@ -6,7 +6,7 @@
 
 use ahash::AHashMap;
 use bolt_core::metadata::{RateLimitConfig, RateLimitKey};
-use bolt_core::middleware::rate_limit::{check_before_auth, RateLimiters};
+use bolt_core::middleware::rate_limit::{RateLimiters, check_before_auth};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
