@@ -346,12 +346,21 @@ fn stop_worker(worker: &mut Option<Child>, timeout: Duration) -> PyResult<()> {
     Ok(())
 }
 
+/// Why the file watcher gave no change.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchError {
+    /// notify reported an error. The watcher still runs.
+    Notify(String),
+    /// The watcher stopped. No change can arrive again, so no reload can happen.
+    Disconnected,
+}
+
 fn recv_change(
     rx: &Receiver<notify::Result<Event>>,
     filter: &ReloadFilter,
     debounce: Duration,
     recv_timeout: Duration,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, WatchError> {
     match rx.recv_timeout(recv_timeout) {
         Ok(Ok(event)) => {
             let found = first_relevant_path(&event, filter).or_else(|| {
@@ -376,7 +385,7 @@ fn recv_change(
                             changed_path = next_path;
                         }
                     }
-                    Ok(Err(err)) => return Err(err.to_string()),
+                    Ok(Err(err)) => return Err(WatchError::Notify(err.to_string())),
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -384,9 +393,9 @@ fn recv_change(
 
             Ok(Some(changed_path))
         }
-        Ok(Err(err)) => Err(err.to_string()),
+        Ok(Err(err)) => Err(WatchError::Notify(err.to_string())),
         Err(RecvTimeoutError::Timeout) => Ok(None),
-        Err(RecvTimeoutError::Disconnected) => Err("File watcher disconnected".to_string()),
+        Err(RecvTimeoutError::Disconnected) => Err(WatchError::Disconnected),
     }
 }
 
@@ -537,8 +546,8 @@ fn run_dev_reloader_inner(
     }
 
     let mut reload_count = 0u64;
+    // None while the worker is dead and the supervisor waits for a change.
     let mut worker = Some(spawn_worker(&command, reload_count)?);
-    let mut worker_exited = false;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -569,7 +578,6 @@ fn run_dev_reloader_inner(
                 "server exited with {}. Waiting for changes...",
                 exit_detail
             )));
-            worker_exited = true;
         }
 
         match recv_change(&rx, &filter, debounce, recv_timeout) {
@@ -582,20 +590,22 @@ fn run_dev_reloader_inner(
                 reload_count += 1;
                 stop_worker(&mut worker, WORKER_STOP_TIMEOUT_RELOAD)?;
                 worker = Some(spawn_worker(&command, reload_count)?);
-                worker_exited = false;
             }
             Ok(None) => {}
-            Err(err) => {
-                if shutdown.load(Ordering::SeqCst) {
-                    stop_worker(&mut worker, WORKER_STOP_TIMEOUT_SHUTDOWN)?;
-                    return Ok(0);
-                }
-
-                if worker_exited {
-                    continue;
-                }
-
+            Err(_) if shutdown.load(Ordering::SeqCst) => {
+                stop_worker(&mut worker, WORKER_STOP_TIMEOUT_SHUTDOWN)?;
+                return Ok(0);
+            }
+            Err(WatchError::Notify(err)) => {
                 paint.log(&paint.yellow(&format!("watcher error: {}", err)));
+            }
+            Err(WatchError::Disconnected) => {
+                // Without a watcher, the session cannot reload. Do not wait with no end.
+                paint.log(
+                    &paint.red("file watcher stopped; changes cannot reload the server, exiting"),
+                );
+                stop_worker(&mut worker, WORKER_STOP_TIMEOUT_SHUTDOWN)?;
+                return Ok(1);
             }
         }
     }
@@ -626,7 +636,7 @@ pub fn run_dev_reloader(
 #[cfg(test)]
 mod tests {
     use super::{
-        Paint, ReloadFilter, color_enabled, display_path, first_relevant_file_in,
+        Paint, ReloadFilter, WatchError, color_enabled, display_path, first_relevant_file_in,
         first_relevant_path, format_exit_status, is_temporary_path, recv_change,
         terminal_worker_exit_code, wait_for_child_exit,
     };
@@ -951,6 +961,27 @@ mod tests {
             paths: vec![PathBuf::from(path)],
             attrs: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_disconnected_watcher_is_reported_apart_from_a_notify_error() {
+        let filter = ReloadFilter::new(vec![], vec![]);
+        let timeout = Duration::from_millis(10);
+        let debounce = Duration::from_millis(50);
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(notify::Error::generic("inotify watch limit")))
+            .unwrap();
+        assert_eq!(
+            recv_change(&rx, &filter, debounce, timeout),
+            Err(WatchError::Notify("inotify watch limit".to_string()))
+        );
+
+        drop(tx);
+        assert_eq!(
+            recv_change(&rx, &filter, debounce, timeout),
+            Err(WatchError::Disconnected)
+        );
     }
 
     #[test]
