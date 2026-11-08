@@ -37,6 +37,11 @@ class FailsInIter:
         raise ValueError("boom in __iter__")
 
 
+class FailsInAiter:
+    def __aiter__(self):
+        raise ValueError("boom in __aiter__")
+
+
 def sync_body():
     yield "first,"
     raise ValueError("boom in sync body")
@@ -67,6 +72,18 @@ def api():
     async def iter_fails():
         return StreamingResponse(FailsInIter(), media_type="text/plain")
 
+    @api.get("/aiter-fails")
+    async def aiter_fails():
+        return StreamingResponse(FailsInAiter(), media_type="text/plain")
+
+    @api.get("/ok")
+    async def ok_stream():
+        async def body():
+            yield "a,"
+            yield "b,"
+
+        return StreamingResponse(body(), media_type="text/plain")
+
     return api
 
 
@@ -94,11 +111,23 @@ def test_body_error_ends_the_body_and_is_logged(api, caplog, path, message):
     assert str(record.exc_info[1]) == message
 
 
-def test_iter_error_gives_an_empty_body_and_is_logged(api, caplog):
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [("/iter-fails", "boom in __iter__"), ("/aiter-fails", "boom in __aiter__")],
+)
+def test_an_error_before_the_first_chunk_gives_an_empty_body_and_is_logged(api, caplog, path, message):
     with caplog.at_level(logging.ERROR, logger=STREAM_LOGGER), TestClient(api) as client:
-        response = client.get("/iter-fails")
+        response = client.get(path)
 
     assert response.status_code == 200
     assert response.content == b""
     [record] = _stream_errors(caplog)
-    assert str(record.exc_info[1]) == "boom in __iter__"
+    assert str(record.exc_info[1]) == message
+
+
+def test_a_body_that_ends_normally_logs_nothing(api, caplog):
+    with caplog.at_level(logging.DEBUG, logger=STREAM_LOGGER), TestClient(api) as client:
+        response = client.get("/ok")
+
+    assert response.content == b"a,b,"
+    assert _stream_errors(caplog) == []

@@ -94,8 +94,11 @@ import inspect
 import logging
 
 async def forward(gen, sender):
-    iterator = gen.__aiter__() if hasattr(gen, "__aiter__") else gen
+    logger = logging.getLogger("django_bolt.streaming")
+    iterator = None
     try:
+        # Inside the try: an error here must also end the body, or the response waits forever.
+        iterator = gen.__aiter__() if hasattr(gen, "__aiter__") else gen
         while True:
             item = await iterator.__anext__()
             should_continue = sender.send(item)
@@ -108,9 +111,7 @@ async def forward(gen, sender):
         pass
     except Exception:
         # The status and headers are already sent. End the body and log the error.
-        logging.getLogger("django_bolt.streaming").exception(
-            "The body of a streaming response raised an error. The response body ends here."
-        )
+        logger.exception("The body of a streaming response raised an error. The response body ends here.")
     finally:
         try:
             aclose = getattr(iterator, "aclose", None)
@@ -119,7 +120,7 @@ async def forward(gen, sender):
                 if inspect.isawaitable(maybe_awaitable):
                     await maybe_awaitable
         except Exception:
-            pass
+            logger.warning("Closing the body of a streaming response raised an error.", exc_info=True)
         sender.close()
 "#;
 
