@@ -104,6 +104,7 @@ class MCP:
         json_response: bool = False,
         list_ttl_ms: int = 0,
         list_cache_scope: str = "private",
+        mask_error_details: bool = True,
     ) -> None:
         """Declare an MCP server.
 
@@ -115,6 +116,12 @@ class MCP:
 
         ``list_ttl_ms``/``list_cache_scope`` are the SEP-2549 caching hints
         stamped on every list result (``0``/``"private"`` = no caching).
+
+        By default, ``mask_error_details=True`` replaces the text of an exception
+        from a tool, resource or prompt with a fixed message. Thus the text does
+        not reach the client. ``ToolError`` messages are sent either way. Every
+        such exception is logged with its traceback. Set ``False`` only for
+        development.
         """
         if list_cache_scope not in _CACHE_SCOPES:
             raise ValueError(f"list_cache_scope must be 'public' or 'private', got {list_cache_scope!r}")
@@ -130,6 +137,7 @@ class MCP:
         self.json_response = json_response
         self.list_ttl_ms = list_ttl_ms
         self.list_cache_scope = list_cache_scope
+        self.mask_error_details = mask_error_details
         self._tools: dict[str, ToolDef] = {}
         self._resources: dict[str, ResourceDef] = {}
         self._resource_templates: dict[str, ResourceTemplateDef] = {}
@@ -232,8 +240,9 @@ class MCP:
         reads the resource and returns its ReadResourceResult dict. An unknown URI,
         a URI that doesn't match the template's types, or an exception in the
         resource function raises out of ``call_next()``; let it propagate so the
-        client gets the JSON-RPC error. The first registered middleware runs
-        outermost.
+        client gets the JSON-RPC error. Bolt logs an exception from the resource
+        function or from middleware and masks its text, but not a ``JsonRpcError``.
+        The first registered middleware runs outermost.
 
         Bolt checks the mount ``auth`` and ``guards`` in Rust first. Resources have
         no guards of their own. To refuse a read, raise ``JsonRpcError``. Register
@@ -251,7 +260,9 @@ class MCP:
         ``await call_next()`` renders the prompt and returns its GetPromptResult dict.
         An unknown prompt, invalid arguments or an exception in the prompt function
         raises out of ``call_next()``; let it propagate so the client gets the
-        JSON-RPC error. The first registered middleware runs outermost.
+        JSON-RPC error. Bolt logs an exception from the prompt function or from
+        middleware and masks its text, but not a ``JsonRpcError``. The first
+        registered middleware runs outermost.
 
         Bolt checks the mount ``auth`` and ``guards`` in Rust first. Prompts have no
         guards of their own. To refuse a prompt, raise ``JsonRpcError``. Register
@@ -281,10 +292,14 @@ class MCP:
         name: str | None = None,
         mime_type: str = "text/plain",
         description: str | None = None,
+        meta: dict[str, Any] | None = None,
     ):
         """Register a resource. A ``uri`` containing ``{var}`` placeholders registers a
         *resource template*: the handler's parameters must match the placeholders, and a
-        ``resources/read`` for any matching concrete URI extracts + type-coerces them."""
+        ``resources/read`` for any matching concrete URI extracts + type-coerces them.
+
+        ``meta`` is sent as ``_meta`` on the ``resources/read`` contents, for example
+        MCP Apps' ``{"ui": {"csp": {...}}}``."""
 
         def register(fn: Callable) -> Callable:
             pattern, var_names = _compile_uri_template(uri)
@@ -303,6 +318,7 @@ class MCP:
                     name=res_name,
                     description=res_desc,
                     mime_type=mime_type,
+                    meta=meta,
                     param_names=var_names,
                     is_async=inspect.iscoroutinefunction(fn),
                     pattern=pattern,
@@ -315,6 +331,7 @@ class MCP:
                     name=res_name,
                     description=res_desc,
                     mime_type=mime_type,
+                    meta=meta,
                     is_async=inspect.iscoroutinefunction(fn),
                 )
             return fn

@@ -123,6 +123,7 @@ class ResourceDef:
     name: str | None = None
     description: str | None = None
     mime_type: str = "text/plain"
+    meta: dict[str, Any] | None = None  # sent as `_meta` on the `resources/read` contents
     is_async: bool = False
 
 
@@ -133,6 +134,7 @@ class ResourceTemplateDef:
     name: str | None = None
     description: str | None = None
     mime_type: str = "text/plain"
+    meta: dict[str, Any] | None = None  # sent as `_meta` on the `resources/read` contents
     param_names: list[str] = field(default_factory=list)
     is_async: bool = False
     # Computed at registration:

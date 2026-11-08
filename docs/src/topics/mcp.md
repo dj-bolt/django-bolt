@@ -119,8 +119,48 @@ async def add(a: int, b: int) -> dict:
 | `str` | `content` text |
 | `dict` | `content` text **and** `structuredContent` |
 | other (Struct, dataclass, list, …) | serialized to text + `structuredContent` |
+| `ToolResult` | its `content` as the content, `structured` as `structuredContent`, `meta` as `_meta` |
+
+By default the text content is the JSON of the structured content. Return a `ToolResult` to set the text apart from it, for example a short summary for the model while an [MCP App](https://modelcontextprotocol.io/extensions/apps) renders the full data:
+
+```python
+from bolt_mcp import ToolResult
+
+@mcp.tool(output_schema={"type": "object", "properties": {"days": {"type": "array"}}})
+async def forecast(city: str) -> ToolResult:
+    days = await weather.forecast(city)
+    return ToolResult(
+        content=f"{len(days)} days of forecast for {city}.",
+        structured={"days": days},
+    )
+```
+
+`content` is a string or a list of MCP content blocks (text, image, resource link). `structured` is optional, and a value that is not an object is sent as `{"result": ...}`. `output_schema="auto"` cannot read a schema from `-> ToolResult`, or from a union that contains `ToolResult`. It raises `TypeError`, so pass the schema of `structured` as a dict.
+
+Bolt does not validate the structured content against the `output_schema` of the tool. This applies to `ToolResult.structured` and to a `dict` or other return value. A `ToolResult` without `structured` sends no `structuredContent`, also when the tool declares an `output_schema`. Make sure that each result agrees with the schema that you declare.
 
 **Errors are in-band.** A `raise` inside a tool becomes a `CallToolResult` with `isError: true` (the MCP convention), not a transport-level error — so the client sees a normal tool failure it can reason about.
+
+Raise `ToolError` for a message the client and the model may read. Bolt sends its text to the client.
+
+Bolt masks the text of every other exception. The client gets `Tool 'name' failed.` in place of the text. Thus database errors, host names, passwords and file paths stay on the server. Bolt logs the full traceback on the `bolt_mcp._execute` logger.
+
+A resource or prompt handler that raises gives a JSON-RPC internal error. The client gets `Resource 'uri' failed.` or `Prompt 'name' failed.`. Bolt logs the traceback on the `bolt_mcp._dispatch` logger. For a message the client may read, raise `JsonRpcError` (see [Resource and prompt middleware](#resource-and-prompt-middleware)).
+
+To send the exception text to the client during development, use `MCP("billing", mask_error_details=False)`. Do not use this setting in production.
+
+```python
+from bolt_mcp import MCP, ToolError
+
+mcp = MCP("billing")
+
+@mcp.tool
+async def pay_invoice(invoice_id: int) -> dict:
+    invoice = await Invoice.objects.filter(pk=invoice_id).afirst()
+    if invoice is None:
+        raise ToolError(f"No invoice {invoice_id}.")   # sent to the client
+    return await payments.pay(invoice)                  # any error here is logged and masked
+```
 
 **Accessing the request.** Declare a `request` (or `req`) parameter to receive the Django-Bolt `Request` — injected automatically and excluded from the tool's input schema. Read the authenticated principal with `bolt_mcp.principal(request)`, which returns `{user_id, is_staff, is_superuser, permissions, auth_claims}` and works under **every** auth tier (Tier 1 fills `request.context`; the OAuth tiers stash it on `request.state` — `principal()` reads both, so prefer it over `request.context` directly).
 
@@ -144,7 +184,7 @@ async def trace_tool(call: ToolCall, call_next) -> dict:
         return result
 ```
 
-`call_next()` returns the `CallToolResult` dict, and a tool exception or an argument error is already an `isError` result there. The middleware returns that dict or another one. Bolt adds `"resultType": "complete"` to a returned dict that does not have it. The first registered middleware runs outermost. Register middleware before the server is mounted.
+`call_next()` returns the `CallToolResult` dict, and a tool exception or an argument error is already an `isError` result there. The middleware returns that dict or another one. Bolt adds `"resultType": "complete"` to a returned dict that does not have it. An exception that middleware raises gets the same treatment as a tool exception: Bolt logs it and masks its text. The first registered middleware runs outermost. Register middleware before the server is mounted.
 
 When a tool asks a 2026-07-28 client for input (elicitation or sampling), the request passes up through the middleware as a `BaseException`. Let it propagate.
 
@@ -171,7 +211,7 @@ async def trace_prompt(get: PromptGet, call_next) -> dict:
         return await call_next()
 ```
 
-Unlike a tool, a failed read or prompt is a JSON-RPC error, not a result. An unknown URI or prompt, or invalid arguments, raises a `JsonRpcError` out of `call_next()`. An exception in the handler also raises out of `call_next()`. Let it propagate so the client gets the error.
+Unlike a tool, a failed read or prompt is a JSON-RPC error, not a result. An unknown URI or prompt, or invalid arguments, raises a `JsonRpcError` out of `call_next()`. An exception in the handler also raises out of `call_next()`. Let it propagate so the client gets the error. Bolt logs an exception from the handler or from middleware and masks its text, as for a handler with no middleware. Bolt does not mask a `JsonRpcError`.
 
 Bolt checks the `auth` and `guards` of the mount in Rust, before middleware runs. Resources and prompts have no guards of their own. To refuse a read or a prompt, raise `JsonRpcError` in the middleware. A resource or prompt function can raise it too. The client gets a JSON-RPC error with your message.
 
@@ -201,6 +241,18 @@ import msgspec
 @mcp.resource("config://example", name="example-config", mime_type="application/json")
 async def example_config() -> str:
     return msgspec.json.encode({"app": "demo", "env": "dev"}).decode()
+```
+
+`meta` is sent as `_meta` on the `resources/read` contents. [MCP Apps](https://modelcontextprotocol.io/extensions/apps) read the iframe settings of an app from it, such as its content security policy:
+
+```python
+@mcp.resource(
+    "ui://weather/view.html",
+    mime_type="text/html;profile=mcp-app",
+    meta={"ui": {"csp": {"connectDomains": ["https://api.example.com"]}}},
+)
+async def weather_view() -> str:
+    return WEATHER_HTML
 ```
 
 ### Resource templates

@@ -31,7 +31,10 @@ from django_bolt._json import encode as json_encode
 
 
 class McpClientError(Exception):
-    """Raised inside a tool when the client returns an error to a sample/elicit request."""
+    """Raised inside a tool when the client cannot answer a sample/elicit request.
+
+    The message reaches the client, also when ``MCP`` masks other exceptions.
+    """
 
     def __init__(self, error: Any) -> None:
         super().__init__(str(error))
@@ -124,7 +127,7 @@ class Context:
         """Read one of this server's own resources (static or templated)."""
         if self._resolver is None:
             raise RuntimeError("read_resource is unavailable in this context")
-        text, _mime = await self._resolver(uri)
+        text, _mime, _meta = await self._resolver(uri)
         return text
 
     # ── bidirectional: ask the client, await the answer ──────────────────────
@@ -134,7 +137,7 @@ class Context:
         if self._rust.era == "legacy":
             capability_ok = self._rust.supports_elicitation if kind == "elicitation" else self._rust.supports_sampling
             if not capability_ok:
-                raise RuntimeError(
+                raise McpClientError(
                     f"The connected MCP client did not advertise the {kind!r} capability at "
                     f"initialize, so this tool cannot call back into it. Use a client that "
                     f"supports {kind} (e.g. MCP Inspector)."
@@ -144,7 +147,7 @@ class Context:
             envelope = json_decode(await future)
         else:
             if kind == "sampling":
-                raise RuntimeError(
+                raise McpClientError(
                     "ctx.sample() is not supported for 2026-07-28 clients: sampling is "
                     "deprecated by the MCP spec (SEP-2577) — integrate with an LLM "
                     "provider API directly instead."

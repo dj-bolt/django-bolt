@@ -176,3 +176,15 @@ def test_middleware_does_not_run_for_unknown_or_denied_tools():
     assert denied["isError"] is True
     assert unknown["isError"] is True
     assert calls == []
+
+
+def test_an_exception_in_middleware_is_logged_and_masked(caplog):
+    async def leaky(call: ToolCall, call_next) -> dict:
+        raise RuntimeError("connect to postgres://admin:hunter2@db.internal")
+
+    with TestClient(_server(leaky)) as client, caplog.at_level("ERROR", logger="bolt_mcp"):
+        result = _legacy_call(client, "add", {"a": 1, "b": 2})
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "Tool 'add' failed."
+    assert "hunter2" in caplog.text
