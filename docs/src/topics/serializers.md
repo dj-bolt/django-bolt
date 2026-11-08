@@ -590,6 +590,8 @@ async def login(request) -> LoginResult:
     # {"user": {"email": "test@example.com"}, "token": "..."}
 ```
 
+`dump()` does the same for the fields of a Serializer. A Serializer in a Struct, dict or tuple field of a Serializer also gives its `dump()`.
+
 A value with no declared type goes out as msgspec encodes it. msgspec encodes a Serializer with all of its fields, also the write-only fields. Thus declare the type, or call `dump()`:
 
 ```python

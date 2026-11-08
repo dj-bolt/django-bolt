@@ -104,6 +104,24 @@ def compile_serializer_dumper(annotation: Any) -> Dumper | None:
         return _compile_at_first_call(annotation)
 
 
+def compile_field_dumpers(cls: type, hints: dict[str, Any]) -> dict[str, Dumper]:
+    """Return the dumper of each field of the Struct ``cls`` that can hold a Serializer.
+
+    msgspec reads the field types when the module is complete. A type that
+    never resolves, for example an import under TYPE_CHECKING, keeps its
+    type in ``hints``.
+    """
+    try:
+        types_by_name = {info.name: info.type for info in msgspec.structs.fields(cls)}
+    except NameError:
+        types_by_name = hints
+    return {
+        name: dumper
+        for name, annotation in types_by_name.items()
+        if (dumper := compile_serializer_dumper(annotation)) is not None
+    }
+
+
 def _compile(annotation: Any) -> Dumper | None:
     shapes = _shapes(annotation)
     holders = _holders(shapes)

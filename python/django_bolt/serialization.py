@@ -15,6 +15,7 @@ from collections.abc import (
 from collections.abc import (
     AsyncIterator as AsyncIteratorABC,
 )
+from collections.abc import Callable
 from collections.abc import (
     Generator as GeneratorABC,
 )
@@ -809,6 +810,9 @@ def _compile_inline_response_validator(
       - ``None`` — no inline path; the dispatcher falls back to
         ``serialize_response[_sync]``.
 
+    The dispatcher encodes with ``meta["_inline_encode"]``. For a type that
+    holds a Serializer, it dumps each Serializer first.
+
     The dispatcher always delegates non-matching runtime values (Response
     objects, QuerySets, generators, ``None``, dicts, Serializers, ...) to
     ``serialize_response`` so the slow path handles every edge case uniformly.
@@ -836,10 +840,6 @@ def _compile_inline_response_validator(
     response_type = meta.get("response_type")
     if response_type is None or response_type in _VALIDATION_NOOP_TYPES:
         return None
-    # The inline path encodes the value directly, so a Serializer in it would
-    # send all of its fields. The slow path dumps it.
-    if compile_serializer_dumper(response_type) is not None:
-        return None
 
     if _is_plain_struct(response_type):
         return ("struct", (response_type,))
@@ -859,6 +859,19 @@ def _compile_inline_response_validator(
 
     # pragma: no mutate end
     return None
+
+
+def _compile_inline_encode(response_type: Any) -> Callable[[Any], bytes]:
+    """Return the encoder of the inline path. It dumps each Serializer of ``response_type`` first."""
+    encode = _json._ENCODER.encode
+    dump = compile_serializer_dumper(response_type)
+    if dump is None:
+        return encode
+
+    def encode_dumped(value: Any) -> bytes:
+        return encode(dump(value))
+
+    return encode_dumped
 
 
 def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
@@ -887,6 +900,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     meta["_stream_item_validator"] = stream_validator_sync
     meta["_stream_item_validator_async"] = stream_validator_async
     meta["_inline_response_validator"] = inline_validator  # pragma: no mutate
+    meta["_inline_encode"] = None if inline_validator is None else _compile_inline_encode(meta["response_type"])
     # The validators come in pairs: both are None, or neither is.
     meta["_has_response_validation"] = validator_sync is not None
 

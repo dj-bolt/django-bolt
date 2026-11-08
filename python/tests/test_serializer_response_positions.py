@@ -12,6 +12,7 @@ declared type goes out as msgspec encodes it.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 from collections.abc import Iterator
@@ -95,6 +96,30 @@ class Pair(msgspec.Struct, array_like=True):
     account: Account
 
 
+class TaggedPair(msgspec.Struct, array_like=True, tag=True):
+    """A list at its position starts with the tag."""
+
+    n: int
+    account: Account
+
+
+class SubEnvelope(Envelope):
+    extra: Account | None = None
+
+
+@dataclasses.dataclass
+class SubBox(Box):
+    extra: Account | None = None
+
+
+type EnvelopeAlias = Envelope
+
+
+class TaggedAccount(Serializer, tag=True):
+    id: int
+    password: str = field(write_only=True)
+
+
 class FrozenAccount(Serializer, frozen=True):
     id: int
     password: str = field(write_only=True)
@@ -105,10 +130,38 @@ DEFAULT_ACCOUNT = FrozenAccount(id=0, password=SECRET)
 
 class WithDefault(msgspec.Struct, omit_defaults=True):
     account: FrozenAccount = DEFAULT_ACCOUNT
+    second: FrozenAccount = DEFAULT_ACCOUNT
+
+
+class Profile(Serializer):
+    """A Serializer with a Struct field, a dict field and a list of Structs, each with a Serializer in it."""
+
+    id: int
+    envelope: Envelope
+    by_name: dict[str, Account]
+    envelopes: list[Envelope] = []
+    note: str | None = None
 
 
 def account(i: int = 1) -> Account:
     return Account(id=i, password=SECRET)
+
+
+def profile() -> Profile:
+    return Profile(
+        id=9,
+        envelope=Envelope(account=account()),
+        by_name={"a": account(2)},
+        envelopes=[Envelope(account=account(3))],
+    )
+
+
+PROFILE_DUMPED = {
+    "id": 9,
+    "envelope": {"account": {"id": 1, "label": "user-1"}, "note": "n"},
+    "by_name": {"a": {"id": 2, "label": "user-2"}},
+    "envelopes": [{"account": {"id": 3, "label": "user-3"}, "note": "n"}],
+}
 
 
 # The routes below register before the module defines LateAccount, as in an
@@ -198,6 +251,12 @@ def test_containers(validate):
     def tuple_route() -> tuple[Account, ...]:
         return (account(), account())
 
+    @api.get("/awaits-tuple", validate_response=validate)
+    async def awaits_tuple() -> tuple[Account, ...]:
+        # A tuple from a handler that awaits takes the async validator.
+        await asyncio.sleep(0)
+        return (account(),)
+
     @api.get("/fixed-tuple", validate_response=validate)
     def fixed_tuple() -> tuple[int, Account]:
         return (7, account())
@@ -208,6 +267,7 @@ def test_containers(validate):
 
     assert get(api, "/dict") == {"a": DUMPED}
     assert get(api, "/tuple") == [DUMPED, DUMPED]
+    assert get(api, "/awaits-tuple") == [DUMPED]
     assert get(api, "/fixed-tuple") == [7, DUMPED]
     assert get(api, "/nested") == {"a": [DUMPED]}
 
@@ -363,9 +423,15 @@ def test_union_of_alternatives_that_each_hold_a_serializer():
     def both() -> tuple[Account, int] | tuple[Account, Account]:
         return (account(), account(2))
 
+    @api.get("/mapping", validate_response=False)
+    def mapping() -> tuple[int, Account] | dict[str, Account]:
+        # The tuple option keeps a dict, also a dict with as many keys as the tuple has items.
+        return {"a": account(), "b": account(2)}
+
     assert get(api, "/first") == [DUMPED, 7]
     assert get(api, "/second") == [7, DUMPED]
     assert get(api, "/both") == [DUMPED, {"id": 2, "label": "user-2"}]
+    assert get(api, "/mapping") == {"a": DUMPED, "b": {"id": 2, "label": "user-2"}}
 
 
 def test_array_like_struct_as_a_list():
@@ -375,7 +441,17 @@ def test_array_like_struct_as_a_list():
     def pair() -> Pair:
         return [7, account()]  # type: ignore[return-value]
 
+    @api.get("/tagged", validate_response=False)
+    def tagged() -> TaggedPair:
+        return ["TaggedPair", 7, account()]  # type: ignore[return-value]
+
+    @api.get("/tagged-dumped", validate_response=False)
+    def tagged_dumped() -> TaggedPair:
+        return ["TaggedPair", 7, DUMPED]  # type: ignore[return-value]
+
     assert get(api, "/pair") == [7, DUMPED]
+    assert get(api, "/tagged") == ["TaggedPair", 7, DUMPED]
+    assert get(api, "/tagged-dumped") == ["TaggedPair", 7, DUMPED]
 
 
 def test_omit_defaults_still_omits_the_default_serializer():
@@ -389,5 +465,104 @@ def test_omit_defaults_still_omits_the_default_serializer():
     def other() -> WithDefault:
         return WithDefault(account=FrozenAccount(id=3, password=SECRET))
 
+    @api.get("/second")
+    def second() -> WithDefault:
+        # The first field holds its default, so msgspec omits it. The second field still gives its dump().
+        return WithDefault(second=FrozenAccount(id=3, password=SECRET))
+
     assert get(api, "/default") == {}
     assert get(api, "/other") == {"account": {"id": 3}}
+    assert get(api, "/second") == {"second": {"id": 3}}
+
+
+def test_dict_at_the_position_of_a_struct_or_a_dataclass():
+    """msgspec encodes a dict as it is. Its keys are wire names or field names."""
+    api = BoltAPI()
+
+    @api.get("/struct", validate_response=False)
+    def struct() -> Envelope:
+        return {"account": account()}  # type: ignore[return-value]
+
+    @api.get("/dumped", validate_response=False)
+    def dumped() -> Envelope:
+        return {"account": DUMPED}  # type: ignore[return-value]
+
+    @api.get("/wire-name", validate_response=False)
+    def wire_name() -> Wrapped:
+        return {"mainAccount": account()}  # type: ignore[return-value]
+
+    @api.get("/field-name", validate_response=False)
+    def field_name() -> Wrapped:
+        return {"main_account": account()}  # type: ignore[return-value]
+
+    @api.get("/dataclass", validate_response=False)
+    def dataclass_route() -> Box:
+        return {"account": account()}  # type: ignore[return-value]
+
+    assert get(api, "/struct") == {"account": DUMPED}
+    assert get(api, "/dumped") == {"account": DUMPED}
+    assert get(api, "/wire-name") == {"mainAccount": DUMPED}
+    assert get(api, "/field-name") == {"main_account": DUMPED}
+    assert get(api, "/dataclass") == {"account": DUMPED}
+
+
+def test_subclass_of_a_struct_or_a_dataclass_dumps_its_own_fields():
+    api = BoltAPI()
+
+    @api.get("/struct")
+    def struct() -> Envelope:
+        return SubEnvelope(account=account(), extra=account(2))
+
+    @api.get("/dataclass")
+    def dataclass_route() -> Box:
+        return SubBox(account=account(), extra=account(2))
+
+    dumped_2 = {"id": 2, "label": "user-2"}
+    assert get(api, "/struct") == {"account": DUMPED, "note": "n", "extra": dumped_2}
+    assert get(api, "/dataclass") == {"account": DUMPED, "extra": dumped_2}
+
+
+def test_annotated_alias_and_tagged_serializer():
+    api = BoltAPI()
+
+    @api.get("/annotated")
+    def annotated() -> Annotated[Envelope, "doc"]:
+        return Envelope(account=account())
+
+    @api.get("/alias")
+    def alias() -> EnvelopeAlias:
+        return Envelope(account=account())
+
+    @api.get("/tagged")
+    def tagged() -> dict[str, TaggedAccount]:
+        return {"a": TaggedAccount(id=1, password=SECRET)}
+
+    assert get(api, "/annotated") == {"account": DUMPED, "note": "n"}
+    assert get(api, "/alias") == {"account": DUMPED, "note": "n"}
+    assert get(api, "/tagged") == {"a": {"type": "TaggedAccount", "id": 1}}
+
+
+def test_serializer_in_a_field_of_a_serializer():
+    """dump() dumps a Serializer in a Struct, a dict or a list field of the Serializer."""
+    api = BoltAPI()
+
+    @api.get("/profile")
+    def profile_route() -> Profile:
+        return profile()
+
+    @api.get("/in-struct")
+    def in_struct() -> Envelope | None:
+        return Envelope(account=Admin(id=1, password=SECRET, token=SECRET))
+
+    @api.get("/profiles")
+    def profiles() -> dict[str, Profile]:
+        return {"p": profile()}
+
+    @api.get("/exclude-none")
+    def exclude_none() -> dict:
+        return profile().dump(exclude_none=True)
+
+    assert get(api, "/profile") == {**PROFILE_DUMPED, "note": None}
+    assert get(api, "/in-struct") == {"account": DUMPED, "note": "n"}
+    assert get(api, "/profiles") == {"p": {**PROFILE_DUMPED, "note": None}}
+    assert get(api, "/exclude-none") == PROFILE_DUMPED

@@ -2414,7 +2414,8 @@ class BoltAPI:
             # uniformly.
             _inline_spec = meta.get("_inline_response_validator")
             if _inline_spec is not None:
-                _encode = _json._ENCODER.encode
+                # It dumps each Serializer of the declared type before it encodes.
+                _encode = meta["_inline_encode"]
                 _meta_json = _RESPONSE_META_JSON
                 _inline_kind, _inline_match = _inline_spec
                 # A mutant of a marked line in the inline fast path only sends the
@@ -2745,7 +2746,8 @@ class BoltAPI:
             # Sync-handler inline-encoding fast path (mirrors async branch above).
             _inline_spec = meta.get("_inline_response_validator")
             if _inline_spec is not None:
-                _encode = _json._ENCODER.encode
+                # It dumps each Serializer of the declared type before it encodes.
+                _encode = meta["_inline_encode"]
                 _meta_json = _RESPONSE_META_JSON
                 _inline_kind, _inline_match = _inline_spec
                 # A mutant of a marked line in the inline fast path only sends the
