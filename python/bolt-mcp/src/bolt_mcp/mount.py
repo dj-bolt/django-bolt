@@ -215,3 +215,4 @@ def mount_mcp(
         allowed_origins=list(allowed_origins) if allowed_origins is not None else None,
     )
     api._mcp_mounts.append(definition)
+    mcp._mounted = True

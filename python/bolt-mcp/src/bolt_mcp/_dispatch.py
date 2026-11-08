@@ -27,7 +27,7 @@ from django_bolt._json import encode as json_encode
 
 from ._execute import RESULT_TYPE_COMPLETE, error_result, execute_tool
 from .context import Context, _InputRequired
-from .registry import PromptGet, ResourceRead, ToolCall
+from .registry import JsonRpcError, PromptGet, ResourceRead, ToolCall
 
 if TYPE_CHECKING:
     from .registry import ResourceDef, ResourceTemplateDef, ToolDef
@@ -67,15 +67,6 @@ async def _call_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any], raw: Any)
             resolver=partial(_resolve_resource, mcp),
         )
     return await execute_tool(tool, kwargs)
-
-
-class _DispatchError(Exception):
-    """A JSON-RPC error raised inside the middleware chain; becomes an ``__error__`` envelope."""
-
-    def __init__(self, kind: str, message: str) -> None:
-        super().__init__(message)
-        self.kind = kind
-        self.message = message
 
 
 def _request_meta(payload: dict[str, Any]) -> dict[str, Any]:
@@ -170,7 +161,7 @@ async def _dispatch(middleware: list[Any], call: Any, handler: Callable[[], Awai
             result = await _call_through_middleware(middleware, call, handler)
         else:
             result = await handler()
-    except _DispatchError as exc:
+    except JsonRpcError as exc:
         return _error(exc.kind, exc.message)
     return json_encode(result)
 
@@ -179,9 +170,9 @@ async def _read_resource_result(mcp: MCP, uri: str) -> dict[str, Any]:
     try:
         text, mime_type = await _resolve_resource(mcp, uri)
     except LookupError:
-        raise _DispatchError("resource_not_found", f"Unknown resource: {uri!r}") from None
+        raise JsonRpcError(f"Unknown resource: {uri!r}", kind="resource_not_found") from None
     except msgspec.ValidationError as exc:
-        raise _DispatchError("invalid_params", f"Invalid resource URI {uri!r}: {exc}") from None
+        raise JsonRpcError(f"Invalid resource URI {uri!r}: {exc}") from None
     return {"contents": [{"uri": uri, "mimeType": mime_type, "text": text}], "resultType": RESULT_TYPE_COMPLETE}
 
 
@@ -200,11 +191,11 @@ def resource_dispatch(mcp: MCP) -> Any:
 async def _get_prompt_result(mcp: MCP, name: str, raw: Any) -> dict[str, Any]:
     prompt = mcp._prompts.get(name)
     if prompt is None:
-        raise _DispatchError("invalid_params", f"Unknown prompt: {name!r}")
+        raise JsonRpcError(f"Unknown prompt: {name!r}")
     try:
         args = msgspec.convert(raw or {}, prompt.args_struct)
     except msgspec.ValidationError as exc:
-        raise _DispatchError("invalid_params", f"Invalid arguments: {exc}") from None
+        raise JsonRpcError(f"Invalid arguments: {exc}") from None
     kwargs = msgspec.structs.asdict(args)
     rendered = await _invoke(prompt.fn, prompt.is_async, **kwargs)
     if isinstance(rendered, str):

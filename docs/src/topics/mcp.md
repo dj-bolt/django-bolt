@@ -171,7 +171,25 @@ async def trace_prompt(get: PromptGet, call_next) -> dict:
         return await call_next()
 ```
 
-Unlike a tool, a failed read or prompt is a JSON-RPC error, not a result. An unknown URI or prompt, invalid arguments, or an exception in the handler raises out of `call_next()`. Let it propagate so the client gets the error.
+Unlike a tool, a failed read or prompt is a JSON-RPC error, not a result. An unknown URI or prompt, or invalid arguments, raises a `JsonRpcError` out of `call_next()`. An exception in the handler also raises out of `call_next()`. Let it propagate so the client gets the error.
+
+Bolt checks the `auth` and `guards` of the mount in Rust, before middleware runs. Resources and prompts have no guards of their own. To refuse a read or a prompt, raise `JsonRpcError` in the middleware. A resource or prompt function can raise it too. The client gets a JSON-RPC error with your message.
+
+```python
+from bolt_mcp import JsonRpcError, ResourceRead
+
+@mcp.resource_middleware
+async def staff_only(read: ResourceRead, call_next) -> dict:
+    if read.uri.startswith("admin://") and not read.principal.get("is_staff"):
+        raise JsonRpcError("Staff only", kind="resource_not_found")
+    return await call_next()
+```
+
+The `kind` sets the error code. `"invalid_params"` (the default) gives -32602. `"resource_not_found"` gives -32002 to a legacy client and -32602 to a 2026-07-28 client. Use `"resource_not_found"` to hide that a resource exists. Any other exception gives an internal error (-32603).
+
+The client sets `read.meta` and `get.meta`, so do not trust them. `principal` and the prompt `arguments` can hold tokens or personal data. Do not write them to a log as they are.
+
+Register all middleware before you call `mount_mcp`. Registration after the mount raises `RuntimeError`, because the mount tells Rust which middleware exists.
 
 ## Resources
 

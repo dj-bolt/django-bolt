@@ -45,6 +45,12 @@ pub struct McpRegistry {
     pub resource_dispatch: Py<PyAny>,
     /// Async Python callable: payload dict {"name": str, "arguments_json": str} -> GetPromptResult JSON.
     pub prompt_dispatch: Py<PyAny>,
+    /// Whether resource middleware exists. Without it, a `resources/read`
+    /// sends no request `_meta` and no principal to Python.
+    pub resource_middleware: bool,
+    /// Whether prompt middleware exists. Without it, a `prompts/get`
+    /// sends no request `_meta` and no principal to Python.
+    pub prompt_middleware: bool,
     /// HMAC codec for MRTR requestState (key derived from SECRET_KEY in Python).
     pub codec: RequestStateCodec,
     /// Freshness hint applied to all list results (SEP-2549).
@@ -162,6 +168,8 @@ impl McpRegistry {
             .get_item("prompt_dispatch")?
             .ok_or_else(|| PyValueError::new_err("MCP mount config missing 'prompt_dispatch'"))?
             .unbind();
+        let resource_middleware = crate::get_bool(config, "resource_middleware")?;
+        let prompt_middleware = crate::get_bool(config, "prompt_middleware")?;
 
         let state_key = config
             .get_item("state_key")?
@@ -210,6 +218,8 @@ impl McpRegistry {
             prompts: catalog.prompts,
             resource_dispatch,
             prompt_dispatch,
+            resource_middleware,
+            prompt_middleware,
             codec,
             list_ttl_ms: catalog.list_ttl_ms.unwrap_or(0),
             list_cache_scope,

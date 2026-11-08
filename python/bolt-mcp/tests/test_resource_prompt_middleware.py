@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from _helpers import initialize, mint_jwt, parse_rpc, post_rpc
-from bolt_mcp import MCP, PromptGet, ResourceRead, mount_mcp
+from bolt_mcp import MCP, JsonRpcError, PromptGet, ResourceRead, mount_mcp
 
 from django_bolt import BoltAPI, IsAuthenticated, JWTAuthentication
 from django_bolt.testing import TestClient
@@ -28,6 +28,10 @@ def _server(resource_middleware=(), prompt_middleware=(), **mount_kwargs):
     @mcp.resource("users://{user_id}/profile", name="user-profile")
     def user_profile(user_id: int) -> str:
         return f"user {user_id}"
+
+    @mcp.resource("secret://key", name="secret-key")
+    def secret_key() -> str:
+        raise JsonRpcError("Ask an admin for the key")
 
     @mcp.prompt
     def greet(name: str) -> str:
@@ -100,6 +104,8 @@ def test_unknown_resource_raises_through_the_middleware_and_stays_a_jsonrpc_erro
     assert body["error"]["code"] == -32002
     assert "config://nope" in body["error"]["message"]
     assert len(raised) == 1
+    assert isinstance(raised[0], JsonRpcError)
+    assert raised[0].kind == "resource_not_found"
 
 
 def test_prompt_middleware_gets_the_name_arguments_and_meta():
@@ -170,3 +176,45 @@ def test_sync_middleware_is_rejected(decorator):
 
     with pytest.raises(TypeError, match="must be an async function"):
         getattr(mcp, decorator)(not_async)
+
+
+async def reject_anonymous(request, call_next) -> dict:
+    if not request.principal:
+        raise JsonRpcError("Sign in first")
+    return await call_next()
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("resources/read", {"uri": "config://app"}),
+        ("prompts/get", {"name": "greet", "arguments": {"name": "Ada"}}),
+    ],
+)
+def test_middleware_rejects_a_call_with_a_jsonrpc_error(method, params):
+    api = _server(resource_middleware=[reject_anonymous], prompt_middleware=[reject_anonymous])
+    with TestClient(api) as client:
+        body = _rpc(client, method, params)
+    assert "result" not in body
+    assert body["error"]["code"] == -32602
+    assert body["error"]["message"] == "Sign in first"
+
+
+def test_a_resource_function_can_raise_a_jsonrpc_error():
+    with TestClient(_server()) as client:
+        body = _rpc(client, "resources/read", {"uri": "secret://key"})
+    assert body["error"]["code"] == -32602
+    assert body["error"]["message"] == "Ask an admin for the key"
+
+
+def test_jsonrpc_error_rejects_an_unknown_kind():
+    with pytest.raises(ValueError, match="kind"):
+        JsonRpcError("nope", kind="forbidden")
+
+
+@pytest.mark.parametrize("decorator", ["tool_middleware", "resource_middleware", "prompt_middleware"])
+def test_middleware_registered_after_mount_raises(decorator):
+    mcp = MCP("late")
+    mount_mcp(BoltAPI(), mcp)
+    with pytest.raises(RuntimeError, match="before the server is mounted"):
+        getattr(mcp, decorator)(reject_anonymous)

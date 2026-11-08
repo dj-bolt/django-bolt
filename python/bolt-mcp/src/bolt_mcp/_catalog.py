@@ -141,6 +141,9 @@ def build_mount_definition(
         "tools": {name: tool_entry(mcp, tool) for name, tool in mcp._tools.items()},
         "resource_dispatch": resource_dispatch(mcp),
         "prompt_dispatch": prompt_dispatch(mcp),
+        # Rust sends the request `_meta` and the principal only to middleware.
+        "resource_middleware": bool(mcp._resource_middleware),
+        "prompt_middleware": bool(mcp._prompt_middleware),
         "verify_token": verify_token,
         "www_authenticate": www_authenticate,
         "state_key": derive_state_key(secret_key),

@@ -9,7 +9,27 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+
+class JsonRpcError(Exception):
+    """Raise to answer a ``resources/read`` or ``prompts/get`` with a JSON-RPC error.
+
+    Raise it in resource or prompt middleware, or in a resource or prompt function.
+    The client gets ``message``. ``kind`` selects the code: ``"invalid_params"`` is
+    -32602. ``"resource_not_found"`` is -32002 for a legacy client and -32602 for a
+    2026-07-28 client. Bolt raises it too, for an unknown resource or prompt and
+    for invalid arguments.
+    """
+
+    def __init__(
+        self, message: str, *, kind: Literal["invalid_params", "resource_not_found"] = "invalid_params"
+    ) -> None:
+        if kind not in ("invalid_params", "resource_not_found"):
+            raise ValueError(f"JsonRpcError kind must be 'invalid_params' or 'resource_not_found', got {kind!r}")
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
 
 
 @dataclass(frozen=True)
@@ -40,7 +60,9 @@ ToolMiddleware = Callable[[ToolCall, Callable[[], Awaitable[dict[str, Any]]]], A
 class ResourceRead:
     """What a resource middleware sees of one ``resources/read``.
 
-    ``meta`` and ``principal`` are the same as on ``ToolCall``.
+    ``meta`` and ``principal`` are the same as on ``ToolCall``. The client sets
+    ``meta``, so do not trust it. ``principal`` can hold tokens or personal data.
+    Do not log it as it is.
     """
 
     uri: str
@@ -59,6 +81,9 @@ class PromptGet:
 
     ``arguments`` are the decoded arguments as the client sent them, before
     validation. ``meta`` and ``principal`` are the same as on ``ToolCall``.
+
+    The client sets ``meta``, so do not trust it. ``principal`` and ``arguments``
+    can hold tokens or personal data. Do not log them as they are.
     """
 
     name: str

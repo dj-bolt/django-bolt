@@ -137,6 +137,7 @@ class MCP:
         self._tool_middleware: list[ToolMiddleware] = []
         self._resource_middleware: list[ResourceMiddleware] = []
         self._prompt_middleware: list[PromptMiddleware] = []
+        self._mounted = False
 
     # ── Registration decorators ──────────────────────────────────────────────
     def tool(
@@ -219,7 +220,7 @@ class MCP:
         request passes up through the middleware as a ``BaseException``. Let it
         propagate.
         """
-        _check_async(fn, "Tool")
+        self._check_middleware(fn, "Tool")
         self._tool_middleware.append(fn)
         return fn
 
@@ -232,9 +233,13 @@ class MCP:
         a URI that doesn't match the template's types, or an exception in the
         resource function raises out of ``call_next()``; let it propagate so the
         client gets the JSON-RPC error. The first registered middleware runs
-        outermost. Register middleware before the server is mounted.
+        outermost.
+
+        Bolt checks the mount ``auth`` and ``guards`` in Rust first. Resources have
+        no guards of their own. To refuse a read, raise ``JsonRpcError``. Register
+        middleware before the server is mounted, else this raises ``RuntimeError``.
         """
-        _check_async(fn, "Resource")
+        self._check_middleware(fn, "Resource")
         self._resource_middleware.append(fn)
         return fn
 
@@ -246,12 +251,24 @@ class MCP:
         ``await call_next()`` renders the prompt and returns its GetPromptResult dict.
         An unknown prompt, invalid arguments or an exception in the prompt function
         raises out of ``call_next()``; let it propagate so the client gets the
-        JSON-RPC error. The first registered middleware runs outermost. Register
-        middleware before the server is mounted.
+        JSON-RPC error. The first registered middleware runs outermost.
+
+        Bolt checks the mount ``auth`` and ``guards`` in Rust first. Prompts have no
+        guards of their own. To refuse a prompt, raise ``JsonRpcError``. Register
+        middleware before the server is mounted, else this raises ``RuntimeError``.
         """
-        _check_async(fn, "Prompt")
+        self._check_middleware(fn, "Prompt")
         self._prompt_middleware.append(fn)
         return fn
+
+    def _check_middleware(self, fn: Callable[..., Any], kind: str) -> None:
+        if not inspect.iscoroutinefunction(fn):
+            raise TypeError(f"{kind} middleware {getattr(fn, '__name__', fn)!r} must be an async function")
+        # mount_mcp tells Rust once if resource and prompt middleware exist.
+        if self._mounted:
+            raise RuntimeError(
+                f"Register {kind.lower()} middleware {getattr(fn, '__name__', fn)!r} before the server is mounted"
+            )
 
     def add_tool(self, tool: ToolDef) -> None:
         """Register a pre-built ToolDef (used by the auto-expose path)."""
@@ -328,8 +345,3 @@ class MCP:
         if isinstance(name_or_fn, str):
             name = name_or_fn
         return register
-
-
-def _check_async(fn: Callable[..., Any], kind: str) -> None:
-    if not inspect.iscoroutinefunction(fn):
-        raise TypeError(f"{kind} middleware {getattr(fn, '__name__', fn)!r} must be an async function")
