@@ -76,9 +76,17 @@ def api():
     async def aiter_fails():
         return StreamingResponse(FailsInAiter(), media_type="text/plain")
 
-    @api.get("/ok")
-    async def ok_stream():
+    @api.get("/ok-async")
+    async def ok_async_stream():
         async def body():
+            yield "a,"
+            yield "b,"
+
+        return StreamingResponse(body(), media_type="text/plain")
+
+    @api.get("/ok-sync")
+    async def ok_sync_stream():
+        def body():
             yield "a,"
             yield "b,"
 
@@ -125,9 +133,10 @@ def test_an_error_before_the_first_chunk_gives_an_empty_body_and_is_logged(api, 
     assert str(record.exc_info[1]) == message
 
 
-def test_a_body_that_ends_normally_logs_nothing(api, caplog):
+@pytest.mark.parametrize("path", ["/ok-async", "/ok-sync"])
+def test_a_body_that_ends_normally_logs_nothing(api, caplog, path):
     with caplog.at_level(logging.DEBUG, logger=STREAM_LOGGER), TestClient(api) as client:
-        response = client.get("/ok")
+        response = client.get(path)
 
     assert response.content == b"a,b,"
     assert _stream_errors(caplog) == []
