@@ -103,11 +103,14 @@ Both sync and async functions are supported (sync tools run in a worker thread).
     title="Add numbers",              # optional human-readable title
     description="Add two integers",   # defaults to the docstring
     output_schema={...},              # optional JSON Schema for the result
+    meta={"ui": {"resourceUri": "ui://add/view.html"}},  # optional tool `_meta`
     guards=[Requires("permissions", "calc")],   # per-tool authorization (see below)
 )
 async def add(a: int, b: int) -> dict:
     return {"sum": a + b}
 ```
+
+`meta` is sent as the tool's `_meta` in `tools/list`. [MCP Apps](https://modelcontextprotocol.io/extensions/apps) read it: `ui.resourceUri` names the resource that renders the tool's results, and `ui.visibility: ["app"]` hides the tool from the model.
 
 **Return values** map as follows:
 
@@ -116,6 +119,25 @@ async def add(a: int, b: int) -> dict:
 | `str` | `content` text |
 | `dict` | `content` text **and** `structuredContent` |
 | other (Struct, dataclass, list, …) | serialized to text + `structuredContent` |
+| `ToolResult` | its `content` as the content, `structured` as `structuredContent`, `meta` as `_meta` |
+
+By default the text content is the JSON of the structured content. Return a `ToolResult` to set the text apart from it, for example a short summary for the model while an [MCP App](https://modelcontextprotocol.io/extensions/apps) renders the full data:
+
+```python
+from bolt_mcp import ToolResult
+
+@mcp.tool(output_schema={"type": "object", "properties": {"days": {"type": "array"}}})
+async def forecast(city: str) -> ToolResult:
+    days = await weather.forecast(city)
+    return ToolResult(
+        content=f"{len(days)} days of forecast for {city}.",
+        structured={"days": days},
+    )
+```
+
+`content` is a string or a list of MCP content blocks (text, image, resource link). `structured` is optional, and a value that is not an object is sent as `{"result": ...}`. `output_schema="auto"` cannot read a schema from `-> ToolResult`, or from a union that contains `ToolResult`. It raises `TypeError`, so pass the schema of `structured` as a dict.
+
+Bolt does not validate the structured content against the `output_schema` of the tool. This applies to `ToolResult.structured` and to a `dict` or other return value. A `ToolResult` without `structured` sends no `structuredContent`, also when the tool declares an `output_schema`. Make sure that each result agrees with the schema that you declare.
 
 **Errors are in-band.** A `raise` inside a tool becomes a `CallToolResult` with `isError: true` (the MCP convention), not a transport-level error — so the client sees a normal tool failure it can reason about.
 
@@ -152,6 +174,18 @@ import msgspec
 @mcp.resource("config://example", name="example-config", mime_type="application/json")
 async def example_config() -> str:
     return msgspec.json.encode({"app": "demo", "env": "dev"}).decode()
+```
+
+`meta` is sent as `_meta` on the `resources/read` contents. [MCP Apps](https://modelcontextprotocol.io/extensions/apps) read the iframe settings of an app from it, such as its content security policy:
+
+```python
+@mcp.resource(
+    "ui://weather/view.html",
+    mime_type="text/html;profile=mcp-app",
+    meta={"ui": {"csp": {"connectDomains": ["https://api.example.com"]}}},
+)
+async def weather_view() -> str:
+    return WEATHER_HTML
 ```
 
 ### Resource templates
