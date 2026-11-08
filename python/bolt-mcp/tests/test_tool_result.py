@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import msgspec
 import pytest
 from _helpers import initialize, parse_rpc, post_rpc, post_rpc_modern
@@ -88,3 +90,18 @@ def test_auto_output_schema_rejects_tool_result():
         @mcp.tool(output_schema="auto")
         def summary() -> ToolResult:
             return ToolResult(content="x")
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [ToolResult | None, Optional[ToolResult], ToolResult | Day],  # noqa: UP045
+    ids=["pipe-none", "optional", "pipe-struct"],
+)
+def test_auto_output_schema_rejects_a_union_with_tool_result(annotation):
+    def summary():
+        return ToolResult(content="x")
+
+    summary.__annotations__["return"] = annotation
+    mcp = MCP("tool-result-union-schema-test")
+    with pytest.raises(TypeError, match="returns ToolResult"):
+        mcp.tool(output_schema="auto")(summary)

@@ -132,7 +132,9 @@ async def forecast(city: str) -> ToolResult:
     )
 ```
 
-`content` is a string or a list of MCP content blocks (text, image, resource link). `structured` is optional, and a value that is not an object is sent as `{"result": ...}`. `output_schema="auto"` cannot read a schema from `-> ToolResult` and raises `TypeError`, so pass the schema of `structured` as a dict.
+`content` is a string or a list of MCP content blocks (text, image, resource link). `structured` is optional, and a value that is not an object is sent as `{"result": ...}`. `output_schema="auto"` cannot read a schema from `-> ToolResult`, or from a union that contains `ToolResult`. It raises `TypeError`, so pass the schema of `structured` as a dict.
+
+Bolt does not validate the structured content against the `output_schema` of the tool. This applies to `ToolResult.structured` and to a `dict` or other return value. A `ToolResult` without `structured` sends no `structuredContent`, also when the tool declares an `output_schema`. Make sure that each result agrees with the schema that you declare.
 
 **Errors are in-band.** A `raise` inside a tool becomes a `CallToolResult` with `isError: true` (the MCP convention), not a transport-level error — so the client sees a normal tool failure it can reason about.
 
