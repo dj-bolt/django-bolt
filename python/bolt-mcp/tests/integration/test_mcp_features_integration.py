@@ -77,13 +77,13 @@ def test_exposed_rest_route_is_callable_as_a_tool(feature_server):
 
 
 def test_failing_tool_returns_in_band_error(feature_server):
-    """A raised exception is an in-band CallToolResult error, not a JSON-RPC error."""
+    """A raised exception is an in-band CallToolResult error, not a JSON-RPC error, with its text masked."""
     sid, _ = _init(feature_server)
     called = _post(feature_server, "tools/call", {"name": "boom", "arguments": {}}, session_id=sid)
     msg = parse_rpc(called)
     assert "error" not in msg  # JSON-RPC envelope is a success
     assert msg["result"]["isError"] is True
-    assert "kaboom" in msg["result"]["content"][0]["text"]
+    assert msg["result"]["content"][0]["text"] == "Tool 'boom' failed."
 
 
 def test_context_tool_streams_progress_then_result(feature_server):

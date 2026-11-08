@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class ToolError(Exception):
     """Raise in a tool to send this message to the client as the error result.
 
-    The message always reaches the client, with or without ``MCP(mask_error_details=True)``,
+    The message always reaches the client, also when ``MCP`` masks other exceptions,
     and is not logged as a failure.
     """
 
@@ -73,7 +73,7 @@ async def run_tool(tool: ToolDef, kwargs: dict[str, Any]) -> Any:
     return await asyncio.to_thread(tool.fn, **kwargs)
 
 
-async def execute_tool(tool: ToolDef, kwargs: dict[str, Any], *, mask_error_details: bool = False) -> dict[str, Any]:
+async def execute_tool(tool: ToolDef, kwargs: dict[str, Any], *, mask_error_details: bool) -> dict[str, Any]:
     """Run a tool and map its return value (or exception) to a CallToolResult dict.
 
     A raised exception becomes an in-band error result, per MCP tool semantics —

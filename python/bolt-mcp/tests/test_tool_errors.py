@@ -14,9 +14,9 @@ from django_bolt.testing import TestClient
 SECRET = "connection to db.internal:5432 refused"
 
 
-def _server(*, mask: bool):
+def _server(**options):
     api = BoltAPI()
-    mcp = MCP("errors-test", mask_error_details=mask)
+    mcp = MCP("errors-test", **options)
 
     @mcp.tool
     def no_invoice(invoice_id: int) -> dict:
@@ -47,9 +47,9 @@ def _tool(client, name: str, arguments: dict) -> dict:
     return _post(client, "tools/call", {"name": name, "arguments": arguments})["result"]
 
 
-@pytest.mark.parametrize("mask", [False, True])
-def test_tool_error_message_reaches_the_client_and_is_not_logged(mask, caplog):
-    with caplog.at_level(logging.ERROR), TestClient(_server(mask=mask)) as client:
+@pytest.mark.parametrize("options", [{}, {"mask_error_details": False}], ids=["default", "unmasked"])
+def test_tool_error_message_reaches_the_client_and_is_not_logged(options, caplog):
+    with caplog.at_level(logging.ERROR), TestClient(_server(**options)) as client:
         result = _tool(client, "no_invoice", {"invoice_id": 7})
     assert result["isError"] is True
     assert result["content"][0]["text"] == "No invoice 7."
@@ -57,7 +57,7 @@ def test_tool_error_message_reaches_the_client_and_is_not_logged(mask, caplog):
 
 
 def test_other_exception_is_logged_with_its_traceback(caplog):
-    with caplog.at_level(logging.ERROR), TestClient(_server(mask=False)) as client:
+    with caplog.at_level(logging.ERROR), TestClient(_server()) as client:
         _tool(client, "broken", {})
     (record,) = [r for r in caplog.records if r.name == "bolt_mcp._execute"]
     assert record.getMessage() == "MCP tool 'broken' failed"
@@ -65,18 +65,19 @@ def test_other_exception_is_logged_with_its_traceback(caplog):
     assert SECRET in str(record.exc_info[1])
 
 
-def test_other_exception_text_reaches_the_client_by_default():
-    with TestClient(_server(mask=False)) as client:
+def test_other_exception_text_reaches_the_client_when_unmasked():
+    with TestClient(_server(mask_error_details=False)) as client:
         result = _tool(client, "broken", {})
     assert result["isError"] is True
     assert result["content"][0]["text"] == SECRET
 
 
-def test_mask_error_details_replaces_the_exception_text():
-    with TestClient(_server(mask=True)) as client:
+def test_tool_exception_text_is_masked_by_default():
+    with TestClient(_server()) as client:
         result = _tool(client, "broken", {})
     assert result["isError"] is True
     assert result["content"][0]["text"] == "Tool 'broken' failed."
+    assert SECRET not in str(result)
 
 
 @pytest.mark.parametrize(
@@ -86,11 +87,12 @@ def test_mask_error_details_replaces_the_exception_text():
         ("prompts/get", {"name": "broken_prompt"}, "Prompt 'broken_prompt' failed."),
     ],
 )
-def test_resource_and_prompt_exceptions_are_logged_and_masked(method, params, masked, caplog):
-    with caplog.at_level(logging.ERROR), TestClient(_server(mask=True)) as client:
+def test_resource_and_prompt_exceptions_are_logged_and_masked_by_default(method, params, masked, caplog):
+    with caplog.at_level(logging.ERROR), TestClient(_server()) as client:
         body = _post(client, method, params)
     assert body["error"]["code"] == -32603
     assert body["error"]["message"] == masked
+    assert SECRET not in str(body)
     (record,) = [r for r in caplog.records if r.name == "bolt_mcp._dispatch"]
     assert record.exc_info is not None
 
@@ -99,8 +101,8 @@ def test_resource_and_prompt_exceptions_are_logged_and_masked(method, params, ma
     ("method", "params"),
     [("resources/read", {"uri": "config://broken"}), ("prompts/get", {"name": "broken_prompt"})],
 )
-def test_resource_and_prompt_exception_text_is_kept_by_default(method, params):
-    with TestClient(_server(mask=False)) as client:
+def test_resource_and_prompt_exception_text_is_kept_when_unmasked(method, params):
+    with TestClient(_server(mask_error_details=False)) as client:
         body = _post(client, method, params)
     assert body["error"]["code"] == -32603
     assert body["error"]["message"] == f"MCP dispatch failed: RuntimeError: {SECRET}"

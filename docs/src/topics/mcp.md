@@ -119,12 +119,18 @@ async def add(a: int, b: int) -> dict:
 
 **Errors are in-band.** A `raise` inside a tool becomes a `CallToolResult` with `isError: true` (the MCP convention), not a transport-level error — so the client sees a normal tool failure it can reason about.
 
-Raise `ToolError` for a message the client and the model may read. Any other exception is logged with its traceback on the `bolt_mcp._execute` logger, and by default its text is sent to the client. With `MCP(mask_error_details=True)` the client gets `Tool 'name' failed.` instead, so database errors, host names and file paths stay on the server. A resource or prompt handler that raises gives a JSON-RPC internal error, logged and masked the same way.
+Raise `ToolError` for a message the client and the model may read. Bolt sends its text to the client.
+
+Bolt masks the text of every other exception. The client gets `Tool 'name' failed.` in place of the text. Thus database errors, host names, passwords and file paths stay on the server. Bolt logs the full traceback on the `bolt_mcp._execute` logger.
+
+A resource or prompt handler that raises gives a JSON-RPC internal error. The client gets `Resource 'uri' failed.` or `Prompt 'name' failed.`. Bolt logs the traceback on the `bolt_mcp._dispatch` logger.
+
+To send the exception text to the client during development, use `MCP("billing", mask_error_details=False)`. Do not use this setting in production.
 
 ```python
 from bolt_mcp import MCP, ToolError
 
-mcp = MCP("billing", mask_error_details=True)
+mcp = MCP("billing")
 
 @mcp.tool
 async def pay_invoice(invoice_id: int) -> dict:
