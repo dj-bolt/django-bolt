@@ -103,11 +103,14 @@ Both sync and async functions are supported (sync tools run in a worker thread).
     title="Add numbers",              # optional human-readable title
     description="Add two integers",   # defaults to the docstring
     output_schema={...},              # optional JSON Schema for the result
+    meta={"ui": {"resourceUri": "ui://add/view.html"}},  # optional tool `_meta`
     guards=[Requires("permissions", "calc")],   # per-tool authorization (see below)
 )
 async def add(a: int, b: int) -> dict:
     return {"sum": a + b}
 ```
+
+`meta` is sent as the tool's `_meta` in `tools/list`. [MCP Apps](https://modelcontextprotocol.io/extensions/apps) read it: `ui.resourceUri` names the resource that renders the tool's results, and `ui.visibility: ["app"]` hides the tool from the model.
 
 **Return values** map as follows:
 
@@ -150,6 +153,18 @@ import msgspec
 @mcp.resource("config://example", name="example-config", mime_type="application/json")
 async def example_config() -> str:
     return msgspec.json.encode({"app": "demo", "env": "dev"}).decode()
+```
+
+`meta` is sent as `_meta` on the `resources/read` contents. [MCP Apps](https://modelcontextprotocol.io/extensions/apps) read the iframe settings of an app from it, such as its content security policy:
+
+```python
+@mcp.resource(
+    "ui://weather/view.html",
+    mime_type="text/html;profile=mcp-app",
+    meta={"ui": {"csp": {"connectDomains": ["https://api.example.com"]}}},
+)
+async def weather_view() -> str:
+    return WEATHER_HTML
 ```
 
 ### Resource templates

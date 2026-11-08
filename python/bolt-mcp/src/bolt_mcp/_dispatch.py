@@ -96,8 +96,8 @@ async def _invoke(fn: Any, is_async: bool, /, **kwargs: Any) -> Any:
     return await fn(**kwargs) if is_async else fn(**kwargs)
 
 
-async def _resolve_resource(mcp: MCP, uri: str) -> tuple[str, str]:
-    """Resolve a URI to ``(text, mime_type)``: static resources, then templates.
+async def _resolve_resource(mcp: MCP, uri: str) -> tuple[str, str, dict[str, Any] | None]:
+    """Resolve a URI to ``(text, mime_type, meta)``: static resources, then templates.
 
     Raises ``LookupError`` for no match and ``msgspec.ValidationError`` when a
     template matches but its ``{vars}`` don't coerce to the handler's types.
@@ -105,7 +105,7 @@ async def _resolve_resource(mcp: MCP, uri: str) -> tuple[str, str]:
     """
     resource: ResourceDef | None = mcp._resources.get(uri)
     if resource is not None:
-        return await _invoke(resource.fn, resource.is_async), resource.mime_type
+        return await _invoke(resource.fn, resource.is_async), resource.mime_type, resource.meta
     tmpl: ResourceTemplateDef
     for tmpl in mcp._resource_templates.values():
         match = tmpl.pattern.match(uri)
@@ -113,7 +113,7 @@ async def _resolve_resource(mcp: MCP, uri: str) -> tuple[str, str]:
             continue
         raw = {k: unquote(v) for k, v in match.groupdict().items()}
         kwargs = msgspec.structs.asdict(msgspec.convert(raw, tmpl.args_struct, strict=False))
-        return await _invoke(tmpl.fn, tmpl.is_async, **kwargs), tmpl.mime_type
+        return await _invoke(tmpl.fn, tmpl.is_async, **kwargs), tmpl.mime_type, tmpl.meta
     raise LookupError(uri)
 
 
@@ -124,14 +124,15 @@ def _error(kind: str, message: str) -> bytes:
 async def _read_resource(mcp: MCP, payload: dict[str, Any]) -> bytes:
     uri = payload["uri"]
     try:
-        text, mime_type = await _resolve_resource(mcp, uri)
+        text, mime_type, meta = await _resolve_resource(mcp, uri)
     except LookupError:
         return _error("resource_not_found", f"Unknown resource: {uri!r}")
     except msgspec.ValidationError as exc:
         return _error("invalid_params", f"Invalid resource URI {uri!r}: {exc}")
-    return json_encode(
-        {"contents": [{"uri": uri, "mimeType": mime_type, "text": text}], "resultType": RESULT_TYPE_COMPLETE}
-    )
+    content: dict[str, Any] = {"uri": uri, "mimeType": mime_type, "text": text}
+    if meta is not None:
+        content["_meta"] = meta
+    return json_encode({"contents": [content], "resultType": RESULT_TYPE_COMPLETE})
 
 
 def resource_dispatch(mcp: MCP) -> Any:
