@@ -67,6 +67,21 @@ pub struct Route {
     /// Per-route bound sync dispatch (same shape as `dispatch`).
     pub dispatch_sync: Py<PyAny>,
     pub handler_id: usize, // Store handler_id for middleware metadata lookup
+    /// Set for a native route: the request goes to this handler, not to Python.
+    /// `handler` then holds the capsule, which keeps the handler alive.
+    pub native: Option<NativeHandler>,
+}
+
+/// The handler id of every native route. Native routes have no route
+/// metadata, and no Python or WebSocket route has this id, so a lookup by it
+/// finds nothing.
+pub const NATIVE_HANDLER_ID: usize = usize::MAX;
+
+/// A handler from a `bolt_native_abi` capsule, checked at registration.
+#[derive(Clone, Copy)]
+pub struct NativeHandler {
+    pub handler: &'static bolt_native_abi::HandlerV1,
+    pub call: bolt_native_abi::CallFn,
 }
 
 /// Check if a path contains any path parameters (dynamic segments)
@@ -188,6 +203,37 @@ impl Router {
         dispatch: Py<PyAny>,
         dispatch_sync: Py<PyAny>,
     ) -> PyResult<()> {
+        let route = Route {
+            handler,
+            dispatch,
+            dispatch_sync,
+            handler_id,
+            native: None,
+        };
+        self.insert(method, path, route, false)
+    }
+
+    /// Register a native route. Unlike a Python route, a native route that has
+    /// the same method and path as another route is an error.
+    pub fn register_native(
+        &mut self,
+        py: Python<'_>,
+        method: &str,
+        path: &str,
+        capsule: Py<PyAny>,
+        native: NativeHandler,
+    ) -> PyResult<()> {
+        let route = Route {
+            handler: capsule,
+            dispatch: py.None(),
+            dispatch_sync: py.None(),
+            handler_id: NATIVE_HANDLER_ID,
+            native: Some(native),
+        };
+        self.insert(method, path, route, true)
+    }
+
+    fn insert(&mut self, method: &str, path: &str, route: Route, unique: bool) -> PyResult<()> {
         let method_router = match method {
             "GET" => &mut self.get,
             "POST" => &mut self.post,
@@ -209,22 +255,16 @@ impl Router {
         // Static routes use O(1) HashMap lookup, dynamic routes use radix tree
         if is_static_path(path) {
             // Static route: store in HashMap for O(1) lookup
-            let route = Route {
-                handler,
-                dispatch,
-                dispatch_sync,
-                handler_id,
-            };
+            if unique && method_router.static_routes.contains_key(path) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Failed to register route: {} {} is already registered",
+                    method, path
+                )));
+            }
             method_router.static_routes.insert(path.to_string(), route);
         } else {
             // Dynamic route: convert path and store in radix tree
             let converted_path = convert_path(path);
-            let route = Route {
-                handler,
-                dispatch,
-                dispatch_sync,
-                handler_id,
-            };
             method_router
                 .dynamic_router
                 .insert(&converted_path, route)
