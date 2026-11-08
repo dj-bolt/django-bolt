@@ -18,6 +18,7 @@ to the ``api.mount_mcp(mcp)`` method.
 
 from __future__ import annotations
 
+from ._execute import ToolResult
 from .autoexpose import expose_as_tool, expose_routes
 from .context import Context
 from .mount import ProtectedResource, mount_mcp
@@ -33,4 +34,5 @@ __all__ = [
     "expose_routes",
     "expose_as_tool",
     "Context",
+    "ToolResult",
 ]

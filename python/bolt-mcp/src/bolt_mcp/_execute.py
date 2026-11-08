@@ -7,6 +7,7 @@ Calls sync/async tool functions and maps their return value into an MCP
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any
 
 import msgspec
@@ -31,8 +32,39 @@ def error_result(message: str) -> dict[str, Any]:
     return {"content": [_text_content(message)], "isError": True, "resultType": RESULT_TYPE_COMPLETE}
 
 
+@dataclass(frozen=True)
+class ToolResult:
+    """A tool result whose text content is set apart from its structured content.
+
+    ``content`` is the text the model reads, or a list of MCP content blocks.
+    ``structured`` becomes ``structuredContent`` (a non-object is wrapped as
+    ``{"result": ...}``). ``meta`` becomes the result's ``_meta``.
+    """
+
+    content: str | list[dict[str, Any]]
+    structured: Any = None
+    meta: dict[str, Any] | None = None
+
+
+def _structured(value: Any) -> dict[str, Any]:
+    payload = msgspec.to_builtins(value, enc_hook=default_serializer)
+    return payload if isinstance(payload, dict) else {"result": payload}
+
+
+def _from_tool_result(result: ToolResult) -> dict[str, Any]:
+    content = [_text_content(result.content)] if isinstance(result.content, str) else list(result.content)
+    mapped: dict[str, Any] = {"content": content, "isError": False, "resultType": RESULT_TYPE_COMPLETE}
+    if result.structured is not None:
+        mapped["structuredContent"] = _structured(result.structured)
+    if result.meta is not None:
+        mapped["_meta"] = result.meta
+    return mapped
+
+
 def to_call_tool_result(result: Any) -> dict[str, Any]:
     """Map a tool's return value into a CallToolResult dict."""
+    if isinstance(result, ToolResult):
+        return _from_tool_result(result)
     if isinstance(result, str):
         return {"content": [_text_content(result)], "isError": False, "resultType": RESULT_TYPE_COMPLETE}
     if isinstance(result, dict):

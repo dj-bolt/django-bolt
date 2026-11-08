@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
-from typing import Any, get_type_hints
+from types import UnionType
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import msgspec
+
+from ._execute import ToolResult
 
 INJECTED_PARAMS = frozenset({"request", "req"})
 _AUTOEXPOSE_SOURCES = frozenset({"path", "query", "body", "header", "cookie"})
@@ -83,6 +86,14 @@ def output_schema_from_return(fn: Callable) -> dict[str, Any] | None:
     annotation = hints.get("return")
     if annotation is None or annotation is type(None):
         return None
+    # The schema of ToolResult describes its own fields, not the structured content.
+    if annotation is ToolResult or (
+        get_origin(annotation) in (Union, UnionType) and ToolResult in get_args(annotation)
+    ):
+        raise TypeError(
+            f"{getattr(fn, '__name__', fn)!r} returns ToolResult, so its output schema cannot be derived. "
+            "Pass output_schema as a JSON Schema dict for the structured content, or leave it out."
+        )
     schema = _inline_root_ref(msgspec.json.schema(annotation))
     if schema.get("type") != "object":
         return None
