@@ -124,7 +124,7 @@ class Context:
         """Read one of this server's own resources (static or templated)."""
         if self._resolver is None:
             raise RuntimeError("read_resource is unavailable in this context")
-        text, _mime = await self._resolver(uri)
+        text, _mime, _meta = await self._resolver(uri)
         return text
 
     # ── bidirectional: ask the client, await the answer ──────────────────────
