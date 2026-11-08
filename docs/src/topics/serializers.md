@@ -571,6 +571,37 @@ result = user.dump()
 # {'email': 'test@example.com'}  # password excluded
 ```
 
+### Write-only fields in a response
+
+A response gives the `dump()` of each Serializer at a position of the declared response type. The declared type is the return annotation or `response_model`. A position can be a field of a `Struct`, a dataclass or a `TypedDict`. It can also be an item of a list or a tuple, a value of a dict, or a member of a union:
+
+```python
+import msgspec
+
+
+class LoginResult(msgspec.Struct):
+    user: UserCreateSerializer
+    token: str
+
+
+@api.post("/login")
+async def login(request) -> LoginResult:
+    return LoginResult(user=user, token="...")
+    # {"user": {"email": "test@example.com"}, "token": "..."}
+```
+
+`dump()` does the same for the fields of a Serializer. A Serializer in a Struct, dict or tuple field of a Serializer also gives its `dump()`.
+
+A value with no declared type goes out as msgspec encodes it. msgspec encodes a Serializer with all of its fields, also the write-only fields. Thus declare the type, or call `dump()`:
+
+```python
+@api.post("/login")
+async def login(request) -> dict:
+    return {"user": user.dump(), "token": "..."}  # dump() hides the password
+```
+
+Bolt makes the plan of each response type once, when the route registers. A type with no Serializer gets no plan and costs nothing.
+
 ## Nested serializers
 
 ### Basic nesting
