@@ -16,7 +16,7 @@ import asyncio
 import dataclasses
 import json
 from collections.abc import Iterator
-from typing import Annotated, Generic, NotRequired, TypedDict, TypeVar
+from typing import Annotated, Generic, NamedTuple, NotRequired, TypedDict, TypeVar
 
 import msgspec
 import pytest
@@ -101,6 +101,38 @@ class TaggedPair(msgspec.Struct, array_like=True, tag=True):
 
     n: int
     account: Account
+
+
+class Row(NamedTuple):
+    """msgspec encodes a NamedTuple as an array."""
+
+    n: int
+    account: Account
+
+
+class GenericHolder(TypedDict, Generic[T]):  # noqa: UP046 - PEP 695 params do not resolve under PEP 563
+    item: T
+
+
+class Unhashable(msgspec.Struct):
+    """Field types that cannot be hashed, and a bare tuple.
+
+    msgspec keeps Annotated in the field types, and this metadata cannot be
+    hashed. The plan reads the fields from the last one, so it meets the
+    list of numbers before the list of accounts.
+    """
+
+    accounts: list[Annotated[Account, {"doc": "accounts"}]]
+    numbers: list[Annotated[int, {"doc": "numbers"}]]
+    loose: tuple = ()
+
+
+@dataclasses.dataclass
+class Partial:
+    """The first field has no value, so msgspec skips it."""
+
+    first: Account = dataclasses.field(init=False)
+    second: Account | None = None
 
 
 class SubEnvelope(Envelope):
@@ -473,6 +505,37 @@ def test_omit_defaults_still_omits_the_default_serializer():
     assert get(api, "/default") == {}
     assert get(api, "/other") == {"account": {"id": 3}}
     assert get(api, "/second") == {"second": {"id": 3}}
+
+
+def test_named_tuple_generic_typed_dict_and_unhashable_metadata():
+    api = BoltAPI()
+
+    @api.get("/row")
+    def row() -> list[Row]:
+        return [Row(n=7, account=account())]
+
+    @api.get("/generic-typed-dict", validate_response=False)
+    def generic_typed_dict() -> GenericHolder[Account]:
+        return {"item": account()}
+
+    @api.get("/unhashable")
+    def unhashable() -> Unhashable:
+        return Unhashable(accounts=[account()], numbers=[7])
+
+    @api.get("/partial")
+    def partial() -> Partial:
+        return Partial(second=account())
+
+    @api.get("/short", validate_response=False)
+    def short() -> Pair:
+        # A list with fewer items than the Struct has fields.
+        return [7]  # type: ignore[return-value]
+
+    assert get(api, "/row") == [[7, DUMPED]]
+    assert get(api, "/generic-typed-dict") == {"item": DUMPED}
+    assert get(api, "/unhashable") == {"accounts": [DUMPED], "numbers": [7], "loose": []}
+    assert get(api, "/partial") == {"second": DUMPED}
+    assert get(api, "/short") == [7]
 
 
 def test_dict_at_the_position_of_a_struct_or_a_dataclass():
