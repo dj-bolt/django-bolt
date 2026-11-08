@@ -340,21 +340,50 @@ impl RefreshingJwks {
     }
 
     /// Get the JWKS from the Python callback and replace the keys. A failed
-    /// fetch keeps the last known-good keys.
+    /// fetch keeps the last known-good keys and logs a warning.
     fn fetch(&self) {
-        let result = Python::attach(|py| {
-            self.refresh
+        let keys = Python::attach(|py| {
+            let document = match self
+                .refresh
                 .call0(py)
-                .ok()
-                .and_then(|value| value.extract::<Option<String>>(py).ok())
-                .flatten()
+                .and_then(|value| value.extract::<Option<String>>(py))
+            {
+                Ok(Some(document)) => document,
+                // The callback logged its own failure, or a refresh already runs.
+                Ok(None) => return None,
+                Err(err) => {
+                    log_jwks_refresh_failure(py, &format!("the refresh callback raised {err}"));
+                    return None;
+                }
+            };
+            match build_jwks_key_source(&document) {
+                Ok(JwtKeySource::Jwks(keys)) => Some(keys),
+                Ok(_) => None,
+                Err(err) => {
+                    log_jwks_refresh_failure(py, &err);
+                    None
+                }
+            }
         });
         *self.last_refresh.lock() = Instant::now();
-        if let Some(document) = result
-            && let Ok(JwtKeySource::Jwks(keys)) = build_jwks_key_source(&document)
-        {
+        if let Some(keys) = keys {
             *self.keys.write() = keys;
         }
+    }
+}
+
+/// Log a JWKS refresh that Bolt cannot use to the `django_bolt.auth` logger.
+///
+/// Bolt keeps the last keys, so a token from a new key gets a 401. The log
+/// is the only sign that the provider fails. The `log` crate has no output here.
+fn log_jwks_refresh_failure(py: Python<'_>, reason: &str) {
+    let message = format!("JWKS refresh failed: {reason}. Bolt keeps the last keys.");
+    let logged = py
+        .import(intern!(py, "logging"))
+        .and_then(|logging| logging.call_method1(intern!(py, "getLogger"), ("django_bolt.auth",)))
+        .and_then(|logger| logger.call_method1(intern!(py, "warning"), (message.as_str(),)));
+    if let Err(err) = logged {
+        eprintln!("[django-bolt] {message} Logging failed: {err}");
     }
 }
 

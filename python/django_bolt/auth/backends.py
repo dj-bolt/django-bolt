@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import sys
 import threading
 from abc import ABC, abstractmethod
@@ -35,6 +36,9 @@ from django.db import InterfaceError, OperationalError
 
 from .pk_loader import load_user_by_pk_sync
 from .revocation import create_revocation_handler
+
+# Rust logs here too: a JWKS refresh that it cannot use.
+logger = logging.getLogger("django_bolt.auth")
 
 # (jti) -> True if the token is revoked, False otherwise.
 RevokedTokenHandler = Callable[[str], Awaitable[bool]] | Callable[[str, dict[str, Any]], Awaitable[bool]]
@@ -355,6 +359,8 @@ class JWTAuthentication(BaseAuthentication):
             self._jwks = response.text
             return self._jwks
         except (httpx.HTTPError, ValueError):
+            # Bolt keeps the last keys. A token from a new key gets a 401 until a refresh works.
+            logger.warning("JWKS refresh from %s failed. Bolt keeps the last keys.", self.jwks_url, exc_info=True)
             return None
         finally:
             self._jwks_refresh_lock.release()
