@@ -46,6 +46,7 @@ def compile_catalog(mcp: MCP) -> str:
                 "outputSchema": t.output_schema,
                 "annotations": t.annotations,
                 "icons": t.icons,
+                "_meta": t.meta,
             }
         )
         for t in mcp._tools.values()
