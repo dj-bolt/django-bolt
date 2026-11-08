@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
+use rmcp::RoleServer;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
     ErrorCode, ErrorData as McpError, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
@@ -24,15 +25,14 @@ use rmcp::model::{
     ResultType, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
-use rmcp::RoleServer;
 use serde_json::Value;
 
+use crate::McpAuthExt;
 use crate::context::{CtxEvent, McpPyContext, ProtocolMode};
 use crate::registry::{McpRegistry, McpToolEntry};
 use crate::state_codec;
-use crate::McpAuthExt;
-use bolt_core::middleware::auth::{populate_auth_context, AuthContext};
-use bolt_core::permissions::{evaluate_guards, GuardResult};
+use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
+use bolt_core::permissions::{GuardResult, evaluate_guards};
 use bolt_loop as worker_loop;
 
 #[derive(Clone)]
@@ -97,28 +97,28 @@ enum PyOutcome<T> {
 fn parse_py_result<T: serde::de::DeserializeOwned>(raw: &str, mode: ProtocolMode) -> PyOutcome<T> {
     // Cheap envelope sniff before typed parsing: envelopes are single-key
     // objects produced by our own dispatch layer.
-    if raw.contains("\"__inputRequired__\"") || raw.contains("\"__error__\"") {
-        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw) {
-            if let Some(items) = map.get("__inputRequired__") {
-                match serde_json::from_value::<Vec<PyInputRequired>>(items.clone()) {
-                    Ok(items) => return PyOutcome::InputRequired(items),
-                    Err(e) => {
-                        return PyOutcome::Error(McpError::internal_error(
-                            format!("invalid __inputRequired__ envelope: {e}"),
-                            None,
-                        ))
-                    }
+    if (raw.contains("\"__inputRequired__\"") || raw.contains("\"__error__\""))
+        && let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw)
+    {
+        if let Some(items) = map.get("__inputRequired__") {
+            match serde_json::from_value::<Vec<PyInputRequired>>(items.clone()) {
+                Ok(items) => return PyOutcome::InputRequired(items),
+                Err(e) => {
+                    return PyOutcome::Error(McpError::internal_error(
+                        format!("invalid __inputRequired__ envelope: {e}"),
+                        None,
+                    ));
                 }
             }
-            if let Some(err) = map.get("__error__") {
-                match serde_json::from_value::<PyErrorEnvelope>(err.clone()) {
-                    Ok(env) => return PyOutcome::Error(map_py_error(&env.kind, env.message, mode)),
-                    Err(e) => {
-                        return PyOutcome::Error(McpError::internal_error(
-                            format!("invalid __error__ envelope: {e}"),
-                            None,
-                        ))
-                    }
+        }
+        if let Some(err) = map.get("__error__") {
+            match serde_json::from_value::<PyErrorEnvelope>(err.clone()) {
+                Ok(env) => return PyOutcome::Error(map_py_error(&env.kind, env.message, mode)),
+                Err(e) => {
+                    return PyOutcome::Error(McpError::internal_error(
+                        format!("invalid __error__ envelope: {e}"),
+                        None,
+                    ));
                 }
             }
         }

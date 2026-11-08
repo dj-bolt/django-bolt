@@ -7,13 +7,13 @@ use actix_http::encoding::Encoder;
 /// it removes the header and returns the response uncompressed.
 /// Otherwise, it applies compression based on CompressionConfig and Accept-Encoding.
 use actix_web::{
-    body::{BodySize, MessageBody},
-    dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    http::header::{ContentEncoding, ACCEPT_ENCODING, CONTENT_ENCODING, VARY},
     Error,
+    body::{BodySize, MessageBody},
+    dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
+    http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding},
 };
-use futures_util::future::LocalBoxFuture;
-use std::future::{ready, Ready};
+use futures_util::future::{FutureExt, Map};
+use std::future::{Ready, ready};
 use std::sync::Arc;
 
 use crate::metadata::CompressionConfig;
@@ -56,6 +56,9 @@ pub struct CompressionMiddlewareService<S> {
     service: S,
 }
 
+/// The result of the inner service, and of this middleware.
+type Outcome<B> = Result<ServiceResponse<B>, Error>;
+
 impl<S, B> Service<ServiceRequest> for CompressionMiddlewareService<S>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
@@ -64,100 +67,64 @@ where
 {
     type Response = ServiceResponse<Encoder<B>>;
     type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+    // A named future: the request needs no box, and it copies nothing.
+    type Future = Map<S::Future, fn(Outcome<B>) -> Outcome<Encoder<B>>>;
 
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        // Store Accept-Encoding header from request for later use
-        let accept_encoding = req
-            .headers()
-            .get(ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        // Get compression config from app state
-        let compression_config = req
-            .app_data::<actix_web::web::Data<Arc<AppState>>>()
-            .and_then(|state| state.global_compression_config.clone());
-
-        let fut = self.service.call(req);
-
-        Box::pin(async move {
-            let res = fut.await?;
-
-            // If the response already declares a Content-Encoding, the handler
-            // owns the encoding (e.g. per-chunk SSE compression). Pass it
-            // through without re-wrapping.
-            //
-            // Special case: `identity` is our internal "skip compression"
-            // marker — strip it so clients don't see it. Any other value
-            // (br, gzip, zstd) is preserved as-is.
-            let pre_set = res
-                .headers()
-                .get(CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok());
-
-            if let Some(encoding) = pre_set {
-                let is_identity = encoding.eq_ignore_ascii_case("identity");
-                let (req, mut response) = res.into_parts();
-                if is_identity {
-                    response.headers_mut().remove(CONTENT_ENCODING);
-                }
-                return Ok(ServiceResponse::new(
-                    req,
-                    response.map_body(|head, body| {
-                        Encoder::response(ContentEncoding::Identity, head, body)
-                    }),
-                ));
-            }
-
-            // Apply compression based on CompressionConfig and Accept-Encoding
-            let (req, mut response) = res.into_parts();
-
-            // Select encoding based on config and client support
-            let encoding =
-                select_encoding(accept_encoding.as_deref(), compression_config.as_deref());
-
-            // Get minimum size from config or use default
-            let minimum_size = compression_config
-                .as_ref()
-                .map(|c| c.minimum_size)
-                .unwrap_or(500);
-
-            // Check if response size warrants compression (skip small responses)
-            let should_compress = match response.body().size() {
-                BodySize::None => encoding != ContentEncoding::Identity,
-                BodySize::Sized(size) => {
-                    size >= minimum_size as u64 && encoding != ContentEncoding::Identity
-                }
-                _ => encoding != ContentEncoding::Identity,
-            };
-
-            if should_compress {
-                // Add Vary header to indicate content varies by Accept-Encoding
-                // Use append (not insert) to preserve existing Vary headers like CORS's Vary: Origin
-                response.headers_mut().append(
-                    VARY,
-                    actix_web::http::header::HeaderValue::from_static("accept-encoding"),
-                );
-
-                // Create encoder with selected encoding
-                Ok(ServiceResponse::new(
-                    req,
-                    response.map_body(|head, body| Encoder::response(encoding, head, body)),
-                ))
-            } else {
-                // No compression needed
-                Ok(ServiceResponse::new(
-                    req,
-                    response.map_body(|head, body| {
-                        Encoder::response(ContentEncoding::Identity, head, body)
-                    }),
-                ))
-            }
-        })
+        self.service.call(req).map(encode_response::<B>)
     }
+}
+
+/// Wrap the body of a response in the encoder that the response gets. The
+/// response holds its request, so the Accept-Encoding value and the config
+/// are read in place.
+fn encode_response<B: MessageBody>(res: Outcome<B>) -> Outcome<Encoder<B>> {
+    let res = res?;
+
+    // If the response already declares a Content-Encoding, the handler
+    // owns the encoding (e.g. per-chunk SSE compression). Pass it
+    // through without re-wrapping.
+    //
+    // Special case: `identity` is our internal "skip compression"
+    // marker — strip it so clients don't see it. Any other value
+    // (br, gzip, zstd) is preserved as-is.
+    let pre_set = res
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(encoding) = pre_set {
+        let is_identity = encoding.eq_ignore_ascii_case("identity");
+        let (req, mut response) = res.into_parts();
+        if is_identity {
+            response.headers_mut().remove(CONTENT_ENCODING);
+        }
+        return Ok(ServiceResponse::new(
+            req,
+            response
+                .map_body(|head, body| Encoder::response(ContentEncoding::Identity, head, body)),
+        ));
+    }
+
+    let request = res.request();
+    let accept_encoding = request
+        .headers()
+        .get(ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let config = request
+        .app_data::<actix_web::web::Data<Arc<AppState>>>()
+        .and_then(|state| state.global_compression_config.as_deref());
+    let encoding = response_encoding(accept_encoding, config, res.response().body().size());
+
+    // When the encoder compresses the body, it sets Content-Encoding
+    // and appends `Vary: accept-encoding` after a Vary of the handler.
+    let (req, response) = res.into_parts();
+    Ok(ServiceResponse::new(
+        req,
+        response.map_body(|head, body| Encoder::response(encoding, head, body)),
+    ))
 }
 
 #[cfg(test)]
@@ -165,7 +132,7 @@ mod bypass_tests {
     use super::*;
     use actix_web::http::header::{HeaderName, HeaderValue};
     use actix_web::test::{self, TestRequest};
-    use actix_web::{web, App, HttpResponse};
+    use actix_web::{App, HttpResponse, web};
 
     async fn assert_encoding_preserved(pre_set_encoding: &'static str) {
         // The body must be >= minimum_size (default 500 bytes) to trigger the
@@ -231,6 +198,46 @@ mod bypass_tests {
     async fn pre_set_zstd_encoding_is_preserved() {
         assert_encoding_preserved("zstd").await;
     }
+
+    /// Call a middleware app that answers with 600 bytes and `headers`.
+    async fn call_with_headers(
+        headers: &'static [(&'static str, &'static str)],
+    ) -> ServiceResponse<impl MessageBody> {
+        let app = test::init_service(App::new().wrap(CompressionMiddleware::new()).route(
+            "/",
+            web::get().to(move || async move {
+                let mut response = HttpResponse::Ok();
+                for (name, value) in headers {
+                    response.insert_header((*name, *value));
+                }
+                response.body(vec![b'x'; 600])
+            }),
+        ))
+        .await;
+        let req = TestRequest::get()
+            .uri("/")
+            .insert_header(("accept-encoding", "br, gzip, zstd"))
+            .to_request();
+        test::call_service(&app, req).await
+    }
+
+    #[actix_web::test]
+    async fn the_identity_marker_is_removed() {
+        let resp = call_with_headers(&[("content-encoding", "IDENTITY")]).await;
+        assert!(resp.headers().get("content-encoding").is_none());
+        assert!(resp.headers().get("vary").is_none());
+        assert_eq!(test::read_body(resp).await, vec![b'x'; 600]);
+    }
+
+    #[actix_web::test]
+    async fn an_app_without_a_compression_config_does_not_compress() {
+        // The app has no AppState, so the middleware has no config.
+        let resp = call_with_headers(&[("vary", "Origin")]).await;
+        assert!(resp.headers().get("content-encoding").is_none());
+        let vary: Vec<_> = resp.headers().get_all("vary").collect();
+        assert_eq!(vary, [&HeaderValue::from_static("Origin")]);
+        assert_eq!(test::read_body(resp).await, vec![b'x'; 600]);
+    }
 }
 
 /// Select best compression encoding based on config and client support.
@@ -270,6 +277,22 @@ fn select_encoding(
         return ContentEncoding::Gzip;
     }
     ContentEncoding::Identity
+}
+
+/// The coding for a response body of `size`. A body that is smaller than the
+/// minimum size of the config gets `Identity`. A body of unknown size gets
+/// the coding of `select_encoding`.
+fn response_encoding(
+    accept_encoding: Option<&str>,
+    config: Option<&CompressionConfig>,
+    size: BodySize,
+) -> ContentEncoding {
+    match (config, size) {
+        (Some(cfg), BodySize::Sized(size)) if size < cfg.minimum_size as u64 => {
+            ContentEncoding::Identity
+        }
+        _ => select_encoding(accept_encoding, config),
+    }
 }
 
 #[cfg(test)]
@@ -430,5 +453,75 @@ mod select_encoding_tests {
             select_encoding(Some("x-gzip-old"), Some(&cfg)),
             ContentEncoding::Identity
         );
+    }
+
+    // ─── response_encoding ────────────────────────────────────────────
+
+    #[test]
+    fn a_body_from_the_minimum_size_up_is_compressed() {
+        let cfg = cfg_brotli();
+        let min = cfg.minimum_size as u64;
+        for size in [min, min + 1] {
+            assert_eq!(
+                response_encoding(Some("br"), Some(&cfg), BodySize::Sized(size)),
+                ContentEncoding::Brotli,
+                "size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_under_the_minimum_size_is_not_compressed() {
+        let cfg = cfg_brotli();
+        let size = cfg.minimum_size as u64 - 1;
+        assert_eq!(
+            response_encoding(Some("br"), Some(&cfg), BodySize::Sized(size)),
+            ContentEncoding::Identity
+        );
+    }
+
+    #[test]
+    fn a_body_of_unknown_size_is_compressed() {
+        // A stream has no size, so the minimum size does not apply.
+        let cfg = CompressionConfig {
+            minimum_size: 1 << 20,
+            ..cfg_gzip()
+        };
+        assert_eq!(
+            response_encoding(Some("gzip"), Some(&cfg), BodySize::Stream),
+            ContentEncoding::Gzip
+        );
+    }
+
+    #[test]
+    fn a_large_body_follows_the_accept_encoding() {
+        let cfg = cfg_zstd();
+        let size = BodySize::Sized(cfg.minimum_size as u64 * 2);
+        assert_eq!(
+            response_encoding(None, Some(&cfg), size),
+            ContentEncoding::Identity
+        );
+        assert_eq!(
+            response_encoding(Some("identity"), Some(&cfg), size),
+            ContentEncoding::Identity
+        );
+        assert_eq!(
+            response_encoding(Some("zstd"), Some(&cfg), size),
+            ContentEncoding::Zstd
+        );
+    }
+
+    #[test]
+    fn no_config_is_never_compressed() {
+        for size in [
+            BodySize::Sized(0),
+            BodySize::Sized(1 << 20),
+            BodySize::Stream,
+        ] {
+            assert_eq!(
+                response_encoding(Some("br, gzip, zstd"), None, size),
+                ContentEncoding::Identity
+            );
+        }
     }
 }

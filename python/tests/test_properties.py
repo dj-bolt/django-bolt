@@ -20,12 +20,13 @@ import httpx
 import pytest
 from django.http import QueryDict
 from django.http.cookie import parse_cookie
+from django.test import override_settings
 from hypothesis import example, given
 from hypothesis import strategies as st
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, responses
 from django_bolt.param_functions import Cookie, Form, Query
-from django_bolt.responses import JSON
+from django_bolt.responses import JSON, FileResponse
 from django_bolt.testing import TestClient
 
 api = BoltAPI()
@@ -375,3 +376,64 @@ def test_selected_cookie_matches_django(client, parts):
     response = client.get("/selected-cookie", headers={"cookie": header})
     assert response.status_code == 200
     assert response.json() == {"a": parse_cookie(header).get("a", "missing")}
+
+
+# The parts of a generated FileResponse path. The tree of `file_client` has each name.
+FILE_PATH_PARTS = [
+    "public",
+    "outside",
+    "probe",
+    "escape",
+    "back",
+    "dangling",
+    "loop",
+    "known.txt",
+    "missing",
+    "..",
+    ".",
+]
+
+
+@pytest.fixture(scope="module")
+def file_client(tmp_path_factory):
+    """Serve paths below an allowed dir, with links out of it and back into it."""
+    root = tmp_path_factory.mktemp("files")
+    public = root / "public"
+    outside = root / "outside"
+    public.mkdir()
+    outside.mkdir()
+    (public / "known.txt").write_text("known")
+    (public / "escape").symlink_to("../outside", target_is_directory=True)
+    (public / "dangling").symlink_to("../outside/probe")
+    (public / "loop").symlink_to("loop")
+    (outside / "back").symlink_to("../public", target_is_directory=True)
+    file_api = BoltAPI()
+
+    @file_api.get("/file")
+    def file(path: str):
+        return FileResponse(f"{public}/{path}")
+
+    with override_settings(BOLT_ALLOWED_FILE_PATHS=[str(public)]), pytest.MonkeyPatch.context() as patch:
+        patch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
+        patch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
+        responses.initialize_file_response_settings()
+        with TestClient(file_api) as test_client:
+            yield test_client, outside / "probe"
+
+
+@given(parts=st.lists(st.sampled_from(FILE_PATH_PARTS), min_size=1, max_size=8))
+@example(parts=["..", "outside", "probe", "..", "..", "public", "known.txt"])
+@example(parts=["escape", "probe", "..", "back", "known.txt"])
+@example(parts=["dangling"])
+@example(parts=["dangling", "..", "back"])
+@example(parts=["escape", "..", "outside", "probe"])
+def test_a_file_response_status_does_not_show_whether_a_file_out_of_the_allowed_dir_exists(file_client, parts):
+    client, probe = file_client
+    path = "/".join(parts)
+    without_file = client.get("/file", params={"path": path}).status_code
+    probe.write_text("secret")
+    try:
+        with_file = client.get("/file", params={"path": path}).status_code
+    finally:
+        probe.unlink()
+    assert without_file == with_file

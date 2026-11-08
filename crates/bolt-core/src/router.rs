@@ -1,20 +1,25 @@
 use ahash::{AHashMap, AHashSet};
-use matchit::{Match, Router as MatchRouter};
+use matchit::{Match, Params, Router as MatchRouter};
 use pyo3::prelude::*;
 use std::borrow::Cow;
 
+/// The path params of a match. Each name borrows from the router. Each value
+/// borrows from the path, unless it has a `%` escape.
+pub type PathParams<'a> = AHashMap<&'a str, Cow<'a, str>>;
+
 /// Lookup result type that indicates whether path params exist
 /// For static routes, params is always None (avoiding allocation)
-/// For dynamic routes, params contains the extracted path parameters
-pub enum RouteMatch<'a> {
-    Static(&'a Route),
-    Dynamic(&'a Route, AHashMap<String, String>),
+/// For dynamic routes, params holds the params of the radix tree. They borrow
+/// from the router and the path, so a lookup does not allocate.
+pub enum RouteMatch<'r, 'p> {
+    Static(&'r Route),
+    Dynamic(&'r Route, Params<'r, 'p>),
 }
 
-impl<'a> RouteMatch<'a> {
+impl<'r, 'p> RouteMatch<'r, 'p> {
     /// Get the route handler
     #[inline]
-    pub fn route(&self) -> &Route {
+    pub fn route(&self) -> &'r Route {
         match self {
             RouteMatch::Static(r) => r,
             RouteMatch::Dynamic(r, _) => r,
@@ -22,14 +27,23 @@ impl<'a> RouteMatch<'a> {
     }
 
     /// Decompose into the route reference (with the router's lifetime — 'static
-    /// for the global router) and owned path params. Lets the request handler
+    /// for the global router) and the decoded path params. Lets the request handler
     /// defer the handler `clone_ref` into the main GIL block instead of paying
     /// an extra `Python::attach` per request.
     #[inline]
-    pub fn into_parts(self) -> (&'a Route, Option<AHashMap<String, String>>) {
+    pub fn into_parts(self) -> (&'r Route, Option<PathParams<'p>>)
+    where
+        'r: 'p,
+    {
         match self {
             RouteMatch::Static(r) => (r, None),
-            RouteMatch::Dynamic(r, params) => (r, Some(params)),
+            RouteMatch::Dynamic(r, params) => {
+                let mut decoded = PathParams::with_capacity(params.len());
+                for (name, value) in params.iter() {
+                    decoded.insert(name, decode_path_param(value));
+                }
+                (r, Some(decoded))
+            }
         }
     }
 
@@ -53,6 +67,21 @@ pub struct Route {
     /// Per-route bound sync dispatch (same shape as `dispatch`).
     pub dispatch_sync: Py<PyAny>,
     pub handler_id: usize, // Store handler_id for middleware metadata lookup
+    /// Set for a native route: the request goes to this handler, not to Python.
+    /// `handler` then holds the capsule, which keeps the handler alive.
+    pub native: Option<NativeHandler>,
+}
+
+/// The handler id of every native route. Native routes have no route
+/// metadata, and no Python or WebSocket route has this id, so a lookup by it
+/// finds nothing.
+pub const NATIVE_HANDLER_ID: usize = usize::MAX;
+
+/// A handler from a `bolt_native_abi` capsule, checked at registration.
+#[derive(Clone, Copy)]
+pub struct NativeHandler {
+    pub handler: &'static bolt_native_abi::HandlerV1,
+    pub call: bolt_native_abi::CallFn,
 }
 
 /// Check if a path contains any path parameters (dynamic segments)
@@ -174,6 +203,37 @@ impl Router {
         dispatch: Py<PyAny>,
         dispatch_sync: Py<PyAny>,
     ) -> PyResult<()> {
+        let route = Route {
+            handler,
+            dispatch,
+            dispatch_sync,
+            handler_id,
+            native: None,
+        };
+        self.insert(method, path, route, false)
+    }
+
+    /// Register a native route. Unlike a Python route, a native route that has
+    /// the same method and path as another route is an error.
+    pub fn register_native(
+        &mut self,
+        py: Python<'_>,
+        method: &str,
+        path: &str,
+        capsule: Py<PyAny>,
+        native: NativeHandler,
+    ) -> PyResult<()> {
+        let route = Route {
+            handler: capsule,
+            dispatch: py.None(),
+            dispatch_sync: py.None(),
+            handler_id: NATIVE_HANDLER_ID,
+            native: Some(native),
+        };
+        self.insert(method, path, route, true)
+    }
+
+    fn insert(&mut self, method: &str, path: &str, route: Route, unique: bool) -> PyResult<()> {
         let method_router = match method {
             "GET" => &mut self.get,
             "POST" => &mut self.post,
@@ -187,7 +247,7 @@ impl Router {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Unsupported method: {}",
                     method
-                )))
+                )));
             }
         };
 
@@ -195,22 +255,16 @@ impl Router {
         // Static routes use O(1) HashMap lookup, dynamic routes use radix tree
         if is_static_path(path) {
             // Static route: store in HashMap for O(1) lookup
-            let route = Route {
-                handler,
-                dispatch,
-                dispatch_sync,
-                handler_id,
-            };
+            if unique && method_router.static_routes.contains_key(path) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Failed to register route: {} {} is already registered",
+                    method, path
+                )));
+            }
             method_router.static_routes.insert(path.to_string(), route);
         } else {
             // Dynamic route: convert path and store in radix tree
             let converted_path = convert_path(path);
-            let route = Route {
-                handler,
-                dispatch,
-                dispatch_sync,
-                handler_id,
-            };
             method_router
                 .dynamic_router
                 .insert(&converted_path, route)
@@ -239,7 +293,7 @@ impl Router {
     ///
     /// OPTIMIZATION: #[inline] on hot path - called on every request
     #[inline]
-    pub fn find(&self, method: &str, path: &str) -> Option<RouteMatch<'_>> {
+    pub fn find<'p>(&self, method: &str, path: &'p str) -> Option<RouteMatch<'_, 'p>> {
         let method_router = match method {
             "GET" => &self.get,
             "POST" => &self.post,
@@ -262,13 +316,7 @@ impl Router {
         // Phase 2: Radix tree lookup for dynamic routes
         // Only reached for paths with parameters like /users/{id}
         match method_router.dynamic_router.at(path) {
-            Ok(Match { value, params }) => {
-                let mut path_params = AHashMap::new();
-                for (key, value) in params.iter() {
-                    path_params.insert(key.to_string(), value.to_string());
-                }
-                Some(RouteMatch::Dynamic(value, path_params))
-            }
+            Ok(Match { value, params }) => Some(RouteMatch::Dynamic(value, params)),
             Err(_) => None,
         }
     }
@@ -313,16 +361,25 @@ impl Router {
     }
 }
 
-/// URL-decode path parameters in place (`/items/hello%20world` yields `hello world`).
+/// URL-decode a path param (`hello%20world` yields `hello world`).
 /// A value that does not decode to UTF-8 stays as it is.
 /// A `+` in a path is a literal `+`, so only a `%` starts a decode.
 #[inline]
+pub fn decode_path_param(value: &str) -> Cow<'_, str> {
+    if memchr::memchr(b'%', value.as_bytes()).is_some()
+        && let Ok(decoded) = urlencoding::decode(value)
+    {
+        return decoded;
+    }
+    Cow::Borrowed(value)
+}
+
+/// URL-decode path parameters in place, as `decode_path_param` does.
+#[inline]
 pub fn decode_path_params(params: &mut AHashMap<String, String>) {
     for v in params.values_mut() {
-        if memchr::memchr(b'%', v.as_bytes()).is_some() {
-            if let Ok(Cow::Owned(s)) = urlencoding::decode(v) {
-                *v = s;
-            }
+        if let Cow::Owned(s) = decode_path_param(v) {
+            *v = s;
         }
     }
 }
@@ -471,6 +528,175 @@ mod tests {
         // Another type keeps only the name.
         assert_eq!(convert_path("/items/{id:int}"), "/items/{id}");
         assert_eq!(convert_path("/items/{id}/tags"), "/items/{id}/tags");
+    }
+
+    const METHODS: [&str; 8] = [
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY",
+    ];
+
+    /// A router with the handler id of each route at its index. Each callable is `None`.
+    fn router_with(routes: &[(&str, &str)]) -> Router {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut router = Router::new();
+            for (handler_id, (method, path)) in routes.iter().enumerate() {
+                router
+                    .register(method, path, handler_id, py.None(), py.None(), py.None())
+                    .unwrap();
+            }
+            router
+        })
+    }
+
+    type Params = Option<Vec<(String, String)>>;
+
+    /// The handler id of the match, and its decoded path params in name order.
+    fn lookup(router: &Router, method: &str, path: &str) -> Option<(usize, Params)> {
+        let found = router.find(method, path)?;
+        let handler_id = found.handler_id();
+        assert_eq!(found.route().handler_id, handler_id);
+        let (route, params) = found.into_parts();
+        assert_eq!(route.handler_id, handler_id);
+        let params = params.map(|params| {
+            let mut params: Vec<(String, String)> = params
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.into_owned()))
+                .collect();
+            params.sort();
+            params
+        });
+        Some((handler_id, params))
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> Params {
+        Some(
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn each_method_finds_only_its_own_routes() {
+        let routes: Vec<(&str, &str)> = METHODS
+            .iter()
+            .flat_map(|method| [(*method, "/items"), (*method, "/items/{id}")])
+            .collect();
+        let router = router_with(&routes);
+        for (index, method) in METHODS.iter().enumerate() {
+            assert_eq!(lookup(&router, method, "/items"), Some((2 * index, None)));
+            assert_eq!(
+                lookup(&router, method, "/items/7"),
+                Some((2 * index + 1, params(&[("id", "7")])))
+            );
+        }
+
+        let router = router_with(&[("GET", "/items"), ("GET", "/items/{id}")]);
+        for method in &METHODS[1..] {
+            assert_eq!(lookup(&router, method, "/items"), None);
+            assert_eq!(lookup(&router, method, "/items/7"), None);
+        }
+    }
+
+    #[test]
+    fn an_unknown_method_does_not_register_and_finds_nothing() {
+        let mut router = router_with(&[("GET", "/items")]);
+        Python::attach(|py| {
+            let error = router
+                .register("TRACE", "/items", 1, py.None(), py.None(), py.None())
+                .unwrap_err();
+            assert_eq!(error.to_string(), "ValueError: Unsupported method: TRACE");
+        });
+        assert_eq!(lookup(&router, "TRACE", "/items"), None);
+        assert_eq!(lookup(&router, "get", "/items"), None);
+    }
+
+    #[test]
+    fn a_static_route_wins_and_has_no_params() {
+        let router = router_with(&[("GET", "/users/{id}"), ("GET", "/users/me")]);
+        assert_eq!(lookup(&router, "GET", "/users/me"), Some((1, None)));
+        assert_eq!(
+            lookup(&router, "GET", "/users/42"),
+            Some((0, params(&[("id", "42")])))
+        );
+        assert_eq!(lookup(&router, "GET", "/users"), None);
+        assert_eq!(lookup(&router, "GET", "/users/42/posts"), None);
+    }
+
+    #[test]
+    fn a_dynamic_route_gives_each_param() {
+        let router = router_with(&[
+            ("GET", "/orgs/{org}/repos/{repo:str}"),
+            ("GET", "/files/{rest:path}"),
+        ]);
+        assert_eq!(
+            lookup(&router, "GET", "/orgs/acme/repos/widgets"),
+            Some((0, params(&[("org", "acme"), ("repo", "widgets")])))
+        );
+        // A path param takes the rest of the path. Only `%XX` decodes.
+        assert_eq!(
+            lookup(&router, "GET", "/files/a/b%20c+d.txt"),
+            Some((1, params(&[("rest", "a/b c+d.txt")])))
+        );
+    }
+
+    #[test]
+    fn a_path_param_borrows_from_the_path_unless_it_decodes() {
+        let router = router_with(&[("GET", "/items/{id}/{name}")]);
+        let (_, params) = router.find("GET", "/items/7/a%20b").unwrap().into_parts();
+        let params = params.unwrap();
+        assert!(matches!(params["id"], Cow::Borrowed("7")));
+        assert!(matches!(&params["name"], Cow::Owned(name) if name == "a b"));
+    }
+
+    #[test]
+    fn a_path_param_decodes_once() {
+        let router = router_with(&[("GET", "/items/{id}")]);
+        let (_, params) = router.find("GET", "/items/a%252Fb").unwrap().into_parts();
+        assert_eq!(params.unwrap()["id"], "a%2Fb");
+    }
+
+    #[test]
+    fn a_route_that_conflicts_does_not_register() {
+        let mut router = router_with(&[("GET", "/items/{id}")]);
+        Python::attach(|py| {
+            let error = router
+                .register("GET", "/items/{key}", 1, py.None(), py.None(), py.None())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("ValueError: Failed to register route: "),
+                "{error}"
+            );
+        });
+        assert_eq!(
+            lookup(&router, "GET", "/items/1"),
+            Some((0, params(&[("id", "1")])))
+        );
+    }
+
+    #[test]
+    fn find_all_methods_lists_the_methods_of_a_path_and_options() {
+        let router = router_with(&[
+            ("GET", "/items"),
+            ("POST", "/items"),
+            ("PUT", "/items"),
+            ("PATCH", "/items"),
+            ("HEAD", "/items"),
+            ("QUERY", "/items"),
+            ("DELETE", "/items/{id}"),
+            ("GET", "/cors"),
+            ("OPTIONS", "/cors"),
+        ]);
+        assert_eq!(
+            router.find_all_methods("/items"),
+            ["GET", "POST", "PUT", "PATCH", "HEAD", "QUERY", "OPTIONS"]
+        );
+        assert_eq!(router.find_all_methods("/items/3"), ["DELETE", "OPTIONS"]);
+        // A registered OPTIONS route is listed once.
+        assert_eq!(router.find_all_methods("/cors"), ["GET", "OPTIONS"]);
+        assert!(router.find_all_methods("/none").is_empty());
     }
 
     #[test]
@@ -707,6 +933,10 @@ mod tests {
         #[test]
         fn an_encoded_path_param_decodes_to_its_text(text in any::<String>()) {
             let encoded = urlencoding::encode(&text).into_owned();
+            prop_assert_eq!(decode_path_param(&encoded), text.as_str());
+            let plain = text.replace('%', "");
+            prop_assert!(matches!(decode_path_param(&plain), Cow::Borrowed(value) if value == plain));
+
             let mut params = AHashMap::from_iter([("value".to_string(), encoded)]);
             decode_path_params(&mut params);
             prop_assert_eq!(&params["value"], &text);

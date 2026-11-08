@@ -56,6 +56,9 @@ _SEQUENCE_ORIGINS = (list, set, frozenset, tuple)
 _META_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "pattern", "min_length", "max_length", "tz")
 # These sources give one value. A query key can give more than one.
 _SINGLE_VALUE_SOURCES = ("path", "header", "cookie")
+# This map gives the `loc` source of a struct parameter error for each source name in messages.
+# A scalar parameter from the same source has the same `loc` source.
+_STRUCT_ERROR_SOURCES = {"query parameter": "query", "cookie": "cookie", "form field": "body"}
 
 
 def _holds_one_item(annotation: Any) -> bool:
@@ -355,17 +358,19 @@ def _collect_struct_errors(
     struct_type: type,
     data: dict[str, Any],
     param_type: str,
+    source: str,
     has_files: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Collect validation errors for every field of a msgspec struct from the provided input mapping.
 
-    Validate each field of `struct_type` against `data` and return a list of error objects describing either per-field validation failures or missing required fields/files. This function treats form fields as body-located errors when `param_type` is "form field" and, when `has_files` is True, enables upload-file decoding for validation.
+    Validate each field of `struct_type` against `data` and return a list of error objects describing either per-field validation failures or missing required fields/files. The `loc` of each error names the source as a scalar parameter does ("query", "cookie" or "body"). When `has_files` is True, the function decodes upload files for validation.
 
     Parameters:
         struct_type (type): The msgspec struct/serializer type whose fields to validate.
         data (dict[str, Any]): The input mapping of encoded field names to values.
-        param_type (str): The parameter source name used in error locations (e.g., "query", "cookie", "form field").
+        param_type (str): The source name in a missing-field message ("query parameter", "cookie" or "form field").
+        source (str): The source in `loc` ("query", "cookie" or "body").
         has_files (bool): Enable upload-file decoding hooks when True.
 
     Returns:
@@ -376,7 +381,6 @@ def _collect_struct_errors(
             - "input": the offending input value or None for missing fields/files.
     """
     dec_hook = _upload_file_dec_hook if has_files else None
-    loc_prefix = "body" if param_type == "form field" else param_type
     errors: list[dict[str, Any]] = []
     for field in msgspec.structs.fields(struct_type):
         encoded_name = getattr(field, "encode_name", field.name)
@@ -387,7 +391,7 @@ def _collect_struct_errors(
                 errors.append(
                     {
                         "type": "validation_error",
-                        "loc": (loc_prefix, encoded_name),
+                        "loc": (source, encoded_name),
                         "msg": str(e),
                         "input": data[encoded_name],
                     }
@@ -397,8 +401,8 @@ def _collect_struct_errors(
             errors.append(
                 {
                     "type": "file_missing" if is_file else "missing_field",
-                    "loc": ("body", field.name) if is_file else (param_type, field.name),
-                    "msg": "Missing required file" if is_file else f"Missing required {param_type}: {field.name}",
+                    "loc": ("body", encoded_name) if is_file else (source, encoded_name),
+                    "msg": "Missing required file" if is_file else f"Missing required {param_type}: {encoded_name}",
                     "input": None,
                 }
             )
@@ -452,11 +456,13 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
     Parameters:
         struct_type (type): msgspec struct/serializer type to produce.
         default (Any): Reserved for optional-struct support; not used by the extractor itself.
-        param_type (str): Human-readable parameter source name used in error locations (e.g., "query parameter", "form field", "cookie").
+        param_type (str): The source name in error messages ("query parameter", "form field" or "cookie"). It also selects the source in `loc`.
 
     Returns:
         Callable: An extractor function that produces a validated instance of `struct_type` from incoming parameter data and raises RequestValidationError on validation errors.
     """
+    # An unknown source fails here, when the route registers.
+    source = _STRUCT_ERROR_SOURCES[param_type]
     # Check at registration time if any fields need file handling
     has_upload_file_fields = any(is_upload_file_type(f.type) for f in msgspec.structs.fields(struct_type))
     # Pre-compute sequence field names — empty tuple means zero runtime overhead.
@@ -496,7 +502,7 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
             try:
                 result = msgspec.convert(merged, struct_type, strict=False, dec_hook=_upload_file_dec_hook)
             except msgspec.ValidationError as e:
-                errors = _collect_struct_errors(struct_type, merged, param_type, has_files=True)
+                errors = _collect_struct_errors(struct_type, merged, param_type, source, has_files=True)
                 if errors:
                     raise RequestValidationError(errors=errors) from e
                 raise
@@ -545,13 +551,48 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
             try:
                 return msgspec.convert(param_map, struct_type, strict=False)
             except msgspec.ValidationError as e:
-                errors = _collect_struct_errors(struct_type, param_map, param_type)
+                errors = _collect_struct_errors(struct_type, param_map, param_type, source)
                 if errors:
                     raise RequestValidationError(errors=errors) from e
                 raise
 
         extract.needs_files_map = False  # type: ignore[attr-defined]
         return extract
+
+
+def _collect_header_struct_errors(
+    header_fields: tuple[tuple[str, str, Any, bool], ...], data: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return one error for each missing or invalid field of a header struct.
+
+    ``header_fields`` holds the header name, the encoded name, the type and the
+    required flag of each field. ``data`` maps encoded names to header values.
+    The ``loc`` of each error is ``("header", header name)``, as for a scalar header.
+    """
+    errors: list[dict[str, Any]] = []
+    for header_name, encoded_name, field_type, required in header_fields:
+        if encoded_name in data:
+            try:
+                msgspec.convert(data[encoded_name], type=field_type)
+            except msgspec.ValidationError as e:
+                errors.append(
+                    {
+                        "type": "validation_error",
+                        "loc": ("header", header_name),
+                        "msg": str(e),
+                        "input": data[encoded_name],
+                    }
+                )
+        elif required:
+            errors.append(
+                {
+                    "type": "missing_field",
+                    "loc": ("header", header_name),
+                    "msg": f"Missing required header: {header_name}",
+                    "input": None,
+                }
+            )
+    return errors
 
 
 def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable:
@@ -562,7 +603,8 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     aliases (field(name=...)) and rename strategies.
 
     Note: Rust converts the typed struct fields before this runs (see
-    ``create_header_extractor``), so msgspec gets typed values.
+    ``create_header_extractor``), so msgspec gets typed values. A missing or
+    invalid field gives a RequestValidationError with one error for each field.
 
     Args:
         struct_type: The msgspec.Struct or Serializer class
@@ -576,23 +618,28 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     # Pre-compute header name mapping at registration time
     # Maps kebab-case header name → encoded field name (for msgspec alias support)
     header_to_encoded: list[tuple[str, str]] = []
-    required_headers: set[str] = set()
+    header_fields: list[tuple[str, str, Any, bool]] = []
     for field in msgspec.structs.fields(struct_type):
         encoded_name = getattr(field, "encode_name", field.name)
         header_name = encoded_name.lower().replace("_", "-")
         header_to_encoded.append((header_name, encoded_name))
-        if field.required:
-            required_headers.add(header_name)
+        header_fields.append((header_name, encoded_name, field.type, field.required))
+    error_fields = tuple(header_fields)
 
     def extract(headers_map: dict[str, str]) -> Any:
         converted = {}
         for header_name, encoded_name in header_to_encoded:
-            if header_name in headers_map:
-                converted[encoded_name] = headers_map[header_name]
-            elif header_name in required_headers:
-                raise HTTPException(status_code=422, detail=f"Missing required header: {header_name}")
+            value = headers_map.get(header_name)
+            if value is not None:
+                converted[encoded_name] = value
 
-        return msgspec.convert(converted, struct_type)
+        try:
+            return msgspec.convert(converted, struct_type)
+        except msgspec.ValidationError as e:
+            errors = _collect_header_struct_errors(error_fields, converted)
+            if errors:
+                raise RequestValidationError(errors=errors) from e
+            raise
 
     return extract
 
@@ -841,11 +888,10 @@ def create_extractor_for_field(field: FieldDefinition) -> Callable | None:
     elif source == "dependency":
         # Dependencies are handled specially in the injector
         return None
-    else:
-        # Fallback for unknown sources
-        if default is not inspect.Parameter.empty:
-            return lambda *_args, **_kwargs: default
-        return None
+    raise TypeError(
+        f"Parameter {name!r} has an unsupported source {source!r}. "
+        "Use one of: path, query, header, cookie, form, file, body."
+    )
 
 
 def compile_response_coercer(annotation: Any) -> tuple[Callable[[Any], Any], Callable[[Any], Any]]:

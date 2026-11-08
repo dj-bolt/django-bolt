@@ -32,7 +32,9 @@ from typing import (
     runtime_checkable,
 )
 
-from ..exceptions import HTTPException
+import msgspec
+
+from ..exceptions import HTTPException, ValidationException
 
 if TYPE_CHECKING:
     from ..request import Request
@@ -128,14 +130,9 @@ def normalize_middleware_specs(
             if allow_function_middleware and _is_function_middleware_callable(spec):
                 normalized.append(FunctionMiddlewareSpec(spec))
                 continue
-            if not isinstance(spec, type):
-                raise TypeError(
-                    f"{context} middleware does not accept middleware instances ({type(spec).__name__}). "
-                    "Pass middleware classes instead, e.g. middleware=[MyMiddleware]."
-                )
             raise TypeError(
-                f"{context} middleware entry '{spec}' must be a middleware class "
-                "or DjangoMiddleware/DjangoMiddlewareStack wrapper."
+                f"{context} middleware does not accept middleware instances ({type(spec).__name__}). "
+                "Pass middleware classes instead, e.g. middleware=[MyMiddleware]."
             )
 
         raise TypeError(
@@ -380,15 +377,28 @@ def middleware(*args, **kwargs):
     def decorator(handler: Callable) -> Callable:
         normalized = normalize_middleware_specs(args, context="route", allow_function_middleware=True)
         for spec in normalized:
+            if isinstance(spec, dict) and spec.get("type") == "cors":
+                _reject_second_cors(handler)
             attach_middleware(handler, spec)
 
         # Support dict-style middleware metadata (e.g. @middleware(type="cors", ...))
         if kwargs:
+            if kwargs.get("type") == "cors":
+                _reject_second_cors(handler)
             attach_middleware(handler, kwargs)
 
         return handler
 
     return decorator
+
+
+def _rate_limit_count(name: str, value: Any) -> int:
+    """Return a count of @rate_limit. Raise for a value that is not an int of 1 or more."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"rate_limit {name} must be an int, got {type(value).__name__} {value!r}")
+    if value < 1:
+        raise ValueError(f"rate_limit {name} must be 1 or more, got {value}")
+    return value
 
 
 def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
@@ -414,9 +424,13 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     route or the API; the server refuses to start without one.
 
     Args:
-        rps: Requests per second limit
-        burst: Burst capacity (defaults to 2x rps)
+        rps: Requests per second limit. An int of 1 or more.
+        burst: Burst capacity. An int of 1 or more (defaults to 2x rps).
         key: Rate limit key strategy ("ip", "user", "api_key", or header name)
+
+    Raises:
+        TypeError: rps or burst is not an int, or key is not a str.
+        ValueError: rps or burst is less than 1, or key is empty.
 
     Example:
         @api.get("/api/data")
@@ -425,13 +439,52 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
             return {"data": [...]}
     """
 
+    # Check the values here. Rust cannot read a bad value, and the route must
+    # not get another limit than the one its author gave.
+    rps = _rate_limit_count("rps", rps)
+    burst = rps * 2 if burst is None else _rate_limit_count("burst", burst)
+    if not isinstance(key, str):
+        raise TypeError(f"rate_limit key must be a str, got {type(key).__name__} {key!r}")
+    if not key:
+        raise ValueError("rate_limit key must not be empty")
+
     def decorator(func):
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
-        func.__bolt_middleware__.append({"type": "rate_limit", "rps": rps, "burst": burst or rps * 2, "key": key})
+        func.__bolt_middleware__.append({"type": "rate_limit", "rps": rps, "burst": burst, "key": key})
         return func
 
     return decorator
+
+
+def _reject_second_cors(handler: Callable) -> None:
+    """Raise ValueError when the handler already has a cors config.
+
+    Two cors configs on one route have no clear order. The config stays on the
+    function, so one function cannot serve two routes with different origins.
+    """
+    if any(isinstance(mw, dict) and mw.get("type") == "cors" for mw in getattr(handler, "__bolt_middleware__", ())):
+        raise ValueError(
+            "The function already has a @cors. Merge the origins into one @cors, or give each route its own function."
+        )
+
+
+def _cors_str_list(name: str, value: Any) -> list[str]:
+    """Return a str or a sequence of str as a list of str.
+
+    Any other type raises TypeError here, at decoration, with the name of the argument.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        raise TypeError(f"@cors() {name} must be a str or a list of str, not {type(value).__name__}")
+    items = list(value)
+    for item in items:
+        if not isinstance(item, str):
+            raise TypeError(f"@cors() {name} must hold only str, not {type(item).__name__}")
+    return items
 
 
 def cors(
@@ -440,6 +493,7 @@ def cors(
     headers: list[str] = None,
     credentials: bool = False,
     max_age: int = 3600,
+    origin_regexes: list[str] | str | None = None,
 ):
     """
     CORS configuration decorator (Rust-accelerated).
@@ -447,9 +501,16 @@ def cors(
     This middleware is handled in Rust for maximum performance.
     CORS preflight requests are handled without Python overhead.
 
+    The origins and origin_regexes of the route are its complete allow list. The route does
+    not use CORS_ALLOWED_ORIGINS or CORS_ALLOWED_ORIGIN_REGEXES.
+
     Args:
-        origins: Allowed origins (REQUIRED). Use ["*"] for all origins, or specific origins
-                 like ["https://example.com"]. For global config, use Django settings instead.
+        origins: Allowed origins (REQUIRED unless origin_regexes is given). Use ["*"] for all
+                 origins, or specific origins like ["https://example.com"]. For global config,
+                 use Django settings instead.
+        origin_regexes: Patterns for allowed origins, as in CORS_ALLOWED_ORIGIN_REGEXES. Start
+                 each pattern with ^ and end it with $. Patterns use the syntax of the Rust
+                 regex crate, which has no look-around and no back-references.
         methods: Allowed methods (default: GET, POST, PUT, PATCH, DELETE, OPTIONS)
         headers: Allowed headers
         credentials: Allow credentials (cannot be combined with wildcard "*")
@@ -465,27 +526,40 @@ def cors(
         @cors(origins=["https://app.example.com"], credentials=True)
         async def with_cookies(): ...
 
+        @cors(origin_regexes=[r"^https://[a-z]+\\.example\\.com$"])
+        async def tenant_endpoint(): ...
+
     Raises:
-        ValueError: If origins is not specified (empty @cors() is not allowed)
+        ValueError: If origins and origin_regexes are both missing or empty (empty @cors() is not allowed),
+            if a pattern is empty, or if the route already has a @cors
+        TypeError: If origins or origin_regexes holds a value that is not a str
     """
 
     def decorator(func):
-        # SECURITY: Require explicit origins - empty @cors() is a common mistake
-        if origins is None:
+        # A str is one origin or one pattern, not a sequence of characters.
+        origin_list = _cors_str_list("origins", origins)
+        regex_list = _cors_str_list("origin_regexes", origin_regexes)
+
+        # SECURITY: Require explicit origins - empty @cors() is a common mistake.
+        # An empty list would use the global settings, which the route replaces.
+        if not origin_list and not regex_list:
             raise ValueError(
-                "@cors() requires 'origins' argument. Examples:\n"
+                "@cors() requires an 'origins' or 'origin_regexes' argument. Examples:\n"
                 "  @cors(origins=['https://example.com'])  # Specific origin\n"
                 "  @cors(origins=['*'])  # Allow all origins\n"
+                "  @cors(origin_regexes=[r'^https://\\w+\\.example\\.com$'])  # Origin patterns\n"
                 "\n"
                 "If you want to use global CORS settings from Django (CORS_ALLOWED_ORIGINS),\n"
                 "simply remove the @cors decorator - global config applies automatically."
             )
 
+        # SECURITY: An empty pattern matches every origin.
+        if any(not pattern for pattern in regex_list):
+            raise ValueError("@cors() origin_regexes holds an empty pattern, which matches every origin.")
+
+        _reject_second_cors(func)
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
-
-        # Parse origins
-        origin_list = origins if isinstance(origins, list) else [origins]
 
         # SECURITY: Validate wildcard + credentials
         if "*" in origin_list and credentials:
@@ -500,6 +574,7 @@ def cors(
             {
                 "type": "cors",
                 "origins": origin_list,
+                "origin_regexes": regex_list,
                 "methods": methods or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"],
                 "headers": headers,
                 "credentials": credentials,
@@ -680,8 +755,9 @@ class ErrorHandlerMiddleware(BaseMiddleware):
     async def process_request(self, request: Request) -> Response:
         try:
             return await self.get_response(request)
-        except HTTPException:
-            raise  # Let HTTP exceptions pass through
+        except (HTTPException, ValidationException, msgspec.ValidationError):
+            # An HTTP exception or a validation error is not a server fault. Bolt answers it.
+            raise
         except Exception as e:
             self.logger.exception(f"Unhandled exception: {e}")
 

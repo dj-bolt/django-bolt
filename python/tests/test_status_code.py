@@ -1,8 +1,14 @@
 """
-Tests for the status_codes module.
+Tests for the status_codes module, and for the body of a 204 response.
 """
 
-from django_bolt import status, status_codes
+import asyncio
+
+import pytest
+
+from django_bolt import BoltAPI, status, status_codes
+from django_bolt.middleware import middleware
+from django_bolt.testing import TestClient
 
 
 def test_status_alias_import():
@@ -62,3 +68,35 @@ def test_status_classification_boundaries():
     assert status_codes.is_error(400)
     assert status_codes.is_error(599)
     assert not status_codes.is_error(600)
+
+
+@middleware
+async def body_length(request, call_next):
+    """Send the length of the handler body. Rust drops a 204 body, so only a middleware sees it."""
+    response = await call_next(request)
+    response.headers["x-body-length"] = str(len(response.body))
+    return response
+
+
+@pytest.mark.parametrize("path", ["/sync", "/async"])
+def test_204_with_none_has_an_empty_body(path):
+    """A 204 handler that returns None gives an empty body, also to a middleware."""
+    api = BoltAPI()
+
+    @api.delete("/sync", status_code=204)
+    @body_length
+    def sync_delete():
+        return None
+
+    @api.delete("/async", status_code=204)
+    @body_length
+    async def async_delete():
+        await asyncio.sleep(0)
+        return None
+
+    with TestClient(api) as client:
+        response = client.delete(path)
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert response.headers["x-body-length"] == "0"

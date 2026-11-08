@@ -89,6 +89,9 @@ class HTTPException(BoltException):
     def __repr__(self) -> str:
         return f"{self.status_code} - {self.__class__.__name__} - {self.detail}"
 
+    def __str__(self) -> str:
+        return f"{self.status_code}: {self.detail}"
+
 
 class ValidationException(BoltException, ValueError):
     """Base exception for validation errors."""
@@ -278,6 +281,23 @@ class GatewayTimeout(ServerException):
     status_code = 504
 
 
+class ResponseFileNotFound(FileNotFoundError):
+    """The path of a ``FileResponse`` or a ``File`` names no regular file. Bolt answers 404.
+
+    Only these responses raise it. A ``FileNotFoundError`` of handler code is
+    a server fault, and Bolt answers 500.
+    """
+
+
+class ResponseFileNotAllowed(PermissionError):
+    """The path of a ``FileResponse`` is outside ``BOLT_ALLOWED_FILE_PATHS``. Bolt answers 403.
+
+    Only ``FileResponse`` raises it. A ``PermissionError`` of handler code, or a
+    file in the allowed directories that the server cannot read, is a server
+    fault, and Bolt answers 500.
+    """
+
+
 # Helper functions for better error messages
 
 
@@ -300,21 +320,12 @@ def parse_msgspec_decode_error(error: Exception, body_bytes: bytes) -> dict[str,
     if match:
         byte_pos = int(match.group(1))
 
-        # Calculate line and column from byte position
-        lines = body_bytes.split(b"\n")
-        current_pos = 0
-        line_num = 1
-        col_num = 0
-        error_line_content = ""
-
-        for i, line in enumerate(lines, 1):
-            line_len = len(line) + 1  # +1 for newline
-            if current_pos + line_len > byte_pos:
-                line_num = i
-                col_num = byte_pos - current_pos + 1  # +1 for human-readable column (1-indexed)
-                error_line_content = line.decode("utf-8", errors="replace")
-                break
-            current_pos += line_len
+        # The position is in bytes. The column counts characters, so decode the bytes before it.
+        before_error = body_bytes[:byte_pos]
+        line_start = before_error.rfind(b"\n") + 1
+        line_num = before_error.count(b"\n") + 1
+        col_num = len(before_error[line_start:].decode("utf-8", errors="replace")) + 1  # 1-indexed
+        error_line_content = body_bytes[line_start:].split(b"\n", 1)[0].decode("utf-8", errors="replace")
 
         # Build descriptive error message
         msg = f"Invalid JSON at line {line_num}, column {col_num}: {error_msg}"

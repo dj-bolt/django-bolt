@@ -38,6 +38,7 @@ from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
 
 from django_bolt import _json
+from django_bolt.error_handlers import msgspec_validation_error_to_dict
 from django_bolt.exceptions import (
     RequestValidationError,
     SerializationError,
@@ -975,6 +976,13 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 # Validate this field individually
                 msgspec.convert(data[data_key], type=field_type, strict=False)
             except MsgspecValidationError as e:
+                # msgspec names the parent of a missing field in the path. The loc
+                # of a missing field ends with its name, as for a top-level field.
+                entries = msgspec_validation_error_to_dict(e, data_key)
+                if len(entries) == 1 and entries[0]["type"] == "missing_field":
+                    errors.append({"loc": ("body", *entries[0]["loc"]), "msg": entries[0]["msg"], "type": "missing"})
+                    continue
+
                 # Extract field path from error message if present
                 error_msg = str(e)
                 match = ERR_RE.search(error_msg)

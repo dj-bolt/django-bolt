@@ -141,3 +141,15 @@ class Document(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class Release(models.Model):
+    """Model with a composite primary key for cursor pagination tests."""
+
+    pk = models.CompositePrimaryKey("product", "version")
+    product = models.CharField(max_length=50)
+    version = models.IntegerField()
+    channel = models.CharField(max_length=20)
+
+    class Meta:
+        app_label = "django_bolt"

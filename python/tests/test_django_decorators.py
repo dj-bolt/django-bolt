@@ -159,3 +159,42 @@ class TestNormalResponsesUnaffected:
         response = client.get("/normal-response")
 
         assert "application/json" in response.headers.get("content-type", "")
+
+
+class TestDjangoRedirect:
+    """Test the headers and body of a Django HttpResponseRedirect."""
+
+    def test_django_redirect_keeps_its_other_headers_and_sends_no_body(self):
+        api = BoltAPI()
+
+        @api.get("/redirect")
+        async def redirect():
+            response = HttpResponseRedirect("/target")
+            response["X-Extra"] = "1"
+            return response
+
+        with TestClient(api) as client:
+            response = client.get("/redirect", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert response.headers["location"] == "/target"
+        assert response.headers["x-extra"] == "1"
+        assert response.headers["content-type"] == "text/html; charset=utf-8"
+        assert response.content == b""
+
+    def test_django_redirect_without_a_content_type_sends_none(self):
+        """A redirect has no default content type, so the response has no Content-Type header."""
+        api = BoltAPI()
+
+        @api.get("/redirect")
+        async def redirect():
+            response = HttpResponseRedirect("/target")
+            del response["Content-Type"]
+            return response
+
+        with TestClient(api) as client:
+            response = client.get("/redirect", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert response.headers["location"] == "/target"
+        assert "content-type" not in response.headers

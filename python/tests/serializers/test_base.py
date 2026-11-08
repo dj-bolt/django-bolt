@@ -436,6 +436,20 @@ class TestMultiErrorCollection:
         assert user.password == "longpassword123"
 
 
+class _Address(Serializer):
+    city: str
+    zip: str
+
+
+class _Person(Serializer):
+    name: str
+    address: _Address
+
+
+class _Order(Serializer):
+    items: list[_Address]
+
+
 class TestModelValidateCollectsAllErrors:
     """Regression tests for issue #201 — model_validate/model_validate_json must
     collect every error, including missing required fields, not just those that
@@ -485,6 +499,22 @@ class TestModelValidateCollectsAllErrors:
         for err in errors:
             if tuple(err["loc"]) in {("body", "password"), ("body", "age")}:
                 assert err["type"] == "missing"
+
+    def test_nested_missing_field_has_the_type_of_a_top_level_one_and_its_full_loc(self):
+        with pytest.raises(RequestValidationError) as exc_info:
+            _Person.model_validate({"name": "x", "address": {"city": "a"}})
+
+        assert exc_info.value.errors() == [
+            {"loc": ("body", "address", "zip"), "msg": "Object missing required field `zip`", "type": "missing"}
+        ]
+
+    def test_missing_field_in_a_list_item_has_the_index_in_its_loc(self):
+        with pytest.raises(RequestValidationError) as exc_info:
+            _Order.model_validate_json(b'{"items": [{"city": "a", "zip": "1"}, {"city": "b"}]}')
+
+        assert exc_info.value.errors() == [
+            {"loc": ("body", "items", "1", "zip"), "msg": "Object missing required field `zip`", "type": "missing"}
+        ]
 
     def test_optional_missing_field_does_not_produce_error(self):
         class Profile(Serializer):
