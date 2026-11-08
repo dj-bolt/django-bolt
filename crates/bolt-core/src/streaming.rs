@@ -1,10 +1,10 @@
 use actix_web::web::Bytes;
-use futures_util::{stream, Stream, StreamExt};
+use futures_util::{Stream, StreamExt, stream};
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyDict, PyMemoryView, PyModule, PyString};
-use pyo3::IntoPyObjectExt;
 use pyo3_async_runtimes::TaskLocals;
 use std::ffi::CString;
 use std::pin::Pin;
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
-use crate::settings::{env_positive_int, env_var, DjangoSettings};
+use crate::settings::{DjangoSettings, env_positive_int, env_var};
 use crate::state::ACTIVE_SYNC_STREAMING_THREADS;
 // Streaming uses direct_stream only in higher-level handler; not directly here
 
@@ -39,23 +39,20 @@ pub fn convert_python_chunk(value: &Bound<'_, PyAny>) -> Option<Bytes> {
         let s = py_str.to_string_lossy().into_owned();
         return Some(Bytes::from(s.into_bytes()));
     }
-    if let Ok(memory_view) = value.cast::<PyMemoryView>() {
-        if let Ok(bytes_obj) = memory_view.call_method0("tobytes") {
-            if let Ok(backed) = bytes_obj.extract::<PyBackedBytes>() {
-                return Some(Bytes::from_owner(backed));
-            }
-        }
+    if let Ok(memory_view) = value.cast::<PyMemoryView>()
+        && let Ok(bytes_obj) = memory_view.call_method0("tobytes")
+        && let Ok(backed) = bytes_obj.extract::<PyBackedBytes>()
+    {
+        return Some(Bytes::from_owner(backed));
     }
     let py = value.py();
     if value
         .hasattr(pyo3::intern!(py, "__bytes__"))
         .unwrap_or(false)
+        && let Ok(buffer) = value.call_method0(pyo3::intern!(py, "__bytes__"))
+        && let Ok(backed) = buffer.extract::<PyBackedBytes>()
     {
-        if let Ok(buffer) = value.call_method0(pyo3::intern!(py, "__bytes__")) {
-            if let Ok(backed) = buffer.extract::<PyBackedBytes>() {
-                return Some(Bytes::from_owner(backed));
-            }
-        }
+        return Some(Bytes::from_owner(backed));
     }
     if let Ok(py_str) = value.str() {
         let s = py_str.to_string_lossy().into_owned();

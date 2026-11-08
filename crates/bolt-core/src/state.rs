@@ -2,10 +2,9 @@ use actix_web::http::header::HeaderValue;
 use ahash::AHashMap;
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
-use regex::Regex;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use crate::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
@@ -109,10 +108,11 @@ pub struct AppState {
     /// `type_coercion::resolve_max_param_length`); read directly on the hot path.
     pub max_param_length: usize,
     pub asgi_mount_timeout: Duration,
+    /// How long a native route handler has to call `complete`.
+    pub native_route_timeout: Duration,
     /// Streaming limits, read once at startup (see `StreamConfig::read`).
     pub stream_config: StreamConfig,
     pub global_cors_config: Option<CorsConfig>, // Global CORS configuration from Django settings
-    pub cors_origin_regexes: Vec<Regex>,        // Compiled regex patterns for origin matching
     pub global_compression_config: Option<Arc<CompressionConfig>>, // Global compression configuration used by middleware
     /// Deployment-wide forwarding-header trust policy.
     pub trusted_proxies: Arc<TrustedProxies>,

@@ -6,6 +6,7 @@
 //! - Lowercase header keys in a single location
 //! - Serialize cookies directly without SimpleCookie overhead
 
+use actix_web::http::header::HeaderValue;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
@@ -55,6 +56,38 @@ impl ResponseType {
             Self::Redirect => "",
             Self::File => "",
             Self::Streaming => "",
+        }
+    }
+
+    /// The Content-Type header value, or None for a type with no content type.
+    /// The values are constants, so a response copies and checks no bytes.
+    #[inline]
+    pub fn content_type_header(&self) -> Option<HeaderValue> {
+        const fn header(response_type: ResponseType) -> Option<HeaderValue> {
+            let content_type = response_type.content_type();
+            if content_type.is_empty() {
+                None
+            } else {
+                Some(HeaderValue::from_static(content_type))
+            }
+        }
+        const EMPTY: Option<HeaderValue> = header(ResponseType::Empty);
+        const JSON: Option<HeaderValue> = header(ResponseType::Json);
+        const HTML: Option<HeaderValue> = header(ResponseType::Html);
+        const PLAIN_TEXT: Option<HeaderValue> = header(ResponseType::PlainText);
+        const OCTET_STREAM: Option<HeaderValue> = header(ResponseType::OctetStream);
+        const REDIRECT: Option<HeaderValue> = header(ResponseType::Redirect);
+        const FILE: Option<HeaderValue> = header(ResponseType::File);
+        const STREAMING: Option<HeaderValue> = header(ResponseType::Streaming);
+        match self {
+            Self::Empty => EMPTY,
+            Self::Json => JSON,
+            Self::Html => HTML,
+            Self::PlainText => PLAIN_TEXT,
+            Self::OctetStream => OCTET_STREAM,
+            Self::Redirect => REDIRECT,
+            Self::File => FILE,
+            Self::Streaming => STREAMING,
         }
     }
 }
@@ -233,5 +266,28 @@ mod tests {
         assert_eq!(ResponseType::Redirect.content_type(), "");
         assert_eq!(ResponseType::File.content_type(), "");
         assert_eq!(ResponseType::Streaming.content_type(), "");
+    }
+
+    #[test]
+    fn test_response_type_content_type_header_matches_content_type() {
+        for response_type in [
+            ResponseType::Empty,
+            ResponseType::Json,
+            ResponseType::Html,
+            ResponseType::PlainText,
+            ResponseType::OctetStream,
+            ResponseType::Redirect,
+            ResponseType::File,
+            ResponseType::Streaming,
+        ] {
+            let content_type = response_type.content_type();
+            let expected =
+                (!content_type.is_empty()).then(|| HeaderValue::from_static(content_type));
+            assert_eq!(
+                response_type.content_type_header(),
+                expected,
+                "{response_type:?}"
+            );
+        }
     }
 }

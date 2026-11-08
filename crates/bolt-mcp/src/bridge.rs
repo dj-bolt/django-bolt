@@ -6,7 +6,7 @@
 //! and the Tier-2 OAuth hook run BEFORE rmcp sees the request; the resolved
 //! principal rides the request extensions into every handler method.
 
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{HttpRequest, HttpResponse, web};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use pyo3::prelude::*;
@@ -17,7 +17,7 @@ use bolt_core::middleware::auth::AuthContext;
 use bolt_core::request_pipeline::extract_headers;
 use bolt_core::responses;
 use bolt_core::state::AppState;
-use bolt_core::validation::{cookie_csrf_blocks, validate_auth_and_guards, AuthGuardResult};
+use bolt_core::validation::{AuthGuardResult, cookie_csrf_blocks, validate_auth_and_guards};
 
 /// Buffer the request body, enforcing the payload cap. Mirrors the bounded
 /// read loop used for regular routes; rmcp enforces its own configured cap as
@@ -66,7 +66,7 @@ fn auth_context_from_principal(dict: &Bound<'_, PyDict>) -> PyResult<AuthContext
         user_id: item(dict, "user_id")?.extract()?,
         is_staff: item(dict, "is_staff")?.extract()?,
         is_superuser: item(dict, "is_superuser")?.extract()?,
-        backend: item(dict, "backend")?.extract()?,
+        backend: item(dict, "backend")?.extract::<String>()?.into(),
         backend_index: None,
         claims,
         permissions: permissions.into_iter().collect(),
@@ -109,10 +109,10 @@ pub async fn handle_mcp_request(
             }
             // Registration refuses a session backend on a mount. Fail closed.
             AuthGuardResult::Deferred(_) | AuthGuardResult::Unauthorized => {
-                return responses::error_401()
+                return responses::error_401();
             }
             AuthGuardResult::Forbidden(denial) => {
-                return responses::error_403_denial(denial.as_deref())
+                return responses::error_403_denial(denial.as_deref());
             }
         };
 
@@ -188,12 +188,11 @@ pub async fn handle_mcp_request(
     );
     let mut is_sse = false;
     for (name, value) in &parts.headers {
-        if name == http::header::CONTENT_TYPE {
-            if let Ok(v) = value.to_str() {
-                if v.starts_with("text/event-stream") {
-                    is_sse = true;
-                }
-            }
+        if name == http::header::CONTENT_TYPE
+            && let Ok(v) = value.to_str()
+            && v.starts_with("text/event-stream")
+        {
+            is_sse = true;
         }
         if let Ok(value) = value.to_str() {
             builder.append_header((name.as_str(), value));

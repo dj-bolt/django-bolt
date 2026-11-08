@@ -28,7 +28,9 @@ class TypedCookies(msgspec.Struct):
     flag: bool = False
 
 
-@pytest.fixture(scope="module")
+# Function scope: each test registers its routes, so a mutation tool sees
+# each test reach the request-time closures of the extractors.
+@pytest.fixture
 def client():
     api = BoltAPI()
 

@@ -40,6 +40,37 @@ export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
 eval "$(cargo llvm-cov show-env --sh)"
 cargo llvm-cov clean --workspace
 
+# A process that is killed while it writes its coverage data leaves a data
+# file that is not a valid database. The suites kill runbolt processes on
+# purpose, and the slow instrumented build makes a kill during that write
+# possible. coverage then cannot combine the file, and it leaves a database
+# connection open. pytest-cov combines all data files at the end of a run, so
+# the ResourceWarning fails the next pytest run, although each test passed.
+# Remove such a file before the next combine, and say which one.
+drop_broken_coverage_data() {
+    uv run --no-sync python - <<'PY'
+import contextlib
+import glob
+import os
+import sqlite3
+import sys
+
+for path in sorted(glob.glob(".coverage.*")):
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
+            result = db.execute("PRAGMA quick_check").fetchone()[0]
+            db.execute("SELECT count(*) FROM meta").fetchone()
+        if result == "ok":
+            continue
+        reason = result
+    except sqlite3.DatabaseError as exc:
+        reason = str(exc)
+    os.remove(path)
+    message = f"Removed coverage data file {path} that coverage cannot read ({reason}). A process stopped during its write."
+    print(f"::warning::{message}" if os.environ.get("GITHUB_ACTIONS") else message, file=sys.stderr)
+PY
+}
+
 # A test failure or a failed report must not hide the other reports, so
 # record the status and go on.
 status=0
@@ -58,9 +89,11 @@ uv run --no-sync maturin develop
 # hung run shows where it waits.
 uv run --no-sync pytest python/tests -m "not artifact_smoke" -n auto --dist loadfile \
     -o faulthandler_timeout=300 --cov --cov-report= || status=1
+drop_broken_coverage_data
 # bolt-mcp configures Django differently, so it runs in its own process.
 uv run --no-sync pytest python/bolt-mcp/tests -m "not artifact_smoke" \
     -o faulthandler_timeout=300 --cov --cov-append --cov-report= || status=1
+drop_broken_coverage_data
 
 uv run --no-sync coverage report --format=markdown > "$out/python.md" || status=1
 uv run --no-sync coverage html --directory "$out/python-html" --quiet || status=1

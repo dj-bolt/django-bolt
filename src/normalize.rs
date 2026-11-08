@@ -3,9 +3,9 @@
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
+use actix_web::Error;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
 use actix_web::middleware::{NormalizePath, TrailingSlash};
-use actix_web::Error;
 use futures_util::future::LocalBoxFuture;
 
 pub struct MergeSlashes;

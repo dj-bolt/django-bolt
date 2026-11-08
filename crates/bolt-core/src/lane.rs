@@ -16,7 +16,7 @@
 //!   uses it as the executor of the request's thread-sensitive context.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -590,6 +590,38 @@ mod tests {
         ));
         assert!(receiver.try_recv().is_err());
         assert!(!take_idle(u64::MAX));
+    }
+
+    /// A request that ends with no `release` call, for example when its task
+    /// is cancelled, still gives its lane back. Else the lane waits for a job
+    /// of that request forever and never reaches its idle time.
+    #[test]
+    fn drop_releases_the_lane() {
+        let _globals = GLOBALS.lock();
+        let (lane, receiver) = request_lane(u64::MAX - 3, 0);
+        drop(lane);
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Job::Release { listed: true })
+        ));
+        assert!(take_idle(u64::MAX - 3));
+    }
+
+    /// `shutdown` waits until `LANES` is empty, so a stopped lane must leave it.
+    #[test]
+    fn unlist_removes_only_its_lane() {
+        let _globals = GLOBALS.lock();
+        let (sender, _receiver) = channel::<Job>();
+        LANES.lock().push((u64::MAX - 4, sender.clone()));
+        LANES.lock().push((u64::MAX - 5, sender));
+
+        unlist(u64::MAX - 4);
+        let ids: Vec<u64> = LANES.lock().iter().map(|(id, _)| *id).collect();
+        unlist(u64::MAX - 5);
+
+        assert_eq!(ids, vec![u64::MAX - 5]);
+        assert!(LANES.lock().is_empty());
     }
 
     /// `shutdown` waits only for the lanes that started before it.

@@ -30,12 +30,13 @@ only upstream-supported Django series, enforced by `scripts/check_support_matrix
 
 ## Layout
 
-Cargo workspace, layered bottom-up with no back-edges: `bolt-loop` → `bolt-core` → {`bolt-asgi`, `bolt-websocket`, `bolt-mcp`} → root `django-bolt` (`src/`, the `_core` PyO3 module).
+Cargo workspace, layered bottom-up with no back-edges: {`bolt-native-abi`, `bolt-loop`} → `bolt-core` → {`bolt-asgi`, `bolt-websocket`, `bolt-mcp`} → root `django-bolt` (`src/`, the `_core` PyO3 module).
 
 - `src/` — `lib.rs` (module entry), `server.rs` (Actix + tokio, CORS/compression), `handler.rs` (dispatch, `DispatchOutcome`), `testing.rs` (`TestClient` backend: `handle_request` on test worker threads), `dev_reload.rs`
 - `crates/bolt-loop` — per-worker-thread asyncio `WorkerLoop` (a real `SelectorEventLoop` on the Tokio reactor; one shared loop for threads with no bound loop), timer thread
 - `crates/bolt-core` — router (matchit), `request_pipeline.rs`, `validation.rs`, `type_coercion.rs`, `middleware/` (auth, rate_limit), `permissions.rs`, `streaming.rs`, `response_meta.rs` / `response_builder.rs`, `form_parsing.rs`, `metadata.rs`, `error.rs`
 - `crates/bolt-asgi`, `crates/bolt-websocket`, `crates/bolt-mcp` — ASGI mounts, WebSocket, MCP transport (rmcp)
+- `crates/bolt-native-abi` — the C ABI of native route handlers in other extension modules (`native.rs` calls them). No dependencies; versioned with the ABI, not with Bolt
 - `python/django_bolt/` — `api.py` (BoltAPI, decorators, `_dispatch`/`_dispatch_sync`), `_kwargs/` (param extraction/injectors), `serialization.py` (ResponseWireV1, meta tags), `responses.py`, `params.py`, `dependencies.py`, `auth/`, `middleware/` (`compiler.py` → Rust metadata), `serializers/`, `openapi/`, `pagination.py`, `viewsets.py`, `concurrency.py`, `workers.py`, `management/commands/runbolt.py`, `testing/`
 
 ## Core design (keep these invariants)

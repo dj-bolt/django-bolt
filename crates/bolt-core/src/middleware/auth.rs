@@ -1,17 +1,18 @@
 use ahash::AHashMap;
-use aws_lc_rs::hmac;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use aws_lc_rs::{constant_time, hmac};
 use base64::Engine;
-use jsonwebtoken::{crypto, get_current_timestamp, Algorithm, AlgorithmFamily, DecodingKey};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, crypto, get_current_timestamp};
+use pyo3::IntoPyObjectExt;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
-use pyo3::IntoPyObjectExt;
+use pyo3::types::{PyDict, PyString};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
@@ -63,7 +64,9 @@ pub struct AuthContext {
     pub user_id: Option<String>,
     pub is_staff: bool,
     pub is_superuser: bool,
-    pub backend: String,
+    /// The scheme name of the backend: "jwt", "api_key" or "session". A
+    /// principal from an MCP `verify_token` hook brings its own name.
+    pub backend: Cow<'static, str>,
     /// Position of the authenticating backend in the route's backend list.
     /// Two backends can have the same scheme name (two JWT secrets), so
     /// Python finds the per-backend revocation handler and user loader by
@@ -77,23 +80,21 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    pub fn from_jwt_claims(claims: Claims, backend: &str, cookie_csrf: bool) -> Self {
+    pub fn from_jwt_claims(mut claims: Claims, backend: &'static str, cookie_csrf: bool) -> Self {
         let user_id = claims.sub.clone();
         let is_staff = claims.is_staff.unwrap_or(false);
         let is_superuser = claims.is_superuser.unwrap_or(false);
 
-        let mut permissions = HashSet::new();
-        if let Some(perms) = &claims.permissions {
-            for perm in perms {
-                permissions.insert(perm.clone());
-            }
-        }
+        // The guards and Python read the permissions from the context, not
+        // from the claims, so they move out of the claims.
+        let permissions: HashSet<String> =
+            claims.permissions.take().into_iter().flatten().collect();
 
         AuthContext {
             user_id,
             is_staff,
             is_superuser,
-            backend: backend.to_string(),
+            backend: Cow::Borrowed(backend),
             backend_index: None,
             claims: Some(claims),
             permissions,
@@ -113,7 +114,7 @@ impl AuthContext {
             user_id: Some(format!("apikey:{}", key)),
             is_staff: false,
             is_superuser: false,
-            backend: "api_key".to_string(),
+            backend: Cow::Borrowed("api_key"),
             backend_index: None,
             claims: None,
             permissions,
@@ -130,7 +131,7 @@ impl AuthContext {
             user_id: None,
             is_staff: false,
             is_superuser: false,
-            backend: "session".to_string(),
+            backend: Cow::Borrowed("session"),
             backend_index: Some(backend_index),
             claims: None,
             permissions: HashSet::new(),
@@ -349,11 +350,54 @@ impl RefreshingJwks {
                 .flatten()
         });
         *self.last_refresh.lock() = Instant::now();
-        if let Some(document) = result {
-            if let Ok(JwtKeySource::Jwks(keys)) = build_jwks_key_source(&document) {
-                *self.keys.write() = keys;
+        if let Some(document) = result
+            && let Ok(JwtKeySource::Jwks(keys)) = build_jwks_key_source(&document)
+        {
+            *self.keys.write() = keys;
+        }
+    }
+}
+
+/// The valid keys of an API key backend, by their SipHash.
+///
+/// The SipHash key is random for each `ApiKeys`, so a client cannot compute
+/// the hash of a key. `find` looks up the hash of the request key, and then
+/// compares the request key in constant time with each valid key of that
+/// hash. Thus only the constant-time comparison reads the bytes of a valid
+/// key, and the cost does not grow with the number of keys.
+#[derive(Debug, Clone, Default)]
+pub struct ApiKeys {
+    state: RandomState,
+    by_hash: AHashMap<u64, Vec<String>>,
+}
+
+impl ApiKeys {
+    /// The valid key that equals `candidate`, or None.
+    pub fn find(&self, candidate: &str) -> Option<&str> {
+        let keys = self.by_hash.get(&self.state.hash_one(candidate))?;
+        // Two keys can have the same hash. Compare each, with no early stop.
+        let mut found = None;
+        for key in keys {
+            if constant_time::verify_slices_are_equal(key.as_bytes(), candidate.as_bytes()).is_ok()
+            {
+                found = Some(key.as_str());
             }
         }
+        found
+    }
+}
+
+impl FromIterator<String> for ApiKeys {
+    fn from_iter<I: IntoIterator<Item = String>>(keys: I) -> Self {
+        let state = RandomState::new();
+        let mut by_hash: AHashMap<u64, Vec<String>> = AHashMap::new();
+        for key in keys {
+            let same_hash = by_hash.entry(state.hash_one(key.as_str())).or_default();
+            if !same_hash.contains(&key) {
+                same_hash.push(key);
+            }
+        }
+        Self { state, by_hash }
     }
 }
 
@@ -391,7 +435,7 @@ pub enum AuthBackend {
         cookie_csrf: bool,
     },
     APIKey {
-        api_keys: HashSet<String>,
+        api_keys: ApiKeys,
         header: String,
         key_permissions: HashMap<String, Vec<String>>,
     },
@@ -747,11 +791,11 @@ fn decode_and_validate(
             return None;
         }
     }
-    if let Some(nbf) = claims.nbf {
-        if nbf > now + leeway {
-            log::debug!("JWT rejected: token not yet valid (nbf)");
-            return None;
-        }
+    if let Some(nbf) = claims.nbf
+        && nbf > now + leeway
+    {
+        log::debug!("JWT rejected: token not yet valid (nbf)");
+        return None;
     }
     // aud is only validated when an audience is configured; a token merely
     // carrying an aud claim is not rejected (unlike jsonwebtoken's default).
@@ -816,12 +860,12 @@ fn try_jwt_auth(
 
 fn try_api_key_auth(
     headers: &AHashMap<String, String>,
-    api_keys: &HashSet<String>,
+    api_keys: &ApiKeys,
     header_name: &str,
     key_permissions: &HashMap<String, Vec<String>>,
 ) -> Option<AuthContext> {
     // SECURITY: Reject if no API keys configured (don't allow empty set)
-    if api_keys.is_empty() {
+    if api_keys.by_hash.is_empty() {
         return None;
     }
 
@@ -834,12 +878,9 @@ fn try_api_key_auth(
         .or_else(|| api_key_header.strip_prefix("ApiKey "))
         .unwrap_or(api_key_header);
 
-    // Check if key is valid - use constant-time comparison for security
-    if api_keys.contains(api_key) {
-        Some(AuthContext::from_api_key(api_key, key_permissions))
-    } else {
-        None
-    }
+    // Check if the key is valid. See `ApiKeys::find` for the timing.
+    let api_key = api_keys.find(api_key)?;
+    Some(AuthContext::from_api_key(api_key, key_permissions))
 }
 
 /// Insert `key -> value` into a PyDict only if `value` is `Some`.
@@ -869,7 +910,13 @@ pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: P
 
     let _ = dict.set_item(intern!(py, "is_staff"), auth_ctx.is_staff);
     let _ = dict.set_item(intern!(py, "is_superuser"), auth_ctx.is_superuser);
-    let _ = dict.set_item(intern!(py, "auth_backend"), &auth_ctx.backend);
+    let backend = match auth_ctx.backend.as_ref() {
+        "jwt" => intern!(py, "jwt"),
+        "api_key" => intern!(py, "api_key"),
+        "session" => intern!(py, "session"),
+        other => &PyString::new(py, other),
+    };
+    let _ = dict.set_item(intern!(py, "auth_backend"), backend);
     set_if_some!(dict, py, "auth_backend_index", auth_ctx.backend_index);
 
     if !auth_ctx.permissions.is_empty() {
@@ -899,7 +946,7 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
             let _ = claims_dict.set_item(intern!(py, "aud"), aud);
         }
         Some(Audience::Multiple(auds)) => {
-            let _ = claims_dict.set_item(intern!(py, "aud"), auds.clone());
+            let _ = claims_dict.set_item(intern!(py, "aud"), auds);
         }
         None => {}
     }
@@ -915,7 +962,7 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
     // statically since the set is open. set_item(&str, ...) handles them.
     for (key, value) in &claims.extra {
         let py_value = match value {
-            serde_json::Value::String(s) => s.clone().into_py_any(py).unwrap_or_else(|_| py.None()),
+            serde_json::Value::String(s) => PyString::new(py, s).into_any().unbind(),
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     i.into_py_any(py).unwrap_or_else(|_| py.None())
@@ -1041,16 +1088,18 @@ mod tests {
             format!("{}A", &token[..token.len() - 1])
         };
 
-        assert!(decode_and_validate(
-            &tampered,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &tampered,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1116,32 +1165,36 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn rejects_missing_exp() {
         let token = sign_token(r#"{"alg":"HS256"}"#, r#"{"sub":"42"}"#, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1153,16 +1206,18 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1173,26 +1228,30 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            Some("api"),
-            None,
-            60,
-            None
-        )
-        .is_some());
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            Some("mobile"),
-            None,
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                Some("api"),
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                Some("mobile"),
+                None,
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1202,16 +1261,18 @@ mod tests {
         let claims_json = format!(r#"{{"sub":"42","exp":{},"aud":"api"}}"#, future_exp());
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_some());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1222,40 +1283,46 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &with_iss, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            Some("https://issuer.example"),
-            60,
-            None
-        )
-        .is_some());
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            Some("https://other.example"),
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                Some("https://issuer.example"),
+                60,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                Some("https://other.example"),
+                60,
+                None
+            )
+            .is_none()
+        );
 
         // Missing iss is rejected when an issuer is configured.
         let without_iss = format!(r#"{{"sub":"42","exp":{}}}"#, future_exp());
         let token = sign_token(r#"{"alg":"HS256"}"#, &without_iss, Algorithm::HS256);
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            Some("https://issuer.example"),
-            60,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                Some("https://issuer.example"),
+                60,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1328,16 +1395,18 @@ mod tests {
         // Keycloak access tokens carry typ Bearer.
         let json = format!(r#"{{"sub":"42","exp":{},"typ":"Bearer"}}"#, future_exp());
         let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_some());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1392,32 +1461,36 @@ mod tests {
             future_exp()
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            Some("refresh")
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                Some("refresh")
+            )
+            .is_none()
+        );
         // An expected type still needs `typ`: another type claim alone is not enough.
         let json = format!(
             r#"{{"sub":"42","exp":{},"token_type":"refresh"}}"#,
             future_exp()
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &json, Algorithm::HS256);
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            Some("refresh")
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                Some("refresh")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1428,27 +1501,31 @@ mod tests {
         let access = sign_token(r#"{"alg":"HS256"}"#, &access_json, Algorithm::HS256);
 
         // A rotation endpoint expecting "refresh" accepts refresh tokens...
-        assert!(decode_and_validate(
-            &refresh,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            Some("refresh")
-        )
-        .is_some());
+        assert!(
+            decode_and_validate(
+                &refresh,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                Some("refresh")
+            )
+            .is_some()
+        );
         // ...and rejects access tokens (no typ at all).
-        assert!(decode_and_validate(
-            &access,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            Some("refresh")
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &access,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                Some("refresh")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1457,16 +1534,18 @@ mod tests {
         let claims_json = format!(r#"{{"sub":"42","exp":{},"typ":"access"}}"#, future_exp());
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_some());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1509,26 +1588,30 @@ mod tests {
         );
         let token = sign_token(r#"{"alg":"HS256"}"#, &claims_json, Algorithm::HS256);
 
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            60,
-            None
-        )
-        .is_some());
-        assert!(decode_and_validate(
-            &token,
-            &hs256_key(),
-            &[Algorithm::HS256],
-            None,
-            None,
-            0,
-            None
-        )
-        .is_none());
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                60,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                None,
+                0,
+                None
+            )
+            .is_none()
+        );
     }
 
     fn validate(token: &str, audience: Option<&str>, leeway: i64) -> Option<Claims> {
@@ -1658,13 +1741,13 @@ mod tests {
 
         let first = authenticate(&bearer_headers("secret-a"), &backends).unwrap();
         assert_eq!(
-            (first.backend.as_str(), first.backend_index),
+            (first.backend.as_ref(), first.backend_index),
             ("jwt", Some(0))
         );
 
         let second = authenticate(&bearer_headers("secret-b"), &backends).unwrap();
         assert_eq!(
-            (second.backend.as_str(), second.backend_index),
+            (second.backend.as_ref(), second.backend_index),
             ("jwt", Some(1))
         );
 
@@ -1672,11 +1755,70 @@ mod tests {
     }
 
     #[test]
+    fn an_api_key_must_equal_a_valid_key() {
+        let keys: ApiKeys = ["key-one".to_string(), "key-two".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(keys.find("key-one"), Some("key-one"));
+        assert_eq!(keys.find("key-two"), Some("key-two"));
+        for candidate in ["", "key-on", "key-one ", "key-onf", "KEY-ONE", "key-three"] {
+            assert_eq!(keys.find(candidate), None, "{candidate:?}");
+        }
+        assert_eq!(ApiKeys::default().find(""), None);
+
+        let repeated: ApiKeys = ["b", "a", "b"].into_iter().map(str::to_string).collect();
+        let mut stored: Vec<&String> = repeated.by_hash.values().flatten().collect();
+        stored.sort();
+        assert_eq!(stored, ["a", "b"]);
+
+        let many: ApiKeys = (0..100).map(|i| format!("key-{i}")).collect();
+        for i in 0..100 {
+            let key = format!("key-{i}");
+            assert_eq!(many.find(&key), Some(key.as_str()));
+        }
+        assert_eq!(many.find("key-100"), None);
+    }
+
+    #[test]
+    fn a_key_with_the_hash_of_a_valid_key_must_still_equal_it() {
+        // A random hash state cannot give a collision on demand, so the test
+        // puts a valid key in the bucket of the hash of "candidate".
+        let mut keys: ApiKeys = ["key-one".to_string()].into_iter().collect();
+        let bucket = keys.state.hash_one("candidate");
+        keys.by_hash
+            .entry(bucket)
+            .or_default()
+            .push("other-key".to_string());
+        assert_eq!(keys.find("candidate"), None);
+        assert_eq!(keys.find("other-key"), None);
+        assert_eq!(keys.find("key-one"), Some("key-one"));
+    }
+
+    #[test]
+    fn an_api_key_backend_strips_the_prefix_and_names_the_key() {
+        let backends = [AuthBackend::APIKey {
+            api_keys: ["key-one".to_string()].into_iter().collect(),
+            header: "x-api-key".to_string(),
+            key_permissions: HashMap::from([("key-one".to_string(), vec!["read".to_string()])]),
+        }];
+        for value in ["key-one", "Bearer key-one", "ApiKey key-one"] {
+            let headers = AHashMap::from_iter([("x-api-key".to_string(), value.to_string())]);
+            let ctx = authenticate(&headers, &backends).unwrap();
+            assert_eq!(ctx.user_id.as_deref(), Some("apikey:key-one"));
+            assert!(ctx.permissions.contains("read"));
+        }
+        for value in ["key-two", "Token key-one", ""] {
+            let headers = AHashMap::from_iter([("x-api-key".to_string(), value.to_string())]);
+            assert!(authenticate(&headers, &backends).is_none(), "{value:?}");
+        }
+    }
+
+    #[test]
     fn authenticate_records_the_position_of_an_api_key_backend() {
         let backends = [
             hs256_backend("secret-a"),
             AuthBackend::APIKey {
-                api_keys: HashSet::from(["key-1".to_string()]),
+                api_keys: ["key-1".to_string()].into_iter().collect(),
                 header: "x-api-key".to_string(),
                 key_permissions: HashMap::new(),
             },
@@ -1686,7 +1828,7 @@ mod tests {
 
         let ctx = authenticate(&headers, &backends).unwrap();
         assert_eq!(
-            (ctx.backend.as_str(), ctx.backend_index),
+            (ctx.backend.as_ref(), ctx.backend_index),
             ("api_key", Some(1))
         );
     }
@@ -1879,6 +2021,48 @@ mod tests {
             assert_eq!(item("team").extract::<String>().unwrap(), "core");
             // A list or an object is not converted.
             assert!(item("tags").is_none());
+        });
+    }
+
+    #[test]
+    fn the_context_names_the_backend_and_keeps_the_jwt_claims() {
+        Python::initialize();
+        let claims: Claims = serde_json::from_value(serde_json::json!({
+            "sub": "1",
+            "aud": ["a", "b"],
+            "permissions": ["read", "write"],
+        }))
+        .unwrap();
+        let mut principal = AuthContext::from_api_key("k", &HashMap::new());
+        principal.backend = "oauth".to_string().into();
+        let contexts = [
+            ("jwt", AuthContext::from_jwt_claims(claims, "jwt", false)),
+            ("api_key", AuthContext::from_api_key("k", &HashMap::new())),
+            ("session", AuthContext::from_session(0, false)),
+            // A principal from an MCP `verify_token` hook names its own backend.
+            ("oauth", principal),
+        ];
+        Python::attach(|py| {
+            for (name, auth_ctx) in &contexts {
+                let context = PyDict::new(py).unbind();
+                populate_auth_context(&context, auth_ctx, py);
+                let context = context.bind(py);
+                let item = |key: &str| context.get_item(key).unwrap();
+                assert_eq!(
+                    item("auth_backend").unwrap().extract::<String>().unwrap(),
+                    *name
+                );
+                if *name != "jwt" {
+                    continue;
+                }
+                let mut permissions: Vec<String> = item("permissions").unwrap().extract().unwrap();
+                permissions.sort();
+                assert_eq!(permissions, ["read", "write"]);
+                let claims = item("auth_claims").unwrap();
+                let claim = |key: &str| claims.get_item(key).unwrap();
+                assert_eq!(claim("sub").extract::<String>().unwrap(), "1");
+                assert_eq!(claim("aud").extract::<Vec<String>>().unwrap(), ["a", "b"]);
+            }
         });
     }
 

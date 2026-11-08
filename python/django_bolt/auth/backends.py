@@ -21,7 +21,6 @@ import inspect
 import json
 import sys
 import threading
-import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -294,7 +293,6 @@ class JWTAuthentication(BaseAuthentication):
         self.oidc_issuer = oidc_issuer
         self.jwks_refresh_interval = jwks_refresh_interval
         self._jwks_refresh_lock = threading.Lock()
-        self._jwks_refreshed_at = 0.0
 
         # Revocation support (OPTIONAL - only checked if provided)
         self.revoked_token_handler = revoked_token_handler
@@ -338,7 +336,6 @@ class JWTAuthentication(BaseAuthentication):
             response = httpx.get(self.jwks_url, timeout=10.0)
             response.raise_for_status()
             self._jwks = response.text
-            self._jwks_refreshed_at = time.monotonic()
             return self._jwks
         return None
 
@@ -356,7 +353,6 @@ class JWTAuthentication(BaseAuthentication):
             if not isinstance(document, dict) or not isinstance(document.get("keys"), list):
                 raise ValueError("JWKS response must contain a keys array")
             self._jwks = response.text
-            self._jwks_refreshed_at = time.monotonic()
             return self._jwks
         except (httpx.HTTPError, ValueError):
             return None

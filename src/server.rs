@@ -1,36 +1,36 @@
 use actix_http::KeepAlive;
 use actix_web::{
-    self as aw, http::header::HeaderValue, web, App, HttpRequest, HttpResponse, HttpServer,
+    self as aw, App, HttpRequest, HttpResponse, HttpServer, http::header::HeaderValue, web,
 };
 use ahash::AHashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::handler::handle_request;
 use bolt_asgi::asgi_mounts::validate_and_sort_asgi_mounts;
+use bolt_core::bind_addr::resolve_bind_addr;
 use bolt_core::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
-use bolt_core::router::Router;
+use bolt_core::middleware::rate_limit::{DEFAULT_IPV6_PREFIX, RateLimiters};
 use bolt_core::settings::{
-    env_flag, env_non_negative_int, env_positive_int, env_var, improperly_configured,
-    DjangoSettings,
+    DjangoSettings, env_flag, env_non_negative_int, env_positive_int, env_var,
+    improperly_configured,
 };
 use bolt_core::state::{
-    find_websocket_mount, AppState, ScopeConfig, ServeMode, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER,
-    ROUTE_METADATA_TEMP, TASK_LOCALS,
+    AppState, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, ROUTE_METADATA_TEMP, ScopeConfig, ServeMode,
+    TASK_LOCALS, find_websocket_mount,
 };
 use bolt_core::static_files::handle_file;
 use bolt_core::streaming::StreamConfig;
 use bolt_websocket::{
-    handle_websocket_upgrade, is_websocket_upgrade, WebSocketRouter, WsConfig, WsTarget,
-    GLOBAL_WEBSOCKET_ROUTER,
+    GLOBAL_WEBSOCKET_ROUTER, WebSocketRouter, WsConfig, WsTarget, handle_websocket_upgrade,
+    is_websocket_upgrade,
 };
 
 /// Reject URL prefixes containing actix scope path-param syntax.
@@ -128,6 +128,13 @@ fn read_max_age_setting(
     ))
 }
 
+/// Read `BOLT_RATE_LIMIT_IPV6_PREFIX`: the prefix length of the network that a
+/// rate limit keys an IPv6 client on. `runbolt` and the test clients read it here,
+/// in `ServerConfig::read`.
+fn read_rate_limit_ipv6_prefix(settings: &DjangoSettings<'_>) -> PyResult<u8> {
+    settings.int_up_to("BOLT_RATE_LIMIT_IPV6_PREFIX", 128, DEFAULT_IPV6_PREFIX)
+}
+
 /// The scope prefix for a static URL such as `"/static/"`, or None when the
 /// URL cannot be mounted. An empty prefix (`"/"`) would shadow every route.
 pub(crate) fn static_scope_prefix(static_url: &str) -> Option<String> {
@@ -158,10 +165,13 @@ pub(crate) struct ServerConfig {
     pub max_payload_size: usize,
     pub max_param_length: usize,
     pub asgi_mount_timeout: Duration,
+    pub native_route_timeout: Duration,
     pub stream_config: StreamConfig,
     pub ws_config: Arc<WsConfig>,
     pub global_cors_config: Option<CorsConfig>,
     pub trusted_proxies: Arc<TrustedProxies>,
+    /// `BOLT_RATE_LIMIT_IPV6_PREFIX`: the network that an IPv6 client keys on.
+    pub rate_limit_ipv6_prefix: u8,
     pub static_files_config: Option<Arc<ScopeConfig>>,
     pub media_files_config: Option<Arc<ScopeConfig>>,
 }
@@ -186,7 +196,10 @@ impl ServerConfig {
         let max_payload_size = settings.non_negative_int("BOLT_MAX_UPLOAD_SIZE", 1024 * 1024)?; // Default 1MB
         let asgi_mount_timeout =
             settings.positive_seconds("BOLT_ASGI_MOUNT_TIMEOUT", Duration::from_secs(30))?; // Default 30s
+        let native_route_timeout =
+            settings.positive_seconds("BOLT_NATIVE_ROUTE_TIMEOUT", Duration::from_secs(30))?;
         let stream_config = StreamConfig::read(&settings)?;
+        let rate_limit_ipv6_prefix = read_rate_limit_ipv6_prefix(&settings)?;
         let ws_config = Arc::new(WsConfig::from_django_settings(&settings)?);
 
         let (global_cors_config, static_files_config, media_files_config) = if read_cors_and_files {
@@ -209,10 +222,12 @@ impl ServerConfig {
             max_payload_size,
             max_param_length,
             asgi_mount_timeout,
+            native_route_timeout,
             stream_config,
             ws_config,
             global_cors_config,
             trusted_proxies,
+            rate_limit_ipv6_prefix,
             static_files_config,
             media_files_config,
         })
@@ -242,15 +257,6 @@ impl ServerConfig {
                 None,
             ))
         };
-    }
-
-    /// The compiled `CORS_ALLOWED_ORIGIN_REGEXES` of the global CORS config,
-    /// for `AppState`. The global config compiles them once at startup.
-    pub(crate) fn cors_origin_regexes(&self) -> Vec<regex::Regex> {
-        self.global_cors_config
-            .as_ref()
-            .map(|cors| cors.compiled_origin_regexes.clone())
-            .unwrap_or_default()
     }
 }
 
@@ -302,27 +308,27 @@ fn read_cors_and_file_scopes(
         // Get STATIC_ROOT (primary location for collected static files).
         // Defaults to None in Django when not configured -- skip None so we
         // don't push the literal string "None".
-        if let Some(static_root) = settings.get("STATIC_ROOT")? {
-            if !static_root.is_none() {
-                if let Some(root_str) = settings_path_to_string(&static_root) {
-                    if !root_str.is_empty() {
-                        directories.push(root_str);
-                    }
-                }
-            }
+        if let Some(static_root) = settings.get("STATIC_ROOT")?
+            && !static_root.is_none()
+            && let Some(root_str) = settings_path_to_string(&static_root)
+            && !root_str.is_empty()
+        {
+            directories.push(root_str);
         }
 
         // Get STATICFILES_DIRS (additional directories). Convert element-wise
         // rather than `extract::<Vec<String>>`, which would fail the whole
         // list on the first Path entry.
-        if let Some(static_dirs) = settings.get("STATICFILES_DIRS")? {
-            if let Ok(iter) = static_dirs.try_iter() {
-                for entry in iter.flatten() {
-                    if let Some(dir) = settings_path_to_string(&entry) {
-                        if !dir.is_empty() && dir != "None" && !directories.contains(&dir) {
-                            directories.push(dir);
-                        }
-                    }
+        if let Some(static_dirs) = settings.get("STATICFILES_DIRS")?
+            && let Ok(iter) = static_dirs.try_iter()
+        {
+            for entry in iter.flatten() {
+                if let Some(dir) = settings_path_to_string(&entry)
+                    && !dir.is_empty()
+                    && dir != "None"
+                    && !directories.contains(&dir)
+                {
+                    directories.push(dir);
                 }
             }
         }
@@ -347,9 +353,9 @@ fn read_cors_and_file_scopes(
         // full URLs and missing leading slash produce malformed scope prefixes.
         if !media_url.starts_with('/') {
             eprintln!(
-                    "[django-bolt] Warning: MEDIA_URL must start with '/' for in-process serving (got {:?}); ignoring.",
-                    media_url
-                );
+                "[django-bolt] Warning: MEDIA_URL must start with '/' for in-process serving (got {:?}); ignoring.",
+                media_url
+            );
             return Ok(None);
         }
         let url_prefix = media_url.trim_end_matches('/').to_string();
@@ -431,7 +437,9 @@ fn read_cors_and_file_scopes(
 
     // Validate CORS configuration: wildcard + credentials is invalid per spec
     if allow_all && credentials {
-        eprintln!("[django-bolt] Warning: CORS_ALLOW_ALL_ORIGINS=True with CORS_ALLOW_CREDENTIALS=True is invalid.");
+        eprintln!(
+            "[django-bolt] Warning: CORS_ALLOW_ALL_ORIGINS=True with CORS_ALLOW_CREDENTIALS=True is invalid."
+        );
         eprintln!(
             "[django-bolt] Per CORS spec, wildcard origin (*) cannot be used with credentials."
         );
@@ -584,13 +592,11 @@ pub(crate) fn configure_file_scopes(cfg: &mut web::ServiceConfig, state: &AppSta
     reason = "PyO3 wire format: Python passes each route as one tuple"
 )]
 pub fn register_routes(
-    _py: Python<'_>,
+    py: Python<'_>,
     routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
+    native_routes: Vec<crate::native::NativeRouteSpec>,
 ) -> PyResult<()> {
-    let mut router = Router::new();
-    for (method, path, handler_id, handler, dispatch, dispatch_sync) in routes {
-        router.register(&method, &path, handler_id, handler, dispatch, dispatch_sync)?;
-    }
+    let router = crate::native::build_router(py, routes, native_routes)?;
     GLOBAL_ROUTER
         .set(Arc::new(router))
         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Router already initialized"))?;
@@ -778,7 +784,6 @@ pub fn start_server(
         None => None,
     };
 
-    let cors_origin_regexes = config.cors_origin_regexes();
     let app_state = Arc::new(AppState {
         dispatch,
         debug: config.debug,
@@ -786,12 +791,12 @@ pub fn start_server(
         max_payload_size: config.max_payload_size,
         max_param_length: config.max_param_length,
         asgi_mount_timeout: config.asgi_mount_timeout,
+        native_route_timeout: config.native_route_timeout,
         stream_config: config.stream_config,
         global_cors_config: config.global_cors_config,
-        cors_origin_regexes,
         global_compression_config: global_compression_config.clone(),
         trusted_proxies: config.trusted_proxies,
-        rate_limiters: Arc::default(),
+        rate_limiters: Arc::new(RateLimiters::new(config.rate_limit_ipv6_prefix)),
         router: Arc::clone(GLOBAL_ROUTER.get().expect("checked at the start")),
         route_metadata,
         asgi_mounts: GLOBAL_ASGI_MOUNTS.get().cloned().unwrap_or_default(),
@@ -882,13 +887,12 @@ pub fn start_server(
                     // Multi-write responses (streaming, SSE, ASGI mounts) hit
                     // the Nagle + delayed-ACK 40 ms stall without TCP_NODELAY.
                     .on_connect(|conn, _ext| {
-                        if let Some(stream) = conn.downcast_ref::<actix_web::rt::net::TcpStream>() {
-                            if let Err(err) = stream.set_nodelay(true) {
+                        if let Some(stream) = conn.downcast_ref::<actix_web::rt::net::TcpStream>()
+                            && let Err(err) = stream.set_nodelay(true) {
                                 eprintln!(
                                     "[django-bolt] Failed to set TCP_NODELAY on connection: {err}"
                                 );
                             }
-                        }
                     })
                     // A read-side EOF while a handler runs is a client that
                     // went away. Drop the handler, so ASGI mounts get
@@ -964,12 +968,8 @@ fn bind_listener(
     use_reuse_port: bool,
     backlog: i32,
 ) -> std::io::Result<std::net::TcpListener> {
-    let ip: IpAddr = host.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
-    let domain = match ip {
-        IpAddr::V4(_) => Domain::IPV4,
-        IpAddr::V6(_) => Domain::IPV6,
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    let addr = resolve_bind_addr(host, port)?;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
 
     // Only set SO_REUSEPORT when explicitly requested (multi-process mode)
@@ -978,7 +978,7 @@ fn bind_listener(
         socket.set_reuse_port(true)?;
     }
 
-    socket.bind(&SocketAddr::new(ip, port).into())?;
+    socket.bind(&addr.into())?;
     socket.listen(backlog)?;
     let listener: std::net::TcpListener = socket.into();
     listener.set_nonblocking(true)?;
@@ -990,7 +990,7 @@ fn bind_listener(
 /// actix-server's default per-signal semantics.
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> bool {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     // If a handler cannot be installed, log it and never resolve that arm:
     // the remaining signals still work, and the OS default disposition was
@@ -1081,28 +1081,28 @@ pub async fn websocket_upgrade_handler(
     };
 
     // Look up in global WebSocket router
-    if let Some(ws_router) = GLOBAL_WEBSOCKET_ROUTER.get() {
-        if let Some((route, path_params)) = ws_router.find(normalized_path) {
-            let (handler, injector) = Python::attach(|py| {
-                (
-                    route.handler.clone_ref(py),
-                    route.injector.as_ref().map(|i| i.clone_ref(py)),
-                )
-            });
-            // Pass AppState to WebSocket handler for CORS validation and connection tracking
-            return handle_websocket_upgrade(
-                req,
-                stream,
-                WsTarget::Route {
-                    handler,
-                    handler_id: route.handler_id,
-                    path_params,
-                    injector,
-                },
-                state.get_ref().clone(),
+    if let Some(ws_router) = GLOBAL_WEBSOCKET_ROUTER.get()
+        && let Some((route, path_params)) = ws_router.find(normalized_path)
+    {
+        let (handler, injector) = Python::attach(|py| {
+            (
+                route.handler.clone_ref(py),
+                route.injector.as_ref().map(|i| i.clone_ref(py)),
             )
-            .await;
-        }
+        });
+        // Pass AppState to WebSocket handler for CORS validation and connection tracking
+        return handle_websocket_upgrade(
+            req,
+            stream,
+            WsTarget::Route {
+                handler,
+                handler_id: route.handler_id,
+                path_params,
+                injector,
+            },
+            state.get_ref().clone(),
+        )
+        .await;
     }
 
     Ok(HttpResponse::NotFound().body("WebSocket endpoint not found"))
@@ -1166,4 +1166,39 @@ async fn websocket_not_found_handler(
     }
 
     actix_web_actors::ws::start(WebSocketNotFoundActor, &req, stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn bound_ip(host: &str) -> std::io::Result<IpAddr> {
+        Ok(bind_listener(host, 0, false, 8)?.local_addr()?.ip())
+    }
+
+    #[test]
+    fn bind_listener_binds_an_ip_address() {
+        assert_eq!(bound_ip("127.0.0.1").unwrap(), IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn bind_listener_binds_an_ipv6_address_in_brackets() {
+        assert_eq!(
+            bound_ip("[::1]").unwrap(),
+            IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn bind_listener_binds_the_ipv4_loopback_for_localhost() {
+        assert_eq!(bound_ip("localhost").unwrap(), IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn bind_listener_fails_for_a_host_with_no_address() {
+        // RFC 6761: a name under .invalid never resolves.
+        let err = bound_ip("bolt-test.invalid").unwrap_err();
+        assert!(err.to_string().contains("bolt-test.invalid"), "{err}");
+    }
 }
