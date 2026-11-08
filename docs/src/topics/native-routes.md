@@ -24,7 +24,7 @@ api.native_route("GET", "/native/users/{id}", my_extension.user_handler())
 
 A native route is a route of the normal router. The path syntax, the trailing slash rule, the mount prefix and the automatic `OPTIONS` response are the same as for a Python route. A static route matches before a route with a path parameter. This is also true when one of the routes is native.
 
-Bolt does not check the type of a path parameter for a native route. Thus `native_route()` refuses a type such as `{id:int}`. Use `{id}`, and check the value in the handler. `{rest:path}` is valid. It matches the rest of the path, with its slashes.
+Bolt does not check the type of a path parameter for a native route. Thus `native_route()` refuses each type other than `path`, also `{id:str}`. This rule also applies to the API prefix and the mount path. Use `{id}`, and check the value in the handler. `{rest:path}` is valid. It matches the rest of the path, with its slashes.
 
 `native_route()` checks the capsule. These stop startup:
 
@@ -39,8 +39,8 @@ Bolt does these steps:
 - Apply `BOLT_MAX_HEADER_SIZE` and the limit of 100 headers. The size limit applies to each raw value, also a value that is not ASCII.
 - Read the full body. A body larger than `BOLT_MAX_UPLOAD_SIZE` gets 413. As for a Python route, no timeout applies while the body arrives.
 - Resolve the client address and the scheme with `BOLT_TRUSTED_PROXIES`.
-- Apply the global CORS configuration and compression.
-- Send 504 when the handler does not complete within `BOLT_NATIVE_ROUTE_TIMEOUT`. This does not stop the handler, so the handler must limit its own work.
+- Apply the global CORS configuration and compression. A native route cannot turn off the global CORS configuration.
+- Send 504 when the handler does not complete within `BOLT_NATIVE_ROUTE_TIMEOUT`. This does not stop the handler, so the handler must limit its own work. A handler must complete each request one time, also after the 504. If it does not, the request token of Bolt stays in memory until the process stops.
 
 Bolt does not do these steps:
 
@@ -91,8 +91,9 @@ Rules for the handler:
 - Bolt calls the handler on many threads at the same time. Do not block in it.
 - Start threads and runtimes lazily, in the process that serves requests. With `runbolt --processes N`, a thread that started at import time is not in the worker processes.
 - The request gives all headers, also `authorization` and `cookie`. A header value can have bytes that are not UTF-8; Python routes do not get such a header.
+- The path is the full request path, with the API prefix and the mount path. Use the path parameters to read the parts of the path.
 - Path parameters are percent-decoded one time. A value that does not decode to UTF-8 stays encoded, as for Python routes. Bolt does not limit the length of a path parameter; the URL limit applies. The path and the query are not decoded.
-- Bolt sends 500 for a status outside 200-599. It drops a response header that is not valid HTTP and logs it. The response body is buffered.
+- Bolt sends 500 for a status outside 200-599. It drops a response header that is not valid HTTP and logs it. The response body is buffered. Bolt sends no body for `HEAD`, 204, 205 and 304.
 - Each ABI struct starts with `size`. A later version of `bolt-native-abi` adds fields only at the end, so a handler and Bolt can use different minor versions. `handler!` and `Responder` set `size` for you.
 - A native route for `GET` does not answer `HEAD`. Register `HEAD` too if you need it.
 

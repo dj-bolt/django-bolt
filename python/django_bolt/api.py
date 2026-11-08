@@ -304,8 +304,19 @@ def _validate_asgi_mount_conflicts(
 
 _HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY"})
 
-# A path parameter with a type, for example ``{id:int}``.
-_TYPED_PATH_PARAM = re.compile(r"\{\w+:(\w+)\}")
+# A path parameter with a type, for example ``{id:int}``. As the router does,
+# the type is all the text after the first colon.
+_TYPED_PATH_PARAM = re.compile(r"\{[^}:]*:([^}]*)\}")
+
+
+def _refuse_typed_native_path_params(path: str) -> None:
+    """Refuse a path parameter type other than ``path``: Bolt does not check it for a native route."""
+    for param in _TYPED_PATH_PARAM.finditer(path):
+        if param.group(1) != "path":
+            raise ValueError(
+                f"A native route does not check the type of {param.group(0)}. "
+                "Remove the type, and check the value in the handler."
+            )
 
 
 def _validate_mcp_mount_conflicts(
@@ -3526,17 +3537,12 @@ class BoltAPI:
         method = method.upper()
         if method not in _HTTP_METHODS:
             raise ValueError(f"Unsupported HTTP method for a native route: {method}")
-        for param in _TYPED_PATH_PARAM.finditer(path):
-            if param.group(1) != "path":
-                raise ValueError(
-                    f"A native route does not check the type of {param.group(0)}. "
-                    "Remove the type, and check the value in the handler."
-                )
+        path = path or "/"
+        full_path = _normalize_path(f"{self.prefix}{path}" if self.prefix else path, self.trailing_slash)
+        _refuse_typed_native_path_params(full_path)
         # Check the capsule now, so a bad capsule stops startup before runbolt
         # starts its worker processes.
         _core.check_native_capsule(capsule)
-        path = path or "/"
-        full_path = _normalize_path(f"{self.prefix}{path}" if self.prefix else path, self.trailing_slash)
         self._native_routes.append((method, full_path, capsule))
 
     def mount(self, path: str, app: BoltAPI) -> None:
@@ -3643,6 +3649,7 @@ class BoltAPI:
 
         for method, route_path, capsule in app._native_routes:
             new_path = _normalize_path(mount_path + route_path, self.trailing_slash)
+            _refuse_typed_native_path_params(new_path)
             self._native_routes.append((method, new_path, capsule))
 
         # Copy WebSocket routes

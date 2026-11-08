@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import re
 
 import pytest
 from bolt_mcp import MCP, mount_mcp
@@ -99,6 +100,7 @@ BOLT_500 = {"detail": "Internal Server Error"}
         ("status-404", 404, None),  # the handler's own error stays as it is
         ("status-204", 204, b""),  # no body, also when the handler sends one
         ("status-304", 304, b""),
+        ("status-205", 205, b""),
     ],
 )
 def test_native_handler_outcomes(case, status, body):
@@ -242,6 +244,32 @@ def test_native_route_does_not_take_the_cors_config_of_a_python_route():
     assert "access-control-allow-origin" not in native.headers
 
 
+def test_cors_preflight_to_a_native_route_gets_the_global_cors_headers():
+    with TestClient(native_api(), use_http_layer=True, cors_allowed_origins=["https://a.example"]) as client:
+        response = client.options(
+            "/items/1",
+            headers={"Origin": "https://a.example", "Access-Control-Request-Method": "POST"},
+        )
+
+    assert response.status_code == 204
+    assert response.headers["access-control-allow-origin"] == "https://a.example"
+    assert "POST" in response.headers["access-control-allow-methods"]
+
+
+def test_head_to_a_get_only_native_route_is_not_found_as_for_a_python_route():
+    api = native_api()
+
+    @api.get("/python")
+    async def python_route():
+        return {}
+
+    with TestClient(api) as client:
+        native = client.head("/items/1")
+        python = client.head("/python")
+
+    assert native.status_code == python.status_code == 404
+
+
 def test_automatic_options_includes_native_routes():
     with TestClient(native_api()) as client:
         response = client.options("/items/1")
@@ -332,9 +360,26 @@ def _capsule(name: bytes):
 OTHER_NAME = b"other.capsule"
 
 
-def test_native_route_refuses_a_typed_path_param():
-    with pytest.raises(ValueError, match=r"does not check the type of \{id:int\}"):
-        BoltAPI().native_route("GET", "/items/{id:int}", _core.native_test_capsule())
+@pytest.mark.parametrize(
+    ("prefix", "path", "param"),
+    [
+        ("", "/items/{id:int}", "{id:int}"),
+        ("", "/items/{id: int}", "{id: int}"),
+        ("", "/items/{id:int }", "{id:int }"),
+        ("", "/items/{id:str}", "{id:str}"),
+        ("/t/{tenant:int}", "/items", "{tenant:int}"),
+    ],
+)
+def test_native_route_refuses_a_typed_path_param(prefix, path, param):
+    with pytest.raises(ValueError, match=f"does not check the type of {re.escape(param)}"):
+        BoltAPI(prefix=prefix).native_route("GET", path, _core.native_test_capsule())
+
+
+def test_mount_path_with_a_typed_path_param_refuses_a_native_route():
+    child = BoltAPI()
+    child.native_route("GET", "/items", _core.native_test_capsule())
+    with pytest.raises(ValueError, match=r"does not check the type of \{tenant:int\}"):
+        BoltAPI().mount("/t/{tenant:int}", child)
 
 
 def test_native_route_takes_a_path_param_of_type_path():

@@ -126,7 +126,8 @@ pub struct Request {
     pub size: usize,
     /// The method, for example `POST`.
     pub method: Slice,
-    /// The path as received, still percent-encoded.
+    /// The path as received, still percent-encoded. It includes the API
+    /// prefix and the mount path.
     pub path: Slice,
     /// The query string as received, without `?`, still percent-encoded.
     pub query: Slice,
@@ -220,7 +221,7 @@ impl<'a> RequestRef<'a> {
         unsafe { self.req.method.as_bytes() }
     }
 
-    /// The path, still percent-encoded.
+    /// The path, still percent-encoded, with the API prefix and the mount path.
     pub fn path(&self) -> &'a [u8] {
         unsafe { self.req.path.as_bytes() }
     }

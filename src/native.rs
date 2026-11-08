@@ -110,8 +110,14 @@ unsafe extern "C" fn complete(token: *mut c_void, resp: *const abi::Response) {
         return;
     }
     // SAFETY: `size` is the first field of every version.
-    if unsafe { (*resp).size } < std::mem::size_of::<abi::Response>() {
-        // A broken handler. Dropping the sender sends 500.
+    let size = unsafe { (*resp).size };
+    if size < std::mem::size_of::<abi::Response>() {
+        // A broken handler. Dropping the sender sends 500. The token does not
+        // name the handler, so this line gives only the cause.
+        eprintln!(
+            "[django-bolt] ERROR: a native handler sent a Response smaller than v1 ({size} < {} bytes); set its size field",
+            std::mem::size_of::<abi::Response>()
+        );
         return;
     }
     // SAFETY: `resp` and its pointers are valid during this call, and the size
@@ -294,10 +300,11 @@ pub async fn dispatch(
             ),
         }
     }
-    // HEAD, 204 and 304 have no body (RFC 9110). Actix writes the bytes that
-    // it gets, so a body would corrupt the next response on the connection.
+    // HEAD, 204, 205 and 304 have no body (RFC 9110). Actix writes the bytes
+    // that it gets, so a body would corrupt the next response on the connection.
     if req.method() == actix_web::http::Method::HEAD
         || status == StatusCode::NO_CONTENT
+        || status == StatusCode::RESET_CONTENT
         || status == StatusCode::NOT_MODIFIED
     {
         return response.finish();
