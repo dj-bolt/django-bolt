@@ -124,22 +124,22 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
 
     // ---- Tier-1 auth + mount guards (same wire format as route metadata) ----
     let mut auth_backends = Vec::new();
-    if let Some(list) = mount_def.get_item("auth_backends")? {
-        if !list.is_none() {
-            let dicts: Vec<HashMap<String, Py<PyAny>>> = list.extract().map_err(|e| {
-                PyValueError::new_err(format!("Invalid MCP mount 'auth_backends': {e}"))
-            })?;
-            for dict in &dicts {
-                let backend = parse_auth_backend(dict, py)?;
-                // Django middleware does not run on an MCP mount, so no code
-                // could check the guards of a session request.
-                if matches!(backend, AuthBackend::Session { .. }) {
-                    return Err(PyValueError::new_err(
-                        "SessionAuthentication works on HTTP routes only. Remove it from the auth of the MCP mount.",
-                    ));
-                }
-                auth_backends.push(backend);
+    if let Some(list) = mount_def.get_item("auth_backends")?
+        && !list.is_none()
+    {
+        let dicts: Vec<HashMap<String, Py<PyAny>>> = list.extract().map_err(|e| {
+            PyValueError::new_err(format!("Invalid MCP mount 'auth_backends': {e}"))
+        })?;
+        for dict in &dicts {
+            let backend = parse_auth_backend(dict, py)?;
+            // Django middleware does not run on an MCP mount, so no code
+            // could check the guards of a session request.
+            if matches!(backend, AuthBackend::Session { .. }) {
+                return Err(PyValueError::new_err(
+                    "SessionAuthentication works on HTTP routes only. Remove it from the auth of the MCP mount.",
+                ));
             }
+            auth_backends.push(backend);
         }
     }
     let guards = match mount_def.get_item("guards")? {

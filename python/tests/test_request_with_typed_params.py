@@ -15,7 +15,9 @@ from django_bolt import BoltAPI
 from django_bolt.testing import TestClient
 
 
-@pytest.fixture(scope="module")
+# Function scope: each test registers its routes, so a mutation tool sees
+# each test reach the request-time closures of the extractors.
+@pytest.fixture
 def api():
     """Create test API with routes that have request + typed params."""
     api = BoltAPI()
@@ -87,7 +89,7 @@ def api():
     return api
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def client(api):
     return TestClient(api)
 

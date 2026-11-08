@@ -87,10 +87,10 @@ pub fn resolve_max_param_length(py: Python<'_>) -> PyResult<usize> {
 fn is_valid_decimal_literal(s: &str) -> bool {
     let b = s.as_bytes();
     let mut i = 0;
-    if let Some(&c) = b.first() {
-        if c == b'+' || c == b'-' {
-            i = 1;
-        }
+    if let Some(&c) = b.first()
+        && (c == b'+' || c == b'-')
+    {
+        i = 1;
     }
     let mut mantissa_digits = 0;
     while i < b.len() && b[i].is_ascii_digit() {

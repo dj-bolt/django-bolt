@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import pytest
@@ -9,7 +10,7 @@ from django.http import HttpResponse
 
 from django_bolt import JSON, BoltAPI, Cookie, Response, StreamingResponse
 from django_bolt.cookies import make_delete_cookie
-from django_bolt.responses import HTML, PlainText, Redirect
+from django_bolt.responses import HTML, File, FileResponse, PlainText, Redirect
 from django_bolt.serialization import (
     compile_response_handlers,
     serialize_html_response,
@@ -122,6 +123,154 @@ class TestCookieSerialization:
         header = cookie.to_header_value()
         # SimpleCookie should properly quote values with spaces
         assert "data=" in header
+
+
+class TestCookieHeaderExactText:
+    """Tests for the exact text of Cookie.to_header_value()."""
+
+    def test_header_value_starts_with_the_name_and_value(self):
+        """The header value holds no prefix before the name."""
+        assert Cookie("session", "abc123").to_header_value() == "session=abc123; Path=/; SameSite=Lax"
+
+    def test_header_value_with_every_attribute(self):
+        """Each attribute appears once in the header value."""
+        cookie = Cookie(
+            "session",
+            "abc123",
+            max_age=3600,
+            expires=datetime(2025, 12, 31, 23, 59, 59, tzinfo=UTC),
+            path="/api",
+            domain="example.com",
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+        )
+        assert cookie.to_header_value() == (
+            "session=abc123; Domain=example.com; expires=Wed, 31 Dec 2025 23:59:59 GMT; "
+            "HttpOnly; Max-Age=3600; Path=/api; SameSite=Strict; Secure"
+        )
+
+
+class TestCookieRawTuple:
+    """Tests for the 9-tuple that Rust serializes."""
+
+    def test_raw_tuple_with_every_attribute(self):
+        """The tuple holds each field in the documented order."""
+        cookie = Cookie(
+            "session",
+            "abc123",
+            max_age=3600,
+            expires=datetime(2025, 12, 31, 23, 59, 59, tzinfo=UTC),
+            path="/api",
+            domain="example.com",
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+        )
+        assert cookie.to_raw_tuple() == (
+            "session",
+            "abc123",
+            "/api",
+            3600,
+            "Wed, 31 Dec 2025 23:59:59 GMT",
+            "example.com",
+            True,
+            True,
+            "Strict",
+        )
+
+    def test_raw_tuple_keeps_an_expires_string(self):
+        """An expires string goes to Rust without a change."""
+        cookie = Cookie("session", "abc123", expires="Thu, 01 Jan 2026 00:00:00 GMT")
+        assert cookie.to_raw_tuple()[4] == "Thu, 01 Jan 2026 00:00:00 GMT"
+
+    def test_raw_tuple_defaults(self):
+        """A cookie with samesite=False has None for expires, max age, domain and samesite."""
+        assert Cookie("session", "abc123", samesite=False).to_raw_tuple() == (
+            "session",
+            "abc123",
+            "/",
+            None,
+            None,
+            None,
+            False,
+            False,
+            None,
+        )
+
+
+class TestCookieAttributesInSetCookieHeader:
+    """Tests for the Set-Cookie header that the server sends."""
+
+    @staticmethod
+    def _set_cookie_parts(cookie: Cookie) -> list[str]:
+        api = BoltAPI()
+
+        @api.get("/cookie")
+        async def set_cookie():
+            return Response({"ok": True}).set_cookie(
+                cookie.name,
+                cookie.value,
+                max_age=cookie.max_age,
+                expires=cookie.expires,
+                path=cookie.path,
+                domain=cookie.domain,
+                secure=cookie.secure,
+                httponly=cookie.httponly,
+                samesite=cookie.samesite,
+            )
+
+        with TestClient(api) as client:
+            header = client.get("/cookie").headers["set-cookie"]
+        return header.split("; ")
+
+    def test_every_attribute_reaches_the_header(self):
+        """The header holds the value and every attribute."""
+        cookie = Cookie(
+            "session",
+            "abc123",
+            max_age=3600,
+            expires=datetime(2025, 12, 31, 23, 59, 59, tzinfo=UTC),
+            path="/api",
+            domain="example.com",
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+        )
+        parts = self._set_cookie_parts(cookie)
+        assert parts[0] == "session=abc123"
+        assert sorted(parts[1:]) == sorted(
+            [
+                "Max-Age=3600",
+                "Expires=Wed, 31 Dec 2025 23:59:59 GMT",
+                "Path=/api",
+                "Domain=example.com",
+                "Secure",
+                "HttpOnly",
+                "SameSite=Strict",
+            ]
+        )
+
+    def test_expires_string_reaches_the_header(self):
+        """An expires string appears in the header."""
+        parts = self._set_cookie_parts(Cookie("session", "abc123", expires="Thu, 01 Jan 2026 00:00:00 GMT"))
+        assert "Expires=Thu, 01 Jan 2026 00:00:00 GMT" in parts
+
+    def test_no_expires_gives_no_expires_attribute(self):
+        """A cookie with no expires has no Expires attribute."""
+        parts = self._set_cookie_parts(Cookie("session", "abc123"))
+        assert not any(part.lower().startswith("expires") for part in parts)
+
+    def test_samesite_false_omits_the_attribute(self):
+        """A cookie with samesite=False has no SameSite attribute."""
+        parts = self._set_cookie_parts(Cookie("session", "abc123", samesite=False))
+        assert parts[0] == "session=abc123"
+        assert not any(part.lower().startswith("samesite") for part in parts)
+
+    def test_default_cookie_attributes(self):
+        """A plain cookie has the path and SameSite=Lax only."""
+        parts = self._set_cookie_parts(Cookie("session", "abc123"))
+        assert sorted(parts) == ["Path=/", "SameSite=Lax", "session=abc123"]
 
 
 class TestMakeDeleteCookie:
@@ -540,3 +689,80 @@ class TestCookieSecurityValidation:
         assert "valid=" in set_cookie or "also_valid=" in set_cookie
         # Injection attempt should be blocked
         assert "injection" not in set_cookie
+
+
+class TestCookiesReachTheResponse:
+    """Each response kind sends its cookies in a Set-Cookie header."""
+
+    def test_streaming_response_sends_its_cookie(self):
+        api = BoltAPI()
+
+        @api.get("/stream")
+        def stream():
+            def gen():
+                yield "a"
+                yield "b"
+
+            return StreamingResponse(gen(), media_type="text/plain").set_cookie("s", "1")
+
+        with TestClient(api) as client:
+            response = client.get("/stream")
+
+        assert response.status_code == 200
+        assert response.content == b"ab"
+        assert response.headers["set-cookie"].startswith("s=1;")
+
+    def test_file_sends_its_cookie(self, tmp_path):
+        path = tmp_path / "report.txt"
+        path.write_bytes(b"file body")
+        api = BoltAPI()
+
+        @api.get("/file")
+        def file():
+            return File(str(path)).set_cookie("f", "1")
+
+        with TestClient(api) as client:
+            response = client.get("/file")
+
+        assert response.status_code == 200
+        assert response.content == b"file body"
+        assert response.headers["set-cookie"].startswith("f=1;")
+
+    def test_file_response_sends_its_cookie(self, tmp_path):
+        path = tmp_path / "report.txt"
+        path.write_bytes(b"file body")
+        api = BoltAPI()
+
+        @api.get("/file")
+        def file():
+            return FileResponse(str(path)).set_cookie("fr", "1")
+
+        with TestClient(api) as client:
+            response = client.get("/file")
+
+        assert response.status_code == 200
+        assert response.content == b"file body"
+        assert response.headers["set-cookie"].startswith("fr=1;")
+
+    @pytest.mark.parametrize("path", ["/sync", "/async"])
+    def test_json_keeps_its_headers_cookies_and_content_type(self, path):
+        """The async handler awaits, so it takes the async serializer, not the sync one."""
+        api = BoltAPI()
+
+        @api.get("/sync")
+        def sync_json():
+            return JSON({"a": 1}, headers={"X-A": "1"}).set_cookie("k", "v")
+
+        @api.get("/async")
+        async def async_json():
+            await asyncio.sleep(0)
+            return JSON({"a": 1}, headers={"X-A": "1"}).set_cookie("k", "v")
+
+        with TestClient(api) as client:
+            response = client.get(path)
+
+        assert response.status_code == 200
+        assert response.json() == {"a": 1}
+        assert response.headers["content-type"] == "application/json"
+        assert response.headers["x-a"] == "1"
+        assert response.headers["set-cookie"].startswith("k=v;")

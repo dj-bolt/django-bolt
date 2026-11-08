@@ -191,6 +191,8 @@ raise ResponseValidationError(errors)
 
 Response validation errors indicate a server bug, so they return 500 Internal Server Error.
 
+The validation errors name the model, the fields and the types of your handler. With `DEBUG=False`, the body is only `{"detail": "Response validation error"}`. Bolt writes the validation errors to the server log. With `DEBUG=True`, the body also has `extra.validation_errors`.
+
 ## Error handlers
 
 Django-Bolt provides built-in error handlers:
@@ -244,6 +246,7 @@ status, headers, body = generic_exception_handler(exc, debug=True)
 The main entry point that routes to appropriate handlers. It maps some Django exceptions as Django does:
 
 - `PermissionDenied` gives 403.
+- `Http404`, also from `get_object_or_404`, gives 404. With `DEBUG=False`, the detail is `Not Found`.
 - `SuspiciousOperation`, for example `DisallowedHost`, gives 400. Bolt logs it to the `django.security.<class name>` logger, as Django does. With `DEBUG=False`, the detail is `Bad Request`.
 
 ```python
@@ -283,6 +286,14 @@ except msgspec.ValidationError as e:
     # [{"loc": [...], "msg": "...", "type": "..."}]
 ```
 
+A missing field has the type `missing_field` at any depth. Its `loc` ends with the field name. For a missing `zip` in the `address` struct, the error is:
+
+```python
+{"loc": ["body", "address", "zip"], "msg": "Object missing required field `zip`", "type": "missing_field"}
+```
+
+For an array item, `loc` has the index as a string, for example `["body", "items", "0", "zip"]`.
+
 ## Error response format
 
 All errors follow a consistent format:
@@ -318,6 +329,7 @@ An error formatter changes the body of each error response that the framework ma
   - 422 from path, query, header, cookie and form values.
   - 429 from rate limits.
   - A `FileResponse` whose file Rust cannot open or read when it sends the response.
+  - 500 and 504 that Bolt makes for a native route. The formatter does not change a response from the native handler.
 - Python: request and response validation, `HTTPException`, and unhandled exceptions.
 
 Without a formatter, the errors keep their default body.
@@ -373,7 +385,7 @@ api = BoltAPI(error_formatter=format_error)
 | `status` | The HTTP status code. |
 | `kind` | A stable name for the error. See the table below. |
 | `detail` | A message for a human. Bolt does not put internal data, such as a file path, in it. |
-| `errors` | The field errors. Each one has `loc`, `msg` and `type`. Some also have `ctx`. |
+| `errors` | The field errors. Each one has `loc`, `msg` and `type`. Some also have `ctx`. A `response_validation` error has no `errors` when `DEBUG=False`. Read `error.exception.errors()` for them. |
 | `headers` | The headers that the error needs, for example `WWW-Authenticate` or `Retry-After`. |
 | `extra` | The `extra` of an `HTTPException`, or `{"retry_after": n}` for a rate limit. |
 | `exception` | The Python exception. It is `None` for an error of the Rust core. |
@@ -382,13 +394,14 @@ api = BoltAPI(error_formatter=format_error)
 |------|--------|--------|
 | `bad_request` | 400 | Too many headers, a header that is too large, a body that Bolt cannot read, or a Django `SuspiciousOperation`, such as `DisallowedHost` |
 | `not_authenticated` | 401 | A guard, or an `HTTPException(401)` |
-| `forbidden` | 403 | A guard, the CSRF origin check of Bolt, `PermissionDenied` or an `HTTPException(403)` |
-| `not_found` | 404 | No route, `FileNotFoundError` or an `HTTPException(404)` |
+| `forbidden` | 403 | A guard, the CSRF origin check of Bolt, `PermissionDenied`, a `FileResponse` outside `BOLT_ALLOWED_FILE_PATHS` or an `HTTPException(403)` |
+| `not_found` | 404 | No route, Django's `Http404` (also from `get_object_or_404`), a `FileResponse` or a `File` whose path names no regular file, or an `HTTPException(404)` |
 | `payload_too_large` | 413 | A body over `BOLT_MAX_UPLOAD_SIZE` |
 | `validation` | 422 | A value that fails validation, in Rust or in Python |
 | `rate_limited` | 429 | A rate limit |
 | `response_validation` | 500 | A handler return value that fails validation |
-| `internal_error` | 500 | An unhandled exception, or a failure in the Rust core, for example a file that Rust cannot read |
+| `internal_error` | 500 | An unhandled exception, also a `FileNotFoundError` or `PermissionError` of handler code, a file in `BOLT_ALLOWED_FILE_PATHS` that the server cannot read, a directory on the way to them that the server cannot search, or a failure in the Rust core |
+| `gateway_timeout` | 504 | A native route handler that does not complete within `BOLT_NATIVE_ROUTE_TIMEOUT` |
 
 An `HTTPException` gets its kind from its status, for example `conflict` for 409. A status with no name gives `http_error`.
 
@@ -402,7 +415,7 @@ The formatter runs only for an error, and only when the app has a formatter. A r
 
 The formatter must be a sync callable. Bolt raises `TypeError` for an async one. The response of the formatter must have a status from 400 to 599. Each header name and value must be a `str`. The response cannot set cookies. When the formatter raises an exception or returns a response that is not valid, Bolt logs the error and sends the default response.
 
-Bolt logs each 500 error, also when the formatter formats it. An `HTTPException` is a planned response, so Bolt does not log it.
+Bolt logs each error that it answers with a 500 by default, also when the formatter gives another status. Bolt does not log an error that it answers with a 4xx by default, also when the formatter gives a 5xx. An `HTTPException` is a planned response, so Bolt does not log it.
 
 With more than one API in a project, `runbolt` uses one formatter for all of them. Set the same formatter on each API, or set it on one API. Two different formatters stop startup.
 

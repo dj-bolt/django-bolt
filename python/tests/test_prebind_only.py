@@ -12,11 +12,16 @@ from __future__ import annotations
 
 from typing import Annotated
 
+import msgspec
 import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.param_functions import Cookie, Header, Query
 from django_bolt.testing import TestClient
+
+
+class NewItem(msgspec.Struct):
+    name: str
 
 
 def _route_meta(api: BoltAPI, path: str) -> dict:
@@ -26,7 +31,9 @@ def _route_meta(api: BoltAPI, path: str) -> dict:
     raise AssertionError(f"route {path} not registered")
 
 
-@pytest.fixture(scope="module")
+# Function scope: each test registers its routes, so a mutation tool sees
+# each test reach the request-time closures of the extractors.
+@pytest.fixture
 def api() -> BoltAPI:
     api = BoltAPI()
 
@@ -53,7 +60,7 @@ def api() -> BoltAPI:
     return api
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def client(api: BoltAPI):
     with TestClient(api) as client:
         yield client
@@ -124,3 +131,39 @@ def test_request_parameter_still_sees_the_headers(client: TestClient) -> None:
     assert body["x_count"] == 3
     assert body["seen"] == 3
     assert body["n"] >= 2
+
+
+# --- Routes that Rust does not bind ---
+# A sequence type or a body keeps the Python injector. Each test registers its
+# routes, so a mutation tool sees the test reach the injector.
+
+
+def test_a_query_sequence_and_a_cookie_both_reach_the_handler() -> None:
+    """The cookie is not read from the query map. Rust does not bind a sequence, so the Python injector runs."""
+    api = BoltAPI()
+
+    @api.get("/tags")
+    async def tags(tag: Annotated[list[int], Query()], session: Annotated[str, Cookie()]) -> dict:
+        return {"tag": tag, "session": session}
+
+    with TestClient(api) as client:
+        response = client.get("/tags?tag=1&tag=2", headers={"Cookie": "session=abc"})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"tag": [1, 2], "session": "abc"}
+
+        missing = client.get("/tags?tag=1")
+        assert missing.status_code == 422
+        assert missing.json()["detail"] == "Missing required cookie: session"
+
+
+def test_a_body_and_a_query_value_both_reach_the_handler() -> None:
+    api = BoltAPI()
+
+    @api.post("/items")
+    async def create(item: NewItem, notify: bool = False) -> dict:
+        return {"name": item.name, "notify": notify}
+
+    with TestClient(api) as client:
+        response = client.post("/items?notify=true", json={"name": "bolt"})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"name": "bolt", "notify": True}

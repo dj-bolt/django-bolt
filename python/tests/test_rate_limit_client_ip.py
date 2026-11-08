@@ -1,10 +1,11 @@
 """
 Tests for `settings.BOLT_TRUSTED_PROXIES`, the list that decides whether a
-`key="ip"` rate limit may believe `X-Forwarded-For`.
+`key="ip"` rate limit may believe `X-Forwarded-For`, and for
+`settings.BOLT_RATE_LIMIT_IPV6_PREFIX`.
 
-Only the configuration half lives here. The test client sends each request
-from 127.0.0.1, so in process every caller has the same address. Tests that
-need several client addresses run against a real server, in
+The test client sends each request from 127.0.0.1. With that address in
+`BOLT_TRUSTED_PROXIES`, `X-Forwarded-For` gives each request its client
+address. The tests of the forwarding rules run against a real server, in
 ``python/tests/integration/test_rate_limit_client_ip_server_integration.py``.
 """
 
@@ -113,3 +114,51 @@ def test_the_ip_key_is_matched_without_regard_to_case():
         assert status == 429
         # A header named `ip` must not buy a new bucket.
         assert client.get("/limited", headers={"ip": "b"}).status_code == 429
+
+
+@pytest.mark.parametrize("value", [-1, 129, 256, 64.0, "64", True])
+def test_an_invalid_ipv6_prefix_fails_at_startup(value):
+    """The prefix is an int from 0 to 128. A bool is not an int."""
+    with (
+        override_settings(BOLT_RATE_LIMIT_IPV6_PREFIX=value),
+        pytest.raises(ImproperlyConfigured, match="BOLT_RATE_LIMIT_IPV6_PREFIX"),
+    ):
+        TestClient(_api_with_limited_route())
+
+
+def _status_from(client, address):
+    return client.get("/limited", headers={"X-Forwarded-For": address}).status_code
+
+
+@pytest.mark.parametrize(
+    ("prefix", "neighbour", "sibling"),
+    [
+        pytest.param(None, 429, 200, id="default-64"),
+        pytest.param(56, 429, 429, id="56"),
+        pytest.param(128, 200, 200, id="128"),
+    ],
+)
+def test_an_ipv6_client_is_counted_per_network(prefix, neighbour, sibling):
+    """A client cannot get a fresh bucket from each address of its /64."""
+    settings = {"BOLT_TRUSTED_PROXIES": ["127.0.0.1"]}
+    if prefix is not None:
+        settings["BOLT_RATE_LIMIT_IPV6_PREFIX"] = prefix
+    api = BoltAPI()
+
+    @api.get("/limited")
+    @rate_limit(rps=1, burst=2, key="ip")
+    async def limited():
+        return {"ok": True}
+
+    with override_settings(**settings), TestClient(api) as client:
+        statuses = [_status_from(client, "2001:db8:1:2::1") for _ in range(3)]
+        assert statuses == [200, 200, 429]
+        # Another address of the same /64.
+        assert _status_from(client, "2001:db8:1:2::2") == neighbour
+        # An address in another /64 of the same /56.
+        assert _status_from(client, "2001:db8:1:3::1") == sibling
+        # Another /48.
+        assert _status_from(client, "2001:db8:2::1") == 200
+        # Each IPv4 address keeps its own bucket.
+        assert [_status_from(client, "203.0.113.7") for _ in range(3)] == [200, 200, 429]
+        assert _status_from(client, "203.0.113.8") == 200

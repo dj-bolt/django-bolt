@@ -1,9 +1,8 @@
 """Real-server tests for how a rate limit picks its bucket key.
 
-These run against an actual ``runbolt`` process over TCP, which is the only way
-to give the limit a real peer address. The in-process ``TestClient`` builds its
-request with ``TestRequest``, which leaves ``peer_addr`` unset, so every caller
-resolves to the same constant and no proxy can ever be trusted.
+These run against an actual ``runbolt`` process over TCP, so the limit sees a
+real peer address and the settings that ``runbolt`` reads at startup. The
+in-process ``TestClient`` sends each request from 127.0.0.1.
 
 ``BOLT_TRUSTED_PROXIES`` is read once per process at server startup, so each
 trust setting needs one server. The tests for one setting share that server.
@@ -145,6 +144,34 @@ def test_a_trusted_proxy_makes_the_header_usable_again(make_server_project):
     assert allowed.status_code == 200, allowed.text
     assert spoofed.status_code == 429, spoofed.text
     assert bare.status_code == 200, bare.text
+
+
+def test_an_ipv6_client_is_counted_per_network(make_server_project):
+    """``runbolt`` keys an IPv6 client on its /64 by default."""
+    project = make_server_project(api_module=APP, settings_extra=TRUST_LOOPBACK)
+
+    with project.start() as server:
+        assert _exhaust(server, **{"X-Forwarded-For": "2001:db8:1:2::1"}) == 429
+        neighbour = server.request("GET", "/limited", headers={"X-Forwarded-For": "2001:db8:1:2::2"})
+        other = server.request("GET", "/limited", headers={"X-Forwarded-For": "2001:db8:1:3::1"})
+
+    assert neighbour.status_code == 429, neighbour.text
+    assert other.status_code == 200, other.text
+
+
+def test_the_ipv6_prefix_setting_sets_the_network(make_server_project):
+    """``runbolt`` reads ``BOLT_RATE_LIMIT_IPV6_PREFIX`` at startup."""
+    project = make_server_project(api_module=APP, settings_extra=f"{TRUST_LOOPBACK}\nBOLT_RATE_LIMIT_IPV6_PREFIX = 56")
+
+    with project.start() as server:
+        assert _exhaust(server, **{"X-Forwarded-For": "2001:db8:1:2::1"}) == 429
+        # Another /64 of the same /56.
+        sibling = server.request("GET", "/limited", headers={"X-Forwarded-For": "2001:db8:1:3::1"})
+        # Another /56.
+        other = server.request("GET", "/limited", headers={"X-Forwarded-For": "2001:db8:1:100::1"})
+
+    assert sibling.status_code == 429, sibling.text
+    assert other.status_code == 200, other.text
 
 
 def test_remote_addr_follows_the_forwarding_rules(make_server_project):
