@@ -223,6 +223,10 @@ class WebSocketTestClient:
 
         return found, is_asgi_mount, handler_id, handler, path_params_dict, scope_dict
 
+    def _handshake_decided(self) -> bool:
+        """Whether the handler accepted, refused or failed the handshake."""
+        return self._handshake is not None and self._handshake.done()
+
     def _decide(self, outcome: int | BaseException | None) -> None:
         """Record the handshake decision. The first decision wins."""
         if self._handshake is not None and not self._handshake.done():
@@ -237,7 +241,10 @@ class WebSocketTestClient:
         return await self._client_to_server.get()
 
     async def _send(self, message: dict[str, Any]) -> None:
-        """ASGI send callable - puts messages to server queue."""
+        """ASGI send callable - puts messages to server queue.
+
+        It refuses the messages that the server refuses, with the same errors.
+        """
         msg_type = message.get("type", "")
 
         if msg_type == "websocket.accept":
@@ -254,9 +261,20 @@ class WebSocketTestClient:
                         f"The handshake sets the '{name.decode()}' header. "
                         "Use accept(subprotocol=...) to select a subprotocol."
                     )
+            if self._handshake_decided():
+                raise RuntimeError("WebSocket handshake is already complete")
             self._accepted = True
             self._accepted_subprotocol = subprotocol
             self._decide(None)
+
+        elif msg_type == "websocket.send":
+            if "text" not in message and "bytes" not in message:
+                raise ValueError("websocket.send requires 'text' or 'bytes'")
+            if not self._accepted:
+                if not self._handshake_decided():
+                    raise RuntimeError("WebSocket is not accepted: call accept() before send")
+                # The server refused the upgrade, so no client is there.
+                raise ConnectionResetError("WebSocket client disconnected")
 
         elif msg_type == "websocket.close":
             # Close before accept refuses the handshake with 403, as on the server.
@@ -264,6 +282,9 @@ class WebSocketTestClient:
                 self._decide(403)
             self._closed = True
             self._close_code = message.get("code", CloseCode.NORMAL)
+
+        else:
+            raise ValueError(f"Unknown message type: {msg_type}")
 
         # Put all messages in queue for client to receive
         await self._server_to_client.put(message)
