@@ -413,9 +413,14 @@ class TestClient(httpx.Client):
         )
         self.api = api
         self._db_share = SharedConnections() if share_db_connection else None
+        # The running lifespan: its loop and context manager. None before startup and after shutdown.
+        self._lifespan: tuple[asyncio.AbstractEventLoop, Any] | None = None
 
     def __enter__(self):
         """Enter context manager — runs lifespan startup if configured."""
+        if self.is_closed:
+            # The test app is released. Do not run the lifespan of the API again.
+            raise RuntimeError("TestClient is closed. Create a new TestClient for each `with` block.")
         if self._db_share is None or not self._db_share.install():
             _warn_if_inside_atomic_block()
         if self.api._has_lifespan:
@@ -426,22 +431,28 @@ class TestClient(httpx.Client):
             except BaseException:
                 loop.close()
                 raise
-            self._lifespan_loop = loop
-            self._lifespan_cm = cm
+            self._lifespan = (loop, cm)
         try:
             return super().__enter__()
         except BaseException:
-            if hasattr(self, "_lifespan_cm"):
-                self._lifespan_loop.run_until_complete(self._lifespan_cm.__aexit__(None, None, None))
-                self._lifespan_loop.close()
+            self._stop_lifespan(None, None, None)
             raise
+
+    def _stop_lifespan(self, exc_type, exc_val, exc_tb) -> None:
+        """Run the lifespan shutdown once, if the startup ran."""
+        if self._lifespan is None:
+            return
+        loop, cm = self._lifespan
+        self._lifespan = None
+        try:
+            loop.run_until_complete(cm.__aexit__(exc_type, exc_val, exc_tb))
+        finally:
+            loop.close()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit context manager — runs lifespan shutdown, then cleans up test app."""
         try:
-            if hasattr(self, "_lifespan_cm"):
-                self._lifespan_loop.run_until_complete(self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb))
-                self._lifespan_loop.close()
+            self._stop_lifespan(exc_type, exc_val, exc_tb)
         finally:
             try:
                 if self._db_share is not None:
@@ -452,10 +463,16 @@ class TestClient(httpx.Client):
         return super().__exit__(exc_type, exc_val, exc_tb)
 
     def close(self) -> None:
-        """Close the client and release its native test app."""
-        super().close()
-        self._release_app()
-        _close_server_connections()
+        """Close the client and release its native test app.
+
+        A client entered without ``with`` runs its lifespan shutdown here.
+        """
+        try:
+            self._stop_lifespan(None, None, None)
+        finally:
+            super().close()
+            self._release_app()
+            _close_server_connections()
 
     # Override HTTP methods to support stream=True
     def _add_streaming_methods(self, response: Response) -> Response:
@@ -719,6 +736,8 @@ class AsyncTestClient(httpx.AsyncClient):
             **kwargs,
         )
         self.api = api
+        # The context manager of the running lifespan. None before startup and after shutdown.
+        self._lifespan: Any | None = None
 
     async def __aenter__(self):
         """Enter async context manager — runs lifespan startup if configured.
@@ -728,29 +747,44 @@ class AsyncTestClient(httpx.AsyncClient):
         that runs in an event loop gets its own connection object and cannot
         read the transaction that the test opened. The check would never fire.
         """
+        if self.is_closed:
+            # The test app is released. Do not run the lifespan of the API again.
+            raise RuntimeError("AsyncTestClient is closed. Create a new AsyncTestClient for each `async with` block.")
         if self.api._has_lifespan:
             cm = self.api._lifespan_context(self.api)
             await cm.__aenter__()
-            self._lifespan_cm = cm
+            self._lifespan = cm
         try:
             return await super().__aenter__()
         except BaseException:
-            if hasattr(self, "_lifespan_cm"):
-                await self._lifespan_cm.__aexit__(None, None, None)
+            await self._stop_lifespan(None, None, None)
             raise
+
+    async def _stop_lifespan(self, exc_type, exc_val, exc_tb) -> None:
+        """Run the lifespan shutdown once, if the startup ran."""
+        if self._lifespan is None:
+            return
+        cm = self._lifespan
+        self._lifespan = None
+        await cm.__aexit__(exc_type, exc_val, exc_tb)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Exit async context manager — runs lifespan shutdown, then cleans up test app."""
         try:
-            if hasattr(self, "_lifespan_cm"):
-                await self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb)
+            await self._stop_lifespan(exc_type, exc_val, exc_tb)
         finally:
             self._release_app()
             _close_server_connections()
         return await super().__aexit__(exc_type, exc_val, exc_tb)
 
     async def aclose(self) -> None:
-        """Close the client and release its native test app."""
-        await super().aclose()
-        self._release_app()
-        _close_server_connections()
+        """Close the client and release its native test app.
+
+        A client entered without ``async with`` runs its lifespan shutdown here.
+        """
+        try:
+            await self._stop_lifespan(None, None, None)
+        finally:
+            await super().aclose()
+            self._release_app()
+            _close_server_connections()

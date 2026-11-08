@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 import pytest
 
 from django_bolt.api import BoltAPI
-from django_bolt.testing import TestClient
+from django_bolt.testing import AsyncTestClient, TestClient
 
 
 def test_no_lifespan_by_default():
@@ -119,3 +119,66 @@ def test_lifespan_startup_failure_prevents_tests():
 
     with pytest.raises(RuntimeError, match="startup failed"), TestClient(api):
         pass
+
+
+def _recording_api(events: list[str]) -> BoltAPI:
+    @asynccontextmanager
+    async def lifespan(app):
+        events.append("startup")
+        yield
+        events.append("shutdown")
+
+    api = BoltAPI(lifespan=lifespan)
+
+    @api.get("/health")
+    async def health():
+        return {"ok": True}
+
+    return api
+
+
+def test_a_closed_test_client_does_not_run_the_lifespan_again():
+    events: list[str] = []
+    client = TestClient(_recording_api(events))
+    with client:
+        pass
+
+    with pytest.raises(RuntimeError, match="TestClient is closed"), client:
+        pass
+
+    assert events == ["startup", "shutdown"]
+
+
+def test_close_runs_the_lifespan_shutdown_of_an_entered_test_client():
+    events: list[str] = []
+    client = TestClient(_recording_api(events))
+    client.__enter__()
+    client.close()
+    client.close()
+
+    assert events == ["startup", "shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_a_closed_async_test_client_does_not_run_the_lifespan_again():
+    events: list[str] = []
+    client = AsyncTestClient(_recording_api(events))
+    async with client:
+        pass
+
+    with pytest.raises(RuntimeError, match="AsyncTestClient is closed"):
+        async with client:
+            pass
+
+    assert events == ["startup", "shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_aclose_runs_the_lifespan_shutdown_of_an_entered_async_test_client():
+    events: list[str] = []
+    client = AsyncTestClient(_recording_api(events))
+    await client.__aenter__()
+    await client.aclose()
+    await client.aclose()
+
+    assert events == ["startup", "shutdown"]
