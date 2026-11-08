@@ -27,7 +27,7 @@ from django_bolt._json import encode as json_encode
 
 from ._execute import RESULT_TYPE_COMPLETE, error_result, execute_tool, tool_failed
 from .context import Context, _InputRequired
-from .registry import ToolCall
+from .registry import JsonRpcError, PromptGet, ResourceRead, ToolCall
 
 if TYPE_CHECKING:
     from .registry import ResourceDef, ResourceTemplateDef, ToolDef
@@ -69,18 +69,18 @@ async def _call_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any], raw: Any)
     return await execute_tool(tool, kwargs, mask_error_details=mcp.mask_error_details)
 
 
-def _request_meta(ctx: Any) -> dict[str, Any]:
-    raw = ctx.meta_json if ctx is not None else None
+def _request_meta(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = payload["meta_json"]
     meta = json_decode(raw) if raw else {}
     return meta if isinstance(meta, dict) else {}
 
 
 async def _call_through_middleware(
-    middleware: list[Any], call: ToolCall, call_tool: Callable[[], Awaitable[dict[str, Any]]]
+    middleware: list[Any], call: Any, handler: Callable[[], Awaitable[dict[str, Any]]]
 ) -> dict[str, Any]:
     async def call_next(index: int) -> dict[str, Any]:
         if index == len(middleware):
-            return await call_tool()
+            return await handler()
         return await middleware[index](call, partial(call_next, index + 1))
 
     return await call_next(0)
@@ -94,7 +94,7 @@ async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
             call = ToolCall(
                 name=tool.name,
                 arguments=raw,
-                meta=_request_meta(payload["ctx"]),
+                meta=_request_meta(payload),
                 principal=payload["auth"] or {},
             )
             try:
@@ -124,8 +124,7 @@ def tool_entry(mcp: MCP, tool: ToolDef) -> dict[str, Any]:
     """The per-tool config dict Rust stores in its registry."""
     return {
         "dispatch": partial(_run_tool, tool, mcp),
-        # Rust passes the request `_meta` only inside a Context, and tool middleware reads it.
-        "needs_context": tool.ctx_param is not None or bool(mcp._tool_middleware),
+        "needs_context": tool.ctx_param is not None,
         "guards": [g.to_metadata() for g in tool.guards],
     }
 
@@ -159,49 +158,72 @@ def _error(kind: str, message: str) -> bytes:
     return json_encode({"__error__": {"kind": kind, "message": message}})
 
 
-def _handler_failed(mcp: MCP, what: str, exc: Exception) -> bytes:
-    """Log a resource or prompt handler's exception and build its JSON-RPC internal error."""
-    logger.exception("MCP %s failed", what)
+def _handler_failed(mcp: MCP, component: str, name: str, exc: Exception) -> bytes:
+    """Log an exception of a resource or prompt, or of its middleware, and build its JSON-RPC internal error."""
+    logger.exception("MCP %s %r failed", component, name)
     if mcp.mask_error_details:
-        return _error("internal_error", f"{what[0].upper()}{what[1:]} failed.")
+        return _error("internal_error", f"{component.capitalize()} {name!r} failed.")
     return _error("internal_error", f"MCP dispatch failed: {type(exc).__name__}: {exc}")
+
+
+async def _dispatch(
+    mcp: MCP,
+    component: str,
+    name: str,
+    middleware: list[Any],
+    call: Any,
+    handler: Callable[[], Awaitable[dict[str, Any]]],
+) -> bytes:
+    try:
+        if middleware:
+            result = await _call_through_middleware(middleware, call, handler)
+        else:
+            result = await handler()
+    except JsonRpcError as exc:
+        # An intentional error for the client: never masked.
+        return _error(exc.kind, exc.message)
+    except Exception as exc:
+        return _handler_failed(mcp, component, name, exc)
+    return json_encode(result)
+
+
+async def _read_resource_result(mcp: MCP, uri: str) -> dict[str, Any]:
+    try:
+        text, mime_type, meta = await _resolve_resource(mcp, uri)
+    except LookupError:
+        raise JsonRpcError(f"Unknown resource: {uri!r}", kind="resource_not_found") from None
+    except msgspec.ValidationError as exc:
+        raise JsonRpcError(f"Invalid resource URI {uri!r}: {exc}") from None
+    content: dict[str, Any] = {"uri": uri, "mimeType": mime_type, "text": text}
+    if meta is not None:
+        content["_meta"] = meta
+    return {"contents": [content], "resultType": RESULT_TYPE_COMPLETE}
 
 
 async def _read_resource(mcp: MCP, payload: dict[str, Any]) -> bytes:
     uri = payload["uri"]
-    try:
-        text, mime_type, meta = await _resolve_resource(mcp, uri)
-    except LookupError:
-        return _error("resource_not_found", f"Unknown resource: {uri!r}")
-    except msgspec.ValidationError as exc:
-        return _error("invalid_params", f"Invalid resource URI {uri!r}: {exc}")
-    except Exception as exc:
-        return _handler_failed(mcp, f"resource {uri!r}", exc)
-    content: dict[str, Any] = {"uri": uri, "mimeType": mime_type, "text": text}
-    if meta is not None:
-        content["_meta"] = meta
-    return json_encode({"contents": [content], "resultType": RESULT_TYPE_COMPLETE})
+    read = None
+    if mcp._resource_middleware:
+        read = ResourceRead(uri=uri, meta=_request_meta(payload), principal=payload["auth"] or {})
+    return await _dispatch(
+        mcp, "resource", uri, mcp._resource_middleware, read, partial(_read_resource_result, mcp, uri)
+    )
 
 
 def resource_dispatch(mcp: MCP) -> Any:
     return partial(_read_resource, mcp)
 
 
-async def _get_prompt(mcp: MCP, payload: dict[str, Any]) -> bytes:
-    name = payload["name"]
+async def _get_prompt_result(mcp: MCP, name: str, raw: Any) -> dict[str, Any]:
     prompt = mcp._prompts.get(name)
     if prompt is None:
-        return _error("invalid_params", f"Unknown prompt: {name!r}")
-    raw = json_decode(payload["arguments_json"])
+        raise JsonRpcError(f"Unknown prompt: {name!r}")
     try:
         args = msgspec.convert(raw or {}, prompt.args_struct)
     except msgspec.ValidationError as exc:
-        return _error("invalid_params", f"Invalid arguments: {exc}")
+        raise JsonRpcError(f"Invalid arguments: {exc}") from None
     kwargs = msgspec.structs.asdict(args)
-    try:
-        rendered = await _invoke(prompt.fn, prompt.is_async, **kwargs)
-    except Exception as exc:
-        return _handler_failed(mcp, f"prompt {name!r}", exc)
+    rendered = await _invoke(prompt.fn, prompt.is_async, **kwargs)
     if isinstance(rendered, str):
         messages = [{"role": "user", "content": {"type": "text", "text": rendered}}]
     else:
@@ -209,7 +231,18 @@ async def _get_prompt(mcp: MCP, payload: dict[str, Any]) -> bytes:
     result: dict[str, Any] = {"messages": messages, "resultType": RESULT_TYPE_COMPLETE}
     if prompt.description:
         result["description"] = prompt.description
-    return json_encode(result)
+    return result
+
+
+async def _get_prompt(mcp: MCP, payload: dict[str, Any]) -> bytes:
+    name = payload["name"]
+    raw = json_decode(payload["arguments_json"])
+    get = None
+    if mcp._prompt_middleware:
+        get = PromptGet(name=name, arguments=raw, meta=_request_meta(payload), principal=payload["auth"] or {})
+    return await _dispatch(
+        mcp, "prompt", name, mcp._prompt_middleware, get, partial(_get_prompt_result, mcp, name, raw)
+    )
 
 
 def prompt_dispatch(mcp: MCP) -> Any:

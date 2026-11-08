@@ -145,7 +145,7 @@ Raise `ToolError` for a message the client and the model may read. Bolt sends it
 
 Bolt masks the text of every other exception. The client gets `Tool 'name' failed.` in place of the text. Thus database errors, host names, passwords and file paths stay on the server. Bolt logs the full traceback on the `bolt_mcp._execute` logger.
 
-A resource or prompt handler that raises gives a JSON-RPC internal error. The client gets `Resource 'uri' failed.` or `Prompt 'name' failed.`. Bolt logs the traceback on the `bolt_mcp._dispatch` logger.
+A resource or prompt handler that raises gives a JSON-RPC internal error. The client gets `Resource 'uri' failed.` or `Prompt 'name' failed.`. Bolt logs the traceback on the `bolt_mcp._dispatch` logger. For a message the client may read, raise `JsonRpcError` (see [Resource and prompt middleware](#resource-and-prompt-middleware)).
 
 To send the exception text to the client during development, use `MCP("billing", mask_error_details=False)`. Do not use this setting in production.
 
@@ -186,9 +186,50 @@ async def trace_tool(call: ToolCall, call_next) -> dict:
 
 `call_next()` returns the `CallToolResult` dict, and a tool exception or an argument error is already an `isError` result there. The middleware returns that dict or another one. Bolt adds `"resultType": "complete"` to a returned dict that does not have it. An exception that middleware raises gets the same treatment as a tool exception: Bolt logs it and masks its text. The first registered middleware runs outermost. Register middleware before the server is mounted.
 
-The request `_meta` reaches Python only inside a tool `Context`, so with any middleware registered every tool call gets a `Context` object, whether or not the tool declares one. When a tool asks a 2026-07-28 client for input (elicitation or sampling), the request passes up through the middleware as a `BaseException`. Let it propagate.
+When a tool asks a 2026-07-28 client for input (elicitation or sampling), the request passes up through the middleware as a `BaseException`. Let it propagate.
 
 The client sets `call.meta`, so do not trust it. For example, a client can send any `traceparent`. `call.principal` and `call.arguments` can hold tokens or personal data. Do not write them to a log as they are.
+
+### Resource and prompt middleware
+
+`@mcp.resource_middleware` runs around every `resources/read` and gets a `ResourceRead` with the `uri`, `meta` and `principal`. `@mcp.prompt_middleware` runs around every `prompts/get` and gets a `PromptGet` with the prompt `name`, the raw `arguments`, `meta` and `principal`. `call_next()` returns the `ReadResourceResult` or `GetPromptResult` dict.
+
+```python
+from bolt_mcp import PromptGet, ResourceRead
+
+@mcp.resource_middleware
+async def trace_resource(read: ResourceRead, call_next) -> dict:
+    parent = propagate.extract({k: v for k, v in read.meta.items() if isinstance(v, str)})
+    with tracer.start_as_current_span("resources/read", context=parent) as span:
+        span.set_attribute("mcp.resource.uri", read.uri)
+        return await call_next()
+
+@mcp.prompt_middleware
+async def trace_prompt(get: PromptGet, call_next) -> dict:
+    parent = propagate.extract({k: v for k, v in get.meta.items() if isinstance(v, str)})
+    with tracer.start_as_current_span(f"prompts/get {get.name}", context=parent):
+        return await call_next()
+```
+
+Unlike a tool, a failed read or prompt is a JSON-RPC error, not a result. An unknown URI or prompt, or invalid arguments, raises a `JsonRpcError` out of `call_next()`. An exception in the handler also raises out of `call_next()`. Let it propagate so the client gets the error. Bolt logs an exception from the handler or from middleware and masks its text, as for a handler with no middleware. Bolt does not mask a `JsonRpcError`.
+
+Bolt checks the `auth` and `guards` of the mount in Rust, before middleware runs. Resources and prompts have no guards of their own. To refuse a read or a prompt, raise `JsonRpcError` in the middleware. A resource or prompt function can raise it too. The client gets a JSON-RPC error with your message.
+
+```python
+from bolt_mcp import JsonRpcError, ResourceRead
+
+@mcp.resource_middleware
+async def staff_only(read: ResourceRead, call_next) -> dict:
+    if read.uri.startswith("admin://") and not read.principal.get("is_staff"):
+        raise JsonRpcError("Staff only", kind="resource_not_found")
+    return await call_next()
+```
+
+The `kind` sets the error code. `"invalid_params"` (the default) gives -32602. `"resource_not_found"` gives -32002 to a legacy client and -32602 to a 2026-07-28 client. Use `"resource_not_found"` to hide that a resource exists. Any other exception gives an internal error (-32603).
+
+The client sets `read.meta` and `get.meta`, so do not trust them. `principal` and the prompt `arguments` can hold tokens or personal data. Do not write them to a log as they are.
+
+Register all middleware before you call `mount_mcp`. Registration after the mount raises `RuntimeError`, because the mount tells Rust which middleware exists.
 
 ## Resources
 
