@@ -274,6 +274,7 @@ mod tests {
                 max_payload_size: 1024 * 1024,
                 max_param_length: 4096,
                 asgi_mount_timeout: Duration::from_secs(30),
+                native_route_timeout: Duration::from_secs(30),
                 stream_config: StreamConfig {
                     sync_batch_size: 5,
                     channel_capacity: 32,

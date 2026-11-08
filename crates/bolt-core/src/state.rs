@@ -108,6 +108,8 @@ pub struct AppState {
     /// `type_coercion::resolve_max_param_length`); read directly on the hot path.
     pub max_param_length: usize,
     pub asgi_mount_timeout: Duration,
+    /// How long a native route handler has to call `complete`.
+    pub native_route_timeout: Duration,
     /// Streaming limits, read once at startup (see `StreamConfig::read`).
     pub stream_config: StreamConfig,
     pub global_cors_config: Option<CorsConfig>, // Global CORS configuration from Django settings
