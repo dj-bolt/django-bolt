@@ -421,6 +421,9 @@ class TestClient(httpx.Client):
         if self.is_closed:
             # The test app is released. Do not run the lifespan of the API again.
             raise RuntimeError("TestClient is closed. Create a new TestClient for each `with` block.")
+        if self._lifespan is not None:
+            # A second startup would orphan the loop and the lifespan of the first one.
+            raise RuntimeError("TestClient is already open. Enter it once.")
         if self._db_share is None or not self._db_share.install():
             _warn_if_inside_atomic_block()
         if self.api._has_lifespan:
@@ -449,8 +452,11 @@ class TestClient(httpx.Client):
         finally:
             loop.close()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Exit context manager — runs lifespan shutdown, then cleans up test app."""
+    def _shut_down(self, exc_type, exc_val, exc_tb) -> None:
+        """Undo ``__enter__`` once: the lifespan, the shared connections, the native app.
+
+        Each step runs also when an earlier one raises.
+        """
         try:
             self._stop_lifespan(exc_type, exc_val, exc_tb)
         finally:
@@ -460,19 +466,25 @@ class TestClient(httpx.Client):
             finally:
                 self._release_app()
                 _close_server_connections()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager — runs lifespan shutdown, then cleans up test app."""
+        try:
+            self._shut_down(exc_type, exc_val, exc_tb)
+        except BaseException:
+            super().__exit__(exc_type, exc_val, exc_tb)
+            raise
         return super().__exit__(exc_type, exc_val, exc_tb)
 
     def close(self) -> None:
         """Close the client and release its native test app.
 
-        A client entered without ``with`` runs its lifespan shutdown here.
+        A client entered without ``with`` undoes ``__enter__`` here.
         """
         try:
-            self._stop_lifespan(None, None, None)
+            self._shut_down(None, None, None)
         finally:
             super().close()
-            self._release_app()
-            _close_server_connections()
 
     # Override HTTP methods to support stream=True
     def _add_streaming_methods(self, response: Response) -> Response:
@@ -750,6 +762,8 @@ class AsyncTestClient(httpx.AsyncClient):
         if self.is_closed:
             # The test app is released. Do not run the lifespan of the API again.
             raise RuntimeError("AsyncTestClient is closed. Create a new AsyncTestClient for each `async with` block.")
+        if self._lifespan is not None:
+            raise RuntimeError("AsyncTestClient is already open. Enter it once.")
         if self.api._has_lifespan:
             cm = self.api._lifespan_context(self.api)
             await cm.__aenter__()
@@ -771,10 +785,14 @@ class AsyncTestClient(httpx.AsyncClient):
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Exit async context manager — runs lifespan shutdown, then cleans up test app."""
         try:
-            await self._stop_lifespan(exc_type, exc_val, exc_tb)
-        finally:
-            self._release_app()
-            _close_server_connections()
+            try:
+                await self._stop_lifespan(exc_type, exc_val, exc_tb)
+            finally:
+                self._release_app()
+                _close_server_connections()
+        except BaseException:
+            await super().__aexit__(exc_type, exc_val, exc_tb)
+            raise
         return await super().__aexit__(exc_type, exc_val, exc_tb)
 
     async def aclose(self) -> None:

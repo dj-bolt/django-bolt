@@ -1,3 +1,4 @@
+import threading
 from contextlib import asynccontextmanager
 
 import pytest
@@ -182,3 +183,56 @@ async def test_aclose_runs_the_lifespan_shutdown_of_an_entered_async_test_client
     await client.aclose()
 
     assert events == ["startup", "shutdown"]
+
+
+@pytest.mark.django_db
+def test_close_of_an_entered_test_client_stops_sharing_the_database_connection():
+    # In a transaction, __enter__ shares the connection of this thread. close() must stop sharing it,
+    # or a client on another thread raises SharedTestConnectionError.
+    api = BoltAPI()
+
+    @api.get("/health")
+    async def health():
+        return {"ok": True}
+
+    client = TestClient(api)
+    client.__enter__()
+    client.close()
+
+    statuses: list[int] = []
+    errors: list[BaseException] = []
+
+    def other_thread():
+        try:
+            with TestClient(api, share_db_connection=False) as other:
+                statuses.append(other.get("/health").status_code)
+        except BaseException as exc:  # noqa: BLE001 - the test reports it below
+            errors.append(exc)
+
+    thread = threading.Thread(target=other_thread)
+    thread.start()
+    thread.join()
+
+    assert (statuses, errors) == ([200], [])
+
+
+def test_an_open_test_client_cannot_be_entered_again():
+    events: list[str] = []
+    client = TestClient(_recording_api(events))
+    with client, pytest.raises(RuntimeError, match="TestClient is already open"), client:
+        pass
+
+    assert events == ["startup", "shutdown"]
+
+
+def test_a_failing_lifespan_shutdown_still_closes_the_test_client():
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        raise RuntimeError("shutdown failed")
+
+    client = TestClient(BoltAPI(lifespan=lifespan))
+    with pytest.raises(RuntimeError, match="shutdown failed"), client:
+        pass
+
+    assert client.is_closed
