@@ -115,8 +115,13 @@ async def execute_tool(tool: ToolDef, kwargs: dict[str, Any], *, mask_error_deta
     """
     try:
         return to_call_tool_result(await run_tool(tool, kwargs))
-    except (ToolError, McpClientError) as exc:
-        return error_result(str(exc))
     except Exception as exc:
-        logger.exception("MCP tool %r failed", tool.name)
-        return error_result(f"Tool {tool.name!r} failed." if mask_error_details else str(exc))
+        return tool_failed(tool, exc, mask_error_details=mask_error_details)
+
+
+def tool_failed(tool: ToolDef, exc: Exception, *, mask_error_details: bool) -> dict[str, Any]:
+    """Map an exception from a tool or its middleware to an error result."""
+    if isinstance(exc, (ToolError, McpClientError)):
+        return error_result(str(exc))
+    logger.exception("MCP tool %r failed", tool.name)
+    return error_result(f"Tool {tool.name!r} failed." if mask_error_details else str(exc))
