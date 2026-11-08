@@ -689,6 +689,8 @@ pub fn start_server(
     if error_renderer.is_some() {
         bolt_core::error::enable_error_info();
     }
+    // runbolt configured Python logging before this call.
+    crate::logging::install(py)?;
 
     // Read the Django settings ONCE at startup, not per request. The test
     // client reads them with the same function. A bad setting fails here,

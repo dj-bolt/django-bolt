@@ -281,6 +281,34 @@ setup_django_logging()
 
 This creates a `QueueHandler` that offloads log writing to a background thread, ensuring log I/O doesn't block request handling.
 
+## Log records of the Rust core
+
+The Rust core of Bolt writes its own log records to stderr, one line each, without Python.
+An example is an error that a mounted ASGI app raises:
+
+```text
+[django-bolt] ERROR bolt_asgi::asgi_http: ASGI mount: coroutine raised an exception: RuntimeError: boom
+```
+
+The effective level of the `django_bolt` logger sets the level of these records.
+Bolt reads the level once, when `runbolt` starts the server or a test client starts.
+A later change of the level does not apply to the Rust records.
+A record of a lower level costs one check in Rust and is not formatted.
+The default level is `WARNING`.
+
+To see the debug records of the Rust core, set the level of `django_bolt` to `DEBUG`:
+
+```python
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "loggers": {"django_bolt": {"level": "DEBUG"}},
+}
+```
+
+To turn the Rust records off, set the level to `CRITICAL`.
+Handlers and formatters of `LOGGING` do not get these records.
+
 ## Django integration
 
 ### With Django's LOGGING setting
