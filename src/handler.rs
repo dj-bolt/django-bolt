@@ -1,10 +1,10 @@
 use actix_multipart::Multipart;
 use actix_web::http::header::{HeaderName, HeaderValue};
-use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
+use actix_web::{HttpRequest, HttpResponse, http::StatusCode, web};
 use ahash::AHashMap;
 use bytes::Bytes;
-use futures_util::stream;
 use futures_util::StreamExt;
+use futures_util::stream;
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::sync::PyOnceLock;
@@ -20,29 +20,30 @@ use tokio::io::AsyncReadExt;
 use bolt_asgi::asgi_http;
 use bolt_core::error::{self, handle_python_error};
 use bolt_core::form_parsing::{
-    parse_multipart, parse_urlencoded, FileContent, FileFieldConstraints, FileInfo,
-    FormParseResult, FormValue, LimitedPayload, DEFAULT_MAX_FIELDS, DEFAULT_MAX_PARTS,
-    DEFAULT_MEMORY_LIMIT, ERROR_TYPE_PAYLOAD_TOO_LARGE,
+    DEFAULT_MAX_FIELDS, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT, ERROR_TYPE_PAYLOAD_TOO_LARGE,
+    FileContent, FileFieldConstraints, FileInfo, FormParseResult, FormValue, LimitedPayload,
+    parse_multipart, parse_urlencoded,
 };
 use bolt_core::metadata::{RustArgBinding, RustArgSource};
 use bolt_core::middleware;
 use bolt_core::middleware::auth::populate_auth_context;
 use bolt_core::request::PyRequest;
 use bolt_core::request_pipeline::{
-    build_validation_error_response, extract_cookie_header, extract_headers, query_sequences,
-    set_query_sequences, validate_and_cache_source, validate_and_cache_typed_params, EMPTY_TYPES,
+    EMPTY_TYPES, build_validation_error_response, extract_cookie_header, extract_headers,
+    query_sequences, set_query_sequences, validate_and_cache_source,
+    validate_and_cache_typed_params,
 };
 use bolt_core::response_builder;
 use bolt_core::response_meta::ResponseMeta;
 use bolt_core::responses;
-use bolt_core::router::{parse_query_string, QueryParams};
-use bolt_core::state::{find_asgi_mount, AppState};
-use bolt_core::streaming::{create_python_stream, create_sse_stream, StreamConfig};
+use bolt_core::router::{QueryParams, parse_query_string};
+use bolt_core::state::{AppState, find_asgi_mount};
+use bolt_core::streaming::{StreamConfig, create_python_stream, create_sse_stream};
 use bolt_core::type_coercion::{
-    coerced_value_to_py, string_map_to_py_dict, CoercedValue, TypeHints,
+    CoercedValue, TypeHints, coerced_value_to_py, string_map_to_py_dict,
 };
 use bolt_core::validation::{
-    parse_cookies_inline, parse_selected_cookies, validate_auth_and_guards, AuthGuardResult,
+    AuthGuardResult, parse_cookies_inline, parse_selected_cookies, validate_auth_and_guards,
 };
 
 use std::future::Future;
@@ -109,10 +110,10 @@ pub async fn build_file_response(
                     Ok(_) => {
                         let mut builder = HttpResponse::build(status);
                         for (k, v) in headers {
-                            if let Ok(name) = HeaderName::try_from(k) {
-                                if let Ok(val) = HeaderValue::try_from(v) {
-                                    builder.append_header((name, val));
-                                }
+                            if let Ok(name) = HeaderName::try_from(k)
+                                && let Ok(val) = HeaderValue::try_from(v)
+                            {
+                                builder.append_header((name, val));
                             }
                         }
                         if skip_compression {
@@ -134,10 +135,10 @@ pub async fn build_file_response(
                 // For large files, use streaming
                 let mut builder = HttpResponse::build(status);
                 for (k, v) in headers {
-                    if let Ok(name) = HeaderName::try_from(k) {
-                        if let Ok(val) = HeaderValue::try_from(v) {
-                            builder.append_header((name, val));
-                        }
+                    if let Ok(name) = HeaderName::try_from(k)
+                        && let Ok(val) = HeaderValue::try_from(v)
+                    {
+                        builder.append_header((name, val));
                     }
                 }
                 if skip_compression {
@@ -358,7 +359,7 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Unknown response meta tag: {}",
                     tag
-                )))
+                )));
             }
         }
     } else {
@@ -419,7 +420,7 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Unsupported response body kind: {}",
                 other
-            )))
+            )));
         }
     };
 
@@ -613,7 +614,7 @@ pub async fn response_from_wire_result(
 }
 
 /// One request source as Rust holds it: the string map and its coerced values.
-/// The query map borrows its strings from the request; the other maps own them.
+/// The path and query maps borrow their strings; the header and cookie maps own them.
 pub(crate) struct SourceValues<'a, K = String, V = String> {
     pub values: Option<&'a AHashMap<K, V>>,
     pub coerced: &'a [(&'a str, CoercedValue)],
@@ -641,7 +642,7 @@ impl<K: Borrow<str> + Eq + Hash, V: AsRef<str>> SourceValues<'_, K, V> {
 pub(crate) fn build_prebound_from_values(
     py: Python<'_>,
     bindings: &[RustArgBinding],
-    path: &SourceValues<'_>,
+    path: &SourceValues<'_, &str, Cow<'_, str>>,
     query: &SourceValues<'_, Cow<'_, str>, Cow<'_, str>>,
     headers: &SourceValues<'_>,
     cookies: &SourceValues<'_>,
@@ -720,6 +721,43 @@ pub(crate) fn content_length_exceeds_limit(
     matches!(content_length, Some(len) if len > max_payload_size)
 }
 
+/// Read the whole body. The total is bounded by `max_payload_size` while it
+/// streams, so a chunked request (no Content-Length) is bounded too.
+#[expect(
+    clippy::result_large_err,
+    reason = "the error is the response to send, as for the request_pipeline helpers; the path is cold"
+)]
+pub(crate) async fn read_body(
+    payload: &mut web::Payload,
+    max_payload_size: usize,
+) -> Result<Vec<u8>, HttpResponse> {
+    // Not sized from Content-Length: a client could claim the limit and
+    // send nothing, so memory follows the bytes that arrive.
+    let mut body = Vec::new();
+    while let Some(chunk) = payload.next().await {
+        match chunk {
+            Ok(data) => {
+                if data.len() > max_payload_size - body.len() {
+                    return Err(responses::error_413());
+                }
+                body.extend_from_slice(&data);
+            }
+            Err(e) => {
+                let response = HttpResponse::BadRequest()
+                    .content_type("application/json")
+                    .body(format!(
+                        "{{\"error\": \"Failed to read request body: {}\"}}",
+                        e
+                    ));
+                return Err(error::with_error_info(response, || {
+                    error::ErrorInfo::core("bad_request", "Failed to read request body")
+                }));
+            }
+        }
+    }
+    Ok(body)
+}
+
 pub async fn handle_request<const ACCESS_LOG: bool>(
     req: HttpRequest,
     payload: web::Payload,
@@ -774,13 +812,7 @@ async fn route_request<const ACCESS_LOG: bool>(
     let (route, path_params, handler_id) = {
         if let Some(route_match) = router.find(method, path) {
             let handler_id = route_match.handler_id();
-            let (route, raw_params) = route_match.into_parts();
-
-            // Values are decoded in the existing map — no map rebuild.
-            let path_params = raw_params.map(|mut params| {
-                bolt_core::router::decode_path_params(&mut params);
-                params
-            });
+            let (route, path_params) = route_match.into_parts();
             (route, path_params, handler_id)
         } else {
             // No route found - check for trailing slash redirect FIRST
@@ -863,6 +895,21 @@ async fn route_request<const ACCESS_LOG: bool>(
             return responses::error_404();
         }
     };
+
+    // A native route goes to a Rust handler in another extension module. Auth,
+    // guards, rate limits, Python middleware and the access log do not run;
+    // Actix middleware such as CORS and compression does. The boxed future
+    // keeps the future of this function small for Python routes.
+    if let Some(native) = route.native {
+        return Box::pin(crate::native::dispatch(
+            &req,
+            payload,
+            native,
+            path_params,
+            &state,
+        ))
+        .await;
+    }
 
     // Method maps to a static str (known fixed set — no per-request alloc);
     // path is dynamic and must be owned for PyRequest.
@@ -1022,22 +1069,21 @@ async fn route_request<const ACCESS_LOG: bool>(
         None
     };
 
-    if let Some(config) = rate_config {
-        if let Some(headers_map) = headers.as_ref() {
-            if let Some(response) = middleware::rate_limit::check_after_auth(
-                &state.rate_limiters,
-                handler_id,
-                headers_map,
-                client_ip.as_ref(),
-                auth_ctx.as_ref(),
-                config,
-                method,
-                path,
-            ) {
-                // CORS headers will be added by CorsMiddleware
-                return response;
-            }
-        }
+    if let Some(config) = rate_config
+        && let Some(headers_map) = headers.as_ref()
+        && let Some(response) = middleware::rate_limit::check_after_auth(
+            &state.rate_limiters,
+            handler_id,
+            headers_map,
+            client_ip.as_ref(),
+            auth_ctx.as_ref(),
+            config,
+            method,
+            path,
+        )
+    {
+        // CORS headers will be added by CorsMiddleware
+        return response;
     }
 
     // Optimization: Only parse cookies if handler needs them
@@ -1198,36 +1244,10 @@ async fn route_request<const ACCESS_LOG: bool>(
             }
         }
     } else {
-        // Read payload as bytes (for non-multipart requests).
-        // The aggregate size is bounded against max_payload_size during
-        // streaming so chunked requests (no Content-Length) are enforced too.
-        let mut body_vec = Vec::new();
-        let mut total_read: usize = 0;
-        while let Some(chunk) = payload.next().await {
-            match chunk {
-                Ok(data) => {
-                    total_read = match total_read.checked_add(data.len()) {
-                        Some(v) => v,
-                        None => return responses::error_413(),
-                    };
-                    if total_read > state.max_payload_size {
-                        return responses::error_413();
-                    }
-                    body_vec.extend_from_slice(&data);
-                }
-                Err(e) => {
-                    let response = HttpResponse::BadRequest()
-                        .content_type("application/json")
-                        .body(format!(
-                            "{{\"error\": \"Failed to read request body: {}\"}}",
-                            e
-                        ));
-                    return error::with_error_info(response, || {
-                        error::ErrorInfo::core("bad_request", "Failed to read request body")
-                    });
-                }
-            }
-        }
+        let body_vec = match read_body(&mut payload, state.max_payload_size).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
 
         // URL-encoded form parsing
         if needs_form_parsing && is_urlencoded {
@@ -1531,19 +1551,12 @@ async fn route_request<const ACCESS_LOG: bool>(
                 .await
                 {
                     Ok(response) => response,
-                    Err(e) => Python::attach(|py| {
+                    Err(e) => {
                         let reason =
                             format!("Handler returned unsupported response wire format: {}", e);
-                        let response = error::build_error_response(
-                            py,
-                            500,
-                            reason.clone(),
-                            vec![],
-                            None,
-                            state.debug,
-                        );
+                        let response = error::internal_error_response(&reason);
                         error::with_error_info(response, || error::ErrorInfo::internal(reason))
-                    }),
+                    }
                 }
             }
             Err(e) => Python::attach(|py| {

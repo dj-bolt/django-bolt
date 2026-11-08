@@ -174,7 +174,9 @@ def test_current_user_rejects_a_request_with_no_user(handler_is_async):
             return {"user": None if user is None else user.username}
 
     with TestClient(api) as client:
-        assert client.get("/required").status_code == 401
+        rejected = client.get("/required")
+        assert rejected.status_code == 401
+        assert rejected.json() == {"detail": "Authentication required"}
         response = client.get("/optional")
         assert response.status_code == 200, response.text
         assert response.json() == {"user": None}

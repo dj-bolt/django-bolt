@@ -7,9 +7,9 @@ use actix_web_actors::ws;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+use super::ConnectionSlot;
 use super::config::WsConfig;
 use super::messages::{SendToClient, WsMessage};
-use super::ConnectionSlot;
 
 /// How often each connection polls the process-wide drain flag.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);

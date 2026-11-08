@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 
-use actix_web::cookie::{time, Cookie, SameSite};
+use actix_web::cookie::{Cookie, SameSite, time};
 
 use crate::response_meta::CookieData;
 

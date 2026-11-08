@@ -65,6 +65,21 @@ class JWTAuthViews:
         response.delete_cookie(self.refresh_cookie, path=self.prefix)
         return response
 
+    async def _require_live_refresh(self, request: Any) -> dict[str, Any]:
+        """Reject a refresh token that ``/refresh`` also rejects.
+
+        A used, revoked or old-version token must not end the sessions of live tokens.
+        """
+        claims = request["context"]["auth_claims"]
+        fam = claims.get("fam")
+        if (
+            await self.store.is_revoked(claims["jti"])
+            or (fam is not None and await self.store.is_family_revoked(fam))
+            or claims.get("ver", 0) != await self.store.get_user_version(request["context"]["user_id"])
+        ):
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return claims
+
     def register(self, api: Any) -> None:
         """Attach the four lifecycle routes to a :class:`BoltAPI`."""
         refresh_auth = JWTAuthentication(
@@ -134,7 +149,7 @@ class JWTAuthViews:
             summary="Log out",
         )
         async def logout(request: Any):
-            claims = request["context"]["auth_claims"]
+            claims = await self._require_live_refresh(request)
             await self.store.revoke_family(claims["fam"], exp=claims.get("exp"))
             return self._clear_cookies(JSON({"ok": True}))
 
@@ -146,5 +161,6 @@ class JWTAuthViews:
             summary="Log out everywhere",
         )
         async def logout_all(request: Any):
+            await self._require_live_refresh(request)
             await self.store.bump_user_version(request["context"]["user_id"])
             return self._clear_cookies(JSON({"ok": True}))

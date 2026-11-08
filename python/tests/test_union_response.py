@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import msgspec
+import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.middleware import Middleware
 from django_bolt.openapi.config import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.responses import EventSourceResponse
@@ -276,3 +279,232 @@ def test_list_of_tagged_union_omits_per_arm_examples():
     items = media["schema"]["items"]
     refs = {item["$ref"].rsplit("/", 1)[-1] for item in items["oneOf"]}
     assert refs == {"Cat", "Dog"}
+
+
+class Row(msgspec.Struct):
+    id: int
+    note: str = "default"
+
+
+class RowObject:
+    """An object with attributes in place of keys, as a model instance has."""
+
+    def __init__(self, id: int):
+        self.id = id
+
+
+ROWS_JSON = [{"id": 1, "note": "default"}, {"id": 2, "note": "default"}]
+
+
+class PassThroughMiddleware(Middleware):
+    """Python middleware: the route cannot use the sync dispatch of Rust."""
+
+    async def process_request(self, request):
+        return await self.get_response(request)
+
+
+@pytest.mark.parametrize(
+    "api_kwargs",
+    [
+        {},
+        {"middleware": [PassThroughMiddleware]},
+        {"django_middleware": ["django.middleware.clickjacking.XFrameOptionsMiddleware"]},
+    ],
+    ids=["plain", "python-middleware", "django-middleware"],
+)
+def test_inline_list_path_converts_a_later_object_by_attribute(api_kwargs):
+    """The inline list path checks only the first element.
+
+    A list that starts with a dict and holds an object later gets the result of
+    the slow path, which converts the object by attribute.
+    """
+    api = BoltAPI(**api_kwargs)
+
+    @api.get("/trivial")
+    async def trivial() -> list[Row]:
+        return [{"id": 1}, RowObject(2)]
+
+    @api.get("/trivial-query")
+    async def trivial_query(start: int = 1) -> list[Row]:
+        return [{"id": start}, RowObject(start + 1)]
+
+    @api.get("/awaits")
+    async def awaits() -> list[Row]:
+        await asyncio.sleep(0)
+        return [{"id": 1}, RowObject(2)]
+
+    @api.get("/awaits-query")
+    async def awaits_query(start: int = 1) -> list[Row]:
+        await asyncio.sleep(0)
+        return [{"id": start}, RowObject(start + 1)]
+
+    @api.get("/sync")
+    def sync_rows() -> list[Row]:
+        return [{"id": 1}, RowObject(2)]
+
+    @api.get("/sync-query")
+    def sync_rows_query(start: int = 1) -> list[Row]:
+        return [{"id": start}, RowObject(start + 1)]
+
+    with TestClient(api) as client:
+        for path in ("/trivial", "/trivial-query", "/awaits", "/awaits-query", "/sync", "/sync-query"):
+            resp = client.get(path)
+            assert resp.status_code == 200, (path, resp.text)
+            assert resp.json() == ROWS_JSON, path
+        # The handler gets its query parameter also when the list takes the slow path.
+        for path in ("/trivial-query", "/awaits-query", "/sync-query"):
+            resp = client.get(path, params={"start": 4})
+            assert resp.status_code == 200, (path, resp.text)
+            assert resp.json() == [{"id": 4, "note": "default"}, {"id": 5, "note": "default"}], path
+
+
+def test_inline_list_path_reports_an_invalid_element(settings):
+    """An invalid element still gives the validation error of that element."""
+    # The 500 shows the validation errors only when DEBUG is on. This test reads them.
+    settings.DEBUG = True
+    api = BoltAPI()
+
+    @api.get("/rows")
+    async def rows() -> list[Row]:
+        return [{"id": 1}, {"id": "x"}]
+
+    with TestClient(api) as client:
+        resp = client.get("/rows")
+        assert resp.status_code == 500
+        assert resp.json()["extra"]["validation_errors"] == [
+            {"loc": ["response", "1", "id"], "msg": "Expected `int`, got `str`", "type": "validation_error"}
+        ]
+
+
+def test_list_route_that_returns_one_struct_gives_a_response_validation_error():
+    """A list route checks the shape of the result, not only the type of the Struct."""
+    api = BoltAPI()
+
+    @api.get("/rows")
+    async def rows() -> list[Row]:
+        return Row(id=1)
+
+    with TestClient(api) as client:
+        resp = client.get("/rows")
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "Response validation error"
+
+
+class Left(msgspec.Struct):
+    left: int
+
+
+class Right(msgspec.Struct):
+    right: int
+
+
+class Checked(msgspec.Struct):
+    n: int
+
+    def __post_init__(self):
+        if self.n < 0:
+            # msgspec wraps a TypeError or a ValueError of __post_init__ in a
+            # ValidationError, but not this error.
+            raise RuntimeError("n must not be negative")
+
+
+@pytest.mark.parametrize(
+    "api_kwargs", [{}, {"middleware": [PassThroughMiddleware]}], ids=["plain", "python-middleware"]
+)
+def test_inline_list_path_reports_each_error_as_the_slow_path_does(api_kwargs, settings):
+    """Each error of the inline list path gives the error body of the slow path.
+
+    An untagged union of Structs makes msgspec raise TypeError. An error in
+    __post_init__ escapes msgspec as it is.
+    """
+    # The 500 shows the validation errors only when DEBUG is on. This test reads them.
+    settings.DEBUG = True
+    api = BoltAPI(**api_kwargs)
+
+    @api.get("/slow-union")
+    async def slow_union(request) -> list[Left | Right]:
+        return [{"left": 1}]
+
+    @api.get("/slow-checked")
+    async def slow_checked(request) -> list[Checked]:
+        return [{"n": -1}]
+
+    @api.get("/trivial")
+    async def trivial() -> list[Left | Right]:
+        return [{"left": 1}]
+
+    @api.get("/trivial-query")
+    async def trivial_query(start: int = 1) -> list[Left | Right]:
+        return [{"left": start}]
+
+    @api.get("/awaits")
+    async def awaits() -> list[Left | Right]:
+        await asyncio.sleep(0)
+        return [{"left": 1}]
+
+    @api.get("/awaits-query")
+    async def awaits_query(start: int = 1) -> list[Left | Right]:
+        await asyncio.sleep(0)
+        return [{"left": start}]
+
+    @api.get("/sync")
+    def sync_rows() -> list[Left | Right]:
+        return [{"left": 1}]
+
+    @api.get("/sync-query")
+    def sync_rows_query(start: int = 1) -> list[Left | Right]:
+        return [{"left": start}]
+
+    @api.get("/checked")
+    async def checked() -> list[Checked]:
+        return [{"n": -1}]
+
+    @api.get("/checked-sync")
+    def checked_sync() -> list[Checked]:
+        return [{"n": -1}]
+
+    with TestClient(api) as client:
+        slow_union_body = client.get("/slow-union").json()
+        slow_checked_body = client.get("/slow-checked").json()
+        assert slow_union_body["detail"] == "Response validation error"
+        assert slow_checked_body["extra"]["validation_errors"][0]["msg"] == "n must not be negative"
+
+        for path in ("/trivial", "/trivial-query", "/awaits", "/awaits-query", "/sync", "/sync-query"):
+            resp = client.get(path)
+            assert (resp.status_code, resp.json()) == (500, slow_union_body), path
+        for path in ("/checked", "/checked-sync"):
+            resp = client.get(path)
+            assert (resp.status_code, resp.json()) == (500, slow_checked_body), path
+
+
+class RowSerializer(Serializer):
+    id: int
+
+
+def test_response_validation_error_locates_the_error_in_the_response(settings):
+    """A response validation error has the root "response", not the root of the request body."""
+    # The 500 shows the validation errors only when DEBUG is on. This test reads them.
+    settings.DEBUG = True
+    api = BoltAPI()
+
+    @api.get("/list")
+    async def rows(request) -> list[Row]:
+        return [{"id": 1}, {"id": "x"}]
+
+    @api.get("/struct")
+    def row() -> Row:
+        return {"id": "x"}
+
+    @api.get("/serializer")
+    async def serialized() -> RowSerializer:
+        return {"id": "x"}
+
+    # The struct coercer wraps the msgspec error, so the field path of /struct
+    # is in the message, not in the location.
+    expected = {"/list": ["response", "1", "id"], "/struct": ["response"], "/serializer": ["response", "id"]}
+    with TestClient(api) as client:
+        for path, loc in expected.items():
+            resp = client.get(path)
+            assert resp.status_code == 500, path
+            errors = resp.json()["extra"]["validation_errors"]
+            assert [error["loc"] for error in errors] == [loc], (path, errors)

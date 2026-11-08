@@ -1,7 +1,7 @@
 //! Coercion of a path, query, header or cookie value never panics.
 #![no_main]
 
-use bolt_core::type_coercion::{coerce_param, DEFAULT_MAX_PARAM_LENGTH};
+use bolt_core::type_coercion::{DEFAULT_MAX_PARAM_LENGTH, coerce_param};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: (u8, &str)| {

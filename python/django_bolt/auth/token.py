@@ -312,7 +312,7 @@ class Token:
             issuer: Token issuer
             audience: Token audience
             is_staff: Staff flag
-            is_admin: Admin flag
+            is_admin: Admin flag. An admin is also staff, so it sets ``is_staff`` too.
             permissions: List of permissions
             **extra_claims: Any additional claims
 
@@ -331,8 +331,8 @@ class Token:
             iat=now,
             iss=issuer,
             aud=audience,
-            is_staff=is_staff,
-            is_admin=is_admin or is_staff,  # Admin implies staff
+            is_staff=is_staff or is_admin,  # An admin is also staff.
+            is_admin=is_admin,
             permissions=permissions,
             extras=extra_claims,
         )

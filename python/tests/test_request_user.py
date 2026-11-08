@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import jwt
 import pytest
@@ -618,3 +619,32 @@ class TestRequestUserGuardBehavior:
             assert response.status_code == 200
             assert handler_called["called"] is True
             assert response.json()["user_loaded"] is True
+
+
+class ClaimsAuth(JWTAuthentication):
+    """Build the user from the claims of the token, with no query."""
+
+    def get_user(self, user_id, auth_context):
+        return SimpleNamespace(username=auth_context["auth_claims"]["name"])
+
+
+@pytest.mark.parametrize("path", ["/async", "/sync"])
+def test_a_custom_get_user_gets_the_auth_context_of_the_request(path):
+    api = BoltAPI(django_middleware=[])
+    auth = [ClaimsAuth(secret="test-secret")]
+
+    @api.get("/async", auth=auth)
+    async def read_async(request):
+        user = await request.auser()
+        return {"username": user.username}
+
+    @api.get("/sync", auth=auth)
+    def read_sync(request):
+        return {"username": request.user.username}
+
+    token = create_jwt_token("7", name="ann")
+    with TestClient(api) as client:
+        response = client.get(path, headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"username": "ann"}

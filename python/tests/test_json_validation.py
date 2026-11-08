@@ -10,6 +10,7 @@ Tests cover:
 """
 
 import json
+from typing import Annotated
 
 import msgspec
 import pytest
@@ -18,7 +19,9 @@ from django_bolt import BoltAPI
 from django_bolt._kwargs import create_body_extractor, get_msgspec_decoder
 from django_bolt._kwargs.extractors import _DECODER_CACHE
 from django_bolt.error_handlers import handle_exception, msgspec_validation_error_to_dict
-from django_bolt.exceptions import RequestValidationError
+from django_bolt.exceptions import RequestValidationError, parse_msgspec_decode_error
+from django_bolt.params import Body
+from django_bolt.testing import TestClient
 
 
 class UserCreate(msgspec.Struct):
@@ -50,6 +53,92 @@ class UserWithNested(msgspec.Struct):
 
     name: str
     address: NestedAddress
+
+
+class _Address(msgspec.Struct):
+    city: str
+    zip: str
+
+
+class _Person(msgspec.Struct):
+    name: str
+    address: _Address
+
+
+class _Company(msgspec.Struct):
+    name: str
+    owner: _Person
+
+
+class _Order(msgspec.Struct):
+    name: str
+    items: list[_Address]
+
+
+class TestNestedValidationErrorBodies:
+    """The 422 body of a nested error has the same type and a full loc as a top-level error."""
+
+    @staticmethod
+    def _post(path: str, body: dict) -> list[dict]:
+        api = BoltAPI()
+
+        @api.post("/people")
+        async def people(person: _Person):
+            return {"name": person.name}
+
+        @api.post("/companies")
+        async def companies(company: _Company):
+            return {"name": company.name}
+
+        @api.post("/orders")
+        async def orders(order: _Order):
+            return {"name": order.name}
+
+        with TestClient(api) as client:
+            response = client.post(path, json=body)
+        assert response.status_code == 422, response.text
+        return response.json()["detail"]
+
+    def test_top_level_missing_field_is_unchanged(self):
+        assert self._post("/people", {"address": {"city": "a", "zip": "1"}}) == [
+            {"loc": ["body", "name"], "msg": "Object missing required field `name`", "type": "missing_field"}
+        ]
+
+    def test_nested_missing_field_has_the_missing_field_type_and_its_full_loc(self):
+        assert self._post("/people", {"name": "x", "address": {"city": "a"}}) == [
+            {"loc": ["body", "address", "zip"], "msg": "Object missing required field `zip`", "type": "missing_field"}
+        ]
+
+    def test_doubly_nested_missing_field(self):
+        body = {"name": "c", "owner": {"name": "o", "address": {"zip": "1"}}}
+        assert self._post("/companies", body) == [
+            {
+                "loc": ["body", "owner", "address", "city"],
+                "msg": "Object missing required field `city`",
+                "type": "missing_field",
+            }
+        ]
+
+    def test_missing_field_in_a_list_item_names_the_index(self):
+        body = {"name": "x", "items": [{"city": "a", "zip": "1"}, {"city": "b"}]}
+        assert self._post("/orders", body) == [
+            {
+                "loc": ["body", "items", "1", "zip"],
+                "msg": "Object missing required field `zip`",
+                "type": "missing_field",
+            }
+        ]
+
+    def test_nested_type_mismatch_is_unchanged(self):
+        assert self._post("/people", {"name": "x", "address": {"city": 5, "zip": "1"}}) == [
+            {"loc": ["body", "address", "city"], "msg": "Expected `str`, got `int`", "type": "validation_error"}
+        ]
+
+    def test_type_mismatch_in_a_list_item_names_the_index(self):
+        body = {"name": "x", "items": [{"city": "a", "zip": 1}]}
+        assert self._post("/orders", body) == [
+            {"loc": ["body", "items", "0", "zip"], "msg": "Expected `str`, got `int`", "type": "validation_error"}
+        ]
 
 
 class TestInvalidJSONParsing:
@@ -119,6 +208,129 @@ class TestInvalidJSONParsing:
         # Number instead of object
         with pytest.raises(msgspec.ValidationError):
             extractor(b"42")
+
+
+class TestBodyOfNonStructType:
+    """A body with a type that is not a Struct is decoded as the type, with the same errors."""
+
+    def test_valid_json_is_decoded_as_the_type(self):
+        extractor = create_body_extractor("ids", list[int])
+
+        assert extractor(b"[1, 2]") == [1, 2]
+
+    def test_invalid_json_gives_a_422_error_with_the_body(self):
+        extractor = create_body_extractor("ids", list[int])
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            extractor(b"[1,")
+
+        errors = exc_info.value.errors()
+        assert len(errors) == 1
+        assert errors[0]["type"] == "json_invalid"
+        assert errors[0]["loc"] == ("body",)
+        assert "truncated" in errors[0]["msg"].lower()
+        assert exc_info.value.body == b"[1,"
+
+    def test_malformed_json_gives_the_line_and_column(self):
+        extractor = create_body_extractor("ids", list[int])
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            extractor(b"[1,\n 2, x]")
+
+        error = exc_info.value.errors()[0]
+        assert error["loc"] == ("body", 2, 5)
+        assert error["ctx"]["line"] == 2
+        assert error["ctx"]["column"] == 5
+
+    def test_a_value_of_the_wrong_type_raises_the_msgspec_error(self):
+        extractor = create_body_extractor("ids", list[int])
+
+        with pytest.raises(msgspec.ValidationError):
+            extractor(b'["a"]')
+
+    def test_an_annotation_that_cannot_be_hashed_still_checks_the_type(self):
+        """Metadata such as a dict makes the annotation unhashable. The extractor still validates the body."""
+        extractor = create_body_extractor("ids", Annotated[list[int], {"note": "unhashable"}])
+
+        assert extractor(b"[1, 2]") == [1, 2]
+        with pytest.raises(msgspec.ValidationError):
+            extractor(b'["a"]')
+
+    def test_invalid_json_for_a_struct_keeps_the_body_in_the_error(self):
+        extractor = create_body_extractor("user", UserCreate)
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            extractor(b'{"name": ')
+
+        assert exc_info.value.body == b'{"name": '
+
+    def test_a_route_binds_a_list_body_and_answers_a_bad_body_with_a_422(self):
+        api = BoltAPI()
+
+        @api.post("/ids")
+        async def ids(values: Annotated[list[int], Body()]):
+            return {"values": values}
+
+        with TestClient(api) as client:
+            ok = client.post("/ids", content=b"[1, 2]", headers={"content-type": "application/json"})
+            assert ok.status_code == 200, ok.text
+            assert ok.json() == {"values": [1, 2]}
+
+            truncated = client.post("/ids", content=b"[1,", headers={"content-type": "application/json"})
+            assert truncated.status_code == 422
+            assert truncated.json()["detail"][0]["type"] == "json_invalid"
+            assert truncated.json()["detail"][0]["loc"] == ["body"]
+
+            wrong = client.post("/ids", content=b'["a"]', headers={"content-type": "application/json"})
+            assert wrong.status_code == 422
+            assert wrong.json()["detail"][0]["loc"] == ["body", "0"]
+
+
+class TestParseMsgspecDecodeError:
+    """Test the line and column of a JSON decode error."""
+
+    @staticmethod
+    def _parse(body: bytes) -> dict:
+        with pytest.raises(msgspec.DecodeError) as exc_info:
+            msgspec.json.decode(body)
+        return parse_msgspec_decode_error(exc_info.value, body)
+
+    def test_ascii_body_column(self):
+        """Test a body with ASCII text only."""
+        body = b'{"name": "hello", "x": }'
+        detail = self._parse(body)
+
+        assert detail["loc"] == ("body", 1, body.index(b"}") + 1)
+        assert detail["ctx"]["line"] == 1
+        assert detail["ctx"]["column"] == body.index(b"}") + 1
+
+    def test_column_counts_characters_not_bytes(self):
+        """Test multi-byte UTF-8 text before the error on the same line."""
+        text = '{"name": "héllo", "x": }'
+        body = text.encode()
+        detail = self._parse(body)
+
+        assert len(body) > len(text)
+        assert detail["loc"] == ("body", 1, text.index("}") + 1)
+        assert detail["ctx"]["column"] == text.index("}") + 1
+        assert detail["ctx"]["byte_position"] == body.index(b"}")
+        assert detail["msg"].endswith(f"\n  {text}\n  {' ' * text.index('}')}^")
+
+    def test_column_on_later_line_counts_characters(self):
+        """Test the line number and the column after a newline."""
+        line_before_error = '  "é€": '
+        body = f'{{"a": "é€",\n{line_before_error}}}'.encode()
+        detail = self._parse(body)
+
+        assert detail["loc"] == ("body", 2, len(line_before_error) + 1)
+        assert detail["ctx"]["line"] == 2
+
+    def test_multi_byte_text_on_earlier_line_does_not_shift_column(self):
+        """Test that multi-byte text on an earlier line changes only the line number."""
+        body = '{"a": "é",\n"b": }'.encode()
+        detail = self._parse(body)
+
+        assert detail["loc"] == ("body", 2, len('"b": ') + 1)
 
 
 class TestMsgspecStructValidation:

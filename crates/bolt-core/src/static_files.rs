@@ -12,7 +12,7 @@
 //! 2. Django's staticfiles finders (for app static files like admin)
 
 use actix_files::NamedFile;
-use actix_web::{http::header, web, HttpRequest, HttpResponse};
+use actix_web::{HttpRequest, HttpResponse, http::header, web};
 use pyo3::prelude::*;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -77,10 +77,11 @@ fn find_in_directories(relative_path: &str, directories: &[PathBuf]) -> Option<P
         // Canonicalize the *file* (not the dir) to resolve any symlinks in
         // the relative portion, then verify the result is still inside the
         // canonical root. Stops a symlink-out-of-root from escaping.
-        if let Ok(canonical) = full_path.canonicalize() {
-            if canonical.starts_with(dir_canonical) && canonical.is_file() {
-                return Some(canonical);
-            }
+        if let Ok(canonical) = full_path.canonicalize()
+            && canonical.starts_with(dir_canonical)
+            && canonical.is_file()
+        {
+            return Some(canonical);
         }
     }
     None
@@ -164,12 +165,12 @@ pub async fn handle_file(
         // 404/4xx caching forces a stale view of the resource long after the
         // file finally lands. 304 already carries the original 200's
         // Cache-Control via the client's cached entry, so no action needed.
-        if response.status().is_success() {
-            if let Some(ref cc) = config.cache_control {
-                response
-                    .headers_mut()
-                    .insert(header::CACHE_CONTROL, cc.clone());
-            }
+        if response.status().is_success()
+            && let Some(ref cc) = config.cache_control
+        {
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, cc.clone());
         }
     };
 

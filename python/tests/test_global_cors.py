@@ -97,7 +97,7 @@ def test_cors_decorator_requires_origins():
     """Test that @cors() without origins raises ValueError."""
     api = BoltAPI()
 
-    with pytest.raises(ValueError, match="@cors\\(\\) requires 'origins' argument"):
+    with pytest.raises(ValueError, match="@cors\\(\\) requires an 'origins' or 'origin_regexes' argument"):
 
         @api.get("/test")
         @cors()  # Empty @cors() should raise error
