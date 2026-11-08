@@ -203,12 +203,13 @@ def django_db_setup(django_db_blocker):
                 BlogPost,
                 Comment,
                 Document,
+                Release,
                 Tag,
                 User,
                 UserProfile,
             )
 
-            models = [Article, Author, Tag, BlogPost, Comment, User, UserProfile, Document]
+            models = [Article, Author, Tag, BlogPost, Comment, User, UserProfile, Document, Release]
             for model in models:
                 # Check if table already exists
                 if model._meta.db_table not in connection.introspection.table_names():
