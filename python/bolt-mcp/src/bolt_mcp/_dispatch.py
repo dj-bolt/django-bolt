@@ -98,6 +98,8 @@ async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
                 principal=payload["auth"] or {},
             )
             result = await _call_through_middleware(mcp._tool_middleware, call, call_tool)
+            # A middleware can build its own result. 2026-07-28 clients need resultType.
+            result.setdefault("resultType", RESULT_TYPE_COMPLETE)
         else:
             result = await call_tool()
     except _InputRequired as pending:
