@@ -568,6 +568,7 @@ class CursorPagination(PaginationBase):
         ordering: Field to order by (default: "-id" for descending ID).
             The primary key breaks ties, so the field does not have to be unique.
             A values() queryset must include the primary key.
+            The field must not be null: a null value cannot make a cursor.
     """
 
     page_size: int = 100
@@ -684,22 +685,33 @@ class CursorPagination(PaginationBase):
             last_item = raw_items[-1]
             # Items are raw (Django models or dicts from values()), get cursor value
             if isinstance(last_item, dict):
-                last_value = last_item.get(ordering_field)
+                if ordering_field not in last_item:
+                    raise ValueError(
+                        f"CursorPagination ordering {ordering!r} needs {ordering_field!r} in values() "
+                        f"to make the next cursor."
+                    )
+                last_value = last_item[ordering_field]
                 last_pk = last_item.get(pk_field.attname, last_item.get("pk"))
             else:
                 last_value = getattr(last_item, ordering_field, None)
                 last_pk = getattr(last_item, "pk", None)
 
-            if last_value is not None:
-                if not tie_break:
-                    next_cursor = self._encode_cursor(last_value)
-                elif last_pk is None:
-                    raise ValueError(
-                        f"CursorPagination ordering {ordering!r} needs the primary key "
-                        f"{pk_field.attname!r} in values() to continue after rows with equal values."
-                    )
-                else:
-                    next_cursor = self._encode_cursor(last_value, last_pk)
+            if last_value is None:
+                # A cursor of null means "first page", and SQL compares no value with null.
+                # Without this error, the page says has_next but gives no cursor to get it.
+                raise ValueError(
+                    f"CursorPagination cannot continue after a row whose {ordering_field!r} is null. "
+                    f"Order by a field that is never null, or exclude the null values."
+                )
+            if not tie_break:
+                next_cursor = self._encode_cursor(last_value)
+            elif last_pk is None:
+                raise ValueError(
+                    f"CursorPagination ordering {ordering!r} needs the primary key "
+                    f"{pk_field.attname!r} in values() to continue after rows with equal values."
+                )
+            else:
+                next_cursor = self._encode_cursor(last_value, last_pk)
 
         # Serialize items using efficient batch serialization
         items = await self._serialize_items(raw_items)

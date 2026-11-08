@@ -82,7 +82,9 @@ Query: `/articles?cursor=eyJ2IjoxMDB9`
 
 The `ordering` field does not have to be unique. Bolt also orders by the primary key, so rows with equal values keep their place across pages. The cursor holds the value and the primary key of the last row. For an index, add the primary key after the ordering field, for example `models.Index(fields=["-created_at", "-id"])`.
 
-A `values()` queryset must include the ordering field and the primary key, for example `Article.objects.values("id", "created_at", "title")`. Without the primary key, the paginator cannot make the next cursor and raises `ValueError`.
+A `values()` queryset must include the ordering field and the primary key, for example `Article.objects.values("id", "created_at", "title")`. Without one of them, the paginator cannot make the next cursor and raises `ValueError`.
+
+The `ordering` field must not be null. A null value cannot make a cursor, and SQL compares no value with null. When the last row of a page has a null value, the paginator raises `ValueError`. Order by a field that is never null, or exclude the null values, for example `Article.objects.exclude(published_at=None)`.
 
 ## Specifying the Serializer
 

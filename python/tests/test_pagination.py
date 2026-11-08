@@ -24,7 +24,7 @@ from django_bolt import (
 )
 from django_bolt.testing import TestClient
 
-from .test_models import Article, Author, BlogPost, Release
+from .test_models import Article, Author, BlogPost, Release, User, UserProfile
 
 # ============================================================================
 # Schemas
@@ -1446,3 +1446,51 @@ def test_multiple_pagination_types_different_endpoints(sample_articles):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_after_a_null_ordering_value_is_an_error(settings):
+    """A null value cannot make a cursor. The page fails loudly, not with has_next and no cursor."""
+    settings.DEBUG = True  # the 500 body then shows the exception
+    for number in range(4):
+        user = User.objects.create(username=f"u{number}", email=f"u{number}@example.com", password_hash="x")
+        UserProfile.objects.create(user=user, date_of_birth=None)
+    api = BoltAPI()
+
+    class BirthdayCursorPagination(CursorPagination):
+        page_size = 2
+        ordering = "date_of_birth"
+
+    @api.get("/profiles")
+    @paginate(BirthdayCursorPagination)
+    async def list_profiles(request):
+        return UserProfile.objects.all()
+
+    with TestClient(api) as client:
+        response = client.get("/profiles")
+
+    assert response.status_code == 500
+    assert "ValueError" in response.text
+    assert "is null" in response.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_values_queryset_without_the_ordering_field_is_an_error(sample_articles, settings):
+    settings.DEBUG = True  # the 500 body then shows the exception
+    api = BoltAPI()
+
+    class TitleCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "-id"
+
+    @api.get("/articles")
+    @paginate(TitleCursorPagination)
+    async def list_articles(request):
+        return Article.objects.values("title")
+
+    with TestClient(api) as client:
+        response = client.get("/articles")
+
+    assert response.status_code == 500
+    assert "ValueError" in response.text
+    assert "in values() to make the next cursor" in response.text
