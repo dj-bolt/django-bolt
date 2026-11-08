@@ -29,6 +29,10 @@ def _server(resource_middleware=(), prompt_middleware=(), **mount_kwargs):
     def user_profile(user_id: int) -> str:
         return f"user {user_id}"
 
+    @mcp.resource("boom://db", name="boom")
+    def boom() -> str:
+        raise RuntimeError("connect to postgres://admin:hunter2@db.internal")
+
     @mcp.resource("secret://key", name="secret-key")
     def secret_key() -> str:
         raise JsonRpcError("Ask an admin for the key")
@@ -192,6 +196,7 @@ async def reject_anonymous(request, call_next) -> dict:
     ],
 )
 def test_middleware_rejects_a_call_with_a_jsonrpc_error(method, params):
+    # MCP masks error details by default; a JsonRpcError keeps its message.
     api = _server(resource_middleware=[reject_anonymous], prompt_middleware=[reject_anonymous])
     with TestClient(api) as client:
         body = _rpc(client, method, params)
@@ -218,3 +223,41 @@ def test_middleware_registered_after_mount_raises(decorator):
     mount_mcp(BoltAPI(), mcp)
     with pytest.raises(RuntimeError, match="before the server is mounted"):
         getattr(mcp, decorator)(reject_anonymous)
+
+
+async def leaky(request, call_next) -> dict:
+    raise RuntimeError("connect to postgres://admin:hunter2@db.internal")
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "message"),
+    [
+        ("resources/read", {"uri": "config://app"}, "Resource 'config://app' failed."),
+        ("prompts/get", {"name": "greet", "arguments": {"name": "Ada"}}, "Prompt 'greet' failed."),
+    ],
+)
+def test_an_exception_in_middleware_is_logged_and_masked(caplog, method, params, message):
+    api = _server(resource_middleware=[leaky], prompt_middleware=[leaky])
+    with TestClient(api) as client, caplog.at_level("ERROR", logger="bolt_mcp"):
+        body = _rpc(client, method, params)
+    assert body["error"]["code"] == -32603
+    assert body["error"]["message"] == message
+    assert "hunter2" in caplog.text
+
+
+def test_middleware_sees_a_handler_exception_and_the_client_gets_it_masked(caplog):
+    raised: list[BaseException] = []
+
+    async def watch(read: ResourceRead, call_next) -> dict:
+        try:
+            return await call_next()
+        except Exception as exc:
+            raised.append(exc)
+            raise
+
+    with TestClient(_server(resource_middleware=[watch])) as client, caplog.at_level("ERROR", logger="bolt_mcp"):
+        body = _rpc(client, "resources/read", {"uri": "boom://db"})
+    assert [type(exc) for exc in raised] == [RuntimeError]
+    assert body["error"]["code"] == -32603
+    assert body["error"]["message"] == "Resource 'boom://db' failed."
+    assert "hunter2" in caplog.text
