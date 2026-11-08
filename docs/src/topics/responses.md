@@ -259,6 +259,13 @@ async def async_stream():
     return StreamingResponse(generate(), media_type="text/event-stream")
 ```
 
+### Errors in a stream
+
+Bolt sends the status and the headers before the first chunk.
+Thus an error in the generator cannot become a 500.
+The body ends at the error, and the client gets the chunks before it.
+Bolt logs the error with its traceback to the `django_bolt.streaming` logger, at level ERROR.
+
 ### Server-Sent Events (SSE)
 
 For SSE endpoints, see the dedicated [Server-Sent Events guide](sse.md). Django-Bolt provides `EventSourceResponse` with automatic SSE framing, compression skipping, and keep-alive pings:

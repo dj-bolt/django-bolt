@@ -301,10 +301,8 @@ def test_an_int_debug_is_read_as_django_reads_it(capfd, value, detail):
         "bytes-item",
     ],
 )
-def test_wrong_type_of_bolt_allowed_file_paths_stops_startup(monkeypatch, value, wrong):
+def test_wrong_type_of_bolt_allowed_file_paths_stops_startup(value, wrong):
     # runbolt reads the setting at startup. A str is a sequence of one-character paths, so "/" was an allowed dir.
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
 
     with override_settings(BOLT_ALLOWED_FILE_PATHS=value), pytest.raises(ImproperlyConfigured) as excinfo:
         responses.initialize_file_response_settings()
@@ -315,41 +313,55 @@ def test_wrong_type_of_bolt_allowed_file_paths_stops_startup(monkeypatch, value,
 
 
 @pytest.mark.parametrize("container", [list, tuple])
-def test_bolt_allowed_file_paths_takes_a_list_of_str_and_path(monkeypatch, tmp_path, container):
+def test_bolt_allowed_file_paths_takes_a_list_of_str_and_path(tmp_path, container):
     public = tmp_path / "public"
     public.mkdir()
     (public / "known.txt").write_text("known")
     (tmp_path / "secret.txt").write_text("secret")
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
     api = BoltAPI()
 
     @api.get("/file/{name}")
     def file(name: str):
         return FileResponse(str(tmp_path / name))
 
-    with override_settings(BOLT_ALLOWED_FILE_PATHS=container([public, str(tmp_path / "other")])):
-        responses.initialize_file_response_settings()
-        with TestClient(api) as client:
-            statuses = (client.get("/file/public%2Fknown.txt").status_code, client.get("/file/secret.txt").status_code)
+    with (
+        override_settings(BOLT_ALLOWED_FILE_PATHS=container([public, str(tmp_path / "other")])),
+        TestClient(api) as client,
+    ):
+        statuses = (client.get("/file/public%2Fknown.txt").status_code, client.get("/file/secret.txt").status_code)
 
     assert statuses == (200, 403)
 
 
 @pytest.mark.parametrize("value", [None, [], ()], ids=["none", "empty-list", "empty-tuple"])
-def test_no_bolt_allowed_file_paths_sets_no_limit(monkeypatch, tmp_path, value):
+def test_no_bolt_allowed_file_paths_sets_no_limit(tmp_path, value):
     (tmp_path / "data.txt").write_text("data")
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
     api = BoltAPI()
 
     @api.get("/file")
     def file():
         return FileResponse(str(tmp_path / "data.txt"))
 
-    with override_settings(BOLT_ALLOWED_FILE_PATHS=value):
-        responses.initialize_file_response_settings()
-        with TestClient(api) as client:
-            response = client.get("/file")
+    with override_settings(BOLT_ALLOWED_FILE_PATHS=value), TestClient(api) as client:
+        response = client.get("/file")
 
     assert (response.status_code, response.content) == (200, b"data")
+
+
+def test_test_client_applies_bolt_allowed_file_paths_from_override_settings(tmp_path):
+    # No startup call: the first FileResponse loads the setting, and each change of it loads it again.
+    public = tmp_path / "public"
+    public.mkdir()
+    (tmp_path / "secret.txt").write_text("secret")
+    api = BoltAPI()
+
+    @api.get("/secret")
+    def secret():
+        return FileResponse(str(tmp_path / "secret.txt"))
+
+    with TestClient(api) as client:
+        with override_settings(BOLT_ALLOWED_FILE_PATHS=[str(public)]):
+            limited = client.get("/secret").status_code
+        unlimited = client.get("/secret").status_code
+
+    assert (limited, unlimited) == (403, 200)
