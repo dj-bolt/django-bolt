@@ -25,7 +25,7 @@ import msgspec
 from django_bolt._json import decode as json_decode
 from django_bolt._json import encode as json_encode
 
-from ._execute import RESULT_TYPE_COMPLETE, error_result, execute_tool
+from ._execute import RESULT_TYPE_COMPLETE, error_result, execute_tool, tool_failed
 from .context import Context, _InputRequired
 from .registry import ToolCall
 
@@ -66,7 +66,7 @@ async def _call_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any], raw: Any)
             request=McpRequest(payload["auth"]),
             resolver=partial(_resolve_resource, mcp),
         )
-    return await execute_tool(tool, kwargs)
+    return await execute_tool(tool, kwargs, mask_error_details=mcp.mask_error_details)
 
 
 def _request_meta(ctx: Any) -> dict[str, Any]:
@@ -97,7 +97,10 @@ async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
                 meta=_request_meta(payload["ctx"]),
                 principal=payload["auth"] or {},
             )
-            result = await _call_through_middleware(mcp._tool_middleware, call, call_tool)
+            try:
+                result = await _call_through_middleware(mcp._tool_middleware, call, call_tool)
+            except Exception as exc:
+                result = tool_failed(tool, exc, mask_error_details=mcp.mask_error_details)
             # A middleware can build its own result. 2026-07-28 clients need resultType.
             result.setdefault("resultType", RESULT_TYPE_COMPLETE)
         else:
@@ -131,8 +134,8 @@ async def _invoke(fn: Any, is_async: bool, /, **kwargs: Any) -> Any:
     return await fn(**kwargs) if is_async else fn(**kwargs)
 
 
-async def _resolve_resource(mcp: MCP, uri: str) -> tuple[str, str]:
-    """Resolve a URI to ``(text, mime_type)``: static resources, then templates.
+async def _resolve_resource(mcp: MCP, uri: str) -> tuple[str, str, dict[str, Any] | None]:
+    """Resolve a URI to ``(text, mime_type, meta)``: static resources, then templates.
 
     Raises ``LookupError`` for no match and ``msgspec.ValidationError`` when a
     template matches but its ``{vars}`` don't coerce to the handler's types.
@@ -140,7 +143,7 @@ async def _resolve_resource(mcp: MCP, uri: str) -> tuple[str, str]:
     """
     resource: ResourceDef | None = mcp._resources.get(uri)
     if resource is not None:
-        return await _invoke(resource.fn, resource.is_async), resource.mime_type
+        return await _invoke(resource.fn, resource.is_async), resource.mime_type, resource.meta
     tmpl: ResourceTemplateDef
     for tmpl in mcp._resource_templates.values():
         match = tmpl.pattern.match(uri)
@@ -148,7 +151,7 @@ async def _resolve_resource(mcp: MCP, uri: str) -> tuple[str, str]:
             continue
         raw = {k: unquote(v) for k, v in match.groupdict().items()}
         kwargs = msgspec.structs.asdict(msgspec.convert(raw, tmpl.args_struct, strict=False))
-        return await _invoke(tmpl.fn, tmpl.is_async, **kwargs), tmpl.mime_type
+        return await _invoke(tmpl.fn, tmpl.is_async, **kwargs), tmpl.mime_type, tmpl.meta
     raise LookupError(uri)
 
 
@@ -156,17 +159,28 @@ def _error(kind: str, message: str) -> bytes:
     return json_encode({"__error__": {"kind": kind, "message": message}})
 
 
+def _handler_failed(mcp: MCP, what: str, exc: Exception) -> bytes:
+    """Log a resource or prompt handler's exception and build its JSON-RPC internal error."""
+    logger.exception("MCP %s failed", what)
+    if mcp.mask_error_details:
+        return _error("internal_error", f"{what[0].upper()}{what[1:]} failed.")
+    return _error("internal_error", f"MCP dispatch failed: {type(exc).__name__}: {exc}")
+
+
 async def _read_resource(mcp: MCP, payload: dict[str, Any]) -> bytes:
     uri = payload["uri"]
     try:
-        text, mime_type = await _resolve_resource(mcp, uri)
+        text, mime_type, meta = await _resolve_resource(mcp, uri)
     except LookupError:
         return _error("resource_not_found", f"Unknown resource: {uri!r}")
     except msgspec.ValidationError as exc:
         return _error("invalid_params", f"Invalid resource URI {uri!r}: {exc}")
-    return json_encode(
-        {"contents": [{"uri": uri, "mimeType": mime_type, "text": text}], "resultType": RESULT_TYPE_COMPLETE}
-    )
+    except Exception as exc:
+        return _handler_failed(mcp, f"resource {uri!r}", exc)
+    content: dict[str, Any] = {"uri": uri, "mimeType": mime_type, "text": text}
+    if meta is not None:
+        content["_meta"] = meta
+    return json_encode({"contents": [content], "resultType": RESULT_TYPE_COMPLETE})
 
 
 def resource_dispatch(mcp: MCP) -> Any:
@@ -184,7 +198,10 @@ async def _get_prompt(mcp: MCP, payload: dict[str, Any]) -> bytes:
     except msgspec.ValidationError as exc:
         return _error("invalid_params", f"Invalid arguments: {exc}")
     kwargs = msgspec.structs.asdict(args)
-    rendered = await _invoke(prompt.fn, prompt.is_async, **kwargs)
+    try:
+        rendered = await _invoke(prompt.fn, prompt.is_async, **kwargs)
+    except Exception as exc:
+        return _handler_failed(mcp, f"prompt {name!r}", exc)
     if isinstance(rendered, str):
         messages = [{"role": "user", "content": {"type": "text", "text": rendered}}]
     else:

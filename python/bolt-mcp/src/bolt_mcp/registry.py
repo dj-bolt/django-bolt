@@ -45,6 +45,7 @@ class ToolDef:
     output_schema: dict[str, Any] | None = None
     annotations: dict[str, Any] | None = None  # MCP ToolAnnotations (readOnlyHint, ...)
     icons: list[dict[str, Any]] | None = None
+    meta: dict[str, Any] | None = None  # sent as the tool's `_meta` (e.g. MCP Apps `ui`)
     guards: list[Any] = field(default_factory=list)
     # Computed at registration:
     args_struct: Any = None
@@ -61,6 +62,7 @@ class ResourceDef:
     name: str | None = None
     description: str | None = None
     mime_type: str = "text/plain"
+    meta: dict[str, Any] | None = None  # sent as `_meta` on the `resources/read` contents
     is_async: bool = False
 
 
@@ -71,6 +73,7 @@ class ResourceTemplateDef:
     name: str | None = None
     description: str | None = None
     mime_type: str = "text/plain"
+    meta: dict[str, Any] | None = None  # sent as `_meta` on the `resources/read` contents
     param_names: list[str] = field(default_factory=list)
     is_async: bool = False
     # Computed at registration:
