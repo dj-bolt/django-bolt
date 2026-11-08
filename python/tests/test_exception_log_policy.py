@@ -22,7 +22,7 @@ from django.db.models import QuerySet
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 
-from django_bolt import BoltAPI, responses
+from django_bolt import BoltAPI
 from django_bolt.error_handlers import is_server_exception
 from django_bolt.exceptions import HTTPException, RequestValidationError, ResponseValidationError
 from django_bolt.logging import LoggingConfig, LoggingMiddleware
@@ -345,20 +345,17 @@ def test_an_os_error_of_handler_code_is_a_logged_500_without_the_path(server_err
     ]
 
 
-def _allow_file_paths(settings, monkeypatch, *paths) -> None:
-    """Set BOLT_ALLOWED_FILE_PATHS and load it, as runbolt does at startup."""
+def _allow_file_paths(settings, *paths) -> None:
+    """Set BOLT_ALLOWED_FILE_PATHS. The next FileResponse loads it."""
     settings.BOLT_ALLOWED_FILE_PATHS = [str(path) for path in paths]
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
-    responses.initialize_file_response_settings()
 
 
 @pytest.fixture
-def allowed_dir(settings, monkeypatch, tmp_path):
+def allowed_dir(settings, tmp_path):
     """Allow FileResponse paths in one directory."""
     public = tmp_path / "public"
     public.mkdir()
-    _allow_file_paths(settings, monkeypatch, public)
+    _allow_file_paths(settings, public)
     return public
 
 
@@ -476,12 +473,12 @@ def test_a_file_that_the_server_cannot_read_in_an_allowed_dir_is_a_logged_500(se
     ],
 )
 def test_a_parent_of_the_allowed_dir_that_the_server_cannot_search(
-    server_errors, settings, monkeypatch, locked_dir, tmp_path, root, target, status, records
+    server_errors, settings, locked_dir, tmp_path, root, target, status, records
 ):
     # A deploy fault: the server cannot reach a file in the allowed dir. A path to another dir there stays a 403.
     home = tmp_path / "home"
     (home / root).mkdir(parents=True)
-    _allow_file_paths(settings, monkeypatch, home / root)
+    _allow_file_paths(settings, home / root)
     locked_dir(home)
     api = BoltAPI()
 
@@ -520,15 +517,13 @@ def test_a_path_that_comes_back_into_the_allowed_dir_gives_the_same_status_wheth
 
 
 @pytest.mark.parametrize("data", ["missing", "file"])
-def test_a_parent_of_a_missing_allowed_dir_is_out_of_the_allowed_dirs(
-    server_errors, settings, monkeypatch, tmp_path, data
-):
+def test_a_parent_of_a_missing_allowed_dir_is_out_of_the_allowed_dirs(server_errors, settings, tmp_path, data):
     # The allowed dir data/media does not exist yet. data and data/x are not in it, also when data is a file.
     public = tmp_path / "public"
     public.mkdir()
     if data == "file":
         (tmp_path / "data").write_text("data")
-    _allow_file_paths(settings, monkeypatch, public, tmp_path / "data" / "media")
+    _allow_file_paths(settings, public, tmp_path / "data" / "media")
     api = BoltAPI()
 
     @api.get("/file/{name:path}")
@@ -543,12 +538,10 @@ def test_a_parent_of_a_missing_allowed_dir_is_out_of_the_allowed_dirs(
 
 
 @pytest.mark.parametrize("root", ["media", "site/media"])
-def test_a_file_in_an_allowed_dir_that_does_not_exist_yet_is_a_404(
-    server_errors, settings, monkeypatch, tmp_path, root
-):
+def test_a_file_in_an_allowed_dir_that_does_not_exist_yet_is_a_404(server_errors, settings, tmp_path, root):
     # Django makes MEDIA_ROOT at the first upload, so an allowed dir can be missing at first.
     media = tmp_path / root
-    _allow_file_paths(settings, monkeypatch, media)
+    _allow_file_paths(settings, media)
     api = BoltAPI()
 
     @api.get("/file")
@@ -634,13 +627,13 @@ def test_a_path_out_of_the_allowed_dirs_is_a_403_whether_or_not_it_exists(server
     assert server_errors() == []
 
 
-def test_a_missing_file_in_an_allowed_dir_named_through_a_link_is_a_404(server_errors, settings, monkeypatch, tmp_path):
+def test_a_missing_file_in_an_allowed_dir_named_through_a_link_is_a_404(server_errors, settings, tmp_path):
     # The lookup stops in the allowed dir, also when the path names it through a link from out of it.
     real = tmp_path / "releases" / "42"
     real.mkdir(parents=True)
     current = tmp_path / "current"
     current.symlink_to(real, target_is_directory=True)
-    _allow_file_paths(settings, monkeypatch, real)
+    _allow_file_paths(settings, real)
     api = BoltAPI()
 
     @api.get("/file")
@@ -676,7 +669,7 @@ def test_a_lookup_stops_after_40_links_as_on_linux(server_errors, allowed_dir, t
     assert server_errors() == []
 
 
-def test_an_allowed_dir_is_the_dir_that_the_os_resolves(server_errors, settings, monkeypatch, tmp_path):
+def test_an_allowed_dir_is_the_dir_that_the_os_resolves(server_errors, settings, tmp_path):
     # The OS follows "link" before it applies "..", so link/../public is deep/public and not tmp_path/public.
     (tmp_path / "deep" / "sub").mkdir(parents=True)
     (tmp_path / "deep" / "public").mkdir()
@@ -684,7 +677,7 @@ def test_an_allowed_dir_is_the_dir_that_the_os_resolves(server_errors, settings,
     (tmp_path / "link").symlink_to(tmp_path / "deep" / "sub", target_is_directory=True)
     (tmp_path / "public").mkdir()
     (tmp_path / "public" / "secret.txt").write_text("secret")
-    _allow_file_paths(settings, monkeypatch, f"{tmp_path}/link/../public")
+    _allow_file_paths(settings, f"{tmp_path}/link/../public")
     api = BoltAPI()
 
     @api.get("/page")

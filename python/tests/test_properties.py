@@ -24,7 +24,7 @@ from django.test import override_settings
 from hypothesis import example, given
 from hypothesis import strategies as st
 
-from django_bolt import BoltAPI, responses
+from django_bolt import BoltAPI
 from django_bolt.param_functions import Cookie, Form, Query
 from django_bolt.responses import JSON, FileResponse
 from django_bolt.testing import TestClient
@@ -413,12 +413,8 @@ def file_client(tmp_path_factory):
     def file(path: str):
         return FileResponse(f"{public}/{path}")
 
-    with override_settings(BOLT_ALLOWED_FILE_PATHS=[str(public)]), pytest.MonkeyPatch.context() as patch:
-        patch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
-        patch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
-        responses.initialize_file_response_settings()
-        with TestClient(file_api) as test_client:
-            yield test_client, outside / "probe"
+    with override_settings(BOLT_ALLOWED_FILE_PATHS=[str(public)]), TestClient(file_api) as test_client:
+        yield test_client, outside / "probe"
 
 
 @given(parts=st.lists(st.sampled_from(FILE_PATH_PARTS), min_size=1, max_size=8))

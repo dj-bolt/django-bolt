@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from django_bolt import BoltAPI, responses
+from django_bolt import BoltAPI
 from django_bolt.responses import FileResponse
 from django_bolt.testing import TestClient
 
@@ -24,7 +24,7 @@ pytestmark = pytest.mark.platform_smoke
 
 
 @pytest.fixture
-def tree(settings, monkeypatch, tmp_path):
+def tree(settings, tmp_path):
     """Allow one dir with a file in it. Return it and a dir next to it."""
     public = tmp_path / "public"
     outside = tmp_path / "outside"
@@ -32,9 +32,6 @@ def tree(settings, monkeypatch, tmp_path):
     outside.mkdir()
     (public / "known.txt").write_text("known")
     settings.BOLT_ALLOWED_FILE_PATHS = [str(public)]
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_INITIALIZED", False)
-    monkeypatch.setattr(responses, "_ALLOWED_FILE_PATHS_CACHE", None)
-    responses.initialize_file_response_settings()
     return public, outside
 
 
