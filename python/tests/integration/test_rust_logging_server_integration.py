@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import re
+
 import httpx
 import pytest
 
 from .apps import app_module
 
+# A line of the Rust log backend, at any level.
+RUST_RECORD = re.compile(r"^\[django-bolt\] (TRACE|DEBUG|INFO|WARNING|ERROR) \S+: ")
 RUST_ERROR = (
     "[django-bolt] ERROR bolt_asgi::asgi_http: "
     "ASGI mount: coroutine raised an exception: RuntimeError: boom from the mounted app"
@@ -22,6 +26,6 @@ def test_runbolt_writes_a_rust_error_record_to_stderr(make_server_project):
             assert client.get("/mounted/x").status_code == 500
         _stdout, stderr = server.stop()
 
-    rust_records = [line for line in stderr.splitlines() if line.startswith("[django-bolt] ERROR ")]
-    # Only the mounted app wrote a record. The normal route wrote none.
+    rust_records = [line for line in stderr.splitlines() if RUST_RECORD.match(line)]
+    # Only the mounted app wrote a record, at any level. The normal route wrote none.
     assert rust_records == [RUST_ERROR]

@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import logging
 
+import jwt
 import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.testing import TestClient
 
 ASGI_ERROR = "[django-bolt] ERROR bolt_asgi::asgi_http: ASGI mount: coroutine raised an exception: RuntimeError: boom"
+JWT_DEBUG = "[django-bolt] DEBUG bolt_core::middleware::auth: JWT rejected: invalid signature"
 
 
 def _failing_mount_api() -> BoltAPI:
@@ -53,3 +56,18 @@ def test_the_django_bolt_logger_level_filters_rust_records(capfd, bolt_logger_le
         assert client.get("/app/x").status_code == 500
 
     assert "bolt_asgi::asgi_http" not in capfd.readouterr().err
+
+
+def test_a_rust_debug_record_reaches_stderr_at_the_debug_level(capfd, bolt_logger_level):
+    bolt_logger_level(logging.DEBUG)
+    api = BoltAPI()
+
+    @api.get("/me", auth=[JWTAuthentication(secret="right-secret")], guards=[IsAuthenticated()])
+    async def me():
+        return {}
+
+    token = jwt.encode({"sub": "1"}, "wrong-secret", algorithm="HS256")
+    with TestClient(api) as client:
+        assert client.get("/me", headers={"Authorization": f"Bearer {token}"}).status_code == 401
+
+    assert JWT_DEBUG in capfd.readouterr().err.splitlines()

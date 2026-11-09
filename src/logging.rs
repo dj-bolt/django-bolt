@@ -20,9 +20,21 @@ struct StderrLogger;
 
 static LOGGER: StderrLogger = StderrLogger;
 
+/// Whether a record of `level` from the module `target` gets a line.
+///
+/// The level of `django_bolt` applies to each crate. Crates that are not part
+/// of Bolt, such as Actix, also need `WARNING` or higher. Their `INFO` and
+/// `DEBUG` records describe their own work, not the work of Bolt.
+fn record_passes(level: Level, target: &str, max_level: LevelFilter) -> bool {
+    level <= max_level
+        && (level <= Level::Warn
+            || target.starts_with("bolt_")
+            || target.starts_with("django_bolt"))
+}
+
 impl Log for StderrLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() <= log::max_level()
+        record_passes(metadata.level(), metadata.target(), log::max_level())
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -52,7 +64,18 @@ fn level_name(level: Level) -> &'static str {
 }
 
 fn format_record(level: Level, target: &str, args: &std::fmt::Arguments<'_>) -> String {
-    format!("[django-bolt] {} {}: {}\n", level_name(level), target, args)
+    let mut message = args.to_string();
+    // A message can hold text from a request or an exception. Escape its line
+    // breaks, so that it cannot start a line that looks like another record.
+    if message.contains(['\n', '\r']) {
+        message = message.replace('\r', "\\r").replace('\n', "\\n");
+    }
+    format!(
+        "[django-bolt] {} {}: {}\n",
+        level_name(level),
+        target,
+        message
+    )
 }
 
 /// The Rust level filter for an effective level of a Python logger.
@@ -89,8 +112,34 @@ pub fn install(py: Python<'_>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_record, level_filter};
+    use super::{format_record, level_filter, record_passes};
     use log::{Level, LevelFilter};
+
+    #[test]
+    fn other_crates_log_only_warnings_and_errors() {
+        let debug = LevelFilter::Debug;
+        assert!(record_passes(
+            Level::Debug,
+            "bolt_core::middleware::auth",
+            debug
+        ));
+        assert!(record_passes(Level::Info, "django_bolt::server", debug));
+        assert!(!record_passes(Level::Info, "actix_server::builder", debug));
+        assert!(!record_passes(Level::Debug, "actix_server::accept", debug));
+        assert!(record_passes(Level::Warn, "actix_server::accept", debug));
+        assert!(record_passes(Level::Error, "actix_http::h1", debug));
+        // The level of django_bolt still applies to each crate.
+        assert!(!record_passes(
+            Level::Warn,
+            "actix_server::accept",
+            LevelFilter::Error
+        ));
+        assert!(!record_passes(
+            Level::Debug,
+            "bolt_core::lane",
+            LevelFilter::Warn
+        ));
+    }
 
     #[test]
     fn python_levels_map_to_the_rust_filter_that_logs_the_same_records() {
@@ -124,6 +173,18 @@ mod tests {
                 &format_args!("lane {} failed", 3)
             ),
             "[django-bolt] WARNING bolt_core::lane: lane 3 failed\n"
+        );
+    }
+
+    #[test]
+    fn a_line_break_in_the_message_does_not_start_a_new_record() {
+        assert_eq!(
+            format_record(
+                Level::Error,
+                "bolt_asgi::asgi_http",
+                &format_args!("boom\r\n[django-bolt] ERROR fake: injected")
+            ),
+            "[django-bolt] ERROR bolt_asgi::asgi_http: boom\\r\\n[django-bolt] ERROR fake: injected\n"
         );
     }
 }

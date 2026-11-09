@@ -294,7 +294,12 @@ The effective level of the `django_bolt` logger sets the level of these records.
 Bolt reads the level once, when `runbolt` starts the server or a test client starts.
 A later change of the level does not apply to the Rust records.
 A record of a lower level costs one check in Rust and is not formatted.
-The default level is `WARNING`.
+Without a `LOGGING` setting, Bolt sets this level to `DEBUG` when `DEBUG = True`, and to `WARNING` when `DEBUG = False`.
+With your own `LOGGING`, the level of `django_bolt` applies.
+If `LOGGING` does not set it, Python uses the level of the root logger.
+
+Other crates, such as Actix, write only their `WARNING` and `ERROR` records.
+Bolt writes a line break in a message as `\n`, so each record stays on one line.
 
 To see the debug records of the Rust core, set the level of `django_bolt` to `DEBUG`:
 
