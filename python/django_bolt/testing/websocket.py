@@ -245,7 +245,9 @@ class WebSocketTestClient:
 
         It refuses the messages that the server refuses, with the same errors.
         """
-        msg_type = message.get("type", "")
+        if "type" not in message:
+            raise KeyError("Missing 'type' key")
+        msg_type = message["type"]
 
         if msg_type == "websocket.accept":
             subprotocol = message.get("subprotocol")
@@ -268,7 +270,14 @@ class WebSocketTestClient:
             self._decide(None)
 
         elif msg_type == "websocket.send":
-            if "text" not in message and "bytes" not in message:
+            # The server reads 'text' first. It reads 'bytes' only when 'text' is absent.
+            if "text" in message:
+                if not isinstance(message["text"], str):
+                    raise TypeError(f"websocket.send 'text' must be str, not {type(message['text']).__name__}")
+            elif "bytes" in message:
+                if not isinstance(message["bytes"], (bytes, bytearray)):
+                    raise TypeError(f"websocket.send 'bytes' must be bytes, not {type(message['bytes']).__name__}")
+            else:
                 raise ValueError("websocket.send requires 'text' or 'bytes'")
             if not self._accepted:
                 if not self._handshake_decided():
