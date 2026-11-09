@@ -326,6 +326,7 @@ pub fn create_test_app(
     if error_renderer.is_some() {
         bolt_core::error::enable_error_info();
     }
+    crate::logging::install(py)?;
     // Without read_django_settings, the CORS, static and media settings are not
     // read at all, so their warnings do not show either.
     let mut config = ServerConfig::read(py, read_django_settings)?;

@@ -943,6 +943,7 @@ dependencies = [
  "futures-util",
  "http 1.5.0",
  "libc",
+ "log",
  "mimalloc",
  "notify",
  "once_cell",

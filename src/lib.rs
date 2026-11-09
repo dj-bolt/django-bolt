@@ -5,6 +5,7 @@ use bolt_core::request::PyRequest;
 mod dev_reload;
 mod error_formatter;
 mod handler;
+mod logging;
 mod native;
 mod normalize;
 mod response_body;
