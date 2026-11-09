@@ -39,8 +39,8 @@ class WebSocket:
         self._scope = scope
         self._receive = receive
         self._send = send
+        # The only lifecycle field. See ``WebSocketState`` for the transitions.
         self._state = WebSocketState.CONNECTING
-        self._accepted = False
 
     @property
     def state(self) -> WebSocketState:
@@ -104,15 +104,18 @@ class WebSocket:
         """
         Accept the WebSocket connection.
 
-        Must be called before sending or receiving messages.
+        Call it before you send or receive messages. A second call does nothing.
+        A call after close raises ``RuntimeError``.
 
         Args:
             subprotocol: One of ``subprotocols``. The server sends it in the
                 ``Sec-WebSocket-Protocol`` header of the 101 response.
             headers: Extra ``(name, value)`` byte pairs for the 101 response.
         """
-        if self._accepted:
+        if self._state is WebSocketState.CONNECTED:
             return
+        if self._state is WebSocketState.DISCONNECTED:
+            raise RuntimeError("WebSocket is closed: accept() cannot open it again")
 
         message: dict[str, Any] = {"type": "websocket.accept"}
         if subprotocol is not None:
@@ -122,15 +125,15 @@ class WebSocket:
 
         await self._send(message)
         self._state = WebSocketState.CONNECTED
-        self._accepted = True
 
     async def receive(self) -> dict[str, Any]:
         """
         Receive a raw WebSocket message.
 
-        Returns a dict with 'type' key indicating message type.
+        Returns a dict with 'type' key indicating message type. Before
+        ``accept()``, the first call returns the ``websocket.connect`` event.
         """
-        if self._state == WebSocketState.DISCONNECTED:
+        if self._state is WebSocketState.DISCONNECTED:
             raise WebSocketDisconnect(CloseCode.NORMAL)
 
         message = await self._receive()
@@ -143,14 +146,20 @@ class WebSocket:
 
         return message
 
+    async def _receive_data(self) -> dict[str, Any]:
+        """Receive a data message. Only an accepted connection has data messages."""
+        if self._state is WebSocketState.CONNECTING:
+            raise RuntimeError("WebSocket is not accepted: call accept() before receive()")
+        return await self.receive()
+
     async def receive_text(self) -> str:
         """Receive a text message."""
-        message = await self.receive()
+        message = await self._receive_data()
         return message.get("text", "")
 
     async def receive_bytes(self) -> bytes:
         """Receive a binary message."""
-        message = await self.receive()
+        message = await self._receive_data()
         return message.get("bytes", b"")
 
     async def receive_json(self, mode: str = "text") -> Any:
@@ -169,8 +178,10 @@ class WebSocket:
 
     async def send(self, message: dict[str, Any]) -> None:
         """Send a raw WebSocket message."""
-        if self._state != WebSocketState.CONNECTED:
-            raise RuntimeError("WebSocket is not connected")
+        if self._state is WebSocketState.CONNECTING:
+            raise RuntimeError("WebSocket is not accepted: call accept() before send()")
+        if self._state is WebSocketState.DISCONNECTED:
+            raise RuntimeError("WebSocket is closed: send() is not possible")
         try:
             await self._send(message)
         except OSError as exc:
@@ -212,9 +223,10 @@ class WebSocket:
             code: WebSocket close code (default: 1000 Normal Closure)
             reason: Human-readable close reason
         """
-        if self._state == WebSocketState.DISCONNECTED:
+        if self._state is WebSocketState.DISCONNECTED:
             return
 
+        # Close before accept refuses the handshake with 403.
         self._state = WebSocketState.DISCONNECTED
         # A client that left needs no close frame.
         with contextlib.suppress(OSError):

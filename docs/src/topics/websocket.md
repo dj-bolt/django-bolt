@@ -343,7 +343,18 @@ States:
 
 - `WebSocketState.CONNECTING` - Before `accept()`
 - `WebSocketState.CONNECTED` - After `accept()`
-- `WebSocketState.DISCONNECTED` - After close
+- `WebSocketState.DISCONNECTED` - After close, or after the client leaves
+
+The state only moves forward. A call that the state does not allow raises `RuntimeError`.
+The message names the state and the method:
+
+| Call | `CONNECTING` | `CONNECTED` | `DISCONNECTED` |
+|------|--------------|-------------|----------------|
+| `accept()` | Accepts | Does nothing | `RuntimeError` |
+| `send_text()`, `send_bytes()`, `send_json()` | `RuntimeError` | Sends | `RuntimeError` |
+| `receive_text()`, `receive_bytes()`, `receive_json()` | `RuntimeError` | Receives | `WebSocketDisconnect` |
+| `receive()` | The first call gives `websocket.connect` | Receives | `WebSocketDisconnect` |
+| `close()` | Refuses the handshake with 403 | Closes | Does nothing |
 
 ## OpenAPI metadata
 
