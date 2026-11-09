@@ -346,6 +346,18 @@ fn stop_worker(worker: &mut Option<Child>, timeout: Duration) -> PyResult<()> {
     Ok(())
 }
 
+/// Whether a watcher error differs from the last one logged, and remember it.
+///
+/// A poll watcher reports the same error, such as an unreadable directory, on
+/// each scan. The supervisor logs it once, and again when the error changes.
+fn is_new_watch_error(last: &mut Option<String>, err: &str) -> bool {
+    if last.as_deref() == Some(err) {
+        return false;
+    }
+    *last = Some(err.to_string());
+    true
+}
+
 /// Why the file watcher gave no change.
 #[derive(Debug, PartialEq, Eq)]
 enum WatchError {
@@ -548,6 +560,8 @@ fn run_dev_reloader_inner(
     let mut reload_count = 0u64;
     // None while the worker is dead and the supervisor waits for a change.
     let mut worker = Some(spawn_worker(&command, reload_count)?);
+    // The last watcher error logged, so a repeated error is logged once.
+    let mut last_watch_error: Option<String> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -582,6 +596,8 @@ fn run_dev_reloader_inner(
 
         match recv_change(&rx, &filter, debounce, recv_timeout) {
             Ok(Some(changed_path)) => {
+                // After a reload, a watcher error that comes back is news again.
+                last_watch_error = None;
                 paint.log(&format!(
                     "{} {}",
                     paint.green("reloading"),
@@ -597,7 +613,9 @@ fn run_dev_reloader_inner(
                 return Ok(0);
             }
             Err(WatchError::Notify(err)) => {
-                paint.log(&paint.yellow(&format!("watcher error: {}", err)));
+                if is_new_watch_error(&mut last_watch_error, &err) {
+                    paint.log(&paint.yellow(&format!("watcher error: {}", err)));
+                }
             }
             Err(WatchError::Disconnected) => {
                 // Without a watcher, the session cannot reload. Do not wait with no end.
@@ -637,8 +655,8 @@ pub fn run_dev_reloader(
 mod tests {
     use super::{
         Paint, ReloadFilter, WatchError, color_enabled, display_path, first_relevant_file_in,
-        first_relevant_path, format_exit_status, is_temporary_path, recv_change,
-        terminal_worker_exit_code, wait_for_child_exit,
+        first_relevant_path, format_exit_status, is_new_watch_error, is_temporary_path,
+        recv_change, terminal_worker_exit_code, wait_for_child_exit,
     };
     use notify::{
         Event, EventKind,
@@ -961,6 +979,25 @@ mod tests {
             paths: vec![PathBuf::from(path)],
             attrs: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_repeated_watcher_error_is_logged_once_until_it_changes() {
+        let mut last = None;
+
+        assert!(is_new_watch_error(
+            &mut last,
+            "permission denied about /srv"
+        ));
+        // A poll watcher reports the same error on each scan.
+        assert!(!is_new_watch_error(
+            &mut last,
+            "permission denied about /srv"
+        ));
+        assert!(is_new_watch_error(&mut last, "no space left"));
+        // A reload clears the last error, so the next one shows again.
+        last = None;
+        assert!(is_new_watch_error(&mut last, "no space left"));
     }
 
     #[test]
