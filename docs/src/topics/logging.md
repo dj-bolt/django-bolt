@@ -299,7 +299,7 @@ With your own `LOGGING`, the level of `django_bolt` applies.
 If `LOGGING` does not set it, Python uses the level of the root logger.
 
 Other crates, such as Actix, write only their `WARNING` and `ERROR` records.
-Bolt writes a line break in a message as `\n`, so each record stays on one line.
+Bolt escapes each line break in a message, such as `\n` or U+2028, so each record stays on one line.
 
 To see the debug records of the Rust core, set the level of `django_bolt` to `DEBUG`:
 

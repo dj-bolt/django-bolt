@@ -63,12 +63,35 @@ fn level_name(level: Level) -> &'static str {
     }
 }
 
+/// A character at which Python's `str.splitlines()` starts a new line.
+fn is_line_break(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{1c}'
+            ..='\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// Write `\n` and `\r` as these two characters, and each other line break as `\uXXXX`.
+fn escape_line_breaks(message: &str) -> String {
+    let mut escaped = String::with_capacity(message.len() + 8);
+    for c in message.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            c if is_line_break(c) => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 fn format_record(level: Level, target: &str, args: &std::fmt::Arguments<'_>) -> String {
     let mut message = args.to_string();
     // A message can hold text from a request or an exception. Escape its line
     // breaks, so that it cannot start a line that looks like another record.
-    if message.contains(['\n', '\r']) {
-        message = message.replace('\r', "\\r").replace('\n', "\\n");
+    if message.contains(is_line_break) {
+        message = escape_line_breaks(&message);
     }
     format!(
         "[django-bolt] {} {}: {}\n",
@@ -185,6 +208,17 @@ mod tests {
                 &format_args!("boom\r\n[django-bolt] ERROR fake: injected")
             ),
             "[django-bolt] ERROR bolt_asgi::asgi_http: boom\\r\\n[django-bolt] ERROR fake: injected\n"
+        );
+    }
+
+    #[test]
+    fn each_line_break_of_python_splitlines_is_escaped() {
+        // str.splitlines() of Python also breaks a line at these characters.
+        let message = "a\u{0b}b\u{0c}c\u{1c}d\u{1d}e\u{1e}f\u{85}g\u{2028}h\u{2029}i";
+        let line = format_record(Level::Error, "bolt_asgi", &format_args!("{message}"));
+        assert_eq!(
+            line,
+            "[django-bolt] ERROR bolt_asgi: a\\u000bb\\u000cc\\u001cd\\u001de\\u001ef\\u0085g\\u2028h\\u2029i\n"
         );
     }
 }
