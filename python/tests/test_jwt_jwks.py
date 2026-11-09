@@ -9,6 +9,7 @@ tests supply the JWKS directly (``jwks=``) so no network is needed; the
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 
@@ -639,3 +640,71 @@ def test_configuration_error_message_names_the_mistake(kwargs, message):
         JWTAuthentication(**kwargs)
 
     assert str(raised.value) == message
+
+
+AUTH_LOGGER = "django_bolt.auth"
+
+
+def _rotating_api(auth: JWTAuthentication) -> BoltAPI:
+    api = BoltAPI()
+
+    @api.get("/rotating", auth=[auth], guards=[IsAuthenticated()])
+    async def rotating():
+        return {"ok": True}
+
+    return api
+
+
+def _key2_token() -> str:
+    return make_token(KEY2_PRIV, "key-2", iss="https://issuer.example/", aud="api")
+
+
+class TestJwksRefreshFailuresAreLogged:
+    """A failed refresh keeps the last keys. The log is the only sign that the provider fails."""
+
+    def test_an_unreachable_provider_is_logged(self, monkeypatch, caplog):
+        def unavailable(url, timeout):
+            raise auth_backends.httpx.ConnectError("offline")
+
+        auth = _remote_jwks_auth(monkeypatch, JWKS, unavailable)
+
+        with caplog.at_level(logging.WARNING, logger=AUTH_LOGGER):
+            assert auth._refresh_jwks() is None
+
+        [record] = [r for r in caplog.records if r.name == AUTH_LOGGER]
+        assert record.levelno == logging.WARNING
+        assert "https://issuer.example/jwks.json" in record.getMessage()
+        assert str(record.exc_info[1]) == "offline"
+
+    def test_a_malformed_document_is_logged(self, monkeypatch, caplog):
+        auth = _remote_jwks_auth(monkeypatch, JWKS, _serving({"keys": "not-a-list"}))
+
+        with caplog.at_level(logging.WARNING, logger=AUTH_LOGGER):
+            assert auth._refresh_jwks() is None
+
+        [record] = [r for r in caplog.records if r.name == AUTH_LOGGER]
+        assert str(record.exc_info[1]) == "JWKS response must contain a keys array"
+
+    def test_a_document_with_no_usable_key_is_logged(self, monkeypatch, caplog):
+        # Python accepts the shape. Rust finds no key with a kid in it.
+        auth = _remote_jwks_auth(monkeypatch, {"keys": [KEY1_JWK]}, _serving({"keys": []}))
+
+        with caplog.at_level(logging.WARNING, logger=AUTH_LOGGER), TestClient(_rotating_api(auth)) as client:
+            status = client.get("/rotating", headers={"Authorization": f"Bearer {_key2_token()}"}).status_code
+
+        assert status == 401
+        [record] = [r for r in caplog.records if r.name == AUTH_LOGGER]
+        assert "no usable keys" in record.getMessage()
+
+    def test_a_refresh_callback_that_raises_is_logged(self, monkeypatch, caplog):
+        def broken(url, timeout):
+            raise RuntimeError("bug in the fetch")
+
+        auth = _remote_jwks_auth(monkeypatch, {"keys": [KEY1_JWK]}, broken)
+
+        with caplog.at_level(logging.WARNING, logger=AUTH_LOGGER), TestClient(_rotating_api(auth)) as client:
+            status = client.get("/rotating", headers={"Authorization": f"Bearer {_key2_token()}"}).status_code
+
+        assert status == 401
+        [record] = [r for r in caplog.records if r.name == AUTH_LOGGER]
+        assert "bug in the fetch" in record.getMessage()
