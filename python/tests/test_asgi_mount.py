@@ -643,3 +643,26 @@ def test_mount_asgi_head_request_does_not_fake_a_disconnect():
         assert done.wait(timeout=2)
 
     assert seen == ["no-disconnect"]
+
+
+def test_mount_asgi_body_before_start_raises_in_the_app():
+    # ASGI: http.response.start comes first. Bolt buffered an early body chunk and sent it after the start.
+    api = BoltAPI()
+    errors = []
+
+    async def asgi_app(scope, receive, send):
+        await receive()
+        try:
+            await send({"type": "http.response.body", "body": b"early", "more_body": True})
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    api.mount_asgi("/app", asgi_app)
+
+    with TestClient(api) as client:
+        response = client.get("/app/x")
+
+    assert (response.status_code, response.text) == (200, "ok")
+    assert errors == ["http.response.body sent before http.response.start"]

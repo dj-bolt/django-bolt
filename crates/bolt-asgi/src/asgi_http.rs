@@ -163,6 +163,18 @@ impl AsgiSend {
                 }
             }
             "http.response.body" => {
+                // ASGI: the start comes first. Before it, the sender of the start is still here.
+                let start_pending = self
+                    .state
+                    .response_start_tx
+                    .lock()
+                    .map_err(|_| PyRuntimeError::new_err("Failed to lock response_start_tx"))?
+                    .is_some();
+                if start_pending {
+                    return Err(PyRuntimeError::new_err(
+                        "http.response.body sent before http.response.start",
+                    ));
+                }
                 let body = parse_asgi_body(message)?;
                 let more_body = message
                     .get_item("more_body")?
