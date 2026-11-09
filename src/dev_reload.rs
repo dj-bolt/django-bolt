@@ -346,12 +346,33 @@ fn stop_worker(worker: &mut Option<Child>, timeout: Duration) -> PyResult<()> {
     Ok(())
 }
 
+/// Whether a watcher error differs from the last one logged, and remember it.
+///
+/// A poll watcher reports the same error, such as an unreadable directory, on
+/// each scan. The supervisor logs it once, and again when the error changes.
+fn is_new_watch_error(last: &mut Option<String>, err: &str) -> bool {
+    if last.as_deref() == Some(err) {
+        return false;
+    }
+    *last = Some(err.to_string());
+    true
+}
+
+/// Why the file watcher gave no change.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchError {
+    /// notify reported an error. The watcher still runs.
+    Notify(String),
+    /// The watcher stopped. No change can arrive again, so no reload can happen.
+    Disconnected,
+}
+
 fn recv_change(
     rx: &Receiver<notify::Result<Event>>,
     filter: &ReloadFilter,
     debounce: Duration,
     recv_timeout: Duration,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, WatchError> {
     match rx.recv_timeout(recv_timeout) {
         Ok(Ok(event)) => {
             let found = first_relevant_path(&event, filter).or_else(|| {
@@ -376,7 +397,7 @@ fn recv_change(
                             changed_path = next_path;
                         }
                     }
-                    Ok(Err(err)) => return Err(err.to_string()),
+                    Ok(Err(err)) => return Err(WatchError::Notify(err.to_string())),
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -384,9 +405,9 @@ fn recv_change(
 
             Ok(Some(changed_path))
         }
-        Ok(Err(err)) => Err(err.to_string()),
+        Ok(Err(err)) => Err(WatchError::Notify(err.to_string())),
         Err(RecvTimeoutError::Timeout) => Ok(None),
-        Err(RecvTimeoutError::Disconnected) => Err("File watcher disconnected".to_string()),
+        Err(RecvTimeoutError::Disconnected) => Err(WatchError::Disconnected),
     }
 }
 
@@ -537,8 +558,10 @@ fn run_dev_reloader_inner(
     }
 
     let mut reload_count = 0u64;
+    // None while the worker is dead and the supervisor waits for a change.
     let mut worker = Some(spawn_worker(&command, reload_count)?);
-    let mut worker_exited = false;
+    // The last watcher error logged, so a repeated error is logged once.
+    let mut last_watch_error: Option<String> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -569,11 +592,12 @@ fn run_dev_reloader_inner(
                 "server exited with {}. Waiting for changes...",
                 exit_detail
             )));
-            worker_exited = true;
         }
 
         match recv_change(&rx, &filter, debounce, recv_timeout) {
             Ok(Some(changed_path)) => {
+                // After a reload, a watcher error that comes back is news again.
+                last_watch_error = None;
                 paint.log(&format!(
                     "{} {}",
                     paint.green("reloading"),
@@ -582,20 +606,24 @@ fn run_dev_reloader_inner(
                 reload_count += 1;
                 stop_worker(&mut worker, WORKER_STOP_TIMEOUT_RELOAD)?;
                 worker = Some(spawn_worker(&command, reload_count)?);
-                worker_exited = false;
             }
             Ok(None) => {}
-            Err(err) => {
-                if shutdown.load(Ordering::SeqCst) {
-                    stop_worker(&mut worker, WORKER_STOP_TIMEOUT_SHUTDOWN)?;
-                    return Ok(0);
+            Err(_) if shutdown.load(Ordering::SeqCst) => {
+                stop_worker(&mut worker, WORKER_STOP_TIMEOUT_SHUTDOWN)?;
+                return Ok(0);
+            }
+            Err(WatchError::Notify(err)) => {
+                if is_new_watch_error(&mut last_watch_error, &err) {
+                    paint.log(&paint.yellow(&format!("watcher error: {}", err)));
                 }
-
-                if worker_exited {
-                    continue;
-                }
-
-                paint.log(&paint.yellow(&format!("watcher error: {}", err)));
+            }
+            Err(WatchError::Disconnected) => {
+                // Without a watcher, the session cannot reload. Do not wait with no end.
+                paint.log(
+                    &paint.red("file watcher stopped; changes cannot reload the server, exiting"),
+                );
+                stop_worker(&mut worker, WORKER_STOP_TIMEOUT_SHUTDOWN)?;
+                return Ok(1);
             }
         }
     }
@@ -626,9 +654,9 @@ pub fn run_dev_reloader(
 #[cfg(test)]
 mod tests {
     use super::{
-        Paint, ReloadFilter, color_enabled, display_path, first_relevant_file_in,
-        first_relevant_path, format_exit_status, is_temporary_path, recv_change,
-        terminal_worker_exit_code, wait_for_child_exit,
+        Paint, ReloadFilter, WatchError, color_enabled, display_path, first_relevant_file_in,
+        first_relevant_path, format_exit_status, is_new_watch_error, is_temporary_path,
+        recv_change, terminal_worker_exit_code, wait_for_child_exit,
     };
     use notify::{
         Event, EventKind,
@@ -951,6 +979,46 @@ mod tests {
             paths: vec![PathBuf::from(path)],
             attrs: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_repeated_watcher_error_is_logged_once_until_it_changes() {
+        let mut last = None;
+
+        assert!(is_new_watch_error(
+            &mut last,
+            "permission denied about /srv"
+        ));
+        // A poll watcher reports the same error on each scan.
+        assert!(!is_new_watch_error(
+            &mut last,
+            "permission denied about /srv"
+        ));
+        assert!(is_new_watch_error(&mut last, "no space left"));
+        // A reload clears the last error, so the next one shows again.
+        last = None;
+        assert!(is_new_watch_error(&mut last, "no space left"));
+    }
+
+    #[test]
+    fn a_disconnected_watcher_is_reported_apart_from_a_notify_error() {
+        let filter = ReloadFilter::new(vec![], vec![]);
+        let timeout = Duration::from_millis(10);
+        let debounce = Duration::from_millis(50);
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(notify::Error::generic("inotify watch limit")))
+            .unwrap();
+        assert_eq!(
+            recv_change(&rx, &filter, debounce, timeout),
+            Err(WatchError::Notify("inotify watch limit".to_string()))
+        );
+
+        drop(tx);
+        assert_eq!(
+            recv_change(&rx, &filter, debounce, timeout),
+            Err(WatchError::Disconnected)
+        );
     }
 
     #[test]
