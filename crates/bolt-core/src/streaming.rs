@@ -61,12 +61,44 @@ pub fn convert_python_chunk(value: &Bound<'_, PyAny>) -> Option<Bytes> {
     None
 }
 
+/// Logger of errors that a streaming body raises after the response started.
+const STREAM_LOGGER: &str = "django_bolt.streaming";
+const STREAM_ERROR_MESSAGE: &str =
+    "The body of a streaming response raised an error. The response body ends here.";
+
+/// Log an error of a streaming body with its traceback.
+///
+/// The status and headers are already sent, so the client gets a short body.
+/// The log is the only record of the error.
+fn log_stream_error(py: Python<'_>, err: &PyErr) {
+    let logged = (|| -> PyResult<()> {
+        let logger = py
+            .import(pyo3::intern!(py, "logging"))?
+            .call_method1(pyo3::intern!(py, "getLogger"), (STREAM_LOGGER,))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(pyo3::intern!(py, "exc_info"), err.value(py))?;
+        logger.call_method(
+            pyo3::intern!(py, "error"),
+            (STREAM_ERROR_MESSAGE,),
+            Some(&kwargs),
+        )?;
+        Ok(())
+    })();
+    if let Err(log_err) = logged {
+        eprintln!("[django-bolt] {STREAM_ERROR_MESSAGE} {err}. Logging failed: {log_err}");
+    }
+}
+
 const ASYNC_STREAM_FORWARDER: &str = r#"
 import inspect
+import logging
 
 async def forward(gen, sender):
-    iterator = gen.__aiter__() if hasattr(gen, "__aiter__") else gen
+    logger = logging.getLogger("django_bolt.streaming")
+    iterator = None
     try:
+        # Inside the try: an error here must also end the body, or the response waits forever.
+        iterator = gen.__aiter__() if hasattr(gen, "__aiter__") else gen
         while True:
             item = await iterator.__anext__()
             should_continue = sender.send(item)
@@ -78,10 +110,8 @@ async def forward(gen, sender):
     except StopAsyncIteration:
         pass
     except Exception:
-        # Match the existing behavior of terminating the stream when the Python
-        # iterator raises. The response body simply ends instead of surfacing a
-        # noisy "Task exception was never retrieved" diagnostic.
-        pass
+        # The status and headers are already sent. End the body and log the error.
+        logger.exception("The body of a streaming response raised an error. The response body ends here.")
     finally:
         try:
             aclose = getattr(iterator, "aclose", None)
@@ -90,7 +120,7 @@ async def forward(gen, sender):
                 if inspect.isawaitable(maybe_awaitable):
                     await maybe_awaitable
         except Exception:
-            pass
+            logger.warning("Closing the body of a streaming response raised an error.", exc_info=True)
         sender.close()
 "#;
 
@@ -402,7 +432,10 @@ fn create_python_stream_with_config(
                         } else if bound.hasattr(pyo3::intern!(py, "__iter__")).unwrap_or(false) {
                             match bound.call_method0(pyo3::intern!(py, "__iter__")) {
                                 Ok(it) => it.unbind(),
-                                Err(_) => return true,
+                                Err(err) => {
+                                    log_stream_error(py, &err);
+                                    return true;
+                                }
                             }
                         } else {
                             return true;
@@ -419,10 +452,12 @@ fn create_python_stream_with_config(
                                 }
                             }
                             Err(err) => {
-                                if err.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
-                                    return true;
+                                // Any error ends the body. An iterator that is not a
+                                // generator could go on after an error. Do not call it again.
+                                if !err.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                                    log_stream_error(py, &err);
                                 }
-                                break;
+                                return true;
                             }
                         }
                     }
