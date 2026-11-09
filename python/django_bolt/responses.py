@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import msgspec
 from django.core.exceptions import ImproperlyConfigured
+from django.core.signals import setting_changed
 
 # Django import - may fail if Django not configured, kept at top for consistency
 try:
@@ -88,31 +89,44 @@ class CookieMixin:
         return self
 
 
-# Cache for BOLT_ALLOWED_FILE_PATHS - loaded once at server startup
-_ALLOWED_FILE_PATHS_CACHE: list[Path] | None = None
-_ALLOWED_FILE_PATHS_INITIALIZED = False
+# BOLT_ALLOWED_FILE_PATHS, resolved. It has one of three values:
+# - _NOT_LOADED: nothing read the setting yet, or the setting changed (override_settings).
+# - None: no limit.
+# - A list of directories: a FileResponse path must be in one of them.
+_NOT_LOADED: Any = object()
+_allowed_file_paths: list[Path] | None = _NOT_LOADED
 
 
-def initialize_file_response_settings():
+def initialize_file_response_settings() -> None:
+    """Load BOLT_ALLOWED_FILE_PATHS if it is not loaded.
+
+    runbolt calls it at startup, so a wrong value stops the server before the first request.
+    Otherwise the first FileResponse loads the setting.
     """
-    Initialize FileResponse settings cache at server startup.
-    This should be called once when the server starts to cache BOLT_ALLOWED_FILE_PATHS.
-    """
-    global _ALLOWED_FILE_PATHS_CACHE, _ALLOWED_FILE_PATHS_INITIALIZED
+    global _allowed_file_paths
 
-    if _ALLOWED_FILE_PATHS_INITIALIZED:
+    if _allowed_file_paths is not _NOT_LOADED:
         return
 
     try:
         if django_settings and hasattr(django_settings, "BOLT_ALLOWED_FILE_PATHS"):
-            _ALLOWED_FILE_PATHS_CACHE = _resolve_allowed_file_paths(django_settings.BOLT_ALLOWED_FILE_PATHS)
+            _allowed_file_paths = _resolve_allowed_file_paths(django_settings.BOLT_ALLOWED_FILE_PATHS)
         else:
-            _ALLOWED_FILE_PATHS_CACHE = None
+            _allowed_file_paths = None
     except ImportError:
         # Django not configured, allow any path (development mode)
-        _ALLOWED_FILE_PATHS_CACHE = None
+        _allowed_file_paths = None
 
-    _ALLOWED_FILE_PATHS_INITIALIZED = True
+
+def _unload_changed_allowed_file_paths(*, setting: str, **kwargs: Any) -> None:
+    """Load BOLT_ALLOWED_FILE_PATHS again after override_settings changes it."""
+    global _allowed_file_paths
+
+    if setting == "BOLT_ALLOWED_FILE_PATHS":
+        _allowed_file_paths = _NOT_LOADED
+
+
+setting_changed.connect(_unload_changed_allowed_file_paths)
 
 
 def _resolve_allowed_file_paths(value: object) -> list[Path] | None:
@@ -274,7 +288,9 @@ class FileResponse(CookieMixin):
         status_code: int = 200,
         headers: dict[str, str] | None = None,
     ):
-        self.path = resolve_response_file(path, _ALLOWED_FILE_PATHS_CACHE)
+        if _allowed_file_paths is _NOT_LOADED:
+            initialize_file_response_settings()
+        self.path = resolve_response_file(path, _allowed_file_paths)
         self.media_type = media_type
         self.filename = filename
         self.status_code = status_code

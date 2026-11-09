@@ -361,12 +361,12 @@ def test_permission_denied_reaches_the_formatter_as_forbidden(message, detail):
     assert (data["errors"], data["headers"], data["extra"]) == ([], {}, None)
 
 
-def test_file_response_out_of_the_allowed_dirs_reaches_the_formatter_as_forbidden(settings, monkeypatch, tmp_path):
+def test_file_response_out_of_the_allowed_dirs_reaches_the_formatter_as_forbidden(settings, tmp_path):
     public = tmp_path / "public"
     public.mkdir()
     outside = tmp_path / "secret.txt"
     outside.write_text("secret")
-    _allow_file_paths(settings, monkeypatch, public)
+    _allow_file_paths(settings, public)
     api = BoltAPI(error_formatter=_record)
 
     @api.get("/outside")

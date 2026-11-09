@@ -284,7 +284,7 @@ BOLT_ALLOWED_FILE_PATHS = [
 ]
 ```
 
-The setting is a list or a tuple of absolute paths. Each path is a str or a `Path`. One str is not a list, so it stops startup with `ImproperlyConfigured`. A relative path, such as `""` or `"media"`, also stops startup. `None` or an empty list sets no limit.
+The setting is a list or a tuple of absolute paths. Each path is a str or a `Path`. One str is not a list, so it stops startup with `ImproperlyConfigured`. `runbolt` reads the setting at startup. Under `TestClient`, the first `FileResponse` reads it. `override_settings` changes the limit for the next `FileResponse`. A relative path, such as `""` or `"media"`, also stops startup. `None` or an empty list sets no limit.
 
 When set, `FileResponse` only serves files within these directories. For a path outside them, it raises `ResponseFileNotAllowed`, and Bolt answers 403. When the lookup of a path fails, Bolt follows its links, as `realpath` does, to the point where the lookup stops. Nothing exists below that point, so Bolt completes the path from there as text. When that path is outside these directories, Bolt answers 403, also when the path names no file. Thus a client cannot learn which regular files exist there, on Linux, macOS and Windows. A path can leave these directories with `..` and come back into them. Such a path can still show whether a directory, or a link into these directories, exists outside them.
 
