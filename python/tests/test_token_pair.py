@@ -598,6 +598,36 @@ class TestRotationDetails:
         assert recorded["exp"] == now + 60
 
     @pytest.mark.asyncio
+    async def test_entries_live_until_the_validator_stops_accepting_the_tokens(self, frozen_now):
+        """``JWTAuthentication`` accepts a token until ``exp + leeway``.
+
+        A store can keep an entry only until the ``exp`` that it gets. Thus the
+        ``exp`` of each entry must include the leeway.
+        """
+        recorded = {}
+
+        class ExactExpStore(InMemoryRevocation):
+            async def consume(self, jti, *, exp=None):
+                recorded["consume"] = exp
+                return await super().consume(jti, exp=exp)
+
+            async def revoke_family(self, fam, *, exp=None):
+                recorded["family"] = exp
+                await super().revoke_family(fam, exp=exp)
+
+        store = ExactExpStore()
+        pair = create_token_pair("u", secret=SECRET, refresh_ttl=500)
+
+        rotated = await rotate_refresh_token(
+            pair.refresh_claims, store=store, secret=SECRET, refresh_ttl=1000, leeway=90
+        )
+        assert recorded["consume"] == pair.refresh_claims["exp"] + 90
+
+        with pytest.raises(TokenRotationError):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, refresh_ttl=1000, leeway=90)
+        assert recorded["family"] == rotated.refresh_claims["exp"] + 90
+
+    @pytest.mark.asyncio
     async def test_zero_leeway_is_valid(self):
         pair = create_token_pair("u", secret=SECRET)
 
@@ -700,7 +730,8 @@ class TestRotationDetails:
         with pytest.raises(TokenRotationError):
             await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, refresh_ttl=1000)
 
-        assert recorded["exp"] == pair.refresh_claims["exp"]
+        # The validator accepts the token until ``exp`` plus the default leeway of 60 seconds.
+        assert recorded["exp"] == pair.refresh_claims["exp"] + 60
 
 
 class TestRotationRejections:
