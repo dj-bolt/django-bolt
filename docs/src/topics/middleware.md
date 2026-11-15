@@ -99,6 +99,8 @@ Parameters:
 - `burst` - Maximum burst size (allows short spikes)
 - `key` - What to count per: `"ip"` (the default), `"user"`, `"api_key"` or a request header name
 
+A route takes one rate limit. A second `@rate_limit`, or a `@rate_limit` together with `@middleware(type="rate_limit")`, raises `ValueError`. The config stays on the function, so give each route with `@rate_limit` its own function.
+
 ### Counting per caller
 
 `key="ip"` counts per client address. An IPv6 client counts per /64 network,

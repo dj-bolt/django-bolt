@@ -377,14 +377,13 @@ def middleware(*args, **kwargs):
     def decorator(handler: Callable) -> Callable:
         normalized = normalize_middleware_specs(args, context="route", allow_function_middleware=True)
         for spec in normalized:
-            if isinstance(spec, dict) and spec.get("type") == "cors":
-                _reject_second_cors(handler)
+            if isinstance(spec, dict):
+                _reject_second_config(handler, spec.get("type"))
             attach_middleware(handler, spec)
 
         # Support dict-style middleware metadata (e.g. @middleware(type="cors", ...))
         if kwargs:
-            if kwargs.get("type") == "cors":
-                _reject_second_cors(handler)
+            _reject_second_config(handler, kwargs.get("type"))
             attach_middleware(handler, kwargs)
 
         return handler
@@ -430,7 +429,8 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
 
     Raises:
         TypeError: rps or burst is not an int, or key is not a str.
-        ValueError: rps or burst is less than 1, or key is empty.
+        ValueError: rps or burst is less than 1, key is empty, or the route
+            already has a @rate_limit.
 
     Example:
         @api.get("/api/data")
@@ -449,6 +449,7 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
         raise ValueError("rate_limit key must not be empty")
 
     def decorator(func):
+        _reject_second_config(func, "rate_limit")
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
         func.__bolt_middleware__.append({"type": "rate_limit", "rps": rps, "burst": burst, "key": key})
@@ -457,15 +458,26 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     return decorator
 
 
-def _reject_second_cors(handler: Callable) -> None:
-    """Raise ValueError when the handler already has a cors config.
+# What to do in place of a second config of one type on a function.
+_SECOND_CONFIG_ADVICE = {
+    "cors": "Merge the origins into one @cors",
+    "rate_limit": "Keep one @rate_limit with the limit of the route",
+}
 
-    Two cors configs on one route have no clear order. The config stays on the
-    function, so one function cannot serve two routes with different origins.
+
+def _reject_second_config(handler: Callable, mw_type: Any) -> None:
+    """Raise ValueError when the handler already has a config of this type: cors or rate_limit.
+
+    Two configs of one type on one route have no clear order: Rust uses one of
+    them and drops the other. The config stays on the function, so one
+    function cannot serve two routes with different configs.
     """
-    if any(isinstance(mw, dict) and mw.get("type") == "cors" for mw in getattr(handler, "__bolt_middleware__", ())):
+    if mw_type not in ("cors", "rate_limit"):
+        return
+    if any(isinstance(mw, dict) and mw.get("type") == mw_type for mw in getattr(handler, "__bolt_middleware__", ())):
         raise ValueError(
-            "The function already has a @cors. Merge the origins into one @cors, or give each route its own function."
+            f"The function already has a @{mw_type}. {_SECOND_CONFIG_ADVICE[mw_type]}, "
+            "or give each route its own function."
         )
 
 
@@ -557,7 +569,7 @@ def cors(
         if any(not pattern for pattern in regex_list):
             raise ValueError("@cors() origin_regexes holds an empty pattern, which matches every origin.")
 
-        _reject_second_cors(func)
+        _reject_second_config(func, "cors")
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
 
