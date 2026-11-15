@@ -29,8 +29,9 @@ from .serialization import _render_response_body
 
 logger = logging.getLogger(__name__)
 
-# Pre-computed constant headers (avoid per-error allocation)
-_DEFAULT_JSON_HEADERS: list[tuple[str, str]] = [("content-type", "application/json")]
+# Each response gets its own list, because the public handlers return it and a
+# caller can change it. The entry is a tuple, so the responses can share it.
+_JSON_CONTENT_TYPE: tuple[str, str] = ("content-type", "application/json")
 
 # Django import - may fail if Django not configured
 try:
@@ -53,11 +54,9 @@ def _json_response(
     status_code: int, headers: dict[str, str] | None, payload: Any
 ) -> tuple[int, list[tuple[str, str]], bytes]:
     """Encode ``payload`` as a JSON response tuple with optional extra headers."""
+    response_headers = [_JSON_CONTENT_TYPE]
     if headers:
-        response_headers = list(_DEFAULT_JSON_HEADERS)
         response_headers.extend(headers.items())
-    else:
-        response_headers = _DEFAULT_JSON_HEADERS
     return status_code, response_headers, _json.encode(payload)
 
 
@@ -101,7 +100,8 @@ def http_exception_handler(exc: HTTPException) -> tuple[int, list[tuple[str, str
 
 # Pre-compiled regex patterns for validation error parsing
 _RE_AT_LOCATION = re.compile(r" - at `(.+?)`$")
-_RE_MISSING_FIELD = re.compile(r"Object missing required field `(.+)`")
+# A response error has the name of the struct before this text.
+_RE_MISSING_FIELD = re.compile(r"(?:^|: )Object missing required field `(.+)`$")
 _RE_PATH_SPLIT = re.compile(r"[.\[]")
 
 
@@ -146,7 +146,7 @@ def msgspec_validation_error_to_dict(error: msgspec.ValidationError, root: str =
         msg_part = error_msg
         loc_parts = [root]
 
-    missing_match = _RE_MISSING_FIELD.fullmatch(msg_part)
+    missing_match = _RE_MISSING_FIELD.search(msg_part)
     if missing_match:
         return [{"loc": [*loc_parts, missing_match.group(1)], "msg": msg_part, "type": "missing_field"}]
 
@@ -449,6 +449,7 @@ class BoltError(msgspec.Struct, frozen=True, kw_only=True):
             "forbidden", "not_found", "validation", "rate_limited",
             "payload_too_large", "response_validation" or "internal_error".
         detail: A message for a human. Bolt does not put internal data, such as a file path, in it.
+            It is a dict or a list when an HTTPException has such a detail.
         errors: The field errors. Each one is a dict with "loc", "msg" and "type", and some have "ctx".
             A "response_validation" error has none when DEBUG is off.
         headers: The headers that the error needs, for example WWW-Authenticate
@@ -460,7 +461,7 @@ class BoltError(msgspec.Struct, frozen=True, kw_only=True):
 
     status: int
     kind: str
-    detail: str
+    detail: str | dict[str, Any] | list[Any]
     errors: list[dict[str, Any]] = msgspec.field(default_factory=list)
     headers: dict[str, str] = msgspec.field(default_factory=dict)
     extra: Any = None
@@ -505,7 +506,8 @@ class ProblemDetails(msgspec.Struct, kw_only=True):
     """An error body in the RFC 9457 Problem Details format.
 
     The body has "errors" when the error has field errors. The keys of the
-    "extra" of the error are more members of the body.
+    "extra" of the error are more members of the body. So are the keys of a
+    dict detail, because "detail" is a string.
     """
 
     type: str
@@ -514,6 +516,17 @@ class ProblemDetails(msgspec.Struct, kw_only=True):
     detail: str
     instance: str
     errors: list[ProblemFieldError] = []
+
+
+def _add_extension_members(body: dict[str, Any], members: Any) -> None:
+    """Add a dict as extension members, or another value as the "extra" member. A set member stays."""
+    if isinstance(members, dict):
+        for key, value in members.items():
+            # "errors" is a list of field errors, as ProblemDetails declares it.
+            if key != "errors":
+                body.setdefault(key, value)
+    else:
+        body.setdefault("extra", members)
 
 
 @error_schema(ProblemDetails, media_type="application/problem+json")
@@ -525,23 +538,29 @@ def problem_details(error: BoltError, request: Any) -> Response:
     the error has field errors. The keys of ``error.extra`` are extension
     members. A key with the name of a standard member does not replace it.
     An "errors" key is not used, because "errors" holds only field errors.
+
+    "detail" is a string (RFC 9457 section 3.1.4). A dict or a list detail of
+    an ``HTTPException`` thus goes to extension members, after ``error.extra``
+    and by the same rules. "detail" is then the title.
     """
+    title = _STATUS_TITLES.get(error.status, "Error")
+    detail = error.detail
+    structured = None
+    if not isinstance(detail, str):
+        structured, detail = detail, title
     body: dict[str, Any] = {
         "type": "about:blank",
-        "title": _STATUS_TITLES.get(error.status, "Error"),
+        "title": title,
         "status": error.status,
-        "detail": error.detail,
+        "detail": detail,
         "instance": request.path,
     }
     if error.errors:
         body["errors"] = error.errors
-    if isinstance(error.extra, dict):
-        for key, value in error.extra.items():
-            # "errors" is a list of field errors, as ProblemDetails declares it.
-            if key != "errors":
-                body.setdefault(key, value)
-    elif error.extra is not None:
-        body.setdefault("extra", error.extra)
+    if error.extra is not None:
+        _add_extension_members(body, error.extra)
+    if structured is not None:
+        _add_extension_members(body, structured)
     return Response(body, status_code=error.status, media_type="application/problem+json")
 
 
@@ -670,6 +689,11 @@ def _log_formatted_error(error: BoltError) -> None:
         _log_server_error(error.exception)
 
 
+def _skips_formatter(exc: HTTPException) -> bool:
+    """Whether the default response of ``exc`` goes to the client with no call of the formatter."""
+    return exc.body is not None or exc.status_code < 400
+
+
 def handle_exception_with_formatter(
     formatter: ErrorFormatter | None,
     exc: Exception,
@@ -678,8 +702,10 @@ def handle_exception_with_formatter(
     """Handle an exception with the formatter, or with ``handle_exception`` when there is none.
 
     An HTTPException with a typed body skips the formatter. The handler chose that body.
+    An HTTPException with a status below 400, such as a redirect, also skips it.
+    That response is not an error.
     """
-    if isinstance(exc, HTTPException) and exc.body is not None:
+    if isinstance(exc, HTTPException) and _skips_formatter(exc):
         return http_exception_handler(exc)
     if formatter is not None:
         error = bolt_error_from_exception(exc)
@@ -708,10 +734,10 @@ def render_core_error(
     comes from the exception, as for an error in ``_dispatch``. ``reason`` tells
     the cause of a Rust 500 for the log. The formatter does not get it. The
     result is None when the formatter fails, or for an HTTPException with a
-    typed body. Then Rust sends its default response.
+    typed body or a status below 400. Then Rust sends its default response.
     """
     if exception is not None:
-        if isinstance(exception, HTTPException) and exception.body is not None:
+        if isinstance(exception, HTTPException) and _skips_formatter(exception):
             return None
         error = bolt_error_from_exception(exception)
     else:

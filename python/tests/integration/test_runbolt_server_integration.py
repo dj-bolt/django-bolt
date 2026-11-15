@@ -58,6 +58,16 @@ def test_runbolt_applies_global_cors_settings_at_startup(make_server_project):
     assert response.headers.get("access-control-allow-origin") == "https://example.com"
 
 
+def test_runbolt_runs_the_lifespan_of_a_mounted_api(make_server_project):
+    project = make_server_project(api_module=app_module("mounted_lifespan"))
+
+    with project.start(startup_path="/health") as server:
+        response = server.get("/child/state")
+
+    assert response.status_code == 200
+    assert response.json() == {"started": True}
+
+
 def test_runbolt_prints_system_checks_and_migration_warning(make_server_project):
     """runbolt prints runserver-style startup diagnostics before the banner.
 
@@ -99,6 +109,16 @@ def test_runbolt_with_a_str_bolt_allowed_file_paths_stops_startup(make_server_pr
 
     assert "runbolt exited before the server became ready" in str(excinfo.value)
     assert "BOLT_ALLOWED_FILE_PATHS must be a list of absolute paths, got str '/srv/media'." in str(excinfo.value)
+
+
+def test_runbolt_with_a_bolt_compression_of_a_wrong_type_stops_startup(make_server_project):
+    project = make_server_project(api_module=app_module("hello"), settings_extra="BOLT_COMPRESSION = True\n")
+
+    with pytest.raises(AssertionError) as excinfo, project.start():
+        pass
+
+    assert "runbolt exited before the server became ready" in str(excinfo.value)
+    assert "settings.BOLT_COMPRESSION must be a CompressionConfig, None or False, not bool" in str(excinfo.value)
 
 
 def test_runbolt_failing_system_check_stops_startup(make_server_project):

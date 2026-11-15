@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Annotated, Any, Literal, TypeVar
 from uuid import UUID
 
@@ -27,7 +28,12 @@ class FieldConfig:
     """
 
     read_only: bool = False
-    """If True, field is only included in output (dump), not accepted in input (load)."""
+    """
+    If True, input cannot set the field. Input is a JSON request body, a
+    Query(), Header(), Cookie() or Form() model, model_validate() and
+    model_validate_json(). The field gets its default, so
+    it must have one. Python code and from_model() set the field.
+    """
 
     write_only: bool = False
     """If True, field is only accepted in input (load), not included in output (dump)."""
@@ -39,7 +45,10 @@ class FieldConfig:
     """
 
     alias: str | None = None
-    """Alternative name for this field in JSON input/output."""
+    """
+    Name of this field in JSON, for input and for output. The field name is then
+    not a key of the JSON object. The alias wins over the rename option of the class.
+    """
 
     default: Any = _UNSET
     """Default value for this field."""
@@ -48,22 +57,25 @@ class FieldConfig:
     """Factory function to create default value."""
 
     description: str | None = None
-    """Description for OpenAPI documentation."""
+    """The ``description`` of the property in the OpenAPI schema."""
 
     title: str | None = None
-    """Title for OpenAPI documentation."""
+    """The ``title`` of the property in the OpenAPI schema."""
 
     examples: list[Any] | None = None
-    """Example values for OpenAPI documentation."""
+    """The ``examples`` list of the property in the OpenAPI schema."""
 
     deprecated: bool = False
-    """Mark this field as deprecated in OpenAPI documentation."""
+    """If True, the property has ``deprecated: true`` in the OpenAPI schema."""
 
     exclude: bool = False
     """Always exclude this field from serialization."""
 
     include_in_schema: bool = True
-    """Whether to include this field in OpenAPI schema."""
+    """
+    If False, the OpenAPI schema has no property for this field, also not in
+    ``required``. The field still validates input and is still in the output.
+    """
 
     def has_default(self) -> bool:
         """Check if this field has a default value."""
@@ -137,28 +149,35 @@ def field(
         price: Annotated[float, Meta(ge=0.0)]
 
     Args:
-        read_only: If True, field is only included in output, not accepted in input.
+        read_only: If True, input cannot set the field. Bolt ignores the input value,
+                   and the field gets its default. Give the field a default.
+                   With forbid_unknown_fields=True, the input value is an error.
+                   Python code and from_model() set the field. The OpenAPI request
+                   body schema has no such field. The response schema marks it readOnly.
                    Use for auto-generated fields like `id`, `created_at`.
         write_only: If True, field is only accepted in input, not included in output.
                     Use for sensitive data like `password`.
         source: Source attribute name on the model. Supports dot notation.
                 Example: source="author.name" maps field to instance.author.name
-        alias: Alternative name for this field in JSON input/output.
+        alias: Name of this field in JSON, for input and for output. The input does
+               not accept the field name then. The alias wins over the rename
+               option of the class. Python code still uses the field name.
         default: Default value for this field.
         default_factory: Factory function to create default value (for mutable defaults).
-        description: Description for OpenAPI documentation.
-        title: Title for OpenAPI documentation.
-        examples: Example values for OpenAPI documentation.
-        deprecated: Mark this field as deprecated.
+        description: The description of the property in the OpenAPI schema.
+        title: The title of the property in the OpenAPI schema.
+        examples: A list of example values for the property in the OpenAPI schema.
+        deprecated: If True, the OpenAPI schema marks the property as deprecated.
         exclude: Always exclude this field from serialization.
-        include_in_schema: Whether to include this field in OpenAPI schema.
+        include_in_schema: If False, the OpenAPI schema has no property for this field.
+                           The field still validates input and is still in the output.
 
     Returns:
         A field configuration that can be used as a default value.
 
     Example:
         class UserSerializer(Serializer):
-            id: int = field(read_only=True)
+            id: int = field(read_only=True, default=0)
             email: str = field(source="email_address")
             password: str = field(write_only=True)
             tags: list[str] = field(default_factory=list)
@@ -243,8 +262,8 @@ def get_msgspec_type_for_django_field(field: models.Field) -> Any:
         base_type = float
 
     elif isinstance(field, models.DecimalField):
-        # Decimal is a complex type, but we can use float for JSON API
-        base_type = float
+        # A float loses digits. JSON sends a Decimal as a string, as Django REST Framework does.
+        base_type = Decimal
 
     elif isinstance(field, models.BooleanField):
         base_type = bool
@@ -267,10 +286,10 @@ def get_msgspec_type_for_django_field(field: models.Field) -> Any:
     elif isinstance(field, models.UUIDField):
         base_type = UUID
 
-    # ForeignKey and OneToOneField, its subclass (simplified)
+    # ForeignKey and OneToOneField (a subclass of ForeignKey): the primary key
+    # of the related row. from_model() reads it from `<name>_id`, and to_model()
+    # and update_instance() write it there.
     elif isinstance(field, models.ForeignKey):
-        # For now, just use int (the primary key)
-        # Can be enhanced with nested serializers later
         base_type = int
 
     # ManyToManyField
@@ -284,7 +303,7 @@ def get_msgspec_type_for_django_field(field: models.Field) -> Any:
         base_type = Any
 
     # Handle nullable fields
-    if field.null and not isinstance(field, models.BooleanField):
+    if field.null:
         base_type = base_type | None
 
     # Apply constraints if any

@@ -18,11 +18,15 @@ Example:
 import inspect
 from collections.abc import Callable
 from contextlib import suppress
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
-from django.db.models import Model, ObjectDoesNotExist, QuerySet
+import msgspec
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError
+from django.db.models import AutoField, Model, ObjectDoesNotExist, QuerySet
 
-from ._json import decode
+from ._kwargs.extractors import create_body_extractor
 from ._view_context import _current_action, _current_request
 from .exceptions import HTTPException
 from .pagination import PaginationBase
@@ -46,6 +50,75 @@ def _copy_route_middleware(source: Callable, target: Callable) -> None:
         target.__bolt_middleware__ = list(source.__bolt_middleware__)
     if hasattr(source, "__bolt_skip_middleware__"):
         target.__bolt_skip_middleware__ = set(source.__bolt_skip_middleware__)
+
+
+_REQUEST_PARAM_NAMES = frozenset({"request", "req"})
+
+
+def _plan_request_argument(
+    params: list[inspect.Parameter],
+) -> tuple[list[inspect.Parameter], int | None, str | None, int]:
+    """Find where the handler of a view method gets the request.
+
+    Bolt passes the request to the parameter with the name ``request`` or
+    ``req``. A method with no such parameter gets one in the handler signature,
+    in front. The handler reads it for ``self.request`` and does not pass it on.
+
+    Returns:
+        The handler parameters, the positional index of the request (or None),
+        the keyword name of the request (or None), and the number of leading
+        arguments that the method does not take.
+    """
+    for index, param in enumerate(params):
+        if param.name in _REQUEST_PARAM_NAMES:
+            if param.kind is inspect.Parameter.KEYWORD_ONLY:
+                return params, None, param.name, 0
+            return params, index, None, 0
+
+    kind = (
+        inspect.Parameter.POSITIONAL_ONLY
+        if params and params[0].kind is inspect.Parameter.POSITIONAL_ONLY
+        else inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    return [inspect.Parameter("request", kind), *params], 0, None, 1
+
+
+# PATCH takes a JSON object with a subset of the serializer fields. The body
+# extractor of the framework gives the 422 of a function route for other input.
+_decode_patch_body = create_body_extractor("body", dict[str, Any])
+
+
+def _validate_json_body[S: Serializer](serializer_class: type[S], body: bytes) -> S:
+    """Validate the request body of a write action as ``serializer_class``.
+
+    The body extractor of the framework decodes it. Thus a bad body gives the
+    422 of a function route with the same body type.
+    """
+    return create_body_extractor("body", serializer_class)(body)
+
+
+@cache
+def _primary_key_names(model: type[Model]) -> frozenset[str]:
+    """Return each attribute name that sets the primary key of a ``model`` instance.
+
+    The names include the fields of a composite primary key. They include the
+    primary key of each parent model for multi-table inheritance.
+    """
+    opts = model._meta
+    names = {"pk"}
+    for model_field in (opts.pk, *opts.pk_fields, *(f for f in opts.concrete_fields if f.primary_key)):
+        names.add(model_field.name)
+        names.add(model_field.attname)
+    return frozenset(names)
+
+
+@cache
+def _has_database_primary_key(model: type[Model]) -> bool:
+    """Return True when the database gives the primary key of a new ``model`` row."""
+    pk = model._meta.pk
+    while pk.remote_field is not None and pk.remote_field.parent_link:
+        pk = pk.remote_field.model._meta.pk
+    return isinstance(pk, AutoField)
 
 
 class APIView:
@@ -83,7 +156,7 @@ class APIView:
         return _current_request.get()
 
     @classmethod
-    def as_view(cls, method: str, action: str | None = None) -> Callable:
+    def as_view(cls, method: str, action: str | None = None, **initkwargs: Any) -> Callable:
         """
         Create a handler callable for a specific HTTP method.
 
@@ -98,6 +171,8 @@ class APIView:
         Args:
             method: HTTP method name (lowercase, e.g., "get", "post")
             action: Optional action name for DRF-style methods (e.g., "list", "retrieve")
+            **initkwargs: Attributes of the view instance of this handler. They
+                do not change the class.
 
         Returns:
             Handler function compatible with BoltAPI routing (sync or async)
@@ -137,12 +212,16 @@ class APIView:
         sig = inspect.signature(method_handler)
         params = list(sig.parameters.values())[1:]  # Skip 'self' parameter
 
+        # Decide one time where the request is. A method with no request
+        # parameter gets one in the handler signature, for `self.request`.
+        params, request_index, request_name, skip = _plan_request_argument(params)
+
         # Build new signature without 'self'
         new_sig = sig.replace(parameters=params)
 
         # Create single view instance at registration time (not per-request)
         # This eliminates the per-request instantiation overhead (~40% faster)
-        view_instance = cls()
+        view_instance = cls(**initkwargs)
 
         # Bind the method once to eliminate lookup overhead
         bound_method = method_handler.__get__(view_instance, cls)
@@ -155,16 +234,16 @@ class APIView:
             async def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated async view handler that calls bound method directly."""
                 _current_action.set(_action)
-                _current_request.set(args[0])
-                return await bound_method(*args, **kwargs)
+                _current_request.set(args[request_index] if request_name is None else kwargs[request_name])
+                return await bound_method(*args[skip:], **kwargs)
 
         else:
             # Create sync wrapper for sync methods
             def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated sync view handler that calls bound method directly."""
                 _current_action.set(_action)
-                _current_request.set(args[0])
-                return bound_method(*args, **kwargs)
+                _current_request.set(args[request_index] if request_name is None else kwargs[request_name])
+                return bound_method(*args[skip:], **kwargs)
 
         view_handler.__wrapped__ = method_handler
 
@@ -198,6 +277,9 @@ class APIView:
             view_handler.__bolt_status_code__ = cls.status_code
         if cls.validate_response is not None:
             view_handler.__bolt_validate_response__ = cls.validate_response
+
+        if getattr(method_handler, "validate_response", None) is not None:
+            view_handler.validate_response = method_handler.validate_response
 
         _copy_route_middleware(method_handler, view_handler)
 
@@ -423,7 +505,8 @@ class ViewSet[T: Model](APIView):
             Model instance
 
         Raises:
-            HTTPException: If object not found (404)
+            HTTPException: If object not found (404). A lookup value that the
+                field cannot hold is also not found.
         """
         queryset = await self.get_queryset()
         queryset = await self._apply_filter_queryset(queryset)
@@ -438,8 +521,17 @@ class ViewSet[T: Model](APIView):
                 raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
             lookup_kwargs = {self.lookup_field: params[self.lookup_field]}
         try:
+            # The filter does no database call. The field rejects a value of the
+            # wrong type here, for example "abc" for an integer primary key.
+            queryset = queryset.filter(**lookup_kwargs)
+        except (ValueError, TypeError, ValidationError) as e:
+            if queryset.query.is_sliced:
+                # Not a bad value: Django does not filter a sliced QuerySet.
+                raise
+            raise HTTPException(status_code=404, detail="Not found") from e
+        try:
             # Use aget for async retrieval
-            obj = await queryset.aget(**lookup_kwargs)
+            obj = await queryset.aget()
             return obj
         except ObjectDoesNotExist as e:
             # Django raises DoesNotExist, but we convert to HTTPException
@@ -495,6 +587,11 @@ class ViewSet[T: Model](APIView):
         Subclasses can override this and use ``self.action`` / ``self.request``
         for runtime decisions.  When not overridden, class-level action-specific
         serializer attributes provide the default behavior.
+
+        Bolt also calls this method at registration, to find the response type
+        of a standard action with no return annotation. ``self.action`` is
+        "list" for the list route and "retrieve" for the other routes then.
+        ``self.request`` is not available at registration.
         """
         if action is None:
             with suppress(LookupError):
@@ -502,7 +599,16 @@ class ViewSet[T: Model](APIView):
         return self.__class__._get_default_serializer_class(action)
 
     async def perform_create(self, obj: T):
-        await obj.asave()
+        # INSERT only. A primary key from the request body must not update a row.
+        await obj.asave(force_insert=True)
+
+    def _unwritable_fields(self, serializer_class: type[Serializer], obj: T) -> frozenset[str]:
+        """Return the serializer fields that an update action does not write.
+
+        These are the ``read_only`` fields, the primary key and the lookup field.
+        Thus the request body cannot move the write to a different row.
+        """
+        return serializer_class.__read_only_fields__ | _primary_key_names(type(obj)) | {self.lookup_field}
 
     async def perform_update(self, obj: T):
         await obj.asave()
@@ -583,17 +689,29 @@ class CreateMixin(_ViewSet):
 
         The `data` parameter should be a msgspec.Struct with the fields to create.
         Uses create_serializer_class if defined, otherwise serializer_class.
+
+        The new object does not get a ``read_only`` field of the body. It does not
+        get the primary key of the body when the database gives the primary key.
+
+        Does not update an existing row. A primary key or a unique value that
+        a row already has answers 409.
         """
         serializer_class = self.get_serializer_class("create")
-        validated_obj = serializer_class.model_validate_json(request.body)
+        validated_obj = _validate_json_body(serializer_class, request.body)
 
         # Get the model class
         base_queryset = self._get_base_queryset()
         model = base_queryset.model if base_queryset is not None else (await self.get_queryset()).model
 
         # Create object
-        obj = validated_obj.to_model(model)
-        await self.perform_create(obj)
+        skip = serializer_class.__read_only_fields__
+        if _has_database_primary_key(model):
+            skip = skip | _primary_key_names(model)
+        obj = model(**{name: value for name, value in validated_obj.to_dict().items() if name not in skip})
+        try:
+            await self.perform_create(obj)
+        except IntegrityError as e:
+            raise HTTPException(status_code=409, detail="The object conflicts with an existing object") from e
 
         return obj
 
@@ -607,18 +725,22 @@ class UpdateMixin(_ViewSet):
     """
 
     async def update(self, request: Request):
-        """Update an object (full update)."""
+        """
+        Update an object (full update).
+
+        Writes each serializer field. Does not write a ``read_only`` field, the
+        primary key or the lookup field.
+        """
         obj = await self.get_object()
 
         serializer_class = self.get_serializer_class("update")
-        validated_obj = serializer_class.model_validate_json(request.body)
+        validated_obj = _validate_json_body(serializer_class, request.body)
 
         # Update object fields
-        if validated_obj.__struct_config__.omit_defaults:
-            for key, value in validated_obj.to_dict().items():
+        skip = self._unwritable_fields(serializer_class, obj)
+        for key, value in validated_obj.to_dict().items():
+            if key not in skip:
                 setattr(obj, key, value)
-        else:
-            validated_obj.update_instance(obj)
 
         # Save object
         await self.perform_update(obj)
@@ -635,11 +757,17 @@ class PartialUpdateMixin(_ViewSet):
     """
 
     async def partial_update(self, request: Request):
-        """Update an object (partial update)."""
-        data = decode(request.body)
+        """
+        Update an object (partial update).
+
+        Writes the serializer fields of the body. Does not write a ``read_only``
+        field, the primary key or the lookup field.
+        """
+        data = _decode_patch_body(request.body)
         obj = await self.get_object()
 
         serializer_class = self.get_serializer_class("update")
+        skip = self._unwritable_fields(serializer_class, obj)
         rename_map = getattr(serializer_class, "__rename_map__", {})
         input_key_to_field = {field_name: field_name for field_name in serializer_class.__struct_fields__}
         input_key_to_field.update({alias: field_name for field_name, alias in rename_map.items()})
@@ -647,16 +775,19 @@ class PartialUpdateMixin(_ViewSet):
         patch_data = {}
         for key, value in data.items():
             field_name = input_key_to_field.get(key)
-            if field_name is not None:
+            if field_name is not None and field_name not in skip:
                 patch_data[field_name] = value
 
         if not patch_data:
             return obj
 
+        # msgspec reads the wire names, so the merged data uses them.
         current_state = await serializer_class.afrom_model(obj)
-        merged_data = current_state.to_dict()
-        merged_data.update(patch_data)
-        validated_obj = serializer_class.model_validate(merged_data)
+        merged_data = {rename_map.get(name, name): value for name, value in current_state.to_dict().items()}
+        for field_name, value in patch_data.items():
+            merged_data[rename_map.get(field_name, field_name)] = value
+        # The error handler makes the 422 of a function route from the error of msgspec.
+        validated_obj = msgspec.convert(merged_data, type=serializer_class)
 
         # Apply only the patched fields, but use the validated values.
         for field_name in patch_data:

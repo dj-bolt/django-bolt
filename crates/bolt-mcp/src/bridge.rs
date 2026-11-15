@@ -109,7 +109,7 @@ pub async fn handle_mcp_request(
             }
             // Registration refuses a session backend on a mount. Fail closed.
             AuthGuardResult::Deferred(_) | AuthGuardResult::Unauthorized => {
-                return responses::error_401();
+                return responses::error_401_challenge(mount.auth_challenge.as_ref());
             }
             AuthGuardResult::Forbidden(denial) => {
                 return responses::error_403_denial(denial.as_deref());
