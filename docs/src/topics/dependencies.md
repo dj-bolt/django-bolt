@@ -29,6 +29,8 @@ async def get_profile(user=Depends(get_current_user)):
     return {"id": user.id, "username": user.username}
 ```
 
+A dependency returns its value. Bolt has no cleanup dependencies, so a generator function (a function with `yield`) is not a dependency. Bolt binds each parameter by its name, so a dependency or a handler cannot have `*args` or `**kwargs`. Bolt raises `TypeError` for these shapes when it registers the route.
+
 ### Dependency resolution
 
 When a handler parameter is annotated with `Depends()`, Django-Bolt:
@@ -109,6 +111,8 @@ async def test(
     # expensive_operation is called ONCE, result is reused
     return {"dep1": dep1, "dep2": dep2}
 ```
+
+The async dependencies of a handler run at the same time. A cached dependency that two of them need runs first. Thus it also runs one time.
 
 ### Disabling cache
 
@@ -194,6 +198,21 @@ async def get_data(db=Depends(DatabaseSession)):
     async with db:
         # Use database connection
         pass
+```
+
+An object with a `__call__` method is also a dependency. Bolt reads the parameters of `__call__`. Bolt awaits the call when `__call__` is `async def`:
+
+```python
+class PageSize:
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+
+    async def __call__(self, size: int = 20) -> int:
+        return min(size, self.max_size)
+
+@api.get("/items")
+async def list_items(size=Depends(PageSize(max_size=100))):
+    return {"size": size}
 ```
 
 ## Parameter extraction in dependencies
@@ -321,21 +340,30 @@ class ItemViewSet(ViewSet):
 
 ## Testing with dependencies
 
-Override dependencies in tests:
+Bolt has no API that replaces a dependency in a test. `TestClient` runs each dependency of a route, as `runbolt` does.
+
+To control the value in a test, write the dependency so that it reads data that the test controls. Examples are a request header, a database row or a Django setting:
 
 ```python
+from django.conf import settings
+from django.test import override_settings
+
+from django_bolt import BoltAPI, Depends
 from django_bolt.testing import TestClient
 
-def mock_get_user(request):
-    return User(id=1, username="test")
+api = BoltAPI()
 
-# In tests, the actual dependency is replaced
-@api.get("/profile")
-async def profile(user=Depends(get_current_user)):
-    return {"username": user.username}
 
-# Testing (pseudocode - actual implementation may vary)
-with TestClient(api) as client:
-    # Override dependency
-    response = client.get("/profile")
+def get_page_size() -> int:
+    return settings.PAGE_SIZE
+
+
+@api.get("/items")
+async def list_items(page_size: int = Depends(get_page_size)):
+    return {"page_size": page_size}
+
+
+def test_list_items_uses_the_page_size_setting():
+    with override_settings(PAGE_SIZE=5), TestClient(api) as client:
+        assert client.get("/items").json() == {"page_size": 5}
 ```

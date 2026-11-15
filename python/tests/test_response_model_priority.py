@@ -12,12 +12,15 @@ This test suite verifies that:
 from __future__ import annotations
 
 import inspect
+import sys
 
 import msgspec
+import pytest
 
 import django_bolt.api as api_module
 from django_bolt import BoltAPI
 from django_bolt.serializers import Serializer
+from django_bolt.testing import TestClient
 from django_bolt.typing import is_msgspec_struct
 
 
@@ -128,6 +131,50 @@ def test_return_annotation_fallback_async():
 # ============================================================================
 # Test 3: Both syntaxes produce identical metadata
 # ============================================================================
+
+
+_HANDLER_SOURCE = """
+from __future__ import annotations
+
+import msgspec
+
+
+class Item(msgspec.Struct):
+    id: int
+
+
+def handler(item_id: int) -> Item:
+    return {"id": item_id, "secret": "x"}
+"""
+
+
+def _handler_of_a_module_not_in_sys_modules():
+    namespace = {"__name__": "module_that_is_not_imported"}
+    exec(_HANDLER_SOURCE, namespace)
+    assert namespace["handler"].__module__ not in sys.modules
+    return namespace["handler"]
+
+
+def _handler_with_a_changed_module():
+    namespace = {"__name__": __name__}
+    exec(_HANDLER_SOURCE, namespace)
+    # The new module is in sys.modules, but it does not have the names of the annotations.
+    namespace["handler"].__module__ = "msgspec"
+    return namespace["handler"]
+
+
+@pytest.mark.parametrize("make_handler", [_handler_of_a_module_not_in_sys_modules, _handler_with_a_changed_module])
+def test_annotations_resolve_in_the_globals_of_the_handler(make_handler):
+    """The string annotations of a handler resolve where the handler was defined, not in ``__module__``."""
+    api = BoltAPI()
+    api.get("/items/{item_id}")(make_handler())
+
+    with TestClient(api) as client:
+        response = client.get("/items/5")
+        # The path parameter is an int, and the response has only the fields of Item.
+        assert response.status_code == 200, response.text
+        assert response.json() == {"id": 5}
+        assert client.get("/items/x").status_code == 422
 
 
 def test_both_syntaxes_produce_same_metadata():

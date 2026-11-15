@@ -73,6 +73,7 @@ mod tests {
             None,
             None,
         )
+        .unwrap()
     }
 
     fn origin(value: &str) -> HeaderValue {
