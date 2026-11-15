@@ -215,3 +215,25 @@ def test_runbolt_stops_when_the_host_has_no_address(make_server_project):
 
     assert process.returncode == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
     assert f'cannot resolve host "{host}"' in stderr, stderr
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Multiprocess smoke only runs on Linux.")
+def test_runbolt_processes_two_bind_failure_stops_with_exit_status_1(make_server_project):
+    """No worker can bind the port. The supervisor must stop and report the failure."""
+    project = make_server_project(api_module=app_module("hello"))
+
+    # Hold the port without SO_REUSEPORT, so the bind of each worker fails.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as blocker:
+        blocker.bind((DEFAULT_HOST, 0))
+        blocker.listen(8)
+        port = int(blocker.getsockname()[1])
+
+        process, _ = project.spawn(port=port, processes=2)
+        try:
+            stdout, stderr = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = _terminate_process(process)
+            pytest.fail(f"runbolt kept running after the bind of port {port} failed\nstderr:\n{stderr}")
+
+    assert process.returncode == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    assert stderr.count("Address already in use") == 2, stderr

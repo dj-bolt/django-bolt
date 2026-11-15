@@ -312,3 +312,42 @@ def test_respawn_failed_workers_replaces_crashed_worker(make_server_project):
         new_pid = _wait_for_pid_change(server, first_pid)
         assert new_pid != first_pid
         assert server.get("/health").json() == {"status": "ok"}
+
+
+@_requires_posix
+@pytest.mark.parametrize(
+    "extra_args",
+    [[], ["--max-rss", "4096"], ["--workers-lifetime", "3600"]],
+    ids=["no-limit", "below-max-rss", "below-lifetime"],
+)
+def test_a_worker_below_its_limits_keeps_its_process(make_server_project, extra_args):
+    """The supervisor recycles a worker only at a limit. With no limit, it does not recycle."""
+    project = make_server_project(api_module=app_module("recycling_pid"))
+
+    with project.start(processes=2, extra_args=extra_args) as server:
+        workers = child_pids(server.process.pid)
+        assert len(workers) == 2, workers
+        # The supervisor checks the limits one time each second.
+        time.sleep(3.5)
+
+        assert child_pids(server.process.pid) == workers
+
+
+@_requires_posix
+def test_runbolt_stops_with_exit_status_1_after_each_worker_failed(make_server_project):
+    """A process manager must see the failure when no worker is left."""
+    project = make_server_project(api_module=app_module("recycling_pid"))
+
+    server = project.start(processes=2)
+    try:
+        # Each /die stops one worker with exit status 1. The connection drops.
+        for _ in range(40):
+            if server.process.poll() is not None:
+                break
+            with contextlib.suppress(httpx.HTTPError):
+                server.get("/die", headers={"Connection": "close"})
+        exit_code = server.process.wait(timeout=30)
+    finally:
+        stdout, stderr = server.stop()
+
+    assert exit_code == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
