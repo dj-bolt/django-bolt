@@ -143,6 +143,25 @@ class TestMiddlewareDecorators:
         with pytest.raises(error, match=f"^{re.escape(message)}$"):
             rate_limit(**kwargs)
 
+    @pytest.mark.parametrize(
+        ("inner", "outer"),
+        [
+            (rate_limit(rps=100), rate_limit(rps=1, burst=1)),
+            (rate_limit(rps=100), middleware(type="rate_limit", rps=1)),
+            (middleware(type="rate_limit", rps=100), rate_limit(rps=1)),
+            (middleware({"type": "rate_limit", "rps": 100}), middleware({"type": "rate_limit", "rps": 1})),
+        ],
+        ids=["two-decorators", "keywords-over-decorator", "decorator-over-keywords", "two-dicts"],
+    )
+    def test_a_route_takes_one_rate_limit(self, inner, outer):
+        """Before, the route kept the limit of the bottom decorator and dropped the other, with no error."""
+
+        async def route():
+            return {}
+
+        with pytest.raises(ValueError, match="already has a @rate_limit"):
+            outer(inner(route))
+
     def test_router_rate_limit_with_a_bad_value_stops_the_registration(self):
         """A rate limit dict that does not come from @rate_limit is checked in Rust."""
         api = BoltAPI()
