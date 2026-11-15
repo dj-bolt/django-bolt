@@ -3728,6 +3728,7 @@ class BoltAPI:
         Mount a sub-application at a given path (FastAPI-style).
 
         The mounted app's routes are copied to this app with the path prefix prepended.
+        The ``prefix`` of this app comes before the mount path.
         Each sub-app maintains its own middleware, auth, and configuration.
         The lifespan of the mounted app runs with this app. It starts after
         the lifespan of this app, and it stops before it.
@@ -3783,6 +3784,11 @@ class BoltAPI:
             raise ValueError(
                 "The mounted API sets a different error_formatter. Set the same error_formatter on both APIs, or on one."
             )
+
+        # The prefix of this API applies to the mounted endpoints, as to each
+        # route, native route and ASGI mount of this API.
+        if self.prefix:
+            path = f"{self.prefix}/{path.strip('/')}"
 
         # Normalize path prefix: ensure leading slash, strip trailing slash.
         # A path of only slashes is the root, as an empty path is.
