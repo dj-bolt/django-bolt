@@ -5,12 +5,15 @@ Tests the complete flow from route registration to request handling.
 """
 
 import re
+from dataclasses import dataclass
+from datetime import date
 
 import msgspec
 import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.params import Cookie, File, Form, Header, Path, Query
+from django_bolt.testing import TestClient
 
 
 class User(msgspec.Struct):
@@ -207,6 +210,47 @@ def test_mixed_parameter_sources():
     assert sources["include_details"] == "query"
     assert sources["user_agent"] == "header"
     assert sources["session_id"] == "cookie"
+
+
+@dataclass
+class OrderUpdate:
+    quantity: int
+
+
+def test_parameters_with_no_marker_get_their_source_from_the_type():
+    """With no marker: ``req`` is the request, a dataclass is the body, each other type is a query value."""
+    api = BoltAPI()
+
+    @api.post("/orders/{order_id}")
+    async def update_order(
+        req,
+        order_id: int,
+        order: OrderUpdate,
+        tags: list[int],
+        ship_on: date,
+        note=None,
+    ):
+        return {
+            "path": req.path,
+            "order_id": order_id,
+            "quantity": order.quantity,
+            "tags": tags,
+            "ship_on": ship_on.isoformat(),
+            "note": note,
+        }
+
+    with TestClient(api) as client:
+        response = client.post("/orders/7?tags=1&tags=2&ship_on=2024-01-02&note=fragile", json={"quantity": 3})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "path": "/orders/7",
+        "order_id": 7,
+        "quantity": 3,
+        "tags": [1, 2],
+        "ship_on": "2024-01-02",
+        "note": "fragile",
+    }
 
 
 # ============================================================================
