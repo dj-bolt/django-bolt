@@ -1,10 +1,12 @@
 import builtins
 
+import msgspec
 import pytest
 
 from django_bolt import BoltAPI, ModelViewSet, PageNumberPagination, ReadOnlyModelViewSet, ViewSet, action, paginate
 from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
+from django_bolt.views import APIView
 from tests.test_models import Article
 
 
@@ -222,6 +224,133 @@ def test_viewset_custom_action_with_return_annotation(api, sample_articles, view
         assert "id" not in data
         assert "is_published" not in data
         assert data["title"] == article.title
+
+
+class _Pair(msgspec.Struct):
+    id: int
+
+
+class _TwoPerPage(PageNumberPagination):
+    page_size = 2
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+def test_custom_action_gets_the_view_instance_and_its_arguments(api, kind):
+    """A sync or async @action method runs on a view instance with the request, the action name and the path value."""
+
+    def describe(view, pk: int) -> dict:
+        return {"view": type(view).__name__, "action": view.action, "path": view.request["path"], "pk": pk}
+
+    @api.viewset("/things")
+    class ThingViewSet(ViewSet):
+        @action(methods=["GET"], detail=True)
+        def sync_info(self, request, pk: int) -> dict:
+            """Describe one thing."""
+            return describe(self, pk)
+
+        @action(methods=["GET"], detail=True)
+        async def async_info(self, request, pk: int) -> dict:
+            """Describe one thing."""
+            return describe(self, pk)
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get(f"/things/7/{kind}_info")
+        operation = client.get("/docs/openapi.json").json()["paths"][f"/things/{{pk}}/{kind}_info"]["get"]
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "view": "ThingViewSet",
+        "action": f"{kind}_info",
+        "path": f"/things/7/{kind}_info",
+        "pk": 7,
+    }
+    # The docstring of the method documents the route.
+    assert operation["summary"] == "Describe one thing."
+
+
+def test_viewset_class_settings_apply_to_its_routes(api):
+    """``status_code`` of the class applies to the standard actions, and ``validate_response`` also to an @action."""
+
+    @api.viewset("/things")
+    class ThingViewSet(ViewSet):
+        status_code = 202
+        validate_response = False
+
+        async def list(self, request) -> list[_Pair]:
+            return [{"id": "not a number"}]
+
+        async def create(self, request) -> dict:
+            return {"created": True}
+
+        @action(methods=["GET"], detail=False)
+        async def unchecked(self, request) -> _Pair:
+            return {"id": "not a number"}
+
+        @action(methods=["GET"], detail=False, validate_response=True)
+        async def checked(self, request) -> _Pair:
+            return {"id": "not a number"}
+
+    with TestClient(api) as client:
+        # With validation on, these bodies give 500, because they are not a _Pair.
+        response = client.get("/things")
+        assert (response.status_code, response.json()) == (202, [{"id": "not a number"}])
+        assert client.get("/things/unchecked").json() == {"id": "not a number"}
+
+        # The status code of the class replaces the 201 of the create action.
+        assert client.post("/things").status_code == 202
+        # The argument of @action wins over the class.
+        assert client.get("/things/checked").status_code == 500
+
+
+@pytest.mark.parametrize("kind", ["view", "viewset"])
+def test_validate_response_attribute_of_a_method(api, kind):
+    """A ``validate_response`` attribute on the method function sets the validation of its route."""
+
+    async def unchecked(self, request) -> _Pair:
+        return {"id": "not a number"}
+
+    unchecked.validate_response = False
+
+    if kind == "view":
+
+        @api.view("/things")
+        class ThingView(APIView):
+            get = unchecked
+
+    else:
+
+        @api.viewset("/things")
+        class ThingViewSet(ViewSet):
+            list = unchecked
+
+    with TestClient(api) as client:
+        response = client.get("/things")
+
+    # With validation on, this body gives 500, because it is not a _Pair.
+    assert response.status_code == 200
+    assert response.json() == {"id": "not a number"}
+
+
+def test_viewset_list_with_its_own_paginate_is_paginated_one_time(api):
+    """A list action with @paginate keeps that pagination when the class also sets ``pagination_class``."""
+
+    @api.viewset("/things")
+    class ThingViewSet(ViewSet):
+        pagination_class = PageNumberPagination
+
+        @paginate(_TwoPerPage)
+        async def list(self, request):
+            return [{"id": number} for number in range(5)]
+
+    with TestClient(api) as client:
+        response = client.get("/things")
+
+    assert response.status_code == 200
+    page = response.json()
+    assert page["items"] == [{"id": 0}, {"id": 1}]
+    assert (page["total"], page["page_size"]) == (5, 2)
 
 
 @pytest.mark.parametrize("view_set_class", [ViewSet, ReadOnlyModelViewSet, ModelViewSet])
