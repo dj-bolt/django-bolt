@@ -36,6 +36,21 @@ class ReadOnlyUser(Serializer):
         read_only = {"created"}
 
 
+class StrictConfigReadOnly(Serializer, forbid_unknown_fields=True):
+    name: str
+    id: int = 0
+    tags: list[str] = []
+
+    class Config:
+        read_only = {"id", "tags"}
+
+
+class StrictFieldReadOnly(Serializer, forbid_unknown_fields=True):
+    name: str
+    id: int = field(read_only=True, default=0)
+    tags: list[str] = field(read_only=True, default_factory=list)
+
+
 class NoDefaultBody(Serializer):
     id: int = field(read_only=True)
     name: str
@@ -119,6 +134,44 @@ class TestFieldFunction:
             Strict.model_validate_json(b'{"id": 99, "name": "n"}')
         assert Strict.model_validate({"name": "n"}).id == 0
         assert Strict(id=4, name="n").id == 4
+
+    @pytest.mark.parametrize("Strict", [StrictConfigReadOnly, StrictFieldReadOnly])  # noqa: N803
+    @pytest.mark.parametrize("sent_id", [0, 5])
+    def test_a_strict_body_refuses_each_value_of_a_read_only_field(self, Strict, sent_id):  # noqa: N803
+        """Config.read_only with a plain default is the same as field(read_only=True, default=...).
+
+        An input value that is equal to the default is still an unknown field.
+        """
+        api = BoltAPI()
+
+        async def create(body):
+            return body.dump()
+
+        create.__annotations__ = {"body": Strict, "return": dict}
+        api.post("/strict")(create)
+
+        with TestClient(api) as client:
+            response = client.post("/strict", json={"name": "a", "id": sent_id})
+            assert response.status_code == 422
+            assert "unknown field `id`" in response.text
+            assert client.post("/strict", json={"name": "a", "tags": []}).status_code == 422
+            response = client.post("/strict", json={"name": "a"})
+            assert response.status_code == 200
+            assert response.json() == {"name": "a", "id": 0, "tags": []}
+
+        # Python code sets the field. Each instance gets its own default list.
+        assert Strict(name="a").dump() == {"name": "a", "id": 0, "tags": []}
+        assert Strict(name="a", id=7).dump() == {"name": "a", "id": 7, "tags": []}
+        assert Strict(name="a").tags is not Strict(name="a").tags
+        assert Strict.model_validate({"name": "a"}).id == 0
+        with pytest.raises(msgspec.ValidationError, match="unknown field `id`"):
+            Strict.model_validate({"name": "a", "id": sent_id})
+        # A subset keeps the rule, and it keeps forbid_unknown_fields.
+        subset = Strict.subset("name", "id")
+        assert subset(name="a").dump() == {"name": "a", "id": 0}
+        assert subset.model_validate({"name": "a"}).id == 0
+        with pytest.raises(msgspec.ValidationError, match="unknown field `id`"):
+            subset.model_validate({"name": "a", "id": sent_id})
 
     def test_read_only_field_with_no_default_cannot_validate_input(self):
         """Input has no value for the field, and there is no default to use."""

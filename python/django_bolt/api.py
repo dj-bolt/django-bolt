@@ -387,6 +387,10 @@ def _validate_asgi_mount_conflicts(
             )
 
 
+# RFC 9110 section 15: a final response status is from 200 to 599.
+_MIN_RESPONSE_STATUS = 200
+_MAX_RESPONSE_STATUS = 599
+
 _HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY"})
 
 # A path parameter with a type, for example ``{id:int}``. As the router does,
@@ -576,6 +580,14 @@ def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: s
     new_message = dict(message)
     new_message["headers"] = rewritten
     return new_message
+
+
+class _ErrorResponseFailure(Exception):
+    """Bolt met ``error`` while it built an error response inside the middleware chain."""
+
+    def __init__(self, error: Exception):
+        super().__init__(error)
+        self.error = error
 
 
 def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: bytes) -> ResponseWireV1:
@@ -1736,22 +1748,9 @@ class BoltAPI:
 
         # Scan all attributes in the class
         for name in dir(view_cls):
-            # Skip private attributes and standard action methods
-            if name.startswith("_") or name.lower() in {
-                "get",
-                "post",
-                "put",
-                "patch",
-                "delete",
-                "head",
-                "options",
-                "list",
-                "retrieve",
-                "create",
-                "update",
-                "partial_update",
-                "destroy",
-            }:
+            # Skip private attributes. A method with the name of an HTTP method
+            # or of a standard action is a custom action when it has @action.
+            if name.startswith("_"):
                 continue
 
             attr = getattr(view_cls, name)
@@ -1900,8 +1899,11 @@ class BoltAPI:
         _router_middleware: list[Any] | None = None,
     ):
         # RFC 9110 section 15: a final status is from 200 to 599. A 1xx status is interim.
-        if status_code is not None and not 200 <= int(status_code) <= 599:
-            raise ValueError(f"The status_code of {method} {path} must be an int from 200 to 599, got {status_code}")
+        if status_code is not None and not _MIN_RESPONSE_STATUS <= int(status_code) <= _MAX_RESPONSE_STATUS:
+            raise ValueError(
+                f"The status_code of {method} {path} must be an int "
+                f"from {_MIN_RESPONSE_STATUS} to {_MAX_RESPONSE_STATUS}, got {status_code}"
+            )
 
         def decorator(fn: Callable):
             _check_wrapper_takes_handler_arguments(fn)
@@ -2045,10 +2047,16 @@ class BoltAPI:
                     # Dict mode: per-status-code response schemas
                     # A bool is an int in Python, but it is not a status code.
                     # A key of another type, such as "404", matches no status.
+                    # A response status is from 200 to 599, so a key outside this range matches no response.
                     for code in response_model:
                         if code is not ... and (isinstance(code, bool) or not isinstance(code, int)):
                             raise TypeError(
                                 f"response_model has the key {code!r}. A key must be an integer status code or `...`."
+                            )
+                        if code is not ... and not _MIN_RESPONSE_STATUS <= code <= _MAX_RESPONSE_STATUS:
+                            raise ValueError(
+                                f"response_model has the key {code!r}. A status code key must be "
+                                f"from {_MIN_RESPONSE_STATUS} to {_MAX_RESPONSE_STATUS}."
                             )
                     int_codes = sorted(c for c in response_model if isinstance(c, int))
                     if not int_codes:
@@ -3322,6 +3330,33 @@ class BoltAPI:
             self._log_error_response_failure(request, error)
             raise
 
+    def _chain_error_response(
+        self, handler: Callable, meta: dict[str, Any], error: Exception, request: Any
+    ) -> MiddlewareResponse:
+        """Return the error response for an exception that reaches a Django middleware.
+
+        Django makes the error response inside the middleware chain. The result
+        is the response that ``_dispatch`` makes for the same exception.
+        """
+        if isinstance(error, _ErrorResponseFailure):
+            # An inner Django middleware got no error response. Do not try again.
+            raise error
+        try:
+            if isinstance(error, HTTPException):
+                wire = self._handle_http_exception(error, request)
+            else:
+                if isinstance(error, LaneAffinityError):
+                    handler_id = next(key for key, value in self._handler_meta.items() if value is meta)
+                    self._describe_lane_affinity_error(error, handler, handler_id)
+                # A handler that ran the ORM inline on this thread may have left
+                # a dead connection behind; drop it so the next request reconnects.
+                _drop_broken_connections_after_error()
+                wire = self._handle_generic_exception(error, request=request)
+        except Exception as failure:
+            # Bolt logged the failure. ``_dispatch`` gives it to Rust, as for a route with no middleware.
+            raise _ErrorResponseFailure(failure) from failure
+        return MiddlewareResponse.from_tuple(wire)
+
     @staticmethod
     def _is_python_middleware_spec(middleware_spec: Any) -> bool:
         """Return True for middleware entries that execute in Python."""
@@ -3540,6 +3575,8 @@ class BoltAPI:
         with self._route_executor_lock:
             cached_executor = self._route_executor_cache.get(key)  # pragma: no mutate
             if cached_executor is None:
+                # Django middleware calls this for an exception of the handler.
+                meta["_chain_error_response"] = functools.partial(self._chain_error_response, handler, meta)
                 cached_executor = self._build_route_executor(handler, meta)
                 self._route_executor_cache[key] = cached_executor
 
@@ -3575,8 +3612,9 @@ class BoltAPI:
 
         request_state = request.state
 
-        # Django middleware gets this view in process_view.
-        request_state["_view_func"] = meta["view_func"]
+        # Django middleware reads the view for process_view from the metadata,
+        # and the error response for an exception of the handler.
+        request_state["_route_meta"] = meta
         request_state["_bolt_route_executor"] = self._get_route_executor(handler, meta)
 
         middleware_response = await middleware_chain(request)
@@ -3689,6 +3727,8 @@ class BoltAPI:
 
         except HTTPException as he:
             return self._handle_http_exception(he, request)
+        except _ErrorResponseFailure as failure:
+            raise failure.error from None
         except Exception as e:
             if isinstance(e, LaneAffinityError):
                 self._describe_lane_affinity_error(e, handler, handler_id)

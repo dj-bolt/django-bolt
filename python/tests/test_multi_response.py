@@ -456,6 +456,32 @@ def test_a_key_that_is_not_an_int_or_ellipsis_raises_at_registration(key):
     assert str(excinfo.value) == (f"response_model has the key {key!r}. A key must be an integer status code or `...`.")
 
 
+@pytest.mark.parametrize("key", [99, 199, 600, 700, 0, -1])
+def test_an_int_key_that_is_not_a_response_status_raises_at_registration(key):
+    """A response status is from 200 to 599. A key outside this range matches no response."""
+    api = BoltAPI()
+
+    with pytest.raises(ValueError, match="response_model has the key") as excinfo:
+
+        @api.get("/item", response_model={200: OkSchema, key: ErrorSchema})
+        async def handler():
+            return {"id": 1, "name": "x"}
+
+    assert str(excinfo.value) == f"response_model has the key {key!r}. A status code key must be from 200 to 599."
+
+
+@pytest.mark.parametrize("key", [200, 599])
+def test_an_int_key_at_the_limit_of_the_status_range_registers(key):
+    api = BoltAPI()
+
+    @api.get("/item", response_model={key: OkSchema})
+    async def handler():
+        return key, {"id": 1, "name": "x"}
+
+    with TestClient(api) as client:
+        assert client.get("/item").status_code == key
+
+
 # ============================================================================
 # Edge case: a dict with no 2xx code keeps the default status 200
 # ============================================================================

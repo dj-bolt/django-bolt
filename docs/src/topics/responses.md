@@ -606,6 +606,16 @@ async def bytes_response():
     return b"binary data"  # Content-Type: application/octet-stream
 ```
 
+A response type that names `str` or `bytes` allows such a result with no check, for example `-> str`, `-> str | None` or `-> bytes | Item`. Each other response type validates the result:
+
+```python
+@api.get("/count")
+async def count() -> int:
+    return "abc"  # 500: response validation error
+```
+
+A `str` that the response type converts is JSON. For example, `-> UUID` with a `str` result sends the UUID in quotes as `application/json`.
+
 ## Empty responses
 
 For 204 No Content responses:

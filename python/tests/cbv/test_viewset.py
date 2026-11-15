@@ -401,6 +401,29 @@ def test_viewset_action_inheritance(api, view_set_class: type):
         assert response.json() == {"message": "from child"}
 
 
+def test_custom_action_with_the_name_of_an_http_method_or_a_standard_action(api):
+    """An @action method is a route for each method name, also ``options``, ``head`` or ``list``."""
+
+    @api.viewset("/products")
+    class ProductViewSet(ViewSet):
+        @action(methods=["GET"], detail=False)
+        async def options(self, request):
+            return {"options": ["color", "size"]}
+
+        @action(methods=["GET"], detail=True)
+        async def head(self, request, pk: int):
+            return {"head": pk}
+
+        @action(methods=["GET"], detail=False)
+        async def list(self, request):
+            return {"list": "custom"}
+
+    with TestClient(api) as client:
+        assert client.get("/products/options").json() == {"options": ["color", "size"]}
+        assert client.get("/products/7/head").json() == {"head": 7}
+        assert client.get("/products/list").json() == {"list": "custom"}
+
+
 def test_viewset_registers_sync_standard_actions(api):
     """A sync standard action gets its route, as a sync APIView method and a sync @action do."""
 

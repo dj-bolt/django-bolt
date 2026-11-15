@@ -52,7 +52,7 @@ from .decorators import (
     collect_field_validators,
     collect_model_validators,
 )
-from .fields import FieldConfig, _FieldMarker
+from .fields import FieldConfig, _FieldMarker, field
 from .loading import LoadingPlan, build_loading_plan
 from .nested import resolve_nested_config, validate_nested_field
 
@@ -68,6 +68,8 @@ _STRUCT_META = type(msgspec.Struct)
 _MODEL_VALUE_NOOP_TYPES = (str, int, float, bool, bytes, type(None))
 # msgspec keeps a mutable default ([], {} or default_factory=...) as an object of this type.
 _MSGSPEC_FACTORY = type(msgspec.defstruct("_FactoryProbe", [("value", list, [])]).__struct_defaults__[0])
+# The type of the result of ``msgspec.field()``.
+_MSGSPEC_FIELD = type(msgspec.field())
 
 
 @dataclass(frozen=True)
@@ -357,6 +359,41 @@ def _get_django_relation_info(model_cls: type, attr_name: str) -> _DjangoRelatio
     return None
 
 
+# msgspec makes a new object from an empty default of these types for each instance.
+_EMPTY_MUTABLE_DEFAULTS = (list, dict, set, bytearray)
+
+
+def _mark_config_read_only_defaults(namespace: dict[str, Any]) -> None:
+    """
+    Give each ``Config.read_only`` field with a plain default a ``field()`` marker default.
+
+    ``id: int = 0`` with ``Config.read_only = {"id"}`` then is the same as
+    ``id: int = field(read_only=True, default=0)``. The marker tells an absent
+    field from an input value that is equal to the default.
+
+    This applies to a field that the class body declares. A field of a base
+    class keeps its struct default, and so does a ``msgspec.field()`` default.
+    """
+    config = namespace.get("Config")
+    read_only = getattr(config, "read_only", None)
+    if not read_only:
+        return
+    for field_name in read_only:
+        if field_name not in namespace:
+            continue
+        default = namespace[field_name]
+        if isinstance(default, (_FieldMarker, _MSGSPEC_FIELD)) or hasattr(default, "__get__"):
+            # A marker, a msgspec field, or a method or property with this name.
+            continue
+        if isinstance(default, _EMPTY_MUTABLE_DEFAULTS):
+            if default:
+                # msgspec refuses this default with its own message.
+                continue
+            namespace[field_name] = field(read_only=True, default_factory=type(default))
+        else:
+            namespace[field_name] = field(read_only=True, default=default)
+
+
 class _SerializerMeta(_STRUCT_META):
     """
     Custom metaclass that forces kw_only=True for all Serializer subclasses.
@@ -368,6 +405,7 @@ class _SerializerMeta(_STRUCT_META):
     def __new__(mcs, name: str, bases: tuple, namespace: dict, **kwargs):
         # Force kw_only=True for all Serializer subclasses
         kwargs.setdefault("kw_only", True)
+        _mark_config_read_only_defaults(namespace)
 
         # field() with no default is not a default value. Take the marker out of
         # the class body, so msgspec reports a missing value as it does for a
@@ -805,8 +843,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 raise ImproperlyConfigured(cls._read_only_no_default_message(field_name))
             if forbid_unknown:
                 value = getattr(self, field_name)
-                # An absent ``field()`` field holds its marker. A plain default
-                # has no such sign, so an input value equal to it passes.
+                # An absent ``field()`` field holds its marker. Config.read_only
+                # gives a plain default of the class body a marker too. The plain
+                # default of a base class field or of ``msgspec.field()`` has no
+                # such sign, so an input value equal to it passes.
                 if not isinstance(value, _FieldMarker) if is_marker else value != default:
                     raise ValueError(f"Object contains unknown field `{input_name}`")
             _setattr(self, field_name, default)
