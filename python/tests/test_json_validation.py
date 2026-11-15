@@ -333,6 +333,76 @@ class TestParseMsgspecDecodeError:
         assert detail["loc"] == ("body", 2, len('"b": ') + 1)
 
 
+@pytest.mark.parametrize("method", ["post", "put", "patch"])
+def test_a_dict_parameter_with_no_marker_is_the_json_body(method):
+    """A query string cannot hold a dict. A route whose method has a body reads the dict from the JSON body."""
+    api = BoltAPI()
+    route = getattr(api, method)
+
+    @route("/plain")
+    async def plain(data: dict):
+        return {"data": data}
+
+    @route("/typed/{item_id}")
+    async def typed(item_id: int, counts: dict[str, int], page: int = 1):
+        return {"item_id": item_id, "counts": counts, "page": page}
+
+    @route("/optional")
+    async def optional(data: dict | None = None):
+        return {"data": data}
+
+    # A list of simple values stays a repeated query parameter.
+    @route("/numbers")
+    async def numbers(ids: list[int]):
+        return {"ids": ids}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        send = getattr(client, method)
+        response = send("/plain", json={"a": 1, "b": [2]})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"data": {"a": 1, "b": [2]}}
+
+        response = send("/typed/7?page=2", json={"a": 1})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"item_id": 7, "counts": {"a": 1}, "page": 2}
+
+        response = send("/typed/7", json={"a": "x"})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"][0] == "body"
+
+        # A JSON array is not a dict.
+        assert send("/plain", json=[1]).status_code == 422
+
+        assert send("/optional", json={"a": 1}).json() == {"data": {"a": 1}}
+        assert send("/numbers?ids=1&ids=2").json() == {"ids": [1, 2]}
+
+        operations = client.get("/docs/openapi.json").json()["paths"]
+        plain_operation = operations["/plain"][method]
+        assert plain_operation["requestBody"]["content"]["application/json"]["schema"] == {"type": "object"}
+        assert "parameters" not in plain_operation
+        typed_operation = operations["/typed/{item_id}"][method]
+        assert typed_operation["requestBody"]["content"]["application/json"]["schema"] == {
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+        }
+        assert [parameter["name"] for parameter in typed_operation["parameters"]] == ["item_id", "page"]
+        assert "requestBody" not in operations["/numbers"][method]
+
+
+def test_a_dict_parameter_of_a_get_route_stays_a_query_parameter():
+    """A GET route has no body. Its registration does not fail for a dict parameter."""
+    api = BoltAPI()
+
+    @api.get("/search")
+    async def search(filters: dict | None = None):
+        return {"filters": filters}
+
+    with TestClient(api) as client:
+        assert client.get("/search").json() == {"filters": None}
+
+
 class TestMsgspecStructValidation:
     """Test msgspec struct validation failures."""
 

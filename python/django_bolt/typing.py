@@ -396,6 +396,10 @@ def is_dataclass_type(annotation: Any) -> bool:
         return False
 
 
+# The methods whose request has a body. See the method check in _kwargs/model.py.
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+
 def infer_param_source(name: str, annotation: Any, path_params: set[str], http_method: str) -> str:
     """
     Infer parameter source based on type and context.
@@ -406,6 +410,9 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     3. If simple type (str, int, float, bool) -> "query"
     4. If msgspec.Struct or dataclass -> "body" (method validation happens later)
     5. Default -> "query"
+
+    A ``dict`` or ``dict[K, V]`` is "body" on a POST, PUT or PATCH route. A
+    query string cannot hold a dict. On each other method it stays "query".
 
     Args:
         name: Parameter name
@@ -432,6 +439,11 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     # 3. Simple types -> query params
     if is_simple_type(unwrapped):
         return "query"
+
+    # A dict comes only from a JSON body. A method with no body keeps the
+    # default, so the registration of such a route does not fail.
+    if (unwrapped is dict or get_origin(unwrapped) is dict) and http_method in _BODY_METHODS:
+        return "body"
 
     # 4. Sequence of simple types -> query (for list params)
     if is_sequence_type(unwrapped):
