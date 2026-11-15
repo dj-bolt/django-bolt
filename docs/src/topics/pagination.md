@@ -106,6 +106,8 @@ async def list_articles(request):
 
 Both approaches work identically. The serializer automatically filters fields - only declared fields are included in the response.
 
+The item type can also be a plain `msgspec.Struct`. Bolt converts each page as it converts a `list[Struct]` response type with no `@paginate`. An item that does not fit the Struct gives a response validation error (status 500). `build_response()` then gets instances of the Struct as `items`.
+
 ## ViewSet with Pagination
 
 ```python
