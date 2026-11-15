@@ -92,6 +92,46 @@ def field_has_upload_file(field: FieldDefinition) -> bool:
     return False
 
 
+# The sources whose keys a query, cookie or form struct can get.
+_STRUCT_KEY_SOURCES = {"query": ("query",), "cookie": ("cookie",), "form": ("form", "file")}
+
+
+def _keys_of_other_fields(field: FieldDefinition, fields: list[FieldDefinition]) -> frozenset[str]:
+    """Return the keys that the other parameters read from the source of a struct parameter.
+
+    Only a struct that forbids unknown fields needs them: its extractor gets
+    the complete query, cookie or form map, and the keys of the other
+    parameters are not unknown. For any other field the result is empty.
+    """
+    sources = _STRUCT_KEY_SOURCES.get(field.source)
+    annotation = unwrap_optional(field.annotation)
+    if sources is None or not is_msgspec_struct(annotation) or not annotation.__struct_config__.forbid_unknown_fields:
+        return frozenset()
+    keys: set[str] = set()
+    for other in fields:
+        if other is field or other.source not in sources:
+            continue
+        other_type = unwrap_optional(other.annotation)
+        if is_msgspec_struct(other_type):
+            keys.update(struct_field.encode_name for struct_field in msgspec.structs.fields(other_type))
+        else:
+            keys.add(other.alias or other.name)
+    return frozenset(keys)
+
+
+def _attach_extractors(fields: list[FieldDefinition]) -> None:
+    """Attach the pre-compiled extractor to each field that has one.
+
+    This runs after all fields exist, because the extractor of a struct that
+    forbids unknown fields needs the keys of the other fields.
+    """
+    for field in fields:
+        extractor = create_extractor_for_field(field, _keys_of_other_fields(field, fields))
+        if extractor is not None:
+            # Use object.__setattr__ since FieldDefinition is frozen
+            object.__setattr__(field, "extractor", extractor)
+
+
 def classify_handler_pattern(
     fields: list[FieldDefinition], meta: HandlerMetadata, needs_form_parsing: bool
 ) -> HandlerPattern:
@@ -210,14 +250,11 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
             explicit_marker=explicit_marker,
         )
 
-        # Attach pre-compiled extractor to field (performance optimization)
-        # This allows the injector to call the extractor directly without source checking
-        extractor = create_extractor_for_field(field)
-        if extractor is not None:
-            # Use object.__setattr__ since FieldDefinition is frozen
-            object.__setattr__(field, "extractor", extractor)
-
         field_definitions.append(field)
+
+    # Attach pre-compiled extractors to the fields (performance optimization)
+    # This allows the injector to call the extractor directly without source checking
+    _attach_extractors(field_definitions)
 
     # HTTP Method Validation: Ensure GET/HEAD/DELETE/OPTIONS don't have body params
     body_fields = [f for f in field_definitions if f.source == "body"]
@@ -357,12 +394,10 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
             explicit_marker=explicit_marker,
         )
 
-        # Attach pre-compiled extractor to field
-        extractor = create_extractor_for_field(field)
-        if extractor is not None:
-            object.__setattr__(field, "extractor", extractor)
-
         field_definitions.append(field)
+
+    # Attach pre-compiled extractors to the fields
+    _attach_extractors(field_definitions)
 
     meta["fields"] = field_definitions
 
