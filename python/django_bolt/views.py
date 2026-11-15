@@ -21,12 +21,13 @@ from contextlib import suppress
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
+import msgspec
 from django.core.exceptions import ValidationError
 from django.db.models import AutoField, Model, ObjectDoesNotExist, QuerySet
 
-from ._json import decode
+from ._kwargs.extractors import create_body_extractor
 from ._view_context import _current_action, _current_request
-from .exceptions import HTTPException
+from .exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
 from .pagination import PaginationBase
 from .request import Request
 from .serializers.base import Serializer
@@ -48,6 +49,25 @@ def _copy_route_middleware(source: Callable, target: Callable) -> None:
         target.__bolt_middleware__ = list(source.__bolt_middleware__)
     if hasattr(source, "__bolt_skip_middleware__"):
         target.__bolt_skip_middleware__ = set(source.__bolt_skip_middleware__)
+
+
+# PATCH takes a JSON object with a subset of the serializer fields. The body
+# extractor of the framework gives the 422 of a function route for other input.
+_decode_patch_body = create_body_extractor("body", dict[str, Any])
+
+
+def _validate_json_body[S: Serializer](serializer_class: type[S], body: bytes) -> S:
+    """Validate the request body of a write action as ``serializer_class``.
+
+    A body that is not JSON gives the 422 of a function route (``json_invalid``).
+    """
+    try:
+        return serializer_class.model_validate_json(body)
+    except msgspec.ValidationError:
+        # ValidationError is a subclass of DecodeError. The error handler makes its 422.
+        raise
+    except msgspec.DecodeError as e:
+        raise RequestValidationError(errors=[parse_msgspec_decode_error(e, body)], body=body) from e
 
 
 @cache
@@ -653,7 +673,7 @@ class CreateMixin(_ViewSet):
         get the primary key of the body when the database gives the primary key.
         """
         serializer_class = self.get_serializer_class("create")
-        validated_obj = serializer_class.model_validate_json(request.body)
+        validated_obj = _validate_json_body(serializer_class, request.body)
 
         # Get the model class
         base_queryset = self._get_base_queryset()
@@ -687,7 +707,7 @@ class UpdateMixin(_ViewSet):
         obj = await self.get_object()
 
         serializer_class = self.get_serializer_class("update")
-        validated_obj = serializer_class.model_validate_json(request.body)
+        validated_obj = _validate_json_body(serializer_class, request.body)
 
         # Update object fields
         skip = self._unwritable_fields(serializer_class, obj)
@@ -716,7 +736,7 @@ class PartialUpdateMixin(_ViewSet):
         Writes the serializer fields of the body. Does not write a ``read_only``
         field, the primary key or the lookup field.
         """
-        data = decode(request.body)
+        data = _decode_patch_body(request.body)
         obj = await self.get_object()
 
         serializer_class = self.get_serializer_class("update")
