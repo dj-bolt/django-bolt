@@ -405,6 +405,80 @@ class TestMiddlewareEntryValidation:
 
         assert events == ["function", "class"]
 
+    @pytest.mark.parametrize(
+        ("build", "error", "message"),
+        [
+            (
+                lambda: middleware(cors={"origins": ["https://a.test"]}),
+                TypeError,
+                "@middleware() does not take the keyword argument 'cors'. Use @cors(...).",
+            ),
+            (
+                lambda: middleware(skip=["auth"]),
+                TypeError,
+                "@middleware() does not take the keyword argument 'skip'. Use @skip_middleware(...).",
+            ),
+            (
+                lambda: middleware(rate_limit={"rps": 1}),
+                TypeError,
+                "@middleware() does not take the keyword argument 'rate_limit'. Use @rate_limit(...).",
+            ),
+            (
+                lambda: middleware(origins=["https://a.test"]),
+                TypeError,
+                "@middleware() does not take the keyword argument 'origins'. "
+                'Give middleware classes as positional arguments. A dict config needs type="cors" or type="rate_limit".',
+            ),
+            (
+                lambda: middleware(type="bogus"),
+                ValueError,
+                "route middleware dict has the unknown type 'bogus'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+            (
+                lambda: middleware({"type": "bogus"})(_plain_function),
+                ValueError,
+                "route middleware dict has the unknown type 'bogus'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+            (
+                lambda: middleware({"origins": ["https://a.test"]})(_plain_function),
+                ValueError,
+                "route middleware dict has no 'type'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+            (
+                lambda: BoltAPI(middleware=[{"type": "Cors", "origins": ["https://a.test"]}]),
+                ValueError,
+                "api middleware dict has the unknown type 'Cors'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+            (
+                lambda: Router(middleware=[{"rps": 1}]),
+                ValueError,
+                "router middleware dict has no 'type'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+        ],
+        ids=[
+            "kwarg-cors",
+            "kwarg-skip",
+            "kwarg-rate-limit",
+            "kwarg-other",
+            "kwarg-type-unknown",
+            "dict-type-unknown",
+            "dict-no-type",
+            "api-dict-type-case",
+            "router-dict-no-type",
+        ],
+    )
+    def test_a_form_that_no_middleware_reads_raises(self, build, error, message):
+        # Before, Bolt kept the entry and nothing read it: the route had no such middleware.
+        with pytest.raises(error) as raised:
+            build()
+
+        assert str(raised.value) == message
+
     def test_dict_entries_pass_through_unchanged(self):
         entry = {"type": "rate_limit", "rps": 1, "burst": 2, "key": "ip"}
 
