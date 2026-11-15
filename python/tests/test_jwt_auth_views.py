@@ -103,27 +103,6 @@ def test_cookies_are_secure_unless_the_project_turns_it_off(secure_cookies):
         assert "HttpOnly" in attributes
 
 
-def test_views_use_the_given_key_algorithm_and_prefix():
-    """Login signs with the secret, algorithm and ``kid`` of the views. The refresh route accepts these tokens."""
-    api = _views_api(algorithm="HS512", kid="key-1", prefix="/api/auth-X/", secure_cookies=False)
-
-    with TestClient(api) as client:
-        login = client.post("/api/auth-X/login", json=LOGIN)
-        assert login.status_code == 200
-        access = client.cookies.get("access_token")
-        refresh = client.cookies.get("refresh_token")
-        for token in (access, refresh):
-            assert jwt.get_unverified_header(token)["kid"] == "key-1"
-            assert jwt.decode(token, SECRET, algorithms=["HS512"])["sub"] == "view-user"
-        # Only the new prefix has routes.
-        assert client.post("/auth/login", json=LOGIN).status_code == 404
-
-        refreshed = client.post("/api/auth-X/refresh", headers=NO_CSRF_ORIGIN)
-        assert refreshed.status_code == 200, refreshed.text
-        assert client.cookies.get("refresh_token") != refresh
-        assert client.post("/api/auth-X/logout", headers=NO_CSRF_ORIGIN).status_code == 200
-
-
 @pytest.mark.parametrize(
     ("prefix", "path"),
     [("/", "/"), ("", "/"), ("/auth", "/auth"), ("/api/auth/", "/api/auth")],
@@ -145,6 +124,27 @@ def test_refresh_cookie_path_is_the_prefix_of_the_routes(prefix, path):
         assert logout.status_code == 200, logout.text
         # The cookie that clears the refresh cookie has the same path, or the browser keeps the cookie.
         assert refresh_cookie_path(logout) == f"Path={path}"
+
+
+def test_views_use_the_given_key_algorithm_and_prefix():
+    """Login signs with the secret, algorithm and ``kid`` of the views. The refresh route accepts these tokens."""
+    api = _views_api(algorithm="HS512", kid="key-1", prefix="/api/auth-X/", secure_cookies=False)
+
+    with TestClient(api) as client:
+        login = client.post("/api/auth-X/login", json=LOGIN)
+        assert login.status_code == 200
+        access = client.cookies.get("access_token")
+        refresh = client.cookies.get("refresh_token")
+        for token in (access, refresh):
+            assert jwt.get_unverified_header(token)["kid"] == "key-1"
+            assert jwt.decode(token, SECRET, algorithms=["HS512"])["sub"] == "view-user"
+        # Only the new prefix has routes.
+        assert client.post("/auth/login", json=LOGIN).status_code == 404
+
+        refreshed = client.post("/api/auth-X/refresh", headers=NO_CSRF_ORIGIN)
+        assert refreshed.status_code == 200, refreshed.text
+        assert client.cookies.get("refresh_token") != refresh
+        assert client.post("/api/auth-X/logout", headers=NO_CSRF_ORIGIN).status_code == 200
 
 
 def test_refresh_cookie_without_a_jti_is_rejected():
