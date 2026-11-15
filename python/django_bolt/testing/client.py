@@ -10,6 +10,7 @@ This version uses async-native Rust testing infrastructure which provides:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import threading
 import warnings
@@ -27,7 +28,9 @@ from django_bolt.api import (
     _routes_and_native_routes,
     _validate_asgi_mount_conflicts,
     _validate_mcp_mount_conflicts,
+    run_lifespans,
 )
+from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.testing.dbshare import SharedConnections
 
 logger = logging.getLogger(__name__)
@@ -130,8 +133,8 @@ class BoltTestTransport(httpx.BaseTransport):
         path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
-        # Extract headers
-        headers = [(k.decode("utf-8"), v.decode("utf-8")) for k, v in request.headers.raw]
+        # Extract headers. An HTTP server removes the spaces and tabs around a value.
+        headers = [(k.decode("utf-8"), v.decode("utf-8").strip(" \t")) for k, v in request.headers.raw]
 
         # Get body
         if hasattr(request, "_content"):
@@ -200,8 +203,8 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
         path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
-        # Extract headers
-        headers = [(k.decode("utf-8"), v.decode("utf-8")) for k, v in request.headers.raw]
+        # Extract headers. An HTTP server removes the spaces and tabs around a value.
+        headers = [(k.decode("utf-8"), v.decode("utf-8").strip(" \t")) for k, v in request.headers.raw]
 
         # Get body
         if hasattr(request, "_content"):
@@ -357,6 +360,7 @@ class TestClient(httpx.Client):
         # the finalizer then releases the state.
         self._validate_asgi_mount_conflicts(api)
         self._validate_mcp_mount_conflicts(api)
+        refuse_unread_route_config(api._routes, api._websocket_routes)
 
         # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
@@ -434,7 +438,7 @@ class TestClient(httpx.Client):
             _warn_if_inside_atomic_block()
         if self.api._has_lifespan:
             loop = asyncio.new_event_loop()
-            cm = self.api._lifespan_context(self.api)
+            cm = run_lifespans(self.api._source_lifespans)
             try:
                 loop.run_until_complete(cm.__aenter__())
             except BaseException:
@@ -599,45 +603,37 @@ class TestClient(httpx.Client):
         Yields:
             Chunks of response content
         """
+        # A chunk can end inside a multi-byte character. The decoder keeps the part for the next chunk.
+        decoder = codecs.getincrementaldecoder("utf-8")() if decode_unicode else None
         pos = 0
         while pos < len(content):
             chunk = content[pos : pos + chunk_size]
             pos += chunk_size
 
-            if decode_unicode:
-                yield chunk.decode("utf-8")
-            else:
+            if decoder is None:
                 yield chunk
+            else:
+                text = decoder.decode(chunk, final=pos >= len(content))
+                if text:
+                    yield text
 
     @staticmethod
-    def _iter_response_lines(content: bytes, decode_unicode: bool = True) -> Iterator[str]:
+    def _iter_response_lines(content: bytes, decode_unicode: bool = True) -> Iterator[str | bytes]:
         """Iterate over response content line by line.
 
         Args:
             content: Full response content
-            decode_unicode: If True, decode bytes to string (default True)
+            decode_unicode: If True, decode each line to a string (default True). Otherwise give bytes.
 
         Yields:
             Lines from the response
         """
-        buffer = b"" if not decode_unicode else ""
-
-        for chunk in TestClient._iter_response_content(content, chunk_size=8192, decode_unicode=decode_unicode):
-            if chunk:
-                buffer += chunk
-
-                # Split on newlines
-                lines = buffer.split(b"\n") if isinstance(buffer, bytes) else buffer.split("\n")
-
-                # Yield all complete lines, keep incomplete line in buffer
-                for line in lines[:-1]:
-                    yield line if isinstance(line, str) else line.decode("utf-8")
-
-                buffer = lines[-1]
-
-        # Yield any remaining data in buffer
-        if buffer:
-            yield buffer if isinstance(buffer, str) else buffer.decode("utf-8")
+        # Split the bytes, then decode each line. A chunk border can fall inside a character.
+        lines = content.split(b"\n")
+        if not lines[-1]:
+            lines.pop()
+        for line in lines:
+            yield line.decode("utf-8") if decode_unicode else line
 
 
 class AsyncTestClient(httpx.AsyncClient):
@@ -697,6 +693,7 @@ class AsyncTestClient(httpx.AsyncClient):
         # the finalizer then releases the state.
         TestClient._validate_asgi_mount_conflicts(api)
         TestClient._validate_mcp_mount_conflicts(api)
+        refuse_unread_route_config(api._routes, api._websocket_routes)
 
         # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
@@ -773,7 +770,7 @@ class AsyncTestClient(httpx.AsyncClient):
         if self._lifespan is not None:
             raise RuntimeError("AsyncTestClient is already open. Enter it once.")
         if self.api._has_lifespan:
-            cm = self.api._lifespan_context(self.api)
+            cm = run_lifespans(self.api._source_lifespans)
             await cm.__aenter__()
             self._lifespan = cm
         try:

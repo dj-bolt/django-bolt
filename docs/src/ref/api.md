@@ -192,6 +192,7 @@ All route decorators accept these options:
 | `auth` | `list` | Authentication backends |
 | `guards` | `list` | Permission guards |
 | `include_in_schema` | `bool` or `None` | Include in OpenAPI docs. `None` inherits from the view class, then from the `BoltAPI` |
+| `deprecated` | `bool` | Mark the operation as deprecated in OpenAPI docs. The default is `False` |
 
 ### Class-based view decorators
 
@@ -260,6 +261,8 @@ Mount another BoltAPI under a prefix.
 ```python
 api.mount("/v1", v1_api)
 ```
+
+The `prefix` of `api` comes before the mount path. With `BoltAPI(prefix="/api")`, the routes of `v1_api` are at `/api/v1/...`.
 
 #### api.mount_asgi(path, app)
 
@@ -339,6 +342,7 @@ The request dict contains:
 | `headers` | `dict` | Request headers |
 | `body` | `bytes` | Raw request body |
 | `context` | `dict` | Authentication context |
+| `scheme` | `str` | `"http"` or `"https"`. `request.is_secure()` is `True` for `"https"` |
 
 ### Type-safe Request
 
