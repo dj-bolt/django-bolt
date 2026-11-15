@@ -6,6 +6,7 @@ These tests configure Django properly and validate admin via ASGI mounts.
 
 import pytest
 
+from django_bolt.admin.admin_detection import detect_admin_url_prefix, detect_admin_url_prefixes
 from django_bolt.api import BoltAPI
 from django_bolt.testing import TestClient
 
@@ -44,6 +45,154 @@ def test_admin_root_redirect():
         assert len(response.content) > 0, (
             f"Response body is EMPTY! Got {len(response.content)} bytes. Admin mount path is broken."
         )
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("urlconf", "login_path"),
+    [
+        ("tests.admin_tests.urls_regex_prefix", "/manage/login/"),
+        ("tests.admin_tests.urls_include_before_admin", "/backoffice/login/"),
+        ("tests.admin_tests.urls_nested_include", "/portal/internal/staff/login/"),
+        ("tests.admin_tests.urls_custom_site", "/office/login/"),
+    ],
+)
+def test_admin_mount_uses_the_prefix_of_the_admin_site(settings, urlconf, login_path):
+    """The admin answers at the prefix of its URL pattern, also for a regex pattern or a later pattern."""
+    settings.ROOT_URLCONF = urlconf
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        response = client.get(login_path)
+
+    assert response.status_code == 200
+    assert "csrfmiddlewaretoken" in response.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_at_the_root_path_leaves_the_bolt_routes(settings, capsys):
+    """With the admin site at "", Django answers each path that has no Bolt route."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_root_admin"
+    api = BoltAPI()
+
+    @api.get("/items/{item_id}")
+    async def item(item_id: int):
+        return {"item_id": item_id}
+
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    assert "Django answers each path that has no Bolt route" in capsys.readouterr().err
+    with TestClient(api, use_http_layer=True) as client:
+        assert client.get("/items/7").json() == {"item_id": 7}
+        response = client.get("/login/")
+
+    assert response.status_code == 200
+    assert "csrfmiddlewaretoken" in response.text
+
+
+def _use_two_languages(settings, urlconf):
+    settings.ROOT_URLCONF = urlconf
+    settings.LANGUAGE_CODE = "en"
+    settings.LANGUAGES = [("en", "English"), ("fr", "French")]
+    settings.MIDDLEWARE = [
+        "django.contrib.sessions.middleware.SessionMiddleware",
+        "django.middleware.locale.LocaleMiddleware",
+        "django.middleware.common.CommonMiddleware",
+        "django.middleware.csrf.CsrfViewMiddleware",
+        "django.contrib.auth.middleware.AuthenticationMiddleware",
+        "django.contrib.messages.middleware.MessageMiddleware",
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_in_i18n_patterns_answers_for_each_language(settings):
+    """The admin answers at the prefix of each language, and Django redirects the path with no prefix."""
+    _use_two_languages(settings, "tests.admin_tests.urls_i18n")
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        english = client.get("/en/admin/login/")
+        french = client.get("/fr/admin/login/")
+        no_prefix = client.get("/admin/login/", follow_redirects=False)
+
+    assert english.status_code == 200
+    assert '<html lang="en"' in english.text
+    assert french.status_code == 200
+    assert '<html lang="fr"' in french.text
+    # LocaleMiddleware of Django redirects to the prefix of the default language.
+    assert no_prefix.status_code == 302
+    assert no_prefix.headers["location"] == "/en/admin/login/"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_in_i18n_patterns_with_no_prefix_for_the_default_language(settings):
+    """With prefix_default_language=False, the default language has no prefix."""
+    _use_two_languages(settings, "tests.admin_tests.urls_i18n_no_default_prefix")
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        english = client.get("/admin/login/")
+        french = client.get("/fr/admin/login/")
+
+    assert english.status_code == 200
+    assert '<html lang="en"' in english.text
+    assert french.status_code == 200
+    assert '<html lang="fr"' in french.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_in_i18n_patterns_uses_the_default_language_that_django_serves(settings):
+    """With LANGUAGE_CODE "en-us" and no "en-us" in LANGUAGES, Django serves the default language at /en/."""
+    _use_two_languages(settings, "tests.admin_tests.urls_i18n")
+    settings.LANGUAGE_CODE = "en-us"
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        # runbolt shows the first prefix in its banner.
+        banner = client.get(f"/{detect_admin_url_prefix()}/login/")
+        no_prefix = client.get("/admin/login/", follow_redirects=False)
+        default_code = client.get("/en-us/admin/login/")
+
+    assert banner.status_code == 200
+    assert '<html lang="en"' in banner.text
+    assert no_prefix.status_code == 302
+    assert no_prefix.headers["location"] == "/en/admin/login/"
+    # Django has no page at the prefix of LANGUAGE_CODE.
+    assert default_code.status_code == 404
+    assert detect_admin_url_prefixes() == ["en/admin", "admin", "fr/admin"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_in_i18n_patterns_with_no_prefix_keeps_the_path_of_language_code(settings):
+    """With prefix_default_language=False, Django serves LANGUAGE_CODE "en-us" at the path with no prefix."""
+    _use_two_languages(settings, "tests.admin_tests.urls_i18n_no_default_prefix")
+    settings.LANGUAGE_CODE = "en-us"
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    assert detect_admin_url_prefixes() == ["admin", "en/admin", "fr/admin"]
+    with TestClient(api, use_http_layer=True) as client:
+        banner = client.get(f"/{detect_admin_url_prefix()}/login/")
+        english = client.get("/en/admin/login/")
+
+    assert banner.status_code == 200
+    assert english.status_code == 200
+
+
+def test_admin_behind_a_path_parameter_prints_a_warning(settings, capsys):
+    """A prefix with a path parameter cannot be a mount. runbolt names the way to serve it."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_path_parameter"
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    err = capsys.readouterr().err
+    assert err.count("[django-bolt] Warning") == 1
+    assert "path parameter" in err
+    assert 'api.mount_django("/", clear_root_path=True)' in err
 
 
 @pytest.mark.django_db(transaction=True)
@@ -88,3 +237,20 @@ def test_admin_login_page():
         # Should contain login form
         body_text = response.text.lower()
         assert "login" in body_text or "django" in body_text, f"Expected login content, got: {body_text[:200]}"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_mount_serves_only_the_admin_prefix(settings):
+    """The admin mount gives Django the admin prefix, not each path of the URLconf."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_site_page"
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        admin_response = client.get("/admin/login/")
+        site_response = client.get("/site/")
+
+    assert admin_response.status_code == 200
+    assert "csrfmiddlewaretoken" in admin_response.text
+    assert site_response.status_code == 404
+    assert "a page of Django" not in site_response.text
