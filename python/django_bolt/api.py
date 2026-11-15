@@ -602,7 +602,8 @@ class BoltAPI:
             compression: Compression configuration. Pass a `CompressionConfig`
                 to override defaults. Omit (or pass `None`) to apply the default
                 config. Pass `False` to disable compression entirely on this
-                `BoltAPI`. `settings.BOLT_COMPRESSION` takes precedence over
+                `BoltAPI`. Each other value raises `TypeError`.
+                `settings.BOLT_COMPRESSION` takes precedence over
                 this argument in production.
             openapi_config: OpenAPI documentation configuration
             validate_response: Default response validation policy for registered routes
@@ -684,8 +685,10 @@ class BoltAPI:
             self._compression = None
         elif compression is None:
             self._compression = CompressionConfig()
-        else:
+        elif isinstance(compression, CompressionConfig):
             self._compression = compression
+        else:
+            raise TypeError(f"compression must be a CompressionConfig, None or False, not {type(compression).__name__}")
 
         # OpenAPI configuration - enabled by default with sensible defaults
         if openapi_config is None:
