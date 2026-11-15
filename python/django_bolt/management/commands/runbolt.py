@@ -553,6 +553,37 @@ def _project_api_module_names(root_urlconf: str) -> list[str]:
     return package_module_names
 
 
+# Option name -> (lowest value, highest value). None means no limit.
+# The server panics for more than 512 worker threads.
+_OPTION_RANGES: dict[str, tuple[int, int | None]] = {
+    "port": (0, 65535),
+    "processes": (1, None),
+    "workers": (1, 512),
+    "backlog": (0, None),
+    "keep_alive": (0, None),
+    "max_rss": (0, None),
+    "workers_lifetime": (0, None),
+    "workers_kill_timeout": (0, None),
+}
+
+
+def _validate_option_ranges(options) -> None:
+    """Raise CommandError for a number that the server cannot use.
+
+    The check runs before startup. Without it, a bad value fails later with
+    a traceback, or starts a server that does not do what the option says.
+    """
+    for name, (lowest, highest) in _OPTION_RANGES.items():
+        value = options[name]
+        if value is None:
+            continue
+        flag = "--" + name.replace("_", "-")
+        if value < lowest:
+            raise CommandError(f"{flag} must be at least {lowest}, got {value}")
+        if highest is not None and value > highest:
+            raise CommandError(f"{flag} must be at most {highest}, got {value}")
+
+
 class Command(BaseCommand):
     help = "Run Django-Bolt server with autodiscovered APIs"
 
@@ -637,10 +668,9 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         self._handle_started = time.monotonic()
         processes = options["processes"]
+        _validate_option_ranges(options)
         if options["workers"] is None:
             options["workers"] = default_worker_threads()
-        elif options["workers"] < 1:
-            raise CommandError("--workers must be at least 1")
         dev_mode = options.get("dev", False)
         dev_worker_mode = os.environ.get(_ENV_DEV_WORKER) == "1"
         effective_dev_mode = dev_mode or dev_worker_mode
