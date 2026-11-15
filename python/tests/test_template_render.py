@@ -12,8 +12,10 @@ Note: The test template "test_dashboard.html" is defined in conftest.py via locm
 from __future__ import annotations
 
 import pytest
+from django.test import override_settings
 
 from django_bolt import BoltAPI
+from django_bolt.responses import HTML
 from django_bolt.shortcuts import render
 from django_bolt.testing import TestClient
 
@@ -26,12 +28,31 @@ def api():
     async def dashboard(req):
         return render(req, "test_dashboard.html", {"title": "Dashboard"})
 
+    @api.get("/html")
+    async def html():
+        return HTML("<h1>Dashboard</h1>")
+
+    @api.get("/missing")
+    async def missing(req):
+        return render(req, "page.html", {"title": "Gone"}, status=404, using="second")
+
     return api
 
 
 @pytest.fixture(scope="module")
 def client(api):
     return TestClient(api)
+
+
+def _engine(name: str, template: str) -> dict:
+    return {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "NAME": name,
+        "OPTIONS": {
+            "context_processors": ["django.template.context_processors.request"],
+            "loaders": [("django.template.loaders.locmem.Loader", {"page.html": template})],
+        },
+    }
 
 
 class TestRenderShortcut:
@@ -49,3 +70,18 @@ class TestRenderShortcut:
         assert response.status_code == 200
         content_type = response.headers.get("content-type", "")
         assert "text/html" in content_type
+
+    def test_render_sends_the_content_type_of_html(self, client):
+        # HTML() and render() of Django send the charset. render() of Bolt sent "text/html" only.
+        assert client.get("/html").headers["content-type"] == "text/html; charset=utf-8"
+        assert client.get("/dashboard").headers["content-type"] == "text/html; charset=utf-8"
+
+    def test_render_passes_request_engine_and_status(self, client):
+        engines = [
+            _engine("first", "first {{ title }}"),
+            _engine("second", "second {{ title }} at {{ request.path }}"),
+        ]
+        with override_settings(TEMPLATES=engines):
+            response = client.get("/missing")
+        assert response.status_code == 404
+        assert response.text == "second Gone at /missing"

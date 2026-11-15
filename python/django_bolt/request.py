@@ -102,6 +102,15 @@ class Request(Protocol):
         """Django session (requires SessionMiddleware)"""
         ...
 
+    @property
+    def scheme(self) -> str:
+        """The scheme of the request: "http" or "https", as in ``build_absolute_uri()``."""
+        ...
+
+    def is_secure(self) -> bool:
+        """True when ``scheme`` is "https"."""
+        ...
+
     def __getitem__(self, name: str, /) -> Any:
         """Support `request["args"]`"""
         ...

@@ -97,6 +97,23 @@ data = user.dump(exclude_none=True)
 
 # Exclude default values
 data = user.dump(exclude_defaults=True)
+
+# Exclude fields that hold msgspec.UNSET
+data = user.dump(exclude_unset=True)
+```
+
+Use `exclude_unset` for a partial update. Give each optional field the default `msgspec.UNSET`. A field that the request body does not contain keeps that value, and `dump(exclude_unset=True)` leaves it out:
+
+```python
+import msgspec
+
+class UserPatch(Serializer):
+    username: str | msgspec.UnsetType = msgspec.UNSET
+    email: str | None | msgspec.UnsetType = msgspec.UNSET
+
+patch = UserPatch(email=None)
+patch.dump(exclude_unset=True)
+# {'email': None}
 ```
 
 ### Default values
@@ -120,6 +137,27 @@ class UserSerializer(Serializer):
 user = UserSerializer(username="alice")
 print(user.email)  # None
 ```
+
+### Field aliases
+
+`field(alias=...)` sets the name of a field in JSON. Python code uses the field name:
+
+```python
+from django_bolt.serializers import Serializer, field
+
+class AccountSerializer(Serializer):
+    user_name: str = field(alias="userName")
+    age: int = 0
+
+account = AccountSerializer.model_validate({"userName": "alice"})
+print(account.user_name)  # alice
+print(account.dump())     # {"userName": "alice", "age": 0}
+```
+
+The alias is the key for input and for output: in a request body, in `model_validate()`, in `dump()` and in a response.
+The input does not accept the field name, as with `Field(alias=...)` in pydantic.
+A field has one name in JSON. Thus the `by_alias` argument of `dump()` has no effect.
+The alias wins over the `rename` option of the class.
 
 ## Field validation
 
@@ -367,6 +405,61 @@ TestSerializer(value="test")
 # Prints: "Field validator" then "Model validator"
 ```
 
+### Validator modes
+
+`@field_validator` and `@model_validator` take `mode="after"` (the default) or `mode="before"`.
+
+| Validator | Gets | Returns |
+|-----------|------|---------|
+| `@field_validator(name, mode="before")` | The raw input value, before the type of the field converts it. | The value that the type of the field then validates. Bolt uses the result, also `None`. |
+| `@field_validator(name)` | The value that the type of the field accepted. | The new value, or `None` to keep the value. |
+| `@model_validator(mode="before")` | The raw input data, usually a `dict`. It is a classmethod. | The data to validate. |
+| `@model_validator` | The built instance. | Nothing. |
+
+```python
+from django_bolt.serializers import Serializer, field_validator, model_validator
+
+class OrderSerializer(Serializer):
+    order_id: int
+    tags: list[str] = []
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_old_key(cls, data):
+        if isinstance(data, dict) and "id" in data:
+            data = {**data, "order_id": data["id"]}
+            del data["id"]
+        return data
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def split_tags(cls, value):
+        return value.split(",") if isinstance(value, str) else value
+
+order = OrderSerializer.model_validate({"id": 7, "tags": "a,b"})
+# OrderSerializer(order_id=7, tags=['a', 'b'])
+```
+
+The order does not depend on the order of the definitions:
+
+1. Model validators with `mode="before"`. The last one in the class runs first.
+2. Field validators with `mode="before"`. The last one in the class runs first.
+3. The type conversion and the constraints of msgspec.
+4. Field validators with `mode="after"`, in the order of the class.
+5. Model validators with `mode="after"`, in the order of the class.
+
+After validators of a parent class run before those of a subclass. Before validators of a subclass run before those of a parent class. This is the order of pydantic.
+
+A subclass can define a validator again under the same name. Then only the definition of the subclass runs, at the position of the parent definition. A validator with a new name adds to those of the parent.
+
+Notes:
+
+- Before validators get raw values for a JSON request body, `model_validate()` and `model_validate_json()`, also in a nested serializer. A field validator with `mode="before"` runs only if the input has the field. The keys of the raw data are the names in the input (the names after `rename=`).
+- For an instance that Python code builds (`OrderSerializer(order_id=7)`), msgspec does no type conversion. The before validators then get the values of the fields.
+- If a before validator raises `ValueError` or `TypeError`, Bolt reports the errors of the before validators and stops. The `loc` of an error has the full path, for example `["body", "lines", 0, "qty"]`.
+- A serializer with a before validator, at any depth of a body type, decodes the body to builtins first and then converts it. This is slower than the direct decode. A serializer without one keeps the direct decode.
+- `mode="wrap"` and `mode="plain"` are not supported. The decorator raises `ValueError`.
+
 ## Computed fields
 
 ### Basic computed fields
@@ -581,6 +674,29 @@ mini_user = UserMini.from_parent(full_user)
 print(mini_user.dump())  # {'id': 1, 'name': 'John'}
 ```
 
+## Field options for the OpenAPI document
+
+`field()` takes options that describe a field in the OpenAPI schema of the serializer. They do not change validation or `dump()`.
+
+```python
+from django_bolt.serializers import Serializer, field
+
+class ProductSerializer(Serializer):
+    sku: str = field(description="Stock unit", title="SKU", examples=["AB-1"])
+    old_code: str = field(default="", deprecated=True)
+    trace_id: str = field(default="", include_in_schema=False)
+```
+
+| Option | Effect on the property schema |
+|--------|-------------------------------|
+| `description` | Sets `description`. |
+| `title` | Sets `title`. |
+| `examples` | Sets `examples`, a list of example values. |
+| `deprecated=True` | Sets `deprecated: true`. |
+| `include_in_schema=False` | Leaves the property out of the schema, also out of `required`. |
+
+The options apply to the request body schema and to the response schema. A field with `include_in_schema=False` still validates input and is still in the output of `dump()`.
+
 ## Write-only fields
 
 Hide sensitive fields from output:
@@ -621,7 +737,7 @@ user.dump()
 # {'id': 5, 'name': 'alice'}
 ```
 
-Input is a JSON request body, `model_validate()` and `model_validate_json()`. The rule also applies to a nested serializer in that input. `from_model()` and direct construction set the field.
+Input is a JSON request body, `model_validate()` and `model_validate_json()`. A serializer that is a `Query()`, `Header()`, `Cookie()` or `Form()` model is input too. The rule also applies to a nested serializer in that input. `from_model()` and direct construction set the field.
 
 - Bolt ignores the input value. With `forbid_unknown_fields=True` on the serializer, the input value is an error, as an unknown field is.
 - A read-only field must have a default. Without one, route registration and `model_validate()` raise `ImproperlyConfigured`. A serializer that is only a response needs no default.
@@ -802,6 +918,51 @@ users = [
 result = UserSerializer.only("id", "name").dump_many(users)
 # [{'id': 1, 'name': 'John'}, {'id': 2, 'name': 'Jane'}]
 ```
+
+### From serializer to model
+
+`to_model()` makes an unsaved model instance, and `update_instance()` sets the fields of an existing one.
+A `ForeignKey` or `OneToOneField` field can hold the primary key of the related row:
+
+```python
+class PostCreate(Serializer):
+    title: str
+    author: int  # The primary key of the author
+
+post = PostCreate(title="Hello", author=3).to_model(BlogPost)
+# post.author_id == 3
+await post.asave()
+```
+
+Bolt writes the primary key to `author_id`. A model instance in the field goes to `author`, as before.
+`from_model()` reads the primary key from `author_id`, with no query.
+
+### Serializers from a model
+
+`create_serializer()` makes a Serializer class from the fields of a model:
+
+```python
+from django_bolt.serializers import create_serializer
+
+PostSerializer = create_serializer(BlogPost, fields=["id", "title", "author"])
+```
+
+A `ForeignKey` and a `OneToOneField` get the type `int`, the primary key.
+A `DecimalField` gets the type `Decimal`. The JSON output is a string, such as `"19.99"`, so the value keeps each digit. The input can be a JSON string or a JSON number.
+
+## Config options
+
+The inner `Config` class of a serializer has these options:
+
+| Option | Effect |
+|--------|--------|
+| `write_only` | A set of field names that `dump()` leaves out. |
+| `read_only` | A set of field names that the server sets. |
+| `field_sets` | Named lists of fields for `use()` and `fields()`. |
+| `annotations` | Query annotations that `from_models()` applies to a QuerySet. |
+| `model` | The Django model of the serializer. `create_serializer()` sets it. Bolt does not read it. |
+
+`Config` has no `validators` option. A `Config` that sets `validators` raises `TypeError` when the class is created. Declare validators with `@field_validator` and `@model_validator`.
 
 ## Serializer inheritance
 

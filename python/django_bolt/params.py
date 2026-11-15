@@ -39,7 +39,7 @@ class Param:
     """Alternative name for the parameter in the request"""
 
     embed: bool | None = None
-    """Whether to embed body parameter in wrapper object"""
+    """For a body parameter: True reads the value from the key of its name in a JSON object"""
 
     # Numeric constraints
     gt: float | None = None
@@ -214,11 +214,13 @@ def Body(
     Mark parameter as request body.
 
     Args:
-        default: Default value (... for required)
-        alias: Alternative parameter name
-        embed: Whether to wrap in {<alias>: <value>}
-        description: Parameter description
-        example: Example value
+        default: Default value (... for required). A request with no body gives the default.
+        alias: The key of the value with ``embed=True``, in place of the parameter name.
+            Without ``embed`` it has no effect, as in FastAPI.
+        embed: With True, the body is a JSON object and the value is at the key of the
+            parameter name: ``{"item": {...}}`` for the parameter ``item``.
+        description: Description of the request body in the OpenAPI document
+        example: Example of the request body in the OpenAPI document
 
     Returns:
         Param marker instance
@@ -308,8 +310,8 @@ def Form(
     Args:
         default: Default value (... for required)
         alias: Alternative form field name
-        description: Parameter description
-        example: Example value
+        description: Description of the field in the OpenAPI document
+        example: Example of the field in the OpenAPI document
 
     Returns:
         Param marker instance

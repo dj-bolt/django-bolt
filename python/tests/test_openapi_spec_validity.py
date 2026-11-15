@@ -26,7 +26,7 @@ from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
-from django_bolt.param_functions import Query
+from django_bolt.param_functions import Cookie, Header, Query
 from django_bolt.testing import TestClient
 from django_bolt.websocket.types import WebSocket
 
@@ -166,6 +166,37 @@ def test_query_operation_declares_openapi_3_2_and_validates() -> None:
     assert spec.get("openapi") == "3.2.0"
     assert "query" in spec["paths"]["/search"]
     validate(spec)
+
+
+@pytest.mark.parametrize(("marker", "param_in"), [(Header, "header"), (Cookie, "cookie"), (Query, "query")])
+def test_list_parameter_with_an_empty_default_validates(marker, param_in) -> None:
+    """An empty list default must be a valid value of the parameter schema."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="List API", version="1.0.0"))
+
+    async def tagged(tags=[]):  # noqa: B006
+        pass
+
+    async def named(names=["a"]):  # noqa: B006
+        pass
+
+    # The module has postponed annotations, so the test sets the evaluated types.
+    tagged.__annotations__ = {"tags": Annotated[list[str], marker()], "return": dict}
+    named.__annotations__ = {"names": Annotated[list[str], marker()], "return": dict}
+    api.get("/tagged")(tagged)
+    api.get("/named")(named)
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+
+    validate(spec)
+    (tags,) = spec["paths"]["/tagged"]["get"]["parameters"]
+    assert tags["in"] == param_in
+    assert tags["schema"]["default"] == []
+    assert "minItems" not in tags["schema"]
+    # A header or a cookie that is present gives one value. A default with one item keeps the minimum.
+    (names,) = spec["paths"]["/named"]["get"]["parameters"]
+    assert names["schema"].get("minItems") == (None if param_in == "query" else 1)
 
 
 def test_query_free_spec_keeps_openapi_3_1(full_spec: dict) -> None:
