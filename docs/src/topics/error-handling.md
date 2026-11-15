@@ -417,6 +417,8 @@ An `HTTPException` gets its kind from its status, for example `conflict` for 409
 
 Bolt adds `error.headers` to the response of the formatter. A header that the response sets wins. Thus a 401 keeps `WWW-Authenticate`, and a 429 keeps `Retry-After`.
 
+For a 401 that your code raises on a route with auth backends, Bolt adds the `WWW-Authenticate` header of the route after the formatter runs. Thus `error.headers` does not have this header, but the response has it. A 401 of the Rust core has the header in `error.headers`.
+
 An `HTTPException` with a typed `body` keeps its body. The route declares that body, so the formatter does not get the error.
 
 On the request of an error from the Rust core, `method`, `path`, `headers` and `get_full_path()` work. `query` is empty, so use `get_full_path()` to read the query string. The other request data is empty.

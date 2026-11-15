@@ -12,7 +12,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django_bolt.exceptions import HTTPException
 from django_bolt.responses import JSON
 
-from .backends import JWTAuthentication
+from .backends import JWTAuthentication, www_authenticate_challenge
 from .guards import IsAuthenticated
 from .tokens import TokenRotationError, create_token_pair, rotate_refresh_token, set_token_cookies
 
@@ -125,6 +125,10 @@ class JWTAuthViews:
             require_jti=True,
         )
 
+        # The login route has no auth backend, so Rust has no challenge for its 401.
+        # The 401 names the scheme of the tokens that the route gives (RFC 9110 section 15.5.2).
+        login_challenge = {"WWW-Authenticate": www_authenticate_challenge([refresh_auth])}
+
         # A custom credential_validator can return a user that is not a row of
         # the Django user model. Bolt cannot load that user from the token.
         check_user = self.credential_validator == self._authenticate
@@ -133,7 +137,7 @@ class JWTAuthViews:
         async def login(request: Any, credentials: LoginCredentials):
             user = await self.credential_validator(request, credentials)
             if user is None or not getattr(user, "is_active", True):
-                raise HTTPException(status_code=401, detail="Invalid credentials")
+                raise HTTPException(status_code=401, detail="Invalid credentials", headers=login_challenge)
             user_id = str(user.pk)
             version = await self.store.get_user_version(user_id)
             pair = create_token_pair(
