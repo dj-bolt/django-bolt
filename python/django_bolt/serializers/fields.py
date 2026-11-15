@@ -27,7 +27,11 @@ class FieldConfig:
     """
 
     read_only: bool = False
-    """If True, field is only included in output (dump), not accepted in input (load)."""
+    """
+    If True, input cannot set the field. Input is a JSON request body,
+    model_validate() and model_validate_json(). The field gets its default, so
+    it must have one. Python code and from_model() set the field.
+    """
 
     write_only: bool = False
     """If True, field is only accepted in input (load), not included in output (dump)."""
@@ -39,7 +43,10 @@ class FieldConfig:
     """
 
     alias: str | None = None
-    """Alternative name for this field in JSON input/output."""
+    """
+    Name of this field in JSON, for input and for output. The field name is then
+    not a key of the JSON object. The alias wins over the rename option of the class.
+    """
 
     default: Any = _UNSET
     """Default value for this field."""
@@ -140,13 +147,19 @@ def field(
         price: Annotated[float, Meta(ge=0.0)]
 
     Args:
-        read_only: If True, field is only included in output, not accepted in input.
+        read_only: If True, input cannot set the field. Bolt ignores the input value,
+                   and the field gets its default. Give the field a default.
+                   With forbid_unknown_fields=True, the input value is an error.
+                   Python code and from_model() set the field. The OpenAPI request
+                   body schema has no such field. The response schema marks it readOnly.
                    Use for auto-generated fields like `id`, `created_at`.
         write_only: If True, field is only accepted in input, not included in output.
                     Use for sensitive data like `password`.
         source: Source attribute name on the model. Supports dot notation.
                 Example: source="author.name" maps field to instance.author.name
-        alias: Alternative name for this field in JSON input/output.
+        alias: Name of this field in JSON, for input and for output. The input does
+               not accept the field name then. The alias wins over the rename
+               option of the class. Python code still uses the field name.
         default: Default value for this field.
         default_factory: Factory function to create default value (for mutable defaults).
         description: The description of the property in the OpenAPI schema.
@@ -162,7 +175,7 @@ def field(
 
     Example:
         class UserSerializer(Serializer):
-            id: int = field(read_only=True)
+            id: int = field(read_only=True, default=0)
             email: str = field(source="email_address")
             password: str = field(write_only=True)
             tags: list[str] = field(default_factory=list)

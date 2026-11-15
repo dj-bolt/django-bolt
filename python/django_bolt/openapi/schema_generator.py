@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_
 import msgspec
 from django.conf import settings as django_settings
 
+from .._serializer_input import input_has_read_only_fields
 from ..datastructures import UploadFile
 from ..responses import (
     HTML,
@@ -112,6 +113,27 @@ def _type_display_name(annotation: Any) -> str:
         args = ", ".join(_type_display_name(a) for a in get_args(annotation))
         return f"{getattr(origin, '__name__', repr(origin))}[{args}]"
     return getattr(annotation, "__name__", None) or repr(annotation)
+
+
+class _InputComponent:
+    """The component key of the request body schema of a serializer.
+
+    A serializer with a ``read_only`` field has two schemas. The response
+    schema keeps the name of the class. The request body schema has the name
+    ``<class>Input``, or the name of the class if the document has no other
+    schema of that class. The attributes are those that the component names read.
+    """
+
+    def __init__(self, struct_type: Any) -> None:
+        self.struct_type = struct_type
+        self.__module__ = _struct_origin(struct_type).__module__
+        self.set_name(suffix="Input")
+
+    def set_name(self, *, suffix: str) -> None:
+        origin = _struct_origin(self.struct_type)
+        display = _type_display_name(self.struct_type)
+        self.__name__ = f"{display}{suffix}"
+        self.__qualname__ = f"{display.replace(origin.__name__, origin.__qualname__, 1)}{suffix}"
 
 
 class ComponentNameCollisionError(ValueError):
@@ -333,6 +355,10 @@ class SchemaGenerator:
         # registration order the name map iterates.
         self._component_ref: dict[type, Reference] = {}
         self._component_schema: dict[type, Schema] = {}
+        # True while the schema of a JSON request body is built. Input cannot
+        # set a read_only serializer field, so that schema leaves it out.
+        self._input_schema = False
+        self._input_components: dict[type, _InputComponent] = {}
         # strict mode bookkeeping (see OpenAPIStrictError)
         self._opaque_operations: list[str] = []
         self._qualified_components: list[str] = []
@@ -355,6 +381,8 @@ class SchemaGenerator:
         schema = self._type_to_schema(annotation, null_arm=False)
         if isinstance(schema, Schema) and marker and marker.description:
             schema = replace(schema, description=marker.description)
+        if isinstance(schema, Schema) and marker and marker.example is not None:
+            schema = replace(schema, examples=[marker.example])
         if default not in (inspect.Parameter.empty, None):
             schema = self._with_default(schema, default)
         return schema
@@ -1091,6 +1119,12 @@ class SchemaGenerator:
         body_param = meta.get("body_struct_param")
         body_type = meta.get("body_struct_type")
         fields = self._route_fields(meta)
+        # The Body() marker of the handler gives the description and the example.
+        body_field = next((f for f in fields if f.source == "body"), None)
+        marker = body_field.param if body_field is not None else None
+
+        if body_field is not None and body_field.embed:
+            return self._embedded_request_body(body_field)
 
         if not body_param or not body_type:
             # A dependency can read the JSON body.
@@ -1106,12 +1140,6 @@ class SchemaGenerator:
             body_field = next((f for f in fields if f.source == "body"), None)
             if body_field is not None:
                 body_param, body_type, body_required = body_field.name, body_field.annotation, body_field.is_required
-
-        if not body_param or not body_type:
-            # A JSON body of another type, such as a dict.
-            plain_body = next((f for f in fields if f.source == "body"), None)
-            if plain_body is not None:
-                body_param, body_type = plain_body.name, plain_body.annotation
 
         if not body_param or not body_type:
             # A JSON body of another type, such as a dict.
@@ -1178,14 +1206,38 @@ class SchemaGenerator:
             return None
 
         # JSON request body
-        schema = self._type_to_schema(body_type, register_component=True)
+        self._input_schema = True
+        try:
+            schema = self._type_to_schema(body_type, register_component=True)
+        finally:
+            self._input_schema = False
+        if body_field is None or body_field.name != body_param:
+            # The body comes from a dependency or from a ViewSet action.
+            marker = None
 
         return RequestBody(
-            description=f"Request body for {body_param}",
+            description=marker.description if marker and marker.description else f"Request body for {body_param}",
             content={
-                "application/json": OpenAPIMediaType(schema=schema),
+                "application/json": OpenAPIMediaType(schema=schema, example=marker.example if marker else None),
             },
             required=body_required,
+        )
+
+    def _embedded_request_body(self, field: Any) -> RequestBody:
+        """The request body of a ``Body(embed=True)`` parameter: a JSON object with the value at one key."""
+        marker = field.param
+        key = field.alias or field.name
+        schema = self._type_to_schema(field.annotation, register_component=True)
+        has_default = field.default is not inspect.Parameter.empty
+        if has_default and field.default is not None:
+            schema = self._with_default(schema, field.default)
+        required = not has_default and not is_optional(field.annotation)
+        wrapper = Schema(type="object", properties={key: schema}, required=[key] if required else None)
+        example = {key: marker.example} if marker.example is not None else None
+        return RequestBody(
+            description=marker.description or f"Request body for {field.name}",
+            content={"application/json": OpenAPIMediaType(schema=wrapper, example=example)},
+            required=required,
         )
 
     def _response_type_content(self, response_type: Any) -> dict[str, OpenAPIMediaType]:
@@ -1745,15 +1797,19 @@ class SchemaGenerator:
         properties = {}
         required = []
 
+        read_only = self._read_only_fields(struct_type)
         field_configs = self._field_configs(struct_type)
         for field in struct_info.fields:
             field_config = field_configs.get(field.name)
             if not self._field_in_schema(field_config):
                 continue
+            is_read_only = field.name in read_only
+            if is_read_only and self._input_schema:
+                continue
             field_name, field_schema, field_required = self._msgspec_field_schema(
                 field, field_config, register_component=register_component
             )
-            properties[field_name] = field_schema
+            properties[field_name] = self._mark_read_only(field_schema) if is_read_only else field_schema
 
             # Check if required
             if field_required:
@@ -1775,6 +1831,31 @@ class SchemaGenerator:
             properties=properties,
             required=required or None,
         )
+
+    @staticmethod
+    def _read_only_fields(struct_type: Any) -> frozenset[str]:
+        """The ``read_only`` field names of a Serializer. Empty for each other struct."""
+        cls = _struct_origin(struct_type)
+        if not getattr(cls, "__is_bolt_serializer__", False):
+            return frozenset()
+        cls._ensure_dump_ready()
+        return cls.__read_only_fields__
+
+    @staticmethod
+    def _mark_read_only(schema: Schema | Reference) -> Schema:
+        """Add ``readOnly: true`` to an inline schema or to a component reference."""
+        if isinstance(schema, Schema):
+            return replace(schema, read_only=True)
+        return Schema(all_of=[schema], read_only=True)
+
+    def _component_key(self, struct_type: Any) -> Any:
+        """The registry key of a struct: the type, or its input variant in a request body."""
+        if not (self._input_schema and input_has_read_only_fields(struct_type)):
+            return struct_type
+        key = self._input_components.get(struct_type)
+        if key is None:
+            key = self._input_components[struct_type] = _InputComponent(struct_type)
+        return key
 
     def _register_component(self, cls: type, build_schema: Callable[[], Schema]) -> Reference:
         """Register ``cls`` as a component (by type identity) and return its shared Reference.
@@ -1803,7 +1884,7 @@ class SchemaGenerator:
     def _struct_to_component_schema(self, struct_type: type) -> Reference:
         """Convert msgspec.Struct to a component schema and return its reference."""
         return self._register_component(
-            struct_type,
+            self._component_key(struct_type),
             lambda: self._struct_to_schema(struct_type, register_component=True),
         )
 
@@ -1837,6 +1918,11 @@ class SchemaGenerator:
         ``module.qualname`` so all of them coexist. Each type's shared Reference is
         stamped in place, updating all of its use sites at once.
         """
+
+        # An input variant keeps the name of its class if the class has no other schema.
+        for struct_type, variant in self._input_components.items():
+            if variant in self._component_ref and struct_type not in self._component_ref:
+                variant.set_name(suffix="")
 
         def normalize(name: str) -> str:
             return re.sub(r"[^a-zA-Z0-9.\-_]", "_", name)

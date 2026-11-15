@@ -282,6 +282,9 @@ class WebSocketTestClient:
                     raise RuntimeError("WebSocket is not accepted: call accept() before send")
                 # The server refused the upgrade, so no client is there.
                 raise ConnectionResetError("WebSocket client disconnected")
+            if self._closed:
+                # The app closed the connection or the client left, so no client is there.
+                raise ConnectionResetError("WebSocket client disconnected")
 
         elif msg_type == "websocket.close":
             # The server refuses a close that makes an invalid close frame.

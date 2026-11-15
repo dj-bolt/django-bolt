@@ -784,9 +784,11 @@ class PartialUpdateMixin(_ViewSet):
         if not patch_data:
             return obj
 
+        # msgspec reads the wire names, so the merged data uses them.
         current_state = await serializer_class.afrom_model(obj)
-        merged_data = current_state.to_dict()
-        merged_data.update(patch_data)
+        merged_data = {rename_map.get(name, name): value for name, value in current_state.to_dict().items()}
+        for field_name, value in patch_data.items():
+            merged_data[rename_map.get(field_name, field_name)] = value
         # The error handler makes the 422 of a function route from the error of msgspec.
         validated_obj = msgspec.convert(merged_data, type=serializer_class)
 

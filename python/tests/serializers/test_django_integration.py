@@ -1441,7 +1441,7 @@ class ComprehensiveProductSerializer(Serializer):
     # -------------------------------------------------------------------------
     # 1. Basic field with read_only (output-only, auto-generated)
     # -------------------------------------------------------------------------
-    id: int = field(read_only=True, description="Auto-generated product ID")
+    id: int = field(read_only=True, default=0, description="Auto-generated product ID")
 
     # -------------------------------------------------------------------------
     # 2. Reusable validated type (NonEmptyStr - min_length=1)
@@ -1954,7 +1954,7 @@ class TestComprehensiveSerializer:
             "id",
             "name",
             "sku",
-            "description",
+            "desc",  # The alias of `description` is its key in the output.
             "price",
             "quantity",
             "discount_percent",

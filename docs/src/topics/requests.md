@@ -302,6 +302,36 @@ async def search(filters: CreateUser | None = None):
 
 A request with no body then gives the default. A body that is present must be valid JSON of the type.
 
+### Body options
+
+`Body()` marks a parameter as the JSON body and takes options:
+
+```python
+from typing import Annotated
+from django_bolt.params import Body
+
+@api.post("/items")
+async def create_item(
+    item: Annotated[CreateUser, Body(embed=True, description="The new item", example={"username": "ana"})],
+):
+    return {"username": item.username}
+
+@api.post("/counters")
+async def set_counter(count: Annotated[int, Body(embed=True, alias="item-count")] = 0):
+    return {"count": count}
+```
+
+| Option | Effect |
+|--------|--------|
+| `embed=True` | The body is a JSON object, and the value is at the key of the parameter name. `/items` reads `{"item": {"username": "ana"}}`. Bolt does not read the other keys of the object. |
+| `alias` | The key name with `embed=True`. `/counters` reads `{"item-count": 3}`. Without `embed`, `alias` has no effect. |
+| `default` | The value for a request with no body. With `embed=True`, it is also the value for an object that does not have the key. Set it with `=`, or as the first argument of `Body()`. |
+| `description` | The description of the request body in the OpenAPI document. |
+| `example` | The example of the request body in the OpenAPI document. |
+
+With `embed=True`, a body that is not a JSON object, or that does not have the key of a required parameter, gets a 422.
+The OpenAPI document shows the wrapper object. `Form(description=..., example=...)` documents a form field in the same way.
+
 ### Raw body access
 
 Access the raw body bytes:

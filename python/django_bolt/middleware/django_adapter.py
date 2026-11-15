@@ -55,15 +55,21 @@ try:
     from django.utils.module_loading import import_string
 
     class _BoltHttpRequest(HttpRequest):
-        """An HttpRequest that reads POST and FILES on first use, as WSGIRequest does.
+        """The Django request that a Django middleware gets on a Bolt route.
 
-        The base class sets both to empty values. A multipart form needs a parse.
+        It reads POST and FILES on first use, as WSGIRequest does. The base class
+        sets both to empty values. A multipart form needs a parse.
         """
 
         def __init__(self):
             super().__init__()
             del self._post, self._files
             self._read_started = False
+
+        def _get_scheme(self) -> str:
+            # The scheme of the Bolt request, as WSGIRequest reads it from the
+            # server. Django applies SECURE_PROXY_SSL_HEADER on top of it.
+            return self.META["wsgi.url_scheme"]
 
         # Django maps these two errors to a 400 response. Bolt maps SuspiciousOperation to 400.
         def _set_content_type_params(self, meta):
