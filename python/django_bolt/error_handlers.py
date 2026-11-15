@@ -506,7 +506,8 @@ class ProblemDetails(msgspec.Struct, kw_only=True):
     """An error body in the RFC 9457 Problem Details format.
 
     The body has "errors" when the error has field errors. The keys of the
-    "extra" of the error are more members of the body.
+    "extra" of the error are more members of the body. So are the keys of a
+    dict detail, because "detail" is a string.
     """
 
     type: str
@@ -515,6 +516,17 @@ class ProblemDetails(msgspec.Struct, kw_only=True):
     detail: str
     instance: str
     errors: list[ProblemFieldError] = []
+
+
+def _add_extension_members(body: dict[str, Any], members: Any) -> None:
+    """Add a dict as extension members, or another value as the "extra" member. A set member stays."""
+    if isinstance(members, dict):
+        for key, value in members.items():
+            # "errors" is a list of field errors, as ProblemDetails declares it.
+            if key != "errors":
+                body.setdefault(key, value)
+    else:
+        body.setdefault("extra", members)
 
 
 @error_schema(ProblemDetails, media_type="application/problem+json")
@@ -526,23 +538,29 @@ def problem_details(error: BoltError, request: Any) -> Response:
     the error has field errors. The keys of ``error.extra`` are extension
     members. A key with the name of a standard member does not replace it.
     An "errors" key is not used, because "errors" holds only field errors.
+
+    "detail" is a string (RFC 9457 section 3.1.4). A dict or a list detail of
+    an ``HTTPException`` thus goes to extension members, after ``error.extra``
+    and by the same rules. "detail" is then the title.
     """
+    title = _STATUS_TITLES.get(error.status, "Error")
+    detail = error.detail
+    structured = None
+    if not isinstance(detail, str):
+        structured, detail = detail, title
     body: dict[str, Any] = {
         "type": "about:blank",
-        "title": _STATUS_TITLES.get(error.status, "Error"),
+        "title": title,
         "status": error.status,
-        "detail": error.detail,
+        "detail": detail,
         "instance": request.path,
     }
     if error.errors:
         body["errors"] = error.errors
-    if isinstance(error.extra, dict):
-        for key, value in error.extra.items():
-            # "errors" is a list of field errors, as ProblemDetails declares it.
-            if key != "errors":
-                body.setdefault(key, value)
-    elif error.extra is not None:
-        body.setdefault("extra", error.extra)
+    if error.extra is not None:
+        _add_extension_members(body, error.extra)
+    if structured is not None:
+        _add_extension_members(body, structured)
     return Response(body, status_code=error.status, media_type="application/problem+json")
 
 
