@@ -359,6 +359,8 @@ Cookie attributes:
 | `httponly` | `bool` | `False` | No JavaScript access |
 | `samesite` | `str \| False` | `"Lax"` | `"Strict"`, `"Lax"`, `"None"`, or `False` to omit |
 
+The letter case of `samesite` has no meaning, so `"lax"` gives `SameSite=Lax`. Another value raises `ValueError` when you set the cookie, as `HttpResponse.set_cookie()` of Django does.
+
 ### Multiple cookies
 
 Chain multiple `.set_cookie()` calls:
@@ -523,7 +525,7 @@ return 404, {"detail": "Not found"}       # documented as Error
 return JSON({"detail": "Not found"}, status_code=404)
 ```
 
-**Bare return** — A plain dict or list uses the default status code (lowest 2xx in the map):
+**Bare return** — A plain dict or list uses the default status code. That is the `status_code` of the decorator, or else the lowest 2xx code in the map. A map with no 2xx code, such as `{404: Error}`, keeps the default status 200:
 
 ```python
 @api.get("/items", response_model={200: list[Item], 400: Error})
@@ -549,6 +551,8 @@ async def delete_item(item_id: int):
 async def get_item(item_id: int):
     ...  # any non-200 status code is documented as Error
 ```
+
+A key is an integer status code or `...`. The dict needs one integer key or more. Each other key, for example `"404"`, `404.0` or `True`, stops registration with `TypeError`.
 
 **Explicit status_code** — Override the auto-detected default status code:
 

@@ -66,8 +66,8 @@ the problems:
   return annotation and no `response_model`.
 - A component name uses the long form `module.qualname`. This occurs when two
   types have the same short name.
-- The `error_formatter` of the API has no `error_schema`, and a route has a 422
-  response. See [OpenAPI schema](error-handling.md#openapi-schema).
+- The `error_formatter` of the API has no `error_schema`, and a route has a 422,
+  401 or 403 response. See [OpenAPI schema](error-handling.md#openapi-schema).
 
 Routes with `include_in_schema=False` are not problems. Routes with a non-JSON
 `response_class` are not problems. Run strict mode in CI to keep the generated
@@ -169,6 +169,8 @@ async def create_user(user: CreateUser):
     return {"id": 1, "username": user.username}
 ```
 
+A `Serializer` has two schemas if its input and its output do not have the same fields. The request body schema has no `read_only` field and no computed field. The response schema has no `write_only` field. It marks each `read_only` field and each computed field `readOnly: true`. If the API uses the serializer for the two, the response uses the component `<Name>` and the request body uses the component `<Name>Input`. See [Read-only fields](serializers.md#read-only-fields).
+
 ### Status codes
 
 Document the default status code:
@@ -181,12 +183,53 @@ async def create_user():
 
 ### Error responses
 
-The schema shows a 422 response for each route with a request body. Set
-`OpenAPIConfig(include_error_responses=False)` to remove these responses. With
+The schema shows a 422 response for each route whose input Bolt validates.
+Such a route has a path, query, header or cookie parameter, or a request body.
+A route with no parameter and no body has no 422. Set
+`OpenAPIConfig(include_error_responses=False)` to remove these responses.
+
+Without a formatter, the 422 body is `{"detail": ...}`. For a route with only a
+JSON body, `detail` is a list of field errors. For a route with a parameter or
+a form field, `detail` is a list of field errors or a text. Bolt sends the text
+for a missing value and for a value of the wrong type. With
 `BoltAPI(error_formatter=...)`, the 422 shows the body of the formatter. A route
 that declares its own 422 in `response_model` keeps it. The 422 also shows the
 validation body when the API has no formatter, or a formatter with
 `error_schema`. See [OpenAPI schema](error-handling.md#openapi-schema).
+
+### Authentication
+
+A route with an auth backend gets a `security` requirement. The list has one
+entry for each backend of the route. A request needs only one of them. Each
+scheme is in `components.securitySchemes`:
+
+| Backend | Scheme name | Scheme |
+|---|---|---|
+| `JWTAuthentication()` | `BearerAuth` | `http`, `bearer`, format `JWT` |
+| `JWTAuthentication(cookie="name")` | `JWTCookieAuth` | `apiKey` in the cookie `name` |
+| `JWTAuthentication(header="X-Token")` | `JWTHeaderAuth` | `apiKey` in the header `X-Token` |
+| `APIKeyAuthentication()` | `ApiKeyAuth` | `apiKey` in the header of the backend |
+| `SessionAuthentication()` | `SessionAuth` | `apiKey` in the session cookie |
+
+Two backends of one kind can read from different places, for example two API
+key headers. The second place gets its own scheme, such as `ApiKeyAuth2`. A
+scheme in `OpenAPIConfig(components=...)` with one of these names stays as you
+wrote it.
+
+The schema also shows the error responses that the guards of such a route can
+send:
+
+- 401 for a route with `IsAuthenticated` or `Requires`. The response has the
+  `WWW-Authenticate` header.
+- 403 for a route with `Requires`. This guard can deny a user.
+- 302 in place of the 401 for a route with
+  `SessionAuthentication(login_url=...)`. The response has the `Location`
+  header.
+
+The body is `{"detail": "<message>"}`, or the body of the `error_formatter` of
+the API. A route with no auth backend has none of these responses. A route with
+no guard, or with `AllowAny` as its first guard, has none of them.
+`OpenAPIConfig(include_error_responses=False)` removes them.
 
 ## Customizing documentation UIs
 
@@ -282,6 +325,8 @@ api = BoltAPI(
     )
 )
 ```
+
+Bolt gives the path of `OpenAPIConfig` and the path of each plugin a leading slash. Thus `OpenAPIConfig(path="docs")` with `RedocRenderPlugin(path="redoc")` serves `/docs/redoc`.
 
 ## Raw OpenAPI JSON/YAML
 
@@ -403,10 +448,41 @@ api.mount("/internal", internal_api)
 The default value at each layer is `None`. `None` inherits from the outer layer.
 The root `BoltAPI` resolves `None` to `True`.
 
+## Deprecating endpoints
+
+Set `deprecated=True` to mark an endpoint as deprecated in the documentation.
+The operation gets `deprecated: true`. The docs UIs show it as deprecated, and
+client generators mark its function. The server continues to serve the
+endpoint. An endpoint that is not deprecated has no `deprecated` key:
+
+```python
+@api.get("/v1/users", deprecated=True)
+async def list_users_v1():
+    return []
+
+
+@api.view("/v1/profile", deprecated=True)  # each method of the view
+class ProfileView(APIView):
+    async def get(self, request):
+        return {}
+
+
+@api.viewset("/items")
+class ItemViewSet(ViewSet):
+    @action(methods=["GET"], detail=False, deprecated=True)  # only this action
+    async def legacy(self, request):
+        return []
+```
+
+The route decorators of `BoltAPI` and `Router`, `@api.view()`, `@api.viewset()`
+and `@action` take `deprecated`. On `@api.viewset()`, it applies to each route
+of the viewset, and also to its `@action` routes.
+
 ## Non-JSON responses
 
 `response_class` sets the media type in the documentation. The default is
-`application/json`:
+`application/json`. A return annotation with one of these classes, for example
+`-> StreamingResponse`, has the same effect:
 
 | `response_class` | Media type | Schema |
 |---|---|---|
@@ -421,6 +497,16 @@ The root `BoltAPI` resolves `None` to `True`.
 async def report():
     return File("/srv/report.csv")
 ```
+
+A route with the return type `str` shows `text/plain`. A route with the return
+type `bytes` shows `application/octet-stream`. Bolt sends these values as they
+are, not as JSON.
+
+A union shows one media type for each kind of result. For example,
+`-> str | None` shows `text/plain` for the string and `application/json` for
+`null`, and `-> str | Item` shows `text/plain` and `application/json` with the
+schema of `Item`. An entry of a `response_model` dict follows the same rules:
+`{200: str, 404: Error}` shows `text/plain` for the status 200.
 
 Each parametrization of a generic response model gets its own component name.
 This is the same as msgspec. `Page[UserRead]` becomes the component

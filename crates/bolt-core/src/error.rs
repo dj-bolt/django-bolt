@@ -232,6 +232,39 @@ mod tests {
         ));
     }
 
+    /// The status, the content type and the JSON body of an error response.
+    fn json_parts(response: HttpResponse) -> (u16, String, serde_json::Value) {
+        let status = response.status().as_u16();
+        let content_type = response.headers().get("content-type").unwrap();
+        let content_type = content_type.to_str().unwrap().to_string();
+        let Ok(body) = actix_web::body::MessageBody::try_into_bytes(response.into_body()) else {
+            panic!("the body of an error response is complete bytes");
+        };
+        (status, content_type, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[test]
+    fn internal_error_response_is_a_500_with_the_detail_as_json() {
+        let (status, content_type, body) = json_parts(internal_error_response("bad \"wire\"\n"));
+        assert_eq!(status, 500);
+        assert_eq!(content_type, "application/json");
+        assert_eq!(body, serde_json::json!({"detail": "bad \"wire\"\n"}));
+    }
+
+    /// Without DEBUG, the client does not get the text of the exception.
+    #[test]
+    fn a_python_error_is_a_500_that_hides_the_exception() {
+        Python::initialize();
+        Python::attach(|py| {
+            let err = pyo3::exceptions::PyValueError::new_err("secret value");
+            let response = handle_python_error(py, err, "/items", "GET", false);
+            let (status, content_type, body) = json_parts(response);
+            assert_eq!(status, 500);
+            assert_eq!(content_type, "application/json");
+            assert_eq!(body, serde_json::json!({"detail": "Internal Server Error"}));
+        });
+    }
+
     #[test]
     fn test_escape_json() {
         assert_eq!(escape_json(r#"Hello "World""#), r#"Hello \"World\""#);

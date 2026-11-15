@@ -19,11 +19,14 @@ Two defects reported in issue #280, both in the custom-validator path:
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
+import msgspec
 import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.exceptions import RequestValidationError
-from django_bolt.serializers import Serializer, field_validator, model_validator
+from django_bolt.serializers import Serializer, field, field_validator, model_validator
 from django_bolt.testing import TestClient
 
 
@@ -198,6 +201,39 @@ def test_staticmethod_field_validator_is_rejected_not_ignored():
                 return v.upper()
 
 
+class PlainTitle(Serializer):
+    title: str
+    note: str = ""
+
+
+class MarkedTitle(Serializer):
+    note: str = ""
+    title: str = field(description="The title")
+
+
+def test_missing_required_field_from_field_has_the_error_of_a_plain_required_field():
+    """field() with no default keeps the field required, with the error of msgspec for a missing field."""
+    api = BoltAPI()
+
+    @api.post("/plain")
+    async def plain(payload: PlainTitle):
+        return {"ok": True}
+
+    @api.post("/marked")
+    async def marked(payload: MarkedTitle):
+        return {"title": payload.title}
+
+    with TestClient(api) as client:
+        plain_response = client.post("/plain", json={})
+        marked_response = client.post("/marked", json={})
+        accepted = client.post("/marked", json={"title": "t"})
+
+    assert plain_response.status_code == marked_response.status_code == 422
+    assert marked_response.json() == plain_response.json()
+    assert marked_response.json()["detail"][0]["loc"] == ["body", "title"]
+    assert accepted.json() == {"title": "t"}
+
+
 class Inner(Serializer):
     email: str
 
@@ -227,3 +263,44 @@ def test_nested_serializer_errors_keep_the_container_path():
     assert response.json()["detail"] == [
         {"loc": ["body", "inner", "email"], "msg": "Invalid email", "type": "value_error"}
     ]
+
+
+class ShipmentInput(msgspec.Struct):
+    status: str
+    origin: Any = None
+    weight: int = 0
+
+
+class Shipment(Serializer):
+    status: Literal["new"]
+    origin: Inner | None = None
+    weight: int = 0
+
+    @model_validator
+    def check_weight(self):
+        if self.weight < 0:
+            raise ValueError("Weight is negative")
+
+
+def test_errors_of_a_serializer_that_a_handler_builds_have_loc_msg_and_type():
+    """A nested field, a Literal field and a model validator give the error shape of a field validator."""
+    api = BoltAPI()
+
+    @api.post("/shipments")
+    async def create_shipment(payload: ShipmentInput):
+        Shipment(status=payload.status, origin=payload.origin, weight=payload.weight)
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        response = client.post("/shipments", json={"status": "lost", "origin": 5, "weight": -1})
+
+    assert response.status_code == 422
+    nested, literal, model = response.json()["detail"]
+    assert nested["msg"].startswith("origin: Expected Inner object or dict, got int")
+    assert (nested["loc"], nested["type"]) == (["body", "origin"], "value_error")
+    assert literal == {
+        "loc": ["body", "status"],
+        "msg": "invalid value 'lost'. Expected one of: 'new'",
+        "type": "value_error",
+    }
+    assert model == {"loc": ["body"], "msg": "Weight is negative", "type": "value_error"}
