@@ -998,6 +998,19 @@ mod tests {
         assert_eq!(first_relevant_file_in(&file, &filter), None);
     }
 
+    /// root can read a directory with no permission bits. A link to itself
+    /// gives an error for each user, and that error is not "no directory".
+    #[cfg(unix)]
+    #[test]
+    fn a_path_with_another_read_error_triggers_reload() {
+        let root = TempDir::new("link-loop");
+        let link = root.0.join("loop");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        let filter = ReloadFilter::new(vec![], vec![]);
+
+        assert_eq!(first_relevant_file_in(&link, &filter), Some(link.clone()));
+    }
+
     fn modify_event(path: &str) -> Event {
         Event {
             kind: EventKind::Modify(ModifyKind::Data(DataChange::Content)),
@@ -1197,11 +1210,16 @@ mod tests {
         assert!(waited >= Duration::from_millis(100), "{waited:?}");
     }
 
+    /// The tests that change the action of SIGHUP run one at a time.
+    #[cfg(unix)]
+    static SIGHUP_ACTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     #[test]
     fn sighup_is_ignored_reads_the_current_action() {
         use super::sighup_is_ignored;
 
+        let _action = SIGHUP_ACTION.lock().unwrap();
         // SAFETY: SIG_IGN and SIG_DFL install no Rust code. No test of this
         // binary sends SIGHUP.
         let previous = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
@@ -1212,6 +1230,79 @@ mod tests {
 
         assert!(ignored);
         assert!(!default);
+    }
+
+    /// Wait until the file has `expected` as its content. Stop when the
+    /// supervisor ends first.
+    #[cfg(unix)]
+    fn wait_for_content<T>(
+        path: &std::path::Path,
+        expected: &str,
+        supervisor: &thread::JoinHandle<T>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            if content == expected {
+                return;
+            }
+            assert!(
+                !supervisor.is_finished() && Instant::now() < deadline,
+                "worker starts: {content:?}, expected {expected:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The supervisor loop with a real watcher and a `sh` worker. `ctrlc`
+    /// takes one handler for each process, so only this test starts the loop.
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_starts_a_new_worker_after_a_change_and_stops_on_sigterm() {
+        use super::run_dev_reloader_inner;
+
+        let root = TempDir::new("supervisor");
+        let watched = root.0.join("project");
+        std::fs::create_dir_all(&watched).unwrap();
+        // Outside the watched directory: the worker writes its reload count here.
+        let starts = root.0.join("starts");
+        // The first worker runs until the reload stops it. The next one fails.
+        let script = r#"echo "$DJANGO_BOLT_DEV_RELOAD_COUNT" >> "$0"
+            [ "$DJANGO_BOLT_DEV_RELOAD_COUNT" = 0 ] && exec sleep 30
+            exit 7"#;
+        let command = ["sh", "-c", script, starts.to_str().unwrap()].map(String::from);
+        let watch_paths = vec![
+            // A path that does not exist is not watched, and is not an error.
+            root.0.join("missing").to_string_lossy().into_owned(),
+            watched.to_string_lossy().into_owned(),
+        ];
+
+        let action = SIGHUP_ACTION.lock().unwrap();
+        // As under `nohup`. The supervisor must keep this action.
+        // SAFETY: SIG_IGN installs no Rust code.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        let supervisor = thread::spawn(move || {
+            run_dev_reloader_inner(command.to_vec(), watch_paths, vec![], vec![], 50, false)
+        });
+        wait_for_content(&starts, "0\n", &supervisor);
+        assert!(super::sighup_is_ignored());
+        drop(action);
+
+        std::fs::write(watched.join("views.py"), "VALUE = 1\n").unwrap();
+        // The second worker gets the reload count 1. Its failure is not a
+        // failed first start, so the supervisor continues.
+        wait_for_content(&starts, "0\n1\n", &supervisor);
+        thread::sleep(Duration::from_millis(300));
+        assert!(!supervisor.is_finished());
+
+        // The supervisor has its signal handler: a worker started.
+        // SAFETY: the signal goes to this process, which handles it.
+        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        let exit_code = supervisor.join().unwrap();
+        assert!(
+            matches!(exit_code, Ok(0)),
+            "the supervisor did not stop cleanly"
+        );
     }
 
     #[test]
