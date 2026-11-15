@@ -766,3 +766,31 @@ class TestCookiesReachTheResponse:
         assert response.headers["content-type"] == "application/json"
         assert response.headers["x-a"] == "1"
         assert response.headers["set-cookie"].startswith("k=v;")
+
+
+def test_set_cookie_and_delete_cookie_defaults():
+    """set_cookie sends an empty value with Lax. delete_cookie sends Path=/."""
+    api = BoltAPI()
+
+    @api.get("/set")
+    def set_default():
+        return Response({"ok": True}).set_cookie("a")
+
+    @api.get("/delete")
+    def delete_default():
+        return Response({"ok": True}).delete_cookie("a")
+
+    @api.get("/null")
+    def null_content():
+        return Response(None)
+
+    with TestClient(api) as client:
+        set_header = client.get("/set").headers["set-cookie"].split("; ")
+        delete_header = client.get("/delete").headers["set-cookie"].split("; ")
+        null_response = client.get("/null")
+
+    assert sorted(set_header) == ["Path=/", "SameSite=Lax", 'a=""']
+    assert "Path=/" in delete_header
+    assert "Max-Age=0" in delete_header
+    assert null_response.content == b"{}"
+    assert null_response.headers["content-type"] == "application/json"

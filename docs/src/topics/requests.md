@@ -218,6 +218,16 @@ async def create_user(user: CreateUser):
     return {"username": user.username}
 ```
 
+A request with no body gives a 422. To make the body optional, give the parameter a default:
+
+```python
+@api.post("/search")
+async def search(filters: CreateUser | None = None):
+    return {"filtered": filters is not None}
+```
+
+A request with no body then gives the default. A body that is present must be valid JSON of the type.
+
 ### Raw body access
 
 Access the raw body bytes:
@@ -414,6 +424,8 @@ async def login(
     return {"username": username}
 ```
 
+A repeated field keeps its last value, as a repeated query key does. Declare a `list`, `set`, `frozenset` or `tuple` to take each value.
+
 A URL-encoded body can have 1000 fields or fewer. Django has the same default limit, `DATA_UPLOAD_MAX_NUMBER_FIELDS`. A repeated key counts once for each field. A body with more fields gets 422 with the error type `too_many_fields`. A multipart body can have 100 parts or fewer.
 
 ### Multipart forms
@@ -508,6 +520,8 @@ async def secure_endpoint(headers: Annotated[AuthHeaders, Header()]):
 ```
 
 Request: `GET /secure` with headers `X-Api-Key: secret123`
+
+A `list`, `set`, `frozenset` or `tuple` field gets a sequence of one item, the value of the header. Bolt does not split the value at a comma.
 
 ### Cookie models
 

@@ -106,18 +106,24 @@ class PaginatedResponse(msgspec.Struct, Generic[T], omit_defaults=True):  # noqa
     Uses omit_defaults=True so only relevant fields are included in response:
     - PageNumberPagination: page, page_size, total_pages, next_page, previous_page
     - LimitOffsetPagination: limit, offset
-    - CursorPagination: next_cursor, previous_cursor
+    - CursorPagination: page_size, next_cursor
 
     Attributes:
         items: List of paginated items
         total: Total number of items across all pages
         has_next: Whether there is a next page (always included)
-        has_previous: Whether there is a previous page (always included)
+        has_previous: Whether there is a previous page (always included).
+            For CursorPagination, it is True when the request has a valid cursor.
+            A cursor page gives no cursor to go back.
         page: Current page number (for PageNumber pagination)
         page_size: Number of items per page
         total_pages: Total number of pages
         next_page: Next page number (None if no next page)
         previous_page: Previous page number (None if no previous page)
+        limit: Number of items requested (for LimitOffset pagination)
+        offset: Position of the first item (for LimitOffset pagination)
+        next_cursor: Cursor of the next page (for Cursor pagination, None if no next page)
+        previous_cursor: Not set by the built-in schemes. A custom scheme can set it.
     """
 
     # Required fields (always included in response)
@@ -212,7 +218,7 @@ class PaginationBase(ABC):
         """Build the envelope for one page.
 
         ``info`` carries the scheme-specific fields (page/page_size/total_pages/
-        next_page/previous_page, limit/offset, next_cursor/previous_cursor).
+        next_page/previous_page, limit/offset, page_size/next_cursor).
         Override to return an instance of a custom ``response_class``.
         """
         return self.response_class(items=items, total=total, has_next=has_next, has_previous=has_previous, **info)
@@ -478,9 +484,9 @@ class PageNumberPagination(PaginationBase):
         # Calculate total pages
         total_pages = (total + page_size - 1) // page_size if total > 0 else 0
 
-        # Validate page number
-        if page_number > total_pages and total_pages > 0:
-            page_number = total_pages
+        # A page after the last page is the last page. With no rows, it is page 1.
+        if page_number > total_pages:
+            page_number = max(total_pages, 1)
 
         # Calculate offset
         offset = (page_number - 1) * page_size
@@ -574,8 +580,12 @@ class LimitOffsetPagination(PaginationBase):
         # Get total count
         total = await self._get_queryset_count(queryset)
 
-        # Slice queryset and get raw items
-        raw_items = await self._evaluate_queryset_slice(queryset[offset : offset + limit])
+        # An offset at or after the end selects no row, so it needs no query.
+        # The database also refuses an offset that does not fit its integer type.
+        if offset >= total:
+            raw_items = []
+        else:
+            raw_items = await self._evaluate_queryset_slice(queryset[offset : offset + limit])
 
         # Serialize items using efficient batch serialization
         items = await self._serialize_items(raw_items)
@@ -744,12 +754,16 @@ class CursorPagination(PaginationBase):
             last_item = raw_items[-1]
             # Items are raw (Django models or dicts from values()), get cursor value
             if isinstance(last_item, dict):
-                if ordering_field not in last_item:
+                value_key = ordering_field
+                if not tie_break and ordering_field not in last_item:
+                    # The ordering field is the primary key. The row can have it as the column name or as "pk".
+                    value_key = pk_field.attname if pk_field.attname in last_item else "pk"
+                if value_key not in last_item:
                     raise ValueError(
                         f"CursorPagination ordering {ordering!r} needs {ordering_field!r} in values() "
                         f"to make the next cursor."
                     )
-                last_value = last_item[ordering_field]
+                last_value = last_item[value_key]
                 last_pk = last_item.get(pk_field.attname, last_item.get("pk"))
             else:
                 last_value = getattr(last_item, ordering_field, None)
@@ -793,6 +807,11 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     The decorated handler should return a Django QuerySet or list.
     The decorator will automatically apply pagination and return a PaginatedResponse.
 
+    The handler can be async or sync. Bolt calls a sync handler on the event loop.
+    Thus a sync handler must return a lazy QuerySet or a list. If it runs a query,
+    Django raises ``SynchronousOnlyOperation``. The pagination runs the queries of
+    the QuerySet on the ORM executor.
+
     When used with response_model or return type annotation like list[UserSerializer],
     the serializer will be used for efficient batch serialization via dump_many().
 
@@ -821,6 +840,8 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     """
 
     def decorator(handler: Callable) -> Callable:
+        # The route decorator uses the same test for is_async.
+        handler_is_async = inspect.iscoroutinefunction(handler)
         # Store original handler for introspection
         original_handler = handler
         request_getter = _compile_request_getter(original_handler)
@@ -849,7 +870,9 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
 
             # Call original handler to get queryset
             # Pass all args along (including self for methods)
-            queryset = await handler(*args, **kwargs)
+            queryset = handler(*args, **kwargs)
+            if handler_is_async:
+                queryset = await queryset
 
             # Apply pagination using dict version
             paginated = await cached_paginator.paginate_queryset(queryset, request)

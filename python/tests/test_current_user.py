@@ -177,6 +177,8 @@ def test_current_user_rejects_a_request_with_no_user(handler_is_async):
         rejected = client.get("/required")
         assert rejected.status_code == 401
         assert rejected.json() == {"detail": "Authentication required"}
+        # The challenge of each 401, as for a request that Rust rejects.
+        assert rejected.headers["www-authenticate"] == "Bearer"
         response = client.get("/optional")
         assert response.status_code == 200, response.text
         assert response.json() == {"user": None}
