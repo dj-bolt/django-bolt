@@ -9,10 +9,11 @@ import asyncio
 
 import pytest
 
-from django_bolt import BoltAPI, WebSocket, WebSocketDisconnect, WebSocketState
+from django_bolt import BoltAPI, WebSocket, WebSocketDisconnect, WebSocketException, WebSocketState
 from django_bolt.testing import ConnectionClosed, HandshakeRejected, WebSocketTestClient
 from django_bolt.testing import websocket as websocket_testing
 from django_bolt.websocket import CloseCode
+from tests.integration.apps.websocket_frame_types import api as frame_types_api
 from tests.integration.apps.websocket_handler_end import api as handler_end_api
 
 
@@ -50,6 +51,46 @@ async def test_receive_text_before_accept_names_the_missing_accept():
 
     async with WebSocketTestClient(api, "/ws") as ws:
         assert await ws.receive_text() == "WebSocket is not accepted: call accept() before receive()"
+
+
+@pytest.mark.asyncio
+async def test_receive_of_the_wrong_frame_type_names_the_frame_and_loses_no_later_frame():
+    """The same app runs on the server in test_websocket_frame_types_server_integration.py."""
+    async with WebSocketTestClient(frame_types_api, "/ws/text") as ws:
+        await ws.send_bytes(b"\x00\x01")
+        assert await ws.receive_text() == "1003: receive_text() got a binary frame"
+        await ws.send_text("hello")
+        assert await ws.receive_text() == "text: hello"
+
+    async with WebSocketTestClient(frame_types_api, "/ws/bytes") as ws:
+        await ws.send_text("hello")
+        assert await ws.receive_text() == "1003: receive_bytes() got a text frame"
+        await ws.send_bytes(b"\x00\x01")
+        assert await ws.receive_text() == "bytes: 0001"
+
+
+@pytest.mark.asyncio
+async def test_receive_json_names_a_frame_of_the_wrong_type():
+    api = BoltAPI()
+    seen = []
+
+    @api.websocket("/ws")
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        for mode in ("text", "binary"):
+            try:
+                await websocket.receive_json(mode=mode)
+            except WebSocketException as error:
+                seen.append((error.code, error.reason))
+        await websocket.close()
+
+    async with WebSocketTestClient(api, "/ws") as ws:
+        await ws.send_bytes(b"{}")
+        await ws.send_text("{}")
+        with pytest.raises(ConnectionClosed):
+            await ws.receive_text()
+
+    assert seen == [(1003, "receive_text() got a binary frame"), (1003, "receive_bytes() got a text frame")]
 
 
 @pytest.mark.asyncio
