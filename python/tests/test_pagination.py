@@ -893,6 +893,101 @@ def test_cursor_pagination_accepts_a_cursor_without_a_primary_key(sample_article
 
 
 @pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_cursor_needs_no_percent_encoding(db):
+    """A client can put next_cursor into the query string as it is."""
+    # In the standard base64 alphabet, the cursors of these titles have "+" and "/".
+    # A "+" in a query string is a space, so such a cursor did not decode.
+    for title in ("ab>", "ab?", "ac"):
+        Article.objects.create(title=title, content="content", author="author")
+    api = BoltAPI()
+
+    class TitleCursorPagination(CursorPagination):
+        page_size = 1
+        ordering = "title"
+
+    @api.get("/articles")
+    @paginate(TitleCursorPagination)
+    async def list_articles(request):
+        return Article.objects.all()
+
+    with TestClient(api) as client:
+        titles = []
+        url = "/articles"
+        for _ in range(4):
+            data = client.get(url).json()
+            titles.extend(item["title"] for item in data["items"])
+            if "next_cursor" not in data:
+                break
+            url = f"/articles?cursor={data['next_cursor']}"
+        assert titles == ["ab>", "ab?", "ac"]
+
+        # A client can hold a cursor in the standard alphabet from an earlier release.
+        first_pk = Article.objects.get(title="ab>").pk
+        legacy_cursor = base64.b64encode(b'{"v":"ab>","pk":%d}' % first_pk).decode()
+        assert "+" in legacy_cursor
+        response = client.get(f"/articles?cursor={quote(legacy_cursor)}")
+        assert [item["title"] for item in response.json()["items"]] == ["ab?"]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("path", "cursor_json"),
+    [
+        ("/by-id", b'{"v":"x"}'),
+        ("/by-id", b'{"v":[1]}'),
+        ("/by-id", b'"x"'),
+        ("/by-id", b"[1]"),
+        ("/by-author", b'{"v":"Author 1","pk":"x"}'),
+        ("/by-author", b'{"v":"Author 1","pk":[1]}'),
+        ("/by-channel", b'{"v":"stable","pk":["api","x"]}'),
+        ("/by-channel", b'{"v":"stable","pk":["api"]}'),
+    ],
+)
+def test_cursor_pagination_cursor_with_a_wrong_value_gives_the_first_page(sample_articles, path, cursor_json):
+    """A cursor that decodes to a value of the wrong type is no cursor. It is not a server error."""
+    for version in range(1, 5):
+        Release.objects.create(product="api", version=version, channel="stable")
+    api = BoltAPI()
+
+    class IdCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "-id"
+
+    class AuthorCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "author"
+
+    class ChannelCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "channel"
+
+    @api.get("/by-id")
+    @paginate(IdCursorPagination)
+    async def list_by_id(request):
+        return Article.objects.all()
+
+    @api.get("/by-author")
+    @paginate(AuthorCursorPagination)
+    async def list_by_author(request):
+        return Article.objects.all()
+
+    @api.get("/by-channel")
+    @paginate(ChannelCursorPagination)
+    async def list_by_channel(request):
+        return Release.objects.all()  # a composite primary key
+
+    cursor = base64.urlsafe_b64encode(cursor_json).decode()
+    with TestClient(api) as client:
+        first_page = client.get(path)
+        response = client.get(f"{path}?cursor={cursor}")
+
+    assert first_page.status_code == 200
+    assert len(first_page.json()["items"]) == 3
+    assert response.status_code == 200, response.text
+    assert response.json() == first_page.json()
+
+
+@pytest.mark.django_db(transaction=True)
 def test_cursor_pagination_multiple_pages_continuity(sample_articles):
     """Test that cursor pagination maintains continuity across pages"""
     api = BoltAPI()
