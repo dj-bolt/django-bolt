@@ -593,6 +593,19 @@ async fn build_response_from_parsed(
     }
 }
 
+/// Log the cause of a response that Rust cannot build, for example a status
+/// that is not a u16. Python did not see this error, so Python did not log it.
+/// The client gets the 500 of each other exception, which tells the cause
+/// only with DEBUG on.
+#[cold]
+fn log_invalid_response(req: &HttpRequest, err: &PyErr) {
+    log::error!(
+        "{} {}: cannot build the response of the handler: {err}",
+        req.method(),
+        req.path()
+    );
+}
+
 pub async fn response_from_wire_result(
     result_obj: Py<PyAny>,
     skip_compression: bool,
@@ -1465,7 +1478,8 @@ async fn route_request<const ACCESS_LOG: bool>(
                 return Ok(DispatchOutcome::Pending(Box::pin(fut)));
             }
 
-            let parsed = parse_response_wire(py, &result_obj)?;
+            let parsed = parse_response_wire(py, &result_obj)
+                .inspect_err(|err| log_invalid_response(&req, err))?;
             let meta_ref = parsed.meta.as_ref();
             let response = match parsed.body {
                 ResponseWireBody::ZeroCopyBytes(backed) => {
@@ -1552,10 +1566,16 @@ async fn route_request<const ACCESS_LOG: bool>(
                 {
                     Ok(response) => response,
                     Err(e) => {
-                        let reason =
-                            format!("Handler returned unsupported response wire format: {}", e);
-                        let response = error::internal_error_response(&reason);
-                        error::with_error_info(response, || error::ErrorInfo::internal(reason))
+                        log_invalid_response(&req, &e);
+                        Python::attach(|py| {
+                            handle_python_error(
+                                py,
+                                e,
+                                req.path(),
+                                req.method().as_str(),
+                                state.debug,
+                            )
+                        })
                     }
                 }
             }
