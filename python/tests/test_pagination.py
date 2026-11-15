@@ -932,6 +932,38 @@ def test_cursor_pagination_multiple_pages_continuity(sample_articles):
         assert all_ids == sorted(all_ids, reverse=True)
 
 
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("ordering", "key"),
+    [("-pk", "id"), ("pk", "id"), ("-id", "pk")],
+)
+def test_cursor_pagination_finds_the_primary_key_of_a_values_row_by_each_name(sample_articles, ordering, key):
+    """An ordering by the primary key reads it from a values() row as "pk" or as the column name."""
+    api = BoltAPI()
+
+    class PkCursorPagination(CursorPagination):
+        page_size = 20
+
+    PkCursorPagination.ordering = ordering
+
+    @api.get("/articles")
+    @paginate(PkCursorPagination)
+    async def list_articles(request):
+        return Article.objects.values(key, "title")
+
+    ids = []
+    url = "/articles"
+    with TestClient(api) as client:
+        for _ in range(3):
+            response = client.get(url)
+            assert response.status_code == 200, response.content
+            data = response.json()
+            ids.extend(item[key] for item in data["items"])
+            url = f"/articles?cursor={quote(data.get('next_cursor') or '')}"
+
+    assert ids == list(Article.objects.order_by(ordering).values_list("pk", flat=True))
+
+
 # ============================================================================
 # ViewSet Integration Tests
 # ============================================================================

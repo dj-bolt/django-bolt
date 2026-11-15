@@ -685,12 +685,16 @@ class CursorPagination(PaginationBase):
             last_item = raw_items[-1]
             # Items are raw (Django models or dicts from values()), get cursor value
             if isinstance(last_item, dict):
-                if ordering_field not in last_item:
+                value_key = ordering_field
+                if not tie_break and ordering_field not in last_item:
+                    # The ordering field is the primary key. The row can have it as the column name or as "pk".
+                    value_key = pk_field.attname if pk_field.attname in last_item else "pk"
+                if value_key not in last_item:
                     raise ValueError(
                         f"CursorPagination ordering {ordering!r} needs {ordering_field!r} in values() "
                         f"to make the next cursor."
                     )
-                last_value = last_item[ordering_field]
+                last_value = last_item[value_key]
                 last_pk = last_item.get(pk_field.attname, last_item.get("pk"))
             else:
                 last_value = getattr(last_item, ordering_field, None)
