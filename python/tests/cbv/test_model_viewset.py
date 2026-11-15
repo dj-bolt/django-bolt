@@ -134,6 +134,33 @@ def test_model_viewset_crud(api):
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("lookup_value", ["abc", "1.5"])
+def test_lookup_value_of_the_wrong_type_is_not_found(api, lookup_value):
+    """A lookup value that the field cannot hold answers 404, as an unknown value does."""
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+    article = Article.objects.create(title="t", content="c", author="a")
+    body = {"id": article.id, "title": "new", "content": "c", "author": "a", "is_published": False}
+
+    with TestClient(api) as client:
+        responses = [
+            client.get(f"/articles/{lookup_value}"),
+            client.put(f"/articles/{lookup_value}", json=body),
+            client.patch(f"/articles/{lookup_value}", json={"title": "new"}),
+            client.delete(f"/articles/{lookup_value}"),
+        ]
+        for response in responses:
+            assert response.status_code == 404
+            assert response.json() == {"detail": "Not found"}
+
+        assert client.get(f"/articles/{article.id}").json()["title"] == "t"
+
+
+@pytest.mark.django_db(transaction=True)
 def test_write_actions_do_not_write_outside_the_queryset(api):
     """The request body cannot select the row that PUT, PATCH or POST writes."""
 
