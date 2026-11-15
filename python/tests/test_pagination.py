@@ -1219,6 +1219,52 @@ def test_cursor_pagination_cursor_with_a_wrong_value_gives_the_first_page(sample
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("path", "cursor_json"),
+    [
+        ("/by-author", b'{"v":"Author 1","pk":18446744073709551615}'),
+        ("/by-author", b'{"v":"Author 1","pk":-18446744073709551615}'),
+        ("/by-version", b'{"v":18446744073709551615,"pk":["api",1]}'),
+        ("/by-channel", b'{"v":"stable","pk":["api",18446744073709551615]}'),
+        ("/by-post-author", b'{"v":18446744073709551615,"pk":1}'),
+    ],
+)
+def test_cursor_pagination_cursor_with_an_integer_out_of_range_gives_the_first_page(sample_articles, path, cursor_json):
+    """The database cannot hold the integer, so the cursor is no cursor. It is not a server error."""
+    for version in range(1, 5):
+        Release.objects.create(product="api", version=version, channel="stable")
+    author = Author.objects.create(name="Author", email="author@example.com")
+    for number in range(4):
+        BlogPost.objects.create(title=f"Post {number}", content="content", author=author)
+    api = BoltAPI()
+
+    def add_route(route_path, field, make_queryset):
+        class FieldCursorPagination(CursorPagination):
+            page_size = 3
+            ordering = field
+
+        @api.get(route_path)
+        @paginate(FieldCursorPagination)
+        async def list_rows(request):
+            return make_queryset()
+
+    add_route("/by-author", "author", Article.objects.all)
+    add_route("/by-version", "version", Release.objects.all)  # an integer field and a composite primary key
+    add_route("/by-channel", "channel", Release.objects.all)
+    add_route("/by-post-author", "author_id", BlogPost.objects.all)  # a ForeignKey has the range of its target
+
+    cursor = base64.urlsafe_b64encode(cursor_json).decode()
+    with TestClient(api) as client:
+        first_page = client.get(path)
+        response = client.get(f"{path}?cursor={cursor}")
+
+    assert first_page.status_code == 200
+    assert len(first_page.json()["items"]) == 3
+    assert response.status_code == 200, response.text
+    assert response.json() == first_page.json()
+
+
+@pytest.mark.django_db(transaction=True)
 def test_cursor_pagination_multiple_pages_continuity(sample_articles):
     """Test that cursor pagination maintains continuity across pages"""
     api = BoltAPI()
