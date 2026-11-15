@@ -26,9 +26,9 @@ from django_bolt.testing import TestClient
 
 NDJSON = "application/x-ndjson"
 OCTET_STREAM = "application/octet-stream"
-UNSUPPORTED_INT = (
-    "Handler returned unsupported type 'int'. "
-    "Return dict, list, or a Bolt response type (JSON, PlainText, HTML, Redirect, etc.)"
+UNSUPPORTED_OBJECT = (
+    "Handler returned unsupported type 'object'. "
+    "Return dict, list, a JSON scalar, or a Bolt response type (JSON, PlainText, HTML, Redirect, etc.)"
 )
 
 
@@ -316,14 +316,14 @@ def raw_client():
         await asyncio.sleep(0)
         return None
 
-    @api.get("/int/async")
-    async def int_async():
+    @api.get("/object/async")
+    async def object_async():
         await asyncio.sleep(0)
-        return 42
+        return object()
 
-    @api.get("/int/sync")
-    def int_sync():
-        return 42
+    @api.get("/object/sync")
+    def object_sync():
+        return object()
 
     with TestClient(api) as client:
         yield client
@@ -353,12 +353,12 @@ def test_none_result_of_an_async_handler_is_an_error_when_the_status_is_not_204(
     assert response.json()["exception"].startswith("Handler returned unsupported type 'NoneType'.")
 
 
-@pytest.mark.parametrize("path", ["/int/async", "/int/sync"])
+@pytest.mark.parametrize("path", ["/object/async", "/object/sync"])
 def test_unsupported_result_is_an_error_that_names_its_type(raw_client, path):
     response = raw_client.get(path)
 
     assert response.status_code == 500, response.text
-    assert response.json() == {"kind": "internal_error", "exception": UNSUPPORTED_INT}
+    assert response.json() == {"kind": "internal_error", "exception": UNSUPPORTED_OBJECT}
 
 
 class PublicUser(Serializer):

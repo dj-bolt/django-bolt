@@ -295,7 +295,7 @@ def get_msgspec_type_for_django_field(field: models.Field) -> Any:
         base_type = Any
 
     # Handle nullable fields
-    if field.null and not isinstance(field, models.BooleanField):
+    if field.null:
         base_type = base_type | None
 
     # Apply constraints if any
