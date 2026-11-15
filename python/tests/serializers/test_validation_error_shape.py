@@ -26,7 +26,7 @@ import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.exceptions import RequestValidationError
-from django_bolt.serializers import Serializer, field_validator, model_validator
+from django_bolt.serializers import Serializer, field, field_validator, model_validator
 from django_bolt.testing import TestClient
 
 
@@ -199,6 +199,39 @@ def test_staticmethod_field_validator_is_rejected_not_ignored():
             @staticmethod
             def upper(v: str) -> str:
                 return v.upper()
+
+
+class PlainTitle(Serializer):
+    title: str
+    note: str = ""
+
+
+class MarkedTitle(Serializer):
+    note: str = ""
+    title: str = field(description="The title")
+
+
+def test_missing_required_field_from_field_has_the_error_of_a_plain_required_field():
+    """field() with no default keeps the field required, with the error of msgspec for a missing field."""
+    api = BoltAPI()
+
+    @api.post("/plain")
+    async def plain(payload: PlainTitle):
+        return {"ok": True}
+
+    @api.post("/marked")
+    async def marked(payload: MarkedTitle):
+        return {"title": payload.title}
+
+    with TestClient(api) as client:
+        plain_response = client.post("/plain", json={})
+        marked_response = client.post("/marked", json={})
+        accepted = client.post("/marked", json={"title": "t"})
+
+    assert plain_response.status_code == marked_response.status_code == 422
+    assert marked_response.json() == plain_response.json()
+    assert marked_response.json()["detail"][0]["loc"] == ["body", "title"]
+    assert accepted.json() == {"title": "t"}
 
 
 class Inner(Serializer):
