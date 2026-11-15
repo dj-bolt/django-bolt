@@ -9,6 +9,10 @@ import pytest
 
 from django_bolt import BoltAPI, WebSocket, WebSocketState
 from django_bolt.testing import ConnectionClosed, HandshakeRejected, WebSocketTestClient
+from django_bolt.websocket import (
+    CloseCode,
+    WebSocketDisconnect,
+)
 
 
 @pytest.mark.asyncio
@@ -128,3 +132,26 @@ async def test_send_after_close_says_closed():
 
 def test_state_names_are_unchanged():
     assert [state.name for state in WebSocketState] == ["CONNECTING", "CONNECTED", "DISCONNECTED"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("close_args", "expected_code"), [({}, CloseCode.NORMAL), ({"code": 4000}, 4000)])
+async def test_client_close_gives_the_handler_a_disconnect_with_the_code(close_args, expected_code):
+    api = BoltAPI()
+    seen: list[tuple[int, str]] = []
+
+    @api.websocket("/ws")
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        try:
+            await websocket.receive_text()
+        except WebSocketDisconnect as exc:
+            seen.append((exc.code, exc.reason))
+
+    async with WebSocketTestClient(api, "/ws") as ws:
+        await ws.close(**close_args)
+        assert ws.closed
+        assert ws.close_code == expected_code
+        await ws._handler_task
+
+    assert seen == [(expected_code, "")]
