@@ -475,6 +475,41 @@ def _collect_sequence_field_names(struct_type: type) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _or_struct_default(
+    extract: Callable, default: Any, names: tuple[str, ...], needs_files: bool | None = None
+) -> Callable:
+    """Give an optional struct parameter its default when the request has none of its keys.
+
+    ``names`` holds the keys that the struct reads. With one of them in the
+    request, ``extract`` builds and validates the struct, as for a required
+    parameter. A required parameter (no default) keeps ``extract`` as it is.
+    ``needs_files`` is the ``needs_files_map`` flag of a query, cookie or form
+    struct extractor, and None for a header struct extractor.
+    """
+    if default is inspect.Parameter.empty:
+        return extract
+
+    if needs_files:
+
+        def extract_or_default(param_map: dict[str, Any], files_map: dict[str, Any] | None = None) -> Any:
+            for name in names:
+                if name in param_map or (files_map is not None and name in files_map):
+                    return extract(param_map, files_map)
+            return default
+
+    else:
+
+        def extract_or_default(param_map: dict[str, Any]) -> Any:
+            for name in names:
+                if name in param_map:
+                    return extract(param_map)
+            return default
+
+    if needs_files is not None:
+        extract_or_default.needs_files_map = needs_files  # type: ignore[attr-defined]
+    return extract_or_default
+
+
 def _unknown_field_errors(
     data: dict[str, Any], known: frozenset[str], param_type: str, source: str, files: Any = ()
 ) -> list[dict[str, Any]]:
@@ -508,7 +543,7 @@ def _create_param_struct_extractor(
 
     Parameters:
         struct_type (type): msgspec struct/serializer type to produce.
-        default (Any): Reserved for optional-struct support; not used by the extractor itself.
+        default (Any): The value of the parameter when the request has none of the keys of the struct. `inspect.Parameter.empty` makes the struct required.
         param_type (str): The source name in error messages ("query parameter", "form field" or "cookie"). It also selects the source in `loc`.
         other_keys (frozenset[str]): The keys that the other parameters of the handler read from the same source. A struct that forbids unknown fields does not get them. A key that no parameter declares gives a 422 with the type `unknown_field`.
 
@@ -583,7 +618,8 @@ def _create_param_struct_extractor(
             return result
 
         extract_with_files.needs_files_map = True  # type: ignore[attr-defined]
-        return extract_with_files
+        names = tuple(f.encode_name for f in msgspec.structs.fields(struct_type))
+        return _or_struct_default(extract_with_files, default, names, needs_files=True)
     else:
         # Extractor without file support (query params, cookies, non-file forms)
         def extract(param_map: dict[str, Any]) -> Any:
@@ -629,7 +665,8 @@ def _create_param_struct_extractor(
                 raise
 
         extract.needs_files_map = False  # type: ignore[attr-defined]
-        return extract
+        names = tuple(f.encode_name for f in msgspec.structs.fields(struct_type))
+        return _or_struct_default(extract, default, names, needs_files=False)
 
 
 def _collect_header_struct_errors(
@@ -686,13 +723,12 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
 
     Args:
         struct_type: The msgspec.Struct or Serializer class
-        default: Default value if the entire struct is optional
+        default: The value of the parameter when the request has none of the
+            headers of the struct. ``inspect.Parameter.empty`` makes the struct required.
 
     Returns:
         Extractor function that takes headers_map and returns struct instance
     """
-    _ = default  # Reserved for future optional struct support
-
     # Pre-compute header name mapping at registration time
     # Maps kebab-case header name → encoded field name (for msgspec alias support)
     header_to_encoded: list[tuple[str, str, bool]] = []
@@ -720,7 +756,7 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
                 raise RequestValidationError(errors=errors) from e
             raise
 
-    return extract
+    return _or_struct_default(extract, default, tuple(header_name for header_name, _, _, _ in error_fields))
 
 
 def create_file_extractor(
@@ -1014,7 +1050,8 @@ def create_extractor_for_field(field: FieldDefinition, other_keys: frozenset[str
     source = field.source
     name = field.name
     annotation = field.annotation
-    default = field.default
+    # An Optional type without default has the default None.
+    default = None if field.default is inspect.Parameter.empty and is_optional(annotation) else field.default
     alias = field.alias
 
     # Return appropriate extractor based on source
