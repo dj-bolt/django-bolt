@@ -51,6 +51,10 @@ of the streaming thread fails when the body ends.
 off, creates a temporary table and raises. Then it returns the state of the
 connection that the next call gets.
 
+``/query-in-a-helper`` is a sync handler with no query in its own source, so
+Bolt runs it on the worker thread that accepted the request. Its helper
+queries. With ``fail``, the handler raises after the query.
+
 ``lane_api`` is a second API, under ``/lane``, with a Django middleware stack.
 Its sync route ``/lane/query`` runs complete on a request lane. A test project
 lists both APIs in ``BOLT_API``.
@@ -312,6 +316,14 @@ async def autocommit_off_then_fail():
     with contextlib.suppress(ValueError):
         await run_in_orm_executor(_autocommit_off_then_fail)
     return await run_in_orm_executor(_connection_state)
+
+
+@api.get("/query-in-a-helper")
+def query_in_a_helper(fail: bool = False):
+    result = _select_one()
+    if fail:
+        raise ValueError("the handler failed after its query")
+    return {"result": result, "thread": threading.current_thread().name}
 
 
 class _QueryMiddleware(MiddlewareMixin):

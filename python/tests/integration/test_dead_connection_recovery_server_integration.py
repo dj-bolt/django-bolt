@@ -475,6 +475,27 @@ def test_a_user_load_on_the_event_loop_gives_its_pooled_connection_back(make_ser
             assert query_each_orm_thread(server, 1) == ["ok"]
 
 
+def test_a_sync_handler_on_the_worker_thread_gives_its_pooled_connection_back(make_server_project, postgres_database):
+    """A sync handler with no query in its own source runs on the worker thread that accepted the request.
+
+    A helper of the handler can still query. The worker thread must give the
+    connection back when the request ends, also when the handler raises. The
+    pool has one connection, so the call on the ORM pool gets none when the
+    worker thread keeps it.
+    """
+    server, _ = start_server(make_server_project, postgres_database, settings_extra=ONE_CONNECTION_POOL)
+    with server:
+        for _ in range(3):
+            response = server.get("/query-in-a-helper")
+            assert response.status_code == 200, response.text
+            assert response.json()["result"] == "ok"
+            # The handler ran on a worker thread of the server, not on a thread of a Bolt pool.
+            assert not response.json()["thread"].startswith("bolt_"), response.json()
+            assert query_each_orm_thread(server, 1) == ["ok"]
+            assert server.get("/query-in-a-helper?fail=true").status_code == 500
+            assert query_each_orm_thread(server, 1) == ["ok"]
+
+
 def test_a_lane_keeps_its_pooled_connection_until_its_request_ends(make_server_project, postgres_database):
     """A request with Django middleware runs its ORM calls on its lane.
 
