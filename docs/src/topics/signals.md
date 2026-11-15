@@ -71,6 +71,20 @@ If you use such packages, enable signals:
 BOLT_EMIT_SIGNALS = True
 ```
 
+## The scope of `request_started`
+
+A receiver of `request_started` gets a `scope` dict:
+
+| Key | Value |
+|-----|-------|
+| `type` | `"http"` |
+| `method` | The HTTP method |
+| `path` | The request path |
+| `query_string` | The query string as `bytes`, still encoded. It is `b""` for a request with no query. |
+| `headers` | A dict of the request headers. Each name is in lower case. |
+
+With signals on, Bolt keeps the query string and the headers of each request, also for a route that reads no query and no header.
+
 ## Summary
 
 | Setting | Performance | Use Case |
