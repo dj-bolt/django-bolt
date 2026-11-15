@@ -599,6 +599,57 @@ def test_str_or_bytes_for_dict_or_list_is_a_validation_error_on_each_executor(se
 
 
 @pytest.mark.parametrize(
+    ("return_type", "value", "expected"),
+    [
+        (dict, [1], "expected dict, but handler returned list"),
+        (dict, (1, 2), "expected dict, but handler returned tuple"),
+        (dict, 3, "expected dict, but handler returned int"),
+        (dict, None, "expected dict, but handler returned NoneType"),
+        (list, {"a": 1}, "expected list, but handler returned dict"),
+        (list, 3, "expected list, but handler returned int"),
+        (list, None, "expected list, but handler returned NoneType"),
+    ],
+    ids=["dict-list", "dict-tuple", "dict-int", "dict-none", "list-dict", "list-int", "list-none"],
+)
+def test_a_result_of_another_kind_for_dict_or_list_is_a_validation_error_on_each_executor(
+    settings, return_type, value, expected
+):
+    """Bolt sent a list or an int of a ``-> dict`` route, and a dict of a ``-> list`` route, as JSON."""
+    settings.DEBUG = True
+    api = BoltAPI()
+    paths = _mismatch_routes(api, return_type, value)
+
+    with TestClient(api) as scalar_client:
+        for path in paths:
+            assert expected in _validation_message(scalar_client.get(path)), path
+
+
+def test_a_tuple_for_a_bare_list_is_a_json_array_on_each_executor():
+    api = BoltAPI()
+    paths = _mismatch_routes(api, list, (1, "a"))
+
+    with TestClient(api) as scalar_client:
+        for path in paths:
+            response = scalar_client.get(path)
+            assert response.headers["content-type"] == "application/json", path
+            assert response.json() == [1, "a"], path
+
+
+@pytest.mark.parametrize(
+    ("return_type", "value"),
+    [(dict, [1]), (dict, 3), (list, {"a": 1}), (list, 3)],
+    ids=["dict-list", "dict-int", "list-dict", "list-int"],
+)
+def test_a_dict_or_list_route_with_no_validation_sends_a_result_of_another_kind(return_type, value):
+    api = BoltAPI()
+    paths = _mismatch_routes(api, return_type, value, validate_response=False)
+
+    with TestClient(api) as scalar_client:
+        for path in paths:
+            assert scalar_client.get(path).json() == value, path
+
+
+@pytest.mark.parametrize(
     ("return_type", "value", "content_type"),
     [
         (dict, "abc", "text/plain; charset=utf-8"),

@@ -240,6 +240,57 @@ def _raise_plain_type_mismatch(expected: type, result: Any) -> NoReturn:
     )
 
 
+def _compile_plain_container_handlers(
+    container: type,
+    default_status_code: int,
+    prepare_list: Callable[[list[Any]], Any],
+    queryset_handler: Callable[..., Any],
+    queryset_handler_sync: Callable[..., Any],
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Compile the data handlers of a route with the bare response type ``dict`` or ``list``.
+
+    ``-> dict`` takes a dict. ``-> list`` takes a list, a tuple or a QuerySet.
+    Each other result is a response validation error. The type test of the
+    correct result is the first test, so that result pays for no other test.
+    The QuerySet handlers are the general data handlers of the route.
+    """
+
+    def refuse(result: Any, current_status: int) -> ResponseWireV1:
+        if result is None and current_status == 204:
+            return _wire_bytes(204, _RESPONSE_META_EMPTY, b"")
+        _raise_plain_type_mismatch(container, result)
+
+    if container is dict:
+
+        def handler_sync(result: Any, status_code: int | None = None) -> ResponseWireV1:
+            current_status = default_status_code if status_code is None else status_code
+            if isinstance(result, dict):
+                return _wire_bytes(current_status, _RESPONSE_META_JSON, _json.encode(result))
+            return refuse(result, current_status)
+
+        async def handler(result: Any, status_code: int | None = None) -> ResponseWireV1:
+            return handler_sync(result, status_code)
+
+        return handler, handler_sync
+
+    def list_handler_sync(result: Any, status_code: int | None = None) -> ResponseWireV1:
+        current_status = default_status_code if status_code is None else status_code
+        if isinstance(result, list):
+            return _wire_bytes(current_status, _RESPONSE_META_JSON, _json.encode(prepare_list(result)))
+        if isinstance(result, tuple):
+            return _wire_bytes(current_status, _RESPONSE_META_JSON, _json.encode(prepare_list(list(result))))
+        if isinstance(result, QuerySet):
+            return queryset_handler_sync(result, status_code)
+        return refuse(result, current_status)
+
+    async def list_handler(result: Any, status_code: int | None = None) -> ResponseWireV1:
+        if isinstance(result, QuerySet):
+            return await queryset_handler(result, status_code)
+        return list_handler_sync(result, status_code)
+
+    return list_handler, list_handler_sync
+
+
 def _raise_response_validation_error(exc: Exception) -> NoReturn:
     """Convert a low-level validation failure into ResponseValidationError.
 
@@ -1174,6 +1225,11 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             meta = _response_class_wire_meta(result.media_type, result.headers, cookies)
             return _wire_bytes(result.status_code, meta, body)
         return _RESPONSE_SERIALIZERS[cls](result)
+
+    if refuses and plain_type in (dict, list):
+        data_handler, data_handler_sync = _compile_plain_container_handlers(
+            plain_type, default_status_code, prepare_list, data_handler, data_handler_sync
+        )
 
     meta["_default_response_handler"] = data_handler
     meta["_default_response_handler_sync"] = data_handler_sync

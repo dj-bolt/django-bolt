@@ -178,6 +178,17 @@ def _sync_finisher(meta: dict[str, Any], defer: Callable) -> Callable[[Any], Res
     return finish
 
 
+def _fast_dict_type(meta: dict[str, Any]) -> type | tuple:
+    """Return the type whose instances an executor encodes as a JSON object with no other check.
+
+    This is ``dict``. A route with the bare response type ``list`` that validates
+    its response refuses a dict. For it the result is ``()``: the ``isinstance``
+    test of the executor is false, and the response handlers raise the error.
+    Thus the rule adds no test to an executor.
+    """
+    return () if meta.get("response_type") is list and meta["validate_response"] else dict
+
+
 def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Callable) -> Callable:
     """Build the sync executor of a handler whose only parameter is the request.
 
@@ -187,6 +198,7 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
     """
     encode = _json._ENCODER.encode
     finish = _sync_finisher(meta, defer)
+    fast_dict = _fast_dict_type(meta)
 
     if meta["_has_response_validation"]:
         if is_async:
@@ -220,7 +232,7 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
                 coro.close()
                 # Unreachable: _never_suspends accepts no handler that can suspend.
                 raise RuntimeError("Handler awaited unexpectedly in sync dispatch")  # pragma: no mutate
-            if isinstance(result, dict):
+            if isinstance(result, fast_dict):
                 return encode(result)
             return finish(result)
 
@@ -228,7 +240,7 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
 
     def execute(handler: Callable, request: dict[str, Any]) -> ResponseWireV1 | Callable:
         result = handler(request)
-        if isinstance(result, dict):
+        if isinstance(result, fast_dict):
             return encode(result)
         return finish(result)
 
@@ -2264,6 +2276,7 @@ class BoltAPI:
                 # Only a result of the declared container goes to the encoder here. Each
                 # other result, such as a str, gets the checks of the response handlers.
                 _fast_type = list if _resp_origin is list else dict
+                _fast_dict = _fast_dict_type(meta)
 
                 if _trivially_async:
                     # Sync executor for trivially-async handlers: drive coroutine inline.
@@ -2303,7 +2316,7 @@ class BoltAPI:
                                     raise RuntimeError(
                                         "Handler awaited unexpectedly in sync dispatch"  # pragma: no mutate (cannot suspend)
                                     )
-                                if isinstance(result, dict):
+                                if isinstance(result, _fast_dict):
                                     return _encode(result)
                                 if isinstance(result, list):
                                     result = _convert_serializers(result)
@@ -2345,7 +2358,7 @@ class BoltAPI:
                                     raise RuntimeError(
                                         "Handler awaited unexpectedly in sync dispatch"  # pragma: no mutate (cannot suspend)
                                     )
-                                if isinstance(result, dict):
+                                if isinstance(result, _fast_dict):
                                     return _encode(result)
                                 if isinstance(result, list):
                                     result = _convert_serializers(result)
@@ -2366,7 +2379,7 @@ class BoltAPI:
 
                         async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
                             result = await handler()
-                            if isinstance(result, dict):
+                            if isinstance(result, _fast_dict):
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, list):
                                 result = _convert_serializers(result)
@@ -2386,7 +2399,7 @@ class BoltAPI:
                         async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
                             args, kwargs = _get_args(request)
                             result = await handler(*args, **kwargs)
-                            if isinstance(result, dict):
+                            if isinstance(result, _fast_dict):
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, list):
                                 result = _convert_serializers(result)
@@ -2633,6 +2646,7 @@ class BoltAPI:
                 # Only a result of the declared container goes to the encoder here. Each
                 # other result, such as a str, gets the checks of the response handlers.
                 _fast_type = list if _resp_origin is list else dict
+                _fast_dict = _fast_dict_type(meta)
 
                 # Plain (non-async) sync executor for Rust sync dispatch bypass.
                 # Eliminates coroutine creation + into_future_with_locals overhead.
@@ -2648,7 +2662,7 @@ class BoltAPI:
 
                         def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
                             result = handler()
-                            if isinstance(result, dict):
+                            if isinstance(result, _fast_dict):
                                 return _encode(result)
                             if isinstance(result, list):
                                 result = _convert_serializers(result)
@@ -2668,7 +2682,7 @@ class BoltAPI:
                         def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
                             args, kwargs = _get_args(request)
                             result = handler(*args, **kwargs)
-                            if isinstance(result, dict):
+                            if isinstance(result, _fast_dict):
                                 return _encode(result)
                             if isinstance(result, list):
                                 result = _convert_serializers(result)
@@ -2691,7 +2705,7 @@ class BoltAPI:
 
                         async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
                             result = handler()
-                            if isinstance(result, dict):
+                            if isinstance(result, _fast_dict):
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, list):
                                 result = _convert_serializers(result)
@@ -2715,7 +2729,7 @@ class BoltAPI:
                         async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
                             args, kwargs = _get_args(request)
                             result = handler(*args, **kwargs)
-                            if isinstance(result, dict):
+                            if isinstance(result, _fast_dict):
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, list):
                                 result = _convert_serializers(result)
