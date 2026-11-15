@@ -313,7 +313,7 @@ api.include_router(admin_router)
 
 Passing plain middleware instances in these lists fails fast with `TypeError` (`pass class, not instance`).
 
-A dict config needs `"type": "cors"` or `"type": "rate_limit"`. A dict with no type or with another type raises `ValueError`, because no middleware reads it. `@middleware(type="cors", ...)` is the same dict as keyword arguments. A dict config gets the checks of `@cors(...)` or `@rate_limit(...)`, so a value that the decorator refuses raises the same error. Other keyword arguments of `@middleware` raise `TypeError`. Use `@cors(...)`, `@rate_limit(...)` and `@skip_middleware(...)`.
+A dict config needs `"type": "cors"` or `"type": "rate_limit"`. A dict with no type or with another type raises `ValueError`, because no middleware reads it. `@middleware(type="cors", ...)` is the same dict as keyword arguments. A dict config gets the checks of `@cors(...)` or `@rate_limit(...)`, so a value that the decorator refuses raises the same error. A key that is not a keyword argument of the decorator raises `TypeError`, and the error lists the valid keys. Other keyword arguments of `@middleware` raise `TypeError`. Use `@cors(...)`, `@rate_limit(...)` and `@skip_middleware(...)`.
 
 In a `cors` dict, `origins` and `origin_regexes` take a `str` or a collection of `str`. Another type, or an empty pattern, stops startup with `TypeError` or `ValueError`.
 
