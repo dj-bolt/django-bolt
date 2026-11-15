@@ -57,8 +57,8 @@ async def lifespan(app):
 api = BoltAPI(lifespan=lifespan)
 
 @api.get("/cached")
-async def get_cached(request):
-    value = await request.app._redis.get("key")
+async def get_cached():
+    value = await api._redis.get("key")
     return {"value": value}
 ```
 
@@ -133,6 +133,26 @@ api = BoltAPI(lifespan=payments_lifespan)
 #   Blog API stopping
 ```
 
+## Mounted APIs
+
+The lifespan of an API that you mount with `api.mount()` runs with the parent API. Startup runs the parent first, then each mounted API in mount order. Shutdown runs in reverse order. Each lifespan gets its own API as `app`.
+
+```python
+from contextlib import asynccontextmanager
+from django_bolt import BoltAPI
+
+@asynccontextmanager
+async def reports_lifespan(app):
+    app._report_cache = {}
+    yield
+    app._report_cache.clear()
+
+reports_api = BoltAPI(lifespan=reports_lifespan)
+
+api = BoltAPI()
+api.mount("/reports", reports_api)  # reports_lifespan runs with api
+```
+
 ## Testing
 
 The `TestClient` is lifespan-aware. When you enter the `with` block, startup runs. When you exit, shutdown runs. No special setup needed:
@@ -151,8 +171,8 @@ async def lifespan(app):
 api = BoltAPI(lifespan=lifespan)
 
 @api.get("/status")
-async def status(request):
-    return {"ready": request.app._cache.get("ready", False)}
+async def status():
+    return {"ready": api._cache.get("ready", False)}
 
 # Lifespan runs automatically
 with TestClient(api) as client:

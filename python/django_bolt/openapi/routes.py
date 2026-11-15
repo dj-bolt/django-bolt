@@ -7,6 +7,7 @@ This module handles the registration of OpenAPI documentation routes
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from django_bolt.openapi.plugins import JsonRenderPlugin, YamlRenderPlugin
@@ -28,6 +29,16 @@ class OpenAPIRouteRegistrar:
         """
         self.api = api
         self._middleware = middleware
+        # The handler of each docs path. A later handler replaces an earlier one
+        # with the same path, so each path registers one time.
+        self._handlers: dict[str, Callable] = {}
+
+    def _add(self, path: str, handler: Callable) -> None:
+        """Set the handler of a docs path."""
+        # Two paths that differ only in the trailing slash are one route, unless
+        # the API keeps the slash.
+        key = path if self.api.trailing_slash == "keep" else path.rstrip("/") or "/"
+        self._handlers[key] = handler
 
     def register_routes(self) -> None:
         """Register OpenAPI documentation routes.
@@ -66,14 +77,7 @@ class OpenAPIRouteRegistrar:
             except Exception as e:
                 raise Exception(f"Failed to generate OpenAPI JSON schema: {type(e).__name__}: {str(e)}") from e
 
-        self.api._route_decorator(
-            "GET",
-            f"{route_prefix}/openapi.json",
-            guards=guards,
-            auth=auth,
-            _skip_prefix=True,
-            _router_middleware=self._middleware,
-        )(openapi_json_handler)
+        self._add(f"{route_prefix}/openapi.json", openapi_json_handler)
 
         # Always register YAML endpoints
         yaml_plugin = YamlRenderPlugin()
@@ -84,14 +88,7 @@ class OpenAPIRouteRegistrar:
             rendered = yaml_plugin.render(schema, "")
             return PlainText(rendered, status_code=200, headers={"content-type": yaml_plugin.media_type})
 
-        self.api._route_decorator(
-            "GET",
-            f"{route_prefix}/openapi.yaml",
-            guards=guards,
-            auth=auth,
-            _skip_prefix=True,
-            _router_middleware=self._middleware,
-        )(openapi_yaml_handler)
+        self._add(f"{route_prefix}/openapi.yaml", openapi_yaml_handler)
 
         async def openapi_yml_handler(request):
             """Serve OpenAPI schema as YAML (alternative extension)."""
@@ -99,20 +96,23 @@ class OpenAPIRouteRegistrar:
             rendered = yaml_plugin.render(schema, "")
             return PlainText(rendered, status_code=200, headers={"content-type": yaml_plugin.media_type})
 
-        self.api._route_decorator(
-            "GET",
-            f"{route_prefix}/openapi.yml",
-            guards=guards,
-            auth=auth,
-            _skip_prefix=True,
-            _router_middleware=self._middleware,
-        )(openapi_yml_handler)
+        self._add(f"{route_prefix}/openapi.yml", openapi_yml_handler)
 
         # Register UI plugin routes
         self._register_ui_plugins(route_prefix)
 
         # Add root redirect to default plugin
         self._register_root_redirect(route_prefix)
+
+        for path, handler in self._handlers.items():
+            self.api._route_decorator(
+                "GET",
+                path,
+                guards=guards,
+                auth=auth,
+                _skip_prefix=True,
+                _router_middleware=self._middleware,
+            )(handler)
 
         self.api._openapi_routes_registered = True
 
@@ -133,8 +133,6 @@ class OpenAPIRouteRegistrar:
         """Register UI plugin routes (Swagger UI, ReDoc, etc.)."""
         # Schema URL is always the full path (for the UI to fetch)
         schema_url = f"{self.api._openapi_config.path}/openapi.json"
-        guards = self.api._openapi_config.guards
-        auth = self.api._openapi_config.auth
 
         for plugin in self.api._openapi_config.render_plugins:
             for plugin_path in plugin.paths:
@@ -165,14 +163,7 @@ class OpenAPIRouteRegistrar:
                     return ui_handler
 
                 handler = make_handler(plugin)
-                self.api._route_decorator(
-                    "GET",
-                    full_path,
-                    guards=guards,
-                    auth=auth,
-                    _skip_prefix=True,
-                    _router_middleware=self._middleware,
-                )(handler)
+                self._add(full_path, handler)
 
     def _register_root_redirect(self, route_prefix: str) -> None:
         """Register root path to serve default UI directly.
@@ -185,8 +176,6 @@ class OpenAPIRouteRegistrar:
             # Schema URL is always the full path (for the UI to fetch)
             schema_url = f"{self.api._openapi_config.path}/openapi.json"
             plugin = self.api._openapi_config.default_plugin
-            guards = self.api._openapi_config.guards
-            auth = self.api._openapi_config.auth
 
             # Capture plugin in closure
             def make_root_handler(p, url):
@@ -206,11 +195,4 @@ class OpenAPIRouteRegistrar:
                 return openapi_root_handler
 
             handler = make_root_handler(plugin, schema_url)
-            self.api._route_decorator(
-                "GET",
-                route_prefix,
-                guards=guards,
-                auth=auth,
-                _skip_prefix=True,
-                _router_middleware=self._middleware,
-            )(handler)
+            self._add(route_prefix, handler)

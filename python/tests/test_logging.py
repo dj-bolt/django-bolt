@@ -1002,6 +1002,24 @@ class TestQueueBasedLogging:
         has_queue_handler = any(isinstance(h, QueueHandler) for h in root_logger.handlers)
         assert has_queue_handler, "Root logger should have a QueueHandler"
 
+    def test_setup_django_logging_prints_each_record_one_time(self, capsys):
+        """A record of the django logger or of one of its children goes to the console one time."""
+        config_module._LOGGING_CONFIGURED = False
+
+        setup_django_logging(force=True)
+        logging.getLogger("django.request").warning("one request record")
+        logging.getLogger("django.server").warning("one server record")
+        logging.getLogger("django_bolt").warning("one bolt record")
+        logging.getLogger("another_app").warning("one app record")
+        # stop() sends each queued record to the console handler.
+        config_module._QUEUE_LISTENER.stop()
+
+        console = capsys.readouterr().err
+        assert [
+            console.count(text)
+            for text in ("one request record", "one server record", "one bolt record", "one app record")
+        ] == [1, 1, 1, 1]
+
     def test_setup_django_logging_respects_explicit_logging_config(self):
         """setup_django_logging should skip setup when LOGGING is explicitly configured."""
         # Reset global state

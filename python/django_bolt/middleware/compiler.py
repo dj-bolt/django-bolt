@@ -21,7 +21,7 @@ except ImportError:  # Django 5.2 has no django.utils.csp
     build_policy = None
 
 from ..auth.backends import BaseAuthentication, get_default_authentication_classes
-from ..auth.guards import GUARD_TYPES, get_default_permission_classes
+from ..auth.guards import GUARD_TYPES, get_default_permission_classes, guards_need_user
 from ..params import Param
 from ..typing import is_msgspec_struct, resolve_type_alias, unwrap_optional
 
@@ -119,14 +119,19 @@ def _compile_guard(guard: Any, method: str, path: str) -> dict[str, Any]:
 _RUST_MIDDLEWARE = ("cors", "rate_limit", "compression")
 
 
-def route_auth_backends(auth: list[Any] | None) -> list[Any]:
+def route_auth_backends(auth: list[Any] | None, guards: list[Any] | None = None) -> list[Any]:
     """Return the auth backends that Rust gets for a route, in Rust order.
 
     The position of a backend in this list is its identity at dispatch. Rust
     reports it as ``auth_backend_index``. Two backends can have the same
     scheme name, so Python must not find a backend by its scheme name.
+
+    ``guards`` is the ``guards`` argument of the route. With no ``auth`` and no
+    ``BOLT_AUTHENTICATION_CLASSES``, a route with a guard that needs a user
+    gets ``JWTAuthentication()``. Each reader of the backends of a route calls
+    this function with the same arguments.
     """
-    backends = auth if auth is not None else get_default_authentication_classes()
+    backends = auth if auth is not None else get_default_authentication_classes(needs_user=guards_need_user(guards))
     # A dropped entry would leave the route with no backend while it looks authenticated.
     for backend in backends:
         if not isinstance(backend, BaseAuthentication):
@@ -169,7 +174,7 @@ def compile_middleware_meta(
             all_middleware.append(mw_dict)
 
     # Compile authentication backends
-    auth_backends = [auth_backend.to_metadata() for auth_backend in route_auth_backends(auth)]
+    auth_backends = [auth_backend.to_metadata() for auth_backend in route_auth_backends(auth, guards)]
 
     # Compile guards/permissions
     guard_list = []
@@ -536,7 +541,7 @@ def read_size_setting(name: str, default: int) -> int:
         try:
             size = operator.index(value)
         except TypeError:
-            size = -1
+            size = -1  # pragma: no mutate (each negative number fails the check below)
         if size >= 0:
             return size
     raise ImproperlyConfigured(f"{name} must be an int of 0 or more, got {type(value).__name__} {value!r}.")
@@ -638,7 +643,10 @@ def get_trusted_proxies() -> list[str]:
                 f"expected a string, got {type(entry).__name__}."
             )
         try:
-            network = ipaddress.ip_network(entry, strict=False)
+            network = ipaddress.ip_network(
+                entry,
+                strict=False,  # pragma: no mutate (None is also false)
+            )
         except (TypeError, ValueError) as e:
             raise ImproperlyConfigured(
                 f"BOLT_TRUSTED_PROXIES entry {entry!r} is not an address or CIDR block: {e}"

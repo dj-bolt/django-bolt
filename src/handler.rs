@@ -339,6 +339,36 @@ struct ParsedResponseWire {
     body: ResponseWireBody,
 }
 
+/// Read the status of a response wire.
+///
+/// A value that is not an HTTP status is an error. It must not become a success.
+#[inline]
+fn parse_wire_status(item: &Bound<'_, PyAny>) -> PyResult<StatusCode> {
+    match item
+        .extract::<u16>()
+        .ok()
+        .and_then(|code| StatusCode::from_u16(code).ok())
+    {
+        Some(status) => Ok(status),
+        None => Err(invalid_wire_status(item)),
+    }
+}
+
+#[cold]
+fn invalid_wire_status(item: &Bound<'_, PyAny>) -> PyErr {
+    let value = item
+        .repr()
+        .map(|repr| repr.to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    // The client gets no detail of a 500 when DEBUG is off, so the log names the status.
+    log::error!(
+        "The response status must be an int from 100 to 999, got {value}. Bolt sends a 500."
+    );
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "The response status must be an int from 100 to 999, got {value}"
+    ))
+}
+
 fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<ParsedResponseWire> {
     let obj = result_obj.bind(py);
     let tuple = obj.cast::<PyTuple>()?;
@@ -348,8 +378,7 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
         ));
     }
 
-    let status_code: u16 = tuple.get_item(0)?.extract()?;
-    let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
+    let status = parse_wire_status(&tuple.get_item(0)?)?;
     // Fast path: integer meta tag maps to static ResponseMeta (no String alloc, no tuple parse).
     // Slow path: parse full tuple for responses with custom headers/cookies.
     let meta_item = tuple.get_item(1)?;
@@ -592,6 +621,19 @@ async fn build_response_from_parsed(
             response
         }
     }
+}
+
+/// Log the cause of a response that Rust cannot build, for example a status
+/// that is not a u16. Python did not see this error, so Python did not log it.
+/// The client gets the 500 of each other exception, which tells the cause
+/// only with DEBUG on.
+#[cold]
+fn log_invalid_response(req: &HttpRequest, err: &PyErr) {
+    log::error!(
+        "{} {}: cannot build the response of the handler: {err}",
+        req.method(),
+        req.path()
+    );
 }
 
 pub async fn response_from_wire_result(
@@ -972,6 +1014,13 @@ async fn route_request(
                     // CORS headers will be added by CorsMiddleware
                     return HttpResponse::NoContent().finish();
                 }
+            }
+
+            // The path has routes, but none for this method: 405 with `Allow`
+            // (RFC 9110 section 15.5.6). This lookup runs on a miss only.
+            let allowed_methods = router.find_all_methods(path);
+            if !allowed_methods.is_empty() {
+                return responses::error_405(&allowed_methods);
             }
 
             // Route not found - return 404
@@ -1524,7 +1573,7 @@ async fn route_request(
             if result_obj.bind(py).is_instance_of::<PyBytes>() {
                 let backed = AttachedBytes::from(result_obj.extract::<PyBackedBytes>(py)?);
                 let status = route_metadata
-                    .map(|m| StatusCode::from_u16(m.default_status_code).unwrap_or(StatusCode::OK))
+                    .map(|m| m.default_status_code)
                     .unwrap_or(StatusCode::OK);
                 let body = if is_head_request {
                     drop(backed);
@@ -1551,7 +1600,8 @@ async fn route_request(
                 return Ok(DispatchOutcome::Pending(Box::pin(fut)));
             }
 
-            let parsed = parse_response_wire(py, &result_obj)?;
+            let parsed = parse_response_wire(py, &result_obj)
+                .inspect_err(|err| log_invalid_response(&req, err))?;
             let meta_ref = parsed.meta.as_ref();
             let response = match parsed.body {
                 ResponseWireBody::ZeroCopyBytes(backed) => {
@@ -1638,10 +1688,16 @@ async fn route_request(
                 {
                     Ok(response) => response,
                     Err(e) => {
-                        let reason =
-                            format!("Handler returned unsupported response wire format: {}", e);
-                        let response = error::internal_error_response(&reason);
-                        error::with_error_info(response, || error::ErrorInfo::internal(reason))
+                        log_invalid_response(&req, &e);
+                        Python::attach(|py| {
+                            handle_python_error(
+                                py,
+                                e,
+                                req.path(),
+                                req.method().as_str(),
+                                state.debug,
+                            )
+                        })
                     }
                 }
             }
