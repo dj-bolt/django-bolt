@@ -24,6 +24,8 @@ async def create_user():
     return {"created": True}
 ```
 
+Each method and path has one handler. A second handler for the same method and path stops startup with a `ValueError`.
+
 ## HTTP methods
 
 Django-Bolt supports all common HTTP methods:
@@ -38,6 +40,19 @@ Django-Bolt supports all common HTTP methods:
 | `@api.head()` | HEAD | Get headers only |
 | `@api.options()` | OPTIONS | Get allowed methods |
 | `@api.query()` | QUERY | Read using a request body |
+
+A request with a method that the path has no route for gets `405 Method Not Allowed`. The `Allow` header lists the methods of the path. A path with no route gets 404.
+
+```python
+@api.get("/reports")
+async def list_reports():
+    return []
+
+# POST /reports  → 405, Allow: GET, OPTIONS
+# POST /missing  → 404
+```
+
+Bolt adds no HEAD route for a GET route. Thus `HEAD /reports` also gets 405. Add `@api.head()` to serve HEAD.
 
 Example with all methods:
 
@@ -246,6 +261,8 @@ def sync_handler():
 
 Sync handlers are automatically wrapped to run in a thread pool.
 
+A handler is a function, a bound method, or an object with `__call__`. For an object, Bolt registers its `__call__` method. A `functools.partial` is not a handler, and the route decorator raises `TypeError` for it. Register a function that calls the partial. The rule is the same for `@api.websocket()`, where the function or the method must be `async`.
+
 ## WebSocket routes
 
 Define WebSocket endpoints using `@api.websocket()`:
@@ -310,6 +327,10 @@ api.mount("/api/v1", users_api)
 
 Routes from `users_api` are now available at `/api/v1/users`.
 
+An API cannot mount itself, and two APIs cannot mount each other. `mount()` raises `ValueError`.
+
+A mount path can have a parameter, such as `api.mount("/tenants/{tenant}", users_api)`. A handler of the mounted API reads the value from `request.params["tenant"]`. It cannot take `tenant` as an argument, because the mounted API compiled its routes without the mount path. `mount()` raises `ValueError` for such a handler. A `Router` with the prefix `/tenants/{tenant}` gives the value as an argument.
+
 ## ASGI mounts
 
 If you want to mount Django or other ASGI apps under path prefixes, see [ASGI Mounts](asgi-mounts.md).
@@ -335,6 +356,8 @@ You can control this behavior with the `trailing_slash` parameter:
 | `"strip"` | Remove trailing slashes (default) | `/users/` → `/users` |
 | `"append"` | Add trailing slashes | `/users` → `/users/` |
 | `"keep"` | No normalization | `/users/` → `/users/` |
+
+Another value raises `ValueError` when you make the `BoltAPI`.
 
 ### Runtime redirect behavior
 
@@ -407,6 +430,20 @@ async def list_items(): ...
 # GET /items   → 308 Redirect to /items/ (if /items/ exists)
 ```
 
+### WebSocket routes
+
+An HTTP route answers the other form of its path with a redirect. A WebSocket client usually does not follow a redirect. Thus a WebSocket route accepts both forms of its path, in each `trailing_slash` mode:
+
+```python
+@api.websocket("/ws/room/")   # Registered as /ws/room
+async def room(websocket: WebSocket): ...
+
+# /ws/room   → connects
+# /ws/room/  → connects
+```
+
+Django-Bolt stores a WebSocket route path with no trailing slash. It removes the trailing slash of a WebSocket request path before it finds the route. `WebSocketTestClient` follows the same rule.
+
 ### Multiple APIs with different settings
 
 When Django-Bolt auto-discovers and merges multiple `api.py` files, **each API's routes keep their own trailing slash format**. This allows different apps to use different conventions:
@@ -466,3 +503,5 @@ async def list_users():
 ```
 
 This is useful for versioning your API or grouping routes under a common path.
+
+Bolt gives each path and each prefix a leading slash. Thus `BoltAPI(prefix="api/v1")` with `@api.get("users")` serves `/api/v1/users`. The rule is the same for `Router(prefix=...)`, `include_router(prefix=...)`, `mount()`, views, viewsets and WebSocket routes.
