@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 from collections.abc import AsyncIterator
+from typing import Literal
 
 import msgspec
 import pytest
@@ -24,6 +26,23 @@ class Cat(msgspec.Struct, tag=True, tag_field="_type"):
 class Dog(Serializer, tag=True, tag_field="_type"):
     name: str
     barks: bool = True
+
+
+class ExampleColor(enum.Enum):
+    RED = "red"
+
+
+class ExampleCat(msgspec.Struct, tag=True):
+    lives: int
+    tags: list[str]
+    color: ExampleColor
+    kind: Literal["a", "b"]
+    note: str | None
+    price: float
+
+
+class ExampleDog(msgspec.Struct, tag=True):
+    age: int
 
 
 def test_union_response_model():
@@ -248,6 +267,27 @@ def test_tagged_union_emits_per_arm_examples_in_openapi():
     dog_example = examples["Dog"]["value"]
     assert dog_example["type"] == "Dog"
     assert dog_example["barks"] is True
+
+
+def test_tagged_union_examples_use_a_value_of_each_field_type():
+    """The example of a variant has a placeholder of the type of each field."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="t", version="1"))
+
+    @api.get("/pet", response_model=ExampleCat | ExampleDog)
+    async def get_pet():
+        return ExampleDog(age=1)
+
+    schema = SchemaGenerator(api, api._openapi_config).generate().to_schema()
+    media = schema["paths"]["/pet"]["get"]["responses"]["200"]["content"]["application/json"]
+    assert media["examples"]["ExampleCat"]["value"] == {
+        "lives": 0,
+        "tags": ["string"],
+        "color": "red",
+        "kind": "a",
+        "note": "string",
+        "price": 0.0,
+        "type": "ExampleCat",
+    }
 
 
 class Found(msgspec.Struct, tag=True):
