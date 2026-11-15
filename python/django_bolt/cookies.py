@@ -11,6 +11,9 @@ from ._core import format_cookie_date
 
 SameSitePolicy = Literal["Strict", "Lax", "None", False]
 
+# The SameSite values, in lower case. The letter case of a value has no meaning.
+_SAMESITE_VALUES = frozenset({"lax", "none", "strict"})
+
 
 @dataclass(slots=True)
 class Cookie:
@@ -25,7 +28,8 @@ class Cookie:
         domain: Cookie domain (default: None, current domain)
         secure: Require HTTPS (default: False)
         httponly: Prevent JavaScript access (default: False)
-        samesite: SameSite policy - "Strict", "Lax", "None", or False to omit (default: "Lax")
+        samesite: SameSite policy - "Strict", "Lax", "None", or False to omit (default: "Lax").
+            The letter case has no meaning. Another value raises ValueError, as in Django.
 
     Note:
         Invalid cookie names/values are validated and rejected by Rust at serialization time.
@@ -45,6 +49,12 @@ class Cookie:
     secure: bool = False
     httponly: bool = False
     samesite: SameSitePolicy = "Lax"
+
+    def __post_init__(self) -> None:
+        # Rust reads only "strict" and "none", so an unknown value became SameSite=Lax.
+        samesite = self.samesite
+        if samesite and (not isinstance(samesite, str) or samesite.lower() not in _SAMESITE_VALUES):
+            raise ValueError('samesite must be "lax", "none", or "strict".')
 
     def to_header_value(self) -> str:
         """Serialize to Set-Cookie header value using http.cookies for proper escaping."""

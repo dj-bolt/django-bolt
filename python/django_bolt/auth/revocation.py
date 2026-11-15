@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from django.apps import apps
 from django.core.cache import caches
 from django.core.cache.backends.base import BaseCache
+from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError
 from django.db.models import F
 
@@ -20,19 +21,26 @@ _DEFAULT_TTL_SECONDS = 86400 * 7  # 7 days — fallback when caller doesn't pass
 _NEVER_EXPIRES = datetime(9999, 1, 1, tzinfo=UTC)
 
 
-def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS) -> int:
+def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS, *, leeway: int) -> int:
     """
-    Seconds a revocation entry should live.
+    Return the seconds that a revocation entry must live.
 
-    Prefers the token's own ``exp`` (so the entry expires exactly when the
-    token would have anyway). A past ``exp`` clamps to 0 — we never hand a
-    negative duration to ``timedelta``, which would silently subtract from
-    now. When ``exp`` is ``None``, ``default`` is used — typically the
-    store's ``default_ttl`` instance attribute.
+    With ``exp``, the entry lives until ``exp + leeway``. ``JWTAuthentication``
+    accepts a token until that time, so the entry must not expire before it.
+    A result below 0 becomes 0, because ``timedelta`` subtracts a negative
+    duration from now. Without ``exp``, the result is ``default``, usually the
+    ``default_ttl`` of the store. ``leeway`` does not change ``default``.
     """
     if exp is None:
         return default
-    return max(0, int(exp) - int(time.time()))
+    return max(0, int(exp) + leeway - int(time.time()))
+
+
+def _checked_leeway(store_name: str, leeway: int) -> int:
+    """Return ``leeway``. Raise ``ImproperlyConfigured`` when it is negative."""
+    if leeway < 0:
+        raise ImproperlyConfigured(f"{store_name} leeway must be >= 0 seconds.")
+    return leeway
 
 
 class RevocationStore(ABC):
@@ -61,18 +69,19 @@ class RevocationStore(ABC):
         Revoke a token.
 
         The revocation entry must outlive the token, otherwise an attacker
-        could replay a still-valid JWT after the entry is cleaned up. Pass
-        the token's ``exp`` claim so the entry expires exactly when the
-        token would have anyway:
+        could replay a still-valid JWT after the entry is cleaned up.
+        ``JWTAuthentication`` accepts a token until ``exp + leeway``, so the
+        entry must live until that time. Pass the token's ``exp`` claim:
 
             await store.revoke(claims["jti"], exp=claims.get("exp"))
 
         Args:
             jti: JWT ID to revoke.
             exp: The token's ``exp`` claim (epoch seconds). Strongly
-                recommended. If omitted, falls back to a 30-day retention —
-                safe for most refresh-token windows but wasteful for short
-                access tokens.
+                recommended. If omitted, the stores of Bolt keep the entry
+                for their ``default_ttl`` (7 days by default). That is safe
+                only for a token that expires before then, and wasteful for
+                short access tokens.
         """
         pass
 
@@ -250,7 +259,7 @@ class DjangoCacheRevocation(RevocationStore):
         )
 
         # In logout endpoint — pass `exp` so the cache entry expires
-        # exactly when the token would have anyway.
+        # when the backend stops accepting the token (`exp + leeway`).
         @api.post("/logout")
         async def logout(request):
             claims = request["context"]["auth_claims"]
@@ -265,6 +274,7 @@ class DjangoCacheRevocation(RevocationStore):
         key_prefix: str = "revoked:",
         *,
         default_ttl: int = _DEFAULT_TTL_SECONDS,
+        leeway: int = 60,
     ):
         """
         Initialize Django cache-based revocation.
@@ -275,10 +285,14 @@ class DjangoCacheRevocation(RevocationStore):
             default_ttl: Fallback retention (in seconds) used when a caller
                 invokes ``revoke(jti)`` without passing ``exp``. Defaults to
                 7 days. Per-call ``exp`` always wins over this.
+            leeway: The ``leeway`` of the ``JWTAuthentication`` that reads
+                this store (default: 60). An entry lives until
+                ``exp + leeway``.
         """
         self.cache_alias = cache_alias
         self.key_prefix = key_prefix
         self.default_ttl = default_ttl
+        self.leeway = _checked_leeway("DjangoCacheRevocation", leeway)
         self._cache = None
 
     @property
@@ -297,9 +311,9 @@ class DjangoCacheRevocation(RevocationStore):
         """
         Revoke a token by storing its JTI in the cache.
 
-        Pass ``exp`` (the token's ``exp`` claim) so the cache entry expires
-        exactly when the token would have — no security gap, no wasted
-        storage.
+        Pass ``exp`` (the token's ``exp`` claim). The cache entry then
+        lives until ``exp + self.leeway``, the time when the backend stops
+        accepting the token.
 
             await store.revoke(claims["jti"], exp=claims.get("exp"))
 
@@ -307,7 +321,7 @@ class DjangoCacheRevocation(RevocationStore):
         seconds (set on the constructor).
         """
         key = f"{self.key_prefix}{jti}"
-        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl))
+        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
 
     def _require_atomic_cache(self) -> None:
         cache_type = type(self.cache)
@@ -327,7 +341,7 @@ class DjangoCacheRevocation(RevocationStore):
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
         self._require_atomic_cache()
         key = f"{self.key_prefix}{jti}"
-        return bool(self.cache.add(key, "1", timeout=_ttl_for(exp, self.default_ttl)))
+        return bool(self.cache.add(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway)))
 
     async def get_user_version(self, user_id: str) -> int:
         return int(self.cache.get(f"{self.key_prefix}ver:{user_id}") or 0)
@@ -348,7 +362,7 @@ class DjangoCacheRevocation(RevocationStore):
 
     async def revoke_family(self, fam: str, *, exp: int | None = None) -> None:
         key = f"{self.key_prefix}fam:{fam}"
-        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl))
+        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
 
     async def is_family_revoked(self, fam: str) -> bool:
         return self.cache.get(f"{self.key_prefix}fam:{fam}") is not None
@@ -386,8 +400,8 @@ class DjangoORMRevocation(RevocationStore):
         revocation_store=revocation,
     )
 
-    # In logout endpoint — pass `exp` so the row's expires_at aligns
-    # with the token's own expiry.
+    # In logout endpoint — pass `exp` so the row's expires_at is the time
+    # when the backend stops accepting the token (`exp + leeway`).
     @api.post("/logout")
     async def logout(request):
         claims = request["context"]["auth_claims"]
@@ -409,7 +423,13 @@ class DjangoORMRevocation(RevocationStore):
     ```
     """
 
-    def __init__(self, model: str = "bolt_revocation.RevokedToken", *, default_ttl: int = _DEFAULT_TTL_SECONDS):
+    def __init__(
+        self,
+        model: str = "bolt_revocation.RevokedToken",
+        *,
+        default_ttl: int = _DEFAULT_TTL_SECONDS,
+        leeway: int = 60,
+    ):
         """
         Initialize ORM-based revocation.
 
@@ -419,9 +439,13 @@ class DjangoORMRevocation(RevocationStore):
             default_ttl: Fallback retention (in seconds) used when a caller
                 invokes ``revoke(jti)`` without passing ``exp``. Defaults to
                 7 days. Per-call ``exp`` always wins over this.
+            leeway: The ``leeway`` of the ``JWTAuthentication`` that reads
+                this store (default: 60). An entry lives until
+                ``exp + leeway``.
         """
         self.model_path = model
         self.default_ttl = default_ttl
+        self.leeway = _checked_leeway("DjangoORMRevocation", leeway)
         self._model = None
 
     @property
@@ -442,20 +466,20 @@ class DjangoORMRevocation(RevocationStore):
         """
         Revoke a token by upserting a row keyed on its JTI.
 
-        Pass ``exp`` (the token's ``exp`` claim) so ``expires_at`` aligns
-        with the token's own expiry — your cleanup task can drop the row
-        exactly when the token would have stopped being honored anyway.
+        Pass ``exp`` (the token's ``exp`` claim). ``expires_at`` is then
+        ``exp + self.leeway``, the time when the backend stops accepting the
+        token. Your cleanup task can delete the row after that time.
 
             await store.revoke(claims["jti"], exp=claims.get("exp"))
 
         If ``exp`` is omitted, ``expires_at`` is set to ``now +
         self.default_ttl`` (set on the constructor).
         """
-        expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl))
+        expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
         await self.model.objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
-        expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl))
+        expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
         try:
             await self.model.objects.acreate(jti=jti, expires_at=expires_at)
         except IntegrityError:

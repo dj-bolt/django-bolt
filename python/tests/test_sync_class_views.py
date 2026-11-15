@@ -23,6 +23,7 @@ from django_bolt.exceptions import HTTPException
 from django_bolt.params import Depends
 from django_bolt.testing import TestClient
 from django_bolt.views import APIView
+from tests.test_models import Article
 
 # --- Schema Definitions ---
 
@@ -124,7 +125,7 @@ def test_sync_api_view_path_parameters(api):
     @api.view("/users/{user_id}")
     class UserView(APIView):
         def get(self, request, user_id: int) -> dict:
-            return {"user_id": user_id, "type": type(user_id).__name__}
+            return {"user_id": user_id, "type": type(user_id).__name__, "path": self.request.path}
 
     with TestClient(api) as client:
         response = client.get("/users/123")
@@ -132,6 +133,8 @@ def test_sync_api_view_path_parameters(api):
         data = response.json()
         assert data["user_id"] == 123
         assert data["type"] == "int"
+        # self.request is the request of the call.
+        assert data["path"] == "/users/123"
 
 
 def test_sync_api_view_query_parameters(api):
@@ -139,7 +142,8 @@ def test_sync_api_view_query_parameters(api):
 
     @api.view("/search")
     class SearchView(APIView):
-        def get(self, request, q: str, limit: int = 10) -> dict:
+        # limit is keyword-only, so the view gets it as a keyword argument.
+        def get(self, request, q: str, *, limit: int = 10) -> dict:
             return {"query": q, "limit": limit}
 
     with TestClient(api) as client:
@@ -314,10 +318,13 @@ def test_sync_handler_is_sync_metadata(api):
         def get(self, request) -> dict:
             return {"sync": True}
 
-    method, path, handler_id, handler = api._routes[0]
-    meta = api._handler_meta.get(handler_id)
-    assert meta is not None
-    assert meta.get("is_async") is False  # Should be sync
+        def post(self, request) -> dict:
+            return {"articles": Article.objects.count()}
+
+    meta = {method: api._handler_meta[handler_id] for method, _path, handler_id, _handler in api._routes}
+    assert meta["GET"]["is_async"] is False  # Should be sync
+    # Bolt reads the method under the view wrapper. An ORM read is blocking work, so it runs on a thread.
+    assert (meta["GET"]["is_blocking"], meta["POST"]["is_blocking"]) == (False, True)
 
 
 def test_async_handler_is_async_metadata(api):
