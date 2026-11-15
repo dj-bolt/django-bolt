@@ -7,9 +7,11 @@ and compares it with the error response that a client gets.
 from __future__ import annotations
 
 import http.client
+from typing import Annotated
 
 import msgspec
 import pytest
+from jsonschema import Draft202012Validator
 from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
@@ -17,6 +19,7 @@ from django_bolt.error_handlers import BoltError, ProblemDetails, error_schema, 
 from django_bolt.exceptions import HTTPException
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import OpenAPIStrictError, SchemaGenerator
+from django_bolt.param_functions import Cookie, Form, Header, Query
 from django_bolt.responses import PlainText, Response
 from django_bolt.testing import TestClient
 
@@ -94,6 +97,19 @@ DETAIL_SCHEMA = {
     },
     "required": ["detail"],
 }
+# The 422 body of a route with a parameter or a form field: the detail is a list of errors or a text.
+PARAMETER_DETAIL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "detail": {
+            "anyOf": [
+                DETAIL_SCHEMA["properties"]["detail"],
+                {"type": "string", "description": "Validation error message"},
+            ]
+        }
+    },
+    "required": ["detail"],
+}
 REJECTED_REF = {"$ref": "#/components/schemas/Rejected"}
 PROBLEM_REF = {"$ref": "#/components/schemas/ProblemDetails"}
 
@@ -165,6 +181,138 @@ def test_problem_details_documents_the_422_that_the_client_gets():
     assert taken.status_code == 409
     assert taken.headers["content-type"] == "application/json"
     assert taken.json() == {"reason": "taken"}
+
+
+def _parameter_api(formatter=None) -> BoltAPI:
+    api = BoltAPI(
+        error_formatter=formatter,
+        openapi_config=OpenAPIConfig(title="Errors", version="1.0.0", strict=True),
+    )
+
+    @api.get("/ping")
+    async def ping() -> Item:
+        return Item(id=1, name="ping")
+
+    @api.get("/query")
+    async def by_query(n: Annotated[int, Query(ge=1)]) -> Item:
+        return Item(id=n, name="query")
+
+    @api.get("/path/{n}")
+    async def by_path(n: int) -> Item:
+        return Item(id=n, name="path")
+
+    @api.get("/header")
+    async def by_header(x_n: Annotated[int, Header()]) -> Item:
+        return Item(id=x_n, name="header")
+
+    @api.get("/cookie")
+    async def by_cookie(n: Annotated[int, Cookie()]) -> Item:
+        return Item(id=n, name="cookie")
+
+    @api.put("/items/{n}")
+    async def replace_item(n: int, data: ItemIn) -> Item:
+        return Item(id=n, name=data.name)
+
+    @api.post("/forms")
+    async def send_form(n: Annotated[int, Form()]) -> Item:
+        return Item(id=n, name="form")
+
+    api._register_openapi_routes()
+    return api
+
+
+# One request for each parameter location, with a value that is not an integer.
+_BAD_PARAMETER = {
+    "/query": {"url": "/query?n=abc"},
+    "/path/{n}": {"url": "/path/abc"},
+    "/header": {"url": "/header", "headers": {"x-n": "abc"}},
+    "/cookie": {"url": "/cookie", "headers": {"cookie": "n=abc"}},
+}
+
+
+@pytest.mark.parametrize("path", list(_BAD_PARAMETER))
+def test_parameter_route_documents_the_422_that_the_client_gets(path):
+    """Bolt validates a path, query, header or cookie parameter, so the route has a 422."""
+    api = _parameter_api()
+    spec = _spec(api)
+    request = _BAD_PARAMETER[path]
+
+    with TestClient(api) as client:
+        invalid = client.get(request["url"], headers=request.get("headers"))
+
+    assert invalid.status_code == 422
+    assert invalid.headers["content-type"] == "application/json"
+    responses = spec["paths"][path]["get"]["responses"]
+    assert sorted(responses) == ["200", "422"]
+    assert responses["422"] == {
+        "description": "Validation Error - Request data failed validation",
+        "content": {"application/json": {"schema": PARAMETER_DETAIL_SCHEMA}},
+    }
+    Draft202012Validator(PARAMETER_DETAIL_SCHEMA).validate(invalid.json())
+
+
+def test_a_422_detail_is_a_text_or_a_list_of_errors():
+    """A parameter of the wrong type gives a text. A value out of its limit gives a list of errors."""
+    api = _parameter_api()
+    validator = Draft202012Validator(PARAMETER_DETAIL_SCHEMA)
+
+    with TestClient(api) as client:
+        missing = client.get("/query")
+        wrong_type = client.get("/query?n=abc")
+        too_small = client.get("/query?n=0")
+        missing_form_field = client.post("/forms", data={})
+        bad_form_value = client.post("/forms", data={"n": "abc"})
+        bad_body = client.put("/items/1", json={"name": 1})
+
+    assert missing.json() == {"detail": "Missing required query parameter: n"}
+    assert isinstance(wrong_type.json()["detail"], str)
+    assert too_small.json()["detail"][0]["loc"] == ["query", "n"]
+    assert missing_form_field.json() == {"detail": "Missing required form field: n"}
+    assert bad_form_value.json()["detail"][0]["loc"] == ["body", "n"]
+    assert bad_body.json()["detail"][0]["loc"] == ["body", "name"]
+    for response in (missing, wrong_type, too_small, missing_form_field, bad_form_value, bad_body):
+        assert response.status_code == 422
+        validator.validate(response.json())
+
+    spec = _spec(api)
+    # A route with a parameter or a form field can send the two forms of the detail.
+    for method, path in (("put", "/items/{n}"), ("post", "/forms")):
+        content = spec["paths"][path][method]["responses"]["422"]["content"]
+        assert content == {"application/json": {"schema": PARAMETER_DETAIL_SCHEMA}}
+
+
+def test_route_with_no_input_has_no_422():
+    assert sorted(_spec(_parameter_api())["paths"]["/ping"]["get"]["responses"]) == ["200"]
+
+
+def test_parameter_route_documents_the_422_of_the_formatter():
+    api = _parameter_api(problem_details)
+    spec = _spec(api)
+
+    for path in _BAD_PARAMETER:
+        content = spec["paths"][path]["get"]["responses"]["422"]["content"]
+        assert content == {"application/problem+json": {"schema": PROBLEM_REF}}
+    assert "422" not in spec["paths"]["/ping"]["get"]["responses"]
+
+    with TestClient(api) as client:
+        missing = client.get("/query")
+        wrong_type = client.get("/query?n=abc")
+
+    for response in (missing, wrong_type):
+        assert response.status_code == 422
+        assert response.headers["content-type"] == "application/problem+json"
+        msgspec.convert(response.json(), ProblemDetails)
+
+
+def test_parameter_route_has_no_422_without_error_responses():
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Errors", version="1.0.0", include_error_responses=False))
+
+    @api.get("/query")
+    async def by_query(n: int) -> Item:
+        return Item(id=n, name="query")
+
+    api._register_openapi_routes()
+    assert sorted(_spec(api)["paths"]["/query"]["get"]["responses"]) == ["200"]
 
 
 @pytest.mark.parametrize(

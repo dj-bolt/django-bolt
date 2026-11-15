@@ -46,6 +46,16 @@ async def _other_async_dep() -> int:
     return 30
 
 
+async def _async_dep_with_sources(
+    request,
+    a: Count,
+    b: Count,
+    x_c: Annotated[Count, Header()],
+    d: Annotated[Count, Cookie()],
+) -> dict:
+    return {"method": request.method, "a": a, "b": b, "c": x_c, "d": d}
+
+
 @pytest.fixture
 def client():
     api = BoltAPI()
@@ -104,6 +114,15 @@ def client():
     async def full_pos(x_a: Annotated[Count, Header()], b: Annotated[Count, Cookie()] = 7, /):
         return {"a": x_a, "b": b}
 
+    # A path parameter with a cookie, and a path parameter with a body.
+    @api.get("/path-cookie/{a}")
+    async def path_cookie(a: Count, b: Annotated[Count, Cookie()] = 7):
+        return {"a": a, "b": b}
+
+    @api.post("/path-body/{a}")
+    async def path_body(a: Count, item: Item):
+        return {"a": a, "name": item.name}
+
     # Dependencies: sync only, one async, and several async.
     @api.get("/deps-sync-kw")
     async def deps_sync_kw(*, a: Count = 1, dep: int = Depends(_sync_dep)):
@@ -127,6 +146,12 @@ def client():
 
     @api.get("/deps-parallel-pos")
     async def deps_parallel_pos(first: int = Depends(_async_dep), second: int = Depends(_other_async_dep), /):
+        return {"first": first, "second": second}
+
+    @api.get("/deps-parallel-sources/{a}")
+    async def deps_parallel_sources(
+        first: dict = Depends(_async_dep_with_sources), second: int = Depends(_other_async_dep)
+    ):
         return {"first": first, "second": second}
 
     with TestClient(api) as test_client:
@@ -173,6 +198,12 @@ def test_a_header_and_a_cookie_follow_the_declared_convention(client, kind):
     assert client.get(f"/full-{kind}", headers={"X-A": "3"}).json() == {"a": 3, "b": 7}
 
 
+def test_a_path_parameter_binds_next_to_a_cookie_or_a_body(client):
+    assert client.get("/path-cookie/3", headers={"Cookie": "b=4"}).json() == {"a": 3, "b": 4}
+    assert client.get("/path-cookie/3").json() == {"a": 3, "b": 7}
+    assert client.post("/path-body/3", json={"name": "bolt"}).json() == {"a": 3, "name": "bolt"}
+
+
 @pytest.mark.parametrize("flavour", ["sync", "async"])
 @pytest.mark.parametrize("kind", ["kw", "pos"])
 def test_a_dependency_follows_the_declared_convention(client, flavour, kind):
@@ -184,6 +215,12 @@ def test_a_dependency_follows_the_declared_convention(client, flavour, kind):
 @pytest.mark.parametrize("kind", ["kw", "pos"])
 def test_several_async_dependencies_follow_the_declared_convention(client, kind):
     assert client.get(f"/deps-parallel-{kind}").json() == {"first": 20, "second": 30}
+
+
+def test_async_dependencies_that_resolve_together_read_each_source(client):
+    response = client.get("/deps-parallel-sources/1?b=2", headers={"X-C": "3", "Cookie": "d=4"})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"first": {"method": "GET", "a": 1, "b": 2, "c": 3, "d": 4}, "second": 30}
 
 
 def test_two_async_dependencies_resolve_at_the_same_time():

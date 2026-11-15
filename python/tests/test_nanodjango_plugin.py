@@ -431,6 +431,39 @@ async def handler(request):
 
         assert len(extra_src) == 1
 
+    def test_moves_class_views_routers_and_registration_calls(self):
+        """Each statement that adds a route to the API goes to api.py."""
+        source = """\
+bolt = BoltAPI()
+router = Router(prefix="/r")
+
+@bolt.view("/items")
+class Items(APIView):
+    async def get(self, request):
+        return {}
+
+@bolt.viewset("/users")
+class Users(ViewSet):
+    pass
+
+@router.get("/x")
+async def rx(request):
+    return {}
+bolt.include_router(router)
+bolt.mount_asgi("/raw", raw_asgi)
+bolt.mount_mcp("/mcp", mcp)
+bolt.native_route("GET", "/native", capsule)
+"""
+        converter = _make_converter(source)
+        resolver = _make_resolver()
+        extra_src = []
+
+        convert_build_app_api(converter, resolver, extra_src)
+
+        assert extra_src == [ast.unparse(node) for node in converter.ast.body]
+        for name in ("bolt", "router", "Items", "Users", "rx"):
+            resolver.add_object.assert_any_call(name)
+
     def test_multiple_api_instances(self):
         source = """\
 api1 = BoltAPI()

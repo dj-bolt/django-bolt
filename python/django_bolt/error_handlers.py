@@ -29,8 +29,9 @@ from .serialization import _render_response_body
 
 logger = logging.getLogger(__name__)
 
-# Pre-computed constant headers (avoid per-error allocation)
-_DEFAULT_JSON_HEADERS: list[tuple[str, str]] = [("content-type", "application/json")]
+# Each response gets its own list, because the public handlers return it and a
+# caller can change it. The entry is a tuple, so the responses can share it.
+_JSON_CONTENT_TYPE: tuple[str, str] = ("content-type", "application/json")
 
 # Django import - may fail if Django not configured
 try:
@@ -53,11 +54,9 @@ def _json_response(
     status_code: int, headers: dict[str, str] | None, payload: Any
 ) -> tuple[int, list[tuple[str, str]], bytes]:
     """Encode ``payload`` as a JSON response tuple with optional extra headers."""
+    response_headers = [_JSON_CONTENT_TYPE]
     if headers:
-        response_headers = list(_DEFAULT_JSON_HEADERS)
         response_headers.extend(headers.items())
-    else:
-        response_headers = _DEFAULT_JSON_HEADERS
     return status_code, response_headers, _json.encode(payload)
 
 
@@ -101,7 +100,8 @@ def http_exception_handler(exc: HTTPException) -> tuple[int, list[tuple[str, str
 
 # Pre-compiled regex patterns for validation error parsing
 _RE_AT_LOCATION = re.compile(r" - at `(.+?)`$")
-_RE_MISSING_FIELD = re.compile(r"Object missing required field `(.+)`")
+# A response error has the name of the struct before this text.
+_RE_MISSING_FIELD = re.compile(r"(?:^|: )Object missing required field `(.+)`$")
 _RE_PATH_SPLIT = re.compile(r"[.\[]")
 
 
@@ -146,7 +146,7 @@ def msgspec_validation_error_to_dict(error: msgspec.ValidationError, root: str =
         msg_part = error_msg
         loc_parts = [root]
 
-    missing_match = _RE_MISSING_FIELD.fullmatch(msg_part)
+    missing_match = _RE_MISSING_FIELD.search(msg_part)
     if missing_match:
         return [{"loc": [*loc_parts, missing_match.group(1)], "msg": msg_part, "type": "missing_field"}]
 
@@ -689,6 +689,11 @@ def _log_formatted_error(error: BoltError) -> None:
         _log_server_error(error.exception)
 
 
+def _skips_formatter(exc: HTTPException) -> bool:
+    """Whether the default response of ``exc`` goes to the client with no call of the formatter."""
+    return exc.body is not None or exc.status_code < 400
+
+
 def handle_exception_with_formatter(
     formatter: ErrorFormatter | None,
     exc: Exception,
@@ -697,8 +702,10 @@ def handle_exception_with_formatter(
     """Handle an exception with the formatter, or with ``handle_exception`` when there is none.
 
     An HTTPException with a typed body skips the formatter. The handler chose that body.
+    An HTTPException with a status below 400, such as a redirect, also skips it.
+    That response is not an error.
     """
-    if isinstance(exc, HTTPException) and exc.body is not None:
+    if isinstance(exc, HTTPException) and _skips_formatter(exc):
         return http_exception_handler(exc)
     if formatter is not None:
         error = bolt_error_from_exception(exc)
@@ -727,10 +734,10 @@ def render_core_error(
     comes from the exception, as for an error in ``_dispatch``. ``reason`` tells
     the cause of a Rust 500 for the log. The formatter does not get it. The
     result is None when the formatter fails, or for an HTTPException with a
-    typed body. Then Rust sends its default response.
+    typed body or a status below 400. Then Rust sends its default response.
     """
     if exception is not None:
-        if isinstance(exception, HTTPException) and exception.body is not None:
+        if isinstance(exception, HTTPException) and _skips_formatter(exception):
             return None
         error = bolt_error_from_exception(exception)
     else:
