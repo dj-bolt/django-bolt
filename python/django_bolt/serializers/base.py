@@ -1029,6 +1029,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         try:
             return msgspec.convert(data, type=cls)
         except MsgspecValidationError as e:
+            # msgspec wraps the RequestValidationError of our validators. Raise it
+            # with its error list, as model_validate_json() does.
+            if isinstance(e.__cause__, RequestValidationError):
+                raise e.__cause__ from e
+
             # Collect all errors by validating field-by-field (Litestar approach)
             if isinstance(data, dict):
                 errors = cls._collect_msgspec_errors(data)

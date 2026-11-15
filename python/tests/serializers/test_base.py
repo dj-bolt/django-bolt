@@ -515,6 +515,33 @@ class TestModelValidateCollectsAllErrors:
             if tuple(err["loc"]) in {("body", "password"), ("body", "age")}:
                 assert err["type"] == "missing"
 
+    def test_validator_errors_of_a_dict_are_the_errors_of_the_same_json(self):
+        class Signup(Serializer):
+            email: str
+            age: int
+
+            @field_validator("email")
+            def check_email(cls, value):
+                if "@" not in value:
+                    raise ValueError("Invalid email")
+                return value
+
+            @model_validator
+            def check_age(self):
+                if self.age < 0:
+                    raise ValueError("Age is negative")
+
+        with pytest.raises(RequestValidationError) as from_json:
+            Signup.model_validate_json(b'{"email": "x", "age": -1}')
+        with pytest.raises(RequestValidationError) as from_dict:
+            Signup.model_validate({"email": "x", "age": -1})
+
+        assert from_dict.value.errors() == from_json.value.errors()
+        assert from_dict.value.errors() == [
+            {"loc": ["body", "email"], "msg": "Invalid email", "type": "value_error"},
+            {"loc": ["body"], "msg": "Age is negative", "type": "value_error"},
+        ]
+
     def test_nested_missing_field_has_the_type_of_a_top_level_one_and_its_full_loc(self):
         with pytest.raises(RequestValidationError) as exc_info:
             _Person.model_validate({"name": "x", "address": {"city": "a"}})
