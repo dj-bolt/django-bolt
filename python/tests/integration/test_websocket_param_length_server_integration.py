@@ -65,6 +65,9 @@ def test_websocket_normal_path_param_completes_handshake(make_server_project):
         ("/ws/%C3%BC%20b/x%20y", "/ws/ü b/x y"),
         # An escape with lower-case digits is the same path.
         ("/ws/%c3%bc", "/ws/ü"),
+        # The form with a trailing slash matches the same route, for each form of an escape.
+        ("/ws/%C3%BC/", "/ws/ü"),
+        ("/ws/%c3%bc/", "/ws/ü"),
     ],
 )
 def test_websocket_route_path_with_an_escaped_character_completes_handshake(make_server_project, url, expected):

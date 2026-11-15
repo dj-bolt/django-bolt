@@ -1164,10 +1164,13 @@ async fn websocket_not_found_handler(
 
     // Actix has each WebSocket route path with no trailing slash. A request path
     // with a trailing slash comes here. Find its route, as the test backend does.
+    // Each form of a `%XX` escape matches, as in `websocket_upgrade_handler`.
     let is_route = normalized_path.len() != path.len()
-        && GLOBAL_WEBSOCKET_ROUTER
-            .get()
-            .is_some_and(|ws_router| ws_router.find(normalized_path).is_some());
+        && GLOBAL_WEBSOCKET_ROUTER.get().is_some_and(|ws_router| {
+            ws_router
+                .find(&normalize_request_path(normalized_path))
+                .is_some()
+        });
     if is_route {
         return websocket_upgrade_handler(req, stream, state).await;
     }
