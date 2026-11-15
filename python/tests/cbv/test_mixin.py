@@ -14,7 +14,7 @@ from django_bolt.views import (
     RetrieveMixin,
     UpdateMixin,
 )
-from tests.test_models import Article
+from tests.test_models import Article, Country
 
 
 @pytest.fixture
@@ -244,6 +244,50 @@ def test_create_mixin(api, view_classes: list[type]):
         assert "id" in data
         assert data["title"] == "Create Title"
         assert Article.objects.filter(id=data["id"]).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_create_mixin_inserts_only(api):
+    """POST with the primary key of an existing row answers 409 and does not update the row."""
+
+    class CountrySchema(Serializer):
+        code: str
+        name: str
+
+    @api.viewset("/countries")
+    class CountryViewSet(ModelViewSet):
+        queryset = Country.objects.all()
+        serializer_class = CountrySchema
+
+    calls = []
+
+    @api.viewset("/hooked")
+    class HookedViewSet(CountryViewSet):
+        async def perform_create(self, obj):
+            calls.append(obj.code)
+            await super().perform_create(obj)
+
+    Country.objects.create(code="PK", name="Pakistan")
+
+    def rows():
+        return list(Country.objects.order_by("code").values_list("code", "name"))
+
+    with TestClient(api) as client:
+        response = client.post("/countries", json={"code": "FR", "name": "France"})
+        assert response.status_code == 201
+        assert response.json() == {"code": "FR", "name": "France"}
+
+        for prefix in ("/countries", "/hooked"):
+            response = client.post(prefix, json={"code": "PK", "name": "changed"})
+            assert response.status_code == 409
+            assert response.json() == {"detail": "The object conflicts with an existing object"}
+            assert rows() == [("FR", "France"), ("PK", "Pakistan")]
+
+        # The connection is usable after the conflict, and the hook override still creates.
+        response = client.post("/hooked", json={"code": "DE", "name": "Germany"})
+        assert response.status_code == 201
+        assert calls == ["PK", "DE"]
+        assert rows() == [("DE", "Germany"), ("FR", "France"), ("PK", "Pakistan")]
 
 
 @pytest.mark.parametrize(

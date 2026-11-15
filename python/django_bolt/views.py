@@ -20,6 +20,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
+from django.db import IntegrityError
 from django.db.models import Model, ObjectDoesNotExist, QuerySet
 
 from ._json import decode
@@ -516,7 +517,8 @@ class ViewSet[T: Model](APIView):
         return self.__class__._get_default_serializer_class(action)
 
     async def perform_create(self, obj: T):
-        await obj.asave()
+        # INSERT only. A primary key from the request body must not update a row.
+        await obj.asave(force_insert=True)
 
     async def perform_update(self, obj: T):
         await obj.asave()
@@ -597,6 +599,9 @@ class CreateMixin(_ViewSet):
 
         The `data` parameter should be a msgspec.Struct with the fields to create.
         Uses create_serializer_class if defined, otherwise serializer_class.
+
+        Does not update an existing row. A primary key or a unique value that
+        a row already has answers 409.
         """
         serializer_class = self.get_serializer_class("create")
         validated_obj = serializer_class.model_validate_json(request.body)
@@ -607,7 +612,10 @@ class CreateMixin(_ViewSet):
 
         # Create object
         obj = validated_obj.to_model(model)
-        await self.perform_create(obj)
+        try:
+            await self.perform_create(obj)
+        except IntegrityError as e:
+            raise HTTPException(status_code=409, detail="The object conflicts with an existing object") from e
 
         return obj
 
