@@ -30,6 +30,7 @@ from django_bolt.api import (
     _validate_mcp_mount_conflicts,
     run_lifespans,
 )
+from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.testing.dbshare import SharedConnections
 
 logger = logging.getLogger(__name__)
@@ -359,6 +360,7 @@ class TestClient(httpx.Client):
         # the finalizer then releases the state.
         self._validate_asgi_mount_conflicts(api)
         self._validate_mcp_mount_conflicts(api)
+        refuse_unread_route_config(api._routes, api._websocket_routes)
 
         # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
@@ -691,6 +693,7 @@ class AsyncTestClient(httpx.AsyncClient):
         # the finalizer then releases the state.
         TestClient._validate_asgi_mount_conflicts(api)
         TestClient._validate_mcp_mount_conflicts(api)
+        refuse_unread_route_config(api._routes, api._websocket_routes)
 
         # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
