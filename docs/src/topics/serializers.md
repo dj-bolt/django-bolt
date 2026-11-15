@@ -838,6 +838,20 @@ result = UserSerializer.only("id", "name").dump_many(users)
 # [{'id': 1, 'name': 'John'}, {'id': 2, 'name': 'Jane'}]
 ```
 
+## Config options
+
+The inner `Config` class of a serializer has these options:
+
+| Option | Effect |
+|--------|--------|
+| `write_only` | A set of field names that `dump()` leaves out. |
+| `read_only` | A set of field names that the server sets. |
+| `field_sets` | Named lists of fields for `use()` and `fields()`. |
+| `annotations` | Query annotations that `from_models()` applies to a QuerySet. |
+| `model` | The Django model of the serializer. `create_serializer()` sets it. Bolt does not read it. |
+
+`Config` has no `validators` option. A `Config` that sets `validators` raises `TypeError` when the class is created. Declare validators with `@field_validator` and `@model_validator`.
+
 ## Serializer inheritance
 
 Serializers support inheritance:

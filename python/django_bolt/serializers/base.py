@@ -581,6 +581,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Check Config class for read_only/write_only sets (renamed from Meta to avoid conflict with msgspec.Meta)
         meta = getattr(cls, "Config", None)
         if meta:
+            # Nothing ran Config.validators. Reject it: a class that sets it looks validated and is not.
+            if hasattr(meta, "validators"):
+                raise TypeError(
+                    f"{cls.__name__}.Config.validators is not an option. "
+                    f"Declare each validator with @field_validator or @model_validator."
+                )
             meta_read_only = getattr(meta, "read_only", set())
             meta_write_only = getattr(meta, "write_only", set())
             meta_field_sets = getattr(meta, "field_sets", {})
@@ -1983,9 +1989,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         read_only: set[str] = set()
         """Field names that should only be returned, not accepted on input"""
-
-        validators: dict[str, list[Any]] = {}
-        """Additional validators to apply to fields"""
 
         field_sets: dict[str, list[str]] = {}
         """

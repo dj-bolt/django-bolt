@@ -562,6 +562,35 @@ class TestConfigClass:
 
         assert UserSerializer.Config.model == DummyModel
 
+    def test_config_validators_is_not_an_option(self):
+        """Nothing ran Config.validators. A class that sets it is an error, not a class with no validation."""
+
+        def reject(cls, value):
+            raise ValueError("never called")
+
+        with pytest.raises(TypeError, match=r"WithValidators\.Config\.validators is not an option.*@field_validator"):
+
+            class WithValidators(Serializer):
+                username: str
+
+                class Config:
+                    validators = {"username": [reject]}
+
+        with pytest.raises(TypeError, match=r"Child\.Config\.validators is not an option"):
+
+            class Parent(Serializer):
+                username: str
+
+                class Config:
+                    write_only = {"username"}
+
+            class Child(Parent):
+                class Config(Parent.Config):
+                    validators = {}
+
+        assert Parent(username="a").dump() == {}
+        assert not hasattr(Serializer.Config, "validators")
+
 
 class TestMultiErrorCollection:
     """Test that validation collects all errors instead of stopping at the first."""
