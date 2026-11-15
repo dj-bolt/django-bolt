@@ -138,6 +138,50 @@ class TestExceptions:
         assert HTTPException(404, detail=[]).detail == "Not Found"
         assert HTTPException(404, detail="").detail == "Not Found"
 
+    @pytest.mark.parametrize(
+        ("path", "status", "detail"),
+        [
+            ("/detail-first", 404, "User not found"),
+            ("/detail-first-with-headers", 401, "Token expired"),
+            ("/base-detail-first", 500, "Storage is down"),
+            ("/no-phrase-499", 499, "Client Error"),
+            ("/no-phrase-599", 599, "Server Error"),
+        ],
+    )
+    def test_http_exception_takes_a_str_as_the_detail_and_a_status_with_no_phrase(self, path, status, detail):
+        api = BoltAPI()
+
+        @api.get("/detail-first")
+        async def detail_first():
+            raise NotFound("User not found")
+
+        @api.get("/detail-first-with-headers")
+        async def detail_first_with_headers():
+            raise Unauthorized("Token expired", headers={"WWW-Authenticate": "Bearer"})
+
+        @api.get("/base-detail-first")
+        async def base_detail_first():
+            raise HTTPException("Storage is down")
+
+        @api.get("/no-phrase-499")
+        async def no_phrase_499():
+            raise HTTPException(499)
+
+        @api.get("/no-phrase-599")
+        async def no_phrase_599():
+            raise HTTPException(599)
+
+        with TestClient(api) as client:
+            response = client.get(path)
+        assert response.status_code == status
+        assert response.json() == {"detail": detail}
+        if status == 401:
+            assert response.headers["www-authenticate"] == "Bearer"
+
+    def test_http_exception_refuses_a_str_detail_with_a_second_detail(self):
+        with pytest.raises(TypeError, match="status_code must be an int"):
+            NotFound("User not found", "Another detail")
+
     def test_validation_exception_has_a_fixed_detail(self):
         assert ValidationException([1]).detail == "Validation error"
         assert str(ValidationException([1])) == "Validation error"
