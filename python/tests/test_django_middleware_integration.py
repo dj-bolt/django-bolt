@@ -1829,6 +1829,24 @@ class TestProcessView:
         assert response.status_code == 200
         assert response.json() == {"status": "received"}
 
+    def test_csrf_exempt_on_a_handler_with_no_request_parameter_stops_registration(self, kind):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+
+        with pytest.raises(TypeError, match=r"webhook.*must take `request` as its first parameter"):
+            if kind == "sync":
+
+                @api.post("/webhook")
+                @csrf_exempt
+                def webhook():
+                    return {"status": "received"}
+
+            else:
+
+                @api.post("/webhook")
+                @csrf_exempt
+                async def webhook():
+                    return {"status": "received"}
+
     def test_process_view_response_stops_the_request(self, kind):
         api = BoltAPI(middleware=[DjangoMiddleware(_BlockInViewMiddleware)])
         calls = []
