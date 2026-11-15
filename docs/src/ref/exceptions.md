@@ -37,8 +37,12 @@ HTTPException(
 |-----------|------|-------------|
 | `status_code` | `int` | HTTP status code |
 | `detail` | `str` | Error message (defaults to HTTP phrase) |
-| `headers` | `dict` | Headers to include in response |
+| `headers` | `dict` | Headers to include in response. A number value, such as `{"Retry-After": 30}`, becomes a `str`. A value of another type raises `TypeError`. |
 | `extra` | `dict \| list` | Additional data in response |
+
+A `str` in the first position is the detail. Thus `NotFound("User not found")` is the same as `NotFound(detail="User not found")`, and `HTTPException("Storage is down")` is a 500.
+
+A status with no standard phrase, such as 499, gets the detail `Client Error` (4xx) or `Server Error` (5xx).
 
 **Response format:**
 
