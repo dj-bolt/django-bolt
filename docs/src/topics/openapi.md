@@ -403,6 +403,36 @@ api.mount("/internal", internal_api)
 The default value at each layer is `None`. `None` inherits from the outer layer.
 The root `BoltAPI` resolves `None` to `True`.
 
+## Deprecating endpoints
+
+Set `deprecated=True` to mark an endpoint as deprecated in the documentation.
+The operation gets `deprecated: true`. The docs UIs show it as deprecated, and
+client generators mark its function. The server continues to serve the
+endpoint. An endpoint that is not deprecated has no `deprecated` key:
+
+```python
+@api.get("/v1/users", deprecated=True)
+async def list_users_v1():
+    return []
+
+
+@api.view("/v1/profile", deprecated=True)  # each method of the view
+class ProfileView(APIView):
+    async def get(self, request):
+        return {}
+
+
+@api.viewset("/items")
+class ItemViewSet(ViewSet):
+    @action(methods=["GET"], detail=False, deprecated=True)  # only this action
+    async def legacy(self, request):
+        return []
+```
+
+The route decorators of `BoltAPI` and `Router`, `@api.view()`, `@api.viewset()`
+and `@action` take `deprecated`. On `@api.viewset()`, it applies to each route
+of the viewset, and also to its `@action` routes.
+
 ## Non-JSON responses
 
 `response_class` sets the media type in the documentation. The default is
