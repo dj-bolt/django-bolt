@@ -294,6 +294,23 @@ async with websockets.connect(
     print(await ws.recv())
 ```
 
+In a test, send the same header. `WebSocketTestClient` has no option that
+replaces the credential, so the test runs the authentication and the guards of
+the server:
+
+```python
+from django_bolt.testing import WebSocketTestClient
+
+async with WebSocketTestClient(
+    api,
+    "/ws/protected",
+    headers={"Authorization": f"Bearer {token}"},
+) as ws:
+    assert await ws.receive_text() == "Welcome"
+```
+
+A connection that the authentication or a guard refuses raises `PermissionError`.
+
 ### Revoked tokens
 
 A `revoked_token_handler` or a `revocation_store` of the backend applies to

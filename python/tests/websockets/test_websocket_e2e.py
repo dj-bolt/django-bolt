@@ -583,6 +583,15 @@ class TestWebSocketGuards:
         return api
 
     @pytest.mark.asyncio
+    async def test_the_test_client_has_no_option_that_replaces_the_token(self, api):
+        """A test authenticates with the headers that the server reads.
+
+        ``auth_context`` was an option that the guards did not read.
+        """
+        with pytest.raises(TypeError, match="auth_context"):
+            WebSocketTestClient(api, "/ws/protected", auth_context={"user_id": "123"})
+
+    @pytest.mark.asyncio
     async def test_public_route_no_auth(self, api):
         """Test public route works without auth."""
         async with WebSocketTestClient(api, "/ws/public") as ws:
