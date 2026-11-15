@@ -17,7 +17,7 @@ use bolt_core::middleware::client_ip::{self, TrustedProxies};
 use bolt_core::state::{AsgiMount, TASK_LOCALS};
 
 struct AsgiResponseStart {
-    status: u16,
+    status: StatusCode,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -139,10 +139,23 @@ impl AsgiSend {
 
         match msg_type.as_str() {
             "http.response.start" => {
-                let status: u16 = message
-                    .get_item("status")?
-                    .ok_or_else(|| PyValueError::new_err("Missing status in http.response.start"))?
-                    .extract()?;
+                let status_item = message.get_item("status")?.ok_or_else(|| {
+                    PyValueError::new_err("Missing status in http.response.start")
+                })?;
+                // A value that is not an HTTP status is an error of the app. It must not become a 200.
+                let status = status_item
+                    .extract::<u16>()
+                    .ok()
+                    .and_then(|code| StatusCode::from_u16(code).ok())
+                    .ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "The status in http.response.start must be an int from 100 to 999, got {}",
+                            status_item
+                                .repr()
+                                .map(|repr| repr.to_string())
+                                .unwrap_or_else(|_| "?".to_string())
+                        ))
+                    })?;
                 let headers = parse_asgi_headers(message)?;
 
                 let mut start_guard = self
@@ -608,8 +621,7 @@ pub async fn handle_asgi_mount_request(
     };
 
     // 4. Build and stream the response.
-    let status = StatusCode::from_u16(response_start.status).unwrap_or(StatusCode::OK);
-    let mut builder = HttpResponse::build(status);
+    let mut builder = HttpResponse::build(response_start.status);
 
     let mut is_event_stream = false;
     for (name_bytes, value_bytes) in response_start.headers {

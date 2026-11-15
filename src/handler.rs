@@ -338,6 +338,36 @@ struct ParsedResponseWire {
     body: ResponseWireBody,
 }
 
+/// Read the status of a response wire.
+///
+/// A value that is not an HTTP status is an error. It must not become a success.
+#[inline]
+fn parse_wire_status(item: &Bound<'_, PyAny>) -> PyResult<StatusCode> {
+    match item
+        .extract::<u16>()
+        .ok()
+        .and_then(|code| StatusCode::from_u16(code).ok())
+    {
+        Some(status) => Ok(status),
+        None => Err(invalid_wire_status(item)),
+    }
+}
+
+#[cold]
+fn invalid_wire_status(item: &Bound<'_, PyAny>) -> PyErr {
+    let value = item
+        .repr()
+        .map(|repr| repr.to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    // The client gets no detail of a 500 when DEBUG is off, so the log names the status.
+    log::error!(
+        "The response status must be an int from 100 to 999, got {value}. Bolt sends a 500."
+    );
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "The response status must be an int from 100 to 999, got {value}"
+    ))
+}
+
 fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<ParsedResponseWire> {
     let obj = result_obj.bind(py);
     let tuple = obj.cast::<PyTuple>()?;
@@ -347,8 +377,7 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
         ));
     }
 
-    let status_code: u16 = tuple.get_item(0)?.extract()?;
-    let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
+    let status = parse_wire_status(&tuple.get_item(0)?)?;
     // Fast path: integer meta tag maps to static ResponseMeta (no String alloc, no tuple parse).
     // Slow path: parse full tuple for responses with custom headers/cookies.
     let meta_item = tuple.get_item(1)?;
@@ -1438,7 +1467,7 @@ async fn route_request<const ACCESS_LOG: bool>(
             if result_obj.bind(py).is_instance_of::<PyBytes>() {
                 let backed = AttachedBytes::from(result_obj.extract::<PyBackedBytes>(py)?);
                 let status = route_metadata
-                    .map(|m| StatusCode::from_u16(m.default_status_code).unwrap_or(StatusCode::OK))
+                    .map(|m| m.default_status_code)
                     .unwrap_or(StatusCode::OK);
                 let body = if is_head_request {
                     drop(backed);

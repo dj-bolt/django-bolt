@@ -619,6 +619,23 @@ def test_mount_asgi_duplicate_response_start_still_raises():
     assert outcome == {"error": "http.response.start sent more than once"}
 
 
+@pytest.mark.parametrize("status", [0, 99, 1000, 65536])
+def test_mount_asgi_status_that_is_not_an_http_status_is_a_500(status):
+    api = BoltAPI()
+
+    async def bad_status(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": status, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    api.mount_asgi("/bad-status", bad_status)
+
+    with TestClient(api) as client:
+        response = client.get("/bad-status")
+    assert response.status_code == 500
+    assert f"The status in http.response.start must be an int from 100 to 999, got {status}" in response.text
+
+
 def test_mount_asgi_head_request_does_not_fake_a_disconnect():
     api = BoltAPI()
     seen: list[str] = []
