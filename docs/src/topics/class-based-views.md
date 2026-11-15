@@ -285,6 +285,20 @@ class ArticleViewSet(ViewSet):
 | `summary`        | no       | Summary for OpenAPI documentation                                                        |
 | `description`    | no       | Detailed description for OpenAPI documentation                                           |
 
+An action with no `auth`, `guards`, `status_code`, `validate_response` or `tags` uses the value of `@api.viewset(...)`. For `auth`, `guards` and `validate_response`, the class attribute comes next.
+
+```python
+@api.viewset("/articles", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+class ArticleViewSet(ViewSet):
+    @action(methods=["POST"], detail=True)
+    async def publish(self, request, pk: int):  # Needs a valid token
+        ...
+
+    @action(methods=["GET"], detail=False, auth=[], guards=[AllowAny()])
+    async def featured(self, request):  # Public
+        ...
+```
+
 ### Custom path
 
 Override the URL path:
