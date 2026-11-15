@@ -17,10 +17,11 @@ from types import SimpleNamespace
 
 import pytest
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 
 from django_bolt import BoltAPI
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
-from django_bolt.concurrency import run_in_orm_executor, sync_to_thread
+from django_bolt.concurrency import check_pool_environment, run_in_orm_executor, sync_to_thread
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack
 from django_bolt.testing import TestClient
 
@@ -169,3 +170,18 @@ def test_sync_to_thread_propagates_contextvars():
         return positional, with_kwargs
 
     assert asyncio.run(main()) == ("globex", "globex-kw")
+
+
+@pytest.mark.parametrize("variable", ["DJANGO_BOLT_EXECUTOR_THREADS", "DJANGO_BOLT_ORM_THREADS"])
+def test_check_pool_environment_refuses_an_invalid_thread_count(monkeypatch, variable):
+    """The server calls ``check_pool_environment`` at startup, so an invalid value stops startup.
+
+    The pools read the variables at their first use. Without this check, the
+    first request that needs the pool fails.
+    """
+    for name in ("DJANGO_BOLT_EXECUTOR_THREADS", "DJANGO_BOLT_ORM_THREADS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(variable, "0")
+
+    with pytest.raises(ImproperlyConfigured, match=rf"^{variable} must be an int of 1 or more, got '0'\.$"):
+        check_pool_environment()
