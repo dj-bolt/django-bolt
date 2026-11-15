@@ -110,6 +110,8 @@ async def test(
     return {"dep1": dep1, "dep2": dep2}
 ```
 
+The async dependencies of a handler run at the same time. A cached dependency that two of them need runs first. Thus it also runs one time.
+
 ### Disabling cache
 
 To force fresh calls, use `use_cache=False`:

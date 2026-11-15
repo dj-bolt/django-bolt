@@ -769,6 +769,55 @@ def test_async_dependencies_of_a_handler_run_at_the_same_time():
     assert response.json() == {"left": True, "right": True, "plain": True}
 
 
+# Dependencies that run at the same time share the cache of the request.
+
+SLOW_CALLS: list[int] = []
+
+
+async def slow_ticket() -> int:
+    SLOW_CALLS.append(1)
+    ticket = len(SLOW_CALLS)
+    await asyncio.sleep(0.01)
+    return ticket
+
+
+async def slow_wrap_a(ticket: int = Depends(slow_ticket)) -> int:
+    return ticket
+
+
+async def slow_wrap_b(ticket: int = Depends(slow_ticket)) -> int:
+    return ticket
+
+
+@pytest.mark.parametrize("path", ["/direct", "/nested", "/mixed"])
+def test_a_dependency_that_awaits_runs_one_time_for_dependencies_that_run_at_the_same_time(path):
+    api = BoltAPI()
+
+    @api.get("/direct")
+    async def direct(a=Depends(slow_ticket), b=Depends(slow_ticket)):
+        return [a, b]
+
+    @api.get("/nested")
+    async def nested(a=Depends(slow_wrap_a), b=Depends(slow_wrap_b)):
+        return [a, b]
+
+    @api.get("/mixed")
+    async def mixed(a=Depends(slow_wrap_a), b=Depends(slow_ticket), c=Depends(slow_ticket, use_cache=False)):
+        return [a, b, c]
+
+    SLOW_CALLS.clear()
+    with TestClient(api) as client:
+        response = client.get(path)
+    assert response.status_code == 200, response.text
+    if path == "/mixed":
+        # The marker with use_cache=False has its own call.
+        assert response.json()[0] == response.json()[1] != response.json()[2]
+        assert len(SLOW_CALLS) == 2
+    else:
+        assert response.json() == [1, 1]
+        assert len(SLOW_CALLS) == 1
+
+
 # A dependency can be an object with ``async def __call__``.
 
 

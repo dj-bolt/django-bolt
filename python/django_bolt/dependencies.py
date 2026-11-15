@@ -155,6 +155,32 @@ def dependency_needs_event_loop(
     )
 
 
+def shared_dependencies(
+    entries: list[tuple[DependsMarker, dict[str, Any]]],
+) -> tuple[tuple[DependsMarker, dict[str, Any]], ...]:
+    """The cached dependencies that two or more of ``entries`` need.
+
+    Each entry is the (marker, binding) of a dependency that the injector
+    resolves at the same time as the other entries. A dependency that two of
+    them need must have its value in the cache before they start. If not, each
+    one finds an empty cache and calls it. Call this at registration.
+    """
+    owners: dict[Callable, int] = {}
+    shared: dict[Callable, tuple[DependsMarker, dict[str, Any]]] = {}
+
+    def visit(owner: int, marker: DependsMarker, dep_meta: dict[str, Any]) -> None:
+        if marker.use_cache:
+            first_owner = owners.setdefault(marker.dependency, owner)
+            if first_owner != owner:
+                shared.setdefault(marker.dependency, (marker, dep_meta))
+        for _, nested_marker, nested_meta in dep_meta["_dep_nested"]:
+            visit(owner, nested_marker, nested_meta)
+
+    for owner, (marker, dep_meta) in enumerate(entries):
+        visit(owner, marker, dep_meta)
+    return tuple(shared.values())
+
+
 _REQUEST_DATA_SOURCES = frozenset(("path", "query", "header", "cookie", "body", "form", "file"))
 
 
