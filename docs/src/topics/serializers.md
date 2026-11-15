@@ -596,7 +596,7 @@ Input is a JSON request body, `model_validate()` and `model_validate_json()`. Th
 
 - Bolt ignores the input value. With `forbid_unknown_fields=True` on the serializer, the input value is an error, as an unknown field is.
 - A read-only field must have a default. Without one, route registration and `model_validate()` raise `ImproperlyConfigured`. A serializer that is only a response needs no default.
-- In the OpenAPI document, the request body schema has no read-only field. The schema has the name `UserSerializerInput`. The response schema marks the field `readOnly: true`.
+- In the OpenAPI document, the request body schema has no read-only field. The response schema marks the field `readOnly: true`. If the API uses the serializer for a request body and for a response, the request body schema has the name `UserSerializerInput`.
 
 With `forbid_unknown_fields=True`, a `Config.read_only` field that has a plain default accepts an input value equal to that default. Use `field(read_only=True, default=...)` to reject each input value.
 

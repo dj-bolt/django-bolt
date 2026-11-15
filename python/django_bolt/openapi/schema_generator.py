@@ -107,15 +107,20 @@ class _InputComponent:
 
     A serializer with a ``read_only`` field has two schemas. The response
     schema keeps the name of the class. The request body schema has the name
-    ``<class>Input``. The attributes are those that the component names read.
+    ``<class>Input``, or the name of the class if the document has no other
+    schema of that class. The attributes are those that the component names read.
     """
 
     def __init__(self, struct_type: Any) -> None:
-        origin = _struct_origin(struct_type)
-        display = _type_display_name(struct_type)
-        self.__module__ = origin.__module__
-        self.__name__ = f"{display}Input"
-        self.__qualname__ = f"{display.replace(origin.__name__, origin.__qualname__, 1)}Input"
+        self.struct_type = struct_type
+        self.__module__ = _struct_origin(struct_type).__module__
+        self.set_name(suffix="Input")
+
+    def set_name(self, *, suffix: str) -> None:
+        origin = _struct_origin(self.struct_type)
+        display = _type_display_name(self.struct_type)
+        self.__name__ = f"{display}{suffix}"
+        self.__qualname__ = f"{display.replace(origin.__name__, origin.__qualname__, 1)}{suffix}"
 
 
 class ComponentNameCollisionError(ValueError):
@@ -1610,6 +1615,11 @@ class SchemaGenerator:
         ``module.qualname`` so all of them coexist. Each type's shared Reference is
         stamped in place, updating all of its use sites at once.
         """
+
+        # An input variant keeps the name of its class if the class has no other schema.
+        for struct_type, variant in self._input_components.items():
+            if variant in self._component_ref and struct_type not in self._component_ref:
+                variant.set_name(suffix="")
 
         def normalize(name: str) -> str:
             return re.sub(r"[^a-zA-Z0-9.\-_]", "_", name)

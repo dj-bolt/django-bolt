@@ -466,6 +466,10 @@ def test_read_only_field_is_not_in_the_request_body_schema():
     class Plain(Serializer):
         name: str
 
+    class BodyOnly(Serializer):
+        id: int = field(read_only=True, default=0)
+        name: str
+
     api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
 
     @api.post("/pets")
@@ -474,6 +478,10 @@ def test_read_only_field_is_not_in_the_request_body_schema():
 
     @api.post("/plain")
     async def create_plain(body: Plain) -> Plain:
+        pass
+
+    @api.post("/owners")
+    async def create_owner(body: BodyOnly) -> dict:
         pass
 
     spec = _get_schema(api)
@@ -499,6 +507,13 @@ def test_read_only_field_is_not_in_the_request_body_schema():
     assert "readOnly" not in schemas["Pet"]["properties"]["name"]
     assert schemas["Pet"]["properties"]["owner"]["anyOf"][0] == {"$ref": "#/components/schemas/Owner"}
     assert schemas["Owner"]["properties"]["id"]["readOnly"] is True
+
+    # A serializer that is only a request body keeps its name.
+    assert spec["paths"]["/owners"]["post"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/BodyOnly"
+    }
+    assert list(schemas["BodyOnly"]["properties"]) == ["name"]
+    assert "BodyOnlyInput" not in schemas
 
     # A serializer with no read_only field has one schema.
     plain = spec["paths"]["/plain"]["post"]
