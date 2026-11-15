@@ -333,6 +333,10 @@ def test_api_key_authentication_with_valid_key(client):
     assert response.status_code == 200
     data = response.json()
     assert data["message"] == "API key valid"
+    # The header value can name the scheme of the key.
+    for value in ["Bearer valid-key-123", "ApiKey valid-key-123"]:
+        assert client.get("/api-endpoint", headers={"X-API-Key": value}).status_code == 200
+    assert client.get("/api-endpoint", headers={"X-API-Key": "Basic valid-key-123"}).status_code == 401
 
 
 def test_api_key_authentication_with_invalid_key(client):
