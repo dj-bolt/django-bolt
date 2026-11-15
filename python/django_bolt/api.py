@@ -1160,7 +1160,7 @@ class BoltAPI:
         def decorator(fn: Callable) -> Callable:
             # Ensure handler is async
             if not inspect.iscoroutinefunction(fn):
-                raise TypeError(f"WebSocket handler '{fn.__name__}' must be an async function")
+                raise TypeError(f"WebSocket handler '{fn.__qualname__}' must be an async function")
 
             # Mark as WebSocket handler
             fn = mark_websocket_handler(fn)
@@ -1252,7 +1252,12 @@ class BoltAPI:
 
             return fn
 
-        return decorator
+        def normalizing_decorator(fn: Callable):
+            # Register the normalized handler. Return the object that the caller gave.
+            decorator(_route_handler(fn))
+            return fn
+
+        return normalizing_decorator
 
     def view(
         self,
