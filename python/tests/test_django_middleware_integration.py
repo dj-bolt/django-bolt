@@ -1331,6 +1331,7 @@ class _DjangoRequestRecorder(MiddlewareMixin):
             "get_tags": request.GET.getlist("tag"),
             "get_x": request.GET.get("x"),
             "get_is_mutable": request.GET._mutable,
+            "get_lists": dict(request.GET.lists()),
             "post": dict(request.POST.lists()),
             "post_is_mutable": post_is_mutable,
             "read": request.read() if request.body else b"",
@@ -1369,6 +1370,11 @@ class TestDjangoSideRequest:
         assert seen["get_is_mutable"] is True
         assert seen["post"] == {}
         assert seen["read"] == seen["body"] == b""
+
+    def test_query_keys_that_the_handler_does_not_declare_keep_every_value(self, layout):
+        seen = self._send(layout, "GET", "/query?other=a&other=b&caf%C3%A9=%C3%A9")
+
+        assert seen["get_lists"] == {"other": ["a", "b"], "caf\u00e9": ["\u00e9"]}
 
     @pytest.mark.parametrize(
         ("raw_path", "path", "full_path"),
