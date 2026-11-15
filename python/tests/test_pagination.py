@@ -26,6 +26,7 @@ from django_bolt import (
     ViewSet,
     paginate,
 )
+from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
 
 from .test_models import Article, Author, BlogPost, Comment, Release, User, UserProfile
@@ -1896,6 +1897,54 @@ class ArticleWithDefault(msgspec.Struct, rename="camel"):
     id: int
     is_published: bool
     word_count: int = 0
+
+
+class ArticleRow(Serializer):
+    id: int
+    title: str
+    word_count: int = 0
+
+
+PAGES_OF_SERIALIZER_ITEMS = {
+    # Dicts: the default of the Serializer, not null.
+    "dicts": lambda: [{"id": 1, "title": "a"}, {"id": 2, "title": "b", "word_count": 3}],
+    # Each item by its own kind: an object first or a dict first.
+    "object-then-dict": lambda: [SimpleNamespace(id=1, title="a"), {"id": 2, "title": "b"}],
+    "dict-then-object": lambda: [{"id": 1, "title": "a"}, SimpleNamespace(id=2, title="b", word_count=4)],
+    "instance-then-dict": lambda: [ArticleRow(id=1, title="a"), {"id": 2, "title": "b"}],
+    # A value that does not fit the Serializer.
+    "dict-missing-field": lambda: [{"id": 1, "title": "a"}, {"id": 2}],
+    "dict-wrong-type": lambda: [{"id": 1, "title": "a"}, {"id": "x", "title": "b"}],
+    "object-missing-field": lambda: [SimpleNamespace(id=1)],
+}
+
+
+@pytest.mark.parametrize("page", PAGES_OF_SERIALIZER_ITEMS)
+def test_paginated_serializer_items_validate_as_a_plain_list_response(page):
+    """A page of a Serializer type has the items or the error of each item with no @paginate."""
+    api = BoltAPI()
+    make_items = PAGES_OF_SERIALIZER_ITEMS[page]
+
+    @api.get("/plain/{position}")
+    async def plain(position: int) -> ArticleRow:
+        return make_items()[position]
+
+    @api.get("/paged")
+    @paginate(PageNumberPagination)
+    async def paged(request) -> list[ArticleRow]:
+        return make_items()
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        each_item = [client.get(f"/plain/{position}") for position in range(len(make_items()))]
+        response = client.get("/paged")
+
+    failed = [item for item in each_item if item.status_code != 200]
+    if failed:
+        assert (response.status_code, response.json()) == (500, failed[0].json())
+        assert response.json() == {"detail": "Response validation error"}
+    else:
+        assert response.status_code == 200
+        assert response.json()["items"] == [item.json() for item in each_item]
 
 
 @pytest.mark.django_db(transaction=True)
