@@ -1,0 +1,361 @@
+warning: The `UV_NATIVE_TLS` environment variable is deprecated and will be removed in a future release. Use `UV_SYSTEM_CERTS` instead.
+[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+PATCH the row of another author (direct): 404 b'{"detail":"Not found"}'
+
+PATCH my row with the id of the other row: 200 b'{"id":2,"title":"mine","content":"c","author":"me","is_published":false}'
+rows: [(1, 'mine', 'me'), (2, 'mine', 'me')]
+
+PATCH my row with a new id: 200 b'{"id":777,"title":"mine","content":"c","author":"me","is_published":false}'
+rows: [(1, 'mine', 'me'), (2, 'mine', 'me'), (777, 'mine', 'me')]
+
+PUT with a read_only id: 200 b'{"title":"put","content":"c","author":"me","id":2}'
+rows: [(1, 'mine', 'me'), (2, 'put', 'me'), (777, 'mine', 'me')]
+.[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+[15/Nov/2026 05:06:29,861] Exception in GET /articles/abc: ValueError: Field 'id' expected a number but got 'abc'.
+Traceback (most recent call last):
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/fields/__init__.py", line 2207, in get_prep_value
+    return int(value)
+ValueError: invalid literal for int() with base 10: 'abc'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3403, in _dispatch
+    return await meta["_handler_executor"](handler, request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 2908, in execute
+    result = await handler(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 159, in view_handler
+    return await bound_method(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 583, in retrieve
+    return await self.get_object()
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 456, in get_object
+    obj = await queryset.aget(**lookup_kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 734, in aget
+    return await sync_to_async(self.get)(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/asgiref/sync.py", line 580, in __call__
+    ret = await asyncio.shield(exec_coro)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/concurrent/futures/thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/concurrency.py", line 737, in _call_in_orm_slot
+    return _call_guarded(fn, *args)
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/concurrency.py", line 331, in _call_guarded
+    return fn(*args, **kwargs)
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/asgiref/sync.py", line 635, in thread_handler
+    return func(*args, **kwargs)
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/asgiref/sync.py", line 562, in func
+    return context.run(run_child)
+           ~~~~~~~~~~~^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/asgiref/sync.py", line 560, in run_child
+    return child()
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 708, in get
+    clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
+                                                        ~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 1701, in filter
+    return self._filter_or_exclude(False, args, kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 1719, in _filter_or_exclude
+    clone._filter_or_exclude_inplace(negate, args, kwargs)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 1729, in _filter_or_exclude_inplace
+    self._query.add_q(Q(*args, **kwargs))
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/sql/query.py", line 1680, in add_q
+    clause, _ = self._add_q(q_object, can_reuse)
+                ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/sql/query.py", line 1712, in _add_q
+    child_clause, needed_inner = self.build_filter(
+                                 ~~~~~~~~~~~~~~~~~^
+        child,
+        ^^^^^^
+    ...<7 lines>...
+        update_join_types=update_join_types,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/sql/query.py", line 1612, in build_filter
+    condition = self.build_lookup(lookups, col, value)
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/sql/query.py", line 1439, in build_lookup
+    lookup = lookup_class(lhs, rhs)
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/lookups.py", line 36, in __init__
+    self.rhs = self.get_prep_lookup()
+               ~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/lookups.py", line 394, in get_prep_lookup
+    return super().get_prep_lookup()
+           ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/lookups.py", line 94, in get_prep_lookup
+    return self.lhs.output_field.get_prep_value(self.rhs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/fields/__init__.py", line 2209, in get_prep_value
+    raise e.__class__(
+        "Field '%s' expected a number but got %r." % (self.name, value),
+    ) from e
+ValueError: Field 'id' expected a number but got 'abc'.
+
+V3 GET /articles/abc: 500 b'{"detail":"Internal Server Error"}'
+[15/Nov/2026 05:06:29,871] Exception in DELETE /articles/abc: ValueError: Field 'id' expected a number but got 'abc'.
+Traceback (most recent call last):
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/fields/__init__.py", line 2207, in get_prep_value
+    return int(value)
+ValueError: invalid literal for int() with base 10: 'abc'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3403, in _dispatch
+    return await meta["_handler_executor"](handler, request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 2908, in execute
+    result = await handler(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 159, in view_handler
+    return await bound_method(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 695, in destroy
+    obj = await self.get_object()
+          ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 456, in get_object
+    obj = await queryset.aget(**lookup_kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 734, in aget
+    return await sync_to_async(self.get)(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/asgiref/sync.py", line 580, in __call__
+    ret = await asyncio.shield(exec_coro)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/concurrent/futures/thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/concurrency.py", line 737, in _call_in_orm_slot
+    return _call_guarded(fn, *args)
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/concurrency.py", line 331, in _call_guarded
+    return fn(*args, **kwargs)
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/asgiref/sync.py", line 635, in thread_handler
+    return func(*args, **kwargs)
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/asgiref/sync.py", line 562, in func
+    return context.run(run_child)
+           ~~~~~~~~~~~^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/asgiref/sync.py", line 560, in run_child
+    return child()
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 708, in get
+    clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
+                                                        ~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 1701, in filter
+    return self._filter_or_exclude(False, args, kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 1719, in _filter_or_exclude
+    clone._filter_or_exclude_inplace(negate, args, kwargs)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/query.py", line 1729, in _filter_or_exclude_inplace
+    self._query.add_q(Q(*args, **kwargs))
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/sql/query.py", line 1680, in add_q
+    clause, _ = self._add_q(q_object, can_reuse)
+                ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/sql/query.py", line 1712, in _add_q
+    child_clause, needed_inner = self.build_filter(
+                                 ~~~~~~~~~~~~~~~~~^
+        child,
+        ^^^^^^
+    ...<7 lines>...
+        update_join_types=update_join_types,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/sql/query.py", line 1612, in build_filter
+    condition = self.build_lookup(lookups, col, value)
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/sql/query.py", line 1439, in build_lookup
+    lookup = lookup_class(lhs, rhs)
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/lookups.py", line 36, in __init__
+    self.rhs = self.get_prep_lookup()
+               ~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/lookups.py", line 394, in get_prep_lookup
+    return super().get_prep_lookup()
+           ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/lookups.py", line 94, in get_prep_lookup
+    return self.lhs.output_field.get_prep_value(self.rhs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/home/user/django-bolt/.venv/lib/python3.13/site-packages/django/db/models/fields/__init__.py", line 2209, in get_prep_value
+    raise e.__class__(
+        "Field '%s' expected a number but got %r." % (self.name, value),
+    ) from e
+ValueError: Field 'id' expected a number but got 'abc'.
+
+V3 DELETE /articles/abc: 500 b'{"detail":"Internal Server Error"}'
+[15/Nov/2026 05:06:29,876] Exception in POST /articles: DecodeError: JSON is malformed: object keys must be strings (byte 1)
+Traceback (most recent call last):
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3403, in _dispatch
+    return await meta["_handler_executor"](handler, request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 2908, in execute
+    result = await handler(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 159, in view_handler
+    return await bound_method(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 602, in create
+    validated_obj = serializer_class.model_validate_json(request.body)
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/serializers/base.py", line 1064, in model_validate_json
+    return msgspec.json.decode(json_data, type=cls)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+msgspec.DecodeError: JSON is malformed: object keys must be strings (byte 1)
+
+V4 POST /articles, malformed JSON: 500 b'{"detail":"Internal Server Error"}'
+[15/Nov/2026 05:06:29,880] Exception in PUT /articles/778: DecodeError: JSON is malformed: object keys must be strings (byte 1)
+Traceback (most recent call last):
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3403, in _dispatch
+    return await meta["_handler_executor"](handler, request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 2908, in execute
+    result = await handler(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 159, in view_handler
+    return await bound_method(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 628, in update
+    validated_obj = serializer_class.model_validate_json(request.body)
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/serializers/base.py", line 1064, in model_validate_json
+    return msgspec.json.decode(json_data, type=cls)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+msgspec.DecodeError: JSON is malformed: object keys must be strings (byte 1)
+
+V4 PUT /articles/{id}, malformed JSON: 500 b'{"detail":"Internal Server Error"}'
+[15/Nov/2026 05:06:29,882] Exception in PATCH /articles/778: DecodeError: JSON is malformed: object keys must be strings (byte 1)
+Traceback (most recent call last):
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3403, in _dispatch
+    return await meta["_handler_executor"](handler, request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 2908, in execute
+    result = await handler(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 159, in view_handler
+    return await bound_method(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 653, in partial_update
+    data = decode(request.body)
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/_json.py", line 125, in decode
+    return _DECODER.decode(value)
+           ~~~~~~~~~~~~~~~^^^^^^^
+msgspec.DecodeError: JSON is malformed: object keys must be strings (byte 1)
+
+V4 PATCH /articles/{id}, malformed JSON: 500 b'{"detail":"Internal Server Error"}'
+[15/Nov/2026 05:06:29,884] Exception in POST /articles: DecodeError: Input data was truncated
+Traceback (most recent call last):
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3403, in _dispatch
+    return await meta["_handler_executor"](handler, request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 2908, in execute
+    result = await handler(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 159, in view_handler
+    return await bound_method(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 602, in create
+    validated_obj = serializer_class.model_validate_json(request.body)
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/serializers/base.py", line 1064, in model_validate_json
+    return msgspec.json.decode(json_data, type=cls)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+msgspec.DecodeError: Input data was truncated
+
+V4 POST /articles, empty body: 500 b'{"detail":"Internal Server Error"}'
+
+V4 for comparison: function route, malformed JSON: 422 b'{"detail":[{"type":"json_invalid","loc":["body",1,2],"msg":"Invalid JSON at line 1, column 2: JSON is malformed: object keys must be strings (byte 1)\\n  {bad\\n   ^","input":"{bad","ctx":{"line":1,"col'
+[15/Nov/2026 05:06:29,888] Exception in PATCH /articles/778: AttributeError: 'list' object has no attribute 'items'
+Traceback (most recent call last):
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3403, in _dispatch
+    return await meta["_handler_executor"](handler, request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 2908, in execute
+    result = await handler(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 159, in view_handler
+    return await bound_method(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 662, in partial_update
+    for key, value in data.items():
+                      ^^^^^^^^^^
+AttributeError: 'list' object has no attribute 'items'
+
+V5 PATCH /articles/{id}, body [1, 2]: 500 b'{"detail":"Internal Server Error"}'
+
+V5 for comparison: PUT, body [1, 2]: 422 b'{"detail":[{"loc":["body"],"msg":"Expected `object`, got `array`","type":"validation_error"}]}'
+.[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+GET /articles/t1: 400 b'{"detail":"Missing lookup field: pk"}'
+.[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+PATCH /required {title}: 422 b'{"detail":[{"loc":["body","isPublished"],"msg":"Object missing required field `isPublished`","type":"missing"}]}'
+
+PATCH /required {isPublished}: 422 b'{"detail":[{"loc":["body","isPublished"],"msg":"Object missing required field `isPublished`","type":"missing"}]}'
+
+PATCH /default {isPublished: true}: 200 b'{"title":"t","isPublished":false}'
+is_published in the database: False
+.[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+GET /dec without a key: 401 b'{"detail":"Authentication required"}'
+
+GET /dec/extra without a key: 200 b'{"extra":true}'
+.[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+[15/Nov/2026 05:06:30,037] Exception in GET /no-request: IndexError: tuple index out of range
+Traceback (most recent call last):
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3403, in _dispatch
+    return await meta["_handler_executor"](handler, request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 2371, in execute_async_dict_fast
+    result = await handler()
+             ^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/views.py", line 158, in view_handler
+    _current_request.set(args[0])
+                         ~~~~^^^
+IndexError: tuple index out of range
+
+GET /no-request: 500 b'{"detail":"Internal Server Error"}'
+
+GET /users/5: 200 b'{"type_of_self_request":"int"}'
+.
+registration raises LookupError: <ContextVar name='_current_action' at 0x7fca65897290>
+.[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+@cors({'methods': 'GET'}): {'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, QUERY', 'access-control-allow-headers': 'Content-Type, Authorization', 'access-control-allow-origin': 'https://a.com', 'access-control-max-age': '3600'}
+[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+@cors({'methods': [1]}): {'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, QUERY', 'access-control-allow-headers': 'Content-Type, Authorization', 'access-control-allow-origin': 'https://a.com', 'access-control-max-age': '3600'}
+[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+@cors({'headers': 'X-A'}): {'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, QUERY', 'access-control-allow-headers': 'Content-Type, Authorization', 'access-control-allow-origin': 'https://a.com', 'access-control-max-age': '3600'}
+[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+@cors({'credentials': 'yes'}): {'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, QUERY', 'access-control-allow-headers': 'Content-Type, Authorization', 'access-control-allow-origin': 'https://a.com', 'access-control-max-age': '3600'}
+[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+@cors({'max_age': '600'}): {'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, QUERY', 'access-control-allow-headers': 'Content-Type, Authorization', 'access-control-allow-origin': 'https://a.com', 'access-control-max-age': '3600'}
+[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+@cors({'max_age': -1}): {'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, QUERY', 'access-control-allow-headers': 'Content-Type, Authorization', 'access-control-allow-origin': 'https://a.com', 'access-control-max-age': '3600'}
+.[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+[15/Nov/2026 05:06:30,063] Exception in GET /x: TypeError: Middleware chain returned unsupported response type: Response. Expected MiddlewareResponse or ResponseWireV1 tuple.
+Traceback (most recent call last):
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3401, in _dispatch
+    return await self._dispatch_with_middleware(handler, request, middleware_api, meta)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/wt/test-views-middleware-mutants/python/django_bolt/api.py", line 3302, in _dispatch_with_middleware
+    raise TypeError(
+    ...<2 lines>...
+    )
+TypeError: Middleware chain returned unsupported response type: Response. Expected MiddlewareResponse or ResponseWireV1 tuple.
+
+GET /x: 500 b'{"detail":"Internal Server Error"}'
+.[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+
+M3 @middleware(cors={...}): None
+M4 @skip_middleware(Global) ran: ['Global']
+M5 @middleware(First) over @middleware(Second) ran: ['Global', 'Second', 'First']
+M6 statuses with @rate_limit(rps=1, burst=1) over @rate_limit(rps=100): [200, 200, 200, 200]
+.
+10 passed in 0.58s
