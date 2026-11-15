@@ -114,6 +114,63 @@ def test_request_only_route_sends_every_flag(path: str) -> None:
     }
 
 
+def _repeat_on_route(api: BoltAPI) -> None:
+    @api.get("/d/{x}/{x}")
+    async def handler(x: int):
+        return {"x": x}
+
+
+def _repeat_on_typed_route(api: BoltAPI) -> None:
+    @api.get("/d/{x:int}/sub/{x:path}")
+    async def handler(x: int):
+        return {"x": x}
+
+
+def _repeat_with_prefix(_api: BoltAPI) -> None:
+    api = BoltAPI(prefix="/d/{x}")
+
+    @api.get("/{x}")
+    async def handler(x: int):
+        return {"x": x}
+
+
+def _repeat_on_websocket(api: BoltAPI) -> None:
+    @api.websocket("/d/{x}/{x}")
+    async def handler(websocket, x: int):
+        await websocket.accept()
+
+
+def _repeat_with_mount(api: BoltAPI) -> None:
+    child = BoltAPI()
+
+    @child.get("/{x}")
+    async def handler(request):
+        return {"x": request.params["x"]}
+
+    api.mount("/d/{x}", child)
+
+
+@pytest.mark.parametrize(
+    "register",
+    [_repeat_on_route, _repeat_on_typed_route, _repeat_with_prefix, _repeat_on_websocket, _repeat_with_mount],
+)
+def test_a_path_with_one_parameter_name_two_times_stops_registration(register) -> None:
+    """The router keeps one value for each name, so the first value would be lost."""
+    with pytest.raises(ValueError, match="has the parameter 'x' two times"):
+        register(BoltAPI())
+
+
+def test_a_path_with_two_parameter_names_registers() -> None:
+    api = BoltAPI()
+
+    @api.get("/d/{x}/{y}")
+    async def handler(x: int, y: int):
+        return {"x": x, "y": y}
+
+    with TestClient(api) as client:
+        assert client.get("/d/1/2").json() == {"x": 1, "y": 2}
+
+
 def test_websocket_route_sends_every_flag() -> None:
     api = BoltAPI()
 

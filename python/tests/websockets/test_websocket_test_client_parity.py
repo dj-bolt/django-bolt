@@ -13,6 +13,7 @@ import pytest
 from django_bolt import BoltAPI
 from django_bolt.testing import ConnectionClosed, HandshakeRejected, WebSocketTestClient
 from tests.integration.apps import websocket_send_after_close
+from tests.integration.apps.websocket_close_frame import api as close_frame_api
 
 
 async def _error_of(send, message) -> str:
@@ -75,6 +76,55 @@ async def test_a_send_after_the_close_of_the_app_finds_no_client():
 
     assert closed.value.code == 4000
     assert websocket_send_after_close.results == {"send": "ConnectionResetError: WebSocket client disconnected"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "error"),
+    [
+        ("/ws/reason-200-bytes", "WebSocket close reason is 200 bytes: the limit is 123 bytes of UTF-8"),
+        # The limit counts bytes, not characters.
+        (
+            "/ws/reason-124-bytes-62-characters",
+            "WebSocket close reason is 124 bytes: the limit is 123 bytes of UTF-8",
+        ),
+        ("/ws/code-70000", "WebSocket close code 70000 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+        ("/ws/code-1006", "WebSocket close code 1006 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+        # RFC 6455 7.4.1 and 7.4.2: 1004 and 1016 to 2999 are reserved.
+        ("/ws/code-1004", "WebSocket close code 1004 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+        ("/ws/code-1016", "WebSocket close code 1016 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+        # A mounted ASGI app sends the close message with no WebSocket wrapper.
+        ("/raw/reason-200-bytes", "WebSocket close reason is 200 bytes: the limit is 123 bytes of UTF-8"),
+        ("/raw/code-70000", "WebSocket close code 70000 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+        ("/raw/code-2999", "WebSocket close code 2999 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+    ],
+)
+async def test_the_test_client_refuses_the_close_frames_that_the_server_refuses(path, error):
+    """The same app runs on the server in test_websocket_close_frame_server_integration.py."""
+    async with WebSocketTestClient(close_frame_api, path) as ws:
+        assert await ws.receive_text() == f"ValueError: {error}"
+        # The connection is still open after the error, so the handler can close it.
+        with pytest.raises(ConnectionClosed) as closed:
+            await ws.receive_text()
+    assert closed.value.code == 1000
+
+
+@pytest.mark.asyncio
+async def test_the_test_client_accepts_a_close_reason_of_123_bytes():
+    async with WebSocketTestClient(close_frame_api, "/ws/reason-123-bytes") as ws:
+        with pytest.raises(ConnectionClosed) as closed:
+            await ws.receive_text()
+    assert closed.value.code == 4001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "code"), [("/ws/code-1014", 1014), ("/raw/reason-none", 4001)])
+async def test_the_test_client_accepts_the_close_frames_that_the_server_accepts(path, code):
+    """1014 is the last code before the reserved range. The ASGI specification permits a None reason."""
+    async with WebSocketTestClient(close_frame_api, path) as ws:
+        with pytest.raises(ConnectionClosed) as closed:
+            await ws.receive_text()
+    assert closed.value.code == code
 
 
 @pytest.mark.asyncio
