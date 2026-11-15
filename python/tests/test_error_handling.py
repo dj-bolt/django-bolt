@@ -19,6 +19,7 @@ from django_bolt.error_handlers import (
     handle_exception,
     http_exception_handler,
     msgspec_validation_error_to_dict,
+    problem_details,
     request_validation_error_handler,
     response_validation_error_handler,
 )
@@ -58,6 +59,59 @@ class TestExceptions:
         exc = HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Bearer"})
         assert exc.status_code == 401
         assert exc.headers == {"WWW-Authenticate": "Bearer"}
+
+    @pytest.mark.parametrize("formatter", [None, problem_details], ids=["default", "formatter"])
+    @pytest.mark.parametrize(("value", "sent"), [(30, "30"), (1.5, "1.5")])
+    def test_http_exception_converts_a_number_header_value_to_a_str(self, formatter, value, sent, caplog):
+        api = BoltAPI(error_formatter=formatter)
+
+        @api.get("/busy")
+        async def busy():
+            raise TooManyRequests(detail="Slow down", headers={"Retry-After": value})
+
+        with caplog.at_level(logging.ERROR, logger="django_bolt"), TestClient(api) as client:
+            response = client.get("/busy")
+        assert response.status_code == 429
+        assert response.headers["retry-after"] == sent
+        assert [record.getMessage() for record in caplog.records] == []
+
+    @pytest.mark.parametrize(
+        ("headers", "message"),
+        [
+            ({"X-Trace": None}, "The value of the header 'X-Trace' must be a str or a number, not NoneType"),
+            ({"X-Trace": b"abc"}, "The value of the header 'X-Trace' must be a str or a number, not bytes"),
+            ({"X-Trace": True}, "The value of the header 'X-Trace' must be a str or a number, not bool"),
+            ({1: "abc"}, "The name of a header must be a str, not int"),
+        ],
+    )
+    def test_http_exception_refuses_a_header_that_is_not_a_str_or_a_number(self, headers, message):
+        with pytest.raises(TypeError, match=message):
+            HTTPException(400, headers=headers)
+
+    def test_http_exception_does_not_change_the_headers_dict_of_the_caller(self):
+        headers = {"Retry-After": 30, "X-Trace": "abc"}
+        exc = TooManyRequests(headers=headers)
+        assert exc.headers == {"Retry-After": "30", "X-Trace": "abc"}
+        assert headers == {"Retry-After": 30, "X-Trace": "abc"}
+
+    def test_a_header_value_with_a_line_break_is_not_sent_and_is_logged(self, capfd):
+        api = BoltAPI()
+
+        @api.get("/split")
+        async def split():
+            raise BadRequest(detail="No", headers={"X-A": "1\r\nX-Injected: yes", "X-B": "kept"})
+
+        with TestClient(api) as client:
+            response = client.get("/split")
+        assert response.status_code == 400
+        assert "x-a" not in response.headers
+        assert "x-injected" not in response.headers
+        assert response.headers["x-b"] == "kept"
+        # The Rust core writes its log records to stderr.
+        assert (
+            "[django-bolt] WARNING bolt_core::response_builder: "
+            "The response header 'X-A' is not valid in an HTTP response. Bolt does not send it."
+        ) in capfd.readouterr().err.splitlines()
 
     def test_http_exception_with_extra(self):
         """Test HTTPException with extra data."""
