@@ -1323,11 +1323,17 @@ class BoltAPI:
                 ``UserViewSet`` yields "user-view-set-list", "user-view-set-retrieve",
                 etc. -- reverse() works without an explicit name (a derived base is
                 non-explicit, so it loses collisions to explicitly named routes).
-            guards: Optional guards to apply to all routes
-            auth: Optional auth backends to apply to all routes
-            status_code: Optional default status code (overrides action-specific defaults)
+            guards: Optional guards to apply to all routes. An @action that sets
+                ``guards`` keeps its value.
+            auth: Optional auth backends to apply to all routes. An @action that
+                sets ``auth`` keeps its value.
+            status_code: Optional default status code (overrides action-specific
+                defaults). An @action that sets ``status_code`` keeps its value.
+            validate_response: Optional response validation switch for all routes.
+                An @action that sets ``validate_response`` keeps its value.
             lookup_field: Field name for object lookup (default: "pk")
-            tags: Optional tags to apply to all routes
+            tags: Optional tags to apply to all routes. An @action that sets
+                ``tags`` keeps its value.
 
         Returns:
             Decorator function that registers the viewset
@@ -1465,6 +1471,11 @@ class BoltAPI:
                 include_in_schema=merged_include_in_schema,
                 base_name=vs_base,
                 base_name_explicit=name is not None,
+                guards=guards,
+                auth=auth,
+                status_code=status_code,
+                validate_response=validate_response,
+                tags=tags,
             )
 
             return viewset_cls
@@ -1492,11 +1503,18 @@ class BoltAPI:
         base_name: str | None = None,
         base_name_explicit: bool = False,
         include_in_schema: bool | None = None,
+        guards: list[Any] | None = None,
+        auth: list[Any] | None = None,
+        status_code: int | None = None,
+        validate_response: bool | None = None,
+        tags: list[str] | None = None,
     ):
         """
         Scan a ViewSet class for custom action methods and register them.
 
-        Custom actions are methods decorated with @action decorator.
+        Custom actions are methods decorated with @action decorator. For each
+        option, the @action value comes first, then the registration value, then
+        the class attribute.
 
         Args:
             view_cls: The ViewSet class to scan
@@ -1504,12 +1522,19 @@ class BoltAPI:
             lookup_field: Lookup field name for detail actions (e.g., "id", "pk")
             base_name: Base URL-reverse name for the viewset.
             base_name_explicit: True when the user named the viewset directly
+            guards: Guards from the registration call
+            auth: Auth backends from the registration call
+            status_code: Default status code from the registration call
+            validate_response: Response validation switch from the registration call
+            tags: Tags from the registration call
         """
 
-        # Get class-level auth and guards (if any)
-        class_auth = getattr(view_cls, "auth", None)
-        class_guards = getattr(view_cls, "guards", None)
-        class_validate_response = getattr(view_cls, "validate_response", None)
+        # Registration value first, then the class-level value (if any)
+        class_auth = auth if auth is not None else getattr(view_cls, "auth", None)
+        class_guards = guards if guards is not None else getattr(view_cls, "guards", None)
+        class_validate_response = (
+            validate_response if validate_response is not None else getattr(view_cls, "validate_response", None)
+        )
 
         # Scan all attributes in the class
         for name in dir(view_cls):
@@ -1626,11 +1651,11 @@ class BoltAPI:
                         name=action_route_name,
                         _name_explicit=base_name_explicit or attr.name is not None,
                         response_model=attr.response_model,
-                        status_code=attr.status_code,
+                        status_code=attr.status_code if attr.status_code is not None else status_code,
                         validate_response=final_validate_response,
                         guards=final_guards,
                         auth=final_auth,
-                        tags=attr.tags,
+                        tags=attr.tags if attr.tags is not None else tags,
                         summary=attr.summary,
                         description=attr.description,
                         include_in_schema=include_in_schema,
