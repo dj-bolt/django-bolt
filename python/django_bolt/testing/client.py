@@ -27,6 +27,7 @@ from django_bolt.api import (
     _routes_and_native_routes,
     _validate_asgi_mount_conflicts,
     _validate_mcp_mount_conflicts,
+    run_lifespans,
 )
 from django_bolt.testing.dbshare import SharedConnections
 
@@ -434,7 +435,7 @@ class TestClient(httpx.Client):
             _warn_if_inside_atomic_block()
         if self.api._has_lifespan:
             loop = asyncio.new_event_loop()
-            cm = self.api._lifespan_context(self.api)
+            cm = run_lifespans(self.api._source_lifespans)
             try:
                 loop.run_until_complete(cm.__aenter__())
             except BaseException:
@@ -773,7 +774,7 @@ class AsyncTestClient(httpx.AsyncClient):
         if self._lifespan is not None:
             raise RuntimeError("AsyncTestClient is already open. Enter it once.")
         if self.api._has_lifespan:
-            cm = self.api._lifespan_context(self.api)
+            cm = run_lifespans(self.api._source_lifespans)
             await cm.__aenter__()
             self._lifespan = cm
         try:

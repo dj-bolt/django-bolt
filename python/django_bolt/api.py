@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Sequence
 from contextlib import suppress
 from typing import Any, get_origin, get_type_hints
 
@@ -479,20 +479,29 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
     return int(status), meta, _BODY_BYTES, body
 
 
+@contextlib.asynccontextmanager
+async def run_lifespans(source_lifespans: list[tuple[BoltAPI, Callable]]) -> AsyncIterator[None]:
+    """Enter every lifespan context in *source_lifespans*.
+
+    Each ``(api, lifespan_ctx)`` pair is entered in order; teardown runs in
+    reverse order (LIFO) via :class:`contextlib.AsyncExitStack`.
+    """
+    async with contextlib.AsyncExitStack() as stack:
+        for api, lifespan_ctx in source_lifespans:
+            await stack.enter_async_context(lifespan_ctx(api))
+        yield
+
+
 async def serve_with_lifespan(
     source_lifespans: list[tuple[BoltAPI, Callable]],
     server_fn: Callable,
 ) -> None:
     """Run *server_fn* inside every lifespan context in *source_lifespans*.
 
-    Each ``(api, lifespan_ctx)`` pair is entered in order; teardown runs in
-    reverse order (LIFO) via :class:`contextlib.AsyncExitStack`.
     *server_fn* is executed in a thread so the async event-loop stays free
     for lifespan teardown when the server stops.
     """
-    async with contextlib.AsyncExitStack() as stack:
-        for api, lifespan_ctx in source_lifespans:
-            await stack.enter_async_context(lifespan_ctx(api))
+    async with run_lifespans(source_lifespans):
         await asyncio.to_thread(server_fn)
 
 
@@ -685,7 +694,9 @@ class BoltAPI:
         self._emit_signals = getattr(django_settings, "BOLT_EMIT_SIGNALS", False) if django_settings else False
         # Lifecycle: async context manager for startup/shutdown
         self._lifespan_context: Callable | None = lifespan
-        self._source_lifespans: list[tuple[BoltAPI, Callable]] | None = None
+        # The lifespans that a server of this API runs, in startup order: the
+        # lifespan of this API, then the lifespans of the APIs that it mounts.
+        self._source_lifespans: list[tuple[BoltAPI, Callable]] = [(self, lifespan)] if lifespan is not None else []
 
         # Signal support: wrap _dispatch when enabled
         # This is done at init time (not per-request) for zero overhead when disabled
@@ -3556,6 +3567,8 @@ class BoltAPI:
 
         The mounted app's routes are copied to this app with the path prefix prepended.
         Each sub-app maintains its own middleware, auth, and configuration.
+        The lifespan of the mounted app runs with this app. It starts after
+        the lifespan of this app, and it stops before it.
 
         Usage:
             # Create a sub-application with its own middleware
@@ -3702,6 +3715,11 @@ class BoltAPI:
             self._asgi_mounts.append((new_asgi_prefix, asgi_app))
 
         self._mcp_mounts.extend(child_mcp_mounts)
+        # A server of this API also runs the lifespans of the mounted API. An
+        # API that is mounted two times still starts one time.
+        for source_lifespan in app._source_lifespans:
+            if source_lifespan not in self._source_lifespans:
+                self._source_lifespans.append(source_lifespan)
         # Last, so that a mount that raises does not change the formatter.
         if child_formatter is not None:
             self._error_formatter = child_formatter
@@ -3878,5 +3896,5 @@ class BoltAPI:
 
     @property
     def _has_lifespan(self) -> bool:
-        """Check if this API has a lifespan context manager."""
-        return self._lifespan_context is not None
+        """Check if this API, or an API that it mounts, has a lifespan context manager."""
+        return bool(self._source_lifespans)
