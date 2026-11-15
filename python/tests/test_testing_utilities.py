@@ -12,6 +12,7 @@ from django.http import QueryDict
 
 from django_bolt import BoltAPI, _core
 from django_bolt.param_functions import Header
+from django_bolt.responses import PlainText
 from django_bolt.testing import AsyncTestClient, TestClient
 
 
@@ -133,6 +134,29 @@ def test_post_with_body():
         assert data["id"] == 1
         assert data["name"] == "John"
         assert data["email"] == "john@example.com"
+
+
+def test_streamed_response_reads_text_that_a_chunk_splits_inside_a_character():
+    api = BoltAPI()
+
+    @api.get("/text")
+    async def text():
+        return PlainText("\u00e9" * 5000 + "\n" + "\u00e9" * 5000 + "\nlast")
+
+    with TestClient(api) as client:
+        lines = list(client.get("/text", stream=True, headers={"accept-encoding": "identity"}).iter_lines())
+        byte_lines = list(
+            client.get("/text", stream=True, headers={"accept-encoding": "identity"}).iter_lines(decode_unicode=False)
+        )
+        chunks = list(
+            client.get("/text", stream=True, headers={"accept-encoding": "identity"}).iter_content(
+                chunk_size=999, decode_unicode=True
+            )
+        )
+
+    assert lines == ["\u00e9" * 5000, "\u00e9" * 5000, "last"]
+    assert byte_lines == [line.encode() for line in lines]
+    assert "".join(chunks) == "\u00e9" * 5000 + "\n" + "\u00e9" * 5000 + "\nlast"
 
 
 def test_404_not_found():
