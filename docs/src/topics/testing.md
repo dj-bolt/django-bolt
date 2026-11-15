@@ -492,8 +492,8 @@ async def lifespan(app):
 api = BoltAPI(lifespan=lifespan)
 
 @api.get("/status")
-async def status(request):
-    return {"ready": request.app._cache.get("ready", False)}
+async def status():
+    return {"ready": api._cache.get("ready", False)}
 
 with TestClient(api) as client:
     # startup has already run

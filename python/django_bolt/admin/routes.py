@@ -1,5 +1,6 @@
 """Django admin route registration via ASGI mount."""
 
+import sys
 from typing import TYPE_CHECKING
 
 from django_bolt.admin.admin_detection import detect_admin_url_prefix, should_enable_admin
@@ -24,10 +25,17 @@ class AdminRouteRegistrar:
             return
 
         admin_prefix = detect_admin_url_prefix()
-        if not admin_prefix:
+        if admin_prefix is None:
             return
 
-        mount_path = f"/{admin_prefix.strip('/')}"
+        if not admin_prefix:
+            print(
+                "[django-bolt] Warning: the admin site is at the root path. "
+                "Django answers each path that has no Bolt route.",
+                file=sys.stderr,
+            )
+
+        mount_path = f"/{admin_prefix}"
         # clear_root_path=True because Django admin's URL patterns already
         # include the mount prefix (/admin/...), so path_info must equal the
         # full path rather than the subpath relative to the mount prefix.

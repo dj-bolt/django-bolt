@@ -1,5 +1,8 @@
 """Tests for Serializer rename parameter support (camelCase, pascal, kebab, etc.)."""
 
+from datetime import datetime
+from uuid import UUID
+
 import msgspec
 import pytest
 
@@ -159,6 +162,35 @@ class TestRenameWithDefaults:
         data = profile.dump(exclude_none=True)
         assert data == {"userName": "alice"}
 
+    def test_rename_and_tag_dump_gives_the_values_of_the_other_dump_paths(self):
+        """dump() changes only the keys. The values are the same on each path of dump()."""
+
+        class Plain(Serializer):
+            created_at: datetime
+            ident: UUID
+            labels: set[str]
+
+        class Camel(Serializer, rename="camel"):
+            created_at: datetime
+            ident: UUID
+            labels: set[str]
+
+        class Tagged(Serializer, tag="event"):
+            created_at: datetime
+            ident: UUID
+            labels: set[str]
+
+        values = {"created_at": datetime(2024, 1, 2, 3, 4, 5), "ident": UUID(int=1), "labels": {"a"}}
+        camel_values = {"createdAt": values["created_at"], "ident": values["ident"], "labels": values["labels"]}
+
+        assert Plain(**values).dump() == values
+        assert Camel(**values).dump() == camel_values
+        assert Camel(**values).dump(exclude_none=True) == camel_values
+        assert Camel.dump_many([Camel(**values)]) == [camel_values]
+        assert Tagged(**values).dump() == {"type": "event", **values}
+        assert Tagged.dump_many([Tagged(**values)]) == [{"type": "event", **values}]
+        assert list(Tagged(**values).dump()) == ["type", "created_at", "ident", "labels"]
+
 
 class TestRenameWithFieldAlias:
     """Test rename with per-field alias override."""
@@ -213,6 +245,28 @@ class TestRenameWithFieldAlias:
                 "age": 0,
             }
             assert client.get("/accounts/first").json() == {"userName": "ana", "nick-name": "none", "age": 0}
+
+    def test_required_field_with_an_alias_stays_required_under_its_alias(self):
+        """field(alias=...) with no default: the alias is the key, and a missing value is an error."""
+
+        class Item(Serializer):
+            x: str = field(alias="y")
+
+        item = Item.model_validate({"y": "v"})
+        assert item.x == "v"
+        assert item.dump() == {"y": "v"}
+        assert msgspec.json.decode(Item.model_validate_json(b'{"y": "v"}').dump_json()) == {"y": "v"}
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Item.model_validate({})
+        assert exc_info.value.errors() == [
+            {"loc": ("body", "y"), "msg": "Object missing required field `y`", "type": "missing"}
+        ]
+        with pytest.raises(RequestValidationError) as exc_info:
+            Item.model_validate_json(b"{}")
+        assert [error["msg"] for error in exc_info.value.errors()] == ["Object missing required field `y`"]
+        with pytest.raises(TypeError, match="Missing required argument 'x'"):
+            Item()
 
     def test_field_alias_stays_in_a_subclass_and_in_a_subset(self):
         class Account(Serializer):
@@ -341,13 +395,13 @@ class TestRenameBackwardCompat:
         assert SimpleSerializer.__rename_map__ == {}
         assert SimpleSerializer.__has_rename__ is False
 
-    def test_rename_keeps_fast_path_with_to_builtins(self):
-        """Serializers with rename still use the fast path (via to_builtins)."""
+    def test_rename_keeps_fast_path(self):
+        """Serializers with rename still use the fast path."""
 
         class CamelSerializer(Serializer, rename="camel"):
             user_name: str
 
-        # Fast path is still enabled — dump() uses to_builtins() instead of asdict()
+        # Fast path is still enabled. dump() pairs the encoded names with the values.
         assert CamelSerializer.__dump_fast_path__ is True
         assert CamelSerializer.__rename_map__ == {"user_name": "userName"}
         assert CamelSerializer.__has_rename__ is True
@@ -405,8 +459,36 @@ class TestRenameWithFieldValidators:
             pytest.fail(f"Expected RequestValidationError, got {type(exc)}: {exc}")
 
         assert len(errors) >= 1
-        # Field validator errors use Python field names (they run after struct creation)
-        assert errors[0]["loc"] == ["body", "email_address"]
+        # A field validator error names the field as the client sent it.
+        assert errors[0]["loc"] == ["body", "emailAddress"]
+
+    def test_rename_validator_error_and_type_error_name_the_field_in_the_same_way(self):
+        """A 422 has the wire name of a field in `loc`, for a validator error and for a msgspec error."""
+
+        class CreateUser(Serializer, rename="camel"):
+            email_address: str
+
+            @field_validator("email_address")
+            def validate_email(cls, value):
+                if "@" not in value:
+                    raise ValueError("Invalid email")
+                return value
+
+        api = BoltAPI()
+
+        @api.post("/users")
+        async def create_user(data: CreateUser):
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            wrong_type = client.post("/users", json={"emailAddress": 5})
+            rejected = client.post("/users", json={"emailAddress": "bad-email"})
+
+        assert wrong_type.status_code == rejected.status_code == 422
+        assert wrong_type.json()["detail"][0]["loc"] == ["body", "emailAddress"]
+        assert rejected.json()["detail"] == [
+            {"loc": ["body", "emailAddress"], "msg": "Invalid email", "type": "value_error"}
+        ]
 
 
 class TestRenameRoundTrip:
