@@ -47,7 +47,7 @@ async def tenant_data():
 
 A pattern can match a part of the origin, so start it with `^` and end it with `$`. Patterns use the syntax of the Rust `regex` crate, which has no look-around and no back-references. An invalid pattern or an empty pattern stops startup with `ValueError`. Bolt does not reject a pattern that allows too much. A pattern such as `.*` or `^` allows every origin.
 
-The most specific `cors` config applies. A route-level `@cors` takes precedence over the router, and the router takes precedence over the API. A config with no origins and no patterns, such as a router config that sets only `credentials`, keeps the allow list of the outer config. A route takes one cors config. A second `@cors`, or a `@cors` together with `@middleware(type="cors")`, raises `ValueError`. The config stays on the function, so give each route with `@cors` its own function. `@cors` raises `ValueError` when it gets no origin and no pattern. It raises `TypeError` when an origin or a pattern is not a `str`. Give `methods` and `headers` as a list of `str`, `credentials` as a `bool`, and `max_age` as an `int` of 0 or more. Another type raises `TypeError`, and a `max_age` out of range raises `ValueError`. A `cors` dict in the `middleware` of an API or a router gets the same check when the server starts. A method name or a header name with a character that is not valid in an HTTP header, such as a line break, stops startup with `ValueError`.
+The most specific `cors` config applies. A route-level `@cors` takes precedence over the router, and the router takes precedence over the API. A config with no origins and no patterns, such as a router config that sets only `credentials`, keeps the allow list of the outer config. A route takes one cors config. A second `@cors`, or a `@cors` together with `@middleware(type="cors")`, raises `ValueError`. The config stays on the function, so give each route with `@cors` its own function. `@cors` raises `ValueError` when it gets no origin and no pattern. It raises `TypeError` when an origin or a pattern is not a `str`. Give `methods` and `headers` as a list of `str`, `credentials` as a `bool`, and `max_age` as an `int` of 0 or more. Another type raises `TypeError`, and a `max_age` out of range raises `ValueError`. A `cors` dict gets the same checks when you register it. This applies to `@middleware(type="cors", ...)` and to a dict in the `middleware` of an API or a router. Only the config of a route needs an origin or a pattern. A method name or a header name with a character that is not valid in an HTTP header, such as a line break, stops startup with `ValueError`.
 
 A WebSocket route does not use `@cors`. The WebSocket handshake checks the `Origin` header against the global settings only.
 
@@ -343,7 +343,7 @@ Passing plain middleware instances in these lists fails fast with `TypeError` (`
 
 A class with no `__call__` method, for example `int`, also raises `TypeError`. Bolt calls the instance with the request.
 
-A dict config needs `"type": "cors"` or `"type": "rate_limit"`. A dict with no type or with another type raises `ValueError`, because no middleware reads it. `@middleware(type="cors", ...)` is the same dict as keyword arguments. Other keyword arguments of `@middleware` raise `TypeError`. Use `@cors(...)`, `@rate_limit(...)` and `@skip_middleware(...)`.
+A dict config needs `"type": "cors"` or `"type": "rate_limit"`. A dict with no type or with another type raises `ValueError`, because no middleware reads it. `@middleware(type="cors", ...)` is the same dict as keyword arguments. A dict config gets the checks of `@cors(...)` or `@rate_limit(...)`, so a value that the decorator refuses raises the same error. Other keyword arguments of `@middleware` raise `TypeError`. Use `@cors(...)`, `@rate_limit(...)` and `@skip_middleware(...)`.
 
 In a `cors` dict, `origins` and `origin_regexes` take a `str` or a collection of `str`. Another type, or an empty pattern, stops startup with `TypeError` or `ValueError`.
 
@@ -426,6 +426,15 @@ api = BoltAPI(
 ```
 
 Each wrapper runs the `process_view` hook of its middleware before the handler. The hook gets the route handler as the view, so view decorators such as `@csrf_exempt` and `@login_not_required` work.
+
+Put a view decorator below the route decorator. The route decorator registers the function that it gets. A view decorator above it marks a function that Bolt did not register. Thus it has no effect, and Bolt gives no error. The wrapper of `@csrf_exempt` passes `request` to the handler, so the handler must have a `request` parameter.
+
+```python
+@api.post("/webhook")   # First: the route decorator
+@csrf_exempt            # Second: the view decorator
+async def webhook(request):
+    return {"ok": True}
+```
 
 Bolt runs three hooks of a Django middleware: `process_request`, `process_view` and `process_response`. It does not run `process_exception` or `process_template_response`. A handler exception goes to the Bolt error handlers, and `process_exception` does not see it. See [Error Handling](error-handling.md).
 

@@ -192,6 +192,21 @@ Use a code from 1000 to 4999, but not 1005, 1006 or 1015. `close()` raises
 `ValueError` for a code or a reason that makes an invalid close frame. The
 connection stays open, and `WebSocketTestClient` raises the same error.
 
+To close from a helper or a dependency, raise `WebSocketException`. Bolt
+closes the connection with the code and the reason of the exception, and it
+does not log an error. `WebSocketClose` is the same exception with code 1000
+as its default:
+
+```python
+from django_bolt import WebSocketException
+
+@api.websocket("/ws/rooms/{room}")
+async def room(websocket: WebSocket, room: str):
+    await websocket.accept()
+    if room not in OPEN_ROOMS:
+        raise WebSocketException(code=4004, reason="No such room")
+```
+
 ### Refuse the handshake
 
 Bolt sends the `101` response only when the handler calls `accept()`.
@@ -201,7 +216,8 @@ Before that, the handler can refuse the connection with an HTTP status:
 |----------------------------------|----------|
 | Calls `close()` | `403 Forbidden` |
 | Returns | `403 Forbidden` |
-| Raises an exception | `500 Internal Server Error` |
+| Raises `WebSocketException` or `WebSocketClose` | `403 Forbidden` |
+| Raises a different exception | `500 Internal Server Error` |
 
 ```python
 @api.websocket("/ws/rooms/{room}")

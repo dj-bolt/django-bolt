@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from .apps import app_module
-from .helpers import SimpleWebSocketClient
+from .helpers import SimpleWebSocketClient, attempt_ws_upgrade
 
 pytestmark = pytest.mark.server_integration
 
@@ -26,6 +26,19 @@ def test_error_after_accept_closes_the_connection_with_1011(server):
     with SimpleWebSocketClient(server.host, server.port, "/ws/raise") as websocket:
         assert websocket.receive_text() == "bye"
         assert websocket.receive_close() == (1011, "Internal error")
+
+
+def test_websocket_exception_closes_the_connection_with_its_code_and_reason(server):
+    with SimpleWebSocketClient(server.host, server.port, "/ws/exception") as websocket:
+        assert websocket.receive_text() == "bye"
+        assert websocket.receive_close() == (4001, "nope")
+    with SimpleWebSocketClient(server.host, server.port, "/ws/close-exception") as websocket:
+        assert websocket.receive_close() == (4002, "done")
+
+
+def test_websocket_exception_before_accept_refuses_the_handshake_with_403(server):
+    status_line, _body = attempt_ws_upgrade(server.host, server.port, "/ws/exception-before-accept")
+    assert status_line == "HTTP/1.1 403 Forbidden"
 
 
 def test_close_of_the_handler_is_the_only_close_frame(server):

@@ -46,11 +46,14 @@ class OpenAPIRenderPlugin(ABC):
 
         Args:
             path: Path(s) to serve the UI at (relative to openapi_config.path).
+                Each path gets a leading slash and loses its trailing slash,
+                as openapi_config.path does. Thus "swagger" is "/swagger".
             media_type: Media type for the response.
             favicon: HTML <link> tag for the favicon.
             style: Base styling of the html body.
         """
-        self.paths = [path] if isinstance(path, str) else list(path)
+        paths = [path] if isinstance(path, str) else path
+        self.paths = ["/" + item.strip("/") for item in paths]
         self.media_type = media_type
         self.favicon = favicon
         self.style = style

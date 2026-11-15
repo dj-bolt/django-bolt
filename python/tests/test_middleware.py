@@ -179,30 +179,16 @@ class TestMiddlewareDecorators:
         with pytest.raises(ValueError, match="already has a @rate_limit"):
             outer(inner(route))
 
-    def test_router_rate_limit_with_a_bad_value_stops_the_registration(self):
-        """A rate limit dict that does not come from @rate_limit is checked in Rust."""
-        api = BoltAPI()
-        router = Router(prefix="/rl", middleware=[{"type": "rate_limit", "rps": 0.5, "burst": 1, "key": "ip"}])
+    @pytest.mark.parametrize("level", ["api", "router"])
+    def test_a_rate_limit_dict_with_a_bad_value_stops_the_registration(self, level):
+        """A rate limit dict that does not come from @rate_limit gets the checks of @rate_limit."""
+        entry = {"type": "rate_limit", "rps": 0.5, "burst": 1, "key": "ip"}
 
-        @router.get("/items")
-        async def list_items():
-            return {"ok": True}
-
-        api.include_router(router)
-
-        with pytest.raises(TypeError, match="rate_limit rps must be an int of 1 or more"), TestClient(api):
-            pass
-
-    def test_api_rate_limit_with_a_bad_value_stops_the_registration(self):
-        """A rate limit dict in the middleware of the API is checked in Rust too."""
-        api = BoltAPI(middleware=[{"type": "rate_limit", "rps": 0.5, "burst": 1, "key": "ip"}])
-
-        @api.get("/items")
-        async def list_items():
-            return {"ok": True}
-
-        with pytest.raises(TypeError, match="rate_limit rps must be an int of 1 or more"), TestClient(api):
-            pass
+        with pytest.raises(TypeError, match=r"^rate_limit rps must be an int, got float 0\.5$"):
+            if level == "api":
+                BoltAPI(middleware=[entry])
+            else:
+                Router(prefix="/rl", middleware=[entry])
 
     def test_cors_decorator(self):
         """Test CORS decorator attaches metadata"""
@@ -608,6 +594,143 @@ class TestMiddlewareEntryValidation:
             build()
 
         assert str(raised.value) == message
+
+    @pytest.mark.parametrize(
+        ("config", "error", "message"),
+        [
+            ({"type": "cors"}, ValueError, "@middleware(type='cors') requires an 'origins' or 'origin_regexes'"),
+            ({"type": "cors", "credentials": True}, ValueError, "requires an 'origins' or 'origin_regexes'"),
+            (
+                {"type": "cors", "origins": 5},
+                TypeError,
+                "@middleware(type='cors') origins must be a str or a list of str, not int",
+            ),
+            (
+                {"type": "cors", "origin_regexes": [""]},
+                ValueError,
+                "@middleware(type='cors') origin_regexes holds an empty pattern, which matches every origin.",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "methods": "GET"},
+                TypeError,
+                "@middleware(type='cors') methods must be a list of str, not str 'GET'",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "expose_headers": "X-A"},
+                TypeError,
+                "@middleware(type='cors') expose_headers must be a list of str, not str 'X-A'",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "credentials": "yes"},
+                TypeError,
+                "@middleware(type='cors') credentials must be a bool, not str 'yes'",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "max_age": -1},
+                ValueError,
+                "@middleware(type='cors') max_age must be from 0 to 4294967295, got -1",
+            ),
+            ({"type": "rate_limit", "rps": 0}, ValueError, "rate_limit rps must be 1 or more, got 0"),
+            ({"type": "rate_limit", "burst": 1.5}, TypeError, "rate_limit burst must be an int, got float 1.5"),
+            (
+                {"type": "rate_limit", "key": "x forwarded for"},
+                ValueError,
+                'rate_limit key must be "ip", "user", "api_key" or the name of a request header, '
+                "got 'x forwarded for'",
+            ),
+        ],
+        ids=[
+            "cors-no-origins",
+            "cors-only-credentials",
+            "cors-origins-int",
+            "cors-empty-pattern",
+            "cors-methods-str",
+            "cors-expose-headers-str",
+            "cors-credentials-str",
+            "cors-max-age-negative",
+            "rate-limit-rps-zero",
+            "rate-limit-burst-float",
+            "rate-limit-key-space",
+        ],
+    )
+    @pytest.mark.parametrize("form", ["keywords", "dict"])
+    def test_the_dict_form_of_a_route_refuses_what_the_decorator_refuses(self, form, config, error, message):
+        # Before, @middleware(type="cors") took a config with no origins, and Rust read only the types.
+        with pytest.raises(error, match=re.escape(message)):
+            if form == "keywords":
+                middleware(**config)
+            else:
+                middleware(config)(lambda: None)
+
+    @pytest.mark.parametrize("level", ["api", "router"])
+    @pytest.mark.parametrize(
+        ("config", "error", "message"),
+        [
+            (
+                {"type": "rate_limit", "rps": 5, "key": "x forwarded for"},
+                ValueError,
+                'rate_limit key must be "ip", "user", "api_key" or the name of a request header, '
+                "got 'x forwarded for'",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "methods": "GET"},
+                TypeError,
+                "{level} cors dict methods must be a list of str, not str 'GET'",
+            ),
+            (
+                {"type": "cors", "origin_regexes": ""},
+                ValueError,
+                "{level} cors dict origin_regexes holds an empty pattern, which matches every origin.",
+            ),
+        ],
+        ids=["rate-limit-key", "cors-methods", "cors-empty-pattern"],
+    )
+    def test_a_dict_of_an_api_or_a_router_gets_the_checks_of_the_decorator(self, level, config, error, message):
+        # Before, a rate limit key with a space passed, and each caller had the same bucket.
+        with pytest.raises(error, match=re.escape(message.format(level=level))):
+            if level == "api":
+                BoltAPI(middleware=[config])
+            else:
+                Router(middleware=[config])
+
+    def test_a_cors_dict_of_an_api_or_a_router_needs_no_origins(self):
+        """Such a config keeps the allow list of the outer config. Only a route config needs origins."""
+        api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://api.test"]}])
+        router = Router(middleware=[{"type": "cors", "credentials": True}])
+
+        @router.get("/inner")
+        async def inner():
+            return {}
+
+        api.include_router(router)
+
+        with TestClient(api, use_http_layer=True, read_django_settings=False) as client:
+            response = client.get("/inner", headers={"Origin": "https://api.test"})
+
+        assert response.headers.get("Access-Control-Allow-Origin") == "https://api.test"
+        assert response.headers.get("Access-Control-Allow-Credentials") == "true"
+
+    def test_the_keyword_form_gives_the_route_the_config_of_the_decorator(self):
+        api = BoltAPI()
+
+        @api.get("/keywords")
+        @middleware(type="cors", origins="https://a.test", credentials=True)
+        async def keywords():
+            return {}
+
+        @api.get("/limited")
+        @middleware(type="rate_limit", rps=1, burst=1, key="X-Client")
+        async def limited():
+            return {}
+
+        with TestClient(api, use_http_layer=True, read_django_settings=False) as client:
+            allowed = client.get("/keywords", headers={"Origin": "https://a.test"})
+            other = client.get("/keywords", headers={"Origin": "https://b.test"})
+            statuses = [client.get("/limited", headers={"X-Client": "one"}).status_code for _ in range(2)]
+
+        assert allowed.headers.get("Access-Control-Allow-Origin") == "https://a.test"
+        assert other.headers.get("Access-Control-Allow-Origin") is None
+        assert statuses == [200, 429]
 
     def test_dict_entries_pass_through_unchanged(self):
         entry = {"type": "rate_limit", "rps": 1, "burst": 2, "key": "ip"}
