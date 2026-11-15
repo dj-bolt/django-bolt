@@ -318,7 +318,7 @@ def test_response_validation_500_reaches_the_formatter(recorded, caplog, setting
     assert data["detail"] == "Response validation error"
     assert data["exception"] == "ResponseValidationError"
     [error] = data["errors"]
-    assert error["loc"] == ["response"]
+    assert error["loc"] == ["response", "id"]
     assert error["type"] == "validation_error"
     records = [record for record in caplog.records if record.name == "django_bolt.error_handlers"]
     assert len(records) == 1
@@ -329,19 +329,42 @@ def test_response_validation_500_reaches_the_formatter(recorded, caplog, setting
     assert isinstance(records[0].exc_info[1], ResponseValidationError)
 
 
-def test_http_exception_with_another_status_has_the_http_error_kind():
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [
+        (400, "bad_request"),
+        (401, "not_authenticated"),
+        (403, "forbidden"),
+        (404, "not_found"),
+        (405, "method_not_allowed"),
+        (406, "not_acceptable"),
+        (409, "conflict"),
+        (410, "gone"),
+        (413, "payload_too_large"),
+        (422, "validation"),
+        (429, "rate_limited"),
+        (500, "internal_error"),
+        (501, "not_implemented"),
+        (502, "bad_gateway"),
+        (503, "service_unavailable"),
+        (504, "gateway_timeout"),
+        # A status with no name.
+        (418, "http_error"),
+    ],
+)
+def test_http_exception_gets_its_kind_from_its_status(status, kind):
     api = BoltAPI(error_formatter=_record)
 
-    @api.get("/teapot")
-    async def teapot() -> dict:
-        raise HTTPException(418, "Short and stout")
+    @api.get("/raise")
+    async def raise_it() -> dict:
+        raise HTTPException(status, "Short and stout")
 
     with TestClient(api) as client:
-        response = client.get("/teapot")
+        response = client.get("/raise")
 
-    assert response.status_code == 418
+    assert response.status_code == status
     data = response.json()
-    assert (data["kind"], data["detail"]) == ("http_error", "Short and stout")
+    assert (data["kind"], data["detail"], data["errors"]) == (kind, "Short and stout", [])
 
 
 @pytest.mark.parametrize(("message", "detail"), [("no access", "no access"), ("", "Permission denied")])
@@ -476,6 +499,49 @@ def test_problem_details_keeps_extra_as_extension_members(problems):
     assert limited.json()["retry_after"] >= 1
 
 
+@pytest.mark.parametrize(
+    ("status", "extra", "title", "members"),
+    [
+        # A key of the extra data does not replace a standard member, and "errors" holds only field errors.
+        pytest.param(
+            409,
+            {"type": "t", "title": "t", "status": 1, "detail": "d", "instance": "i", "errors": ["e"], "id": 3},
+            "Conflict",
+            {"id": 3},
+            id="extra-with-standard-names",
+        ),
+        # Extra data that is not a dict has no keys, so it is the "extra" member.
+        pytest.param(409, ["a", "b"], "Conflict", {"extra": ["a", "b"]}, id="extra-list"),
+        # The RFC 9110 names. Python 3.12 has older names for these.
+        pytest.param(413, None, "Content Too Large", {}, id="title-413"),
+        pytest.param(414, None, "URI Too Long", {}, id="title-414"),
+        pytest.param(416, None, "Range Not Satisfiable", {}, id="title-416"),
+        # A status that has no name.
+        pytest.param(499, None, "Error", {}, id="title-of-an-unknown-status"),
+    ],
+)
+def test_problem_details_body_of_an_http_exception(status, extra, title, members):
+    api = BoltAPI(error_formatter=problem_details)
+
+    @api.get("/raise")
+    async def raise_it() -> dict:
+        raise HTTPException(status, "Not possible", extra=extra)
+
+    with TestClient(api) as client:
+        response = client.get("/raise")
+
+    assert response.status_code == status
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.json() == {
+        "type": "about:blank",
+        "title": title,
+        "status": status,
+        "detail": "Not possible",
+        "instance": "/raise",
+        **members,
+    }
+
+
 # --- Formatter results ------------------------------------------------------
 
 
@@ -561,7 +627,10 @@ def test_formatter_can_return_a_status_at_the_ends_of_the_error_range(status):
 def test_formatter_can_return_an_int_enum_status_and_a_str_subclass_header():
     def formatter(error: BoltError, request) -> JSON:
         return JSON(
-            {"kind": error.kind}, status_code=HTTPStatus(error.status), headers={"X-Kind": SafeString(error.kind)}
+            {"kind": error.kind},
+            status_code=HTTPStatus(error.status),
+            # A tab is valid in a header value.
+            headers={"X-Kind": SafeString(error.kind), "X-Tab": "a\tb"},
         )
 
     with TestClient(_routes(BoltAPI(error_formatter=formatter))) as client:
@@ -570,6 +639,7 @@ def test_formatter_can_return_an_int_enum_status_and_a_str_subclass_header():
 
     assert (rust_error.status_code, rust_error.headers["x-kind"]) == (404, "not_found")
     assert (python_error.status_code, python_error.headers["x-kind"]) == (409, "conflict")
+    assert (rust_error.headers["x-tab"], python_error.headers["x-tab"]) == ("a\tb", "a\tb")
 
 
 def _formatter_with_a_cookie(error: BoltError, _request) -> JSON:
@@ -612,6 +682,32 @@ _RETURN_TYPES = "error_formatter must return Response, JSON, PlainText or HTML, 
             lambda error, _request: JSON({}, status_code=error.status, headers={"Bad Name": "x"}),
             "error_formatter returned a header name that is not valid: 'Bad Name'",
             id="bad-header-name",
+        ),
+        # A carriage return, a NUL or a DEL in a value can split or corrupt the response headers.
+        pytest.param(
+            lambda error, _request: JSON({}, status_code=error.status, headers={"X-Detail": "a\rb"}),
+            r"error_formatter returned a value that is not valid for the header 'X-Detail': 'a\rb'",
+            id="carriage-return-header",
+        ),
+        pytest.param(
+            lambda error, _request: JSON({}, status_code=error.status, headers={"X-Detail": "a\x00b"}),
+            r"error_formatter returned a value that is not valid for the header 'X-Detail': 'a\x00b'",
+            id="nul-header",
+        ),
+        pytest.param(
+            lambda error, _request: JSON({}, status_code=error.status, headers={"X-Detail": "a\x7fb"}),
+            r"error_formatter returned a value that is not valid for the header 'X-Detail': 'a\x7fb'",
+            id="del-header",
+        ),
+        pytest.param(
+            lambda error, _request: JSON({}, status_code=error.status, headers={"": "x"}),
+            "error_formatter returned a header name that is not valid: ''",
+            id="empty-header-name",
+        ),
+        pytest.param(
+            lambda error, _request: JSON({}, status_code=error.status, headers={"X:Name": "x"}),
+            "error_formatter returned a header name that is not valid: 'X:Name'",
+            id="colon-in-header-name",
         ),
         # A 204 or a 304 has no body. Its body bytes would break a keep-alive connection.
         pytest.param(
@@ -721,6 +817,29 @@ def test_typed_http_exception_body_skips_the_formatter():
     assert response.status_code == 409
     assert response.headers["content-type"] == "application/json"
     assert response.json() == {"code": "dup"}
+
+
+@pytest.mark.parametrize("handler_kind", ["async", "sync"])
+def test_http_exception_below_400_skips_the_formatter(handler_kind, caplog):
+    """A redirect is not an error. The formatter can return only a status from 400 to 599."""
+    api = BoltAPI(error_formatter=problem_details)
+
+    @api.get("/async")
+    async def moved_async():
+        raise HTTPException(307, "Moved", headers={"Location": "/new"})
+
+    @api.get("/sync")
+    def moved_sync():
+        raise HTTPException(307, "Moved", headers={"Location": "/new"})
+
+    with caplog.at_level(logging.ERROR, logger="django_bolt"), TestClient(api) as client:
+        response = client.get(f"/{handler_kind}", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/new"
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "Moved"}
+    assert [record.getMessage() for record in caplog.records] == []
 
 
 @pytest.mark.parametrize("formatter", [None, _record], ids=["default", "formatter"])
