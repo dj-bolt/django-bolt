@@ -421,6 +421,12 @@ jobs:
       - name: Run server integration tests
         run: uv run --no-sync pytest python/tests/integration -m "server_integration and not artifact_smoke" -n auto --dist loadfile -v
 
+      # The in-process tests that need a service (`-m redis`, `-m postgres`
+      # without `server_integration`) skip in the `test` job, which has no
+      # service. They run here.
+      - name: Run in-process service tests
+        run: uv run --no-sync pytest python/tests -m "(redis or postgres) and not server_integration and not artifact_smoke" -v
+
       - name: Run bolt-mcp server integration tests
         run: uv run --no-sync pytest python/bolt-mcp/tests/integration -m "server_integration and not artifact_smoke" -v
 
