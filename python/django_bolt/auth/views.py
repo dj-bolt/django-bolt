@@ -125,6 +125,10 @@ class JWTAuthViews:
             require_jti=True,
         )
 
+        # A custom credential_validator can return a user that is not a row of
+        # the Django user model. Bolt cannot load that user from the token.
+        check_user = self.credential_validator == self._authenticate
+
         @api.post(f"{self.prefix}/login", tags=["auth"], summary="Log in")
         async def login(request: Any, credentials: LoginCredentials):
             user = await self.credential_validator(request, credentials)
@@ -157,6 +161,10 @@ class JWTAuthViews:
             summary="Refresh tokens",
         )
         async def refresh(request: Any):
+            # The default login accepts only an active Django user. Thus, refresh
+            # gives no new tokens when that user is inactive or has no row.
+            if check_user and await request.auser() is None:
+                raise HTTPException(status_code=401, detail="Invalid token")
             try:
                 pair = await rotate_refresh_token(
                     request["context"]["auth_claims"],

@@ -283,6 +283,35 @@ def test_logged_out_refresh_token_cannot_log_out_everywhere():
         assert _post_with_refresh(client, "/auth/refresh", other).status_code == 200
 
 
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("change", ["inactive", "deleted"])
+def test_default_refresh_refuses_a_user_that_cannot_log_in(change):
+    """With no ``credential_validator``, refresh gives no new tokens to an inactive or deleted user."""
+    user = get_user_model().objects.create_user("erin", password="right-password")
+    api = BoltAPI()
+    JWTAuthViews(
+        store=InMemoryRevocation(),
+        secret="a-secure-test-secret-that-is-long-enough",
+        secure_cookies=False,
+    ).register(api)
+
+    with TestClient(api) as client:
+        assert client.post("/auth/login", json={"username": "erin", "password": "right-password"}).status_code == 200
+        headers = {"Sec-Fetch-Site": "none"}
+        assert client.post("/auth/refresh", headers=headers).status_code == 200
+        old_refresh = client.cookies.get("refresh_token")
+
+        if change == "inactive":
+            get_user_model().objects.filter(pk=user.pk).update(is_active=False)
+        else:
+            user.delete()
+        refused = client.post("/auth/refresh", headers=headers)
+
+        assert refused.status_code == 401, refused.text
+        assert refused.json()["detail"] == "Invalid token"
+        assert client.cookies.get("refresh_token") == old_refresh
+
+
 @pytest.mark.parametrize("family", [{}, {"fam": ""}], ids=["no-fam", "empty-fam"])
 def test_refresh_token_without_a_family_cannot_log_out(family):
     """The refresh route rejects a token with no family. This token must not end a live session."""

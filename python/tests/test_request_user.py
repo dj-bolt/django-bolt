@@ -15,7 +15,7 @@ import jwt
 import pytest
 from django.contrib.auth.models import User
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, CurrentUser
 from django_bolt.auth import (
     APIKeyAuthentication,
     IsAuthenticated,
@@ -146,6 +146,42 @@ class TestJWTUserLoading:
 
         assert response.status_code == 200, response.text
         assert response.json() == {"username": user.username, "user_id": user.pk, "same_user": True}
+
+    @pytest.mark.django_db(transaction=True)
+    def test_token_of_an_inactive_user_gives_no_user(self):
+        """A valid token of a user with ``is_active=False`` loads no user, as Django's ``ModelBackend`` does."""
+        api = BoltAPI(django_middleware=[])
+        auth = [JWTAuthentication(secret="test-secret")]
+
+        @api.get("/sync-user", auth=auth)
+        def sync_user(request):
+            return {"user": bool(request.user)}
+
+        @api.get("/auser", auth=auth)
+        async def auser(request):
+            return {"user": await request.auser() is not None}
+
+        @api.get("/current-user", auth=auth)
+        async def current_user(user: CurrentUser):
+            return {"username": user.username}
+
+        @api.get("/no-user-read", auth=auth, guards=[IsAuthenticated()])
+        async def no_user_read():
+            return {"ok": True}
+
+        user = User.objects.create(username="inactive_jwt_user", is_active=False)
+        headers = {"Authorization": f"Bearer {create_jwt_token(user_id=str(user.pk))}"}
+        with TestClient(api) as client:
+            sync_response = client.get("/sync-user", headers=headers)
+            auser_response = client.get("/auser", headers=headers)
+            current_user_response = client.get("/current-user", headers=headers)
+            # The token is valid. A route that does not read the user does no query.
+            no_user_read_response = client.get("/no-user-read", headers=headers)
+
+        assert sync_response.json() == {"user": False}
+        assert auser_response.json() == {"user": False}
+        assert current_user_response.status_code == 401, current_user_response.text
+        assert no_user_read_response.status_code == 200
 
     @pytest.mark.django_db(transaction=True)
     def test_concurrent_auser_calls_share_one_query(self):
