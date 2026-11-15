@@ -648,3 +648,44 @@ def test_openapi_form_serializer_flattens_struct_fields():
         assert props["attachments"] == {"type": "array", "items": {"type": "string", "format": "binary"}}
 
         assert set(media["required"]) == {"username", "age", "email", "attachments", "profile_picture"}
+
+
+def test_openapi_request_body_lists_the_content_types_that_the_route_accepts():
+    """A route with a file accepts multipart only. A route with only form fields accepts both form types."""
+
+    class Report(Serializer):
+        title: str
+        pages: list[UploadFile]
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.post("/avatar")
+    async def avatar(file: Annotated[UploadFile, File()], title: Annotated[str, Form()]):
+        return {"title": title}
+
+    @api.post("/report")
+    async def report(payload: Annotated[Report, Form()]):
+        return {"title": payload.title}
+
+    @api.post("/login")
+    async def login(username: Annotated[str, Form()]):
+        return {"username": username}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        paths = client.get("/docs/openapi.json").json()["paths"]
+        content = {path: list(paths[path]["post"]["requestBody"]["content"]) for path in paths}
+
+        assert content == {
+            "/avatar": ["multipart/form-data"],
+            "/report": ["multipart/form-data"],
+            "/login": ["multipart/form-data", "application/x-www-form-urlencoded"],
+        }
+        # The document shows what the server does.
+        assert client.post("/avatar", data={"title": "a", "file": "text"}).status_code == 422
+        assert client.post("/avatar", data={"title": "a"}, files={"file": ("a.txt", b"x")}).json() == {"title": "a"}
+        assert client.post("/login", data={"username": "ann"}).json() == {"username": "ann"}
+        assert client.post("/login", data={"username": "ann"}, files={"x": ("a.txt", b"x")}).json() == {
+            "username": "ann"
+        }
