@@ -29,6 +29,8 @@ async def get_profile(user=Depends(get_current_user)):
     return {"id": user.id, "username": user.username}
 ```
 
+A dependency returns its value. Bolt has no cleanup dependencies, so a generator function (a function with `yield`) is not a dependency. Bolt binds each parameter by its name, so a dependency or a handler cannot have `*args` or `**kwargs`. Bolt raises `TypeError` for these shapes when it registers the route.
+
 ### Dependency resolution
 
 When a handler parameter is annotated with `Depends()`, Django-Bolt:

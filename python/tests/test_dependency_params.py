@@ -769,6 +769,83 @@ def test_async_dependencies_of_a_handler_run_at_the_same_time():
     assert response.json() == {"left": True, "right": True, "plain": True}
 
 
+# Bolt refuses a dependency shape that it cannot serve, at registration.
+
+
+def generator_dep():
+    yield "session"
+
+
+async def async_generator_dep():
+    yield "session"
+
+
+class GeneratorCallable:
+    def __call__(self):
+        yield "session"
+
+
+def var_positional_dep(*args) -> list:
+    return list(args)
+
+
+def var_keyword_dep(page: int = 1, **options) -> dict:
+    return {"page": page, **options}
+
+
+def wraps_generator_dep(inner=Depends(generator_dep)) -> str:
+    return inner
+
+
+def _register(dep, *, sync_handler: bool) -> None:
+    api = BoltAPI()
+    if sync_handler:
+
+        @api.get("/route")
+        def sync_route(value=Depends(dep)):
+            return {"value": value}
+
+    else:
+
+        @api.get("/route")
+        async def async_route(value=Depends(dep)):
+            return {"value": value}
+
+    with TestClient(api):
+        pass
+
+
+@pytest.mark.parametrize("sync_handler", [False, True], ids=["async-handler", "sync-handler"])
+@pytest.mark.parametrize(
+    ("dep", "message"),
+    [
+        (generator_dep, "Dependency generator_dep is a generator function. Bolt has no cleanup dependencies"),
+        (async_generator_dep, "Dependency async_generator_dep is a generator function. Bolt has no cleanup"),
+        (GeneratorCallable(), "Dependency GeneratorCallable is a generator function. Bolt has no cleanup"),
+        (wraps_generator_dep, "Dependency generator_dep is a generator function. Bolt has no cleanup dependencies"),
+        (var_positional_dep, r"Parameter '\*args' of var_positional_dep: Bolt cannot bind a \*args or \*\*kwargs"),
+        (var_keyword_dep, r"Parameter '\*\*options' of var_keyword_dep: Bolt cannot bind a \*args or \*\*kwargs"),
+    ],
+    ids=["generator", "async-generator", "generator-call", "nested-generator", "var-positional", "var-keyword"],
+)
+def test_a_dependency_shape_that_bolt_cannot_serve_is_refused_at_registration(dep, message, sync_handler):
+    with pytest.raises(TypeError, match=message):
+        _register(dep, sync_handler=sync_handler)
+
+
+def test_a_handler_with_variable_parameters_is_refused_at_registration():
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match=r"Parameter '\*\*filters' of search: Bolt cannot bind a \*args or \*\*kwargs"):
+
+        @api.get("/search")
+        async def search(q: str = "", **filters):
+            return {"q": q, **filters}
+
+        with TestClient(api):
+            pass
+
+
 # A dependency can take the request with other parameters, keyword-only
 # parameters, and a form model that holds uploads.
 

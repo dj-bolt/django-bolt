@@ -41,6 +41,7 @@ from .runtime import extract_path_params
 # store a precomputed bool instead of re-checking inspect.Parameter kinds on
 # every request (hot-path rule: no per-field kind checks at request time).
 _POSITIONAL_KINDS = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+_VARIABLE_KINDS = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
 
 
 def extract_response_metadata(response_type: Any) -> dict[str, Any]:
@@ -195,6 +196,13 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
 
     for param in params:
         name = param.name
+        if param.kind in _VARIABLE_KINDS:
+            # Bolt binds each parameter by its name. Without this check, each request got a 422.
+            owner = getattr(fn, "__name__", type(fn).__name__)
+            raise TypeError(
+                f"Parameter '{param}' of {owner}: Bolt cannot bind a *args or **kwargs parameter. "
+                "Declare each parameter by its name."
+            )
         annotation = type_hints.get(name, param.annotation)
 
         # Take the Param or Depends marker out of Annotated[T, ...] or the default. msgspec.Meta stays.
