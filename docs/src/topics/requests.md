@@ -509,6 +509,8 @@ async def secure_endpoint(headers: Annotated[AuthHeaders, Header()]):
 
 Request: `GET /secure` with headers `X-Api-Key: secret123`
 
+A `list`, `set`, `frozenset` or `tuple` field gets a sequence of one item, the value of the header. Bolt does not split the value at a comma.
+
 ### Cookie models
 
 Group cookies:

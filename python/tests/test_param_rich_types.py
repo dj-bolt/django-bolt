@@ -215,6 +215,32 @@ def test_a_sequence_header_or_cookie_gives_one_item(form_client):
     assert form_client.get("/cookie", headers={"Cookie": "tags=a"}).json() == {"value": ["a"], "type": "set"}
 
 
+class _TagHeaders(msgspec.Struct):
+    x_name: str = "none"
+    x_tags: list[str] = []
+    x_ids: set[int] | None = None
+
+
+def test_a_sequence_field_of_a_header_model_gives_one_item():
+    api = BoltAPI()
+
+    @api.get("/model")
+    async def model(headers: Annotated[_TagHeaders, Header()]):
+        return {"name": headers.x_name, "tags": headers.x_tags, "ids": _show(headers.x_ids)}
+
+    with TestClient(api) as client:
+        response = client.get("/model", headers={"X-Name": "bo", "X-Tags": "a, b", "X-Ids": "4"})
+        assert response.status_code == 200, response.text
+        # The value is one item, as for a sequence header parameter. Bolt does not split it at a comma.
+        assert response.json() == {"name": "bo", "tags": ["a, b"], "ids": {"value": [4], "type": "set"}}
+        assert client.get("/model").json() == {"name": "none", "tags": [], "ids": {"value": None, "type": "NoneType"}}
+
+        bad = client.get("/model", headers={"X-Ids": "x"})
+        assert bad.status_code == 422
+        assert bad.json()["detail"][0]["loc"] == ["header", "x-ids"]
+        assert bad.json()["detail"][0]["input"] == ["x"]
+
+
 @pytest.mark.parametrize(
     ("route", "annotation"),
     [
