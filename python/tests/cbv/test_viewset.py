@@ -334,6 +334,29 @@ def test_viewset_registration_supports_explicit_action_serializer_selection(api)
         assert response.json()["content"] == "Detail Content"
 
 
+def test_viewset_action_and_default_serializer_follow_the_current_action(api):
+    """In a request, self.action is the name of the action. get_serializer_class() uses it."""
+
+    class ArticleListSchema(Serializer):
+        id: int
+        title: str
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ViewSet):
+        serializer_class = ArticleSchema
+        list_serializer_class = ArticleListSchema
+
+        async def list(self, request) -> dict:
+            return {"action": self.action, "serializer": self.get_serializer_class().__name__}
+
+        async def retrieve(self, request, pk: int) -> dict:
+            return {"action": self.action, "serializer": self.get_serializer_class().__name__}
+
+    with TestClient(api) as client:
+        assert client.get("/articles").json() == {"action": "list", "serializer": "ArticleListSchema"}
+        assert client.get("/articles/1").json() == {"action": "retrieve", "serializer": "ArticleSchema"}
+
+
 def test_viewset_context_access_outside_request_raises():
     view = ViewSet()
 
@@ -342,6 +365,10 @@ def test_viewset_context_access_outside_request_raises():
 
     with pytest.raises(LookupError):
         _ = view.action
+
+    # get_serializer_class() needs no action. With no serializer_class, the error names the attribute.
+    with pytest.raises(ValueError, match="'ViewSet' should either include a `serializer_class` attribute"):
+        view.get_serializer_class()
 
 
 @pytest.mark.django_db(transaction=True)
