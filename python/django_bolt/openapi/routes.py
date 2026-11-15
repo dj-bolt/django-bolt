@@ -133,8 +133,6 @@ class OpenAPIRouteRegistrar:
         """Register UI plugin routes (Swagger UI, ReDoc, etc.)."""
         # Schema URL is always the full path (for the UI to fetch)
         schema_url = f"{self.api._openapi_config.path}/openapi.json"
-        guards = self.api._openapi_config.guards
-        auth = self.api._openapi_config.auth
 
         for plugin in self.api._openapi_config.render_plugins:
             for plugin_path in plugin.paths:
@@ -178,8 +176,6 @@ class OpenAPIRouteRegistrar:
             # Schema URL is always the full path (for the UI to fetch)
             schema_url = f"{self.api._openapi_config.path}/openapi.json"
             plugin = self.api._openapi_config.default_plugin
-            guards = self.api._openapi_config.guards
-            auth = self.api._openapi_config.auth
 
             # Capture plugin in closure
             def make_root_handler(p, url):
