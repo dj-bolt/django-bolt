@@ -407,7 +407,17 @@ async def list_items(): ...
 
 ### WebSocket routes
 
-A WebSocket client usually does not follow a redirect. Thus Django-Bolt removes the trailing slash of a WebSocket request path before it finds the route. A WebSocket route has no trailing slash in each mode, and `/ws` and `/ws/` both reach `@api.websocket("/ws")` or `@api.websocket("/ws/")`.
+An HTTP route answers the other form of its path with a redirect. A WebSocket client usually does not follow a redirect. Thus a WebSocket route accepts both forms of its path, in each `trailing_slash` mode:
+
+```python
+@api.websocket("/ws/room/")   # Registered as /ws/room
+async def room(websocket: WebSocket): ...
+
+# /ws/room   → connects
+# /ws/room/  → connects
+```
+
+Django-Bolt stores a WebSocket route path with no trailing slash. It removes the trailing slash of a WebSocket request path before it finds the route. `WebSocketTestClient` follows the same rule.
 
 ### Multiple APIs with different settings
 

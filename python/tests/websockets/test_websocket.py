@@ -323,15 +323,28 @@ async def test_websocket_path_param_is_url_decoded(api):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("trailing_slash", ["strip", "append", "keep"])
 @pytest.mark.parametrize("mounted", [False, True])
-@pytest.mark.parametrize("route_path", ["/ws/room", "/ws/room/"])
+@pytest.mark.parametrize("route_path", ["/ws/room", "/ws/room/", "/ws/{name}", "/ws/{name}/"])
 async def test_websocket_route_with_trailing_slash_is_reachable(trailing_slash, mounted, route_path):
-    """Test a WebSocket route answers with and without a trailing slash, for each mode of the API."""
+    """Test a WebSocket route answers with and without a trailing slash, for each mode of the API.
+
+    The server test for the same rule is
+    integration/test_websocket_trailing_slash_server_integration.py.
+    """
     api = BoltAPI(trailing_slash=trailing_slash)
 
-    @api.websocket(route_path)
-    async def room(websocket: WebSocket):
-        await websocket.accept()
-        await websocket.send_text("joined")
+    if "{name}" in route_path:
+
+        @api.websocket(route_path)
+        async def named_room(websocket: WebSocket, name: str):
+            await websocket.accept()
+            await websocket.send_text("joined" if name == "room" else name)
+
+    else:
+
+        @api.websocket(route_path)
+        async def room(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("joined")
 
     prefix = ""
     if mounted:
