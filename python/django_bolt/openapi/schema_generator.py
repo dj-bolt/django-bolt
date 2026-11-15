@@ -43,6 +43,7 @@ from .spec import (
     SecurityScheme,
     Tag,
 )
+from .spec.schema import _DEFAULT_UNSET
 
 if TYPE_CHECKING:
     from ..api import BoltAPI
@@ -132,6 +133,7 @@ _SCHEME_NAME_MAP: dict[str, str] = {
 
 
 _PATH_PARAM_RE = re.compile(r"{([^{}]+)}")
+_EMPTY_SCHEMA = Schema()
 
 
 def _extract_path_param_names(path: str) -> list[str]:
@@ -312,6 +314,28 @@ class SchemaGenerator:
         if isinstance(schema, Schema):
             return replace(schema, default=default)
         return Schema(all_of=[schema], default=default)
+
+    @classmethod
+    def _model_field_schema(cls, schema: Schema | Reference) -> Schema | Reference:
+        """The schema of one field of a parameter model or of a form model.
+
+        A query, header, cookie or form value cannot be null, and ``required: false``
+        says that the field is optional. Thus ``T | None`` gives the schema of ``T``,
+        as it does for a parameter with no model. A ``None`` default goes away with
+        the null arm, because it is not valid for ``T``. A union of two types or
+        more keeps each arm, as ``_typing_to_schema`` keeps them.
+        """
+        if not isinstance(schema, Schema) or not schema.any_of:
+            return schema
+        arms = [arm for arm in schema.any_of if not (isinstance(arm, Schema) and arm.type == "null")]
+        if len(arms) != 1 or len(arms) == len(schema.any_of):
+            return schema
+        # The union schema holds only its arms and the default of the field.
+        if replace(schema, any_of=None, default=_DEFAULT_UNSET) != _EMPTY_SCHEMA:
+            return schema
+        if schema.default is None or schema.default is _DEFAULT_UNSET:
+            return arms[0]
+        return cls._with_default(arms[0], schema.default)
 
     def _form_field_schema(self, annotation: Any, marker: Any, default: Any) -> Schema | Reference:
         """The schema of one form field, with the description and the default of its marker."""
@@ -895,7 +919,7 @@ class SchemaGenerator:
                             name=field_name,
                             param_in="query",
                             required=field_required,
-                            schema=field_schema,
+                            schema=self._model_field_schema(field_schema),
                             description=f"Parameter {field_name}",
                         )
                     )
@@ -990,7 +1014,7 @@ class SchemaGenerator:
                             sub_name, sub_schema, sub_required = self._msgspec_field_schema(
                                 struct_field, register_component=False
                             )
-                            properties[sub_name] = sub_schema
+                            properties[sub_name] = self._model_field_schema(sub_schema)
                             if sub_required:
                                 required.append(sub_name)
                         continue
