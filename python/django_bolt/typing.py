@@ -475,7 +475,7 @@ class FieldDefinition:
     """Alternative name for the parameter (e.g., 'user-id' for 'user_id')"""
 
     embed: bool | None = None
-    """For body params: whether to embed in a wrapper object"""
+    """For body params: True reads the value from the key of the alias or the name in a JSON object"""
 
     dependency: Any = None
     """Depends marker for dependency injection"""
