@@ -3532,9 +3532,8 @@ class BoltAPI:
             # pragma: no mutate end
         revoked = await handler(jti, claims) if takes_claims else await handler(jti)
         if revoked:
-            raise HTTPException(
-                status_code=401, detail="Token has been revoked", headers={"WWW-Authenticate": "Bearer"}
-            )
+            # Rust adds the challenge of the auth backends of the route to this 401.
+            raise HTTPException(status_code=401, detail="Token has been revoked")
 
     async def _websocket_token_revoked(
         self,
