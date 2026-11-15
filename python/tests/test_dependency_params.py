@@ -789,6 +789,26 @@ async def async_keyword_only(*, page: Annotated[int, Query()] = 1, theme: Annota
     return {"page": page, "theme": theme}
 
 
+def sync_positional_only(
+    page: Annotated[int, Query()] = 1,
+    ticket: int = Depends(sync_ticket),
+    /,
+    *,
+    theme: Annotated[str, Cookie()] = "light",
+) -> dict:
+    return {"page": page, "has_ticket": ticket > 0, "theme": theme}
+
+
+async def async_positional_only(
+    page: Annotated[int, Query()] = 1,
+    ticket: int = Depends(async_ticket),
+    /,
+    *,
+    theme: Annotated[str, Cookie()] = "light",
+) -> dict:
+    return {"page": page, "has_ticket": ticket > 0, "theme": theme}
+
+
 class UploadForm(msgspec.Struct):
     title: str
     upload: UploadFile
@@ -822,6 +842,14 @@ def argument_client():
     def sync_keyword_route(values=Depends(sync_keyword_only)):
         return values
 
+    @api.get("/async/positional-only")
+    async def async_positional_route(values=Depends(async_positional_only)):
+        return values
+
+    @api.get("/sync/positional-only")
+    def sync_positional_route(values=Depends(sync_positional_only)):
+        return values
+
     @api.post("/async/upload-form")
     async def async_upload_form_route(values=Depends(async_upload_form)):
         return values
@@ -847,6 +875,15 @@ def test_a_dependency_gets_its_keyword_only_parameters(argument_client, mode):
     assert response.status_code == 200, response.text
     assert response.json() == {"page": 5, "theme": "dark"}
     assert argument_client.get(f"/{mode}/keyword-only").json() == {"page": 1, "theme": "light"}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_gets_its_positional_only_parameters(argument_client, mode):
+    """A positional-only parameter cannot go by keyword. A nested dependency in that position goes in order too."""
+    response = argument_client.get(f"/{mode}/positional-only?page=5", headers={"Cookie": "theme=dark"})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"page": 5, "has_ticket": True, "theme": "dark"}
+    assert argument_client.get(f"/{mode}/positional-only").json() == {"page": 1, "has_ticket": True, "theme": "light"}
 
 
 @pytest.mark.parametrize("mode", MODES)
