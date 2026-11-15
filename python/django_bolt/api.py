@@ -582,6 +582,14 @@ def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: s
     return new_message
 
 
+class _ErrorResponseFailure(Exception):
+    """Bolt met ``error`` while it built an error response inside the middleware chain."""
+
+    def __init__(self, error: Exception):
+        super().__init__(error)
+        self.error = error
+
+
 def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: bytes) -> ResponseWireV1:
     """Convert error-handler parts into ResponseWireV1."""
 
@@ -3328,6 +3336,33 @@ class BoltAPI:
             self._log_error_response_failure(request, error)
             raise
 
+    def _chain_error_response(
+        self, handler: Callable, meta: dict[str, Any], error: Exception, request: Any
+    ) -> MiddlewareResponse:
+        """Return the error response for an exception that reaches a Django middleware.
+
+        Django makes the error response inside the middleware chain. The result
+        is the response that ``_dispatch`` makes for the same exception.
+        """
+        if isinstance(error, _ErrorResponseFailure):
+            # An inner Django middleware got no error response. Do not try again.
+            raise error
+        try:
+            if isinstance(error, HTTPException):
+                wire = self._handle_http_exception(error, request)
+            else:
+                if isinstance(error, LaneAffinityError):
+                    handler_id = next(key for key, value in self._handler_meta.items() if value is meta)
+                    self._describe_lane_affinity_error(error, handler, handler_id)
+                # A handler that ran the ORM inline on this thread may have left
+                # a dead connection behind; drop it so the next request reconnects.
+                _drop_broken_connections_after_error()
+                wire = self._handle_generic_exception(error, request=request)
+        except Exception as failure:
+            # Bolt logged the failure. ``_dispatch`` gives it to Rust, as for a route with no middleware.
+            raise _ErrorResponseFailure(failure) from failure
+        return MiddlewareResponse.from_tuple(wire)
+
     @staticmethod
     def _is_python_middleware_spec(middleware_spec: Any) -> bool:
         """Return True for middleware entries that execute in Python."""
@@ -3546,6 +3581,8 @@ class BoltAPI:
         with self._route_executor_lock:
             cached_executor = self._route_executor_cache.get(key)  # pragma: no mutate
             if cached_executor is None:
+                # Django middleware calls this for an exception of the handler.
+                meta["_chain_error_response"] = functools.partial(self._chain_error_response, handler, meta)
                 cached_executor = self._build_route_executor(handler, meta)
                 self._route_executor_cache[key] = cached_executor
 
@@ -3581,8 +3618,9 @@ class BoltAPI:
 
         request_state = request.state
 
-        # Django middleware gets this view in process_view.
-        request_state["_view_func"] = meta["view_func"]
+        # Django middleware reads the view for process_view from the metadata,
+        # and the error response for an exception of the handler.
+        request_state["_route_meta"] = meta
         request_state["_bolt_route_executor"] = self._get_route_executor(handler, meta)
 
         middleware_response = await middleware_chain(request)
@@ -3695,6 +3733,8 @@ class BoltAPI:
 
         except HTTPException as he:
             return self._handle_http_exception(he, request)
+        except _ErrorResponseFailure as failure:
+            raise failure.error from None
         except Exception as e:
             if isinstance(e, LaneAffinityError):
                 self._describe_lane_affinity_error(e, handler, handler_id)
