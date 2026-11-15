@@ -1684,6 +1684,48 @@ class TestCSRFMiddleware:
             assert post_response.status_code == 200
             assert post_response.json() == {"status": "submitted"}
 
+    def test_csrf_accepts_a_token_in_a_multipart_form(self):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+
+        @api.post("/submit")
+        async def submit_route():
+            return {"status": "submitted"}
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/submit",
+                data={"csrfmiddlewaretoken": _CSRF_SECRET},
+                files={"upload": ("note.txt", b"text")},
+                headers={"Cookie": f"csrftoken={_CSRF_SECRET}"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "submitted"}
+
+    @pytest.mark.parametrize(
+        ("content_type", "body"),
+        [
+            ("multipart/form-data", b"no boundary"),
+            ("application/x-www-form-urlencoded; charset=utf-16", b"a=1"),
+        ],
+        ids=["multipart-without-boundary", "urlencoded-with-utf-16"],
+    )
+    def test_csrf_rejects_an_unreadable_form_with_a_400(self, content_type, body):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+
+        @api.post("/submit")
+        async def submit_route():
+            return {"status": "submitted"}
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/submit",
+                content=body,
+                headers={"content-type": content_type, "Cookie": f"csrftoken={_CSRF_SECRET}"},
+            )
+
+        assert response.status_code == 400
+
 
 # =============================================================================
 # Test process_view through the single wrapper and the stack
