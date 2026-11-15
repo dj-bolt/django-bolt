@@ -8,12 +8,14 @@ from a real `runbolt` server.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from django.test import override_settings
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Request, WebSocket
 from django_bolt.middleware import rate_limit
-from django_bolt.testing import TestClient
+from django_bolt.testing import AsyncTestClient, TestClient, WebSocketTestClient
 from tests.integration.apps.testclient_parity import api
 from tests.integration.parity_cases import CASES, PREFLIGHT, ParityCase
 
@@ -30,6 +32,36 @@ def test_a_static_prefix_of_slash_does_not_shadow_the_routes(tmp_path):
     static_files = {"url_prefix": "/", "directories": [str(tmp_path)]}
     with TestClient(api, static_files_config=static_files) as client:
         assert client.get("/plain").json() == {"ok": True}
+
+
+def test_a_header_value_loses_its_outer_spaces_and_tabs():
+    """An HTTP server removes the spaces and tabs around a header value (RFC 9110 section 5.5).
+
+    httpx refuses to send such a value to a real server, so this case is not in ``parity_cases``.
+    """
+    local_api = BoltAPI()
+
+    @local_api.get("/probe")
+    async def probe(request: Request):
+        return {"probe": request.headers["x-probe"]}
+
+    @local_api.websocket("/ws/probe")
+    async def ws_probe(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text(websocket.headers["x-probe"])
+
+    headers = {"X-Probe": " \t a  b\t "}
+
+    with TestClient(local_api) as client:
+        assert client.get("/probe", headers=headers).json() == {"probe": "a  b"}
+
+    async def talk() -> tuple[str, str]:
+        async with AsyncTestClient(local_api) as client:
+            response = await client.get("/probe", headers=headers)
+        async with WebSocketTestClient(local_api, "/ws/probe", headers=headers) as websocket:
+            return response.json()["probe"], await websocket.receive_text()
+
+    assert asyncio.run(talk()) == ("a  b", "a  b")
 
 
 def test_read_django_settings_false_ignores_cors_static_and_media(tmp_path):

@@ -2,11 +2,12 @@
 Tests for OpenAPI tags, summary, and description metadata.
 """
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Router
 from django_bolt.decorators import ActionHandler, action
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.openapi.spec import Tag
+from django_bolt.testing import TestClient
 from django_bolt.views import ViewSet
 from django_bolt.websocket import WebSocket
 
@@ -311,6 +312,38 @@ def test_empty_tags_not_stored():
     meta = api._handler_meta.get(handler_id, {})
     assert meta != {}
     assert meta.get("openapi_tags") is None
+
+
+def test_operation_ids_are_unique_when_function_names_repeat():
+    """Two routes with one function name still get different operationId values."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+    first = Router(prefix="/first")
+    second = Router(prefix="/second")
+
+    @first.get("/items")
+    async def list_items() -> dict:
+        return {}
+
+    @second.get("/items")
+    async def list_items() -> dict:  # noqa: F811
+        return {}
+
+    @api.get("/third")
+    async def list_items() -> dict:  # noqa: F811
+        return {}
+
+    api.include_router(first)
+    api.include_router(second)
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        document = client.get("/docs/openapi.json").json()
+
+    operation_ids = [
+        operation["operationId"] for path_item in document["paths"].values() for operation in path_item.values()
+    ]
+    assert len(operation_ids) == 3
+    assert len(set(operation_ids)) == 3
+    assert set(operation_ids) == {"get_list_items", "get_list_items_2", "get_list_items_3"}
 
 
 def test_partial_metadata_override():

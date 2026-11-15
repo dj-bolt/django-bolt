@@ -13,9 +13,9 @@ from typing import Annotated
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, UploadFile
 from django_bolt.middleware import ErrorHandlerMiddleware
-from django_bolt.params import Cookie, Form, Header, Path, Query
+from django_bolt.params import Cookie, File, Form, Header, Path, Query
 from django_bolt.testing import TestClient
 
 
@@ -102,6 +102,58 @@ def test_missing_renamed_field_uses_its_wire_name():
 
     assert response.status_code == 422
     assert response.json()["detail"] == [_missing("query", "query parameter", "pageNumber")]
+
+
+class Closed(msgspec.Struct, forbid_unknown_fields=True):
+    page: int = 1
+
+
+class ClosedUpload(msgspec.Struct, forbid_unknown_fields=True):
+    title: str
+    cover: UploadFile | None = None
+
+
+def test_a_struct_that_forbids_unknown_fields_ignores_the_keys_of_other_parameters():
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(filters: Annotated[Closed, Query()], limit: Annotated[int, Query(alias="max")] = 0):
+        return {"page": filters.page, "limit": limit}
+
+    @api.get("/cookie")
+    async def cookie(filters: Annotated[Closed, Cookie()], token: Annotated[str, Cookie()] = ""):
+        return {"page": filters.page, "token": token}
+
+    @api.post("/form")
+    async def form(
+        filters: Annotated[Closed, Form()],
+        note: Annotated[str, Form()] = "",
+        doc: Annotated[UploadFile | None, File()] = None,
+    ):
+        return {"page": filters.page, "note": note, "doc": doc.filename if doc else None}
+
+    @api.post("/upload")
+    async def upload(doc: Annotated[UploadFile, File()], data: Annotated[ClosedUpload, Form()]):
+        return {"doc": doc.filename, "title": data.title, "cover": data.cover.filename if data.cover else None}
+
+    with TestClient(api) as client:
+        assert client.get("/query?page=2&max=5").json() == {"page": 2, "limit": 5}
+        assert client.get("/cookie", headers={"Cookie": "page=2; token=t"}).json() == {"page": 2, "token": "t"}
+        response = client.post("/form", data={"page": "2", "note": "n"}, files={"doc": ("a.txt", b"a")})
+        assert response.json() == {"page": 2, "note": "n", "doc": "a.txt"}
+        files = {"doc": ("a.txt", b"a"), "cover": ("b.png", b"b")}
+        response = client.post("/upload", data={"title": "t"}, files=files)
+        assert response.json() == {"doc": "a.txt", "title": "t", "cover": "b.png"}
+
+        # A key that no parameter declares is still an error. The error names the source.
+        unknown = client.get("/query?page=2&max=5&other=1")
+        assert unknown.status_code == 422
+        assert unknown.json()["detail"] == [
+            {"type": "unknown_field", "loc": ["query", "other"], "msg": "Unknown query parameter: other", "input": "1"}
+        ]
+        unknown = client.post("/form", data={"page": "2", "other": "1"})
+        assert unknown.status_code == 422
+        assert unknown.json()["detail"][0]["loc"] == ["body", "other"]
 
 
 def test_missing_header_struct_field_names_the_header(client):
