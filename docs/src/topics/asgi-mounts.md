@@ -139,7 +139,7 @@ Use `clear_root_path=True` when the mounted Django app's URL patterns already in
 
 `runbolt` mounts the Django admin at the prefix of the admin site in your URLconf. You do not call `mount_django()` for it.
 
-An admin site in `i18n_patterns()` has one prefix for each language of `settings.LANGUAGES`, for example `/en/admin` and `/fr/admin`. `runbolt` mounts each of them. It also mounts the path with no language, `/admin`. Django's `LocaleMiddleware` redirects that path to the prefix of a language. With `prefix_default_language=False`, the default language has no prefix. Set `LANGUAGES` to the languages that you use: the default of Django has about 100 languages, and each gets a mount.
+An admin site in `i18n_patterns()` has one prefix for each language of `settings.LANGUAGES`, for example `/en/admin` and `/fr/admin`. `runbolt` mounts each of them. It also mounts the path with no language, `/admin`. Django's `LocaleMiddleware` redirects that path to the prefix of a language. With `prefix_default_language=False`, the default language has no prefix. The default language is the variant of `LANGUAGE_CODE` that `LANGUAGES` has: for `"en-us"` with only `"en"` in `LANGUAGES`, the prefix is `/en/admin`, as in Django. Set `LANGUAGES` to the languages that you use: the default of Django has about 100 languages, and each gets a mount.
 
 A prefix with a path parameter, such as `path("<tenant>/admin/", admin.site.urls)`, is not a static path. `runbolt` cannot mount the admin there and prints a warning. To serve it, give Django each path that has no Bolt route:
 

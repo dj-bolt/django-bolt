@@ -4,6 +4,7 @@ Utilities for detecting and configuring Django admin integration.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 
@@ -86,6 +87,10 @@ def detect_admin_url_prefixes() -> list[str] | None:
     The list then also has the prefix with no language, ``"admin"``. Django's
     ``LocaleMiddleware`` redirects that path to the prefix of a language.
 
+    The default language is the variant of ``settings.LANGUAGE_CODE`` that
+    ``settings.LANGUAGES`` has, as in ``LocaleMiddleware``. For ``"en-us"``
+    with only ``"en"`` in ``LANGUAGES``, the first prefix is ``"en/admin"``.
+
     Returns:
         The prefixes with no slash at their ends. The prefix of the default
         language is first. ``None`` when the admin is not installed.
@@ -98,10 +103,17 @@ def detect_admin_url_prefixes() -> list[str] | None:
         return ["admin"]
 
     script_prefix = get_script_prefix()
-    i18n_patterns_used, _ = is_language_prefix_patterns_used(urlconf)
+    i18n_patterns_used, prefix_default_language = is_language_prefix_patterns_used(urlconf)
     # The default language is first. Without i18n_patterns(), each language has the same prefix.
     codes = [settings.LANGUAGE_CODE]
     if i18n_patterns_used:
+        if prefix_default_language:
+            # LANGUAGE_CODE can be a variant that LANGUAGES does not have, such as
+            # "en-us" with only "en". Django then serves the default language at
+            # the prefix of the variant that LANGUAGES has, and answers 404 at
+            # the prefix of LANGUAGE_CODE.
+            with contextlib.suppress(LookupError):
+                codes = [translation.get_supported_language_variant(settings.LANGUAGE_CODE)]
         codes += [code for code, _name in settings.LANGUAGES]
 
     prefixes: list[str] = []

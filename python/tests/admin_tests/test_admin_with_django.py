@@ -6,6 +6,7 @@ These tests configure Django properly and validate admin via ASGI mounts.
 
 import pytest
 
+from django_bolt.admin.admin_detection import detect_admin_url_prefix, detect_admin_url_prefixes
 from django_bolt.api import BoltAPI
 from django_bolt.testing import TestClient
 
@@ -140,6 +141,46 @@ def test_admin_in_i18n_patterns_with_no_prefix_for_the_default_language(settings
     assert '<html lang="en"' in english.text
     assert french.status_code == 200
     assert '<html lang="fr"' in french.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_in_i18n_patterns_uses_the_default_language_that_django_serves(settings):
+    """With LANGUAGE_CODE "en-us" and no "en-us" in LANGUAGES, Django serves the default language at /en/."""
+    _use_two_languages(settings, "tests.admin_tests.urls_i18n")
+    settings.LANGUAGE_CODE = "en-us"
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        # runbolt shows the first prefix in its banner.
+        banner = client.get(f"/{detect_admin_url_prefix()}/login/")
+        no_prefix = client.get("/admin/login/", follow_redirects=False)
+        default_code = client.get("/en-us/admin/login/")
+
+    assert banner.status_code == 200
+    assert '<html lang="en"' in banner.text
+    assert no_prefix.status_code == 302
+    assert no_prefix.headers["location"] == "/en/admin/login/"
+    # Django has no page at the prefix of LANGUAGE_CODE.
+    assert default_code.status_code == 404
+    assert detect_admin_url_prefixes() == ["en/admin", "admin", "fr/admin"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_in_i18n_patterns_with_no_prefix_keeps_the_path_of_language_code(settings):
+    """With prefix_default_language=False, Django serves LANGUAGE_CODE "en-us" at the path with no prefix."""
+    _use_two_languages(settings, "tests.admin_tests.urls_i18n_no_default_prefix")
+    settings.LANGUAGE_CODE = "en-us"
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    assert detect_admin_url_prefixes() == ["admin", "en/admin", "fr/admin"]
+    with TestClient(api, use_http_layer=True) as client:
+        banner = client.get(f"/{detect_admin_url_prefix()}/login/")
+        english = client.get("/en/admin/login/")
+
+    assert banner.status_code == 200
+    assert english.status_code == 200
 
 
 def test_admin_behind_a_path_parameter_prints_a_warning(settings, capsys):
