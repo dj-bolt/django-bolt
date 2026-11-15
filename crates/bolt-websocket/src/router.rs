@@ -83,7 +83,8 @@ impl WebSocketRouter {
     ///
     /// The values are URL-decoded with the same code as for HTTP routes, so
     /// `/ws/rooms/hello%20world` gives `hello world`. The server and the test
-    /// backend both use this lookup.
+    /// backend both use this lookup. `path` is the request path in the form of
+    /// `normalize_request_path`.
     pub fn find(&self, path: &str) -> Option<(&WebSocketRoute, AHashMap<String, String>)> {
         // O(1) static route lookup first
         if let Some(route) = self.static_routes.get(path) {
@@ -160,6 +161,25 @@ mod tests {
             Some((2, "/ws/plain".to_string(), vec![]))
         );
         assert_eq!(found("/ws/\u{fc} b"), None);
+    }
+
+    #[test]
+    fn a_request_path_matches_for_each_form_of_an_escape() {
+        let router = router_with(&["/ws/\u{fc}", "/ws/a:b/{room}"]);
+        let found = |path: &str| {
+            let path = bolt_core::router::normalize_request_path(path);
+            router
+                .find(&path)
+                .map(|(route, params)| (route.handler_id, params.get("room").cloned()))
+        };
+        assert_eq!(found("/ws/%c3%bc"), Some((0, None)));
+        assert_eq!(found("/ws/%C3%bC"), Some((0, None)));
+        assert_eq!(
+            found("/ws/%61%3ab/x%2fy"),
+            Some((1, Some("x/y".to_string())))
+        );
+        // An escaped `/` is data of one segment.
+        assert_eq!(found("/ws/a:b%2Fx"), None);
     }
 
     #[test]
