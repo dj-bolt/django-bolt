@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from html import escape
 from typing import TYPE_CHECKING, Any
 
 from .. import _json
@@ -65,6 +66,23 @@ class OpenAPIRenderPlugin(ABC):
             The rendered JSON as string.
         """
         return _json.encode(openapi_schema).decode("utf-8")
+
+    @staticmethod
+    def render_script_json(value: Any) -> str:
+        """Render a value as JSON for a ``<script>`` element of an HTML page.
+
+        The JSON has no ``<``, ``>`` or ``&``. Thus a text such as ``</script>``
+        in a description does not end the script. JavaScript reads the escapes
+        back to the same text.
+
+        Args:
+            value: The value to encode.
+
+        Returns:
+            The JSON as string.
+        """
+        text = _json.encode(value).decode("utf-8")
+        return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
     @abstractmethod
     def render(self, openapi_schema: dict[str, Any], schema_url: str) -> str | dict[str, Any]:
@@ -172,7 +190,7 @@ class SwaggerRenderPlugin(OpenAPIRenderPlugin):
         """Render Swagger UI HTML page."""
         head = f"""
           <head>
-            <title>{openapi_schema["info"]["title"]}</title>
+            <title>{escape(openapi_schema["info"]["title"])}</title>
             {self.favicon}
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -188,7 +206,7 @@ class SwaggerRenderPlugin(OpenAPIRenderPlugin):
               <div id='swagger-container'/>
                 <script type='text/javascript'>
                 const ui = SwaggerUIBundle({{
-                  spec: {self.render_json(openapi_schema)},
+                  spec: {self.render_script_json(openapi_schema)},
                   dom_id: '#swagger-container',
                   deepLinking: true,
                   showExtensions: true,
@@ -235,7 +253,7 @@ class RedocRenderPlugin(OpenAPIRenderPlugin):
         """Render Redoc HTML page."""
         head = f"""
           <head>
-            <title>{openapi_schema["info"]["title"]}</title>
+            <title>{escape(openapi_schema["info"]["title"])}</title>
             {self.favicon}
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -252,7 +270,7 @@ class RedocRenderPlugin(OpenAPIRenderPlugin):
           </head>
         """
 
-        body = f"<body><div id='redoc-container'/><script type='text/javascript'>Redoc.init({self.render_json(openapi_schema)},undefined,document.getElementById('redoc-container'))</script></body>"
+        body = f"<body><div id='redoc-container'/><script type='text/javascript'>Redoc.init({self.render_script_json(openapi_schema)},undefined,document.getElementById('redoc-container'))</script></body>"
 
         return f"<!DOCTYPE html><html>{head}{body}</html>"
 
@@ -293,7 +311,7 @@ class ScalarRenderPlugin(OpenAPIRenderPlugin):
         """Render Scalar HTML page."""
         head = f"""
                   <head>
-                    <title>{openapi_schema["info"]["title"]}</title>
+                    <title>{escape(openapi_schema["info"]["title"])}</title>
                     {self.style}
                     <meta charset="utf-8"/>
                     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -306,7 +324,7 @@ class ScalarRenderPlugin(OpenAPIRenderPlugin):
         if self.options:
             options_script = f"""
                 <script>
-                  document.getElementById('api-reference').dataset.configuration = '{__import__("django_bolt")._json.encode(self.options).decode()}'
+                  document.getElementById('api-reference').dataset.configuration = JSON.stringify({self.render_script_json(self.options)})
                 </script>
                 """
 
@@ -359,7 +377,7 @@ class RapidocRenderPlugin(OpenAPIRenderPlugin):
         """Render Rapidoc HTML page."""
         head = f"""
           <head>
-            <title>{openapi_schema["info"]["title"]}</title>
+            <title>{escape(openapi_schema["info"]["title"])}</title>
             {self.favicon}
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -422,7 +440,7 @@ class StoplightRenderPlugin(OpenAPIRenderPlugin):
         """
         head = f"""
           <head>
-            <title>{openapi_schema["info"]["title"]}</title>
+            <title>{escape(openapi_schema["info"]["title"])}</title>
             {self.favicon}
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
