@@ -670,6 +670,11 @@ def _log_formatted_error(error: BoltError) -> None:
         _log_server_error(error.exception)
 
 
+def _skips_formatter(exc: HTTPException) -> bool:
+    """Whether the default response of ``exc`` goes to the client with no call of the formatter."""
+    return exc.body is not None or exc.status_code < 400
+
+
 def handle_exception_with_formatter(
     formatter: ErrorFormatter | None,
     exc: Exception,
@@ -678,8 +683,10 @@ def handle_exception_with_formatter(
     """Handle an exception with the formatter, or with ``handle_exception`` when there is none.
 
     An HTTPException with a typed body skips the formatter. The handler chose that body.
+    An HTTPException with a status below 400, such as a redirect, also skips it.
+    That response is not an error.
     """
-    if isinstance(exc, HTTPException) and exc.body is not None:
+    if isinstance(exc, HTTPException) and _skips_formatter(exc):
         return http_exception_handler(exc)
     if formatter is not None:
         error = bolt_error_from_exception(exc)
@@ -708,10 +715,10 @@ def render_core_error(
     comes from the exception, as for an error in ``_dispatch``. ``reason`` tells
     the cause of a Rust 500 for the log. The formatter does not get it. The
     result is None when the formatter fails, or for an HTTPException with a
-    typed body. Then Rust sends its default response.
+    typed body or a status below 400. Then Rust sends its default response.
     """
     if exception is not None:
-        if isinstance(exception, HTTPException) and exception.body is not None:
+        if isinstance(exception, HTTPException) and _skips_formatter(exception):
             return None
         error = bolt_error_from_exception(exception)
     else:
