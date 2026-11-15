@@ -819,6 +819,29 @@ def test_typed_http_exception_body_skips_the_formatter():
     assert response.json() == {"code": "dup"}
 
 
+@pytest.mark.parametrize("handler_kind", ["async", "sync"])
+def test_http_exception_below_400_skips_the_formatter(handler_kind, caplog):
+    """A redirect is not an error. The formatter can return only a status from 400 to 599."""
+    api = BoltAPI(error_formatter=problem_details)
+
+    @api.get("/async")
+    async def moved_async():
+        raise HTTPException(307, "Moved", headers={"Location": "/new"})
+
+    @api.get("/sync")
+    def moved_sync():
+        raise HTTPException(307, "Moved", headers={"Location": "/new"})
+
+    with caplog.at_level(logging.ERROR, logger="django_bolt"), TestClient(api) as client:
+        response = client.get(f"/{handler_kind}", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/new"
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "Moved"}
+    assert [record.getMessage() for record in caplog.records] == []
+
+
 @pytest.mark.parametrize("formatter", [None, _record], ids=["default", "formatter"])
 def test_http_exception_500_is_not_logged_as_a_server_error(formatter, caplog):
     """An HTTPException is a planned response. Bolt logs it with a formatter as without one."""
