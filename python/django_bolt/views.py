@@ -667,9 +667,11 @@ class PartialUpdateMixin(_ViewSet):
         if not patch_data:
             return obj
 
+        # model_validate() reads the wire names, so the merged data uses them.
         current_state = await serializer_class.afrom_model(obj)
-        merged_data = current_state.to_dict()
-        merged_data.update(patch_data)
+        merged_data = {rename_map.get(name, name): value for name, value in current_state.to_dict().items()}
+        for field_name, value in patch_data.items():
+            merged_data[rename_map.get(field_name, field_name)] = value
         validated_obj = serializer_class.model_validate(merged_data)
 
         # Apply only the patched fields, but use the validated values.
