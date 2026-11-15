@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import msgspec
 import pytest
 
 from django_bolt.serializers import (
@@ -34,6 +35,41 @@ class TestFieldFunction:
         assert "id" in result
         assert "name" in result
         assert "internal_id" not in result
+
+    def test_field_default_default_factory_and_exclude(self):
+        """field() gives the default of a field, and exclude=True keeps the field out of dump()."""
+
+        class Member(Serializer):
+            name: str
+            internal: str = field(exclude=True, default="x")
+            role: str = field(default="user")
+            tags: list[str] = field(default_factory=list)
+
+        first, second = Member(name="a"), Member(name="b")
+
+        assert (first.role, first.tags, first.internal) == ("user", [], "x")
+        assert first.tags is not second.tags
+        assert first.dump() == {"name": "a", "role": "user", "tags": []}
+        assert Member.dump_many([first]) == [{"name": "a", "role": "user", "tags": []}]
+
+    def test_write_only_field_is_dropped_and_the_fields_after_it_stay(self):
+        """A write-only field does not hide the fields that follow it, also in a subset."""
+
+        class Account(Serializer):
+            id: int
+            password: str = field(write_only=True)
+            token: str
+            email: str
+
+            class Config:
+                write_only = {"token"}
+
+        account = Account(id=1, password="p", token="t", email="a@example.com")
+        public = {"id": 1, "email": "a@example.com"}
+
+        assert account.dump() == public
+        assert Account.dump_many([account]) == [public]
+        assert Account.subset("id", "token", "email")(id=1, token="t", email="a@example.com").dump() == public
 
     def test_field_write_only_meta(self):
         """Test write_only fields via Meta class."""
@@ -363,6 +399,61 @@ class TestDumpMethods:
             "authors": ["me"],
         }
 
+    @pytest.mark.parametrize(
+        ("option", "expected_tag", "expected_post"),
+        [
+            (
+                {"exclude_none": True},
+                {"name": "a", "weight": 1},
+                {"title": "untitled", "size": 1},
+            ),
+            (
+                {"exclude_defaults": True},
+                {"name": "a"},
+                {"parent": None, "subtitle": None, "size": 1},
+            ),
+            (
+                {"by_alias": True},
+                {"name": "a", "note": None, "w": 1},
+                {"note": None, "t": "untitled", "parent": None, "subtitle": None, "size": 1},
+            ),
+        ],
+    )
+    def test_dump_option_applies_to_nested_serializers_dump_many_and_views(self, option, expected_tag, expected_post):
+        """Each path of dump() gives the same output for an option, at each level."""
+
+        class Tag(Serializer):
+            name: str
+            note: str | None = None
+            weight: int = field(alias="w", default=1)
+
+        class Post(Serializer):
+            note: str | None = None
+            title: str = field(alias="t", default="untitled")
+            parent: int | None
+            tag: Tag
+            tags: list[Tag]
+
+            @computed_field
+            def subtitle(self) -> str | None:
+                return None
+
+            @computed_field
+            def size(self) -> int:
+                return len(self.tags)
+
+        tag = Tag(name="a")
+        post = Post(parent=None, tag={"name": "a"}, tags=[{"name": "a"}])
+        expected = {"tag": expected_tag, "tags": [expected_tag], **expected_post}
+
+        assert tag.dump(**option) == expected_tag
+        assert Tag.dump_many([tag], **option) == [expected_tag]
+        assert post.dump(**option) == expected
+        assert Post.dump_many((item for item in [post]), **option) == [expected]
+        view = Post.exclude("unknown")
+        assert view.dump(post, **option) == expected
+        assert view.dump_many([post], **option) == [expected]
+
     def test_dump_json(self):
         """Test dump_json method."""
 
@@ -431,6 +522,43 @@ class TestSerializerView:
         # Dump respects field selection
         result = view.dump(user)
         assert result == {"id": 1, "name": "John"}
+
+
+class _ViewItem(Serializer):
+    id: int
+    name: str | None = None
+    note: str = "n"
+    nick: str = field(alias="nickName", default="x")
+
+
+class TestSerializerViewApi:
+    """SerializerView chaining and JSON output, and Serializer.validate."""
+
+    def test_only_on_a_view_narrows_it_and_keeps_exclusions(self):
+        item = _ViewItem(id=1, name="a", note="b", nick="c")
+        narrowed = _ViewItem.only("id", "name", "note").only("name", "note", "nick")
+        assert narrowed.dump(item) == {"name": "a", "note": "b"}
+        assert _ViewItem.exclude("note").only("id", "note", "name").dump(item) == {"id": 1, "name": "a"}
+
+    def test_view_dump_json_forwards_each_option(self):
+        view = _ViewItem.exclude("note")
+        item = _ViewItem(id=1, nick="y")
+        assert view.dump_json(item) == b'{"id":1,"name":null,"nick":"y"}'
+        assert view.dump_json(item, exclude_none=True) == b'{"id":1,"nick":"y"}'
+        assert view.dump_json(item, exclude_defaults=True) == b'{"id":1,"nick":"y"}'
+        assert view.dump_json(item, by_alias=True) == b'{"id":1,"name":null,"nickName":"y"}'
+        assert view.dump_many_json([item]) == b'[{"id":1,"name":null,"nick":"y"}]'
+        assert view.dump_many_json([item], exclude_none=True) == b'[{"id":1,"nick":"y"}]'
+        assert view.dump_many_json([item], exclude_defaults=True) == b'[{"id":1,"nick":"y"}]'
+        assert view.dump_many_json([item], by_alias=True) == b'[{"id":1,"name":null,"nickName":"y"}]'
+
+    def test_validate_returns_a_new_instance_or_raises(self):
+        item = _ViewItem(id=1, name="a")
+        checked = item.validate()
+        assert checked == item
+        assert checked is not item
+        with pytest.raises(msgspec.ValidationError):
+            _ViewItem(id="not-int").validate()
 
 
 class TestComplexScenarios:
@@ -609,6 +737,24 @@ class TestSubsetMethod:
         assert user.id == 1
         assert user.name == "John"
         assert user.role == "user"
+
+    def test_subset_keeps_the_struct_options_of_the_parent(self):
+        """A subset has the rename, omit_defaults, forbid_unknown_fields and frozen options of its parent."""
+
+        class Account(Serializer, rename="camel", omit_defaults=True, forbid_unknown_fields=True, frozen=True):
+            user_name: str
+            display_name: str = ""
+            email_address: str = ""
+
+        AccountMini = Account.subset("user_name", "display_name")
+        mini = AccountMini.model_validate({"userName": "ada", "displayName": "Ada"})
+
+        assert mini.dump() == {"userName": "ada", "displayName": "Ada"}
+        assert msgspec.json.encode(AccountMini(user_name="ada")) == b'{"userName":"ada"}'
+        with pytest.raises(msgspec.ValidationError, match="unknown field `emailAddress`"):
+            msgspec.convert({"userName": "ada", "emailAddress": "a@example.com"}, AccountMini)
+        with pytest.raises(AttributeError):
+            mini.user_name = "bob"
 
     def test_subset_with_computed_field(self):
         """Test subset includes computed fields."""
