@@ -27,7 +27,13 @@ from django_bolt.auth import (
     SessionAuthentication,
 )
 from django_bolt.datastructures import UploadFile
-from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, SwaggerRenderPlugin
+from django_bolt.openapi import (
+    OpenAPIConfig,
+    RapidocRenderPlugin,
+    RedocRenderPlugin,
+    StoplightRenderPlugin,
+    SwaggerRenderPlugin,
+)
 from django_bolt.openapi.spec import (
     Components,
     Contact,
@@ -40,6 +46,7 @@ from django_bolt.openapi.spec import (
 from django_bolt.params import File, Form
 from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
+from django_bolt.websocket.types import WebSocket
 
 
 class Item(msgspec.Struct):
@@ -93,6 +100,35 @@ def test_openapi_json_endpoint():
         # Verify our routes are in the schema
         assert "/items/{item_id}" in data["paths"]
         assert "/items" in data["paths"]
+
+
+@pytest.mark.parametrize(
+    ("names", "title"),
+    [
+        ({"PROJECT_NAME": "Shop", "SITE_NAME": "Site"}, "Shop"),
+        ({"SITE_NAME": "Site"}, "Site"),
+        ({}, "API"),
+    ],
+    ids=["project-name", "site-name", "no-name"],
+)
+def test_default_openapi_config_takes_the_title_from_the_settings(settings, names, title):
+    """With no ``openapi_config``, the title is PROJECT_NAME, then SITE_NAME, then "API"."""
+    for name, value in names.items():
+        setattr(settings, name, value)
+
+    api = BoltAPI()
+
+    @api.get("/items")
+    async def items():
+        return []
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get("/docs/openapi.json")
+
+    assert response.status_code == 200
+    assert response.json()["info"] == {"title": title, "version": "1.0.0"}
 
 
 def test_swagger_ui_endpoint():
@@ -153,6 +189,50 @@ def test_redoc_endpoint_uses_available_bundle(options, expected_url):
     assert f'<script src="{expected_url}" crossorigin></script>' in response.text
     assert "Redoc.init(" in response.text
     assert '"/items"' in response.text
+
+
+@pytest.mark.parametrize(
+    ("plugin", "url", "expected_parts"),
+    [
+        (
+            RapidocRenderPlugin(),
+            "/docs/rapidoc",
+            [
+                "<title>Docs UI API</title>",
+                '<script src="https://unpkg.com/rapidoc@9.3.4/dist/rapidoc-min.js" crossorigin></script>',
+                '<rapi-doc spec-url="/docs/openapi.json" />',
+            ],
+        ),
+        (
+            StoplightRenderPlugin(),
+            "/docs/elements",
+            [
+                "<title>Docs UI API</title>",
+                '<link rel="stylesheet" href="https://unpkg.com/@stoplight/elements@7.7.18/styles.min.css">',
+                '<script src="https://unpkg.com/@stoplight/elements@7.7.18/web-components.min.js" crossorigin></script>',
+                'apiDescriptionUrl="/docs/openapi.json"',
+                'router="hash"',
+                'layout="sidebar"',
+            ],
+        ),
+    ],
+)
+def test_rapidoc_and_stoplight_endpoints_render_the_page(plugin, url, expected_parts):
+    """Each UI page names the API title, its bundle and the schema URL."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Docs UI API", version="1.0.0", render_plugins=[plugin]))
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.text.lstrip().startswith("<!DOCTYPE html>")
+    for part in expected_parts:
+        assert part in response.text
+    assert plugin.favicon in response.text
+    assert plugin.style in response.text
+    assert '<meta charset="utf-8"/>' in response.text
+    assert 'name="viewport"' in response.text
 
 
 def test_swagger_ui_supports_openapi_3_2_query_specs():
@@ -292,6 +372,34 @@ def test_openapi_disabled_returns_404():
 
         response = client.get("/docs")
         assert response.status_code == 404, f"Disabled docs UI should return 404, got {response.status_code}"
+
+
+def test_openapi_exclude_paths_match_whole_path_segments():
+    """`/admin` hides `/admin` and `/admin/users`. It does not hide `/administrators`."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0", exclude_paths=["/admin", "/ws"]))
+
+    async def handler():
+        return {}
+
+    for path in ("/admin", "/admin/users", "/administrators", "/docs-archive", "/visible"):
+        api.get(path)(handler)
+
+    @api.websocket("/ws/internal")
+    async def internal_socket(websocket: WebSocket):
+        await websocket.accept()
+
+    @api.websocket("/wsx")
+    async def public_socket(websocket: WebSocket):
+        await websocket.accept()
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        paths = client.get("/docs/openapi.json").json()["paths"]
+        # The routes are not documented, but the server serves them.
+        assert client.get("/admin/users").status_code == 200
+
+    assert sorted(paths) == ["/administrators", "/docs-archive", "/visible", "/wsx"]
 
 
 def test_openapi_protected_without_auth_returns_401():
@@ -681,3 +789,44 @@ def test_openapi_form_serializer_flattens_struct_fields():
         assert props["attachments"] == {"type": "array", "items": {"type": "string", "format": "binary"}}
 
         assert set(media["required"]) == {"username", "age", "email", "attachments", "profile_picture"}
+
+
+def test_openapi_request_body_lists_the_content_types_that_the_route_accepts():
+    """A route with a file accepts multipart only. A route with only form fields accepts both form types."""
+
+    class Report(Serializer):
+        title: str
+        pages: list[UploadFile]
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.post("/avatar")
+    async def avatar(file: Annotated[UploadFile, File()], title: Annotated[str, Form()]):
+        return {"title": title}
+
+    @api.post("/report")
+    async def report(payload: Annotated[Report, Form()]):
+        return {"title": payload.title}
+
+    @api.post("/login")
+    async def login(username: Annotated[str, Form()]):
+        return {"username": username}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        paths = client.get("/docs/openapi.json").json()["paths"]
+        content = {path: list(paths[path]["post"]["requestBody"]["content"]) for path in paths}
+
+        assert content == {
+            "/avatar": ["multipart/form-data"],
+            "/report": ["multipart/form-data"],
+            "/login": ["multipart/form-data", "application/x-www-form-urlencoded"],
+        }
+        # The document shows what the server does.
+        assert client.post("/avatar", data={"title": "a", "file": "text"}).status_code == 422
+        assert client.post("/avatar", data={"title": "a"}, files={"file": ("a.txt", b"x")}).json() == {"title": "a"}
+        assert client.post("/login", data={"username": "ann"}).json() == {"username": "ann"}
+        assert client.post("/login", data={"username": "ann"}, files={"x": ("a.txt", b"x")}).json() == {
+            "username": "ann"
+        }

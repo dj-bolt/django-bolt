@@ -9,6 +9,10 @@ import pytest
 
 from django_bolt import BoltAPI, WebSocket, WebSocketState
 from django_bolt.testing import ConnectionClosed, HandshakeRejected, WebSocketTestClient
+from django_bolt.websocket import (
+    CloseCode,
+    WebSocketDisconnect,
+)
 
 
 @pytest.mark.asyncio
@@ -106,6 +110,34 @@ async def test_accept_after_close_raises():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("iterator_name", "sender_name", "messages"),
+    [
+        ("iter_text", "send_text", ["one", "two"]),
+        ("iter_bytes", "send_bytes", [b"one", b"two"]),
+        ("iter_json", "send_json", [{"n": 1}, {"n": 2}]),
+    ],
+)
+async def test_client_iterator_yields_the_messages_sent_before_the_server_close(iterator_name, sender_name, messages):
+    api = BoltAPI()
+
+    @api.websocket("/ws")
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        for message in messages:
+            await getattr(websocket, sender_name)(message)
+        await websocket.close()
+
+    async with WebSocketTestClient(api, "/ws") as ws:
+        received = [message async for message in getattr(ws, iterator_name)()]
+        # The connection is closed and has no more messages. A receive does not wait for the timeout.
+        with pytest.raises(ConnectionClosed):
+            await ws.receive(timeout=0.01)
+
+    assert received == messages
+
+
+@pytest.mark.asyncio
 async def test_send_after_close_says_closed():
     api = BoltAPI()
     seen: list[str] = []
@@ -128,3 +160,26 @@ async def test_send_after_close_says_closed():
 
 def test_state_names_are_unchanged():
     assert [state.name for state in WebSocketState] == ["CONNECTING", "CONNECTED", "DISCONNECTED"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("close_args", "expected_code"), [({}, CloseCode.NORMAL), ({"code": 4000}, 4000)])
+async def test_client_close_gives_the_handler_a_disconnect_with_the_code(close_args, expected_code):
+    api = BoltAPI()
+    seen: list[tuple[int, str]] = []
+
+    @api.websocket("/ws")
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        try:
+            await websocket.receive_text()
+        except WebSocketDisconnect as exc:
+            seen.append((exc.code, exc.reason))
+
+    async with WebSocketTestClient(api, "/ws") as ws:
+        await ws.close(**close_args)
+        assert ws.closed
+        assert ws.close_code == expected_code
+        await ws._handler_task
+
+    assert seen == [(expected_code, "")]

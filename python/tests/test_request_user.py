@@ -313,6 +313,37 @@ class TestJWTUserLoading:
             # Should return 401 because user not found (not 500 error)
             assert response.status_code == 401, f"Expected 401, got {response.status_code}: {response.text}"
 
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize("path", ["/async", "/sync"])
+    def test_an_attribute_of_a_user_with_no_row_gives_401(self, path):
+        """A valid token can name a user that is deleted. The handler does not get a 500."""
+        api = BoltAPI()
+        auth = [JWTAuthentication(secret="test-secret")]
+
+        @api.get("/async", auth=auth, guards=[IsAuthenticated()])
+        async def read_async(request):
+            return {"user_id": request.user.id}
+
+        @api.get("/sync", auth=auth, guards=[IsAuthenticated()])
+        def read_sync(request):
+            return {"user_id": request.user.id}
+
+        @api.get("/checked", auth=auth, guards=[IsAuthenticated()])
+        async def checked(request):
+            user = request.user
+            return {"is_none": user is None, "falsy": not user, "auser_is_none": await request.auser() is None}
+
+        headers = {"Authorization": f"Bearer {create_jwt_token(user_id='424242')}"}
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.get(path, headers=headers)
+            checked_response = client.get("/checked", headers=headers)
+
+        assert response.status_code == 401, response.text
+        assert response.json() == {"detail": "Authentication required"}
+        assert response.headers["www-authenticate"] == "Bearer"
+        # The read of request.user does not load the user, so the value is not None itself.
+        assert checked_response.json() == {"is_none": False, "falsy": True, "auser_is_none": True}
+
     def test_unauthenticated_request_rejected(self, jwt_api):
         """Test that unauthenticated request is rejected by guard."""
         with TestClient(jwt_api) as client:

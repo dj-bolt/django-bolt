@@ -74,7 +74,8 @@ def load_user_by_pk_sync(model: type, user_id: Any) -> Any | None:
     Load a user by primary key, skipping per-call SQL compilation when safe.
 
     Behaviorally equivalent to ``model._default_manager.get(pk=user_id)``
-    returning ``None`` for a missing or malformed pk. Models whose default
+    returning ``None`` for a missing or malformed pk, and for a pk that is
+    too large for the database. Models whose default
     manager customizes ``get_queryset`` use that manager per call instead of
     the compiled statement.
     """
@@ -101,7 +102,12 @@ def load_user_by_pk_sync(model: type, user_id: Any) -> Any | None:
 
     sql, fields, converters = compiled
     with connection.cursor() as cursor:
-        cursor.execute(sql, (pk_value,))
+        try:
+            cursor.execute(sql, (pk_value,))
+        except OverflowError:
+            # The database driver cannot bind an integer of this size, as
+            # sqlite3 cannot above 64 bits. No row has this pk.
+            return None
         row = cursor.fetchone()
     if row is None:
         return None
