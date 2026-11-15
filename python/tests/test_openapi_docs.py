@@ -8,6 +8,7 @@ are working correctly and not throwing internal errors.
 import re
 import time
 from typing import Annotated
+from urllib.parse import urljoin
 
 import jwt
 import msgspec
@@ -500,6 +501,39 @@ def test_openapi_root_path_serves_ui_directly():
         # Should contain Swagger UI content
         html = response.text
         assert "swagger" in html.lower(), "Response should contain Swagger UI"
+
+
+@pytest.mark.parametrize(
+    ("config_path", "plugin_path"),
+    [("docs", "scalar"), ("/docs/", "scalar/"), ("/docs", "/scalar")],
+)
+def test_docs_paths_with_no_leading_slash_serve_a_page_that_loads_its_schema(config_path, plugin_path):
+    """The docs path and the path of a UI get a leading slash. The page gives a schema URL that answers."""
+    api = BoltAPI(
+        openapi_config=OpenAPIConfig(
+            title="Test API",
+            version="1.0.0",
+            path=config_path,
+            render_plugins=[ScalarRenderPlugin(path=plugin_path)],
+        )
+    )
+
+    @api.get("/test")
+    async def test_endpoint():
+        return {"status": "ok"}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        page = client.get("/docs/scalar")
+        assert page.status_code == 200, page.text
+        assert client.get("/docsscalar").status_code == 404
+
+        # Resolve the schema URL of the page as a browser does.
+        schema_url = re.search(r'data-url="([^"]+)"', page.text).group(1)
+        schema = client.get(urljoin("http://testserver/docs/scalar", schema_url))
+        assert schema.status_code == 200, schema_url
+        assert "/test" in schema.json()["paths"]
 
 
 def test_openapi_renders_serializer_with_field_marker_default():

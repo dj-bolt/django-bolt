@@ -324,6 +324,8 @@ api = BoltAPI(
 )
 ```
 
+Bolt gives the path of `OpenAPIConfig` and the path of each plugin a leading slash. Thus `OpenAPIConfig(path="docs")` with `RedocRenderPlugin(path="redoc")` serves `/docs/redoc`.
+
 ## Raw OpenAPI JSON/YAML
 
 The raw OpenAPI specification is always available at:
