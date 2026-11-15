@@ -415,6 +415,33 @@ class ProductSerializer(Serializer):
         return f"${self.total():.2f}"  # Call as method
 ```
 
+### Computed fields in the OpenAPI document
+
+The response schema of a serializer has a property for each computed field. The property is required and has `readOnly: true`. Its type is the return type of the method. A request body schema has no computed field.
+
+```python
+class UserSerializer(Serializer):
+    first_name: str
+    last_name: str
+
+    @computed_field(title="Full name", examples=["John Doe"])
+    def full_name(self) -> str:
+        """The first name and the last name."""
+        return f"{self.first_name} {self.last_name}"
+
+    @computed_field(include_in_schema=False)
+    def debug_key(self) -> str:
+        return f"user:{self.first_name}"
+```
+
+| Option | Effect on the property schema |
+|--------|-------------------------------|
+| `description` | Sets `description`. The default is the docstring of the method. |
+| `title` | Sets `title`. |
+| `examples` | Sets `examples`, a list of example values. |
+| `deprecated=True` | Sets `deprecated: true`. |
+| `include_in_schema=False` | Leaves the property out of the schema. `dump()` still returns the field. |
+
 ## Dynamic field selection
 
 One of the most powerful features: create different views from a single serializer.
@@ -570,6 +597,8 @@ user = UserCreateSerializer(email="test@example.com", password="secret123")
 result = user.dump()
 # {'email': 'test@example.com'}  # password excluded
 ```
+
+In the OpenAPI document, the response schema has no write-only field. The request body schema marks the field `writeOnly: true`. The same applies to a field with `field(exclude=True)`, without the mark.
 
 ## Read-only fields
 

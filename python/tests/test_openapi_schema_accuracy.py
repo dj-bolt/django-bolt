@@ -19,7 +19,7 @@ from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import ComponentNameCollisionError, SchemaGenerator
 from django_bolt.param_functions import Query
-from django_bolt.serializers import Serializer, field
+from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.serializers.types import Email, HttpsURL, PositiveInt
 from django_bolt.testing import TestClient
 
@@ -519,6 +519,102 @@ def test_read_only_field_is_not_in_the_request_body_schema():
     plain = spec["paths"]["/plain"]["post"]
     assert plain["requestBody"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/Plain"}
     assert "PlainInput" not in schemas
+
+
+class ComputedOwner(Serializer):
+    name: str
+
+
+class ComputedUser(Serializer):
+    """A user."""
+
+    first_name: str
+    last_name: str
+    password: str = field(write_only=True, default="")
+    internal: str = field(exclude=True, default="")
+
+    @computed_field(description="Name for display", title="Display name", deprecated=True, examples=["A B"])
+    def full_name(self) -> str:
+        """The docstring that the description argument replaces."""
+        return f"{self.first_name} {self.last_name}"
+
+    @computed_field
+    def initials(self) -> str:
+        """First letters of the names.
+
+        In upper case.
+        """
+        return (self.first_name[:1] + self.last_name[:1]).upper()
+
+    @computed_field(alias="ownerInfo")
+    def owner(self) -> ComputedOwner | None:
+        return None
+
+    @computed_field
+    def scores(self) -> list[int]:
+        return [1]
+
+    @computed_field(include_in_schema=False)
+    def debug(self) -> str:
+        return "d"
+
+
+def test_computed_fields_are_in_the_response_schema_only():
+    """The response schema has each computed field, read-only and required. The request body schema has none."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.post("/users")
+    async def create_user(body: ComputedUser) -> ComputedUser:
+        return body
+
+    spec = _get_schema(api)
+    validate(spec)
+    schemas = spec["components"]["schemas"]
+    operation = spec["paths"]["/users"]["post"]
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ComputedUserInput"
+    }
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ComputedUser"
+    }
+
+    response_schema = schemas["ComputedUser"]
+    props = response_schema["properties"]
+    # A write_only field and a field with exclude=True are not in the output, so not in its schema.
+    assert list(props) == ["first_name", "last_name", "full_name", "initials", "ownerInfo", "scores"]
+    assert response_schema["required"] == ["first_name", "last_name", "full_name", "initials", "ownerInfo", "scores"]
+    assert props["full_name"] == {
+        "type": "string",
+        "readOnly": True,
+        "description": "Name for display",
+        "title": "Display name",
+        "deprecated": True,
+        "examples": ["A B"],
+    }
+    assert props["initials"] == {
+        "type": "string",
+        "readOnly": True,
+        "description": "First letters of the names.\n\nIn upper case.",
+    }
+    assert props["ownerInfo"] == {
+        "anyOf": [{"$ref": "#/components/schemas/ComputedOwner"}, {"type": "null"}],
+        "readOnly": True,
+    }
+    assert props["scores"] == {"type": "array", "items": {"type": "integer"}, "readOnly": True}
+
+    request_schema = schemas["ComputedUserInput"]
+    assert list(request_schema["properties"]) == ["first_name", "last_name", "password", "internal"]
+    assert request_schema["required"] == ["first_name", "last_name"]
+    assert request_schema["properties"]["password"] == {"type": "string", "default": "", "writeOnly": True}
+    assert request_schema["description"] == "A user."
+
+    # The schema of the response is the shape of the response.
+    with TestClient(api) as client:
+        response = client.post("/users", json={"first_name": "a", "last_name": "b", "password": "p", "internal": "i"})
+        assert response.status_code == 200
+        body = response.json()
+        assert list(body) == [*props, "debug"]
+        assert body["debug"] == "d"
 
 
 def test_documented_constrained_field_matches_msgspec_schema():

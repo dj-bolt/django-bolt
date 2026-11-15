@@ -29,7 +29,7 @@ def _input_nodes(node: Any) -> Iterable[Any]:
         yield from getattr(node, attr, None) or ()
 
 
-def _input_node_has_read_only(node: Any, seen: set[type]) -> bool:
+def _any_serializer_node(node: Any, check: Callable[[Any], bool], seen: set[type]) -> bool:
     found = False
     cls = getattr(node, "cls", None)
     if isinstance(cls, type):
@@ -37,11 +37,20 @@ def _input_node_has_read_only(node: Any, seen: set[type]) -> bool:
             return False
         seen.add(cls)
         if getattr(cls, "__is_bolt_serializer__", False):
-            found = cls._check_read_only_input()
+            found = check(cls)
     for child in _input_nodes(node):
-        # No short circuit: each serializer of the type must pass its check.
-        found = _input_node_has_read_only(child, seen) or found
+        # No short circuit: ``check`` reads each serializer of the type.
+        found = _any_serializer_node(child, check, seen) or found
     return found
+
+
+def any_serializer(annotation: Any, check: Callable[[Any], bool]) -> bool:
+    """Tell if ``check`` is true for a serializer class that the type holds, at each depth."""
+    return _any_serializer_node(msgspec.inspect.type_info(annotation), check, set())
+
+
+def _check_read_only_input(cls: Any) -> bool:
+    return cls._check_read_only_input()
 
 
 def input_has_read_only_fields(annotation: Any) -> bool:
@@ -54,7 +63,7 @@ def input_has_read_only_fields(annotation: Any) -> bool:
         ImproperlyConfigured: A ``read_only`` field has no default. Input cannot
             set the field, so there is no value for it.
     """
-    return _input_node_has_read_only(msgspec.inspect.type_info(annotation), set())
+    return any_serializer(annotation, _check_read_only_input)
 
 
 def ignore_read_only_input(annotation: Any, decode: Callable[[Any], Any]) -> Callable[[Any], Any]:

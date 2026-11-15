@@ -169,7 +169,7 @@ async def create_user(user: CreateUser):
     return {"id": 1, "username": user.username}
 ```
 
-A `Serializer` with a `read_only` field has two schemas. The request body schema has no read-only field. The response schema marks the field `readOnly: true`. If the API uses the serializer for the two, the response uses the component `<Name>` and the request body uses the component `<Name>Input`. See [Read-only fields](serializers.md#read-only-fields).
+A `Serializer` has two schemas if its input and its output do not have the same fields. The request body schema has no `read_only` field and no computed field. The response schema has no `write_only` field. It marks each `read_only` field and each computed field `readOnly: true`. If the API uses the serializer for the two, the response uses the component `<Name>` and the request body uses the component `<Name>Input`. See [Read-only fields](serializers.md#read-only-fields).
 
 ### Status codes
 
