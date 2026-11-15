@@ -888,6 +888,53 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
+def _status_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.get("/async-raise/{code}")
+    async def async_raise(code: int):
+        raise HTTPException(code, detail="boom")
+
+    @api.get("/sync-raise/{code}")
+    def sync_raise(code: int):
+        raise HTTPException(code, detail="boom")
+
+    @api.get("/async-json/{code}")
+    async def async_json(code: int):
+        return JSON({"ok": True}, status_code=code)
+
+    @api.get("/sync-json/{code}")
+    def sync_json(code: int):
+        return JSON({"ok": True}, status_code=code)
+
+    return api
+
+
+@pytest.mark.parametrize("route", ["async-raise", "sync-raise", "async-json", "sync-json"])
+@pytest.mark.parametrize("code", [0, 99, 1000, 65535, 65536, -1])
+def test_a_status_that_is_not_an_http_status_is_a_500_and_not_a_200(route, code, capfd):
+    with TestClient(_status_api()) as client:
+        response = client.get(f"/{route}/{code}")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+    # The Rust core writes its log records to stderr.
+    assert (
+        f"[django-bolt] ERROR django_bolt::handler: The response status must be an int from 100 to 999, got {code}."
+        " Bolt sends a 500."
+    ) in capfd.readouterr().err.splitlines()
+
+
+def test_a_route_status_code_that_is_not_an_http_status_stops_the_start():
+    api = BoltAPI()
+
+    @api.get("/created", status_code=1000)
+    def created():
+        return {"ok": True}
+
+    with pytest.raises(TypeError, match="'default_status_code' for GET /created must be an int from 100 to 999"):
+        TestClient(api).__enter__()
+
+
 class Item(msgspec.Struct):
     id: int
 

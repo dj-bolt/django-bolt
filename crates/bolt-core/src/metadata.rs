@@ -2,6 +2,7 @@
 ///
 /// This module handles parsing Python metadata dicts into strongly-typed
 /// Rust enums at registration time, eliminating per-request GIL overhead.
+use actix_web::http::StatusCode;
 use actix_web::http::header::HeaderValue;
 use ahash::{AHashMap, AHashSet};
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -571,7 +572,7 @@ pub struct RouteMetadata {
     /// Route's default success status code. Used by the bare-bytes response
     /// fast path: sync executors may return just the encoded JSON body and
     /// Rust rebuilds the (status, JSON meta) envelope from this value.
-    pub default_status_code: u16,
+    pub default_status_code: StatusCode,
     /// WebSocket routes with a `revoked_token_handler`: an async Python
     /// callable that takes the auth context and returns True for a revoked
     /// token. The handshake awaits it before the upgrade.
@@ -654,14 +655,16 @@ fn required_bool(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<bool> {
 
 /// Read a required HTTP status code of the route metadata.
 /// A value that is not an int from 0 to 65535 is a TypeError.
-fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<u16> {
+fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<StatusCode> {
     let value = required_item(py_meta, key)?;
     if value.is_instance_of::<PyBool>() {
         return Err(wrong_type(py_meta, key, "an int", &value));
     }
     value
         .extract::<u16>()
-        .map_err(|_| wrong_type(py_meta, key, "an int from 0 to 65535", &value))
+        .ok()
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .ok_or_else(|| wrong_type(py_meta, key, "an int from 100 to 999", &value))
 }
 
 impl RouteMetadata {
@@ -2320,7 +2323,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_status_code_is_an_int_that_fits_a_u16() {
+    fn the_default_status_code_is_an_int_that_is_an_http_status() {
         assert_eq!(route("'default_status_code': 201").default_status_code, 201);
         assert_eq!(
             error_of(parse_route("'default_status_code': True")),
@@ -2329,13 +2332,15 @@ mod tests {
         for (value, name) in [
             ("65536", "int"),
             ("-1", "int"),
+            ("99", "int"),
+            ("1000", "int"),
             ("'200'", "str"),
             ("200.0", "float"),
         ] {
             assert_eq!(
                 error_of(parse_route(&format!("'default_status_code': {value}"))),
                 format!(
-                    "TypeError: Route metadata 'default_status_code' for GET /x must be an int from 0 to 65535, got {name}"
+                    "TypeError: Route metadata 'default_status_code' for GET /x must be an int from 100 to 999, got {name}"
                 ),
                 "{value}"
             );
