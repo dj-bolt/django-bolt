@@ -8,7 +8,10 @@ Compression levels are handled automatically by Actix Web with optimized default
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
+
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 
 # Static type aliases for the per-codec tuning fields. The `Literal` types
 # are checker-only: mypy/pyright will flag obvious out-of-range literals at
@@ -170,3 +173,28 @@ class CompressionConfig:
             "gzip_level": self.gzip_level,
             "zstd_level": self.zstd_level,
         }
+
+
+def check_compression(value: Any, name: str, error: type[Exception] = TypeError) -> CompressionConfig | None:
+    """Return the config of a compression value. Return None for False and for None.
+
+    A compression value is a ``CompressionConfig``, ``None`` or ``False``.
+    Each other value raises ``error``, and the message has ``name``.
+    """
+    if value is None or value is False:
+        return None
+    if isinstance(value, CompressionConfig):
+        return value
+    raise error(f"{name} must be a CompressionConfig, None or False, not {type(value).__name__}")
+
+
+def compression_setting() -> tuple[bool, CompressionConfig | None]:
+    """Read ``settings.BOLT_COMPRESSION``.
+
+    Return ``(defined, config)``. ``None`` and ``False`` switch compression
+    off, thus the config is ``None``. A value of a wrong type raises
+    ``ImproperlyConfigured``.
+    """
+    if not hasattr(settings, "BOLT_COMPRESSION"):
+        return False, None
+    return True, check_compression(settings.BOLT_COMPRESSION, "settings.BOLT_COMPRESSION", ImproperlyConfigured)

@@ -9,6 +9,7 @@ import json
 
 import msgspec
 import pytest
+from django.core.exceptions import ImproperlyConfigured
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import CompressionConfig, no_compress, skip_middleware
@@ -99,6 +100,58 @@ def test_compression_disabled():
     assert response.status_code == 200
     assert response.headers.get("content-encoding") is None
     assert response.json() == {"data": "x" * 1000}
+
+
+@pytest.mark.parametrize(
+    ("setting", "api_compression", "expected"),
+    [
+        (None, None, None),
+        (False, None, None),
+        (CompressionConfig(backend="gzip"), False, "gzip"),
+    ],
+    ids=["none-disables", "false-disables", "config-wins"],
+)
+def test_bolt_compression_setting_wins_over_the_api_argument(settings, setting, api_compression, expected):
+    """`TestClient` applies `settings.BOLT_COMPRESSION` as `runbolt` does: the setting wins over the API."""
+    settings.BOLT_COMPRESSION = setting
+    api = BoltAPI(compression=api_compression)
+
+    @api.get("/data")
+    async def get_data():
+        return {"data": "x" * 1000}
+
+    with TestClient(api, use_http_layer=True) as client:
+        response = client.get("/data", headers={"Accept-Encoding": "gzip, br"})
+
+    assert response.status_code == 200
+    assert response.headers.get("content-encoding") == expected
+    assert response.json() == {"data": "x" * 1000}
+
+
+@pytest.mark.parametrize("value", [True, {"backend": "gzip"}, "gzip"], ids=["true", "dict", "str"])
+def test_compression_argument_of_a_wrong_type_raises(value):
+    """`compression` takes a CompressionConfig, None or False. Each other value raises at once."""
+    with pytest.raises(TypeError, match="compression must be a CompressionConfig, None or False"):
+        BoltAPI(compression=value)
+
+
+@pytest.mark.parametrize(
+    ("value", "type_name"),
+    [(True, "bool"), ({"backend": "gzip"}, "dict"), ("gzip", "str")],
+    ids=["true", "dict", "str"],
+)
+def test_bolt_compression_setting_of_a_wrong_type_raises(settings, value, type_name):
+    """`settings.BOLT_COMPRESSION` takes the values of the `compression` argument. The error names the setting."""
+    settings.BOLT_COMPRESSION = value
+    api = BoltAPI()
+
+    @api.get("/data")
+    async def get_data():
+        return {"data": "x" * 1000}
+
+    message = rf"settings\.BOLT_COMPRESSION must be a CompressionConfig, None or False, not {type_name}"
+    with pytest.raises(ImproperlyConfigured, match=message):
+        TestClient(api, use_http_layer=True)
 
 
 def test_compression_custom_config():
