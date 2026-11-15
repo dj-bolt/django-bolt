@@ -473,7 +473,11 @@ async def refresh(request):
 By the time your handler runs, the token's signature, expiry, and type
 have already been verified in Rust. `rotate_refresh_token()` performs
 the stateful checks against the revocation store, atomically consumes the
-old refresh token, and returns a new pair. A custom store used for full
+old refresh token, and returns a new pair. It also raises
+`TokenRotationError` for claims whose `typ` is not `refresh`. Thus a route
+without `token_type="refresh"` cannot rotate an access token.
+
+A custom store used for full
 rotation must implement `consume(jti, *, exp=None)` as an atomic
 check-and-set and support family revocation; rotation fails closed if it
 cannot. If the validating `JWTAuthentication` uses a non-default `leeway`,
