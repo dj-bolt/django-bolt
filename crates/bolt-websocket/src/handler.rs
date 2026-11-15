@@ -81,8 +81,14 @@ fn requested_close(error: &PyErr) -> Option<(u16, String)> {
             return None;
         }
         let value = error.value(py);
-        let code = value.getattr("code").ok()?.extract().ok()?;
-        let reason = value.getattr("reason").ok()?.extract().ok()?;
+        let code: u16 = value.getattr("code").ok()?.extract().ok()?;
+        let reason: String = value.getattr("reason").ok()?.extract().ok()?;
+        // The last defense. `WebSocketException` checks its code and reason when
+        // the handler makes it. Attributes that make an invalid close frame are
+        // an error of the handler, which closes with 1011.
+        if !is_close_frame_code(code) || reason.len() > MAX_CLOSE_REASON_BYTES {
+            return None;
+        }
         Some((code, reason))
     })
 }

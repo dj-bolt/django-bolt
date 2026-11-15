@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from django_bolt import BoltAPI, WebSocket, WebSocketState
+from django_bolt import BoltAPI, WebSocket, WebSocketClose, WebSocketDisconnect, WebSocketException, WebSocketState
 from django_bolt.testing import ConnectionClosed, HandshakeRejected, WebSocketTestClient
 from tests.integration.apps.websocket_handler_end import api as handler_end_api
 
@@ -93,6 +93,36 @@ async def test_return_after_accept_closes_the_connection_with_1000(path):
         assert [message async for message in ws.iter_text()] == ["bye"]
         assert ws.closed
         assert ws.close_code == 1000
+
+
+@pytest.mark.parametrize("exception_class", [WebSocketException, WebSocketClose])
+def test_websocket_exception_refuses_a_code_or_a_reason_that_makes_an_invalid_close_frame(exception_class):
+    """The rules are those of ``WebSocket.close()``: the handler cannot raise an invalid close."""
+    for code in (999, 1004, 1005, 1006, 1015, 2999, 5000):
+        with pytest.raises(ValueError, match=f"WebSocket close code {code} is not valid"):
+            exception_class(code=code)
+    with pytest.raises(ValueError, match="WebSocket close reason is 124 bytes"):
+        exception_class(code=4001, reason="r" * 124)
+    with pytest.raises(ValueError, match="WebSocket close reason is 126 bytes"):
+        exception_class(code=4001, reason="é" * 63)
+
+    error = exception_class(code=4999, reason="é" * 61 + "r")
+    assert (error.code, len(error.reason.encode())) == (4999, 123)
+    assert exception_class().code == (1011 if exception_class is WebSocketException else 1000)
+    # WebSocketDisconnect reports the close of the client. It can hold each code.
+    assert WebSocketDisconnect(code=1006).code == 1006
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/ws/invalid-code", "/ws/invalid-reason-set-later"])
+async def test_websocket_exception_that_makes_an_invalid_close_frame_is_a_handler_error(path):
+    """The same app runs on the server in test_websocket_handler_end_server_integration.py."""
+    with pytest.raises(ValueError, match="WebSocket close"):
+        async with WebSocketTestClient(handler_end_api, path) as ws:
+            message = await ws.receive()
+            while message["type"] != "websocket.close":
+                message = await ws.receive()
+            assert message["code"] == 1011
 
 
 @pytest.mark.asyncio
