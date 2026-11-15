@@ -399,6 +399,9 @@ flows.
 `/auth/logout` and `/auth/logout-all` accept only a refresh token that
 `/auth/refresh` also accepts. A used, revoked or old-version token gets a 401.
 
+`/auth/logout` revokes the family for the full lifetime of a new refresh token.
+Thus a token that a refresh gives at the same moment as the logout stays revoked.
+
 `/auth/login` answers 401 for wrong credentials. This 401 has the
 `WWW-Authenticate` header of the token routes, although the login route has no
 auth backend.

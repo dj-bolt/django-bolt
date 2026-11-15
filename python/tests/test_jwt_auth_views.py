@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import ClassVar
 
 import jwt
@@ -13,7 +14,14 @@ from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 
 from django_bolt import BoltAPI
-from django_bolt.auth import InMemoryRevocation, IsAuthenticated, JWTAuthentication, JWTAuthViews
+from django_bolt.auth import (
+    DjangoCacheRevocation,
+    InMemoryRevocation,
+    IsAuthenticated,
+    JWTAuthentication,
+    JWTAuthViews,
+)
+from django_bolt.auth.tokens import create_token_pair, rotate_refresh_token
 from django_bolt.testing import TestClient
 
 pytestmark = pytest.mark.django_db
@@ -292,6 +300,51 @@ def test_refresh_token_from_before_logout_all_cannot_log_out_a_new_login():
         assert _post_with_refresh(client, "/auth/refresh", new).status_code == 200
         # The tokens of the new login have version 1. They are live, so they can log out.
         assert client.post("/auth/logout", headers=NO_CSRF_ORIGIN).status_code == 200
+
+
+class _RefreshDuringLogout(DjangoCacheRevocation):
+    """A store where a second process rotates the token while logout runs.
+
+    The rotation runs after logout reads the state of the token and before logout revokes the family.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(key_prefix=f"refresh-during-logout:{uuid.uuid4()}:")
+        self.claims_to_rotate = None
+        self.rotated = None
+
+    async def get_user_version(self, user_id: str) -> int:
+        version = await super().get_user_version(user_id)
+        if self.claims_to_rotate is not None:
+            claims, self.claims_to_rotate = self.claims_to_rotate, None
+            self.rotated = await rotate_refresh_token(claims, store=self, secret=SECRET)
+        return version
+
+
+def test_logout_ends_the_token_that_a_refresh_at_the_same_moment_gave():
+    """Logout of R0 and refresh of R0 run at the same moment. R1 lives longer than R0.
+
+    R1 must stay dead after the server stops accepting R0.
+    """
+    api = BoltAPI()
+    store = _RefreshDuringLogout()
+
+    async def validate(request, credentials):
+        return User()
+
+    JWTAuthViews(store=store, secret=SECRET, secure_cookies=False, credential_validator=validate).register(api)
+
+    with TestClient(api) as client:
+        # R0 is 57 seconds after its ``exp``. The server accepts it for 3 more seconds.
+        old = create_token_pair("logout-race-user", secret=SECRET, refresh_ttl=-57)
+        store.claims_to_rotate = old.refresh_claims
+        assert _post_with_refresh(client, "/auth/logout", old.refresh_token).status_code == 200
+        replacement = store.rotated.refresh_token
+        assert _post_with_refresh(client, "/auth/refresh", replacement).status_code == 401
+
+        # An entry of the cache store lives until ``exp`` of its token plus 60 seconds, in full seconds.
+        time.sleep(max(0.0, old.refresh_claims["exp"] + 61.2 - time.time()))
+        assert _post_with_refresh(client, "/auth/refresh", replacement).status_code == 401
 
 
 def test_logged_out_refresh_token_cannot_log_out_everywhere():

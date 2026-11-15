@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -14,7 +15,13 @@ from django_bolt.responses import JSON
 
 from .backends import JWTAuthentication, www_authenticate_challenge
 from .guards import IsAuthenticated
-from .tokens import TokenRotationError, create_token_pair, rotate_refresh_token, set_token_cookies
+from .tokens import (
+    DEFAULT_REFRESH_TTL,
+    TokenRotationError,
+    create_token_pair,
+    rotate_refresh_token,
+    set_token_cookies,
+)
 
 
 class LoginCredentials(msgspec.Struct):
@@ -197,7 +204,11 @@ class JWTAuthViews:
         )
         async def logout(request: Any):
             claims = await self._require_live_refresh(request)
-            await self.store.revoke_family(claims["fam"], exp=claims.get("exp"))
+            # A refresh in a second process can replace this token before the family is revoked.
+            # The replacement expires after this token. The entry must live as long as the
+            # replacement, as for a token that comes back in ``rotate_refresh_token``.
+            family_exp = max(int(time.time()) + DEFAULT_REFRESH_TTL, claims["exp"])
+            await self.store.revoke_family(claims["fam"], exp=family_exp)
             return self._clear_cookies(JSON({"ok": True}))
 
         @api.post(
