@@ -31,6 +31,7 @@ from django_bolt.api import (
     serve_with_lifespan,
 )
 from django_bolt.concurrency import close_connections_and_pools
+from django_bolt.middleware.compression import compression_setting
 from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.workers import MIB, WorkerSupervisor
 
@@ -863,9 +864,10 @@ class Command(BaseCommand):
 
         # Check compression
         compression_config = None
-        if hasattr(settings, "BOLT_COMPRESSION"):
-            if settings.BOLT_COMPRESSION is not None and settings.BOLT_COMPRESSION is not False:
-                compression_config = settings.BOLT_COMPRESSION.to_rust_config()
+        setting_defined, setting_config = compression_setting()
+        if setting_defined:
+            if setting_config is not None:
+                compression_config = setting_config.to_rust_config()
         else:
             for _api_path, api in apis:
                 if api._compression is not None:
@@ -1038,10 +1040,11 @@ class Command(BaseCommand):
         # Determine compression config (server-level in Actix)
         # Priority: Django setting > first API with compression config
         compression_config = None
-        if hasattr(settings, "BOLT_COMPRESSION"):
+        setting_defined, setting_config = compression_setting()
+        if setting_defined:
             # Use Django setting if provided (highest priority)
-            if settings.BOLT_COMPRESSION is not None and settings.BOLT_COMPRESSION is not False:
-                compression_config = settings.BOLT_COMPRESSION.to_rust_config()
+            if setting_config is not None:
+                compression_config = setting_config.to_rust_config()
         else:
             # Check if any API has compression configured
             for _api_path, api in apis:

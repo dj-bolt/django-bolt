@@ -9,6 +9,7 @@ import json
 
 import msgspec
 import pytest
+from django.core.exceptions import ImproperlyConfigured
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import CompressionConfig, no_compress, skip_middleware
@@ -132,6 +133,25 @@ def test_compression_argument_of_a_wrong_type_raises(value):
     """`compression` takes a CompressionConfig, None or False. Each other value raises at once."""
     with pytest.raises(TypeError, match="compression must be a CompressionConfig, None or False"):
         BoltAPI(compression=value)
+
+
+@pytest.mark.parametrize(
+    ("value", "type_name"),
+    [(True, "bool"), ({"backend": "gzip"}, "dict"), ("gzip", "str")],
+    ids=["true", "dict", "str"],
+)
+def test_bolt_compression_setting_of_a_wrong_type_raises(settings, value, type_name):
+    """`settings.BOLT_COMPRESSION` takes the values of the `compression` argument. The error names the setting."""
+    settings.BOLT_COMPRESSION = value
+    api = BoltAPI()
+
+    @api.get("/data")
+    async def get_data():
+        return {"data": "x" * 1000}
+
+    message = rf"settings\.BOLT_COMPRESSION must be a CompressionConfig, None or False, not {type_name}"
+    with pytest.raises(ImproperlyConfigured, match=message):
+        TestClient(api, use_http_layer=True)
 
 
 def test_compression_custom_config():
