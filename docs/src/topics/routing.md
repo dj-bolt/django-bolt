@@ -499,3 +499,5 @@ async def list_users():
 ```
 
 This is useful for versioning your API or grouping routes under a common path.
+
+Bolt gives each path and each prefix a leading slash. Thus `BoltAPI(prefix="api/v1")` with `@api.get("users")` serves `/api/v1/users`. The rule is the same for `Router(prefix=...)`, `include_router(prefix=...)`, `mount()`, views, viewsets and WebSocket routes.

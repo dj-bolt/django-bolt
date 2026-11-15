@@ -11,11 +11,12 @@ from typing import Annotated
 
 import pytest
 
-from django_bolt import BoltAPI, Router
+from django_bolt import BoltAPI, Router, WebSocket
 from django_bolt.middleware import Middleware
 from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
 from django_bolt.params import Query
-from django_bolt.testing import TestClient
+from django_bolt.testing import TestClient, WebSocketTestClient
+from django_bolt.views import APIView, ViewSet
 
 
 class TestMountPathNormalization:
@@ -794,6 +795,97 @@ class TestTrailingSlashSetting:
 
             registered_paths = [path for _method, path, _handler_id, _handler in api._routes]
             assert "/" in registered_paths, f"Root '/' should be unchanged in '{mode}' mode"
+
+
+def _api_with_route_and_prefix_without_slash():
+    api = BoltAPI(prefix="api")
+
+    @api.get("x")
+    async def handler():
+        return {"ok": True}
+
+    return api
+
+
+def _api_with_router_without_slash():
+    api = BoltAPI()
+    router = Router(prefix="users")
+
+    @router.get("x")
+    async def handler():
+        return {"ok": True}
+
+    @router.get("")
+    async def root():
+        return {"ok": True}
+
+    api.include_router(router, prefix="v1")
+    return api
+
+
+def _api_with_nested_router_without_slash():
+    api = BoltAPI()
+    parent = Router(prefix="v1")
+    child = Router(prefix="users")
+    parent.include_router(child, prefix="admin")
+
+    @child.get("x")
+    async def handler():
+        return {"ok": True}
+
+    api.include_router(parent)
+    return api
+
+
+def _api_with_view_and_viewset_without_slash():
+    api = BoltAPI(prefix="api")
+
+    @api.view("view")
+    class View(APIView):
+        async def get(self, request):
+            return {"ok": True}
+
+    @api.viewset("items")
+    class Items(ViewSet):
+        async def list(self, request):
+            return {"ok": True}
+
+        async def retrieve(self, request, pk: int):
+            return {"ok": True}
+
+    return api
+
+
+@pytest.mark.parametrize(
+    ("make_api", "urls"),
+    [
+        (_api_with_route_and_prefix_without_slash, ["/api/x"]),
+        (_api_with_router_without_slash, ["/v1/users/x", "/v1/users"]),
+        (_api_with_nested_router_without_slash, ["/v1/admin/users/x"]),
+        (_api_with_view_and_viewset_without_slash, ["/api/view", "/api/items", "/api/items/1"]),
+    ],
+)
+def test_a_path_or_prefix_with_no_leading_slash_gets_one(make_api, urls):
+    """Each path and prefix follows the rule of the mount path: Bolt adds the leading slash."""
+    api = make_api()
+    with TestClient(api) as client:
+        for url in urls:
+            response = client.get(url)
+            assert response.status_code == 200, (url, response.text)
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_path_with_no_leading_slash_gets_one():
+    api = BoltAPI(prefix="api")
+
+    @api.websocket("ws")
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+        await websocket.close()
+
+    async with WebSocketTestClient(api, "/api/ws") as ws:
+        assert await ws.receive_text() == "connected"
 
 
 class TagMiddleware(Middleware):

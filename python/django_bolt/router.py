@@ -17,6 +17,11 @@ if TYPE_CHECKING:
     from .middleware import MiddlewareType
 
 
+def _leading_slash(path: str) -> str:
+    """Give a path or a prefix its leading slash. An empty value stays empty."""
+    return path if not path or path.startswith("/") else "/" + path
+
+
 class Router:
     """
     Router for grouping routes with common configuration.
@@ -84,7 +89,7 @@ class Router:
             guards: Default guards/permissions (can be overridden per-route)
             parent: Parent router for nested routers
         """
-        self.prefix = prefix.rstrip("/")
+        self.prefix = _leading_slash(prefix.rstrip("/"))
         self.tags = tags or []
         self.middleware = normalize_middleware_specs(middleware, context="router")
         self.auth = auth
@@ -116,7 +121,7 @@ class Router:
         """Register a GET route."""
 
         def dec(fn: Callable):
-            self._add("GET", path, fn, **kwargs)
+            self._add("GET", _leading_slash(path), fn, **kwargs)
             return fn
 
         return dec
@@ -125,7 +130,7 @@ class Router:
         """Register a POST route."""
 
         def dec(fn: Callable):
-            self._add("POST", path, fn, **kwargs)
+            self._add("POST", _leading_slash(path), fn, **kwargs)
             return fn
 
         return dec
@@ -134,7 +139,7 @@ class Router:
         """Register a PUT route."""
 
         def dec(fn: Callable):
-            self._add("PUT", path, fn, **kwargs)
+            self._add("PUT", _leading_slash(path), fn, **kwargs)
             return fn
 
         return dec
@@ -143,7 +148,7 @@ class Router:
         """Register a PATCH route."""
 
         def dec(fn: Callable):
-            self._add("PATCH", path, fn, **kwargs)
+            self._add("PATCH", _leading_slash(path), fn, **kwargs)
             return fn
 
         return dec
@@ -152,7 +157,7 @@ class Router:
         """Register a DELETE route."""
 
         def dec(fn: Callable):
-            self._add("DELETE", path, fn, **kwargs)
+            self._add("DELETE", _leading_slash(path), fn, **kwargs)
             return fn
 
         return dec
@@ -161,7 +166,7 @@ class Router:
         """Register a HEAD route."""
 
         def dec(fn: Callable):
-            self._add("HEAD", path, fn, **kwargs)
+            self._add("HEAD", _leading_slash(path), fn, **kwargs)
             return fn
 
         return dec
@@ -170,7 +175,7 @@ class Router:
         """Register an OPTIONS route."""
 
         def dec(fn: Callable):
-            self._add("OPTIONS", path, fn, **kwargs)
+            self._add("OPTIONS", _leading_slash(path), fn, **kwargs)
             return fn
 
         return dec
@@ -179,7 +184,7 @@ class Router:
         """Register a QUERY route."""
 
         def dec(fn: Callable):
-            self._add("QUERY", path, fn, **kwargs)
+            self._add("QUERY", _leading_slash(path), fn, **kwargs)
             return fn
 
         return dec
@@ -213,7 +218,7 @@ class Router:
 
         # Combine prefixes
         if prefix:
-            router.prefix = prefix.rstrip("/") + router.prefix
+            router.prefix = _leading_slash(prefix.rstrip("/")) + router.prefix
 
     def get_all_routes(self) -> list[tuple[str, str, Callable, dict[str, Any]]]:
         """

@@ -87,7 +87,7 @@ from .openapi import (
 from .openapi.routes import OpenAPIRouteRegistrar
 from .pagination import extract_pagination_item_type, paginate
 from .responses import JSON as _JSONResponse
-from .router import Router
+from .router import Router, _leading_slash
 from .serialization import (
     _BODY_BYTES,
     _RESPONSE_META_EMPTY,
@@ -639,7 +639,8 @@ class BoltAPI:
         self._handler_meta: dict[int, HandlerMetadata] = {}
         self._handler_middleware: dict[int, dict[str, Any]] = {}  # Middleware metadata per handler
         self._next_handler_id = 0
-        self.prefix = prefix.rstrip("/")  # Remove trailing slash from prefix
+        # Add the leading slash and remove the trailing slash.
+        self.prefix = _leading_slash(prefix.rstrip("/"))
         self.trailing_slash = trailing_slash  # Mode: "strip", "append", or "keep"
         self.namespace = namespace  # Opt-in reverse namespace; see django_bolt.urls
         self._validate_response_default = validate_response
@@ -1154,7 +1155,7 @@ class BoltAPI:
             # Build full path with prefix. The server removes the trailing slash
             # of a WebSocket request path before the lookup, for each
             # trailing_slash mode. Thus the route path has no trailing slash.
-            full_path = _normalize_path(f"{self.prefix}{path}" if self.prefix else path, "strip")
+            full_path = _normalize_path(f"{self.prefix}{_leading_slash(path)}", "strip")
 
             self._handlers[handler_id] = fn
 
@@ -1820,8 +1821,9 @@ class BoltAPI:
 
             # Normalize path (following Starlette conventions):
             # - Empty "" becomes "/"
+            # - A path with no leading slash gets one
             # - Trailing slashes are stripped (except for root "/")
-            normalized_path = path if path else "/"
+            normalized_path = _leading_slash(path) or "/"
 
             # Apply prefix to path (conversion happens in Rust)
             # _skip_prefix is used internally for OpenAPI routes that should be at absolute paths
@@ -3715,7 +3717,7 @@ class BoltAPI:
         method = method.upper()
         if method not in _HTTP_METHODS:
             raise ValueError(f"Unsupported HTTP method for a native route: {method}")
-        path = path or "/"
+        path = _leading_slash(path) or "/"
         full_path = _normalize_path(f"{self.prefix}{path}" if self.prefix else path, self.trailing_slash)
         _refuse_typed_native_path_params(full_path)
         # Check the capsule now, so a bad capsule stops startup before runbolt
