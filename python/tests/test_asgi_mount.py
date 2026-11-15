@@ -367,6 +367,85 @@ def test_mount_django_with_custom_app_forwards_to_mount_asgi():
         assert response.json() == {"source": "django"}
 
 
+def _scope_echo_app(captured: list):
+    """An ASGI app that records its scope and answers 204."""
+
+    async def app(scope, receive, send):
+        await receive()
+        captured.append(scope)
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    return app
+
+
+@pytest.mark.parametrize(
+    ("mount", "url", "root_path"),
+    [("/legacy", "/api/legacy/page", "/api/legacy"), ("/", "/api/page", "/api")],
+)
+def test_mount_asgi_applies_the_prefix_of_the_api(mount, url, root_path):
+    """The prefix of the API comes before the mount path, and a second mount there is an error."""
+    api = BoltAPI(prefix="/api")
+    captured = []
+    api.mount_asgi(mount, _scope_echo_app(captured))
+
+    with TestClient(api) as client:
+        assert client.get(url).status_code == 204
+
+    assert captured[0]["root_path"] == root_path
+
+    with pytest.raises(ValueError, match="Duplicate ASGI mount prefix"):
+        api.mount_asgi(mount, _scope_echo_app(captured))
+
+
+@pytest.mark.parametrize(("clear_root_path", "root_path"), [(False, "/django"), (True, "")])
+def test_mount_django_gives_the_app_the_full_path(clear_root_path, root_path):
+    """The app gets the request path with the mount prefix. ``clear_root_path`` sets ``root_path`` to ``""``."""
+    api = BoltAPI()
+    captured = []
+    api.mount_django("/django", app=_scope_echo_app(captured), clear_root_path=clear_root_path)
+
+    with TestClient(api) as client:
+        assert client.get("/django/page").status_code == 204
+        assert client.get("/django/a%20b").status_code == 204
+
+    assert captured[0]["root_path"] == root_path
+    assert captured[0]["path"] == "/django/page"
+    assert bytes(captured[1]["raw_path"]) == b"/django/a%20b"
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("/accounts/", "/django/accounts/"),
+        ("/django/accounts/", "/django/accounts/"),
+        ("//other.example/accounts/", "//other.example/accounts/"),
+        ("https://other.example/accounts/", "https://other.example/accounts/"),
+    ],
+    ids=["root-relative", "has-prefix", "scheme-relative", "absolute"],
+)
+def test_mount_django_redirect_location_and_other_headers(status, location, expected):
+    """Only a root-relative Location gets the mount prefix. The headers before and after it stay."""
+    api = BoltAPI()
+
+    async def redirecting_app(scope, receive, send):
+        await receive()
+        headers = [(b"x-before", b"1"), (b"Location", location.encode()), (b"x-after", b"2")]
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    api.mount_django("/django", app=redirecting_app)
+
+    with TestClient(api) as client:
+        response = client.get("/django/start", follow_redirects=False)
+
+    assert response.status_code == status
+    assert response.headers["location"] == expected
+    assert response.headers["x-before"] == "1"
+    assert response.headers["x-after"] == "2"
+
+
 def test_mount_django_redirect_keeps_mount_prefix():
     api = BoltAPI()
 
