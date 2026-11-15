@@ -3,6 +3,7 @@ Tests for OpenAPI tags, summary, and description metadata.
 """
 
 from django_bolt import BoltAPI, Router
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.decorators import ActionHandler, action
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
@@ -425,6 +426,24 @@ def test_websocket_empty_tags_match_http():
 
     schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
     assert schema.paths["/ws/stream"].get.tags == schema.paths["/items"].get.tags == []
+
+
+def test_websocket_security_with_default_authentication_classes(settings):
+    """A WebSocket route that uses BOLT_AUTHENTICATION_CLASSES documents the same security as an HTTP route."""
+    settings.BOLT_AUTHENTICATION_CLASSES = [JWTAuthentication(secret="test-secret")]
+    api = BoltAPI()
+
+    @api.websocket("/ws/stream", guards=[IsAuthenticated()])
+    async def stream(websocket: WebSocket):
+        await websocket.accept()
+
+    @api.get("/items", guards=[IsAuthenticated()])
+    async def items():
+        return []
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
+    assert schema.paths["/items"].get.security == [{"BearerAuth": []}]
+    assert schema.paths["/ws/stream"].get.security == [{"BearerAuth": []}]
 
 
 def test_websocket_summary_and_description():
