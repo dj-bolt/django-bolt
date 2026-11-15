@@ -222,7 +222,7 @@ def test_the_remaining_msgspec_types_of_a_json_body():
         "note": {},
         "raw": {},
         "nothing": {"type": "null"},
-        "blob": {"type": "string", "format": "binary"},
+        "blob": {"type": "string", "contentEncoding": "base64"},
     }
     assert components["Address"] == {
         "title": "Address",

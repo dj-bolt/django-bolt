@@ -108,6 +108,11 @@ class TestChoicesFieldDetection:
 
         assert actual_type is str
 
+    def test_null_booleanfield_accepts_none(self):
+        """A BooleanField with null=True gets None in its type, as each other null field does."""
+        assert get_msgspec_type_for_django_field(models.BooleanField(null=True)) == bool | None
+        assert get_msgspec_type_for_django_field(models.BooleanField()) is bool
+
     def test_integerfield_with_choices_generates_literal(self):
         """Test that IntegerField with choices generates Literal type."""
 

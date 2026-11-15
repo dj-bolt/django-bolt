@@ -319,6 +319,68 @@ pub fn improperly_configured(py: Python<'_>, message: String) -> PyErr {
 mod tests {
     use super::*;
 
+    /// Run `test` with a settings object that has the attributes of `code`.
+    fn with_settings(code: &std::ffi::CStr, test: impl FnOnce(DjangoSettings<'_>)) {
+        Python::initialize();
+        Python::attach(|py| {
+            let settings = py.eval(code, None, None).unwrap();
+            test(DjangoSettings { settings });
+        });
+    }
+
+    #[test]
+    fn int_up_to_accepts_0_to_the_maximum() {
+        let code = c"type('Settings', (), {'LOW': 0, 'TOP': 128, 'OVER': 129, 'FLAG': True})()";
+        with_settings(code, |settings| {
+            assert_eq!(settings.int_up_to("LOW", 128, 64).unwrap(), 0);
+            assert_eq!(settings.int_up_to("TOP", 128, 64).unwrap(), 128);
+            assert_eq!(settings.int_up_to("ABSENT", 128, 64).unwrap(), 64);
+            assert!(settings.int_up_to("OVER", 128, 64).is_err());
+            assert!(settings.int_up_to("FLAG", 128, 64).is_err());
+        });
+    }
+
+    #[test]
+    fn positive_int_accepts_1_or_more() {
+        with_settings(
+            c"type('Settings', (), {'ONE': 1, 'ZERO': 0})()",
+            |settings| {
+                assert_eq!(settings.positive_int("ONE", 8u32).unwrap(), 1);
+                assert_eq!(settings.positive_int("ABSENT", 8u32).unwrap(), 8);
+                assert!(settings.positive_int("ZERO", 8u32).is_err());
+            },
+        );
+    }
+
+    #[test]
+    fn positive_seconds_accepts_an_int_or_a_float_more_than_0() {
+        let code = c"type('Settings', (), {'INT': 2, 'FLOAT': 1.5, 'ZERO': 0, 'LESS': -1.0, \
+                     'FLAG': True, 'NAN': float('nan'), 'HUGE': 1e300, 'TEXT': '30'})()";
+        with_settings(code, |settings| {
+            let default = Duration::from_secs(30);
+            let seconds = |name| settings.positive_seconds(name, default);
+            assert_eq!(seconds("INT").unwrap(), Duration::from_secs(2));
+            assert_eq!(seconds("FLOAT").unwrap(), Duration::from_millis(1500));
+            assert_eq!(seconds("ABSENT").unwrap(), default);
+            for name in ["ZERO", "LESS", "FLAG", "NAN", "HUGE", "TEXT"] {
+                assert!(seconds(name).is_err(), "{name}");
+            }
+        });
+    }
+
+    /// An AttributeError from the code that makes the value is not a missing setting.
+    #[test]
+    fn only_an_attribute_error_for_the_setting_itself_means_missing() {
+        let code = c"type('Settings', (), {\
+                     'INNER': property(lambda self: self.helper), \
+                     'BROKEN': property(lambda self: 1 / 0)})()";
+        with_settings(code, |settings| {
+            assert!(settings.get("ABSENT").unwrap().is_none());
+            assert!(settings.get("INNER").is_err());
+            assert!(settings.get("BROKEN").is_err());
+        });
+    }
+
     #[test]
     fn parse_env_reads_a_valid_value() {
         assert_eq!(
