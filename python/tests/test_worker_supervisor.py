@@ -173,6 +173,50 @@ def test_lifetime_exceeded_recycles_worker():
     assert env.signals() == [(100, signal.SIGTERM)]
 
 
+@pytest.mark.parametrize(
+    ("limits", "age", "rss", "recycled"),
+    [
+        ({"lifetime_seconds": 60.0}, 59.9, None, False),
+        ({"lifetime_seconds": 60.0}, 60.0, None, True),
+        ({"max_rss_bytes": 100 * MIB}, 0.0, 100 * MIB, False),
+        ({"max_rss_bytes": 100 * MIB}, 0.0, 100 * MIB + 1, True),
+    ],
+)
+def test_a_worker_is_recycled_at_its_lifetime_and_above_its_rss_limit(limits, age, rss, recycled):
+    env = FakeWorkerEnv()
+    env.now = 1000.0  # The clock of the supervisor does not start at 0.
+    supervisor = make_supervisor(env, **limits)
+    supervisor.start()
+
+    env.now += age
+    env.rss[100] = rss
+    supervisor.tick()
+
+    assert env.signals() == ([(100, signal.SIGTERM)] if recycled else [])
+
+
+def test_a_worker_that_survives_sigkill_gets_one_sigkill_per_kill_timeout():
+    env = FakeWorkerEnv()
+    signals: list[tuple[int, int]] = []
+    # This kill records the signal and the worker stays. FakeWorkerEnv.kill ends the worker on SIGKILL.
+    supervisor = make_supervisor(env, kill_timeout=10.0, kill=lambda pid, signum: signals.append((pid, signum)))
+    supervisor.start()
+    supervisor.request_shutdown()
+    supervisor.tick()
+
+    env.now = 10.0
+    supervisor.tick()
+    supervisor.tick()
+    env.now = 19.9
+    supervisor.tick()
+    assert signals == [(100, signal.SIGTERM), (100, signal.SIGKILL)]
+    assert supervisor.has_draining_workers()
+
+    env.now = 20.0
+    supervisor.tick()
+    assert signals == [(100, signal.SIGTERM), (100, signal.SIGKILL), (100, signal.SIGKILL)]
+
+
 def test_at_most_one_recycle_per_tick():
     env = FakeWorkerEnv()
     supervisor = make_supervisor(env, processes=2, max_rss_bytes=100 * MIB)
@@ -264,6 +308,42 @@ def test_get_rss_bytes_reads_own_process():
     rss = get_rss_bytes(os.getpid())
     assert rss is not None
     assert rss > MIB  # a running CPython interpreter is always > 1 MiB resident
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/self/statm is the Linux ground truth")
+def test_get_rss_bytes_reads_proc_in_bytes(monkeypatch, tmp_path):
+    # No `ps` on the PATH: only the /proc reader can give a value.
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    rss = get_rss_bytes(os.getpid())
+    with open("/proc/self/statm") as statm:
+        resident_pages = int(statm.read().split()[1])
+    expected = resident_pages * os.sysconf("SC_PAGE_SIZE")
+
+    assert rss is not None, "the /proc reader gave no value, and the ps fallback hid it"
+    # The two reads are not at the same instant. A wrong unit is off by a factor of 1024.
+    assert expected * 0.8 <= rss <= expected * 1.25
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="RSS reading is POSIX-only")
+def test_get_rss_bytes_follows_the_memory_of_a_process():
+    code = "import sys; block = b'x' * (64 * 1024 * 1024); print('ready', flush=True); sys.stdin.read()"
+    small = subprocess.Popen(
+        [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    large = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        assert small.stdout.readline() == b"ready\n"
+        assert large.stdout.readline() == b"ready\n"
+        difference = get_rss_bytes(large.pid) - get_rss_bytes(small.pid)
+    finally:
+        for process in (small, large):
+            process.communicate(b"")
+
+    # The large process holds 64 MiB more. A value in KiB or in pages is far below this range.
+    assert 48 * MIB <= difference <= 96 * MIB
 
 
 def test_get_rss_bytes_returns_none_for_dead_pid():

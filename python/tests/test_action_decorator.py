@@ -350,3 +350,20 @@ def test_action_decorator_with_different_lookup_fields(api):
     data = response.json()
     assert data["featured"] is True
     assert data["article_id"] == article.id
+
+
+def test_action_handler_call_and_repr():
+    """A decorated action stays callable, and its repr names methods, kind, path and function."""
+
+    @action(methods=["get", "post"], detail=True, path="prefs")
+    def preferences(*args, **kwargs):
+        return args, kwargs
+
+    assert preferences("a", key="b") == (("a",), {"key": "b"})
+    assert repr(preferences) == "ActionHandler(GET|POST, detail, path=prefs, fn=preferences)"
+
+    @action(methods=["DELETE"], detail=False)
+    def purge():
+        return None
+
+    assert repr(purge) == "ActionHandler(DELETE, list, path=purge, fn=purge)"

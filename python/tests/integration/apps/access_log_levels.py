@@ -13,6 +13,11 @@ async def health():
     return {"status": "ok"}
 
 
+@api.get("/ok")
+async def ok():
+    return {"ok": True}
+
+
 @api.get("/gone")
 async def gone():
     raise HTTPException(404, detail="gone")
