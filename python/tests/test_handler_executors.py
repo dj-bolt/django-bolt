@@ -16,8 +16,9 @@ import msgspec
 import pytest
 from django.test import override_settings
 
-from django_bolt import BoltAPI, Depends
+from django_bolt import JSON, BoltAPI, Depends
 from django_bolt.middleware import Middleware
+from django_bolt.responses import Redirect
 from django_bolt.testing import TestClient
 from tests.test_models import Article
 
@@ -98,6 +99,12 @@ def register_routes(api: BoltAPI) -> None:
         await asyncio.sleep(0)
         return [SimpleNamespace(id=item_id, q=q, in_task=in_task())]
 
+    @api.get("/awaits/struct-list-from-tuple/{item_id}")
+    async def awaits_struct_list_from_tuple(item_id: int, *, q: str) -> list[Item]:
+        # A tuple is not a list, so the slow path validates it.
+        await asyncio.sleep(0)
+        return (item_dict(item_id, q),)
+
     @api.get("/awaits/int-list/{item_id}")
     async def awaits_int_list(item_id: int, *, q: str) -> list[int]:
         # A validated type that the inline fast path does not take.
@@ -163,6 +170,7 @@ TASK = {**ITEM, "in_task": True}
         ("/awaits/struct-from-dict/7", TASK),
         ("/awaits/struct-list/7", [TASK]),
         ("/awaits/object-list/7", [TASK]),
+        ("/awaits/struct-list-from-tuple/7", [TASK]),
         ("/awaits/int-list/7", [7, 4]),
         ("/sync/untyped/7", NO_TASK),
         ("/sync/dict/7", NO_TASK),
@@ -208,6 +216,17 @@ def register_no_param_routes(api: BoltAPI) -> None:
         await asyncio.sleep(0)
         return [item_dict(1, "none")]
 
+    @api.get("/awaits/struct-list")
+    async def awaits_struct_list() -> list[Item]:
+        await asyncio.sleep(0)
+        return [Item(id=1, q="none", in_task=in_task())]
+
+    @api.get("/awaits/struct-list-from-tuple")
+    async def awaits_struct_list_from_tuple() -> list[Item]:
+        # A tuple is not a list, so the slow path validates it.
+        await asyncio.sleep(0)
+        return (item_dict(1, "none"),)
+
     @api.get("/sync/untyped")
     def sync_untyped():
         return item_dict(1, "none")
@@ -248,6 +267,8 @@ def register_no_param_routes(api: BoltAPI) -> None:
         ("/awaits/struct", {"id": 1, "q": "none", "in_task": True}),
         ("/awaits/object-list", [{"id": 1, "q": "none", "in_task": True}]),
         ("/awaits/untyped-list", [{"id": 1, "q": "none", "in_task": True}]),
+        ("/awaits/struct-list", [{"id": 1, "q": "none", "in_task": True}]),
+        ("/awaits/struct-list-from-tuple", [{"id": 1, "q": "none", "in_task": True}]),
         ("/sync/untyped", {"id": 1, "q": "none", "in_task": False}),
         ("/sync/untyped-list", [{"id": 1, "q": "none", "in_task": False}]),
         ("/sync/dict", {"id": 1, "q": "none", "in_task": False}),
@@ -340,6 +361,43 @@ def test_an_async_handler_with_no_await_has_a_running_loop():
         assert response.status_code == 200, response.text
         assert response.json() == {"scheduled": True}
         assert client.get("/ran").json() == ["later"]
+
+
+@pytest.mark.parametrize("middleware", [[], [PassThrough]], ids=["sync-dispatch", "async-executor"])
+@pytest.mark.parametrize(
+    ("declared", "options"),
+    [(dict, {}), (list[Item], {"validate_response": False})],
+    ids=["dict", "list-no-validation"],
+)
+def test_a_route_with_a_json_type_can_return_a_response_object(middleware, declared, options):
+    """A route with the response type ``dict`` can answer with a response object, as a route with no type can."""
+    api = BoltAPI(middleware=middleware)
+
+    @api.get("/async", response_model=declared, **options)
+    async def async_no_params():
+        return JSON({"created": True}, status_code=201)
+
+    @api.get("/async/{item_id}", response_model=declared, **options)
+    async def async_with_params(item_id: int):
+        return Redirect(f"/items/{item_id}")
+
+    @api.get("/sync", response_model=declared, **options)
+    def sync_no_params():
+        return JSON({"created": True}, status_code=201)
+
+    @api.get("/sync/{item_id}", response_model=declared, **options)
+    def sync_with_params(item_id: int):
+        return Redirect(f"/items/{item_id}")
+
+    with TestClient(api) as client:
+        for path in ("/async", "/sync"):
+            response = client.get(path)
+            assert response.status_code == 201, response.text
+            assert response.json() == {"created": True}
+
+            response = client.get(f"{path}/7", follow_redirects=False)
+            assert response.status_code == 307, response.text
+            assert response.headers["location"] == "/items/7"
 
 
 def titles(prefix: str = ""):

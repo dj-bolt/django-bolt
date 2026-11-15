@@ -870,6 +870,59 @@ def test_options_on_nonexistent_route(client):
     assert response.status_code == 404
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "allow"),
+    [
+        ("POST", "/plain", "GET, OPTIONS"),
+        ("HEAD", "/plain", "GET, OPTIONS"),
+        ("PATCH", "/plain", "GET, OPTIONS"),
+        ("PUT", "/items/3", "GET, DELETE, OPTIONS"),
+        ("POST", "/files/a/b.txt", "GET, OPTIONS"),
+        # Each form of a %XX escape is the same route path.
+        ("POST", "/%C3%BC", "GET, OPTIONS"),
+        ("POST", "/%c3%bc", "GET, OPTIONS"),
+        ("POST", "/pl%61in", "GET, OPTIONS"),
+        ("PUT", "/items/%33", "GET, DELETE, OPTIONS"),
+    ],
+)
+def test_wrong_method_on_a_route_path_answers_405_with_allow(method, path, allow):
+    """RFC 9110 15.5.6: a path with routes for other methods answers 405, and Allow lists them."""
+    api = BoltAPI()
+
+    @api.get("/plain")
+    async def get_plain():
+        return {"ok": True}
+
+    @api.get("/items/{item_id}")
+    async def get_item(item_id: int):
+        return {"item_id": item_id}
+
+    @api.delete("/items/{item_id}")
+    async def delete_item(item_id: int):
+        return {"item_id": item_id}
+
+    @api.get("/files/{file_path:path}")
+    async def get_file(file_path: str):
+        return {"file_path": file_path}
+
+    @api.get("/ü")
+    async def get_non_ascii():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        response = client.request(method, path)
+        assert response.status_code == 405
+        assert response.headers["allow"] == allow
+        assert response.headers["content-type"] == "application/json"
+        if method != "HEAD":
+            assert response.json() == {"detail": "Method Not Allowed"}
+        # The right method still answers, and a path with no route is still a 404.
+        assert client.get(path).status_code == 200
+        missing = client.request(method, "/no-route")
+        assert missing.status_code == 404
+        assert "allow" not in missing.headers
+
+
 def test_explicit_options_handler():
     """Test that explicit OPTIONS handler overrides automatic behavior"""
     api = BoltAPI()

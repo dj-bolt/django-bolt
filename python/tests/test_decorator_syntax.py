@@ -4,6 +4,8 @@ Tests for decorator syntax (@api.view and @api.viewset).
 This test suite verifies that the decorator pattern works correctly.
 """
 
+import functools
+
 import msgspec
 import pytest
 
@@ -69,6 +71,42 @@ def test_view_decorator_with_multiple_methods(api):
     response = client.post("/items", json={"name": "test"})
     assert response.status_code == 200
     assert response.json()["created"] is True
+
+
+class _AsyncCallable:
+    async def __call__(self, q: int = 0):
+        """Answer with the query value."""
+        return {"kind": "async", "q": q}
+
+
+class _SyncCallable:
+    def __call__(self, q: int = 0):
+        return {"kind": "sync", "q": q}
+
+
+@pytest.mark.parametrize(("handler", "kind"), [(_AsyncCallable(), "async"), (_SyncCallable(), "sync")])
+def test_an_object_with_call_is_a_route_handler(api, handler, kind):
+    """The route registers the bound __call__ method, and the decorator returns the object."""
+    assert api.get("/call")(handler) is handler
+
+    with TestClient(api) as client:
+        response = client.get("/call?q=5")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"kind": kind, "q": 5}
+        assert client.get("/call?q=x").status_code == 422
+
+
+def test_a_partial_as_route_handler_raises_a_clear_error(api):
+    async def handler(request, k: int = 1):
+        return {"k": k}
+
+    with pytest.raises(TypeError, match="A route handler cannot be a functools.partial"):
+        api.get("/partial")(functools.partial(handler, k=2))
+
+
+def test_a_route_handler_that_is_not_callable_raises_a_clear_error(api):
+    with pytest.raises(TypeError, match="A route handler must be callable, not str 'handler'"):
+        api.get("/text")("handler")
 
 
 @pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete", "head", "options", "query"])
@@ -170,6 +208,71 @@ def test_viewset_decorator_syntax(api):
     assert response.status_code == 200
     data = response.json()
     assert data["title"] == "Test Article"
+
+
+def _item_viewset():
+    class Items(ViewSet):
+        async def list(self, request):
+            return {"action": "list"}
+
+        async def retrieve(self, request, pk: int):
+            return {"action": "retrieve", "pk": pk}
+
+        @action(methods=["GET"], detail=True)
+        async def detail_action(self, request, pk: int):
+            return {"action": "detail", "pk": pk}
+
+        @action(methods=["GET"], detail=False)
+        async def collection_action(self, request):
+            return {"action": "collection"}
+
+    return Items
+
+
+@pytest.mark.parametrize(
+    ("trailing_slash", "routes"),
+    [
+        ("strip", {"/items", "/items/{pk}", "/items/{pk}/detail_action", "/items/collection_action"}),
+        ("append", {"/items/", "/items/{pk}/", "/items/{pk}/detail_action/", "/items/collection_action/"}),
+        # "keep" does no normalization, so each route keeps the slash of the viewset path.
+        ("keep", {"/items/", "/items/{pk}/", "/items/{pk}/detail_action/", "/items/collection_action/"}),
+    ],
+)
+def test_a_viewset_path_with_a_trailing_slash_gives_paths_with_single_slashes(trailing_slash, routes):
+    api = BoltAPI(trailing_slash=trailing_slash)
+    api.viewset("/items/")(_item_viewset())
+
+    assert {path for _method, path, _id, _handler in api._routes} == routes
+    with TestClient(api) as client:
+        slash = "" if trailing_slash == "strip" else "/"
+        assert client.get(f"/items{slash}").json() == {"action": "list"}
+        assert client.get(f"/items/7{slash}").json() == {"action": "retrieve", "pk": 7}
+        assert client.get(f"/items/7/detail_action{slash}").json() == {"action": "detail", "pk": 7}
+        assert client.get(f"/items/collection_action{slash}").json() == {"action": "collection"}
+
+
+def test_a_viewset_path_with_no_trailing_slash_keeps_its_paths():
+    api = BoltAPI(trailing_slash="keep")
+    api.viewset("/items")(_item_viewset())
+
+    assert {path for _method, path, _id, _handler in api._routes} == {
+        "/items",
+        "/items/{pk}",
+        "/items/{pk}/detail_action",
+        "/items/collection_action",
+    }
+
+
+def test_view_with_an_empty_methods_list_raises(api):
+    """An empty list registered no route, with no error."""
+
+    class Health(APIView):
+        async def get(self, request):
+            return {"status": "healthy"}
+
+    with pytest.raises(ValueError, match="methods of @api.view\\(\\) is empty"):
+        api.view("/health", methods=[])(Health)
+    assert api._routes == []
 
 
 @pytest.mark.django_db(transaction=True)
