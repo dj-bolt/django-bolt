@@ -554,6 +554,9 @@ class CursorPagination(PaginationBase):
     More efficient than offset-based pagination for large datasets
     as it doesn't require counting all records or scanning through skipped records.
 
+    The handler must return a Django QuerySet. The cursor is a filter on the database.
+    A list raises TypeError.
+
     Query parameters:
         - cursor: Opaque cursor string (optional)
         - page_size: Items per page (optional)
@@ -642,7 +645,14 @@ class CursorPagination(PaginationBase):
         ordering = self.ordering
         is_descending = ordering.startswith("-")
         ordering_field = ordering.lstrip("-")
-        pk_field = queryset.model._meta.pk
+        try:
+            pk_field = queryset.model._meta.pk
+        except AttributeError:
+            # A cursor is a filter on the database. A list has no such filter.
+            raise TypeError(
+                f"CursorPagination needs a Django QuerySet, and the handler returned {type(queryset).__name__}. "
+                f"Use PageNumberPagination or LimitOffsetPagination for a list."
+            ) from None
 
         # Rows can share an ordering value. Order by the primary key too, so that
         # a page that ends inside such a group continues at the next row.
@@ -731,7 +741,8 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     """
     Decorator to apply pagination to a route handler.
 
-    The decorated handler should return a Django QuerySet or list.
+    The decorated handler should return a Django QuerySet. For PageNumberPagination
+    and LimitOffsetPagination, it can also return a list. CursorPagination raises TypeError for a list.
     The decorator will automatically apply pagination and return a PaginatedResponse.
 
     When used with response_model or return type annotation like list[UserSerializer],
