@@ -96,6 +96,8 @@ def test_revoked_token_is_rejected_after_logout(api):
         rejected = client.get("/protected", headers=headers)
         assert rejected.status_code == 401, rejected.text
         assert rejected.json() == {"detail": "Token has been revoked"}
+        # The challenge of each 401, as for a token that Rust rejects.
+        assert rejected.headers["www-authenticate"] == "Bearer"
 
 
 @pytest.mark.django_db
@@ -172,6 +174,39 @@ def test_revocation_works_with_django_cache_store():
         assert client.get("/p", headers=headers).status_code == 200
         assert client.post("/logout", headers=headers).status_code == 200
         assert client.get("/p", headers=headers).status_code == 401
+
+
+@pytest.mark.django_db
+def test_revoked_token_stays_rejected_inside_the_leeway():
+    """The backend accepts a token until ``exp + leeway``. A logout must hold for that time."""
+    api = BoltAPI()
+    store = DjangoCacheRevocation(cache_alias="default")
+    auth = JWTAuthentication(secret=SECRET, revocation_store=store)
+
+    @api.get("/p", auth=[auth], guards=[IsAuthenticated()])
+    async def p(request):
+        return {"ok": True}
+
+    @api.post("/logout", auth=[auth], guards=[IsAuthenticated()])
+    async def logout(request):
+        claims = request["context"]["auth_claims"]
+        await store.revoke(claims["jti"], exp=claims.get("exp"))
+        return {"ok": True}
+
+    # The token is 10 seconds after its ``exp``. The default leeway of 60 seconds still accepts it.
+    token = jwt.encode(
+        {"sub": "1", "jti": uuid.uuid4().hex, "exp": int(time.time()) - 10},
+        SECRET,
+        algorithm="HS256",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with TestClient(api) as client:
+        assert client.get("/p", headers=headers).status_code == 200
+        assert client.post("/logout", headers=headers).status_code == 200
+        rejected = client.get("/p", headers=headers)
+        assert rejected.status_code == 401, rejected.text
+        assert rejected.json() == {"detail": "Token has been revoked"}
 
 
 # ---------------------------------------------------------------------------

@@ -101,6 +101,13 @@ def test_compression_disabled():
     assert response.json() == {"data": "x" * 1000}
 
 
+@pytest.mark.parametrize("value", [True, {"backend": "gzip"}, "gzip"], ids=["true", "dict", "str"])
+def test_compression_argument_of_a_wrong_type_raises(value):
+    """`compression` takes a CompressionConfig, None or False. Each other value raises at once."""
+    with pytest.raises(TypeError, match="compression must be a CompressionConfig, None or False"):
+        BoltAPI(compression=value)
+
+
 def test_compression_custom_config():
     """Test custom compression configuration."""
     api = BoltAPI(
