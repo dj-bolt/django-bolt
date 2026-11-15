@@ -1026,6 +1026,13 @@ class SchemaGenerator:
             if dependency_body is not None:
                 body_param, body_type = dependency_body.name, dependency_body.annotation
 
+        body_required = True
+        if not body_param or not body_type:
+            # A JSON body that is not a struct, such as a list of structs with Body().
+            body_field = next((f for f in fields if f.source == "body"), None)
+            if body_field is not None:
+                body_param, body_type, body_required = body_field.name, body_field.annotation, body_field.is_required
+
         if not body_param or not body_type:
             # Check for form/file fields
             form_fields = [f for f in fields if f.source in ("form", "file")]
@@ -1088,7 +1095,7 @@ class SchemaGenerator:
             content={
                 "application/json": OpenAPIMediaType(schema=schema),
             },
-            required=True,
+            required=body_required,
         )
 
     def _extract_responses(
