@@ -56,6 +56,30 @@ def test_ready_made_cookie_lifecycle_routes():
         assert client.cookies.get("refresh_token") is None
 
 
+def test_failed_login_has_the_challenge_of_the_token_routes():
+    """RFC 9110 15.5.2: a 401 has a WWW-Authenticate header. The login route has no auth backend."""
+    api = BoltAPI()
+
+    async def nobody(request, credentials):
+        return None
+
+    JWTAuthViews(
+        store=InMemoryRevocation(),
+        secret="a-secure-test-secret-that-is-long-enough",
+        credential_validator=nobody,
+    ).register(api)
+
+    with TestClient(api) as client:
+        denied = client.post("/auth/login", json={"username": "alice", "password": "wrong"})
+        no_token = client.post("/auth/refresh", headers={"Sec-Fetch-Site": "none"})
+
+    assert denied.status_code == 401
+    assert denied.json() == {"detail": "Invalid credentials"}
+    assert no_token.status_code == 401
+    # The tokens of the views are in cookies, so the scheme is the scheme of a cookie backend.
+    assert denied.headers["www-authenticate"] == no_token.headers["www-authenticate"] == "ApiKey"
+
+
 def test_auth_views_are_documented_in_openapi():
     api = BoltAPI()
     JWTAuthViews(store=InMemoryRevocation(), secret="a-secure-test-secret-that-is-long-enough").register(api)

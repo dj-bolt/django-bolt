@@ -395,6 +395,10 @@ flows.
 `/auth/logout` and `/auth/logout-all` accept only a refresh token that
 `/auth/refresh` also accepts. A used, revoked or old-version token gets a 401.
 
+`/auth/login` answers 401 for wrong credentials. This 401 has the
+`WWW-Authenticate` header of the token routes, although the login route has no
+auth backend.
+
 ### Issuing a pair
 
 Call `create_token_pair()` once the user has proved who they are — by
@@ -833,7 +837,7 @@ HTTP/1.1 401 Unauthorized
 www-authenticate: Bearer, ApiKey
 ```
 
-Bolt builds the value one time, when it registers the route. A 401 that a handler, a dependency or a middleware raises on the route gets the same header. A `WWW-Authenticate` header that your code sets stays as it is. A route with no auth backend has no challenge, so Bolt adds no header to a 401 of its handler.
+Bolt builds the value one time, when it registers the route. A 401 that a handler, a dependency or a middleware raises on the route gets the same header. A `WWW-Authenticate` header that your code sets stays as it is. A route with no auth backend has no challenge, so Bolt adds no header to a 401 of its handler. Set the header in the exception of such a route, for example `Unauthorized(detail="Invalid credentials", headers={"WWW-Authenticate": "Bearer"})` in your own login route.
 
 To name another scheme, override `challenge_scheme` in a subclass of the backend:
 
