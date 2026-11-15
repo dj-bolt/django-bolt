@@ -221,8 +221,10 @@ class Token:
             encoded_token: The JWT string to decode
             secret: Secret key for validation
             algorithm: Expected algorithm
-            audience: Expected audience (if any)
-            issuer: Expected issuer (if any)
+            audience: Expected audience. ``None`` or an empty string asks for
+                no check of the ``aud`` claim.
+            issuer: Expected issuer. ``None`` or an empty string asks for no
+                check of the ``iss`` claim.
             verify_exp: Verify expiration time
             verify_nbf: Verify not-before time
 
@@ -237,8 +239,8 @@ class Token:
                 "verify_signature": True,
                 "verify_exp": verify_exp,
                 "verify_nbf": verify_nbf,
-                "verify_aud": audience is not None,
-                "verify_iss": issuer is not None,
+                "verify_aud": bool(audience),
+                "verify_iss": bool(issuer),
             }
 
             payload = jwt.decode(

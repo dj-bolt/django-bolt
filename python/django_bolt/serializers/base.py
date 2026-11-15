@@ -1029,6 +1029,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         try:
             return msgspec.convert(data, type=cls)
         except MsgspecValidationError as e:
+            # msgspec wraps the RequestValidationError of our validators. Raise it
+            # with its error list, as model_validate_json() does.
+            if isinstance(e.__cause__, RequestValidationError):
+                raise e.__cause__ from e
+
             # Collect all errors by validating field-by-field (Litestar approach)
             if isinstance(data, dict):
                 errors = cls._collect_msgspec_errors(data)
@@ -1741,7 +1746,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         Convert serializer to a dictionary.
 
         Args:
-            exclude_unset: If True, exclude fields with default values
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
 
         Returns:
             Dictionary representation of the serializer
@@ -1752,7 +1757,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         """
         result = {}
         for field_name in self.__struct_fields__:
-            result[field_name] = getattr(self, field_name)
+            value = getattr(self, field_name)
+            if exclude_unset and value is msgspec.UNSET:
+                continue
+            result[field_name] = value
         return result
 
     def to_model(self, model_class: type[Model]) -> Model:
@@ -1949,8 +1957,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Copy field validators for included fields
         for field_name, validators in cls.__field_validators__.items():
             if field_name in fields_set:
-                for validator in validators:
-                    class_dict[f"_validator_{field_name}"] = validator
+                for index, validator in enumerate(validators):
+                    class_dict[f"_validator_{field_name}_{index}"] = validator
 
         # Copy Config with adjusted field_sets (only include subsets of our fields)
         parent_meta = getattr(cls, "Config", None)
@@ -2157,7 +2165,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         Args:
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys (not yet implemented)
 
@@ -2175,10 +2183,15 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
             if cls.__orm_state_check_fields__:
                 self._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
-            # to_builtins handles rename and tag injection natively; asdict is
-            # cheaper when neither applies, so keep the split for the common case.
-            if cls.__has_rename__ or cls.__tag_value__ is not None:
-                return msgspec.to_builtins(self)
+            # asdict is cheapest when the keys are the field names. For a rename,
+            # pair the encoded names with the values. The values stay as they are,
+            # as on the slow path.
+            if cls.__tag_value__ is not None:
+                result = {cls.__tag_field__: cls.__tag_value__}
+                result.update(zip(cls.__struct_encode_fields__, msgspec_structs.astuple(self), strict=True))
+                return result
+            if cls.__has_rename__:
+                return dict(zip(cls.__struct_encode_fields__, msgspec_structs.astuple(self), strict=True))
             return msgspec_structs.asdict(self)
 
         # SLOW PATH: Need special handling.
@@ -2231,6 +2244,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
             # Skip None values if exclude_none
             if exclude_none and value is None:
+                continue
+
+            if exclude_unset and value is msgspec.UNSET:
                 continue
 
             if exclude_defaults and spec.default_value is not _MISSING and value == spec.default_value:
@@ -2310,7 +2326,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         Args:
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 
@@ -2341,7 +2357,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         Args:
             instances: Iterable of serializer instances to dump
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 
@@ -2360,9 +2376,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if cls.__orm_state_check_fields__:
                 for instance in instances_list:
                     instance._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
-            if cls.__has_rename__ or cls.__tag_value__ is not None:
-                _to_builtins = msgspec.to_builtins
-                return [_to_builtins(instance) for instance in instances_list]
+            _astuple = msgspec_structs.astuple
+            if cls.__tag_value__ is not None:
+                keys = (cls.__tag_field__, *cls.__struct_encode_fields__)
+                tag = cls.__tag_value__
+                return [dict(zip(keys, (tag, *_astuple(instance)), strict=True)) for instance in instances_list]
+            if cls.__has_rename__:
+                keys = cls.__struct_encode_fields__
+                return [dict(zip(keys, _astuple(instance), strict=True)) for instance in instances_list]
             _asdict = msgspec_structs.asdict
             return [_asdict(instance) for instance in instances_list]
 
@@ -2397,7 +2418,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         Args:
             instances: Iterable of serializer instances to dump
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 
@@ -2512,7 +2533,7 @@ class SerializerView(Iterable[T]):
         Args:
             instance: Serializer instance to dump
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 
@@ -2545,7 +2566,7 @@ class SerializerView(Iterable[T]):
         Args:
             instances: Iterable of serializer instances
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 

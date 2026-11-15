@@ -76,6 +76,42 @@ class TestAuthenticationClasses:
         assert "admin-key" in metadata["key_permissions"]
         assert "users.create" in metadata["key_permissions"]["admin-key"]
 
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"api_keys": {""}}, "api_keys must not contain an empty key"),
+            ({"api_keys": {"key-1", ""}}, "api_keys must not contain an empty key"),
+            ({"api_keys": "sk-prod-123abc"}, "api_keys must be a set, list or tuple of str, not str"),
+            ({"api_keys": ""}, "api_keys must be a set, list or tuple of str, not str"),
+            ({"api_keys": b"sk-prod-123abc"}, "api_keys must be a set, list or tuple of str, not bytes"),
+            ({"api_keys": (key for key in ["key-1"])}, "api_keys must be a set, list or tuple of str, not generator"),
+            ({"api_keys": {b"key-1"}}, "each key in api_keys must be a str, not bytes"),
+            ({"api_keys": [None]}, "each key in api_keys must be a str, not NoneType"),
+            (
+                {"api_keys": {"key-1"}, "key_permissions": {"key-1": "read"}},
+                "key_permissions['key-1'] must be a set, list or tuple of str, not str",
+            ),
+            (
+                {"api_keys": {"key-1"}, "key_permissions": {"key-1": [1]}},
+                "each permission in key_permissions['key-1'] must be a str, not int",
+            ),
+            (
+                {"api_keys": {"key-1"}, "key_permissions": [("key-1", ["read"])]},
+                "key_permissions must be a dict, not list",
+            ),
+            (
+                {"api_keys": {"key-1"}, "key_permissions": {"key-2": ["read"]}},
+                "key_permissions has the key 'key-2', which is not in api_keys",
+            ),
+            ({"key_permissions": {"key-1": ["read"]}}, "key_permissions has the key 'key-1', which is not in api_keys"),
+        ],
+    )
+    def test_api_key_authentication_rejects_an_unsafe_configuration(self, kwargs, message):
+        with pytest.raises(ImproperlyConfigured) as error:
+            APIKeyAuthentication(**kwargs)
+
+        assert str(error.value) == f"APIKeyAuthentication {message}."
+
 
 class TestPermissionGuards:
     """Test the guard classes: AllowAny, IsAuthenticated, and Requires."""

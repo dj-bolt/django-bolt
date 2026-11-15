@@ -13,6 +13,7 @@ from django.core.exceptions import PermissionDenied
 from django_bolt import BoltAPI
 from django_bolt.error_handlers import (
     BoltError,
+    bolt_error_from_exception,
     format_error_response,
     generic_exception_handler,
     handle_exception,
@@ -918,6 +919,18 @@ class TestResponseValidationDisclosure:
         logged = _validation_log_messages(caplog)
         assert len(logged) == 1
         assert "Response validation failed for Item" in logged[0]
+
+    @pytest.mark.parametrize(("setting", "debug"), [(False, True), (True, False)])
+    def test_the_debug_argument_decides_before_the_debug_setting(self, settings, setting, debug):
+        """A caller that gives ``debug`` gets the errors only when it is true."""
+        settings.DEBUG = setting
+        errors = [{"loc": ["response", "id"], "msg": "Expected `int`, got `str`", "type": "validation_error"}]
+
+        error = bolt_error_from_exception(ResponseValidationError(errors), debug=debug)
+
+        assert (error.status, error.kind, error.detail) == (500, "response_validation", "Response validation error")
+        assert error.errors == (errors if debug else [])
+        assert error.exception.errors() == errors
 
     def test_formatter_gets_the_errors_when_debug_is_on(self, settings):
         settings.DEBUG = True
