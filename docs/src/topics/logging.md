@@ -395,7 +395,7 @@ GET /items/7 200 0.4ms
 
 This includes a response that Bolt gives before the handler runs.
 Examples are a 401 or a 403 from authentication or a guard, a 429 from a rate limit, and a 422 or a 400 from request validation.
-Bolt also writes a line for two answers about a route path: the 308 redirect to the other slash form, and the automatic `OPTIONS` answer.
+Bolt also writes a line for three answers about a route path: the 308 redirect to the other slash form, the automatic `OPTIONS` answer, and the 405 for a method that the path does not have.
 With an `error_formatter`, the line has the status of the formatted response.
 
 Bolt writes no line for a request with no route (404), for a mounted ASGI app or MCP server, for a static or media file, and for a [native route](native-routes.md).

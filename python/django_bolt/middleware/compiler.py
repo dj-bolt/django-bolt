@@ -20,7 +20,7 @@ try:
 except ImportError:  # Django 5.2 has no django.utils.csp
     build_policy = None
 
-from ..auth.backends import BaseAuthentication, get_default_authentication_classes
+from ..auth.backends import BaseAuthentication, get_default_authentication_classes, www_authenticate_challenge
 from ..auth.guards import GUARD_TYPES, get_default_permission_classes, guards_need_user
 from ..params import Param
 from ..typing import is_msgspec_struct, resolve_type_alias, unwrap_optional
@@ -174,7 +174,8 @@ def compile_middleware_meta(
             all_middleware.append(mw_dict)
 
     # Compile authentication backends
-    auth_backends = [auth_backend.to_metadata() for auth_backend in route_auth_backends(auth, guards)]
+    backends = route_auth_backends(auth, guards)
+    auth_backends = [auth_backend.to_metadata() for auth_backend in backends]
 
     # Compile guards/permissions
     guard_list = []
@@ -204,6 +205,8 @@ def compile_middleware_meta(
 
     if auth_backends:
         result["auth_backends"] = auth_backends
+        # Rust sends this value in each 401 of the route.
+        result["www_authenticate"] = www_authenticate_challenge(backends)
 
     if guard_list:
         result["guards"] = guard_list

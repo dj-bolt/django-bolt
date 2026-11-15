@@ -148,8 +148,71 @@ impl Default for CorsConfig {
     }
 }
 
+/// Compile the origin patterns of a CORS config. `name` is the setting or the
+/// option that holds them. A pattern that does not compile is an error: a
+/// dropped pattern changes which origins the server allows.
+fn compile_origin_regexes(name: &str, patterns: &[String]) -> Result<Vec<Regex>, String> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            Regex::new(pattern).map_err(|_| {
+                format!("{name} holds a pattern that is not a valid regex: {pattern:?}")
+            })
+        })
+        .collect()
+}
+
+/// Join the names of a CORS list into one header value. `name` is the setting
+/// or the option that holds them. A name that cannot be in an HTTP header is
+/// an error: without the header value, the response has no such header.
+fn cors_header_value(name: &str, items: &[String]) -> Result<(String, HeaderValue), String> {
+    for item in items {
+        if HeaderValue::from_str(item).is_err() {
+            return Err(format!(
+                "{name} holds a value that is not valid in an HTTP header: {item:?}"
+            ));
+        }
+    }
+    let joined = items.join(", ");
+    let header = HeaderValue::from_str(&joined).map_err(|_| {
+        format!("{name} gives a value that is not valid in an HTTP header: {joined:?}")
+    })?;
+    Ok((joined, header))
+}
+
 impl CorsConfig {
-    /// Create CorsConfig from Django settings (django-cors-headers compatible)
+    /// Set the allowed methods and their header value.
+    fn set_methods(&mut self, name: &str, methods: Vec<String>) -> Result<(), String> {
+        let (joined, header) = cors_header_value(name, &methods)?;
+        self.methods_str = joined;
+        self.methods_header = Some(header);
+        self.methods = methods;
+        Ok(())
+    }
+
+    /// Set the allowed request headers and their header value.
+    fn set_headers(&mut self, name: &str, headers: Vec<String>) -> Result<(), String> {
+        let (joined, header) = cors_header_value(name, &headers)?;
+        self.headers_str = joined;
+        self.headers_header = Some(header);
+        self.headers = headers;
+        Ok(())
+    }
+
+    /// Set the exposed response headers. An empty list sends no header.
+    fn set_expose_headers(&mut self, name: &str, expose: Vec<String>) -> Result<(), String> {
+        let (joined, header) = cors_header_value(name, &expose)?;
+        self.expose_headers_str = joined;
+        self.expose_headers_header = (!expose.is_empty()).then_some(header);
+        self.expose_headers = expose;
+        Ok(())
+    }
+
+    /// Create CorsConfig from Django settings (django-cors-headers compatible).
+    ///
+    /// An origin pattern that does not compile, or a method or header name
+    /// that cannot be in an HTTP header, gives `Err` with a message that names
+    /// the setting and the value.
     #[expect(
         clippy::too_many_arguments,
         reason = "one argument for each django-cors-headers setting"
@@ -163,20 +226,10 @@ impl CorsConfig {
         allow_headers: Option<Vec<String>>,
         expose_headers: Option<Vec<String>>,
         max_age: Option<u32>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         // Compile origin regex patterns at startup
-        let compiled_origin_regexes = origin_regexes
-            .iter()
-            .filter_map(|pattern| {
-                Regex::new(pattern).ok().or_else(|| {
-                    eprintln!(
-                        "[django-bolt] Warning: Invalid CORS origin regex pattern: {}",
-                        pattern
-                    );
-                    None
-                })
-            })
-            .collect();
+        let compiled_origin_regexes =
+            compile_origin_regexes("CORS_ALLOWED_ORIGIN_REGEXES", &origin_regexes)?;
 
         let mut config = CorsConfig {
             // Build origin set for O(1) lookups
@@ -190,25 +243,15 @@ impl CorsConfig {
         };
 
         if let Some(methods) = allow_methods {
-            config.methods_str = methods.join(", ");
-            config.methods_header = HeaderValue::from_str(&config.methods_str).ok();
-            config.methods = methods;
+            config.set_methods("CORS_ALLOW_METHODS", methods)?;
         }
 
         if let Some(headers) = allow_headers {
-            config.headers_str = headers.join(", ");
-            config.headers_header = HeaderValue::from_str(&config.headers_str).ok();
-            config.headers = headers;
+            config.set_headers("CORS_ALLOW_HEADERS", headers)?;
         }
 
         if let Some(expose) = expose_headers {
-            config.expose_headers_str = expose.join(", ");
-            config.expose_headers_header = if !expose.is_empty() {
-                HeaderValue::from_str(&config.expose_headers_str).ok()
-            } else {
-                None
-            };
-            config.expose_headers = expose;
+            config.set_expose_headers("CORS_EXPOSE_HEADERS", expose)?;
         }
 
         if let Some(age) = max_age {
@@ -217,7 +260,7 @@ impl CorsConfig {
             config.max_age = age;
         }
 
-        config
+        Ok(config)
     }
 }
 
@@ -528,6 +571,9 @@ impl RouteMetadataStore {
 #[derive(Debug, Clone)]
 pub struct RouteMetadata {
     pub auth_backends: Vec<AuthBackend>,
+    /// The `WWW-Authenticate` value of a 401 of this route. Python builds it
+    /// one time from the auth backends. None for a route with no backend.
+    pub www_authenticate: Option<HeaderValue>,
     /// Cookie names whose presence subjects unsafe requests to the CSRF
     /// origin check. Precomputed from `auth_backends` at registration so
     /// the hot path never re-scans the backend list.
@@ -671,6 +717,25 @@ fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<Stat
         .ok_or_else(|| wrong_type(py_meta, key, "an int from 100 to 999", &value))
 }
 
+/// Read the `WWW-Authenticate` value that Python built for a route or a mount.
+///
+/// A missing key or None gives None. A value that is not a header value
+/// stops startup.
+pub fn parse_challenge(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<HeaderValue>> {
+    let Some(value) = dict.get_item(key)?.filter(|value| !value.is_none()) else {
+        return Ok(None);
+    };
+    let text: String = value
+        .extract()
+        .map_err(|_| PyTypeError::new_err(format!("Metadata '{key}' must be a str or None")))?;
+    let challenge = HeaderValue::from_str(&text).map_err(|_| {
+        PyValueError::new_err(format!(
+            "Invalid '{key}' metadata: {text:?} is not an HTTP header value"
+        ))
+    })?;
+    Ok(Some(challenge))
+}
+
 impl RouteMetadata {
     /// Parse Python metadata dict into strongly-typed Rust metadata
     pub fn from_python(py_meta: &Bound<'_, PyDict>, py: Python) -> PyResult<Self> {
@@ -732,6 +797,8 @@ impl RouteMetadata {
                 auth_backends.push(parse_auth_backend(&backend_dict, py)?);
             }
         }
+
+        let www_authenticate = parse_challenge(py_meta, "www_authenticate")?;
 
         // Parse guards
         if let Some(guard_list) = py_meta.get_item("guards")?
@@ -884,6 +951,7 @@ impl RouteMetadata {
 
         Ok(RouteMetadata {
             auth_backends,
+            www_authenticate,
             guards,
             skip,
             cors_config,
@@ -995,19 +1063,10 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<
                 "cors origin_regexes holds an empty pattern, which matches every origin",
             ));
         }
-        config.origin_regexes = regex_patterns.clone();
-        config.compiled_origin_regexes = regex_patterns
-            .iter()
-            .filter_map(|pattern| {
-                Regex::new(pattern).ok().or_else(|| {
-                    eprintln!(
-                        "[django-bolt] Warning: Invalid route-level CORS origin regex pattern: {}",
-                        pattern
-                    );
-                    None
-                })
-            })
-            .collect();
+        config.compiled_origin_regexes =
+            compile_origin_regexes("cors origin_regexes", &regex_patterns)
+                .map_err(PyValueError::new_err)?;
+        config.origin_regexes = regex_patterns;
     }
 
     // A value that is present must be valid. A bad value must stop startup,
@@ -1026,26 +1085,24 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<
             .is_true();
     }
 
+    // A name that cannot be in an HTTP header raises ValueError, as an invalid
+    // origin pattern does.
     if let Some(methods) = cors_name_list(dict, py, "methods")? {
-        config.methods_str = methods.join(", ");
-        config.methods_header = HeaderValue::from_str(&config.methods_str).ok();
-        config.methods = methods;
+        config
+            .set_methods("cors methods", methods)
+            .map_err(PyValueError::new_err)?;
     }
 
     if let Some(headers) = cors_name_list(dict, py, "headers")? {
-        config.headers_str = headers.join(", ");
-        config.headers_header = HeaderValue::from_str(&config.headers_str).ok();
-        config.headers = headers;
+        config
+            .set_headers("cors headers", headers)
+            .map_err(PyValueError::new_err)?;
     }
 
     if let Some(expose) = cors_name_list(dict, py, "expose_headers")? {
-        config.expose_headers_str = expose.join(", ");
-        config.expose_headers_header = if !expose.is_empty() {
-            HeaderValue::from_str(&config.expose_headers_str).ok()
-        } else {
-            None
-        };
-        config.expose_headers = expose;
+        config
+            .set_expose_headers("cors expose_headers", expose)
+            .map_err(PyValueError::new_err)?;
     }
 
     if let Some(value) = dict.get("max_age").map(|value| value.bind(py))
@@ -1804,7 +1861,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let default = CorsConfig::default();
         assert_eq!(config.origins, ["https://a.test", "https://b.test"]);
         assert!(config.origin_set.contains("https://a.test"));
@@ -1832,7 +1890,8 @@ mod tests {
             Some(strings(&["X-One", "X-Two"])),
             Some(strings(&["X-Out"])),
             Some(120),
-        );
+        )
+        .unwrap();
         assert!(config.allow_all_origins && config.credentials);
         assert_eq!(config.methods, ["GET", "POST"]);
         assert_eq!(config.methods_str, "GET, POST");
@@ -1858,7 +1917,8 @@ mod tests {
             None,
             Some(vec![]),
             Some(0),
-        );
+        )
+        .unwrap();
         assert!(config.expose_headers.is_empty());
         assert_eq!(config.expose_headers_str, "");
         assert!(config.expose_headers_header.is_none());
@@ -1867,8 +1927,8 @@ mod tests {
     }
 
     #[test]
-    fn django_settings_compile_each_valid_origin_regex_and_drop_an_invalid_one() {
-        let patterns = strings(&[r"^https://\w+\.example\.com$", "(unclosed", r"^http://dev$"]);
+    fn django_settings_compile_each_origin_regex() {
+        let patterns = strings(&[r"^https://\w+\.example\.com$", r"^http://dev$"]);
         let config = CorsConfig::from_django_settings(
             vec![],
             patterns.clone(),
@@ -1878,13 +1938,51 @@ mod tests {
             None,
             None,
             None,
-        );
-        // The strings keep all patterns. Only the valid ones compile.
+        )
+        .unwrap();
         assert_eq!(config.origin_regexes, patterns);
         assert_eq!(config.compiled_origin_regexes.len(), 2);
         assert!(config.compiled_origin_regexes[0].is_match("https://api.example.com"));
         assert!(!config.compiled_origin_regexes[0].is_match("https://evil.test"));
         assert!(config.compiled_origin_regexes[1].is_match("http://dev"));
+    }
+
+    #[test]
+    fn a_django_setting_that_rust_cannot_use_is_an_error_that_names_it() {
+        let settings = |regexes: &[&str], methods: &[&str], headers: &[&str], expose: &[&str]| {
+            CorsConfig::from_django_settings(
+                strings(&["https://a.test"]),
+                strings(regexes),
+                false,
+                false,
+                Some(strings(methods)),
+                Some(strings(headers)),
+                Some(strings(expose)),
+                None,
+            )
+            .map(|_| ())
+        };
+        assert_eq!(settings(&["^ok$"], &["GET"], &["X-A"], &[]), Ok(()));
+        for (result, message) in [
+            (
+                settings(&["^ok$", "(unclosed"], &["GET"], &["X-A"], &[]),
+                r#"CORS_ALLOWED_ORIGIN_REGEXES holds a pattern that is not a valid regex: "(unclosed""#,
+            ),
+            (
+                settings(&[], &["GET", "PO\nST"], &["X-A"], &[]),
+                r#"CORS_ALLOW_METHODS holds a value that is not valid in an HTTP header: "PO\nST""#,
+            ),
+            (
+                settings(&[], &["GET"], &["X-A\r\nX-B: 1"], &[]),
+                r#"CORS_ALLOW_HEADERS holds a value that is not valid in an HTTP header: "X-A\r\nX-B: 1""#,
+            ),
+            (
+                settings(&[], &["GET"], &["X-A"], &["X-Out", "X-\u{7f}"]),
+                r#"CORS_EXPOSE_HEADERS holds a value that is not valid in an HTTP header: "X-\u{7f}""#,
+            ),
+        ] {
+            assert_eq!(result, Err(message.to_string()));
+        }
     }
 
     // ---- parse_cors_config ----
@@ -1972,13 +2070,36 @@ mod tests {
     }
 
     #[test]
-    fn cors_origin_regexes_compile_and_an_invalid_one_is_dropped() {
-        let config =
-            cors(r"{'origin_regexes': ['^https://\\w+\\.example\\.com$', '(unclosed']}").unwrap();
-        assert_eq!(config.origin_regexes.len(), 2);
+    fn cors_origin_regexes_compile() {
+        let config = cors(r"{'origin_regexes': ['^https://\\w+\\.example\\.com$']}").unwrap();
+        assert_eq!(config.origin_regexes.len(), 1);
         assert_eq!(config.compiled_origin_regexes.len(), 1);
         assert!(config.compiled_origin_regexes[0].is_match("https://api.example.com"));
         assert!(!config.compiled_origin_regexes[0].is_match("https://example.org"));
+    }
+
+    #[test]
+    fn a_cors_value_that_rust_cannot_use_stops_startup() {
+        for (code, message) in [
+            (
+                r"{'origin_regexes': ['^ok$', '(unclosed']}",
+                r#"cors origin_regexes holds a pattern that is not a valid regex: "(unclosed""#,
+            ),
+            (
+                r"{'methods': ['GET', 'PO\nST']}",
+                r#"cors methods holds a value that is not valid in an HTTP header: "PO\nST""#,
+            ),
+            (
+                r"{'headers': ['X-A\r\nX-B: 1']}",
+                r#"cors headers holds a value that is not valid in an HTTP header: "X-A\r\nX-B: 1""#,
+            ),
+            (
+                r"{'expose_headers': ['X-Out', 'X-\x7f']}",
+                r#"cors expose_headers holds a value that is not valid in an HTTP header: "X-\u{7f}""#,
+            ),
+        ] {
+            assert_eq!(error_of(cors(code)), format!("ValueError: {message}"));
+        }
     }
 
     #[test]
@@ -2510,6 +2631,29 @@ mod tests {
         assert!(matches!(meta.auth_backends[1], AuthBackend::APIKey { .. }));
         assert!(matches!(meta.auth_backends[2], AuthBackend::Session { .. }));
         assert_eq!(readings(meta.plan), only(7));
+    }
+
+    #[test]
+    fn the_challenge_of_a_route_is_a_prebuilt_header_value() {
+        let meta = route(&format!(
+            "'auth_backends': [{JWT}], 'www_authenticate': 'Bearer, ApiKey'"
+        ));
+        assert_eq!(
+            meta.www_authenticate,
+            Some(HeaderValue::from_static("Bearer, ApiKey"))
+        );
+        // A route with no backend has no challenge.
+        assert_eq!(route("'www_authenticate': None").www_authenticate, None);
+        assert_eq!(route("'auth_backends': []").www_authenticate, None);
+        // A value that is not a header value stops startup.
+        assert_eq!(
+            error_of(parse_route("'www_authenticate': 'Bearer\\nX-Other: 1'")),
+            "ValueError: Invalid 'www_authenticate' metadata: \"Bearer\\nX-Other: 1\" is not an HTTP header value"
+        );
+        assert_eq!(
+            error_of(parse_route("'www_authenticate': 7")),
+            "TypeError: Metadata 'www_authenticate' must be a str or None"
+        );
     }
 
     #[test]

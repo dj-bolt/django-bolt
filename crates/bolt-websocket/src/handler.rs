@@ -817,7 +817,11 @@ pub async fn handle_websocket_upgrade(
                 {
                     match token_revoked(check, auth_ctx).await {
                         Ok(false) => {}
-                        Ok(true) => return Ok(bolt_core::responses::error_401()),
+                        Ok(true) => {
+                            return Ok(bolt_core::responses::error_401_challenge(
+                                route_meta.www_authenticate.as_ref(),
+                            ));
+                        }
                         Err(e) => {
                             eprintln!("[django-bolt] WebSocket revocation check error: {}", e);
                             return Ok(HttpResponse::InternalServerError()
@@ -829,7 +833,9 @@ pub async fn handle_websocket_upgrade(
             }
             // Registration refuses a session backend on a WebSocket route. Fail closed.
             AuthGuardResult::Deferred(_) | AuthGuardResult::Unauthorized => {
-                return Ok(bolt_core::responses::error_401());
+                return Ok(bolt_core::responses::error_401_challenge(
+                    route_meta.www_authenticate.as_ref(),
+                ));
             }
             AuthGuardResult::Forbidden(denial) => {
                 return Ok(bolt_core::responses::error_403_denial(denial.as_deref()));

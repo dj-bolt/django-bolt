@@ -96,6 +96,23 @@ async for data in websocket.iter_json():
     print(f"Received: {data}")
 ```
 
+### A frame of a different type
+
+`receive_text()` reads only a text frame, and `receive_bytes()` reads only a
+binary frame. A frame of the other type raises `WebSocketException` with code
+1003 (unsupported data). The reason names the frame, for example
+`receive_text() got a binary frame`. The connection stays open, and the next
+call reads the next frame. `receive_json()` and the iterators raise the same
+error. To read each frame type, use `receive()`:
+
+```python
+message = await websocket.receive()
+if "text" in message:
+    print(f"Text: {message['text']}")
+else:
+    print(f"Binary: {len(message['bytes'])} bytes")
+```
+
 ## Path parameters
 
 WebSocket routes support path parameters:

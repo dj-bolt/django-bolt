@@ -914,8 +914,9 @@ fn without_error_info(mut response: HttpResponse, state: &AppState) -> HttpRespo
 
 /// Route one request. `access_log_route` becomes the handler id of the route
 /// when the response is for a Bolt route: each response after the route match,
-/// the redirect to the other slash form of a route path, and the automatic
-/// OPTIONS answer. `handle_request` writes the access-log line for these, if
+/// the redirect to the other slash form of a route path, the automatic OPTIONS
+/// answer, and the 405 for a method that the route path does not have.
+/// `handle_request` writes the access-log line for these, if
 /// the filter of that route keeps it. A native route, a mount and a path with
 /// no route leave it `None`.
 async fn route_request(
@@ -1026,6 +1027,10 @@ async fn route_request(
             // (RFC 9110 section 15.5.6). This lookup runs on a miss only.
             let allowed_methods = router.find_all_methods(path);
             if !allowed_methods.is_empty() {
+                // The line of this answer has the filter of the first route of the path.
+                *access_log_route = router
+                    .find(&allowed_methods[0], path)
+                    .map(|found| found.handler_id());
                 return responses::error_405(&allowed_methods);
             }
 
@@ -1179,7 +1184,7 @@ async fn route_request(
                 AuthGuardResult::Deferred(ctx) => Some(ctx),
                 AuthGuardResult::Unauthorized => {
                     // CORS headers will be added by CorsMiddleware
-                    return responses::error_401();
+                    return responses::error_401_challenge(route_meta.www_authenticate.as_ref());
                 }
                 AuthGuardResult::Forbidden(denial) => {
                     // CORS headers will be added by CorsMiddleware
@@ -1664,7 +1669,7 @@ async fn route_request(
         }
     });
 
-    match dispatch_result {
+    let mut response = match dispatch_result {
         Ok(DispatchOutcome::Ready(response)) => response,
         // Sync dispatch completed but body needs async post-processing (stream/file).
         // Already parsed — no duplicate GIL acquire or wire re-parse.
@@ -1714,7 +1719,14 @@ async fn route_request(
         Err(e) => Python::attach(|py| {
             handle_python_error(py, e, req.path(), req.method().as_str(), state.debug)
         }),
-    }
+    };
+
+    // A 401 from Python gets the challenge of the route, as a 401 from Rust.
+    responses::add_challenge(
+        &mut response,
+        route_metadata.and_then(|m| m.www_authenticate.as_ref()),
+    );
+    response
 }
 
 #[cfg(test)]

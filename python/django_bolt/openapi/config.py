@@ -150,6 +150,9 @@ class OpenAPIConfig:
     formatter declares with ``error_schema``. A formatter with no declaration
     gives a 422 with no content.
 
+    A route with an auth backend and a guard also gets the 401 and the 403
+    that the guard can send, with the error body of the API.
+
     Set to False to only document successful responses.
 
     Example:
@@ -178,7 +181,7 @@ class OpenAPIConfig:
     response (no return annotation / ``response_model``) or any component name
     had to fall back to ``module.qualname`` because two types share a short name.
     An ``error_formatter`` without ``error_schema`` is also an offender when a
-    route has a 422 response.
+    route has a 422, 401 or 403 response.
     Routes with ``include_in_schema=False`` and non-JSON ``response_class`` routes
     are not offenders.
     """

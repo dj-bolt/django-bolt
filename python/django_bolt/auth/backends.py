@@ -23,7 +23,7 @@ import logging
 import sys
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -96,6 +96,15 @@ class BaseAuthentication(ABC):
         Returns a dict that will be parsed by Rust into typed enums.
         """
         pass
+
+    @property
+    def challenge_scheme(self) -> str:
+        """Return the auth scheme that a 401 names in ``WWW-Authenticate`` for this backend.
+
+        Bolt reads it one time, at registration. Override it in a subclass to
+        name another scheme. The value is one token (RFC 9110 section 11.1).
+        """
+        return "Bearer"
 
     async def get_user(self, user_id: str | None, auth_context: dict[str, Any]) -> Any | None:
         """
@@ -351,6 +360,13 @@ class JWTAuthentication(BaseAuthentication):
     def scheme_name(self) -> str:
         return "jwt"
 
+    @property
+    def challenge_scheme(self) -> str:
+        # RFC 6750 defines Bearer for the Authorization header only.
+        if self.cookie is None and self.header.lower() == "authorization":
+            return "Bearer"
+        return "ApiKey"
+
     def _resolve_jwks(self) -> str | None:
         """Return the JWKS document as a JSON string, or None.
 
@@ -547,6 +563,10 @@ class APIKeyAuthentication(BaseAuthentication):
     def scheme_name(self) -> str:
         return "api_key"
 
+    @property
+    def challenge_scheme(self) -> str:
+        return "ApiKey"
+
     def to_metadata(self) -> dict[str, Any]:
         return {
             "type": "api_key",
@@ -590,6 +610,10 @@ class SessionAuthentication(BaseAuthentication):
     def scheme_name(self) -> str:
         return "session"
 
+    @property
+    def challenge_scheme(self) -> str:
+        return "ApiKey"
+
     def to_metadata(self) -> dict[str, Any]:
         return {
             "type": "session",
@@ -597,6 +621,16 @@ class SessionAuthentication(BaseAuthentication):
             "csrf": self.csrf,
             "login_redirect": self.login_url is not None,
         }
+
+
+def www_authenticate_challenge(backends: Sequence[BaseAuthentication]) -> str | None:
+    """Return the ``WWW-Authenticate`` value of a 401 for these backends, or None for no backend.
+
+    The value has one challenge for each different scheme, in the order of the
+    backends (RFC 9110 section 11.6.1). Bolt builds it one time, at registration.
+    """
+    schemes = dict.fromkeys(backend.challenge_scheme for backend in backends)
+    return ", ".join(schemes) or None
 
 
 def get_default_authentication_classes(*, needs_user: bool = False) -> list[BaseAuthentication]:
