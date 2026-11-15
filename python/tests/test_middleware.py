@@ -693,6 +693,38 @@ class TestMiddlewareEntryValidation:
             else:
                 Router(middleware=[config])
 
+    @pytest.mark.parametrize("level", ["api", "router", "route"])
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (
+                {"type": "cors", "origin": ["https://a.test"], "credentials": True},
+                "{where} has the unknown key 'origin'. The valid keys are 'type', 'origins', 'origin_regexes', "
+                "'methods', 'headers', 'expose_headers', 'credentials' and 'max_age'.",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "allow_credentials": None},
+                "{where} has the unknown key 'allow_credentials'. The valid keys are",
+            ),
+            (
+                {"type": "rate_limit", "rps": 5, "burst_size": 9},
+                "{where} has the unknown key 'burst_size'. The valid keys are 'type', 'rps', 'burst' and 'key'.",
+            ),
+        ],
+        ids=["cors-origin", "cors-none-value", "rate-limit-burst-size"],
+    )
+    def test_a_dict_with_a_key_that_nothing_reads_raises(self, level, config, message):
+        # Before, Bolt ignored the key. The config that the author meant did not apply.
+        name = config["type"]
+        where = f"@middleware(type='{name}')" if level == "route" else f"{level} {name} dict"
+        with pytest.raises(TypeError, match=re.escape(message.format(where=where))):
+            if level == "api":
+                BoltAPI(middleware=[config])
+            elif level == "router":
+                Router(middleware=[config])
+            else:
+                middleware(**config)
+
     def test_a_cors_dict_of_an_api_or_a_router_needs_no_origins(self):
         """Such a config keeps the allow list of the outer config. Only a route config needs origins."""
         api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://api.test"]}])
