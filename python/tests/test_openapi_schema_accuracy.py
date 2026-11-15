@@ -13,11 +13,12 @@ from typing import Annotated, Any, Literal
 import msgspec
 import pytest
 from django.db import models
+from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import ComponentNameCollisionError, SchemaGenerator
-from django_bolt.param_functions import Query
+from django_bolt.param_functions import Form, Query
 from django_bolt.serializers import Serializer
 from django_bolt.serializers.types import Email, HttpsURL, PositiveInt
 from django_bolt.testing import TestClient
@@ -131,12 +132,11 @@ def test_int_ge_le_constraints():
 def test_float_gt_lt_constraints():
     """Test that an annotated float with a gt and lt constraint produces the correct schema.
 
-    `ratio` is `Annotated[float, ...] | None = None` — under OpenAPI 3.1
-    nullability is expressed via `null` in the type union, so the
-    constrained float schema is the first arm of `anyOf`.
+    `ratio` is `Annotated[float, ...] | None = None`. A query value cannot
+    be null, so the parameter has the schema of the constrained float.
     """
     ratio_schema = _get_query_param_schema(ConstrainedFilters, "ratio")
-    inner = ratio_schema["anyOf"][0]
+    inner = ratio_schema
     assert inner["exclusiveMinimum"] == 0.0
     assert inner["exclusiveMaximum"] == 1.0
     assert "minimum" not in inner
@@ -172,12 +172,11 @@ def test_str_min_max_length_constraints():
 def test_str_pattern_constraint():
     """Test that an annotated str with a pattern constraint produces the correct schema.
 
-    `code` is `Annotated[str, ...] | None = None` — OpenAPI 3.1 emits
-    null in the type union via `anyOf`, so the constrained string is
-    the first arm.
+    `code` is `Annotated[str, ...] | None = None`. A query value cannot
+    be null, so the parameter has the schema of the constrained string.
     """
     code_schema = _get_query_param_schema(StringConstrainedQuery, "code")
-    inner = code_schema["anyOf"][0]
+    inner = code_schema
     assert inner["type"] == "string"
     assert inner["pattern"] == r"^[A-Z]{3}$"
 
@@ -185,15 +184,15 @@ def test_str_pattern_constraint():
 def test_str_enum_produces_string_enum_schema():
     """Test that an annotated str with an enum constraint produces the correct schema.
 
-    All four enum-as-nullable tests below use `Foo | None = None`. Under
-    OpenAPI 3.1 the null arm appears in `anyOf` alongside the enum.
+    All four enum-as-nullable tests below use `Foo | None = None`. A query
+    value cannot be null, so the parameter has the schema of the enum.
     """
 
     class FilterQuery(msgspec.Struct):
         status: RegularEnum | None = None
 
     status_schema = _get_query_param_schema(FilterQuery, "status")
-    inner = status_schema["anyOf"][0]
+    inner = status_schema
     assert inner["type"] == "string"
     assert set(inner["enum"]) == {"active", "inactive"}
 
@@ -205,7 +204,7 @@ def test_int_enum_produces_integer_enum_schema():
         priority: IntEnum | None = None
 
     priority_schema = _get_query_param_schema(FilterQuery, "priority")
-    inner = priority_schema["anyOf"][0]
+    inner = priority_schema
     assert inner["type"] == "integer"
     assert set(inner["enum"]) == {1, 2, 3}
 
@@ -217,7 +216,7 @@ def test_django_text_choices_produces_string_enum():
         status: DjangoStatus | None = None
 
     status_schema = _get_query_param_schema(FilterQuery, "status")
-    inner = status_schema["anyOf"][0]
+    inner = status_schema
     assert inner["type"] == "string"
     assert set(inner["enum"]) == {"planned", "active", "completed"}
 
@@ -229,7 +228,7 @@ def test_django_integer_choices_produces_integer_enum():
         priority: DjangoPriority | None = None
 
     priority_schema = _get_query_param_schema(FilterQuery, "priority")
-    inner = priority_schema["anyOf"][0]
+    inner = priority_schema
     assert inner["type"] == "integer"
     assert set(inner["enum"]) == {1, 2, 3}
 
@@ -602,6 +601,122 @@ def test_dict_str_optional_value_renders_anyof_with_null():
     ]
 
 
+class MaybeItem(msgspec.Struct):
+    id: int
+
+
+def test_optional_type_keeps_its_null_arm_outside_a_struct():
+    """`T | None` as a response type, a body type or an item type says that null is valid."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/maybe")
+    async def maybe() -> int | None:
+        pass
+
+    @api.get("/maybe-item")
+    async def maybe_item() -> MaybeItem | None:
+        pass
+
+    @api.get("/maybe-in-list")
+    async def maybe_in_list() -> list[int | None]:
+        pass
+
+    @api.post("/maybe-body")
+    async def maybe_body(item: MaybeItem | None = None, page: int | None = None) -> dict[str, int | None]:
+        pass
+
+    paths = _get_schema(api)["paths"]
+
+    def response_schema(path: str, method: str = "get") -> dict:
+        return paths[path][method]["responses"]["200"]["content"]["application/json"]["schema"]
+
+    nullable_int = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+    nullable_item = {"anyOf": [{"$ref": "#/components/schemas/MaybeItem"}, {"type": "null"}]}
+    assert response_schema("/maybe") == nullable_int == msgspec.json.schema(int | None)
+    assert response_schema("/maybe-item") == nullable_item
+    assert response_schema("/maybe-in-list") == {"type": "array", "items": nullable_int}
+    assert response_schema("/maybe-body", "post") == {"type": "object", "additionalProperties": nullable_int}
+
+    # Bolt decodes the JSON body `null` to None for this parameter.
+    operation = paths["/maybe-body"]["post"]
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == nullable_item
+    # A query parameter cannot carry null: `required: false` says that it is optional.
+    (page,) = operation["parameters"]
+    assert (page["schema"], page["required"]) == ({"type": "integer"}, False)
+
+
+class OptionalFields(msgspec.Struct):
+    name: str
+    opt: str | None = None
+    count: Annotated[int, msgspec.Meta(ge=1)] | None = None
+    tags: list[str] | None = None
+    label: str | None = "x"
+    either: int | str | None = None
+
+
+def test_an_optional_field_of_a_parameter_model_has_the_schema_of_a_parameter():
+    """A query or form value cannot be null. A model field follows the rule of a parameter with no model."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/query-model")
+    async def query_model(params: Annotated[OptionalFields, Query()]):
+        pass
+
+    @api.post("/form-model")
+    async def form_model(params: Annotated[OptionalFields, Form()]):
+        pass
+
+    @api.get("/query")
+    async def query(
+        name: Annotated[str, Query()],
+        opt: Annotated[str | None, Query()] = None,
+        count: Annotated[Annotated[int, msgspec.Meta(ge=1)] | None, Query()] = None,
+        tags: Annotated[list[str] | None, Query()] = None,
+        label: Annotated[str | None, Query()] = "x",
+    ):
+        pass
+
+    @api.post("/form")
+    async def form(
+        name: Annotated[str, Form()],
+        opt: Annotated[str | None, Form()] = None,
+        count: Annotated[Annotated[int, msgspec.Meta(ge=1)] | None, Form()] = None,
+        tags: Annotated[list[str] | None, Form()] = None,
+        label: Annotated[str | None, Form()] = "x",
+    ):
+        pass
+
+    spec = _get_schema(api)
+    validate(spec)
+    paths = spec["paths"]
+
+    def parameters(path: str) -> dict:
+        return {p["name"]: (p["required"], p["schema"]) for p in paths[path]["get"]["parameters"]}
+
+    def form_schema(path: str) -> dict:
+        return paths[path]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+
+    fields = {
+        "name": {"type": "string"},
+        "opt": {"type": "string"},
+        "count": {"type": "integer", "minimum": 1},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "label": {"type": "string", "default": "x"},
+    }
+    # A union of two types or more keeps each arm. The null arm makes the None default valid.
+    either = {"anyOf": [{"type": "integer"}, {"type": "string"}, {"type": "null"}], "default": None}
+
+    model_parameters = parameters("/query-model")
+    assert model_parameters.pop("either") == (False, either)
+    assert model_parameters == {name: (name == "name", schema) for name, schema in fields.items()}
+    assert model_parameters == parameters("/query")
+
+    model_form = form_schema("/form-model")
+    assert model_form["properties"].pop("either") == either
+    assert model_form["properties"] == fields
+    assert model_form == form_schema("/form")
+
+
 def test_dict_str_any_keeps_additional_properties_true():
     """`dict[str, Any]` has no value type to describe — keep `true`, don't regress.
 
@@ -959,7 +1074,7 @@ def test_query_param_enum_stays_inline():
         status: RegularEnum | None = None
 
     status_schema = _get_query_param_schema(FilterQuery, "status")
-    inner = status_schema["anyOf"][0]
+    inner = status_schema
     assert "$ref" not in inner
     assert inner["type"] == "string"
     assert set(inner["enum"]) == {"active", "inactive"}

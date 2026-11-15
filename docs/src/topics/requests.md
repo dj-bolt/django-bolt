@@ -199,6 +199,25 @@ async def user(user_id: UserId, page: Page = 1):
 The handler gets an `int`, and `/users/abc` gives a 422.
 A parameterized alias gets its arguments. With `type Pair[T] = list[T]`, a `Pair[int]` parameter converts as `list[int]`.
 
+### bytes parameters
+
+A `bytes` parameter gets the UTF-8 bytes of the text value:
+
+```python
+@api.get("/echo")
+async def echo(token: bytes):
+    return {"length": len(token)}
+```
+
+`GET /echo?token=abc` gives the handler `b"abc"`. Bolt does not decode base64.
+This rule applies to a path, query, header, cookie and form parameter.
+It also applies to `bytearray`, to a sequence such as `list[bytes]`, and to a `bytes` item of a tuple such as `tuple[bytes, int]`.
+A `msgspec.Meta` constraint such as `max_length` counts the bytes.
+
+A `bytes` field of a [parameter model](#parameter-models) follows the same rule. The model can be a `Query()`, `Form()`, `Header()` or `Cookie()` model.
+
+A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64. The OpenAPI document shows this difference. A `bytes` parameter, form field or field of a parameter model is `{"type": "string"}`. A `bytes` field of a JSON body is `{"type": "string", "contentEncoding": "base64"}`.
+
 ## Request body
 
 ### JSON body
@@ -523,6 +542,8 @@ class SessionCookies(msgspec.Struct):
 async def get_preferences(cookies: Annotated[SessionCookies, Cookie()]):
     return {"theme": cookies.theme, "language": cookies.language}
 ```
+
+The OpenAPI document shows a query, header or cookie model as one parameter for each field. The name of each parameter is the name that Bolt reads. For a header field, that name is in lower case with `-` for each `_`, for example `x-api-key`.
 
 ### Benefits of parameter models
 

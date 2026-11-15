@@ -289,6 +289,214 @@ def test_a_one_item_or_variadic_tuple_header_takes_the_value():
     assert response.json() == {"one": {"value": [4], "type": "tuple"}, "many": {"value": [5], "type": "tuple"}}
 
 
+# --- bytes --------------------------------------------------------------------------
+
+
+def _show_bytes(value):
+    """Describe a bytes value, or each item of a sequence of bytes values."""
+    if isinstance(value, (bytes, bytearray)):
+        return {"type": type(value).__name__, "hex": bytes(value).hex()}
+    if value is None or isinstance(value, str):
+        return {"type": type(value).__name__}
+    return {"type": type(value).__name__, "items": [_show_bytes(item) for item in value]}
+
+
+@pytest.fixture
+def bytes_client():
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(b: bytes):
+        return _show_bytes(b)
+
+    @api.get("/query-sync")
+    def query_sync(b: bytes):
+        return _show_bytes(b)
+
+    @api.get("/optional")
+    async def optional(b: bytes | None = None):
+        return _show_bytes(b)
+
+    @api.get("/list")
+    async def as_list(b: list[bytes]):
+        return _show_bytes(b)
+
+    @api.get("/short")
+    async def short(b: Annotated[bytes, msgspec.Meta(max_length=3)]):
+        return _show_bytes(b)
+
+    @api.get("/bytearray")
+    async def as_bytearray(b: bytearray):
+        return _show_bytes(b)
+
+    @api.get("/path/{b}")
+    async def path(b: bytes):
+        return _show_bytes(b)
+
+    @api.get("/header")
+    async def header(x_b: Annotated[bytes, Header()], x_list: Annotated[list[bytes] | None, Header()] = None):
+        return [_show_bytes(x_b), _show_bytes(x_list)]
+
+    @api.get("/cookie")
+    async def cookie(b: Annotated[bytes, Cookie()]):
+        return _show_bytes(b)
+
+    @api.post("/form")
+    async def form(b: Annotated[bytes, Form()], items: Annotated[list[bytes], Form()]):
+        return [_show_bytes(b), _show_bytes(items)]
+
+    return TestClient(api)
+
+
+def _utf8(text):
+    return {"type": "bytes", "hex": text.encode().hex()}
+
+
+def test_a_bytes_parameter_gets_the_utf8_bytes_of_the_text(bytes_client):
+    """The value of a parameter is text. A ``bytes`` parameter gets its UTF-8 bytes, with no base64 decoding."""
+    # "YWJj" is base64 for "abc". The handler gets the four characters.
+    for text in ("abc", "YWJj", "123", "caf\u00e9"):
+        assert bytes_client.get("/query", params={"b": text}).json() == _utf8(text)
+        assert bytes_client.get("/query-sync", params={"b": text}).json() == _utf8(text)
+    assert bytes_client.get("/optional", params={"b": "abc"}).json() == _utf8("abc")
+    assert bytes_client.get("/optional").json() == {"type": "NoneType"}
+    assert bytes_client.get("/list?b=abc&b=YWJj").json() == {"type": "list", "items": [_utf8("abc"), _utf8("YWJj")]}
+    assert bytes_client.get("/bytearray?b=abc").json() == {"type": "bytearray", "hex": b"abc".hex()}
+    assert bytes_client.get("/path/abc").json() == _utf8("abc")
+    assert bytes_client.get("/header", headers={"x-b": "abc"}).json() == [_utf8("abc"), {"type": "NoneType"}]
+    assert bytes_client.get("/header", headers={"x-b": "abc", "x-list": "YWJj"}).json() == [
+        _utf8("abc"),
+        {"type": "list", "items": [_utf8("YWJj")]},
+    ]
+    assert bytes_client.get("/cookie", headers={"cookie": "b=abc"}).json() == _utf8("abc")
+    response = bytes_client.post("/form", data={"b": "abc", "items": ["x", "YWJj"]})
+    assert response.json() == [_utf8("abc"), {"type": "list", "items": [_utf8("x"), _utf8("YWJj")]}]
+
+
+def test_a_bytes_parameter_checks_its_constraints_on_the_bytes(bytes_client):
+    assert bytes_client.get("/short?b=abc").json() == _utf8("abc")
+    # Two characters, but three bytes in UTF-8.
+    assert bytes_client.get("/short", params={"b": "\u00e9a"}).json() == _utf8("\u00e9a")
+
+    response = bytes_client.get("/short?b=YWJj")
+    assert response.status_code == 422
+    assert response.json()["detail"] == [
+        {"type": "validation_error", "loc": ["query", "b"], "msg": "Expected `bytes` of length <= 3", "input": "YWJj"}
+    ]
+    assert bytes_client.get("/query").status_code == 422
+
+
+class BytesModel(msgspec.Struct):
+    b: bytes
+    items: list[bytes] = []
+    short: Annotated[bytes, msgspec.Meta(max_length=3)] = b""
+    maybe: bytes | None = None
+    n: int = 0
+
+
+class BytesHeaders(msgspec.Struct):
+    x_b: bytes
+    x_n: int = 0
+
+
+@pytest.fixture
+def bytes_model_client():
+    api = BoltAPI()
+
+    def show(model):
+        return {
+            "b": _show_bytes(model.b),
+            "items": _show_bytes(model.items),
+            "short": _show_bytes(model.short),
+            "maybe": _show_bytes(model.maybe),
+            "n": model.n,
+        }
+
+    @api.get("/query")
+    async def query(model: Annotated[BytesModel, Query()]):
+        return show(model)
+
+    @api.post("/form")
+    async def form(model: Annotated[BytesModel, Form()]):
+        return show(model)
+
+    @api.get("/cookie")
+    async def cookie(model: Annotated[BytesModel, Cookie()]):
+        return show(model)
+
+    @api.get("/header")
+    async def header(model: Annotated[BytesHeaders, Header()]):
+        return {"x_b": _show_bytes(model.x_b), "x_n": model.x_n}
+
+    @api.post("/json")
+    async def json_body(model: BytesModel):
+        return show(model)
+
+    @api.get("/tuple")
+    async def as_tuple(pair: tuple[bytes, int]):
+        return _show_bytes(pair[0]) | {"n": pair[1]}
+
+    return TestClient(api)
+
+
+def test_a_bytes_field_of_a_parameter_model_gets_the_utf8_bytes_of_the_text(bytes_model_client):
+    """A parameter model reads a ``bytes`` field as a plain ``bytes`` parameter does, with no base64 decoding."""
+    empty = {"type": "bytes", "hex": ""}
+    # "YWJj" is base64 for "abc". The field gets the four characters.
+    expected = {
+        "b": _utf8("YWJj"),
+        "items": {"type": "list", "items": [_utf8("x"), _utf8("YWJj")]},
+        "short": _utf8("\u00e9a"),
+        "maybe": _utf8("abc"),
+        "n": 7,
+    }
+
+    response = bytes_model_client.get("/query?b=YWJj&items=x&items=YWJj&short=%C3%A9a&maybe=abc&n=7")
+    assert response.json() == expected
+    response = bytes_model_client.post(
+        "/form", data={"b": "YWJj", "items": ["x", "YWJj"], "short": "\u00e9a", "maybe": "abc", "n": "7"}
+    )
+    assert response.json() == expected
+
+    # Text that is not base64 is a value, not an error.
+    one = {"b": _utf8("a b!"), "items": {"type": "list", "items": []}, "short": empty, "maybe": {"type": "NoneType"}}
+    assert bytes_model_client.get("/query", params={"b": "a b!"}).json() == one | {"n": 0}
+    assert bytes_model_client.post("/form", data={"b": "a b!"}).json() == one | {"n": 0}
+    assert bytes_model_client.get("/cookie", headers={"cookie": "b=YWJj; n=2"}).json() == one | {
+        "b": _utf8("YWJj"),
+        "n": 2,
+    }
+    assert bytes_model_client.get("/header", headers={"x-b": "YWJj", "x-n": "3"}).json() == {
+        "x_b": _utf8("YWJj"),
+        "x_n": 3,
+    }
+
+
+def test_a_bytes_field_of_a_parameter_model_checks_its_constraints_on_the_bytes(bytes_model_client):
+    response = bytes_model_client.get("/query?b=abc&short=YWJj")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == [
+        {
+            "type": "validation_error",
+            "loc": ["query", "short"],
+            "msg": "Expected `bytes` of length <= 3",
+            "input": "YWJj",
+        }
+    ]
+
+
+def test_a_bytes_item_of_a_tuple_parameter_gets_the_utf8_bytes_of_the_text(bytes_model_client):
+    assert bytes_model_client.get("/tuple?pair=YWJj&pair=3").json() == _utf8("YWJj") | {"n": 3}
+
+
+def test_a_bytes_field_of_a_json_body_is_base64(bytes_model_client):
+    """JSON has no bytes type. msgspec reads and writes ``bytes`` in JSON as base64 text."""
+    response = bytes_model_client.post("/json", json={"b": "YWJj"})
+
+    assert response.json()["b"] == _utf8("abc")
+
+
 # --- NewType and type aliases ----------------------------------------------------------
 
 
