@@ -18,9 +18,10 @@ Example:
 import inspect
 from collections.abc import Callable
 from contextlib import suppress
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
-from django.db.models import Model, ObjectDoesNotExist, QuerySet
+from django.db.models import AutoField, Model, ObjectDoesNotExist, QuerySet
 
 from ._json import decode
 from ._view_context import _current_action, _current_request
@@ -46,6 +47,30 @@ def _copy_route_middleware(source: Callable, target: Callable) -> None:
         target.__bolt_middleware__ = list(source.__bolt_middleware__)
     if hasattr(source, "__bolt_skip_middleware__"):
         target.__bolt_skip_middleware__ = set(source.__bolt_skip_middleware__)
+
+
+@cache
+def _primary_key_names(model: type[Model]) -> frozenset[str]:
+    """Return each attribute name that sets the primary key of a ``model`` instance.
+
+    The names include the fields of a composite primary key. They include the
+    primary key of each parent model for multi-table inheritance.
+    """
+    opts = model._meta
+    names = {"pk"}
+    for model_field in (opts.pk, *opts.pk_fields, *(f for f in opts.concrete_fields if f.primary_key)):
+        names.add(model_field.name)
+        names.add(model_field.attname)
+    return frozenset(names)
+
+
+@cache
+def _has_database_primary_key(model: type[Model]) -> bool:
+    """Return True when the database gives the primary key of a new ``model`` row."""
+    pk = model._meta.pk
+    while pk.remote_field is not None and pk.remote_field.parent_link:
+        pk = pk.remote_field.model._meta.pk
+    return isinstance(pk, AutoField)
 
 
 class APIView:
@@ -509,6 +534,11 @@ class ViewSet[T: Model](APIView):
         Subclasses can override this and use ``self.action`` / ``self.request``
         for runtime decisions.  When not overridden, class-level action-specific
         serializer attributes provide the default behavior.
+
+        Bolt also calls this method at registration, to find the response type
+        of a standard action with no return annotation. ``self.action`` is
+        "list" for the list route and "retrieve" for the other routes then.
+        ``self.request`` is not available at registration.
         """
         if action is None:
             with suppress(LookupError):
@@ -517,6 +547,14 @@ class ViewSet[T: Model](APIView):
 
     async def perform_create(self, obj: T):
         await obj.asave()
+
+    def _unwritable_fields(self, serializer_class: type[Serializer], obj: T) -> frozenset[str]:
+        """Return the serializer fields that an update action does not write.
+
+        These are the ``read_only`` fields, the primary key and the lookup field.
+        Thus the request body cannot move the write to a different row.
+        """
+        return serializer_class.__read_only_fields__ | _primary_key_names(type(obj)) | {self.lookup_field}
 
     async def perform_update(self, obj: T):
         await obj.asave()
@@ -597,6 +635,9 @@ class CreateMixin(_ViewSet):
 
         The `data` parameter should be a msgspec.Struct with the fields to create.
         Uses create_serializer_class if defined, otherwise serializer_class.
+
+        The new object does not get a ``read_only`` field of the body. It does not
+        get the primary key of the body when the database gives the primary key.
         """
         serializer_class = self.get_serializer_class("create")
         validated_obj = serializer_class.model_validate_json(request.body)
@@ -606,7 +647,10 @@ class CreateMixin(_ViewSet):
         model = base_queryset.model if base_queryset is not None else (await self.get_queryset()).model
 
         # Create object
-        obj = validated_obj.to_model(model)
+        skip = serializer_class.__read_only_fields__
+        if _has_database_primary_key(model):
+            skip = skip | _primary_key_names(model)
+        obj = model(**{name: value for name, value in validated_obj.to_dict().items() if name not in skip})
         await self.perform_create(obj)
 
         return obj
@@ -621,18 +665,22 @@ class UpdateMixin(_ViewSet):
     """
 
     async def update(self, request: Request):
-        """Update an object (full update)."""
+        """
+        Update an object (full update).
+
+        Writes each serializer field. Does not write a ``read_only`` field, the
+        primary key or the lookup field.
+        """
         obj = await self.get_object()
 
         serializer_class = self.get_serializer_class("update")
         validated_obj = serializer_class.model_validate_json(request.body)
 
         # Update object fields
-        if validated_obj.__struct_config__.omit_defaults:
-            for key, value in validated_obj.to_dict().items():
+        skip = self._unwritable_fields(serializer_class, obj)
+        for key, value in validated_obj.to_dict().items():
+            if key not in skip:
                 setattr(obj, key, value)
-        else:
-            validated_obj.update_instance(obj)
 
         # Save object
         await self.perform_update(obj)
@@ -649,11 +697,17 @@ class PartialUpdateMixin(_ViewSet):
     """
 
     async def partial_update(self, request: Request):
-        """Update an object (partial update)."""
+        """
+        Update an object (partial update).
+
+        Writes the serializer fields of the body. Does not write a ``read_only``
+        field, the primary key or the lookup field.
+        """
         data = decode(request.body)
         obj = await self.get_object()
 
         serializer_class = self.get_serializer_class("update")
+        skip = self._unwritable_fields(serializer_class, obj)
         rename_map = getattr(serializer_class, "__rename_map__", {})
         input_key_to_field = {field_name: field_name for field_name in serializer_class.__struct_fields__}
         input_key_to_field.update({alias: field_name for field_name, alias in rename_map.items()})
@@ -661,7 +715,7 @@ class PartialUpdateMixin(_ViewSet):
         patch_data = {}
         for key, value in data.items():
             field_name = input_key_to_field.get(key)
-            if field_name is not None:
+            if field_name is not None and field_name not in skip:
                 patch_data[field_name] = value
 
         if not patch_data:
