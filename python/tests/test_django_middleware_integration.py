@@ -23,6 +23,7 @@ from django.contrib.auth.decorators import login_not_required, login_required
 from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.auth.models import AnonymousUser, User
 from django.contrib.messages.middleware import MessageMiddleware
+from django.contrib.sessions.backends.db import SessionStore
 from django.contrib.sessions.middleware import SessionMiddleware
 from django.core.exceptions import PermissionDenied
 from django.http import HttpResponse
@@ -620,24 +621,26 @@ class TestMiddlewareChainingHTTPCycle:
 
 
 class ExceptionCatchingMiddleware:
-    """Middleware that catches and handles exceptions."""
+    """Middleware that tries to catch an exception of the handler around get_response."""
 
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
         try:
-            return self.get_response(request)
+            response = self.get_response(request)
         except ValueError as e:
             return HttpResponse(f"Caught error: {e}", status=400)
+        response["X-Seen-Status"] = str(response.status_code)
+        return response
 
 
 @pytest.mark.django_db
 class TestErrorHandlingHTTPCycle:
     """Tests for error handling in middleware through HTTP cycle."""
 
-    def test_middleware_catches_exception(self):
-        """Test that middleware can catch and handle exceptions."""
+    def test_get_response_gives_the_error_response_and_does_not_raise(self):
+        """As in Django, get_response returns the error response. process_exception is the hook for the exception."""
         api = BoltAPI(middleware=[DjangoMiddlewareStack([ExceptionCatchingMiddleware])])
 
         @api.get("/error")
@@ -646,8 +649,9 @@ class TestErrorHandlingHTTPCycle:
 
         with TestClient(api, raise_server_exceptions=False) as client:
             response = client.get("/error")
-            assert response.status_code == 400
-            assert b"Caught error: test error" in response.content
+            assert response.status_code == 500
+            assert response.headers["x-seen-status"] == "500"
+            assert b"Caught error" not in response.content
 
 
 # =============================================================================
@@ -1788,22 +1792,14 @@ class TestProcessException:
         assert response.status_code == 418
         assert response.text == "handled boom"
         # The hooks run in reverse order. "first" does not run after the response of "second".
-        hooks = [("third", "process_exception", "ValueError"), ("second", "process_exception", "ValueError")]
-        if layout == "stack":
-            # As in Django, the response goes through process_response of each middleware.
-            assert _exception_calls == [
-                *hooks,
-                ("third", "process_response", 418),
-                ("second", "process_response", 418),
-                ("first", "process_response", 418),
-            ]
-        else:
-            # Each wrapper is a layer. The exception left the layer of "third" before "second" answered.
-            assert _exception_calls == [
-                *hooks,
-                ("second", "process_response", 418),
-                ("first", "process_response", 418),
-            ]
+        # As in Django, the response goes through process_response of each middleware.
+        assert _exception_calls == [
+            ("third", "process_exception", "ValueError"),
+            ("second", "process_exception", "ValueError"),
+            ("third", "process_response", 418),
+            ("second", "process_response", 418),
+            ("first", "process_response", 418),
+        ]
 
     def test_the_exception_goes_to_the_error_handlers_when_no_hook_answers(self, layout, kind):
         _exception_calls.clear()
@@ -1813,9 +1809,12 @@ class TestProcessException:
             response = client.get("/boom")
 
         assert response.status_code == 500
+        # The error response of the API goes through process_response too.
         assert _exception_calls == [
             ("third", "process_exception", "ValueError"),
             ("first", "process_exception", "ValueError"),
+            ("third", "process_response", 500),
+            ("first", "process_response", 500),
         ]
 
     def test_an_http_exception_is_a_response_and_not_an_exception_for_the_hooks(self, layout, kind):
@@ -1826,7 +1825,7 @@ class TestProcessException:
             response = client.get("/conflict")
 
         assert response.status_code == 409
-        assert _exception_calls == []
+        assert _exception_calls == [("second", "process_response", 409), ("first", "process_response", 409)]
 
     def test_a_call_style_middleware_gets_the_exception(self, layout, kind):
         """A stack of hook and ``__call__`` middleware uses the compatibility chain."""
@@ -1853,6 +1852,127 @@ class TestProcessException:
 
         assert response.status_code == 500
         assert _exception_calls == [("call-style", "process_exception", "ValueError")]
+
+
+class _StampResponseMiddleware(MiddlewareMixin):
+    """Add a header in process_response, as a security-header or request-id middleware does."""
+
+    def process_response(self, request, response):
+        response["X-Stamp"] = "stamped"
+        return response
+
+
+class _StampCallMiddleware:
+    """Add the same header in ``__call__``, after the rest of the chain."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response["X-Stamp"] = "stamped"
+        return response
+
+
+def _error_format(error, request):
+    return JSON({"problem": error.detail, "code": error.status}, status_code=error.status)
+
+
+def _error_routes_api(middleware, kind, **api_kwargs):
+    api = BoltAPI(middleware=middleware, **api_kwargs)
+    if kind == "sync":
+
+        @api.get("/missing")
+        def missing():
+            raise HTTPException(status_code=404, detail="no such item", headers={"X-Reason": "gone"})
+
+        @api.post("/body")
+        def body(item: SampleRequestBody):
+            return {"name": item.name}
+
+        @api.get("/boom")
+        def boom():
+            raise ValueError("boom")
+
+        @api.get("/session")
+        def session(request: Request):
+            request.state["session"]["cart"] = "full"
+            raise HTTPException(status_code=409, detail="conflict")
+
+    else:
+
+        @api.get("/missing")
+        async def missing():
+            raise HTTPException(status_code=404, detail="no such item", headers={"X-Reason": "gone"})
+
+        @api.post("/body")
+        async def body(item: SampleRequestBody):
+            return {"name": item.name}
+
+        @api.get("/boom")
+        async def boom():
+            raise ValueError("boom")
+
+        @api.get("/session")
+        async def session(request: Request):
+            request.state["session"]["cart"] = "full"
+            raise HTTPException(status_code=409, detail="conflict")
+
+    return api
+
+
+def _error_requests(client):
+    return [
+        client.get("/missing"),
+        client.post("/body", json={"name": "a", "value": "not a number"}),
+        client.get("/boom"),
+    ]
+
+
+_STAMP_LAYOUTS = {
+    "wrapper": lambda: [DjangoMiddleware(_StampResponseMiddleware)],
+    "hook stack": lambda: [DjangoMiddlewareStack([_StampResponseMiddleware])],
+    "call stack": lambda: [DjangoMiddlewareStack([_StampCallMiddleware])],
+    "mixed stack": lambda: [DjangoMiddlewareStack([_StampResponseMiddleware, _CallStyleExceptionHook])],
+}
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("layout", list(_STAMP_LAYOUTS))
+@pytest.mark.parametrize("api_kwargs", [{}, {"error_formatter": _error_format}], ids=["default", "formatter"])
+def test_process_response_runs_for_an_error_response_of_the_handler(layout, kind, api_kwargs):
+    """Django makes the error response in the chain, so each process_response gets it.
+
+    The client gets the response of a route with no middleware, plus the header of the middleware.
+    """
+    with TestClient(_error_routes_api([], kind, **api_kwargs), raise_server_exceptions=False) as client:
+        plain = _error_requests(client)
+    with TestClient(_error_routes_api(_STAMP_LAYOUTS[layout](), kind, **api_kwargs)) as client:
+        stamped = _error_requests(client)
+
+    assert [response.status_code for response in stamped] == [404, 422, 500]
+    for with_middleware, without_middleware in zip(stamped, plain, strict=True):
+        assert with_middleware.headers["x-stamp"] == "stamped"
+        assert with_middleware.status_code == without_middleware.status_code
+        assert with_middleware.content == without_middleware.content
+        headers = dict(with_middleware.headers)
+        del headers["x-stamp"]
+        assert headers == dict(without_middleware.headers)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("layout", ["stack", "wrappers"])
+def test_the_session_is_saved_when_the_handler_raises_an_http_exception(layout, kind):
+    """SessionMiddleware saves the session in process_response."""
+    api = _error_routes_api(_exception_layout(layout, (SessionMiddleware,)), kind)
+
+    with TestClient(api) as client:
+        response = client.get("/session")
+
+    assert response.status_code == 409
+    session_key = response.cookies[settings.SESSION_COOKIE_NAME]
+    assert SessionStore(session_key=session_key)["cart"] == "full"
 
 
 class _BlockInViewMiddleware(MiddlewareMixin):
