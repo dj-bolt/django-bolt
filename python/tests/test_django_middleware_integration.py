@@ -121,6 +121,21 @@ class TestDjangoMiddlewareStack:
         stack = DjangoMiddlewareStack([SessionMiddleware, CommonMiddleware])
         assert repr(stack) == "DjangoMiddlewareStack([SessionMiddleware, CommonMiddleware])"
 
+    def test_middleware_stack_takes_dotted_paths(self):
+        """A stack imports a dotted path, as DjangoMiddleware does, and serves requests."""
+        stack = DjangoMiddlewareStack(["django.contrib.sessions.middleware.SessionMiddleware", CommonMiddleware])
+        api = BoltAPI(middleware=[stack])
+
+        @api.get("/session")
+        async def session(request):
+            return {"has_session": request.state.get("session") is not None}
+
+        with TestClient(api) as client:
+            response = client.get("/session")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"has_session": True}
+
 
 # =============================================================================
 # Test Full HTTP Cycle - Session Middleware

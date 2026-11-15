@@ -552,13 +552,19 @@ class DjangoMiddlewareStack:
 
         Args:
             middleware_classes: List of Django middleware classes (not instances)
-                               in the order they should be applied (outermost first)
+                               in the order they should be applied (outermost first).
+                               An entry can be the dotted path of a class.
         """
         if not DJANGO_AVAILABLE:
             raise ImportError(
                 "Django is required to use DjangoMiddlewareStack. Install Django with: pip install django"
             )
 
+        # A dotted path string becomes its class, as in DjangoMiddleware.
+        middleware_classes = [
+            import_string(middleware) if isinstance(middleware, str) else middleware
+            for middleware in middleware_classes
+        ]
         for middleware in middleware_classes:
             _check_capabilities(middleware)
         self.middleware_classes = middleware_classes
