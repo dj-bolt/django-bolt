@@ -24,7 +24,7 @@ from django_bolt import (
 )
 from django_bolt.testing import TestClient
 
-from .test_models import Article, Author, BlogPost, Release, User, UserProfile
+from .test_models import Article, Author, BlogPost, Comment, Release, User, UserProfile
 
 # ============================================================================
 # Schemas
@@ -749,6 +749,73 @@ def test_cursor_pagination_keeps_rows_that_share_the_ordering_value(sample_artic
         Article.objects.order_by(ordering, "-pk" if ordering.startswith("-") else "pk").values_list("pk", flat=True)
     )
     assert ids == expected
+
+
+@pytest.fixture
+def blog_posts(db):
+    """Nine posts of three authors. The order of the authors is not the order of the posts."""
+    authors = [Author.objects.create(name=f"Author {n}", email=f"a{n}@example.com") for n in range(3)]
+    for number in range(9):
+        BlogPost.objects.create(title=f"Post {8 - number}", content="content", author=authors[(number * 2) % 3])
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("ordering", "make_queryset"),
+    [
+        ("author", lambda: BlogPost.objects.all()),
+        ("-author", lambda: BlogPost.objects.all()),
+        ("author", lambda: BlogPost.objects.select_related("author")),
+        ("title", lambda: BlogPost.objects.defer("title")),
+        ("-title", lambda: BlogPost.objects.only("content")),
+    ],
+    ids=["foreign-key", "foreign-key-descending", "foreign-key-select-related", "deferred", "deferred-by-only"],
+)
+def test_cursor_pagination_orders_by_a_foreign_key_or_a_deferred_field(blog_posts, ordering, make_queryset):
+    """The cursor of a ForeignKey holds the key. A deferred field does not run a query on the event loop."""
+    api = BoltAPI()
+
+    class PostCursorPagination(CursorPagination):
+        page_size = 2
+
+    PostCursorPagination.ordering = ordering
+
+    @api.get("/posts")
+    @paginate(PostCursorPagination)
+    async def list_posts(request):
+        return make_queryset()
+
+    with TestClient(api) as client:
+        ids = _walk_cursor_pages(client, "/posts")
+
+    expected = BlogPost.objects.order_by(ordering, "-pk" if ordering.startswith("-") else "pk")
+    assert ids == list(expected.values_list("pk", flat=True))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_refuses_a_foreign_key_to_a_model_with_a_default_ordering(blog_posts, settings):
+    """Django orders such a ForeignKey by the ordering of the related model, not by the key in the cursor."""
+    settings.DEBUG = True  # the 500 body then shows the exception
+    author = Author.objects.first()
+    for post in BlogPost.objects.all()[:3]:
+        Comment.objects.create(post=post, author=author, text="text")
+    api = BoltAPI()
+
+    class PostCursorPagination(CursorPagination):
+        page_size = 2
+        ordering = "post"  # BlogPost has Meta.ordering
+
+    @api.get("/comments")
+    @paginate(PostCursorPagination)
+    async def list_comments(request):
+        return Comment.objects.all()
+
+    with TestClient(api) as client:
+        response = client.get("/comments")
+
+    assert response.status_code == 500
+    assert "ValueError" in response.text
+    assert "post_id" in response.text
 
 
 @pytest.mark.django_db(transaction=True)
