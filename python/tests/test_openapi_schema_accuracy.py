@@ -869,6 +869,37 @@ def test_field_with_include_in_schema_false_is_not_in_the_schema():
         assert client.post("/items", json={"name": "n"}).status_code == 422
 
 
+class RequiredFieldFilters(Serializer):
+    code: str = field(description="Short code", examples=["AB"])
+    secret: str = field(include_in_schema=False)
+
+
+def test_required_field_options_are_in_query_and_form_schemas():
+    """A required field of a query or form Serializer has its field() options in the schema."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/items")
+    async def get_items(query: Annotated[RequiredFieldFilters, Query()]) -> dict:
+        pass
+
+    @api.post("/items")
+    async def post_items(form: Annotated[RequiredFieldFilters, Form()]) -> dict:
+        pass
+
+    spec = _get_schema(api)
+    validate(spec)
+    params = spec["paths"]["/items"]["get"]["parameters"]
+    assert [(param["name"], param["required"]) for param in params] == [("code", True)]
+    assert params[0]["schema"] == {"type": "string", "description": "Short code", "examples": ["AB"]}
+
+    content = spec["paths"]["/items"]["post"]["requestBody"]["content"]
+    for media_type in content.values():
+        assert media_type["schema"]["properties"] == {
+            "code": {"type": "string", "description": "Short code", "examples": ["AB"]}
+        }
+        assert media_type["schema"]["required"] == ["code"]
+
+
 def test_documented_query_struct_field_renders_concrete_type():
     """A documented constrained field on a query struct types the parameter.
 
