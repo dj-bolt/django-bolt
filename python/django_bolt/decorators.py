@@ -45,6 +45,7 @@ class ActionHandler:
         "tags",
         "summary",
         "description",
+        "deprecated",
     )
 
     def __init__(
@@ -62,6 +63,7 @@ class ActionHandler:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        deprecated: bool = False,
     ):
         self.fn = fn
         self.methods = [m.upper() for m in methods]  # Normalize to uppercase
@@ -76,6 +78,7 @@ class ActionHandler:
         self.tags = tags
         self.summary = summary
         self.description = description
+        self.deprecated = deprecated
 
     def __call__(self, *args, **kwargs):
         """Make the handler callable (delegates to wrapped function)."""
@@ -101,6 +104,7 @@ def action(
     tags: list[str] | None = None,
     summary: str | None = None,
     description: str | None = None,
+    deprecated: bool = False,
 ) -> Callable:
     """
     Decorator for ViewSet custom actions (DRF-style).
@@ -128,6 +132,7 @@ def action(
         guards: Optional permission guards (overrides class-level guards)
         response_model: Optional response model for serialization
         status_code: Optional HTTP status code
+        deprecated: True marks the operations of the action as deprecated in the OpenAPI schema
 
     Returns:
         ActionHandler instance that wraps the function with metadata
@@ -191,6 +196,7 @@ def action(
             tags=tags,
             summary=summary,
             description=description,
+            deprecated=deprecated,
         )
 
     return decorator

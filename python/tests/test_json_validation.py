@@ -9,8 +9,13 @@ Tests cover:
 - Type coercion and conversion
 """
 
+import dataclasses
+import datetime
+import decimal
+import enum
 import json
-from typing import Annotated
+import uuid
+from typing import Annotated, Any, Literal, TypedDict
 
 import msgspec
 import pytest
@@ -20,8 +25,18 @@ from django_bolt._kwargs import create_body_extractor, get_msgspec_decoder
 from django_bolt._kwargs.extractors import _DECODER_CACHE
 from django_bolt.error_handlers import handle_exception, msgspec_validation_error_to_dict
 from django_bolt.exceptions import RequestValidationError, parse_msgspec_decode_error
-from django_bolt.params import Body
+from django_bolt.params import Body, Cookie, Depends, File, Form, Header, Query
 from django_bolt.testing import TestClient
+
+
+@dataclasses.dataclass
+class Point:
+    x: int
+    y: int
+
+
+class Counts(TypedDict):
+    total: int
 
 
 class UserCreate(msgspec.Struct):
@@ -209,6 +224,25 @@ class TestInvalidJSONParsing:
         with pytest.raises(msgspec.ValidationError):
             extractor(b"42")
 
+    def test_an_empty_body_gives_the_default_of_an_optional_body_parameter(self):
+        api = BoltAPI()
+
+        @api.post("/optional")
+        async def optional(user: UserWithDefaults | None = None):
+            return {"name": user.name if user else None}
+
+        @api.post("/required")
+        async def required(user: UserWithDefaults):
+            return {"name": user.name}
+
+        with TestClient(api) as client:
+            assert client.post("/optional").json() == {"name": None}
+            assert client.post("/optional", json={"name": "Ana"}).json() == {"name": "Ana"}
+            # A body that is present must still be valid JSON of the type.
+            assert client.post("/optional", content=b"{").status_code == 422
+            assert client.post("/optional", json={"name": 1}).status_code == 422
+            assert client.post("/required").status_code == 422
+
 
 class TestBodyOfNonStructType:
     """A body with a type that is not a Struct is decoded as the type, with the same errors."""
@@ -285,6 +319,26 @@ class TestBodyOfNonStructType:
             assert wrong.status_code == 422
             assert wrong.json()["detail"][0]["loc"] == ["body", "0"]
 
+    def test_two_body_parameters_each_decode_the_body_as_their_own_type(self):
+        api = BoltAPI()
+
+        @api.post("/both")
+        async def both(user: UserWithDefaults, strict: UserCreate):
+            return {"user": type(user).__name__, "strict": type(strict).__name__, "age": strict.age}
+
+        with TestClient(api) as client:
+            body = {"name": "Ana", "email": "ana@example.com", "age": 30}
+            assert client.post("/both", json=body).json() == {
+                "user": "UserWithDefaults",
+                "strict": "UserCreate",
+                "age": 30,
+            }
+
+            # The second type has a required field more than the first.
+            missing = client.post("/both", json={"name": "Ana"})
+            assert missing.status_code == 422
+            assert missing.json()["detail"][0]["loc"] == ["body", "email"]
+
 
 class TestParseMsgspecDecodeError:
     """Test the line and column of a JSON decode error."""
@@ -316,6 +370,13 @@ class TestParseMsgspecDecodeError:
         assert detail["ctx"]["byte_position"] == body.index(b"}")
         assert detail["msg"].endswith(f"\n  {text}\n  {' ' * text.index('}')}^")
 
+    def test_message_shows_only_the_error_line(self):
+        """Test that the message quotes the failing line, not the lines after it."""
+        body = b'{"a": 1,\n "b": oops,\n "c": 2,\n "d": 3}'
+        detail = self._parse(body)
+
+        assert detail["msg"].endswith('\n   "b": oops,\n        ^')
+
     def test_column_on_later_line_counts_characters(self):
         """Test the line number and the column after a newline."""
         line_before_error = '  "é€": '
@@ -331,6 +392,266 @@ class TestParseMsgspecDecodeError:
         detail = self._parse(body)
 
         assert detail["loc"] == ("body", 2, len('"b": ') + 1)
+
+
+@pytest.mark.parametrize("method", ["post", "put", "patch"])
+def test_a_dict_parameter_with_no_marker_is_the_json_body(method):
+    """A query string cannot hold a dict. A route whose method has a body reads the dict from the JSON body."""
+    api = BoltAPI()
+    route = getattr(api, method)
+
+    @route("/plain")
+    async def plain(data: dict):
+        return {"data": data}
+
+    @route("/typed/{item_id}")
+    async def typed(item_id: int, counts: dict[str, int], page: int = 1):
+        return {"item_id": item_id, "counts": counts, "page": page}
+
+    @route("/optional")
+    async def optional(data: dict | None = None):
+        return {"data": data}
+
+    # A list of simple values stays a repeated query parameter.
+    @route("/numbers")
+    async def numbers(ids: list[int]):
+        return {"ids": ids}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        send = getattr(client, method)
+        response = send("/plain", json={"a": 1, "b": [2]})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"data": {"a": 1, "b": [2]}}
+
+        response = send("/typed/7?page=2", json={"a": 1})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"item_id": 7, "counts": {"a": 1}, "page": 2}
+
+        response = send("/typed/7", json={"a": "x"})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"][0] == "body"
+
+        # A JSON array is not a dict.
+        assert send("/plain", json=[1]).status_code == 422
+
+        assert send("/optional", json={"a": 1}).json() == {"data": {"a": 1}}
+        assert send("/numbers?ids=1&ids=2").json() == {"ids": [1, 2]}
+
+        operations = client.get("/docs/openapi.json").json()["paths"]
+        plain_operation = operations["/plain"][method]
+        assert plain_operation["requestBody"]["content"]["application/json"]["schema"] == {"type": "object"}
+        assert "parameters" not in plain_operation
+        typed_operation = operations["/typed/{item_id}"][method]
+        assert typed_operation["requestBody"]["content"]["application/json"]["schema"] == {
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+        }
+        assert [parameter["name"] for parameter in typed_operation["parameters"]] == ["item_id", "page"]
+        assert "requestBody" not in operations["/numbers"][method]
+
+
+def _complex_query(api):
+    @api.get("/h")
+    async def handler(value: complex):
+        return {"value": repr(value)}
+
+
+def _dict_query_of_a_get_route(api):
+    @api.get("/h")
+    async def handler(filters: dict | None = None):
+        return {"filters": filters}
+
+
+def _list_of_dicts_query_of_a_get_route(api):
+    @api.get("/h")
+    async def handler(rows: list[dict]):
+        return {"rows": rows}
+
+
+def _nested_list_query(api):
+    @api.get("/h")
+    async def handler(rows: Annotated[list[list[int]], Query()]):
+        return {"rows": rows}
+
+
+def _dataclass_query(api):
+    @api.get("/h")
+    async def handler(point: Annotated[Point, Query()]):
+        return {"point": repr(point)}
+
+
+def _complex_path(api):
+    @api.get("/h/{value}")
+    async def handler(value: complex):
+        return {"value": repr(value)}
+
+
+def _dict_header(api):
+    @api.get("/h")
+    async def handler(x_filters: Annotated[dict, Header()]):
+        return {"filters": x_filters}
+
+
+def _complex_cookie(api):
+    @api.get("/h")
+    async def handler(value: Annotated[complex, Cookie()]):
+        return {"value": repr(value)}
+
+
+def _dict_form(api):
+    @api.post("/h")
+    async def handler(filters: Annotated[dict, Form()]):
+        return {"filters": filters}
+
+
+def _str_file(api):
+    @api.post("/h")
+    async def handler(upload: Annotated[str, File()]):
+        return {"upload": upload}
+
+
+def _complex_in_a_dependency(api):
+    async def dependency(value: complex):
+        return value
+
+    @api.get("/h")
+    async def handler(value: Annotated[complex, Depends(dependency)]):
+        return {"value": repr(value)}
+
+
+@pytest.mark.parametrize(
+    ("register", "source", "name"),
+    [
+        (_complex_query, "query", "value"),
+        (_dict_query_of_a_get_route, "query", "filters"),
+        (_list_of_dicts_query_of_a_get_route, "query", "rows"),
+        (_nested_list_query, "query", "rows"),
+        (_dataclass_query, "query", "point"),
+        (_complex_path, "path", "value"),
+        (_dict_header, "header", "x_filters"),
+        (_complex_cookie, "cookie", "value"),
+        (_dict_form, "form", "filters"),
+        (_str_file, "file", "upload"),
+        (_complex_in_a_dependency, "query", "value"),
+    ],
+)
+def test_a_parameter_type_that_bolt_cannot_convert_stops_registration(register, source, name):
+    """The handler got the text of the request, or the file dict, with no error. Now the route does not register."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError) as error:
+        register(api)
+        # A dependency compiles with the injector of its route.
+        api._register_openapi_routes()
+
+    message = str(error.value)
+    assert f"{source} parameter {name!r}" in message
+    owner = "dependency" if register is _complex_in_a_dependency else "handler"
+    assert f"{register.__name__}.<locals>.{owner} " in message
+
+
+def test_each_parameter_type_that_converts_from_text_registers():
+    """The registration check refuses no type that a text value can give."""
+    api = BoltAPI()
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    @api.get("/scalars/{item_id}")
+    async def scalars(
+        item_id: uuid.UUID,
+        untyped,
+        anything: Any,
+        thing: object,
+        flag: bool,
+        price: decimal.Decimal,
+        day: datetime.date,
+        colors: list[Color],
+        orders: tuple[Literal["asc", "desc"], ...],
+        waits: list[datetime.timedelta],
+        ratio: float | None = None,
+        tags: frozenset[str] = frozenset(),
+    ):
+        return {
+            "item_id": str(item_id),
+            "untyped": untyped,
+            "anything": anything,
+            "thing": thing,
+            "flag": flag,
+            "price": str(price),
+            "day": day.isoformat(),
+            "colors": [color.name for color in colors],
+            "orders": list(orders),
+            "waits": [wait.total_seconds() for wait in waits],
+            "ratio": ratio,
+            "tags": sorted(tags),
+        }
+
+    with TestClient(api) as client:
+        response = client.get(
+            "/scalars/12345678-1234-5678-1234-567812345678?untyped=u&anything=a&thing=t&flag=true&price=1.50"
+            "&day=2026-01-02&colors=red&orders=asc&orders=desc&waits=PT90S&tags=b&tags=a"
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "item_id": "12345678-1234-5678-1234-567812345678",
+            "untyped": "u",
+            "anything": "a",
+            "thing": "t",
+            "flag": True,
+            "price": "1.50",
+            "day": "2026-01-02",
+            "colors": ["RED"],
+            "orders": ["asc", "desc"],
+            "waits": [90.0],
+            "ratio": None,
+            "tags": ["a", "b"],
+        }
+
+
+def test_a_json_only_parameter_with_no_marker_is_the_json_body():
+    """A list of dicts, a nested list and a TypedDict come only from JSON. `Any` stays a query parameter."""
+    api = BoltAPI()
+
+    @api.post("/rows")
+    async def rows(rows: list[dict]):
+        return {"rows": rows}
+
+    @api.post("/matrix")
+    async def matrix(matrix: list[list[int]]):
+        return {"matrix": matrix}
+
+    @api.post("/typed")
+    async def typed(counts: Counts, page: int = 1):
+        return {"counts": counts, "page": page}
+
+    @api.post("/any")
+    async def anything(value: Any):
+        return {"value": value}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.post("/rows", json=[{"a": 1}, {"b": [2]}])
+        assert response.status_code == 200, response.text
+        assert response.json() == {"rows": [{"a": 1}, {"b": [2]}]}
+        # A JSON object is not a list.
+        assert client.post("/rows", json={"a": 1}).status_code == 422
+
+        assert client.post("/matrix", json=[[1, 2], [3]]).json() == {"matrix": [[1, 2], [3]]}
+        assert client.post("/typed?page=2", json={"total": 3}).json() == {"counts": {"total": 3}, "page": 2}
+        assert client.post("/typed", json={"total": "x"}).status_code == 422
+
+        assert client.post("/any?value=x", json={"a": 1}).json() == {"value": "x"}
+
+        operations = client.get("/docs/openapi.json").json()["paths"]
+        rows_schema = operations["/rows"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        assert rows_schema == {"type": "array", "items": {"type": "object"}}
+        assert "parameters" not in operations["/rows"]["post"]
+        assert [parameter["name"] for parameter in operations["/any"]["post"]["parameters"]] == ["value"]
+        assert "requestBody" not in operations["/any"]["post"]
 
 
 class TestMsgspecStructValidation:
