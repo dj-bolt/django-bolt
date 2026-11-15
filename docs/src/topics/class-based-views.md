@@ -30,6 +30,15 @@ This creates:
 - `GET /hello` - Calls the `get` method
 - `POST /hello` - Calls the `post` method
 
+Bolt passes the request to the parameter with the name `request` or `req`, at each position. `self.request` is the same request. A method with no such parameter can still read `self.request`:
+
+```python
+@api.view("/whoami")
+class WhoAmIView(APIView):
+    async def get(self):
+        return {"path": self.request.path}
+```
+
 ### Available methods
 
 Implement any of these methods:
