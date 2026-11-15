@@ -34,3 +34,14 @@ class Example(BaseSchemaObject):
     The ``value`` field and ``externalValue`` field are mutually exclusive. See the rules for resolving
     `Relative References <https://spec.openapis.org/oas/v3.1.0#relativeReferencesURI>`_.
     """
+
+    def to_schema(self) -> dict[str, Any]:
+        """Return the example with its literal ``value``.
+
+        The value is JSON data, not a spec object. The base class drops each
+        ``None`` in a dict, but ``null`` is a valid value in an example.
+        """
+        schema = super().to_schema()
+        if self.value is not None:
+            schema["value"] = self.value
+        return schema

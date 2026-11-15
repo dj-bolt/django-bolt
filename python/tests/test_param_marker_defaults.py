@@ -17,7 +17,7 @@ from typing import Annotated
 import pytest
 from openapi_spec_validator import validate
 
-from django_bolt import BoltAPI, UploadFile, WebSocket
+from django_bolt import BoltAPI, UploadFile, WebSocket, param_functions
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.param_functions import Cookie, File, Form, Header, Path, Query
@@ -368,3 +368,22 @@ def test_a_file_marker_gives_its_default_and_its_description_to_the_schema():
     schema = _spec(api)["paths"]["/upload"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
     assert schema["properties"]["doc"]["description"] == "The document"
     assert "doc" not in schema.get("required", [])
+
+
+@pytest.mark.parametrize("name", ["Query", "Header", "Cookie", "Form", "File", "Body"])
+def test_param_functions_pass_the_positional_default_to_the_marker(name):
+    marker = getattr(param_functions, name)("fallback")
+    assert marker.default == "fallback"
+
+
+def test_param_functions_pass_positional_arguments_of_path_and_depends():
+    with pytest.raises(ValueError, match="Path parameters cannot have default values"):
+        param_functions.Path("fallback")
+
+    def provider():
+        return 1
+
+    assert param_functions.Depends(provider, False).dependency is provider
+    assert param_functions.Depends(provider, False).use_cache is False
+    assert param_functions.Depends(provider, use_cache=False).use_cache is False
+    assert param_functions.Depends(dependency=provider).use_cache is True

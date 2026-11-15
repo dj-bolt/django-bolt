@@ -194,6 +194,51 @@ class TestDiskSpooling:
         assert file_info["temp_path"] is not None  # Has temp file path from Rust
         assert file_info["content_len"] == file_size
 
+    @pytest.mark.parametrize("size", [5, 2 * 1024 * 1024], ids=["in-memory", "disk-spooled"])
+    def test_bytes_file_parameter_gets_the_content_of_the_file(self, size):
+        """``Annotated[bytes, File()]`` is the content of the upload, also when Rust spooled it to disk."""
+        api = BoltAPI()
+        received = {}
+
+        @api.post("/one")
+        async def one(data: Annotated[bytes, File(max_size=50 * 1024 * 1024)]):
+            received["one"] = data
+            return {"type": type(data).__name__}
+
+        @api.post("/many")
+        def many(data: Annotated[list[bytes], File(max_size=50 * 1024 * 1024)]):
+            received["many"] = data
+            return {"types": [type(item).__name__ for item in data]}
+
+        @api.post("/optional")
+        async def optional(data: Annotated[bytes | None, File()] = None):
+            return {"type": type(data).__name__}
+
+        first = b"\x00\xff" + b"a" * (size - 2)
+        second = b"second"
+
+        with TestClient(api) as client:
+            response = client.post("/one", files={"data": ("a.bin", first, "application/octet-stream")})
+            assert response.status_code == 200, response.text
+            assert response.json() == {"type": "bytes"}
+            assert received["one"] == first
+
+            response = client.post("/many", files=[("data", ("a.bin", first)), ("data", ("b.bin", second))])
+            assert response.status_code == 200, response.text
+            assert response.json() == {"types": ["bytes", "bytes"]}
+            assert received["many"] == [first, second]
+
+            # One file for a list parameter is a list of one item.
+            response = client.post("/many", files=[("data", ("b.bin", second))])
+            assert received["many"] == [second]
+
+            assert client.post("/optional", files={"other": ("a.bin", b"x")}).json() == {"type": "NoneType"}
+            assert client.post("/optional", files={"data": ("a.bin", b"x")}).json() == {"type": "bytes"}
+
+            missing = client.post("/one", files={"other": ("a.bin", b"x")})
+            assert missing.status_code == 422
+            assert missing.json()["detail"][0]["type"] == "file_missing"
+
     def test_small_file_stays_in_memory(self):
         """
         Files smaller than 1MB threshold should stay in memory.
