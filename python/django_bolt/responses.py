@@ -266,18 +266,6 @@ class File(CookieMixin):
             return f.read()
 
 
-class UploadFile:
-    def __init__(self, name: str, filename: str | None, content_type: str | None, path: str):
-        self.name = name
-        self.filename = filename
-        self.content_type = content_type
-        self.path = path
-
-    def read(self) -> bytes:
-        with open(self.path, "rb") as f:
-            return f.read()
-
-
 class FileResponse(CookieMixin):
     def __init__(
         self,
