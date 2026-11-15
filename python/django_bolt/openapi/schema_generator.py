@@ -1005,14 +1005,12 @@ class SchemaGenerator:
                     required=required or None,
                 )
 
-                return RequestBody(
-                    description="Form data",
-                    content={
-                        "multipart/form-data": OpenAPIMediaType(schema=schema),
-                        "application/x-www-form-urlencoded": OpenAPIMediaType(schema=schema),
-                    },
-                    required=bool(required),
-                )
+                content = {"multipart/form-data": OpenAPIMediaType(schema=schema)}
+                # A urlencoded body cannot hold a file.
+                if not meta.get("has_file_uploads"):
+                    content["application/x-www-form-urlencoded"] = OpenAPIMediaType(schema=schema)
+
+                return RequestBody(description="Form data", content=content, required=bool(required))
 
             return None
 
