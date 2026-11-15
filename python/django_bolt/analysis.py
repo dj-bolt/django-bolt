@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import sys
 import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ __all__ = [
     "HandlerAnalysis",
     "analyze_dependency_tree",
     "analyze_handler",
+    "annotation_globals",
     "resolve_introspection_target",
 ]
 
@@ -43,6 +45,29 @@ def resolve_introspection_target(fn: Any) -> Any:
         return fn
     # The metaclass has a __call__, so the lookup always finds one.
     return inspect.getattr_static(type(fn), "__call__")
+
+
+def annotation_globals(fn: Any) -> dict[str, Any]:
+    """Return the globals that resolve the string annotations of ``fn``.
+
+    These are the globals of the function, as for ``typing.get_type_hints``.
+    A wrapper with ``__wrapped__`` gives the globals of the function that it
+    wraps, because its annotations come from there. Bolt sets ``__wrapped__``
+    on each wrapper that it makes. ``functools.wraps`` and ``sync_to_async``
+    do the same.
+
+    ``fn.__module__`` is not a safe source. It can name a module that is not
+    in ``sys.modules``, or a module that did not define the function. A
+    callable object gives the globals of its ``__call__``. Only an object with
+    no globals at all, such as a class, uses the dict of its module.
+    """
+    target = inspect.unwrap(fn)
+    for candidate in (target, resolve_introspection_target(target)):
+        globalns = getattr(candidate, "__globals__", None)
+        if globalns is not None:
+            return globalns
+    module = sys.modules.get(getattr(fn, "__module__", None) or "")
+    return {} if module is None else module.__dict__
 
 
 @dataclass

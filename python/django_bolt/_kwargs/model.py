@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import sys
 from collections.abc import Callable
 from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import msgspec
 
-from ..analysis import resolve_introspection_target
+from ..analysis import annotation_globals, resolve_introspection_target
 from ..dependencies import (
     compile_dependency,
     decode_body_once,
@@ -204,10 +203,9 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         TypeError: If GET/HEAD/DELETE/OPTIONS handlers have body parameters
     """
     sig = inspect.signature(fn)
-    # Get the correct namespace for resolving string annotations (from __future__ import annotations)
-    # Use fn.__module__ to get the module where annotations were defined (especially important for
-    # class-based views where the handler wrapper is created in views.py but annotations come from user's module)
-    globalns = sys.modules.get(fn.__module__, {}).__dict__ if fn.__module__ else {}
+    # Get the correct namespace for resolving string annotations (from __future__ import annotations).
+    # The wrapper of a class-based view is made in views.py, but its annotations come from the user's module.
+    globalns = annotation_globals(fn)
     # Class-callable deps (Depends(Backend(...))) expose __call__ — route get_type_hints through it.
     type_hints = get_type_hints(resolve_introspection_target(fn), globalns=globalns, include_extras=True)
 
@@ -327,7 +325,7 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
         Metadata dictionary for parameter binding
     """
     sig = inspect.signature(fn)
-    globalns = sys.modules.get(fn.__module__, {}).__dict__ if fn.__module__ else {}
+    globalns = annotation_globals(fn)
     type_hints = get_type_hints(fn, globalns=globalns, include_extras=True)
 
     # Extract path parameters from route pattern
