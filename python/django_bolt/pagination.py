@@ -31,7 +31,8 @@ from typing import Any, Generic, TypeVar, get_args, get_origin
 
 import msgspec
 from django.core.exceptions import FieldDoesNotExist, ValidationError
-from django.db.models import CompositePrimaryKey, F, Field
+from django.db import connections
+from django.db.models import CompositePrimaryKey, F, Field, IntegerField
 from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, TupleLessThan
 
 from . import _json
@@ -66,8 +67,11 @@ def _cursor_field(model: Any, name: str) -> Any:
     return field if isinstance(field, Field) else None
 
 
-def _field_accepts(field: Any, value: Any) -> bool:
-    """Return True when a lookup on ``field`` can use ``value``. A cursor value comes from the client."""
+def _field_accepts(field: Any, value: Any, queryset: Any) -> bool:
+    """Return True when a lookup on ``field`` can use ``value``. A cursor value comes from the client.
+
+    ``queryset`` gives the database. An integer must be in the range of its column in that database.
+    """
     if field is None:
         return True
     if isinstance(field, CompositePrimaryKey):
@@ -76,13 +80,22 @@ def _field_accepts(field: Any, value: Any) -> bool:
         return (
             isinstance(value, list)
             and len(value) == len(columns)
-            and all(_field_accepts(column, item) for column, item in zip(columns, value, strict=True))
+            and all(_field_accepts(column, item, queryset) for column, item in zip(columns, value, strict=True))
         )
     try:
         # The lookup makes the same call. Without this check, its error is a 500.
-        field.get_prep_value(value)
+        prepared = field.get_prep_value(value)
     except (ValueError, TypeError, ValidationError):
         return False
+    if isinstance(prepared, int):
+        # A ForeignKey has the column type of its target.
+        while field.is_relation:
+            field = field.target_field
+        if isinstance(field, IntegerField):
+            # The row comparison of the tie-breaker sends the integer as it is. Out of the range,
+            # SQLite raises OverflowError and other databases raise a data error.
+            low, high = connections[queryset.db].ops.integer_field_range(field.get_internal_type())
+            return (low is None or prepared >= low) and (high is None or prepared <= high)
     return True
 
 
@@ -693,8 +706,8 @@ class CursorPagination(PaginationBase):
 
         # A value that its field cannot use means no cursor, as a cursor that does not decode.
         if cursor_value is not None and not (
-            _field_accepts(_cursor_field(queryset.model, ordering_field), cursor_value)
-            and (cursor_pk is None or not tie_break or _field_accepts(pk_field, cursor_pk))
+            _field_accepts(_cursor_field(queryset.model, ordering_field), cursor_value, queryset)
+            and (cursor_pk is None or not tie_break or _field_accepts(pk_field, cursor_pk, queryset))
         ):
             cursor_value = None
 
