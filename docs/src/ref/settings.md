@@ -111,10 +111,11 @@ Bolt uses this list to find the canonical client address for
 
 Bolt uses the same list for the request scheme. Only a peer in the list can set the scheme with `X-Forwarded-Proto`. Bolt reads the rightmost value, because the proxy closest to Bolt adds it. A value other than `http` or `https` is ignored. From any other peer, the scheme is the scheme of the connection. Bolt does not end TLS, so that scheme is `http`. The scheme sets these values:
 
-- `request.build_absolute_uri()` and the default `request.META["SERVER_PORT"]` on Bolt routes.
+- `request.build_absolute_uri()`, `request.META["wsgi.url_scheme"]` and the default `request.META["SERVER_PORT"]` on Bolt routes.
+- `request.scheme`, `request.is_secure()` and `request.build_absolute_uri()` of the Django request that a Django middleware gets on a Bolt route. Thus `SecurityMiddleware` and `CsrfViewMiddleware` see `https` behind a listed proxy that ends TLS.
 - The `scheme` key, and the port of the `server` key, of the ASGI scope of `mount_asgi()` and `mount_django()`. Django reads `scope["scheme"]` for `request.is_secure()`.
 
-Django's `SECURE_PROXY_SSL_HEADER` still applies on top of this scheme, in Django code and in `request.build_absolute_uri()`, as in Django. Django middleware on a Bolt route reads the scheme only from `SECURE_PROXY_SSL_HEADER`, as before. That setting trusts the header from every peer, so set it only when the proxy removes the header from client requests.
+Django's `SECURE_PROXY_SSL_HEADER` still applies on top of this scheme, in Django code and in `request.build_absolute_uri()`, as in Django. That setting trusts the header from every peer, so set it only when the proxy removes the header from client requests.
 
 The origin check of cookie authentication reads `X-Forwarded-Proto` from every peer. That check passes only one origin, so a value that a client sends never makes it weaker than the scheme of the connection. See [Cross-site request forgery protection](../topics/authentication.md#cross-site-request-forgery-protection).
 
