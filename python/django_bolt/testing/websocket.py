@@ -400,6 +400,8 @@ class WebSocketTestClient:
                     {
                         "type": "websocket.close",
                         "code": CloseCode.INTERNAL_ERROR,
+                        # The reason that the server sends for a handler error.
+                        "reason": "Internal error",
                     }
                 )
                 self._closed = True
