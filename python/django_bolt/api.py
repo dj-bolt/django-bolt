@@ -260,6 +260,16 @@ def _normalize_path(path: str, trailing_slash: str = "strip") -> str:
         return path
 
 
+def _join_viewset_path(base: str, *segments: str) -> str:
+    """Add segments to the path of a viewset, with one slash between the parts.
+
+    The result ends with a slash if the viewset path does. The `trailing_slash`
+    mode of the API then normalizes it, and "keep" keeps it.
+    """
+    joined = "/".join((base.rstrip("/"), *segments))
+    return joined + "/" if base.endswith("/") and base != "/" else joined
+
+
 def _normalize_mount_prefix(path: str) -> str:
     """Normalize an ASGI mount prefix: ensure leading slash, strip trailing, reject dynamic segments."""
     mount_path = "/" + path.strip("/") if path else "/"
@@ -1190,6 +1200,11 @@ class BoltAPI:
                 methods_to_register = [m.lower() for m in available_methods]
             else:
                 # Validate requested methods are implemented
+                if not methods:
+                    raise ValueError(
+                        f"methods of @api.view() is empty, so {view_cls.__name__} would have no route. "
+                        "Leave out methods to register each method that the class implements."
+                    )
                 methods_to_register = [m.lower() for m in methods]
                 available_methods = {m.lower() for m in view_cls.get_allowed_methods()}
                 for method in methods_to_register:
@@ -1346,10 +1361,10 @@ class BoltAPI:
                 "list": ("GET", path, None),
                 "create": ("POST", path, HTTP_201_CREATED),
                 # Detail routes (with pk)
-                "retrieve": ("GET", f"{path}/{{{actual_lookup_field}}}", None),
-                "update": ("PUT", f"{path}/{{{actual_lookup_field}}}", None),
-                "partial_update": ("PATCH", f"{path}/{{{actual_lookup_field}}}", None),
-                "destroy": ("DELETE", f"{path}/{{{actual_lookup_field}}}", HTTP_204_NO_CONTENT),
+                "retrieve": ("GET", _join_viewset_path(path, f"{{{actual_lookup_field}}}"), None),
+                "update": ("PUT", _join_viewset_path(path, f"{{{actual_lookup_field}}}"), None),
+                "partial_update": ("PATCH", _join_viewset_path(path, f"{{{actual_lookup_field}}}"), None),
+                "destroy": ("DELETE", _join_viewset_path(path, f"{{{actual_lookup_field}}}"), HTTP_204_NO_CONTENT),
             }
 
             # Register routes for each implemented action
@@ -1539,11 +1554,11 @@ class BoltAPI:
                 if attr.detail:
                     # Instance-level action: /base_path/{lookup_field}/action_name
                     # Example: /users/{id}/activate
-                    action_path = f"{base_path}/{{{lookup_field}}}/{attr.path}"
+                    action_path = _join_viewset_path(base_path, f"{{{lookup_field}}}", attr.path)
                 else:
                     # Collection-level action: /base_path/action_name
                     # Example: /users/active
-                    action_path = f"{base_path}/{attr.path}"
+                    action_path = _join_viewset_path(base_path, attr.path)
 
                 # Register route for each HTTP method
                 for http_method in attr.methods:
