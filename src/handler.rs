@@ -818,25 +818,27 @@ async fn route_request<const ACCESS_LOG: bool>(
             // No route found - check for trailing slash redirect FIRST
             // This only runs when route doesn't match (minimal overhead)
             // Starlette-style: redirect to canonical URL if alternate path exists
-            if path != "/" {
-                let alternate_path = if path.ends_with('/') {
-                    path.trim_end_matches('/').to_string()
-                } else {
-                    format!("{}/", path)
-                };
+            let alternate_path = if path == "/" {
+                None
+            } else if path.ends_with('/') {
+                Some(path.trim_end_matches('/').to_string())
+            } else {
+                Some(format!("{}/", path))
+            };
 
-                // Try alternate path - if it matches, send 308 redirect
-                if router.find(method, &alternate_path).is_some() {
-                    let query = req.query_string();
-                    let location = if query.is_empty() {
-                        alternate_path
-                    } else {
-                        format!("{}?{}", alternate_path, query)
-                    };
-                    return HttpResponse::PermanentRedirect() // 308
-                        .insert_header(("Location", location))
-                        .finish();
-                }
+            // Try alternate path - if it matches, send 308 redirect
+            if let Some(alternate_path) = &alternate_path
+                && router.find(method, alternate_path).is_some()
+            {
+                let query = req.query_string();
+                let location = if query.is_empty() {
+                    alternate_path.clone()
+                } else {
+                    format!("{}?{}", alternate_path, query)
+                };
+                return HttpResponse::PermanentRedirect() // 308
+                    .insert_header(("Location", location))
+                    .finish();
             }
 
             // No explicit handler found - check for automatic OPTIONS
@@ -892,7 +894,21 @@ async fn route_request<const ACCESS_LOG: bool>(
 
             // The path has routes, but none for this method: 405 with `Allow`
             // (RFC 9110 section 15.5.6). This lookup runs on a miss only.
-            let allowed_methods = router.find_all_methods(path);
+            // The other slash form of the path gets the same check. That form
+            // redirects for a method of its routes, so the path is a route path.
+            let mut allowed_methods = router.find_all_methods(path);
+            if allowed_methods.is_empty() {
+                if let Some(alternate_path) = &alternate_path {
+                    allowed_methods = router.find_all_methods(alternate_path);
+                }
+                // The automatic OPTIONS answer of the route path.
+                if method == "OPTIONS" && !allowed_methods.is_empty() {
+                    return HttpResponse::NoContent()
+                        .insert_header(("Allow", allowed_methods.join(", ")))
+                        .insert_header(("Content-Type", "application/json"))
+                        .finish();
+                }
+            }
             if !allowed_methods.is_empty() {
                 return responses::error_405(&allowed_methods);
             }
