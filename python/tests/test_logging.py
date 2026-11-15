@@ -11,6 +11,7 @@ These tests validate the behavior documented in docs/LOGGING.md:
 
 import io
 import logging
+import re
 import time
 from contextlib import redirect_stderr
 from logging.handlers import QueueHandler
@@ -19,14 +20,17 @@ from unittest.mock import Mock
 
 import pytest
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.test import override_settings
 
 import django_bolt.logging.config as config_module
+from django_bolt import BoltAPI
 from django_bolt.logging import LoggingConfig, LoggingMiddleware, create_logging_middleware
 from django_bolt.logging.config import (
     _BoundedQueueListener,
     _DropOnFullQueueHandler,
     _ensure_queue_logging,
+    get_default_logging_config,
     setup_django_logging,
 )
 
@@ -99,6 +103,73 @@ class TestLoggingConfig:
         """Minimum duration threshold should be configurable for slow-only logging."""
         config = LoggingConfig(min_duration_ms=500)
         assert config.min_duration_ms == 500
+
+    @pytest.mark.parametrize(
+        ("name", "value", "message"),
+        [
+            ("DJANGO_BOLT_LOG_SAMPLE", 5, "DJANGO_BOLT_LOG_SAMPLE must be a number from 0.0 to 1.0, got 5"),
+            ("DJANGO_BOLT_LOG_SAMPLE", "0.5", "DJANGO_BOLT_LOG_SAMPLE must be a number from 0.0 to 1.0, got '0.5'"),
+            ("DJANGO_BOLT_LOG_SLOW_MS", -1, "DJANGO_BOLT_LOG_SLOW_MS must be a number of 0 or more, got -1"),
+            ("DJANGO_BOLT_LOG_SLOW_MS", True, "DJANGO_BOLT_LOG_SLOW_MS must be a number of 0 or more, got True"),
+        ],
+    )
+    def test_a_log_setting_out_of_range_stops_the_api(self, settings, name, value, message):
+        """A wrong value of a log setting is an error, not a setting with no effect."""
+        setattr(settings, name, value)
+        with pytest.raises(ImproperlyConfigured, match=re.escape(message)):
+            BoltAPI()
+
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (LoggingConfig(sample_rate=1.5), "LoggingConfig.sample_rate must be a number from 0.0 to 1.0, got 1.5"),
+            (
+                LoggingConfig(min_duration_ms=-250),
+                "LoggingConfig.min_duration_ms must be a number of 0 or more, got -250",
+            ),
+        ],
+    )
+    def test_a_logging_config_value_out_of_range_stops_the_api(self, config, message):
+        with pytest.raises(ValueError, match=re.escape(message)):
+            BoltAPI(logging_config=config)
+
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (LoggingConfig(skip_paths="/health"), "LoggingConfig.skip_paths must be a set of paths, got '/health'"),
+            (
+                LoggingConfig(skip_paths={b"/health"}),
+                "LoggingConfig.skip_paths must hold only str paths, got b'/health'",
+            ),
+            (
+                LoggingConfig(skip_status_codes=204),
+                "LoggingConfig.skip_status_codes must be a set of status codes, got 204",
+            ),
+            (
+                LoggingConfig(skip_status_codes={"204"}),
+                "LoggingConfig.skip_status_codes must hold only status codes from 100 to 599, got '204'",
+            ),
+            (
+                LoggingConfig(skip_status_codes={600}),
+                "LoggingConfig.skip_status_codes must hold only status codes from 100 to 599, got 600",
+            ),
+        ],
+    )
+    def test_a_skip_option_of_a_wrong_type_stops_the_api(self, config, message):
+        """Rust applies the two skip options, so a value that it cannot read is an error."""
+        with pytest.raises(ValueError, match=re.escape(message)):
+            BoltAPI(logging_config=config)
+
+    def test_the_default_config_takes_the_two_log_settings(self, settings):
+        """Without the settings, the default config sets no limit, also with DEBUG off."""
+        settings.DEBUG = False
+        default = get_default_logging_config()
+        assert (default.sample_rate, default.min_duration_ms) == (None, None)
+
+        settings.DJANGO_BOLT_LOG_SAMPLE = 0.25
+        settings.DJANGO_BOLT_LOG_SLOW_MS = 300
+        from_settings = get_default_logging_config()
+        assert (from_settings.sample_rate, from_settings.min_duration_ms) == (0.25, 300.0)
 
     def test_skip_paths_configuration(self):
         """Skip paths should be fully customizable."""
@@ -957,6 +1028,24 @@ class TestQueueBasedLogging:
         root_logger = logging.getLogger()
         has_queue_handler = any(isinstance(h, QueueHandler) for h in root_logger.handlers)
         assert has_queue_handler, "Root logger should have a QueueHandler"
+
+    def test_setup_django_logging_prints_each_record_one_time(self, capsys):
+        """A record of the django logger or of one of its children goes to the console one time."""
+        config_module._LOGGING_CONFIGURED = False
+
+        setup_django_logging(force=True)
+        logging.getLogger("django.request").warning("one request record")
+        logging.getLogger("django.server").warning("one server record")
+        logging.getLogger("django_bolt").warning("one bolt record")
+        logging.getLogger("another_app").warning("one app record")
+        # stop() sends each queued record to the console handler.
+        config_module._QUEUE_LISTENER.stop()
+
+        console = capsys.readouterr().err
+        assert [
+            console.count(text)
+            for text in ("one request record", "one server record", "one bolt record", "one app record")
+        ] == [1, 1, 1, 1]
 
     def test_setup_django_logging_respects_explicit_logging_config(self):
         """setup_django_logging should skip setup when LOGGING is explicitly configured."""
