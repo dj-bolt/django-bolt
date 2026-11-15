@@ -968,6 +968,7 @@ mod tests {
     /// The limits of one `parse_multipart` call. The default limits are not reached.
     struct Limits {
         max_upload_size: usize,
+        memory_limit: usize,
         max_parts: usize,
         max_param_length: usize,
         max_total_size: usize,
@@ -977,6 +978,7 @@ mod tests {
         fn default() -> Self {
             Limits {
                 max_upload_size: 1024,
+                memory_limit: DEFAULT_MEMORY_LIMIT,
                 max_parts: DEFAULT_MAX_PARTS,
                 max_param_length: 1024,
                 max_total_size: usize::MAX,
@@ -1032,7 +1034,7 @@ mod tests {
             &HashMap::new(),
             file_constraints,
             limits.max_upload_size,
-            DEFAULT_MEMORY_LIMIT,
+            limits.memory_limit,
             limits.max_parts,
             limits.max_param_length,
             limits.max_total_size,
@@ -1202,6 +1204,29 @@ mod tests {
             &limits,
         );
         assert_eq!(error_type(rejected), "file_too_large");
+    }
+
+    #[test]
+    fn multipart_file_of_the_memory_limit_stays_in_memory_and_one_more_byte_goes_to_disk() {
+        let limits = Limits {
+            memory_limit: 4,
+            ..Limits::default()
+        };
+        let upload = |data: &[u8]| {
+            let parts = [file_part("upload", "text/plain", data)];
+            let mut parsed = parse_parts(&parts, &HashMap::new(), &limits).unwrap();
+            parsed.files_map.remove("upload").unwrap().remove(0)
+        };
+
+        let at_limit = upload(b"abcd");
+        assert!(matches!(&at_limit.content, FileContent::Memory(data) if data == b"abcd"));
+
+        let over_limit = upload(b"abcde");
+        let FileContent::Disk(file) = &over_limit.content else {
+            panic!("a file over the memory limit must go to a temporary file");
+        };
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"abcde");
+        assert_eq!(over_limit.size, 5);
     }
 
     #[test]

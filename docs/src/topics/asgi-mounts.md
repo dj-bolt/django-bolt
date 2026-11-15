@@ -96,8 +96,11 @@ For `api.mount_asgi("/metrics", app)`:
 - `GET /metrics/v1/ping`
   - `scope["root_path"] == "/metrics"`
   - `scope["path"] == "/v1/ping"`
+- `GET /metrics/caf%C3%A9`
+  - `scope["path"] == "/café"`
+  - `scope["raw_path"] == b"/caf%C3%A9"`
 
-Headers and query strings are forwarded in the ASGI scope.
+`path` is percent-decoded, and `raw_path` keeps the request bytes. Headers and query strings are forwarded in the ASGI scope.
 
 ## `mount_django()`
 
