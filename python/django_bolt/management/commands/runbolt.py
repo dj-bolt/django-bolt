@@ -656,7 +656,8 @@ class Command(BaseCommand):
             default=30,
             help=(
                 "Seconds a worker gets to shut down gracefully (finish in-flight "
-                "requests, close WebSockets) before it is SIGKILLed (default: 30)"
+                "requests, close WebSockets) before the server closes its connections "
+                "and the supervisor sends SIGKILL (default: 30)"
             ),
         )
 
@@ -756,10 +757,6 @@ class Command(BaseCommand):
         # Run autodiscovery + banner once in the parent before forking so the
         # user sees a single clean banner instead of N copies.
         self._print_multiprocess_banner(options)
-
-        # Give Actix the same graceful-shutdown window the supervisor allows
-        # before escalating to SIGKILL (user-set env takes precedence).
-        os.environ.setdefault("DJANGO_BOLT_SHUTDOWN_TIMEOUT", str(kill_timeout))
 
         def spawn_worker(slot: int) -> int:
             # A forked worker inherits the sockets of the parent's open database
@@ -1026,6 +1023,10 @@ class Command(BaseCommand):
         # Set environment variables for Rust
         os.environ["DJANGO_BOLT_WORKERS"] = str(options["workers"])
         os.environ["DJANGO_BOLT_BACKLOG"] = str(options["backlog"])
+        # The graceful-shutdown window of the server. With a supervisor, it is
+        # also the time before SIGKILL. A value that the user set in the
+        # environment takes precedence.
+        os.environ.setdefault("DJANGO_BOLT_SHUTDOWN_TIMEOUT", str(options["workers_kill_timeout"]))
         if options.get("keep_alive") is not None:
             os.environ["DJANGO_BOLT_KEEP_ALIVE"] = str(options["keep_alive"])
 
