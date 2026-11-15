@@ -39,7 +39,10 @@ class FieldConfig:
     """
 
     alias: str | None = None
-    """Alternative name for this field in JSON input/output."""
+    """
+    Key of this field in the output of dump(by_alias=True). Input does not accept
+    the alias: it uses the field name, or the name from the rename option of the class.
+    """
 
     default: Any = _UNSET
     """Default value for this field."""
@@ -143,7 +146,9 @@ def field(
                     Use for sensitive data like `password`.
         source: Source attribute name on the model. Supports dot notation.
                 Example: source="author.name" maps field to instance.author.name
-        alias: Alternative name for this field in JSON input/output.
+        alias: Key of this field in the output of dump(by_alias=True). Input does not
+               accept the alias. It uses the field name, or the name from the
+               rename option of the class.
         default: Default value for this field.
         default_factory: Factory function to create default value (for mutable defaults).
         description: Description for OpenAPI documentation.

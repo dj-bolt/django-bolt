@@ -2159,7 +2159,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that weren't explicitly set
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys (not yet implemented)
+            by_alias: If True, use field aliases as keys
 
         Returns:
             Dictionary representation of the serializer
