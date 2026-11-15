@@ -309,7 +309,8 @@ class OrmVisitor(ast.NodeVisitor):
             self.analysis.request_needs_query = True
         elif attr_name == "get_full_path":
             self.analysis.request_needs_query = True
-        elif attr_name == "build_absolute_uri":
+        elif attr_name in {"build_absolute_uri", "scheme", "is_secure"}:
+            # These read META, as the "META" branch above.
             self.analysis.request_needs_headers = True
             self.analysis.request_needs_query = True
         elif attr_name not in {"method", "path", "params", "context", "state", "user", "auser"}:

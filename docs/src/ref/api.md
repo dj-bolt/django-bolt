@@ -339,6 +339,7 @@ The request dict contains:
 | `headers` | `dict` | Request headers |
 | `body` | `bytes` | Raw request body |
 | `context` | `dict` | Authentication context |
+| `scheme` | `str` | `"http"` or `"https"`. `request.is_secure()` is `True` for `"https"` |
 
 ### Type-safe Request
 
