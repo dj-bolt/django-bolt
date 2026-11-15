@@ -384,6 +384,39 @@ def test_none_of_on_a_claim_that_a_session_user_lacks_is_an_error():
             return {"ok": True}
 
 
+def test_a_permissions_guard_needs_the_sync_permissions_method_of_the_user_model(monkeypatch):
+    """The guard check calls ``user.get_all_permissions()``, so startup checks that method."""
+
+    class SyncPermissionsUser:
+        is_authenticated = True
+
+        def get_all_permissions(self):
+            return {"reports.view"}
+
+    class AsyncPermissionsUser:
+        is_authenticated = True
+
+        async def aget_all_permissions(self):
+            return {"reports.view"}
+
+    def add_route(user_model):
+        monkeypatch.setattr("django_bolt.auth.session.get_user_model", lambda: user_model)
+        api = BoltAPI()
+
+        @api.get("/reports", auth=[SessionAuthentication()], guards=[Requires("permissions", "reports.view")])
+        async def reports():
+            return {"ok": True}
+
+    add_route(SyncPermissionsUser)
+    with pytest.raises(ImproperlyConfigured) as error:
+        add_route(AsyncPermissionsUser)
+
+    assert str(error.value) == (
+        "A guard on GET /reports reads permissions of the session user, "
+        "but the user model AsyncPermissionsUser has no get_all_permissions."
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.django_db(transaction=True)
 async def test_a_session_default_is_dropped_on_a_websocket_route():
