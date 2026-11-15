@@ -154,6 +154,11 @@ raises `ValueError` with the same text.
 
 ### From the server
 
+When the handler returns after `accept()` with no `close()`, Bolt closes the
+connection with code 1000. When the handler raises, Bolt closes it with code
+1011 and the reason `Internal error`. To send a different code or a reason,
+call `close()`:
+
 ```python
 await websocket.close()
 

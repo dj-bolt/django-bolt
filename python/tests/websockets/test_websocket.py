@@ -211,7 +211,10 @@ def api():
     @api.websocket("/ws/slow")
     async def slow_handler(websocket: WebSocket):
         await websocket.accept()
-        # Don't send anything - client should timeout
+        # Send nothing and stay connected, so the client times out.
+        # A return here closes the connection with 1000.
+        async for _message in websocket.iter_text():
+            pass
 
     return api
 
