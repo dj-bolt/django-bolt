@@ -24,7 +24,7 @@ import pytest
 from django_bolt import BoltAPI, WebSocket
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, Requires
 from django_bolt.param_functions import Cookie, Header, Query
-from django_bolt.testing import ConnectionClosed, WebSocketTestClient
+from django_bolt.testing import ConnectionClosed, TestClient, WebSocketTestClient
 from django_bolt.websocket import CloseCode
 
 # Test secret for JWT tokens
@@ -283,6 +283,35 @@ async def test_websocket_binary(api):
         length = int.from_bytes(response[:4], "big")
         assert length == len(data)
         assert response[4:] == data
+
+
+@pytest.mark.asyncio
+async def test_websocket_route_has_the_api_prefix_and_documents_its_auth():
+    """A WebSocket route gets the prefix of the API. An explicit ``auth`` shows as the security of its operation."""
+    api = BoltAPI(prefix="/api")
+
+    @api.websocket("/ws/open")
+    async def open_route(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("open")
+
+    @api.websocket("/ws/private", auth=[JWTAuthentication(secret=TEST_JWT_SECRET)], guards=[IsAuthenticated()])
+    async def private_route(websocket: WebSocket):
+        await websocket.accept()
+
+    async with WebSocketTestClient(api, "/api/ws/open") as ws:
+        assert await ws.receive_text() == "open"
+
+    with pytest.raises(ValueError, match="No WebSocket handler found"):
+        async with WebSocketTestClient(api, "/ws/open"):
+            pass
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        paths = client.get("/docs/openapi.json").json()["paths"]
+
+    assert "security" not in paths["/api/ws/open"]["get"]
+    assert paths["/api/ws/private"]["get"]["security"] == [{"BearerAuth": []}]
 
 
 # --- Path Parameter Tests ---

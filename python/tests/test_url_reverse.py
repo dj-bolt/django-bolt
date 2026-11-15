@@ -251,6 +251,25 @@ def test_reverse_namespaced(urlconf_factory):
         django_reverse("get_mission", urlconf=urlconf, kwargs={"id": 5})
 
 
+def test_reverse_websocket_route(urlconf_factory):
+    """A WebSocket route has a name for reverse(): the ``name`` argument, or the name of its handler."""
+    api = BoltAPI(namespace="chat")
+
+    @api.websocket("/ws/rooms/{room}", name="room_socket")
+    async def room(websocket, room: str):
+        await websocket.accept()
+
+    @api.websocket("/ws/lobby")
+    async def lobby(websocket):
+        await websocket.accept()
+
+    urlconf = urlconf_factory(api)
+    assert django_reverse("chat:room_socket", urlconf=urlconf, kwargs={"room": "a"}) == "/ws/rooms/a"
+    assert django_reverse("chat:lobby", urlconf=urlconf) == "/ws/lobby"
+    with pytest.raises(NoReverseMatch):
+        django_reverse("chat:room", urlconf=urlconf, kwargs={"room": "a"})
+
+
 def test_reverse_catch_all_allows_slashes(urlconf_factory):
     """The path converter must accept slashes, matching Bolt's {*name} catch-all."""
     api = BoltAPI()
