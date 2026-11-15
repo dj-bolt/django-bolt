@@ -317,6 +317,31 @@ def test_the_async_executor_of_a_sync_handler_keeps_the_response(path, expected)
     assert response.json() == in_a_task(expected)
 
 
+def test_an_async_handler_with_no_await_has_a_running_loop():
+    """Bolt runs such a handler with no asyncio task. ``create_task()`` in the handler still works."""
+    api = BoltAPI()
+    ran = []
+
+    async def later():
+        ran.append("later")
+
+    @api.get("/schedule")
+    async def schedule():
+        task = asyncio.get_running_loop().create_task(later())
+        return {"scheduled": not task.done()}
+
+    @api.get("/ran")
+    async def read_ran():
+        await asyncio.sleep(0)
+        return ran
+
+    with TestClient(api) as client:
+        response = client.get("/schedule")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"scheduled": True}
+        assert client.get("/ran").json() == ["later"]
+
+
 def titles(prefix: str = ""):
     """Return a QuerySet from a helper, where the analysis of the handler cannot see the ORM."""
     return Article.objects.filter(title__startswith=prefix).values("title")

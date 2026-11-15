@@ -8,10 +8,17 @@ import msgspec
 import pytest
 
 from django_bolt import BoltAPI, ViewSet, action
+from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
+from django_bolt.responses import PlainText
 from django_bolt.testing import TestClient
 from django_bolt.views import APIView
 
 from .test_models import Article  # noqa: PLC0415
+
+
+class _Thing(msgspec.Struct):
+    id: int
+
 
 # --- Fixtures ---
 
@@ -64,14 +71,14 @@ def test_view_decorator_with_multiple_methods(api):
     assert response.json()["created"] is True
 
 
-@pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete", "query"])
+@pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete", "head", "options", "query"])
 def test_method_decorator_passes_its_arguments_to_the_route(api, method):
     """Each method decorator gives ``status_code`` and the OpenAPI arguments to its route."""
 
     @getattr(api, method)(
         "/things", status_code=202, tags=["stock"], summary="Short text", description="Long text", name="things"
     )
-    async def things():
+    async def list_things():
         return {"ok": True}
 
     api._register_openapi_routes()
@@ -79,7 +86,9 @@ def test_method_decorator_passes_its_arguments_to_the_route(api, method):
     with TestClient(api) as client:
         response = client.request(method.upper(), "/things")
         assert response.status_code == 202
-        assert response.json() == {"ok": True}
+        # A HEAD response has no body.
+        if method != "head":
+            assert response.json() == {"ok": True}
 
         operation = client.get("/docs/openapi.json").json()["paths"]["/things"][method]
 
@@ -88,6 +97,43 @@ def test_method_decorator_passes_its_arguments_to_the_route(api, method):
     assert operation["description"] == "Long text"
     assert list(operation["responses"]) == ["202"]
     assert api._handler_meta[api._routes[0][2]]["name"] == "things"
+
+
+@pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete", "head", "options", "query"])
+def test_method_decorator_passes_auth_and_response_arguments(api, method):
+    """Each method decorator gives ``auth``, ``guards`` and the response arguments to its route."""
+    route = getattr(api, method)
+
+    @route(
+        "/guarded",
+        auth=[APIKeyAuthentication(api_keys={"secret"})],
+        guards=[IsAuthenticated()],
+        response_model=_Thing,
+    )
+    async def guarded() -> dict:
+        return {"id": "not a number"}
+
+    @route("/open", validate_response=False, include_in_schema=False)
+    async def open_things() -> _Thing:
+        return {"id": "not a number"}
+
+    @route("/text", response_class=PlainText)
+    async def text():
+        return "plain"
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        assert client.request(method.upper(), "/guarded").status_code == 401
+        # The body is not a _Thing, so the response_model rejects it.
+        assert client.request(method.upper(), "/guarded", headers={"X-API-Key": "secret"}).status_code == 500
+        # With validation on, this body gives 500 too.
+        assert client.request(method.upper(), "/open").status_code == 200
+
+        paths = client.get("/docs/openapi.json").json()["paths"]
+
+    assert "/open" not in paths
+    assert list(paths["/text"][method]["responses"]["200"]["content"]) == ["text/plain"]
 
 
 @pytest.mark.django_db(transaction=True)
