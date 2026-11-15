@@ -7,12 +7,8 @@ import asyncio
 from collections.abc import Callable
 from typing import Any
 
-try:
-    from asgiref.sync import sync_to_async
-    from django.db import DEFAULT_DB_ALIAS, DatabaseError, connection, connections
-except ImportError:
-    sync_to_async = None
-    connection = None
+from asgiref.sync import sync_to_async
+from django.db import DEFAULT_DB_ALIAS, DatabaseError, connections
 
 
 class HealthCheck:
@@ -90,9 +86,6 @@ async def check_database() -> tuple[bool, str]:
         Tuple of (is_healthy, message)
     """
     try:
-        if sync_to_async is None or connection is None:
-            return False, "Django not available"
-
         await sync_to_async(_ensure_connection)()
 
         return True, "Database connection OK"

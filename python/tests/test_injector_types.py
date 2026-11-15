@@ -47,7 +47,6 @@ class TestCompiledInjectorTypes:
         """Create minimal handler metadata for injector compilation."""
         return {
             "fields": [],
-            "path_params": set(),
             "http_method": "WEBSOCKET",
             "handler_pattern": pattern,
             "needs_body": False,

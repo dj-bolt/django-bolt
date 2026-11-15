@@ -293,17 +293,6 @@ class APIView:
 
         return view_handler
 
-    def initialize(self, request: dict[str, Any]) -> None:
-        """
-        Hook called before the method handler is invoked.
-
-        Override this to perform per-request initialization.
-
-        Args:
-            request: The request dictionary
-        """
-        pass
-
     @classmethod
     def get_allowed_methods(cls) -> set[str]:
         """

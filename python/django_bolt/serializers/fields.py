@@ -227,7 +227,7 @@ def get_msgspec_type_for_django_field(field: models.Field) -> Any:
     # Build constraint metadata
     constraints: dict[str, Any] = {}
 
-    # CharField and similar text fields
+    # CharField and its subclasses (EmailField, URLField, SlugField)
     if isinstance(field, models.CharField):
         # Check if field has choices - use Literal type for type safety
         if field.choices:
@@ -239,10 +239,6 @@ def get_msgspec_type_for_django_field(field: models.Field) -> Any:
             base_type = str
 
     elif isinstance(field, models.TextField):
-        base_type = str
-
-    elif isinstance(field, (models.EmailField, models.URLField, models.SlugField)):
-        constraints["max_length"] = field.max_length
         base_type = str
 
     # Numeric fields

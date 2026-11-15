@@ -90,7 +90,6 @@ class HandlerMetadata(TypedDict, total=False):
     fields: list[FieldDefinition]
     """List of parameter field definitions"""
 
-    path_params: set[str]
     """Set of path parameter names extracted from route pattern"""
 
     http_method: str
