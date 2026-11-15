@@ -454,6 +454,8 @@ The `runbolt` management command accepts these options:
 | `--keep-alive` | OS default | HTTP keep-alive timeout |
 | `--skip-checks` | off | Skip the Django system checks at startup |
 
+A number out of range stops `runbolt` before startup, with an error that names the option. `--port` takes 0 to 65535. `--workers` takes 1 to 512. `--processes` takes 1 or more. `--backlog`, `--keep-alive`, `--max-rss`, `--workers-lifetime` and `--workers-kill-timeout` take 0 or more.
+
 At startup, `runbolt` runs the Django system checks and the migration check, like `runserver`. A check error stops startup. The unapplied-migration warning prints before the banner. In `--dev` mode, each reload runs the checks again. Multi-process mode runs them once, in the parent process. `--skip-checks` skips the system checks; the migration check still runs.
 
 ### Examples

@@ -4,7 +4,9 @@ import importlib
 import sys
 from types import SimpleNamespace
 
-from django.core.management import execute_from_command_line
+import pytest
+from django.core.management import call_command, execute_from_command_line
+from django.core.management.base import CommandError
 
 from django_bolt.management.commands import runbolt as runbolt_module
 
@@ -101,6 +103,28 @@ def test_build_display_url_preserves_bind_host_outside_dev_mode():
     assert runbolt_module._build_display_url("0.0.0.0", 8000, dev_mode=True, path="/admin/") == (
         "http://127.0.0.1:8000/admin/"
     )
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--port", "65536"], "--port must be at most 65535, got 65536"),
+        (["--port", "-1"], "--port must be at least 0, got -1"),
+        (["--processes", "0"], "--processes must be at least 1, got 0"),
+        (["--workers", "0"], "--workers must be at least 1, got 0"),
+        (["--workers", "513"], "--workers must be at most 512, got 513"),
+        (["--backlog", "-1"], "--backlog must be at least 0, got -1"),
+        (["--keep-alive", "-1"], "--keep-alive must be at least 0, got -1"),
+        (["--max-rss", "-1"], "--max-rss must be at least 0, got -1"),
+        (["--workers-lifetime", "-1"], "--workers-lifetime must be at least 0, got -1"),
+        (["--workers-kill-timeout", "-1"], "--workers-kill-timeout must be at least 0, got -1"),
+    ],
+)
+def test_runbolt_stops_for_an_option_value_out_of_range(argv, message):
+    with pytest.raises(CommandError) as error:
+        call_command("runbolt", *argv)
+
+    assert str(error.value) == message
 
 
 def test_collapse_watch_paths_deduplicates_nested_directories(tmp_path):
