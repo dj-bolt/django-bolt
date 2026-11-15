@@ -438,11 +438,15 @@ async def webhook(request):
 
 Bolt runs four hooks of a Django middleware: `process_request`, `process_view`, `process_response` and `process_exception`. It does not run `process_template_response`.
 
-When a handler raises an exception, Bolt calls `process_exception` of each middleware, as Django does. The last middleware runs first. The first response that a hook returns answers the request. If no hook returns a response, the exception goes to the Bolt error handlers. See [Error Handling](error-handling.md).
+When a handler raises an exception, Bolt calls `process_exception` of each middleware, as Django does. The last middleware runs first. The first response that a hook returns answers the request. If no hook returns a response, the Bolt error handlers make the error response. See [Error Handling](error-handling.md).
 
 An `HTTPException` and a validation error do not go to `process_exception`. They are responses of the API, and Bolt builds them.
 
-With `django_middleware=[...]` or `DjangoMiddlewareStack`, the response of `process_exception` goes through `process_response` of each middleware. In a list of `DjangoMiddleware` wrappers, it goes through `process_response` of the wrapper that answered and of the wrappers before it.
+Bolt makes the error response inside the middleware chain, as Django does. Thus `process_response` of each middleware gets the error response too. For example, `SessionMiddleware` saves the session, and a middleware that adds a header adds it. This applies to the response of `process_exception`, to an `HTTPException`, to a validation error and to the 500 of an unhandled exception.
+
+`get_response(request)` does not raise the exception of the handler. It returns the error response. To handle the exception in a middleware, use `process_exception`. A Bolt middleware around a Django middleware gets the error response from `call_next` too.
+
+A request with no route, or a request that Rust rejects before the handler (authentication, guards, rate limit), does not run the Django middleware.
 
 A list of wrappers runs the hooks in a different order from Django. Each wrapper runs its `process_request` and then its `process_view`, before the next wrapper starts. Django runs all `process_request` hooks first, and then all `process_view` hooks. If the order of the hooks is important, use `django_middleware=[...]` or `DjangoMiddlewareStack`. They use the order of Django.
 
