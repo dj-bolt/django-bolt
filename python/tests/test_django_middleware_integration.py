@@ -1293,6 +1293,49 @@ class TestRequestConversion:
             assert response.json() == {"received_name": "test", "received_value": 42}
 
 
+@pytest.mark.parametrize(
+    ("trusted_proxies", "proxy_ssl_header", "headers", "scheme"),
+    [
+        # A client that is not a declared proxy cannot choose the scheme.
+        ([], None, {"X-Forwarded-Proto": "https"}, "http"),
+        # A declared proxy can. The test client connects from 127.0.0.1.
+        (["127.0.0.1"], None, {"X-Forwarded-Proto": "https"}, "https"),
+        (["127.0.0.1"], None, {"X-Forwarded-Proto": "http"}, "http"),
+        # SECURE_PROXY_SSL_HEADER applies on top of the scheme, as in Django.
+        ([], ("HTTP_X_FORWARDED_PROTO", "https"), {"X-Forwarded-Proto": "https"}, "https"),
+        ([], ("HTTP_X_FORWARDED_PROTO", "https"), {"X-Forwarded-Proto": "http"}, "http"),
+        ([], ("HTTP_X_FORWARDED_PROTO", "https"), {}, "http"),
+        (["127.0.0.1"], ("HTTP_X_TLS", "on"), {"X-Forwarded-Proto": "https", "X-Tls": "off"}, "http"),
+        (["127.0.0.1"], ("HTTP_X_TLS", "on"), {"X-Forwarded-Proto": "https"}, "https"),
+    ],
+)
+def test_django_middleware_request_has_the_scheme_of_the_bolt_request(
+    settings, trusted_proxies, proxy_ssl_header, headers, scheme
+):
+    """A Django middleware and the handler see one scheme for a request behind a TLS proxy."""
+    settings.BOLT_TRUSTED_PROXIES = trusted_proxies
+    settings.SECURE_PROXY_SSL_HEADER = proxy_ssl_header
+    seen = {}
+
+    class RecordScheme(MiddlewareMixin):
+        def process_request(self, request):
+            seen["django"] = (request.scheme, request.is_secure(), request.build_absolute_uri())
+
+    api = BoltAPI(middleware=[DjangoMiddleware(RecordScheme)])
+
+    @api.get("/page")
+    async def page(request):
+        return {"uri": request.build_absolute_uri()}
+
+    with TestClient(api) as client:
+        response = client.get("/page?q=1", headers={"Host": "example.com", **headers})
+
+    assert response.status_code == 200
+    uri = f"{scheme}://example.com/page?q=1"
+    assert response.json() == {"uri": uri}
+    assert seen["django"] == (scheme, scheme == "https", uri)
+
+
 class _DjangoRequestRecorder(MiddlewareMixin):
     """Record what a Django middleware reads from the request that Bolt converted."""
 

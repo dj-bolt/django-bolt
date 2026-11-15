@@ -66,6 +66,17 @@ except ImportError:
     LazyObject = None
     empty = None
 
+if DJANGO_AVAILABLE:
+
+    class _BoltDjangoRequest(HttpRequest):
+        """The Django request that a Django middleware gets on a Bolt route."""
+
+        def _get_scheme(self) -> str:
+            # The scheme of the Bolt request, as WSGIRequest reads it from the
+            # server. Django applies SECURE_PROXY_SSL_HEADER on top of it.
+            return self.META["wsgi.url_scheme"]
+
+
 # Lazy singleton for empty QueryDict - avoids requiring Django settings at import time
 _EMPTY_QUERYDICT = None
 
@@ -925,7 +936,7 @@ def _to_django_request(request: Request) -> HttpRequest:
     - Reuse empty dicts/QueryDicts where possible
     - Use direct attribute assignment (faster than setattr)
     """
-    django_request = HttpRequest()
+    django_request = _BoltDjangoRequest()
 
     # Copy basic attributes (direct assignment is faster)
     django_request.method = request.method
