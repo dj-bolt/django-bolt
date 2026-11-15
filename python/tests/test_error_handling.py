@@ -460,6 +460,37 @@ class TestErrorHandlers:
         data = json.loads(body)
         assert data["detail"] == "Resource not found"
 
+    @pytest.mark.parametrize(
+        "make_parts",
+        [
+            lambda: handle_exception(NotFound(detail="x")),
+            lambda: http_exception_handler(NotFound(detail="x")),
+            lambda: format_error_response(404, "x"),
+        ],
+        ids=["handle_exception", "http_exception_handler", "format_error_response"],
+    )
+    def test_a_change_to_the_returned_headers_does_not_reach_a_later_error_response(self, make_parts):
+        api = BoltAPI()
+
+        @api.get("/missing")
+        async def missing():
+            raise NotFound(detail="No such item")
+
+        _, headers, _ = make_parts()
+        extra = ("x-request-id", "abc")
+        headers.append(extra)
+        try:
+            with TestClient(api) as client:
+                response = client.get("/missing")
+            assert response.status_code == 404
+            assert "x-request-id" not in response.headers
+            assert make_parts()[1] == [("content-type", "application/json")]
+        finally:
+            # Before the fix, the list was shared by each error response of the process.
+            shared = make_parts()[1]
+            if extra in shared:
+                shared.remove(extra)
+
     def test_handle_exception_validation_error(self):
         """Test main exception handler with validation error."""
         errors = [{"loc": ["body"], "msg": "Invalid", "type": "value_error"}]
