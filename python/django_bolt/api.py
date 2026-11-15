@@ -387,6 +387,10 @@ def _validate_asgi_mount_conflicts(
             )
 
 
+# RFC 9110 section 15: a final response status is from 200 to 599.
+_MIN_RESPONSE_STATUS = 200
+_MAX_RESPONSE_STATUS = 599
+
 _HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY"})
 
 # A path parameter with a type, for example ``{id:int}``. As the router does,
@@ -2041,10 +2045,16 @@ class BoltAPI:
                     # Dict mode: per-status-code response schemas
                     # A bool is an int in Python, but it is not a status code.
                     # A key of another type, such as "404", matches no status.
+                    # A response status is from 200 to 599, so a key outside this range matches no response.
                     for code in response_model:
                         if code is not ... and (isinstance(code, bool) or not isinstance(code, int)):
                             raise TypeError(
                                 f"response_model has the key {code!r}. A key must be an integer status code or `...`."
+                            )
+                        if code is not ... and not _MIN_RESPONSE_STATUS <= code <= _MAX_RESPONSE_STATUS:
+                            raise ValueError(
+                                f"response_model has the key {code!r}. A status code key must be "
+                                f"from {_MIN_RESPONSE_STATUS} to {_MAX_RESPONSE_STATUS}."
                             )
                     int_codes = sorted(c for c in response_model if isinstance(c, int))
                     if not int_codes:
