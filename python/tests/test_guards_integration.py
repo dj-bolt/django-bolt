@@ -184,6 +184,19 @@ def test_protected_endpoint_with_valid_token(client):
     assert data["user_id"] == "user123"
 
 
+@pytest.mark.parametrize("scheme", ["bearer", "BEARER", "bEaReR"])
+def test_the_bearer_scheme_has_no_case(client, scheme):
+    """RFC 9110 section 11.1: the name of an auth scheme is case-insensitive."""
+    token = create_token(user_id="user123")
+    response = client.get("/protected", headers={"Authorization": f"{scheme} {token}"})
+    assert response.status_code == 200, response.text
+    assert response.json()["user_id"] == "user123"
+
+    # The same for the scheme before an API key.
+    assert client.get("/api-endpoint", headers={"X-API-Key": f"{scheme} valid-key-123"}).status_code == 200
+    assert client.get("/api-endpoint", headers={"X-API-Key": "apikey valid-key-123"}).status_code == 200
+
+
 def test_admin_endpoint_with_non_admin_token(client):
     """Test admin endpoint with non-admin token (should fail with 403)"""
     token = create_token(user_id="regular-user", is_superuser=False)
@@ -265,6 +278,8 @@ def test_api_key_authentication_without_key(client):
     """Test API key authentication without key"""
     response = client.get("/api-endpoint")
     assert response.status_code == 401
+    # An empty header value is not a key.
+    assert client.get("/api-endpoint", headers={"X-API-Key": ""}).status_code == 401
 
 
 def test_api_key_authentication_with_valid_key(client):

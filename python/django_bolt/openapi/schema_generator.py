@@ -528,6 +528,10 @@ class SchemaGenerator:
         # 3.1.0 for maximum downstream tooling compatibility.
         has_query_operation = False
 
+        # An operationId must be unique in the document. The id of a route is
+        # method + function name, so two routes can share one.
+        self._operation_ids: set[str] = set()
+
         # Process HTTP routes
         for method, path, handler_id, handler in self.api._routes:
             # Skip OpenAPI docs routes (always excluded)
@@ -562,6 +566,7 @@ class SchemaGenerator:
             )
 
             # Collect tags from operation
+            operation.operation_id = self._unique_operation_id(operation.operation_id)
             if operation.tags:
                 collected_tags.update(operation.tags)
 
@@ -604,6 +609,7 @@ class SchemaGenerator:
             )
 
             # Collect tags from operation
+            operation.operation_id = self._unique_operation_id(operation.operation_id)
             if operation.tags:
                 collected_tags.update(operation.tags)
 
@@ -657,6 +663,16 @@ class SchemaGenerator:
             raise OpenAPIStrictError("OpenAPI strict mode: " + "; ".join(problems))
 
         return openapi
+
+    def _unique_operation_id(self, operation_id: str) -> str:
+        """Return operation_id, or operation_id with a numeric suffix when it is taken."""
+        candidate = operation_id
+        number = 1
+        while candidate in self._operation_ids:
+            number += 1
+            candidate = f"{operation_id}_{number}"
+        self._operation_ids.add(candidate)
+        return candidate
 
     def _create_operation(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import msgspec
 import pytest
 
 from django_bolt.serializers import (
@@ -488,6 +489,43 @@ class TestSerializerView:
         # Dump respects field selection
         result = view.dump(user)
         assert result == {"id": 1, "name": "John"}
+
+
+class _ViewItem(Serializer):
+    id: int
+    name: str | None = None
+    note: str = "n"
+    nick: str = field(alias="nickName", default="x")
+
+
+class TestSerializerViewApi:
+    """SerializerView chaining and JSON output, and Serializer.validate."""
+
+    def test_only_on_a_view_narrows_it_and_keeps_exclusions(self):
+        item = _ViewItem(id=1, name="a", note="b", nick="c")
+        narrowed = _ViewItem.only("id", "name", "note").only("name", "note", "nick")
+        assert narrowed.dump(item) == {"name": "a", "note": "b"}
+        assert _ViewItem.exclude("note").only("id", "note", "name").dump(item) == {"id": 1, "name": "a"}
+
+    def test_view_dump_json_forwards_each_option(self):
+        view = _ViewItem.exclude("note")
+        item = _ViewItem(id=1, nick="y")
+        assert view.dump_json(item) == b'{"id":1,"name":null,"nick":"y"}'
+        assert view.dump_json(item, exclude_none=True) == b'{"id":1,"nick":"y"}'
+        assert view.dump_json(item, exclude_defaults=True) == b'{"id":1,"nick":"y"}'
+        assert view.dump_json(item, by_alias=True) == b'{"id":1,"name":null,"nickName":"y"}'
+        assert view.dump_many_json([item]) == b'[{"id":1,"name":null,"nick":"y"}]'
+        assert view.dump_many_json([item], exclude_none=True) == b'[{"id":1,"nick":"y"}]'
+        assert view.dump_many_json([item], exclude_defaults=True) == b'[{"id":1,"nick":"y"}]'
+        assert view.dump_many_json([item], by_alias=True) == b'[{"id":1,"name":null,"nickName":"y"}]'
+
+    def test_validate_returns_a_new_instance_or_raises(self):
+        item = _ViewItem(id=1, name="a")
+        checked = item.validate()
+        assert checked == item
+        assert checked is not item
+        with pytest.raises(msgspec.ValidationError):
+            _ViewItem(id="not-int").validate()
 
 
 class TestComplexScenarios:

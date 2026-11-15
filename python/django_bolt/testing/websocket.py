@@ -484,7 +484,13 @@ class WebSocketTestClient:
             await self.send_bytes(text.encode("utf-8"))
 
     async def receive(self, timeout: float = 5.0) -> dict[str, Any]:
-        """Receive a raw message from the server."""
+        """Receive a raw message from the server.
+
+        A closed connection gets no more messages. When its queue is empty,
+        this raises ``ConnectionClosed`` at once.
+        """
+        if self._closed and self._server_to_client.empty():
+            raise ConnectionClosed(self._close_code if self._close_code is not None else CloseCode.NORMAL)
         try:
             return await asyncio.wait_for(self._server_to_client.get(), timeout=timeout)
         except TimeoutError as e:
@@ -554,24 +560,24 @@ class WebSocketTestClient:
             self._close_code = code
 
     async def iter_text(self, timeout: float = 5.0) -> AsyncIterator[str]:
-        """Async iterator for text messages."""
-        while not self._closed:
+        """Async iterator for text messages. It stops at the close or at a timeout."""
+        while True:
             try:
                 yield await self.receive_text(timeout=timeout)
             except (ConnectionClosed, TimeoutError):
                 break
 
     async def iter_bytes(self, timeout: float = 5.0) -> AsyncIterator[bytes]:
-        """Async iterator for binary messages."""
-        while not self._closed:
+        """Async iterator for binary messages. It stops at the close or at a timeout."""
+        while True:
             try:
                 yield await self.receive_bytes(timeout=timeout)
             except (ConnectionClosed, TimeoutError):
                 break
 
     async def iter_json(self, timeout: float = 5.0) -> AsyncIterator[Any]:
-        """Async iterator for JSON messages."""
-        while not self._closed:
+        """Async iterator for JSON messages. It stops at the close or at a timeout."""
+        while True:
             try:
                 yield await self.receive_json(timeout=timeout)
             except (ConnectionClosed, TimeoutError):
