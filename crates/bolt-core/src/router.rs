@@ -142,6 +142,41 @@ pub fn convert_path(path: &str) -> String {
     result
 }
 
+/// Write a route path as a client sends it. A client sends each byte that a
+/// URL path cannot hold, such as a space or a byte of a non-ASCII character, as
+/// a `%XX` escape, and the lookup gets the path with its escapes. A `{param}`
+/// stays as it is, and so does a `%`: the path can have escapes already.
+pub fn encode_route_path(path: &str) -> Cow<'_, str> {
+    // RFC 3986 `pchar`, and the `/` between segments.
+    fn is_path_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/%".contains(ch)
+    }
+    if path
+        .chars()
+        .all(|ch| is_path_char(ch) || ch == '{' || ch == '}')
+    {
+        return Cow::Borrowed(path);
+    }
+    let mut encoded = String::with_capacity(path.len() + 8);
+    let mut in_param = false;
+    let mut utf8 = [0u8; 4];
+    for ch in path.chars() {
+        match ch {
+            '{' => in_param = true,
+            '}' => in_param = false,
+            _ if !in_param && !is_path_char(ch) => {
+                for byte in ch.encode_utf8(&mut utf8).bytes() {
+                    encoded.push_str(&format!("%{byte:02X}"));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        encoded.push(ch);
+    }
+    Cow::Owned(encoded)
+}
+
 /// Per-method router combining static (O(1) HashMap) and dynamic (radix tree) routing
 /// Inspired by Elysia's router optimization that separates static from dynamic routes
 struct MethodRouter {
@@ -250,6 +285,9 @@ impl Router {
                 )));
             }
         };
+
+        // The lookup gets the request path with its `%XX` escapes.
+        let path = &*encode_route_path(path);
 
         // Elysia-style optimization: Separate static routes from dynamic routes
         // Static routes use O(1) HashMap lookup, dynamic routes use radix tree
@@ -648,6 +686,34 @@ mod tests {
         let params = params.unwrap();
         assert!(matches!(params["id"], Cow::Borrowed("7")));
         assert!(matches!(&params["name"], Cow::Owned(name) if name == "a b"));
+    }
+
+    #[test]
+    fn encode_route_path_escapes_what_a_url_path_cannot_hold() {
+        assert!(matches!(
+            encode_route_path("/items/{id}/a-b_c.d~e:f@g"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(encode_route_path("/a b"), "/a%20b");
+        assert_eq!(encode_route_path("/\u{fc}"), "/%C3%BC");
+        assert_eq!(encode_route_path("/\u{20ac}/x?y#z"), "/%E2%82%AC/x%3Fy%23z");
+        // A parameter keeps its name, and an escape stays as it is.
+        assert_eq!(
+            encode_route_path("/\u{fc}/{n\u{e4}me}/{rest:path}"),
+            "/%C3%BC/{n\u{e4}me}/{rest:path}"
+        );
+        assert_eq!(encode_route_path("/%C3%BC b"), "/%C3%BC%20b");
+    }
+
+    #[test]
+    fn a_route_path_matches_the_escaped_request_path() {
+        let router = router_with(&[("GET", "/\u{fc} b"), ("GET", "/\u{fc} b/{id}")]);
+        assert_eq!(lookup(&router, "GET", "/%C3%BC%20b"), Some((0, None)));
+        assert_eq!(
+            lookup(&router, "GET", "/%C3%BC%20b/a%20b"),
+            Some((1, params(&[("id", "a b")])))
+        );
+        assert_eq!(lookup(&router, "GET", "/\u{fc} b"), None);
     }
 
     #[test]
