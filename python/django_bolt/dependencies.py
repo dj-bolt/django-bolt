@@ -79,6 +79,7 @@ def _compile_dep_arg_plan(
     and its sync form goes to ``_dep_nested_sync``. All of this is cached in
     dep_meta, so each request iterates plain tuples.
     """
+    _refuse_generator(dep_fn)
     plan: list[tuple[int, Any, bool, str]] = []
     nested_markers: list[tuple[str, DependsMarker, DependsMarker]] = []
     for field in dep_meta["fields"]:
@@ -224,6 +225,17 @@ def decode_body_once(request_cache: dict[Any, Any], extractor: Callable, body: b
     if value is _NOT_DECODED:
         value = request_cache[extractor] = extractor(body)
     return value
+
+
+def _refuse_generator(dep_fn: Callable) -> None:
+    """Raise TypeError for a generator function. A call of it gives a generator, not a value."""
+    for fn in (dep_fn, type(dep_fn).__call__):
+        if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
+            name = getattr(dep_fn, "__name__", type(dep_fn).__name__)
+            raise TypeError(
+                f"Dependency {name} is a generator function. Bolt has no cleanup dependencies: "
+                "it does not run the code after `yield`. Return the value, and do the cleanup in the handler."
+            )
 
 
 def _dep_meta(
