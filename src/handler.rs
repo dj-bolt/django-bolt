@@ -862,7 +862,8 @@ fn without_error_info(mut response: HttpResponse, state: &AppState) -> HttpRespo
 
 /// Route one request. `access_log_filter` becomes `Some` when the response is
 /// for a Bolt route: each response after the route match, the redirect to the
-/// other slash form of a route path, and the automatic OPTIONS answer.
+/// other slash form of a route path, the automatic OPTIONS answer, and the 405
+/// for a method that the route path does not have.
 /// `handle_request` writes the access-log line for these, if the filter keeps
 /// it. A native route, a mount and a path with no route leave it `None`.
 async fn route_request(
@@ -978,6 +979,14 @@ async fn route_request(
             // (RFC 9110 section 15.5.6). This lookup runs on a miss only.
             let allowed_methods = router.find_all_methods(path);
             if !allowed_methods.is_empty() {
+                // The line of this answer has the filter of the first route of the path.
+                *access_log_filter = Some(
+                    router
+                        .find(&allowed_methods[0], path)
+                        .map_or_else(AccessLogFilter::default, |found| {
+                            route_access_log_filter(&state, found.handler_id())
+                        }),
+                );
                 return responses::error_405(&allowed_methods);
             }
 

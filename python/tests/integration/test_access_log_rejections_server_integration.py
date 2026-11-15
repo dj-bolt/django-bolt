@@ -40,6 +40,8 @@ def test_access_log_has_a_line_for_each_response_of_a_route(make_server_project)
         assert server.request("GET", "/items/abc").status_code == 422
         assert server.request("GET", "/open/", follow_redirects=False).status_code == 308
         assert server.request("OPTIONS", "/open").status_code == 204
+        # The path has a route, but not for this method.
+        assert server.request("POST", "/open").status_code == 405
         assert server.request("GET", "/no-route").status_code == 404
     lines = [line.rsplit(" ", 1)[0] for line in project.path("access.log").read_text().splitlines()]
 
@@ -52,4 +54,5 @@ def test_access_log_has_a_line_for_each_response_of_a_route(make_server_project)
         "WARNING GET /items/abc 422",
         "INFO GET /open/ 308",
         "INFO OPTIONS /open 204",
+        "WARNING POST /open 405",
     ]
