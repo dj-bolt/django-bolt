@@ -149,6 +149,7 @@ mod tests {
             Some(vec!["X-Total".to_string()]),
             None,
         )
+        .unwrap()
     }
 
     fn header<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
@@ -322,15 +323,14 @@ mod tests {
     }
 
     #[test]
-    fn route_with_only_invalid_regexes_does_not_take_the_global_list() {
-        // The regex crate has no look-around, so this pattern does not compile.
-        let route = cors(
-            &[],
-            &[r"^https://(?!evil)[a-z]+\.route\.example$"],
-            false,
-            true,
-        );
-        assert!(route.compiled_origin_regexes.is_empty());
+    fn route_with_patterns_and_no_compiled_regex_does_not_take_the_global_list() {
+        // The parsers refuse a pattern that does not compile. A config with
+        // patterns and no compiled regex must still allow no origin.
+        let route = CorsConfig {
+            origin_regexes: vec![r"^https://(?!evil)[a-z]+\.route\.example$".to_string()],
+            credentials: true,
+            ..Default::default()
+        };
         let global = cors(
             &["https://g.example"],
             &[r"^https://[a-z]+\.global\.example$"],
@@ -365,7 +365,8 @@ mod tests {
             Some(vec!["X-Token".to_string()]),
             None,
             Some(600),
-        );
+        )
+        .unwrap();
         let mut headers = HeaderMap::new();
         add_preflight_headers_with_config(&mut headers, &config);
         assert_eq!(
