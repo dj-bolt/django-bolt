@@ -137,13 +137,16 @@ class JWTAuthentication(BaseAuthentication):
         algorithms: List of allowed JWT algorithms (default: ["HS256"]). The
             token's ``alg`` header must name one of these; all must share one
             key family.
-        header: Header name to extract token from (default: "authorization")
+        header: Header name to extract token from (default: "authorization").
+            An empty string raises ``ImproperlyConfigured``.
         cookie: Optional cookie name to extract the token from. When set, the
             token is read from the named cookie only (the header is ignored).
             The cookie value is the raw token (no "Bearer " prefix needed).
         audience: Optional JWT audience claim to validate. Required with
             ``jwks_url`` to prevent cross-application token substitution.
-        issuer: Optional JWT issuer claim to validate
+        issuer: Optional JWT issuer claim to validate. For ``cookie``,
+            ``audience``, ``issuer`` and ``token_type``, None means "not
+            set". An empty string raises ``ImproperlyConfigured``.
         revoked_token_handler: Async callable that returns True when a token is
             revoked. Bolt calls it for each authenticated request, with the
             ``jti`` of the token: ``handler(jti)``. A handler with two
@@ -290,6 +293,18 @@ class JWTAuthentication(BaseAuthentication):
             )
         if secret == "":
             raise ImproperlyConfigured("JWTAuthentication secret must not be empty.")
+        # An empty string is not "not set". Rust would look for a header or a
+        # cookie with no name, or require a claim that is an empty string.
+        if header == "":
+            raise ImproperlyConfigured("JWTAuthentication header must not be empty.")
+        for option, value in (
+            ("cookie", cookie),
+            ("audience", audience),
+            ("issuer", issuer),
+            ("token_type", token_type),
+        ):
+            if value == "":
+                raise ImproperlyConfigured(f"JWTAuthentication {option} must not be empty. Use None for no value.")
         self._secret = secret
         self.public_key = public_key
         self.algorithms = ["HS256"] if algorithms is None else algorithms
@@ -509,6 +524,9 @@ class APIKeyAuthentication(BaseAuthentication):
         self.api_keys = api_keys or set()
         self.header = header
         self.key_permissions = key_permissions or {}
+        # Rust would look for a header with no name, and reject each request.
+        if header == "":
+            raise ImproperlyConfigured("APIKeyAuthentication header must not be empty.")
 
     @property
     def scheme_name(self) -> str:
