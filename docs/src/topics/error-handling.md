@@ -23,9 +23,18 @@ Parameters:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `status_code` | `int` | required | HTTP status code |
-| `detail` | `str` | HTTP phrase | Error message |
+| `detail` | `str`, `dict` or `list` | HTTP phrase | Error message |
 | `headers` | `dict` | `{}` | Response headers |
 | `extra` | `dict` | `None` | Additional error data |
+
+A `dict` or a `list` detail goes to the response as a JSON value:
+
+```python
+raise HTTPException(status_code=400, detail={"code": "out_of_stock", "items": [3, 7]})
+# body: {"detail": {"code": "out_of_stock", "items": [3, 7]}}
+```
+
+A detail of another type becomes its text, so `detail=42` gives `"42"`. An empty detail, such as `""`, `{}` or `[]`, gives the HTTP phrase of the status. Each value in the dict or the list must be a value that Bolt can encode as JSON.
 
 ### Specialized exceptions
 
@@ -384,7 +393,7 @@ api = BoltAPI(error_formatter=format_error)
 |-----------|-------------|
 | `status` | The HTTP status code. |
 | `kind` | A stable name for the error. See the table below. |
-| `detail` | A message for a human. Bolt does not put internal data, such as a file path, in it. |
+| `detail` | A message for a human. Bolt does not put internal data, such as a file path, in it. It is a `dict` or a `list` when an `HTTPException` has such a detail. |
 | `errors` | The field errors. Each one has `loc`, `msg` and `type`. Some also have `ctx`. A `response_validation` error has no `errors` when `DEBUG=False`. Read `error.exception.errors()` for them. |
 | `headers` | The headers that the error needs, for example `WWW-Authenticate` or `Retry-After`. |
 | `extra` | The `extra` of an `HTTPException`, or `{"retry_after": n}` for a rate limit. |

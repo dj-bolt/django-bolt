@@ -27,7 +27,7 @@ Base class for all HTTP error responses.
 ```python
 HTTPException(
     status_code: int = 500,
-    detail: str = "",
+    detail: str | dict | list = "",
     headers: dict[str, str] = None,
     extra: dict | list = None,
 )
