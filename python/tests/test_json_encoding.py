@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import re
+from collections import deque
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
+from fractions import Fraction
 
 import msgspec
 import pytest
@@ -74,6 +77,45 @@ EXPECTED_JSON = {
     "bytearray": '"YWI="',
     "timedelta": '"P1DT5.000006S"',
 }
+
+
+class MyDeque(deque):
+    pass
+
+
+def _numbers():
+    yield 1
+    yield 2
+
+
+# Standard types that msgspec does not encode. The value is a function, because a generator runs one time.
+STANDARD_VALUES = {
+    "deque": (lambda: deque([1, 2]), "[1,2]"),
+    "deque-maxlen": (lambda: deque([1, 2, 3], maxlen=2), "[2,3]"),
+    "deque-subclass": (lambda: MyDeque([1, 2]), "[1,2]"),
+    "deque-empty": (lambda: deque(), "[]"),
+    # The items of the list go through the encoder again.
+    "deque-nested": (lambda: deque([Decimal("1.50"), deque([b"ab"])]), '["1.50",["YWI="]]'),
+    "generator": (_numbers, "[1,2]"),
+    "fraction": (lambda: Fraction(-1, 3), '"-1/3"'),
+    "fraction-integer": (lambda: Fraction(4, 2), '"2"'),
+    "pattern": (lambda: re.compile("a+"), '"a+"'),
+}
+
+
+@pytest.mark.parametrize("name", list(STANDARD_VALUES))
+def test_a_standard_container_or_scalar_in_a_response_encodes(name: str) -> None:
+    api = BoltAPI()
+    make_value, expected = STANDARD_VALUES[name]
+
+    @api.get("/value")
+    async def value():
+        return {"v": make_value()}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/value")
+        assert response.status_code == 200
+        assert response.text == '{"v":' + expected + "}"
 
 
 def test_encode_django_safe_string() -> None:
