@@ -25,7 +25,7 @@ import asyncio
 import base64
 import inspect
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import wraps
 from typing import Any, Generic, TypeVar, get_args, get_origin
 
@@ -201,10 +201,10 @@ class PaginationBase(ABC):
         """
         Get total count of queryset items.
 
-        Handles both sync and async querysets.
-
         Args:
-            queryset: Django QuerySet or list
+            queryset: Django QuerySet, list, tuple or other sized sequence.
+                It can also be a collection of the application that can be sliced
+                and has an async ``acount()`` or a sync ``count()`` with no argument.
 
         Returns:
             Total count
@@ -220,6 +220,9 @@ class PaginationBase(ABC):
         # Non-Django async collections that expose acount
         if hasattr(queryset, "acount"):
             return await queryset.acount()
+        # A sequence has count(value), which counts one value. Its size is len().
+        if isinstance(queryset, Sequence):
+            return len(queryset)
         # Other sync collections with a count() method
         if hasattr(queryset, "count") and callable(queryset.count):
             return await run_in_orm_executor(queryset.count)
