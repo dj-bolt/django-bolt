@@ -312,6 +312,86 @@ mod tests {
         assert!(find_in_directories(absolute.to_str().unwrap(), &directories).is_none());
     }
 
+    fn scope(root: &Path, mode: ServeMode, allow_django_finders: bool) -> ScopeConfig {
+        ScopeConfig {
+            url_prefix: "/files".to_string(),
+            directories: vec![canon(root)],
+            csp_header: None,
+            cache_control: Some(header::HeaderValue::from_static("max-age=60")),
+            mode,
+            allow_django_finders,
+        }
+    }
+
+    async fn get(config: ScopeConfig, name: &str) -> HttpResponse {
+        let request = actix_web::test::TestRequest::default().to_http_request();
+        let path = web::Path::from(name.to_string());
+        handle_file(request, path, web::Data::new(Arc::new(config))).await
+    }
+
+    fn header_of<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
+        response
+            .headers()
+            .get(name)
+            .map(|value| value.to_str().unwrap())
+    }
+
+    /// A browser must download an upload that can carry script, not render it.
+    #[actix_web::test]
+    async fn media_serves_an_upload_that_can_carry_script_as_a_download() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("page.html"),
+            "<script>alert(1)</script>",
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join("notes.txt"), "plain").unwrap();
+        let media = || scope(temp_dir.path(), ServeMode::Media, false);
+
+        let page = get(media(), "page.html").await;
+        assert_eq!(page.status(), 200);
+        assert_eq!(
+            header_of(&page, "content-type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(header_of(&page, "content-disposition"), Some("attachment"));
+        assert_eq!(header_of(&page, "x-content-type-options"), Some("nosniff"));
+        assert_eq!(header_of(&page, "cache-control"), Some("max-age=60"));
+
+        let notes = get(media(), "notes.txt").await;
+        assert_eq!(notes.status(), 200);
+        assert_eq!(
+            header_of(&notes, "content-type"),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_ne!(header_of(&notes, "content-disposition"), Some("attachment"));
+    }
+
+    #[actix_web::test]
+    async fn static_keeps_the_type_of_a_file_and_does_not_cache_a_404() {
+        // The finders of Django run in Python. Here they find no file.
+        Python::initialize();
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("page.html"), "<p>docs</p>").unwrap();
+        let files = || scope(temp_dir.path(), ServeMode::Static, true);
+
+        let page = get(files(), "page.html").await;
+        assert_eq!(page.status(), 200);
+        assert_eq!(
+            header_of(&page, "content-type"),
+            Some("text/html; charset=utf-8")
+        );
+        assert_ne!(header_of(&page, "content-disposition"), Some("attachment"));
+
+        let missing = get(files(), "missing.css").await;
+        assert_eq!(missing.status(), 404);
+        assert_eq!(
+            header_of(&missing, "x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(header_of(&missing, "cache-control"), None);
+    }
+
     #[test]
     fn test_is_plain_relative() {
         assert!(is_plain_relative("css/app.js"));

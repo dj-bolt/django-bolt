@@ -21,7 +21,7 @@ import traceback
 import uuid
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from re import Pattern
 from typing import (
@@ -64,6 +64,55 @@ class FunctionMiddlewareSpec:
     func: Callable
 
 
+def mark_route_handler(handler: Callable) -> None:
+    """Record that a route decorator of an API read the configuration of a handler.
+
+    The mark is a list of the config decorators that ran after the last route
+    decorator. `functools.wraps` copies the reference, so a wrapper shares the
+    list of its function.
+    """
+    unread = getattr(handler, "__bolt_unread_config__", None)
+    if unread is not None:
+        unread.clear()
+        return
+    try:
+        handler.__bolt_unread_config__ = []
+    except AttributeError:
+        # A bound method takes no attribute, so it takes no config decorator either.
+        return
+
+
+def note_config_decorator(handler: Callable, decorator: str) -> None:
+    """Record a config decorator that ran after a route decorator registered the handler.
+
+    The next route decorator reads the configuration and clears the record. A
+    record that stays is a decorator above the route decorator, which has no
+    effect. `refuse_unread_route_config` raises for it at startup.
+    """
+    unread = getattr(handler, "__bolt_unread_config__", None)
+    if unread is not None:
+        unread.append(decorator)
+
+
+def refuse_unread_route_config(
+    routes: Iterable[tuple[str, str, int, Callable]], websocket_routes: Iterable[tuple[str, int, Callable]]
+) -> None:
+    """Raise TypeError for a config decorator that is above the route decorator of a route.
+
+    The arguments are the `_routes` and the `_websocket_routes` of the API that starts.
+    """
+    handlers = [(f"{method} {path}", handler) for method, path, _handler_id, handler in routes]
+    handlers.extend((f"WEBSOCKET {path}", handler) for path, _handler_id, handler in websocket_routes)
+    for route, handler in handlers:
+        unread = getattr(handler, "__bolt_unread_config__", None)
+        if unread:
+            raise TypeError(
+                f"@{unread[0]} is above the route decorator of {route}, so it has no effect. "
+                "Put it below the route decorator: the route decorator reads the configuration of the handler "
+                "when it registers the route."
+            )
+
+
 def _ensure_handler_middleware_list(handler: Callable) -> list[Any]:
     """Get/create per-handler middleware metadata list."""
     if not hasattr(handler, "__bolt_middleware__"):
@@ -76,6 +125,65 @@ def _is_function_middleware_callable(spec: Any) -> bool:
     return inspect.isfunction(spec) or inspect.ismethod(spec) or inspect.isbuiltin(spec)
 
 
+# The dict types that Rust reads (crates/bolt-core/src/metadata.rs). Nothing reads another dict.
+_DICT_MIDDLEWARE_TYPES = ("cors", "rate_limit")
+_DICT_MIDDLEWARE_HINT = 'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).'
+
+# The keys that Rust reads from a dict of each type. They are the keyword arguments of the decorator.
+_DICT_MIDDLEWARE_KEYS = {
+    "cors": ("type", "origins", "origin_regexes", "methods", "headers", "expose_headers", "credentials", "max_age"),
+    "rate_limit": ("type", "rps", "burst", "key"),
+}
+
+# The decorator that does what a keyword argument of @middleware seems to ask for.
+_MIDDLEWARE_KEYWORD_DECORATORS = {
+    "cors": "@cors(...)",
+    "skip": "@skip_middleware(...)",
+    "rate_limit": "@rate_limit(...)",
+}
+
+
+def _check_dict_middleware(spec: dict[str, Any], context: str) -> None:
+    """Raise for a dict config that no middleware reads, or that its decorator refuses.
+
+    The dict gets the checks of @cors or @rate_limit. The dict itself does not
+    change: Rust reads it. A None value is a missing value, as in Rust. A key
+    that Rust does not read raises TypeError, as an unknown keyword argument
+    of the decorator does.
+    """
+    if "type" not in spec:
+        raise ValueError(f"{context} middleware dict has no 'type'. {_DICT_MIDDLEWARE_HINT}")
+    if spec["type"] not in _DICT_MIDDLEWARE_TYPES:
+        raise ValueError(f"{context} middleware dict has the unknown type {spec['type']!r}. {_DICT_MIDDLEWARE_HINT}")
+
+    # The config of a route is its complete allow list, so it needs an origin.
+    # The config of an API or a router can keep the allow list of the outer config.
+    on_route = context == "route"
+    where = f"@middleware(type='{spec['type']}')" if on_route else f"{context} {spec['type']} dict"
+    # Nothing reads a key with another name, so the option that its author meant would not apply.
+    known = _DICT_MIDDLEWARE_KEYS[spec["type"]]
+    for name in spec:
+        if name not in known:
+            valid = ", ".join(repr(key) for key in known[:-1])
+            raise TypeError(f"{where} has the unknown key {name!r}. The valid keys are {valid} and {known[-1]!r}.")
+
+    options = {name: value for name, value in spec.items() if value is not None}
+    if spec["type"] == "rate_limit":
+        _checked_rate_limit_config(options.get("rps", 100), options.get("burst"), options.get("key", "ip"))
+        return
+    _checked_cors_config(
+        where,
+        origins=options.get("origins"),
+        origin_regexes=options.get("origin_regexes"),
+        methods=options.get("methods"),
+        headers=options.get("headers"),
+        expose_headers=options.get("expose_headers"),
+        credentials=options.get("credentials", False),
+        max_age=options.get("max_age", 3600),
+        require_origins=on_route,
+    )
+
+
 def normalize_middleware_specs(
     middleware_specs: list[Any] | tuple[Any, ...] | None,
     *,
@@ -86,11 +194,16 @@ def normalize_middleware_specs(
     Normalize and validate middleware specs.
 
     Allowed forms:
-    - Middleware classes (Django-style __init__(get_response))
+    - Middleware classes (Django-style __init__(get_response), with callable instances)
     - DjangoMiddleware / DjangoMiddlewareStack wrapper instances
-    - Dict middleware metadata (Rust-handled middleware)
+    - Dict middleware metadata (Rust-handled middleware) with the type "cors" or "rate_limit"
     - FunctionMiddlewareSpec (route-level only)
     - Raw middleware functions (route-level only; converted to FunctionMiddlewareSpec)
+
+    Raises:
+        TypeError: An entry is of another kind, or a dict holds a value of the wrong type.
+        ValueError: A dict has no "type", or a type that is not "cors" or "rate_limit",
+            or a value that @cors or @rate_limit refuses.
     """
     normalized: list[Any] = []
     if not middleware_specs:
@@ -98,6 +211,7 @@ def normalize_middleware_specs(
 
     for spec in middleware_specs:
         if isinstance(spec, dict):
+            _check_dict_middleware(spec, context)
             normalized.append(spec)
             continue
 
@@ -123,6 +237,13 @@ def normalize_middleware_specs(
             continue
 
         if isinstance(spec, type):
+            # The chain calls the instance with the request. `type` gives each
+            # class a __call__ that builds an instance, so read the classes.
+            if not any("__call__" in vars(base) for base in spec.__mro__ if base is not object):
+                raise TypeError(
+                    f"{context} middleware class {spec.__name__} has no __call__. "
+                    "A middleware class takes get_response in __init__, and Bolt calls its instance with the request."
+                )
             normalized.append(spec)
             continue
 
@@ -176,7 +297,8 @@ class MiddlewareProtocol(Protocol):
 
     The middleware can:
     - Modify the request before passing it on
-    - Short-circuit by returning a response directly
+    - Short-circuit by returning a response directly: a response object such
+      as JSON, or another value that a handler can return
     - Modify the response after the handler executes
     - Add data to request.state for downstream handlers
     """
@@ -277,7 +399,9 @@ class BaseMiddleware(ABC):
         """
         Process the request. Override this in subclasses.
 
-        Call self.get_response(request) to continue the chain.
+        Call self.get_response(request) to continue the chain. To answer
+        without the handler, return a response object such as JSON, or another
+        value that a handler can return.
 
         Args:
             request: The incoming request
@@ -318,7 +442,9 @@ class Middleware(ABC):
         """
         Process the request.
 
-        Call self.get_response(request) to continue the chain.
+        Call self.get_response(request) to continue the chain. To answer
+        without the handler, return a response object such as JSON, or another
+        value that a handler can return.
 
         Args:
             request: The incoming request object
@@ -343,9 +469,19 @@ def middleware(*args, **kwargs):
     Decorator to attach middleware to a route handler.
 
     Can be used as:
-    - @middleware(MyMiddlewareClass)
-    - @middleware(cors={"origins": ["*"]})
-    - @middleware(skip=["auth"])
+    - @middleware(MyMiddlewareClass, OtherMiddlewareClass)
+    - @middleware on a function `(request, call_next)`, which makes a route decorator
+    - @middleware(type="cors", origins=["https://example.com"]) or the same as one dict.
+      The type is "cors" or "rate_limit". The config gets the checks of @cors(...) or
+      @rate_limit(...).
+
+    To skip a middleware, use @skip_middleware(...).
+
+    Raises:
+        TypeError: A keyword argument without `type`, an entry that is not a middleware,
+            or a config value of the wrong type.
+        ValueError: A dict or keyword config whose type is not "cors" or "rate_limit",
+            or a config value that @cors or @rate_limit refuses.
 
     Example:
         @api.post("/upload")
@@ -356,8 +492,22 @@ def middleware(*args, **kwargs):
         async def upload_file(request: Request) -> dict:
             return {"uploaded": True}
     """
+    # Keyword arguments are one dict config. Check it here, not in the
+    # decorator: nothing reads a config of another form.
+    if kwargs:
+        if "type" not in kwargs:
+            name = next(iter(kwargs))
+            use = _MIDDLEWARE_KEYWORD_DECORATORS.get(name)
+            hint = (
+                f"Use {use}."
+                if use
+                else 'Give middleware classes as positional arguments. A dict config needs type="cors" or type="rate_limit".'
+            )
+            raise TypeError(f"@middleware() does not take the keyword argument {name!r}. {hint}")
+        _check_dict_middleware(kwargs, "route")
 
     def attach_middleware(handler: Callable, middleware_spec: Any) -> Callable:
+        note_config_decorator(handler, "middleware")
         handler_middleware = _ensure_handler_middleware_list(handler)
         handler_middleware.append(middleware_spec)
         return handler
@@ -377,19 +527,22 @@ def middleware(*args, **kwargs):
     def decorator(handler: Callable) -> Callable:
         normalized = normalize_middleware_specs(args, context="route", allow_function_middleware=True)
         for spec in normalized:
-            if isinstance(spec, dict) and spec.get("type") == "cors":
-                _reject_second_cors(handler)
+            if isinstance(spec, dict):
+                _reject_second_config(handler, spec.get("type"))
             attach_middleware(handler, spec)
 
         # Support dict-style middleware metadata (e.g. @middleware(type="cors", ...))
         if kwargs:
-            if kwargs.get("type") == "cors":
-                _reject_second_cors(handler)
+            _reject_second_config(handler, kwargs.get("type"))
             attach_middleware(handler, kwargs)
 
         return handler
 
     return decorator
+
+
+# The characters of a header name (RFC 9110, token).
+_HEADER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
 
 def _rate_limit_count(name: str, value: Any) -> int:
@@ -399,6 +552,25 @@ def _rate_limit_count(name: str, value: Any) -> int:
     if value < 1:
         raise ValueError(f"rate_limit {name} must be 1 or more, got {value}")
     return value
+
+
+def _checked_rate_limit_config(rps: Any, burst: Any, key: Any) -> dict[str, Any]:
+    """Return the rate limit config that Rust reads. Raise for a bad value.
+
+    @rate_limit and a rate_limit dict both use this check.
+    """
+    rps = _rate_limit_count("rps", rps)
+    burst = rps * 2 if burst is None else _rate_limit_count("burst", burst)
+    if not isinstance(key, str):
+        raise TypeError(f"rate_limit key must be a str, got {type(key).__name__} {key!r}")
+    if not key:
+        raise ValueError("rate_limit key must not be empty")
+    # Rust reads "ip", "user" and "api_key" in any letter case. Each other key
+    # is the name of a request header. No request has a header with another
+    # character in its name, so each caller would share one bucket.
+    if not _HEADER_NAME.fullmatch(key):
+        raise ValueError(f'rate_limit key must be "ip", "user", "api_key" or the name of a request header, got {key!r}')
+    return {"type": "rate_limit", "rps": rps, "burst": burst, "key": key}
 
 
 def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
@@ -430,7 +602,8 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
 
     Raises:
         TypeError: rps or burst is not an int, or key is not a str.
-        ValueError: rps or burst is less than 1, or key is empty.
+        ValueError: rps or burst is less than 1, key is empty or is not a
+            valid header name, or the route already has a @rate_limit.
 
     Example:
         @api.get("/api/data")
@@ -441,35 +614,43 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
 
     # Check the values here. Rust cannot read a bad value, and the route must
     # not get another limit than the one its author gave.
-    rps = _rate_limit_count("rps", rps)
-    burst = rps * 2 if burst is None else _rate_limit_count("burst", burst)
-    if not isinstance(key, str):
-        raise TypeError(f"rate_limit key must be a str, got {type(key).__name__} {key!r}")
-    if not key:
-        raise ValueError("rate_limit key must not be empty")
+    config = _checked_rate_limit_config(rps, burst, key)
 
     def decorator(func):
+        _reject_second_config(func, "rate_limit")
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
-        func.__bolt_middleware__.append({"type": "rate_limit", "rps": rps, "burst": burst, "key": key})
+        note_config_decorator(func, "rate_limit")
+        func.__bolt_middleware__.append(dict(config))
         return func
 
     return decorator
 
 
-def _reject_second_cors(handler: Callable) -> None:
-    """Raise ValueError when the handler already has a cors config.
+# What to do in place of a second config of one type on a function.
+_SECOND_CONFIG_ADVICE = {
+    "cors": "Merge the origins into one @cors",
+    "rate_limit": "Keep one @rate_limit with the limit of the route",
+}
 
-    Two cors configs on one route have no clear order. The config stays on the
-    function, so one function cannot serve two routes with different origins.
+
+def _reject_second_config(handler: Callable, mw_type: Any) -> None:
+    """Raise ValueError when the handler already has a config of this type: cors or rate_limit.
+
+    Two configs of one type on one route have no clear order: Rust uses one of
+    them and drops the other. The config stays on the function, so one
+    function cannot serve two routes with different configs.
     """
-    if any(isinstance(mw, dict) and mw.get("type") == "cors" for mw in getattr(handler, "__bolt_middleware__", ())):
+    if mw_type not in ("cors", "rate_limit"):
+        return
+    if any(isinstance(mw, dict) and mw.get("type") == mw_type for mw in getattr(handler, "__bolt_middleware__", ())):
         raise ValueError(
-            "The function already has a @cors. Merge the origins into one @cors, or give each route its own function."
+            f"The function already has a @{mw_type}. {_SECOND_CONFIG_ADVICE[mw_type]}, "
+            "or give each route its own function."
         )
 
 
-def _cors_str_list(name: str, value: Any) -> list[str]:
+def _cors_str_list(where: str, name: str, value: Any) -> list[str]:
     """Return a str or a sequence of str as a list of str.
 
     Any other type raises TypeError here, at decoration, with the name of the argument.
@@ -479,12 +660,95 @@ def _cors_str_list(name: str, value: Any) -> list[str]:
     if isinstance(value, str):
         return [value]
     if not isinstance(value, (list, tuple, set, frozenset)):
-        raise TypeError(f"@cors() {name} must be a str or a list of str, not {type(value).__name__}")
+        raise TypeError(f"{where} {name} must be a str or a list of str, not {type(value).__name__}")
     items = list(value)
     for item in items:
         if not isinstance(item, str):
-            raise TypeError(f"@cors() {name} must hold only str, not {type(item).__name__}")
+            raise TypeError(f"{where} {name} must hold only str, not {type(item).__name__}")
     return items
+
+
+def _cors_name_list(where: str, name: str, value: Any) -> list[str] | None:
+    """Return the methods or a header list of a cors config as a list of str. None stays None.
+
+    A str raises TypeError. It is not one name here, and it is not a sequence of characters.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise TypeError(f"{where} {name} must be a list of str, not {type(value).__name__} {value!r}")
+    items = list(value)
+    for item in items:
+        if not isinstance(item, str):
+            raise TypeError(f"{where} {name} must hold only str, not {type(item).__name__} {item!r}")
+    return items
+
+
+# Rust keeps max_age in a u32.
+_CORS_MAX_AGE_LIMIT = 2**32 - 1
+
+
+def _checked_cors_config(
+    where: str,
+    *,
+    origins: Any = None,
+    origin_regexes: Any = None,
+    methods: Any = None,
+    headers: Any = None,
+    expose_headers: Any = None,
+    credentials: Any = False,
+    max_age: Any = 3600,
+    require_origins: bool = True,
+) -> dict[str, Any]:
+    """Return the cors config that Rust reads. Raise for a bad value.
+
+    @cors and a cors dict both use this check. `where` names the form in the
+    error. The config must not get the default of an option when its author
+    gave another value.
+    """
+    method_list = _cors_name_list(where, "methods", methods)
+    header_list = _cors_name_list(where, "headers", headers)
+    expose_list = _cors_name_list(where, "expose_headers", expose_headers)
+    if not isinstance(credentials, bool):
+        raise TypeError(f"{where} credentials must be a bool, not {type(credentials).__name__} {credentials!r}")
+    if isinstance(max_age, bool) or not isinstance(max_age, int):
+        raise TypeError(f"{where} max_age must be an int, not {type(max_age).__name__} {max_age!r}")
+    if not 0 <= max_age <= _CORS_MAX_AGE_LIMIT:
+        raise ValueError(f"{where} max_age must be from 0 to {_CORS_MAX_AGE_LIMIT}, got {max_age}")
+
+    # A str is one origin or one pattern, not a sequence of characters.
+    origin_list = _cors_str_list(where, "origins", origins)
+    regex_list = _cors_str_list(where, "origin_regexes", origin_regexes)
+
+    # SECURITY: Require explicit origins - an empty route config is a common mistake.
+    # An empty list would use the global settings, which the route replaces.
+    if require_origins and not origin_list and not regex_list:
+        raise ValueError(
+            f"{where} requires an 'origins' or 'origin_regexes' argument. Examples:\n"
+            "  @cors(origins=['https://example.com'])  # Specific origin\n"
+            "  @cors(origins=['*'])  # Allow all origins\n"
+            "  @cors(origin_regexes=[r'^https://\\w+\\.example\\.com$'])  # Origin patterns\n"
+            "\n"
+            "If you want to use global CORS settings from Django (CORS_ALLOWED_ORIGINS),\n"
+            "simply remove the @cors decorator - global config applies automatically."
+        )
+
+    # SECURITY: An empty pattern matches every origin.
+    if any(not pattern for pattern in regex_list):
+        raise ValueError(f"{where} origin_regexes holds an empty pattern, which matches every origin.")
+
+    config = {
+        "type": "cors",
+        "origins": origin_list,
+        "origin_regexes": regex_list,
+        "methods": method_list or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"],
+        "headers": header_list,
+        "credentials": credentials,
+        "max_age": max_age,
+    }
+    if expose_list is not None:
+        config["expose_headers"] = expose_list
+    return config
 
 
 def cors(
@@ -510,11 +774,13 @@ def cors(
                  use Django settings instead.
         origin_regexes: Patterns for allowed origins, as in CORS_ALLOWED_ORIGIN_REGEXES. Start
                  each pattern with ^ and end it with $. Patterns use the syntax of the Rust
-                 regex crate, which has no look-around and no back-references.
-        methods: Allowed methods (default: GET, POST, PUT, PATCH, DELETE, OPTIONS)
-        headers: Allowed headers
-        credentials: Allow credentials (cannot be combined with wildcard "*")
-        max_age: Preflight cache duration in seconds (default: 3600)
+                 regex crate, which has no look-around and no back-references. A pattern
+                 that does not compile stops startup with ValueError.
+        methods: Allowed methods, as a list of str (default: GET, POST, PUT, PATCH, DELETE,
+                 OPTIONS, QUERY)
+        headers: Allowed headers, as a list of str (default: Content-Type, Authorization)
+        credentials: Allow credentials (cannot be combined with wildcard "*"). A bool.
+        max_age: Preflight cache duration in seconds (default: 3600). An int of 0 or more.
 
     Examples:
         @cors(origins=["https://example.com"])
@@ -531,38 +797,30 @@ def cors(
 
     Raises:
         ValueError: If origins and origin_regexes are both missing or empty (empty @cors() is not allowed),
-            if a pattern is empty, or if the route already has a @cors
-        TypeError: If origins or origin_regexes holds a value that is not a str
+            if a pattern is empty, if max_age is less than 0 or too large, or if the route
+            already has a @cors
+        TypeError: If origins or origin_regexes holds a value that is not a str, if methods or
+            headers is not a list of str, if credentials is not a bool, or if max_age is not an int
     """
 
     def decorator(func):
-        # A str is one origin or one pattern, not a sequence of characters.
-        origin_list = _cors_str_list("origins", origins)
-        regex_list = _cors_str_list("origin_regexes", origin_regexes)
+        note_config_decorator(func, "cors")
+        config = _checked_cors_config(
+            "@cors()",
+            origins=origins,
+            origin_regexes=origin_regexes,
+            methods=methods,
+            headers=headers,
+            credentials=credentials,
+            max_age=max_age,
+        )
 
-        # SECURITY: Require explicit origins - empty @cors() is a common mistake.
-        # An empty list would use the global settings, which the route replaces.
-        if not origin_list and not regex_list:
-            raise ValueError(
-                "@cors() requires an 'origins' or 'origin_regexes' argument. Examples:\n"
-                "  @cors(origins=['https://example.com'])  # Specific origin\n"
-                "  @cors(origins=['*'])  # Allow all origins\n"
-                "  @cors(origin_regexes=[r'^https://\\w+\\.example\\.com$'])  # Origin patterns\n"
-                "\n"
-                "If you want to use global CORS settings from Django (CORS_ALLOWED_ORIGINS),\n"
-                "simply remove the @cors decorator - global config applies automatically."
-            )
-
-        # SECURITY: An empty pattern matches every origin.
-        if any(not pattern for pattern in regex_list):
-            raise ValueError("@cors() origin_regexes holds an empty pattern, which matches every origin.")
-
-        _reject_second_cors(func)
+        _reject_second_config(func, "cors")
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
 
         # SECURITY: Validate wildcard + credentials
-        if "*" in origin_list and credentials:
+        if "*" in config["origins"] and credentials:
             warnings.warn(
                 "CORS misconfiguration: Cannot use wildcard '*' with credentials=True. "
                 "This violates the CORS specification. Please specify explicit origins.",
@@ -570,23 +828,13 @@ def cors(
                 stacklevel=2,
             )
 
-        func.__bolt_middleware__.append(
-            {
-                "type": "cors",
-                "origins": origin_list,
-                "origin_regexes": regex_list,
-                "methods": methods or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"],
-                "headers": headers,
-                "credentials": credentials,
-                "max_age": max_age,
-            }
-        )
+        func.__bolt_middleware__.append(config)
         return func
 
     return decorator
 
 
-def skip_middleware(*middleware_names: str):
+def skip_middleware(*middleware_names: str | type):
     """
     Skip specific middleware for this route.
 
@@ -594,9 +842,13 @@ def skip_middleware(*middleware_names: str):
         middleware_names: Names of middleware to skip. A name is "cors",
             "rate_limit" or "compression" for a Rust middleware. For a Python
             middleware, a name is the name or the dotted path of its class or
-            function. "*" skips each Bolt middleware, Python and Rust. "*"
-            does not skip a Django middleware. Give the name of a Django
-            middleware class to skip it, for example "CsrfViewMiddleware".
+            function, or the class itself. "*" skips each Bolt middleware,
+            Python and Rust. "*" does not skip a Django middleware. Give the
+            name of a Django middleware class, or the class, to skip it, for
+            example "CsrfViewMiddleware". A name ignores the letter case.
+
+    Raises:
+        TypeError: A value is not a str or a class.
 
     Examples:
         @api.get("/no-compression")
@@ -615,10 +867,24 @@ def skip_middleware(*middleware_names: str):
             return {"fast": True}
     """
 
+    # Keep each name in lower case, and a class as its dotted path. Rust reads
+    # the names as a list of str and compares them in lower case.
+    names: list[str] = []
+    for name in middleware_names:
+        if isinstance(name, type):
+            name = f"{name.__module__}.{name.__qualname__}"
+        elif not isinstance(name, str):
+            raise TypeError(
+                "@skip_middleware() takes the name of a middleware or a middleware class, "
+                f"not {type(name).__name__} {name!r}"
+            )
+        names.append(name.lower())
+
     def decorator(func):
+        note_config_decorator(func, "skip_middleware")
         if not hasattr(func, "__bolt_skip_middleware__"):
             func.__bolt_skip_middleware__ = set()
-        func.__bolt_skip_middleware__.update(middleware_names)
+        func.__bolt_skip_middleware__.update(names)
         return func
 
     return decorator

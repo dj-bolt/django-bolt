@@ -51,6 +51,8 @@ __all__ = [
     "resolve_type_alias",
     "split_param_annotation",
     "infer_param_source",
+    "reads_text_value",
+    "is_json_only_type",
 ]
 
 
@@ -396,6 +398,93 @@ def is_dataclass_type(annotation: Any) -> bool:
         return False
 
 
+# The methods whose request has a body. See the method check in _kwargs/model.py.
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+# A parameter with one of these names gets the request, unless it is a path parameter or has a marker.
+REQUEST_PARAM_NAMES = frozenset({"request", "req"})
+
+_COLLECTION_NODES = (
+    msgspec.inspect.ListType,
+    msgspec.inspect.SetType,
+    msgspec.inspect.FrozenSetType,
+    msgspec.inspect.VarTupleType,
+)
+# msgspec builds these types from a JSON object or a JSON array, not from text.
+_JSON_ONLY_NODES = (
+    msgspec.inspect.DictType,
+    msgspec.inspect.StructType,
+    msgspec.inspect.DataclassType,
+    msgspec.inspect.TypedDictType,
+    msgspec.inspect.NamedTupleType,
+    msgspec.inspect.RawType,
+    msgspec.inspect.ExtType,
+)
+
+
+def _node_reads_text(node: Any, in_sequence: bool = False) -> bool:
+    if isinstance(node, msgspec.inspect.UnionType):
+        # None is the value of a missing parameter. It is not a type of the text.
+        arms = [arm for arm in node.types if not isinstance(arm, msgspec.inspect.NoneType)]
+        return any(_node_reads_text(arm, in_sequence) for arm in arms)
+    if isinstance(node, _COLLECTION_NODES):
+        # Each text value is one item. An item cannot be a sequence.
+        return not in_sequence and _node_reads_text(node.item_type, True)
+    if isinstance(node, msgspec.inspect.TupleType):
+        return not in_sequence and all(_node_reads_text(item, True) for item in node.item_types)
+    if isinstance(node, msgspec.inspect.CustomType):
+        # msgspec passes a value that is an instance of the class. A text value is a str.
+        return isinstance("", node.cls)
+    return not isinstance(node, _JSON_ONLY_NODES)
+
+
+def _has_custom_node(node: Any) -> bool:
+    if isinstance(node, msgspec.inspect.CustomType):
+        return True
+    items = getattr(node, "types", None) or getattr(node, "item_types", None)
+    if items is None:
+        items = tuple(
+            item
+            for item in (getattr(node, name, None) for name in ("item_type", "key_type", "value_type"))
+            if item is not None
+        )
+    return any(_has_custom_node(item) for item in items)
+
+
+def reads_text_value(annotation: Any) -> bool:
+    """Return True when Bolt can build ``annotation`` from the text of a request.
+
+    A path segment, a query key, a header, a cookie and a form field give text.
+    Text converts to a scalar type (``str``, ``int``, ``float``, ``bool``,
+    ``Decimal``, ``UUID``, a date or time type, an ``Enum``, a ``Literal``,
+    ``bytes``) and to one sequence of such types. A ``dict``, a dataclass, a
+    nested sequence and a class that msgspec does not know come only from JSON,
+    or from nothing. A parameter with no annotation takes each value.
+    """
+    if annotation is inspect.Parameter.empty:
+        return True
+    try:
+        node = msgspec.inspect.type_info(annotation)
+    except TypeError:
+        return False
+    return _node_reads_text(node)
+
+
+def is_json_only_type(annotation: Any) -> bool:
+    """Return True for a type that msgspec decodes from JSON and that text cannot give.
+
+    Examples are ``dict``, ``list[dict]``, ``list[list[int]]`` and a ``TypedDict``.
+    A class that msgspec does not know, such as ``complex``, gives False.
+    """
+    if annotation is inspect.Parameter.empty:
+        return False
+    try:
+        node = msgspec.inspect.type_info(annotation)
+    except TypeError:
+        return False
+    return not _node_reads_text(node) and not _has_custom_node(node)
+
+
 def infer_param_source(name: str, annotation: Any, path_params: set[str], http_method: str) -> str:
     """
     Infer parameter source based on type and context.
@@ -404,8 +493,14 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     1. If name matches path parameter -> "path"
     2. If special name (request, req) -> "request"
     3. If simple type (str, int, float, bool) -> "query"
-    4. If msgspec.Struct or dataclass -> "body" (method validation happens later)
+    4. If msgspec.Struct or dataclass, or a sequence of them -> "body"
+       (method validation happens later)
     5. Default -> "query"
+
+    A JSON-only type, such as ``dict``, ``dict[K, V]`` or ``list[dict]``, is
+    "body" on a POST, PUT or PATCH route. A query string cannot hold it. On
+    each other method it stays "query", and ``compile_binder`` refuses it.
+    ``Any`` stays "query", as in FastAPI.
 
     Args:
         name: Parameter name
@@ -421,7 +516,7 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
         return "path"
 
     # 2. Special request parameter
-    if name in {"request", "req"}:
+    if name in REQUEST_PARAM_NAMES:
         return "request"
 
     # Unwrap Optional and msgspec.Meta if present
@@ -433,6 +528,12 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     if is_simple_type(unwrapped):
         return "query"
 
+    # A dict, a list of dicts and each other JSON-only type come only from a
+    # JSON body. On a method with no body the source stays "query", and the
+    # registration then stops with the error of a type that text cannot give.
+    if http_method in _BODY_METHODS and is_json_only_type(unwrapped):
+        return "body"
+
     # 4. Sequence of simple types -> query (for list params)
     if is_sequence_type(unwrapped):
         args = get_args(unwrapped)
@@ -442,7 +543,9 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     # 5. Complex types (msgspec.Struct, dataclass) -> body
     # Method-appropriateness (rejecting bodies on GET/DELETE/HEAD) is enforced
     # later in the validation path, not here.
-    if is_msgspec_struct(unwrapped) or is_dataclass_type(unwrapped):
+    # A sequence of them is a JSON array. A query string cannot hold it.
+    item = get_args(unwrapped)[0] if is_sequence_type(unwrapped) and get_args(unwrapped) else unwrapped
+    if is_msgspec_struct(item) or is_dataclass_type(item):
         return "body"
 
     # 6. Default to query
@@ -475,7 +578,7 @@ class FieldDefinition:
     """Alternative name for the parameter (e.g., 'user-id' for 'user_id')"""
 
     embed: bool | None = None
-    """For body params: whether to embed in a wrapper object"""
+    """For body params: True reads the value from the key of the alias or the name in a JSON object"""
 
     dependency: Any = None
     """Depends marker for dependency injection"""

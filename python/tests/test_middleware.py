@@ -55,6 +55,15 @@ class CustomTestMiddleware(Middleware):
         return await self.get_response(request)
 
 
+class HeaderProbe(Middleware):
+    """Mark each response that it handles."""
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.headers["X-Probe"] = "ran"
+        return response
+
+
 def _wrap_argument_injectors(api: BoltAPI, wrap) -> None:
     """Give each route that registers after this call the injector ``wrap(injector)``.
 
@@ -73,6 +82,9 @@ def _counting(injector, calls: dict):
         return injector(request)
 
     return counting_injector
+
+
+_BAD_KEY = 'rate_limit key must be "ip", "user", "api_key" or the name of a request header, got {}'
 
 
 class TestMiddlewareDecorators:
@@ -97,6 +109,13 @@ class TestMiddlewareDecorators:
         assert middleware[0]["burst"] == 100
         assert middleware[0]["key"] == "ip"
 
+        # With no argument, the limit is 100 per second per address. The burst is two times the limit.
+        @rate_limit()
+        async def default_limit():
+            return {"status": "ok"}
+
+        assert default_limit.__bolt_middleware__ == [{"type": "rate_limit", "rps": 100, "burst": 200, "key": "ip"}]
+
     @pytest.mark.parametrize(
         ("kwargs", "error", "message"),
         [
@@ -109,6 +128,13 @@ class TestMiddlewareDecorators:
             ({"rps": 10, "burst": 0}, ValueError, "rate_limit burst must be 1 or more, got 0"),
             ({"key": 5}, TypeError, "rate_limit key must be a str, got int 5"),
             ({"key": ""}, ValueError, "rate_limit key must not be empty"),
+            ({"key": " "}, ValueError, _BAD_KEY.format("' '")),
+            ({"key": "x\ny"}, ValueError, _BAD_KEY.format("'x\\ny'")),
+            ({"key": "X-Tenant\n"}, ValueError, _BAD_KEY.format("'X-Tenant\\n'")),
+            ({"key": "X-A B"}, ValueError, _BAD_KEY.format("'X-A B'")),
+            ({"key": " ip"}, ValueError, _BAD_KEY.format("' ip'")),
+            ({"key": "X-Tenant:"}, ValueError, _BAD_KEY.format("'X-Tenant:'")),
+            ({"key": "X-Ténant"}, ValueError, _BAD_KEY.format("'X-Ténant'")),
         ],
         ids=[
             "rps-float",
@@ -120,6 +146,13 @@ class TestMiddlewareDecorators:
             "burst-zero",
             "key-int",
             "key-empty",
+            "key-space",
+            "key-line-break",
+            "key-line-break-at-end",
+            "key-space-inside",
+            "key-space-at-start",
+            "key-colon",
+            "key-not-ascii",
         ],
     )
     def test_rate_limit_decorator_rejects_a_bad_value(self, kwargs, error, message):
@@ -127,30 +160,35 @@ class TestMiddlewareDecorators:
         with pytest.raises(error, match=f"^{re.escape(message)}$"):
             rate_limit(**kwargs)
 
-    def test_router_rate_limit_with_a_bad_value_stops_the_registration(self):
-        """A rate limit dict that does not come from @rate_limit is checked in Rust."""
-        api = BoltAPI()
-        router = Router(prefix="/rl", middleware=[{"type": "rate_limit", "rps": 0.5, "burst": 1, "key": "ip"}])
+    @pytest.mark.parametrize(
+        ("inner", "outer"),
+        [
+            (rate_limit(rps=100), rate_limit(rps=1, burst=1)),
+            (rate_limit(rps=100), middleware(type="rate_limit", rps=1)),
+            (middleware(type="rate_limit", rps=100), rate_limit(rps=1)),
+            (middleware({"type": "rate_limit", "rps": 100}), middleware({"type": "rate_limit", "rps": 1})),
+        ],
+        ids=["two-decorators", "keywords-over-decorator", "decorator-over-keywords", "two-dicts"],
+    )
+    def test_a_route_takes_one_rate_limit(self, inner, outer):
+        """Before, the route kept the limit of the bottom decorator and dropped the other, with no error."""
 
-        @router.get("/items")
-        async def list_items():
-            return {"ok": True}
+        async def route():
+            return {}
 
-        api.include_router(router)
+        with pytest.raises(ValueError, match="already has a @rate_limit"):
+            outer(inner(route))
 
-        with pytest.raises(TypeError, match="rate_limit rps must be an int of 1 or more"), TestClient(api):
-            pass
+    @pytest.mark.parametrize("level", ["api", "router"])
+    def test_a_rate_limit_dict_with_a_bad_value_stops_the_registration(self, level):
+        """A rate limit dict that does not come from @rate_limit gets the checks of @rate_limit."""
+        entry = {"type": "rate_limit", "rps": 0.5, "burst": 1, "key": "ip"}
 
-    def test_api_rate_limit_with_a_bad_value_stops_the_registration(self):
-        """A rate limit dict in the middleware of the API is checked in Rust too."""
-        api = BoltAPI(middleware=[{"type": "rate_limit", "rps": 0.5, "burst": 1, "key": "ip"}])
-
-        @api.get("/items")
-        async def list_items():
-            return {"ok": True}
-
-        with pytest.raises(TypeError, match="rate_limit rps must be an int of 1 or more"), TestClient(api):
-            pass
+        with pytest.raises(TypeError, match=r"^rate_limit rps must be an int, got float 0\.5$"):
+            if level == "api":
+                BoltAPI(middleware=[entry])
+            else:
+                Router(prefix="/rl", middleware=[entry])
 
     def test_cors_decorator(self):
         """Test CORS decorator attaches metadata"""
@@ -276,6 +314,40 @@ class _CallableInstance:
 async def _plain_function(request, call_next): ...
 
 
+class _NoCall:
+    """A class that takes get_response, with instances that are not callable."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+
+class _DjangoStyle:
+    """A plain class of the Django style. It has no base class of Bolt."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    async def __call__(self, request):
+        request.state["seen"] = type(self).__name__
+        return await self.get_response(request)
+
+
+class _InheritsCall(_DjangoStyle):
+    """A class that gets __call__ from its base class."""
+
+
+class _ProcessRequestOnly(Middleware):
+    async def process_request(self, request):
+        request.state["seen"] = type(self).__name__
+        return await self.get_response(request)
+
+
+class _BaseProcessRequestOnly(BaseMiddleware):
+    async def process_request(self, request):
+        request.state["seen"] = type(self).__name__
+        return await self.get_response(request)
+
+
 class TestMiddlewareEntryValidation:
     """Registration rejects a middleware entry of the wrong kind, and the message names the level."""
 
@@ -323,6 +395,50 @@ class TestMiddlewareEntryValidation:
             build()
 
         assert str(raised.value) == message.format(level=level)
+
+    @pytest.mark.parametrize("level", ["api", "router", "route"])
+    @pytest.mark.parametrize("entry", [int, str, dict, _NoCall], ids=["int", "str", "dict", "class-with-no-call"])
+    def test_each_level_rejects_a_class_whose_instances_are_not_callable(self, level, entry):
+        """The chain calls the instance with the request. Such a class gave a 500 for each request."""
+
+        def build():
+            if level == "api":
+                BoltAPI(middleware=[entry])
+            elif level == "router":
+                Router(middleware=[entry])
+            else:
+                middleware(entry)(lambda: None)
+
+        with pytest.raises(TypeError) as raised:
+            build()
+
+        assert str(raised.value) == (
+            f"{level} middleware class {entry.__name__} has no __call__. "
+            "A middleware class takes get_response in __init__, and Bolt calls its instance with the request."
+        )
+
+    @pytest.mark.parametrize(
+        "entry",
+        [_DjangoStyle, _ProcessRequestOnly, _BaseProcessRequestOnly, _InheritsCall],
+        ids=["django-style", "middleware-subclass", "base-middleware-subclass", "inherited-call"],
+    )
+    @pytest.mark.parametrize("level", ["api", "router", "route"])
+    def test_each_level_runs_a_class_whose_instances_are_callable(self, level, entry):
+        api = BoltAPI(middleware=[entry] if level == "api" else None)
+        router = Router(middleware=[entry] if level == "router" else None)
+
+        @router.get("/entry")
+        @middleware(*([entry] if level == "route" else []))
+        async def handler(request):
+            return {"seen": request.state.get("seen")}
+
+        api.include_router(router)
+
+        with TestClient(api) as client:
+            response = client.get("/entry")
+
+        assert response.status_code == 200
+        assert response.json() == {"seen": entry.__name__}
 
     def test_each_kind_of_entry_stays_in_the_list_in_order(self):
         """A kind of entry that the function accepts does not stop the loop."""
@@ -404,6 +520,249 @@ class TestMiddlewareEntryValidation:
             assert client.get("/mixed").json() == {"ok": True}
 
         assert events == ["function", "class"]
+
+    @pytest.mark.parametrize(
+        ("build", "error", "message"),
+        [
+            (
+                lambda: middleware(cors={"origins": ["https://a.test"]}),
+                TypeError,
+                "@middleware() does not take the keyword argument 'cors'. Use @cors(...).",
+            ),
+            (
+                lambda: middleware(skip=["auth"]),
+                TypeError,
+                "@middleware() does not take the keyword argument 'skip'. Use @skip_middleware(...).",
+            ),
+            (
+                lambda: middleware(rate_limit={"rps": 1}),
+                TypeError,
+                "@middleware() does not take the keyword argument 'rate_limit'. Use @rate_limit(...).",
+            ),
+            (
+                lambda: middleware(origins=["https://a.test"]),
+                TypeError,
+                "@middleware() does not take the keyword argument 'origins'. "
+                'Give middleware classes as positional arguments. A dict config needs type="cors" or type="rate_limit".',
+            ),
+            (
+                lambda: middleware(type="bogus"),
+                ValueError,
+                "route middleware dict has the unknown type 'bogus'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+            (
+                lambda: middleware({"type": "bogus"})(_plain_function),
+                ValueError,
+                "route middleware dict has the unknown type 'bogus'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+            (
+                lambda: middleware({"origins": ["https://a.test"]})(_plain_function),
+                ValueError,
+                "route middleware dict has no 'type'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+            (
+                lambda: BoltAPI(middleware=[{"type": "Cors", "origins": ["https://a.test"]}]),
+                ValueError,
+                "api middleware dict has the unknown type 'Cors'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+            (
+                lambda: Router(middleware=[{"rps": 1}]),
+                ValueError,
+                "router middleware dict has no 'type'. "
+                'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).',
+            ),
+        ],
+        ids=[
+            "kwarg-cors",
+            "kwarg-skip",
+            "kwarg-rate-limit",
+            "kwarg-other",
+            "kwarg-type-unknown",
+            "dict-type-unknown",
+            "dict-no-type",
+            "api-dict-type-case",
+            "router-dict-no-type",
+        ],
+    )
+    def test_a_form_that_no_middleware_reads_raises(self, build, error, message):
+        # Before, Bolt kept the entry and nothing read it: the route had no such middleware.
+        with pytest.raises(error) as raised:
+            build()
+
+        assert str(raised.value) == message
+
+    @pytest.mark.parametrize(
+        ("config", "error", "message"),
+        [
+            ({"type": "cors"}, ValueError, "@middleware(type='cors') requires an 'origins' or 'origin_regexes'"),
+            ({"type": "cors", "credentials": True}, ValueError, "requires an 'origins' or 'origin_regexes'"),
+            (
+                {"type": "cors", "origins": 5},
+                TypeError,
+                "@middleware(type='cors') origins must be a str or a list of str, not int",
+            ),
+            (
+                {"type": "cors", "origin_regexes": [""]},
+                ValueError,
+                "@middleware(type='cors') origin_regexes holds an empty pattern, which matches every origin.",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "methods": "GET"},
+                TypeError,
+                "@middleware(type='cors') methods must be a list of str, not str 'GET'",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "expose_headers": "X-A"},
+                TypeError,
+                "@middleware(type='cors') expose_headers must be a list of str, not str 'X-A'",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "credentials": "yes"},
+                TypeError,
+                "@middleware(type='cors') credentials must be a bool, not str 'yes'",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "max_age": -1},
+                ValueError,
+                "@middleware(type='cors') max_age must be from 0 to 4294967295, got -1",
+            ),
+            ({"type": "rate_limit", "rps": 0}, ValueError, "rate_limit rps must be 1 or more, got 0"),
+            ({"type": "rate_limit", "burst": 1.5}, TypeError, "rate_limit burst must be an int, got float 1.5"),
+            (
+                {"type": "rate_limit", "key": "x forwarded for"},
+                ValueError,
+                'rate_limit key must be "ip", "user", "api_key" or the name of a request header, '
+                "got 'x forwarded for'",
+            ),
+        ],
+        ids=[
+            "cors-no-origins",
+            "cors-only-credentials",
+            "cors-origins-int",
+            "cors-empty-pattern",
+            "cors-methods-str",
+            "cors-expose-headers-str",
+            "cors-credentials-str",
+            "cors-max-age-negative",
+            "rate-limit-rps-zero",
+            "rate-limit-burst-float",
+            "rate-limit-key-space",
+        ],
+    )
+    @pytest.mark.parametrize("form", ["keywords", "dict"])
+    def test_the_dict_form_of_a_route_refuses_what_the_decorator_refuses(self, form, config, error, message):
+        # Before, @middleware(type="cors") took a config with no origins, and Rust read only the types.
+        with pytest.raises(error, match=re.escape(message)):
+            if form == "keywords":
+                middleware(**config)
+            else:
+                middleware(config)(lambda: None)
+
+    @pytest.mark.parametrize("level", ["api", "router"])
+    @pytest.mark.parametrize(
+        ("config", "error", "message"),
+        [
+            (
+                {"type": "rate_limit", "rps": 5, "key": "x forwarded for"},
+                ValueError,
+                'rate_limit key must be "ip", "user", "api_key" or the name of a request header, '
+                "got 'x forwarded for'",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "methods": "GET"},
+                TypeError,
+                "{level} cors dict methods must be a list of str, not str 'GET'",
+            ),
+            (
+                {"type": "cors", "origin_regexes": ""},
+                ValueError,
+                "{level} cors dict origin_regexes holds an empty pattern, which matches every origin.",
+            ),
+        ],
+        ids=["rate-limit-key", "cors-methods", "cors-empty-pattern"],
+    )
+    def test_a_dict_of_an_api_or_a_router_gets_the_checks_of_the_decorator(self, level, config, error, message):
+        # Before, a rate limit key with a space passed, and each caller had the same bucket.
+        with pytest.raises(error, match=re.escape(message.format(level=level))):
+            if level == "api":
+                BoltAPI(middleware=[config])
+            else:
+                Router(middleware=[config])
+
+    @pytest.mark.parametrize("level", ["api", "router", "route"])
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (
+                {"type": "cors", "origin": ["https://a.test"], "credentials": True},
+                "{where} has the unknown key 'origin'. The valid keys are 'type', 'origins', 'origin_regexes', "
+                "'methods', 'headers', 'expose_headers', 'credentials' and 'max_age'.",
+            ),
+            (
+                {"type": "cors", "origins": ["https://a.test"], "allow_credentials": None},
+                "{where} has the unknown key 'allow_credentials'. The valid keys are",
+            ),
+            (
+                {"type": "rate_limit", "rps": 5, "burst_size": 9},
+                "{where} has the unknown key 'burst_size'. The valid keys are 'type', 'rps', 'burst' and 'key'.",
+            ),
+        ],
+        ids=["cors-origin", "cors-none-value", "rate-limit-burst-size"],
+    )
+    def test_a_dict_with_a_key_that_nothing_reads_raises(self, level, config, message):
+        # Before, Bolt ignored the key. The config that the author meant did not apply.
+        name = config["type"]
+        where = f"@middleware(type='{name}')" if level == "route" else f"{level} {name} dict"
+        with pytest.raises(TypeError, match=re.escape(message.format(where=where))):
+            if level == "api":
+                BoltAPI(middleware=[config])
+            elif level == "router":
+                Router(middleware=[config])
+            else:
+                middleware(**config)
+
+    def test_a_cors_dict_of_an_api_or_a_router_needs_no_origins(self):
+        """Such a config keeps the allow list of the outer config. Only a route config needs origins."""
+        api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://api.test"]}])
+        router = Router(middleware=[{"type": "cors", "credentials": True}])
+
+        @router.get("/inner")
+        async def inner():
+            return {}
+
+        api.include_router(router)
+
+        with TestClient(api, use_http_layer=True, read_django_settings=False) as client:
+            response = client.get("/inner", headers={"Origin": "https://api.test"})
+
+        assert response.headers.get("Access-Control-Allow-Origin") == "https://api.test"
+        assert response.headers.get("Access-Control-Allow-Credentials") == "true"
+
+    def test_the_keyword_form_gives_the_route_the_config_of_the_decorator(self):
+        api = BoltAPI()
+
+        @api.get("/keywords")
+        @middleware(type="cors", origins="https://a.test", credentials=True)
+        async def keywords():
+            return {}
+
+        @api.get("/limited")
+        @middleware(type="rate_limit", rps=1, burst=1, key="X-Client")
+        async def limited():
+            return {}
+
+        with TestClient(api, use_http_layer=True, read_django_settings=False) as client:
+            allowed = client.get("/keywords", headers={"Origin": "https://a.test"})
+            other = client.get("/keywords", headers={"Origin": "https://b.test"})
+            statuses = [client.get("/limited", headers={"X-Client": "one"}).status_code for _ in range(2)]
+
+        assert allowed.headers.get("Access-Control-Allow-Origin") == "https://a.test"
+        assert other.headers.get("Access-Control-Allow-Origin") is None
+        assert statuses == [200, 429]
 
     def test_dict_entries_pass_through_unchanged(self):
         entry = {"type": "rate_limit", "rps": 1, "burst": 2, "key": "ip"}
@@ -657,6 +1016,48 @@ class TestMiddlewareMetadata:
             response = client.get("/with-cors", headers={"Origin": "https://example.com"})
             assert response.status_code == 200
             assert response.headers.get("Access-Control-Allow-Origin") == "https://example.com"
+
+    @pytest.mark.parametrize(
+        "names",
+        [
+            (HeaderProbe,),
+            ("headerprobe",),
+            ("HEADERPROBE",),
+            (f"{__name__}.headerprobe",),
+            (HeaderProbe, "CORS", "Rate_Limit"),
+        ],
+        ids=["class", "lower-case-name", "upper-case-name", "dotted-path-case", "class-with-rust-names"],
+    )
+    def test_skip_middleware_takes_a_class_and_ignores_the_letter_case_of_a_name(self, names):
+        api = BoltAPI(middleware=[HeaderProbe])
+
+        @api.get("/skipped")
+        @skip_middleware(*names)
+        @cors(origins=["https://example.com"])
+        @rate_limit(rps=1, burst=1)
+        async def skipped():
+            return {}
+
+        @api.get("/plain")
+        async def plain():
+            return {}
+
+        with TestClient(api) as client:
+            responses = [client.get("/skipped", headers={"Origin": "https://example.com"}) for _ in range(3)]
+            assert client.get("/plain").headers["x-probe"] == "ran"
+
+        assert all("x-probe" not in response.headers for response in responses)
+        if len(names) > 1:
+            # A class in the names must not hide the names of the Rust middleware.
+            assert [response.status_code for response in responses] == [200, 200, 200]
+            assert all("access-control-allow-origin" not in response.headers for response in responses)
+
+    @pytest.mark.parametrize("name", [42, None, CustomTestMiddleware(_plain_function), _plain_function])
+    def test_skip_middleware_rejects_a_name_that_is_not_a_str_or_a_class(self, name):
+        with pytest.raises(
+            TypeError, match=r"@skip_middleware\(\) takes the name of a middleware or a middleware class"
+        ):
+            skip_middleware("cors", name)
 
     def test_rust_arg_prebinding_skips_injector_on_http_fast_path(self):
         """Simple path/query handlers should execute without calling Python injector."""
@@ -1113,6 +1514,47 @@ def test_python_middleware_replaces_the_content_type_in_any_letter_case():
     assert response.text == "<p>x</p>"
 
 
+class ReshapeResponse(Middleware):
+    """Replace the headers with a plain dict, set a bytearray body, or read a missing header."""
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        how = request.query.get("how")
+        if how == "plain-dict":
+            response.headers = {"Content-Type": "text/x-plain", "X-Plain": "1"}
+        elif how == "bytearray":
+            response.body = bytearray(b"hello")
+        elif how == "missing-header":
+            response.headers["x-default"] = response.headers.get("X-Nope", "fallback")
+        return response
+
+
+@pytest.mark.parametrize(
+    ("how", "content_type", "extra_header", "body"),
+    [
+        ("plain-dict", "text/x-plain", ("x-plain", "1"), "<p>x</p>"),
+        ("bytearray", "text/html; charset=utf-8", None, "hello"),
+        ("missing-header", "text/html; charset=utf-8", ("x-default", "fallback"), "<p>x</p>"),
+    ],
+)
+def test_python_middleware_reshapes_the_response(how, content_type, extra_header, body):
+    """The client gets the headers and the body that middleware sets, in any container type."""
+    api = BoltAPI(middleware=[ReshapeResponse])
+
+    @api.get("/html")
+    async def html():
+        return HTML("<p>x</p>")
+
+    with TestClient(api) as client:
+        response = client.get("/html", params={"how": how})
+
+    assert response.status_code == 200
+    assert response.headers.get_list("content-type") == [content_type]
+    if extra_header:
+        assert response.headers.get(extra_header[0]) == extra_header[1]
+    assert response.text == body
+
+
 class StateTag(BaseMiddleware):
     """Add a header to each response that this middleware handles."""
 
@@ -1419,6 +1861,49 @@ def test_a_route_rate_limit_limits_a_router_route_with_no_api_limit():
     assert 429 in statuses[1:], statuses
 
 
+_STRICT = {"type": "rate_limit", "rps": 1, "burst": 1}
+_LOOSE = {"type": "rate_limit", "rps": 1000}
+
+
+@pytest.mark.parametrize(
+    ("api_limit", "router_limit", "route_limit", "limited"),
+    [
+        (_LOOSE, None, rate_limit(rps=1, burst=1), True),
+        (_STRICT, None, rate_limit(rps=1000), False),
+        (_LOOSE, _STRICT, None, True),
+        (_STRICT, _LOOSE, None, False),
+        (_STRICT, _STRICT, rate_limit(rps=1000), False),
+        (_LOOSE, _LOOSE, rate_limit(rps=1, burst=1), True),
+        (_STRICT, _STRICT, skip_middleware("rate_limit"), False),
+    ],
+    ids=[
+        "route-over-api",
+        "loose-route-over-api",
+        "router-over-api",
+        "loose-router-over-api",
+        "loose-route-over-router",
+        "route-over-router",
+        "skip-over-all",
+    ],
+)
+def test_the_most_specific_rate_limit_applies(api_limit, router_limit, route_limit, limited):
+    """The order is route, router, API. Before, the API limit won over each other limit."""
+    api = BoltAPI(middleware=[api_limit])
+    router = Router(prefix="/router", middleware=[router_limit] if router_limit else None)
+
+    async def items():
+        return {"ok": True}
+
+    router.get("/items")(route_limit(items) if route_limit else items)
+    api.include_router(router)
+
+    with TestClient(api) as client:
+        statuses = [client.get("/router/items").status_code for _ in range(4)]
+
+    assert statuses[0] == 200
+    assert (429 in statuses[1:]) is limited, statuses
+
+
 class WireTupleMiddleware(Middleware):
     """Answer with a ResponseWireV1 tuple, without the handler."""
 
@@ -1426,11 +1911,37 @@ class WireTupleMiddleware(Middleware):
         return (418, 0, 0, b'{"teapot":true}')
 
 
-class StrMiddleware(Middleware):
-    """Answer with a type that is not a response."""
+class ForbidWithJson(Middleware):
+    """Answer with a response object, without the handler."""
 
     async def process_request(self, request):
-        return "not a response"
+        response = JSON({"detail": "forbidden"}, status_code=403, headers={"X-Reason": "blocked"})
+        response.set_cookie("seen", "1")
+        return response
+
+
+class DictAnswer(Middleware):
+    """Answer with a dict, as a handler can."""
+
+    async def process_request(self, request):
+        return {"from": "middleware"}
+
+
+class TextAnswer(Middleware):
+    """Answer with a PlainText response."""
+
+    async def process_request(self, request):
+        return PlainText("stop", status_code=429)
+
+
+class MarkResponse(Middleware):
+    """Change the response of the inner middleware."""
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.status_code = 401
+        response.headers["X-Outer"] = "changed"
+        return response
 
 
 def test_a_middleware_can_answer_with_a_wire_tuple():
@@ -1447,20 +1958,117 @@ def test_a_middleware_can_answer_with_a_wire_tuple():
     assert response.headers["content-type"] == "application/json"
 
 
-def test_a_middleware_answer_of_another_type_is_a_500_that_names_the_type():
-    api = BoltAPI(middleware=[StrMiddleware])
+def test_a_middleware_can_answer_with_a_response_object():
+    api = BoltAPI(middleware=[ForbidWithJson])
 
     @api.get("/tea")
     async def tea():
         return {"handler": True}
 
-    with override_settings(DEBUG=True), TestClient(api) as client:
+    with TestClient(api) as client:
         response = client.get("/tea")
 
-    assert response.status_code == 500
-    assert (
-        "Middleware chain returned unsupported response type: str. Expected MiddlewareResponse or ResponseWireV1 tuple."
-    ) in response.text
+    assert (response.status_code, response.json()) == (403, {"detail": "forbidden"})
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["x-reason"] == "blocked"
+    assert response.cookies["seen"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("answer", "status", "content_type", "body"),
+    [
+        (DictAnswer, 201, "application/json", b'{"from":"middleware"}'),
+        (TextAnswer, 429, "text/plain; charset=utf-8", b"stop"),
+    ],
+)
+def test_a_middleware_can_answer_with_what_a_handler_can_return(answer, status, content_type, body):
+    api = BoltAPI()
+
+    # A dict gets the status of the route, as a dict from the handler does.
+    @api.post("/tea", status_code=201)
+    @middleware(answer)
+    async def tea():
+        return {"handler": True}
+
+    with TestClient(api) as client:
+        response = client.post("/tea")
+
+    assert (response.status_code, response.content) == (status, body)
+    assert response.headers["content-type"] == content_type
+
+
+def test_an_outer_middleware_changes_the_response_object_of_an_inner_middleware():
+    api = BoltAPI(middleware=[MarkResponse, ForbidWithJson])
+
+    @api.get("/tea")
+    async def tea():
+        return {"handler": True}
+
+    with TestClient(api) as client:
+        response = client.get("/tea")
+
+    assert (response.status_code, response.json()) == (401, {"detail": "forbidden"})
+    assert response.headers["x-outer"] == "changed"
+    assert response.headers["x-reason"] == "blocked"
+    assert response.cookies["seen"] == "1"
+
+
+class HeaderMapping(Middleware):
+    """Use each mapping operation on the response headers, in other letter cases."""
+
+    seen: dict = {}
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        headers = response.headers
+        seen = type(self).seen
+        seen["in"] = ("X-KEEP" in headers, "x-missing" in headers, 1 in headers)
+        seen["getitem"] = headers["X-Keep"]
+        try:
+            headers["X-Missing"]
+        except KeyError:
+            seen["getitem_missing"] = "KeyError"
+        seen["pop"] = headers.pop("X-POP")
+        seen["pop_default"] = (headers.pop("X-Gone", "fallback"), headers.pop("X-Gone", None))
+        try:
+            headers.pop("X-Gone")
+        except KeyError:
+            seen["pop_missing"] = "KeyError"
+        headers.update({"X-Upd-Dict": "1"})
+        headers.update([("X-Upd-Pair", "2")])
+        headers.update({"X-Keep": "updated"}, **{"X-Kw": "3"})
+        headers |= {"X-Ior-Dict": "4"}
+        headers |= [("X-Ior-Pair", "5")]
+        return response
+
+
+def test_python_middleware_response_headers_behave_as_a_case_insensitive_mapping():
+    """Python middleware reads and edits the response headers like a dict, whatever the letter case."""
+    HeaderMapping.seen = {}
+    api = BoltAPI(middleware=[HeaderMapping])
+
+    @api.get("/h")
+    async def handler():
+        return JSON({"ok": True}, headers={"X-Keep": "kept", "X-Pop": "popped"})
+
+    with TestClient(api) as client:
+        response = client.get("/h")
+
+    assert HeaderMapping.seen == {
+        "in": (True, False, False),
+        "getitem": "kept",
+        "getitem_missing": "KeyError",
+        "pop": "popped",
+        "pop_default": ("fallback", None),
+        "pop_missing": "KeyError",
+    }
+    assert "x-pop" not in response.headers
+    assert response.headers["x-keep"] == "updated"
+    assert response.headers["x-upd-dict"] == "1"
+    assert response.headers["x-upd-pair"] == "2"
+    assert response.headers["x-kw"] == "3"
+    assert response.headers["x-ior-dict"] == "4"
+    assert response.headers["x-ior-pair"] == "5"
 
 
 if __name__ == "__main__":

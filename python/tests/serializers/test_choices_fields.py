@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Literal, get_args, get_origin
+from datetime import date, datetime, time
+from decimal import Decimal
+from typing import Annotated, Any, Literal, get_args, get_origin
+from uuid import UUID
 
 import msgspec
 import pytest
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import connection, models
 
 from django_bolt.exceptions import RequestValidationError
@@ -107,6 +111,39 @@ class TestChoicesFieldDetection:
         actual_type = get_args(field_type)[0] if hasattr(field_type, "__origin__") else field_type
 
         assert actual_type is str
+
+    @pytest.mark.parametrize(
+        ("django_field", "expected"),
+        [
+            (models.TextField(), str),
+            (models.FloatField(), float),
+            (models.DecimalField(max_digits=5, decimal_places=2), Decimal),
+            (models.BooleanField(), bool),
+            (models.DateTimeField(), datetime),
+            (models.DateField(), date),
+            (models.TimeField(), time),
+            (models.DurationField(), str),
+            (models.UUIDField(), UUID),
+            (models.ForeignKey("django_bolt.Author", on_delete=models.CASCADE), int),
+            (models.ManyToManyField("django_bolt.Tag"), list[int]),
+            (models.JSONField(), Any),
+            (models.TextField(null=True), str | None),
+            (models.CharField(max_length=7), Annotated[str, msgspec.Meta(max_length=7)]),
+            (models.SlugField(max_length=9, null=True), Annotated[str | None, msgspec.Meta(max_length=9)]),
+            (
+                models.IntegerField(validators=[MinValueValidator(1), MaxValueValidator(9)]),
+                Annotated[int, msgspec.Meta(ge=1, le=9)],
+            ),
+        ],
+    )
+    def test_django_field_gives_its_msgspec_type(self, django_field, expected):
+        """Each Django field class has one msgspec type. A null field adds None. A limit becomes a constraint."""
+        assert get_msgspec_type_for_django_field(django_field) == expected
+
+    def test_null_booleanfield_accepts_none(self):
+        """A BooleanField with null=True gets None in its type, as each other null field does."""
+        assert get_msgspec_type_for_django_field(models.BooleanField(null=True)) == bool | None
+        assert get_msgspec_type_for_django_field(models.BooleanField()) is bool
 
     def test_integerfield_with_choices_generates_literal(self):
         """Test that IntegerField with choices generates Literal type."""
