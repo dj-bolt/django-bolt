@@ -31,6 +31,7 @@ from django_bolt.api import (
     serve_with_lifespan,
 )
 from django_bolt.concurrency import close_connections_and_pools
+from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.workers import MIB, WorkerSupervisor
 
 try:
@@ -849,8 +850,9 @@ class Command(BaseCommand):
         if admin_enabled and detect_admin_url_prefix is not None:
             merged_api._register_admin_routes(options["host"], options["port"])
             if merged_api._admin_routes_registered:
-                admin_prefix = detect_admin_url_prefix() or "admin"
-                features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
+                admin_prefix = detect_admin_url_prefix()
+                admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
+                features.append(("Admin", f"{banner_base_url}{admin_path}"))
 
         _total_route_count = len(merged_api._routes) + len(merged_api._native_routes)
         _framework_route_count = _total_route_count - _user_route_count
@@ -957,8 +959,9 @@ class Command(BaseCommand):
             merged_api._register_admin_routes(options["host"], options["port"])
 
             if merged_api._admin_routes_registered:
-                admin_prefix = detect_admin_url_prefix() or "admin"
-                features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
+                admin_prefix = detect_admin_url_prefix()
+                admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
+                features.append(("Admin", f"{banner_base_url}{admin_path}"))
 
         # Compute route counts
         _total_route_count = len(merged_api._routes) + len(merged_api._native_routes)
@@ -971,6 +974,8 @@ class Command(BaseCommand):
             merged_api._asgi_mounts,
             merged_api._mcp_mounts,
         )
+        # A config decorator above a route decorator has no effect.
+        refuse_unread_route_config(merged_api._routes, merged_api._websocket_routes)
 
         # Register routes with Rust. Each route carries per-route bound
         # dispatch callables (partial binding handler + handler_id) so the

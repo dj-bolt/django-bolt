@@ -327,6 +327,95 @@ def test_write_actions_answer_422_for_a_body_that_is_not_a_json_object(api, body
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"title": "new"},
+        {"title": 1, "content": 2, "author": "a"},
+        {"title": "new", "content": "c", "author": None},
+    ],
+    ids=["no-field", "two-missing-fields", "two-wrong-types", "null"],
+)
+def test_write_actions_answer_the_422_of_a_function_route_for_a_bad_field(api, body):
+    """One body gives one 422 body: the write actions do not have their own error shape."""
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+    @api.post("/function")
+    async def function_route(data: ArticleSchema):
+        return {"ok": True}
+
+    article = Article.objects.create(title="t", content="c", author="a")
+
+    with TestClient(api) as client:
+        expected = client.post("/function", json=body)
+        assert expected.status_code == 422
+        assert len(expected.json()["detail"]) == 1
+
+        assert client.post("/articles", json=body).json() == expected.json()
+        assert client.put(f"/articles/{article.id}", json=body).json() == expected.json()
+        # PATCH takes a subset of the fields, so it reports only a bad value.
+        if not {"title", "content", "author"} - set(body):
+            assert client.patch(f"/articles/{article.id}", json=body).json() == expected.json()
+
+    assert list(Article.objects.values_list("id", "title")) == [(article.id, "t")]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_partial_update_with_a_renamed_serializer(api):
+    """PATCH works when the serializer has wire names that differ from the field names."""
+
+    class CamelRequired(Serializer, rename="camel"):
+        title: str
+        is_published: bool
+
+    class CamelDefault(Serializer, rename="camel"):
+        title: str
+        is_published: bool = False
+
+    @api.viewset("/required")
+    class RequiredViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = CamelRequired
+
+    @api.viewset("/default")
+    class DefaultViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = CamelDefault
+
+    article = Article.objects.create(title="t", content="c", author="a")
+
+    with TestClient(api) as client:
+        # A field with no rename effect. The required renamed field comes from the object.
+        response = client.patch(f"/required/{article.id}", json={"title": "new"})
+        assert response.status_code == 200
+        assert response.json() == {"title": "new", "isPublished": False}
+
+        # A renamed field, by its wire name.
+        response = client.patch(f"/required/{article.id}", json={"isPublished": True})
+        assert response.status_code == 200
+        assert response.json() == {"title": "new", "isPublished": True}
+        article.refresh_from_db()
+        assert (article.title, article.is_published) == ("new", True)
+
+        # A renamed field with a default: the value of the body applies, not the default.
+        Article.objects.filter(id=article.id).update(is_published=False)
+        response = client.patch(f"/default/{article.id}", json={"isPublished": True})
+        assert response.status_code == 200
+        assert response.json() == {"title": "new", "isPublished": True}
+        article.refresh_from_db()
+        assert article.is_published is True
+
+        # A value of the wrong type is still a validation error.
+        response = client.patch(f"/required/{article.id}", json={"isPublished": "text"})
+        assert response.status_code == 422
+
+
+@pytest.mark.django_db(transaction=True)
 def test_model_viewset_lookup_field(api):
     """Test ModelViewSet with custom lookup_field."""
     # Create article

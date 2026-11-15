@@ -30,6 +30,15 @@ This creates:
 - `GET /hello` - Calls the `get` method
 - `POST /hello` - Calls the `post` method
 
+Bolt passes the request to the parameter with the name `request` or `req`, at each position. `self.request` is the same request. A method with no such parameter can still read `self.request`:
+
+```python
+@api.view("/whoami")
+class WhoAmIView(APIView):
+    async def get(self):
+        return {"path": self.request.path}
+```
+
 ### Available methods
 
 Implement any of these methods:
@@ -178,6 +187,25 @@ and nested serializers.
 
 Plain `msgspec.Struct` response models still use the faster `QuerySet.values()`
 projection path for raw column output.
+
+### Request body errors
+
+The generated `create`, `update` and `partial_update` actions validate the
+request body as a function route does for a body parameter of the same
+serializer. A bad body gives the same 422 response. The response reports the
+first error of the body:
+
+```json
+{
+    "detail": [
+        {
+            "loc": ["body", "title"],
+            "msg": "Object missing required field `title`",
+            "type": "missing_field"
+        }
+    ]
+}
+```
 
 ### get_queryset
 

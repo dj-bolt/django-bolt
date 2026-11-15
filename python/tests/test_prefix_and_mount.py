@@ -11,11 +11,13 @@ from typing import Annotated
 
 import pytest
 
-from django_bolt import BoltAPI, Router
+from django_bolt import BoltAPI, Router, WebSocket
+from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
 from django_bolt.middleware import Middleware
 from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
 from django_bolt.params import Query
-from django_bolt.testing import TestClient
+from django_bolt.testing import TestClient, WebSocketTestClient
+from django_bolt.views import APIView, ViewSet
 
 
 class TestMountPathNormalization:
@@ -123,6 +125,81 @@ class TestMountPathNormalization:
                 f"Mounted route should be accessible at /sub/hello, got {response.status_code}"
             )
             assert response.json() == {"message": "Hello from mounted API"}
+
+    def test_mount_keeps_each_route_of_both_apis(self):
+        """Each HTTP and WebSocket route of the parent and of the mounted API keeps its handler and its settings."""
+        main_api = BoltAPI()
+        sub_api = BoltAPI()
+
+        @main_api.get("/first", status_code=201)
+        async def first():
+            return {"route": "first"}
+
+        @main_api.get("/second", status_code=202)
+        async def second():
+            return {"route": "second"}
+
+        @sub_api.get("/a", status_code=203)
+        async def sub_a():
+            return {"route": "a"}
+
+        @sub_api.get("/b", status_code=206)
+        async def sub_b():
+            return {"route": "b"}
+
+        @sub_api.websocket("/ws/a")
+        async def ws_a(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("ws a")
+
+        @sub_api.websocket("/ws/b")
+        async def ws_b(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("ws b")
+
+        main_api.mount("/sub", sub_api)
+
+        @main_api.get("/third", status_code=207)
+        async def third():
+            return {"route": "third"}
+
+        with TestClient(main_api) as client:
+            for path, status, route in [
+                ("/first", 201, "first"),
+                ("/second", 202, "second"),
+                ("/sub/a", 203, "a"),
+                ("/sub/b", 206, "b"),
+                ("/third", 207, "third"),
+            ]:
+                response = client.get(path)
+                assert (response.status_code, response.json()) == (status, {"route": route})
+
+        async def receive_first_text(path: str) -> str:
+            async with WebSocketTestClient(main_api, path) as ws:
+                return await ws.receive_text()
+
+        assert asyncio.run(receive_first_text("/sub/ws/a")) == "ws a"
+        assert asyncio.run(receive_first_text("/sub/ws/b")) == "ws b"
+
+    def test_mounted_websocket_route_keeps_its_auth_and_guards(self):
+        """A WebSocket route of a mounted API refuses a connection with no credentials, as before the mount."""
+        main_api = BoltAPI()
+        sub_api = BoltAPI()
+
+        @sub_api.websocket("/ws", auth=[APIKeyAuthentication(api_keys={"secret"})], guards=[IsAuthenticated()])
+        async def protected(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("welcome")
+
+        main_api.mount("/sub", sub_api)
+
+        async def connect(headers: dict[str, str]) -> str:
+            async with WebSocketTestClient(main_api, "/sub/ws", headers=headers) as ws:
+                return await ws.receive_text()
+
+        with pytest.raises(PermissionError):
+            asyncio.run(connect({}))
+        assert asyncio.run(connect({"X-API-Key": "secret"})) == "welcome"
 
     @pytest.mark.parametrize("mount_path", ["/", "//", ""])
     def test_mount_at_the_root_keeps_the_route_paths(self, mount_path):
@@ -402,6 +479,35 @@ class TestOpenAPIDocsWithPrefix:
             assert "/api/items" in paths, f"API routes should be in schema: {paths}"
 
 
+class TestIncludeRouter:
+    """Tests for the arguments that include_router() gives to each route."""
+
+    def test_include_router_applies_prefix_and_router_settings(self):
+        """The prefix, the route arguments, and the tags and guards of the router reach each route."""
+        api = BoltAPI()
+        router = Router(prefix="/users", tags=["people"], guards=[IsAuthenticated()])
+
+        @router.post("", status_code=201, summary="Add a user", auth=[APIKeyAuthentication(api_keys={"secret"})])
+        async def add_user():
+            return {"added": True}
+
+        api.include_router(router, prefix="/api/v1/")
+        api._register_openapi_routes()
+
+        with TestClient(api) as client:
+            assert client.post("/users").status_code == 404
+            assert client.post("/api/v1/users").status_code == 401
+
+            response = client.post("/api/v1/users", headers={"X-API-Key": "secret"})
+            assert response.status_code == 201
+            assert response.json() == {"added": True}
+
+            operation = client.get("/docs/openapi.json").json()["paths"]["/api/v1/users"]["post"]
+
+        assert operation["tags"] == ["people"]
+        assert operation["summary"] == "Add a user"
+
+
 @pytest.mark.parametrize(
     ("route", "url", "expected"),
     [
@@ -433,6 +539,58 @@ def test_a_route_path_with_a_character_that_a_url_escapes_matches_the_request(ro
         response = client.get(url)
         assert response.status_code == 200, response.text
         assert response.json() == expected
+
+
+@pytest.mark.parametrize(
+    ("route", "url", "expected"),
+    [
+        # RFC 3986 section 6.2.2.1: the letter case of an escape has no meaning.
+        ("/ü", "/%c3%bc", {"route": "/ü"}),
+        ("/a b/{x}", "/a%20b/a%2fb", {"route": "/a b/{x}", "x": "a/b"}),
+        ("/%c3%a9", "/%C3%A9", {"route": "/%c3%a9"}),
+        # RFC 3986 section 6.2.2.2: an escape of an unreserved character is that character.
+        ("/a", "/%61", {"route": "/a"}),
+        ("/%61", "/a", {"route": "/%61"}),
+        ("/a-b/{x}", "/a%2Db/%61", {"route": "/a-b/{x}", "x": "a"}),
+        # Django decodes each escape before it matches. So does Bolt, but not `%2F` and `%25`.
+        ("/a:b,c", "/a%3Ab%2cc", {"route": "/a:b,c"}),
+        ("/files/{x}", "/files/a%2Fb%2541", {"route": "/files/{x}", "x": "a/b%41"}),
+    ],
+)
+def test_an_escape_in_another_form_matches_the_same_route(route, url, expected):
+    """A client can write an escape in lower case, or escape a character that needs no escape."""
+    api = BoltAPI()
+
+    if "{x}" in route:
+
+        @api.get(route)
+        async def handler(x: str):
+            return {"route": route, "x": x}
+
+    else:
+
+        @api.get(route)
+        async def handler():
+            return {"route": route}
+
+    with TestClient(api) as client:
+        response = client.get(url)
+        assert response.status_code == 200, response.text
+        assert response.json() == expected
+
+
+def test_an_escaped_slash_does_not_split_a_segment():
+    """`%2F` is data of one segment. It does not match the `/` between two segments."""
+    api = BoltAPI()
+
+    @api.get("/a/b")
+    async def handler():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        assert client.get("/a/b").status_code == 200
+        assert client.get("/a%2Fb").status_code == 404
+        assert client.get("/a%2fb").status_code == 404
 
 
 class TestEmptyRouteRegistration:
@@ -794,6 +952,97 @@ class TestTrailingSlashSetting:
 
             registered_paths = [path for _method, path, _handler_id, _handler in api._routes]
             assert "/" in registered_paths, f"Root '/' should be unchanged in '{mode}' mode"
+
+
+def _api_with_route_and_prefix_without_slash():
+    api = BoltAPI(prefix="api")
+
+    @api.get("x")
+    async def handler():
+        return {"ok": True}
+
+    return api
+
+
+def _api_with_router_without_slash():
+    api = BoltAPI()
+    router = Router(prefix="users")
+
+    @router.get("x")
+    async def handler():
+        return {"ok": True}
+
+    @router.get("")
+    async def root():
+        return {"ok": True}
+
+    api.include_router(router, prefix="v1")
+    return api
+
+
+def _api_with_nested_router_without_slash():
+    api = BoltAPI()
+    parent = Router(prefix="v1")
+    child = Router(prefix="users")
+    parent.include_router(child, prefix="admin")
+
+    @child.get("x")
+    async def handler():
+        return {"ok": True}
+
+    api.include_router(parent)
+    return api
+
+
+def _api_with_view_and_viewset_without_slash():
+    api = BoltAPI(prefix="api")
+
+    @api.view("view")
+    class View(APIView):
+        async def get(self, request):
+            return {"ok": True}
+
+    @api.viewset("items")
+    class Items(ViewSet):
+        async def list(self, request):
+            return {"ok": True}
+
+        async def retrieve(self, request, pk: int):
+            return {"ok": True}
+
+    return api
+
+
+@pytest.mark.parametrize(
+    ("make_api", "urls"),
+    [
+        (_api_with_route_and_prefix_without_slash, ["/api/x"]),
+        (_api_with_router_without_slash, ["/v1/users/x", "/v1/users"]),
+        (_api_with_nested_router_without_slash, ["/v1/admin/users/x"]),
+        (_api_with_view_and_viewset_without_slash, ["/api/view", "/api/items", "/api/items/1"]),
+    ],
+)
+def test_a_path_or_prefix_with_no_leading_slash_gets_one(make_api, urls):
+    """Each path and prefix follows the rule of the mount path: Bolt adds the leading slash."""
+    api = make_api()
+    with TestClient(api) as client:
+        for url in urls:
+            response = client.get(url)
+            assert response.status_code == 200, (url, response.text)
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_path_with_no_leading_slash_gets_one():
+    api = BoltAPI(prefix="api")
+
+    @api.websocket("ws")
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+        await websocket.close()
+
+    async with WebSocketTestClient(api, "/api/ws") as ws:
+        assert await ws.receive_text() == "connected"
 
 
 class TagMiddleware(Middleware):

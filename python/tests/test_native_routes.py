@@ -328,8 +328,8 @@ def _x_route(api: BoltAPI) -> BoltAPI:
     return api
 
 
-def _mounted() -> BoltAPI:
-    parent = BoltAPI()
+def _mounted(**parent_options) -> BoltAPI:
+    parent = BoltAPI(**parent_options)
     parent.mount("/v2", _x_route(BoltAPI()))
     return parent
 
@@ -340,8 +340,9 @@ def _mounted() -> BoltAPI:
         (lambda: _x_route(BoltAPI(prefix="/api")), "/api/x/1"),
         (lambda: _x_route(BoltAPI(trailing_slash="append")), "/x/1/"),
         (_mounted, "/v2/x/1"),
+        (lambda: _mounted(trailing_slash="append"), "/v2/x/1/"),
     ],
-    ids=["prefix", "append-slash", "mount"],
+    ids=["prefix", "append-slash", "mount", "mount-append-slash"],
 )
 def test_native_route_path_follows_the_api(make_api, path):
     with TestClient(make_api()) as client:

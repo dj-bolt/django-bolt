@@ -9,8 +9,13 @@ Tests cover:
 - Type coercion and conversion
 """
 
+import dataclasses
+import datetime
+import decimal
+import enum
 import json
-from typing import Annotated
+import uuid
+from typing import Annotated, Any, Literal, TypedDict
 
 import msgspec
 import pytest
@@ -20,8 +25,18 @@ from django_bolt._kwargs import create_body_extractor, get_msgspec_decoder
 from django_bolt._kwargs.extractors import _DECODER_CACHE
 from django_bolt.error_handlers import handle_exception, msgspec_validation_error_to_dict
 from django_bolt.exceptions import RequestValidationError, parse_msgspec_decode_error
-from django_bolt.params import Body
+from django_bolt.params import Body, Cookie, Depends, File, Form, Header, Query
 from django_bolt.testing import TestClient
+
+
+@dataclasses.dataclass
+class Point:
+    x: int
+    y: int
+
+
+class Counts(TypedDict):
+    total: int
 
 
 class UserCreate(msgspec.Struct):
@@ -229,6 +244,128 @@ class TestInvalidJSONParsing:
             assert client.post("/required").status_code == 422
 
 
+class TestBodyMarkerOptions:
+    """`Body()` options do what the `Body()` options of FastAPI do."""
+
+    def test_embed_reads_the_value_from_the_key_of_the_parameter_name(self):
+        api = BoltAPI()
+
+        @api.post("/struct")
+        async def struct(user: Annotated[UserCreate, Body(embed=True)]):
+            return {"name": user.name}
+
+        @api.post("/scalar")
+        async def scalar(count: Annotated[int, Body(embed=True)]):
+            return {"count": count}
+
+        @api.post("/alias")
+        async def alias(count: Annotated[int, Body(embed=True, alias="item-count")]):
+            return {"count": count}
+
+        @api.post("/default")
+        async def default(count: Annotated[int, Body(embed=True)] = 5):
+            return {"count": count}
+
+        @api.post("/optional")
+        async def optional(count: Annotated[int | None, Body(embed=True)]):
+            return {"count": count}
+
+        @api.post("/default-in-marker")
+        async def default_in_marker(count: int = Body(7, embed=True)):
+            return {"count": count}
+
+        with TestClient(api) as client:
+            user = {"name": "Ana", "email": "ana@example.com", "age": 30}
+            assert client.post("/struct", json={"user": user}).json() == {"name": "Ana"}
+            # The object of the type with no wrapper has no "user" key.
+            response = client.post("/struct", json=user)
+            assert response.status_code == 422
+            assert response.json()["detail"][0]["loc"] == ["body", "user"]
+            assert client.post("/struct", json={"user": {"name": "Ana"}}).json()["detail"][0]["loc"] == [
+                "body",
+                "user",
+                "email",
+            ]
+
+            assert client.post("/scalar", json={"count": 3, "other": 1}).json() == {"count": 3}
+            assert client.post("/scalar", json={"count": "x"}).json()["detail"][0]["loc"] == ["body", "count"]
+            # The value with no wrapper is not an object.
+            assert client.post("/scalar", json=3).status_code == 422
+            assert client.post("/scalar", json={}).status_code == 422
+            assert client.post("/scalar").status_code == 422
+
+            assert client.post("/alias", json={"item-count": 3}).json() == {"count": 3}
+            assert client.post("/alias", json={"count": 3}).status_code == 422
+
+            for path, value in (("/default", 5), ("/optional", None), ("/default-in-marker", 7)):
+                assert client.post(path).json() == {"count": value}, path
+                assert client.post(path, json={}).json() == {"count": value}, path
+                assert client.post(path, json={"count": 2}).json() == {"count": 2}, path
+
+    def test_embed_alias_description_and_example_are_in_the_openapi_document(self):
+        api = BoltAPI()
+
+        @api.post("/embed")
+        async def embed(
+            user: Annotated[UserCreate, Body(embed=True, alias="account", description="The account", example={"a": 1})],
+        ):
+            return {"name": user.name}
+
+        @api.post("/embed-default")
+        async def embed_default(count: Annotated[int, Body(embed=True)] = 5):
+            return {"count": count}
+
+        @api.post("/plain")
+        async def plain(user: Annotated[UserCreate, Body(description="The user", example={"name": "Ana"})]):
+            return {"name": user.name}
+
+        @api.post("/no-options")
+        async def no_options(user: UserCreate):
+            return {"name": user.name}
+
+        @api.post("/form")
+        async def form(tag: Annotated[str, Form(example="blue", description="A tag")]):
+            return {"tag": tag}
+
+        api._register_openapi_routes()
+
+        with TestClient(api) as client:
+            paths = client.get("/docs/openapi.json").json()["paths"]
+
+        user_ref = {"$ref": "#/components/schemas/UserCreate"}
+        assert paths["/embed"]["post"]["requestBody"] == {
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object", "properties": {"account": user_ref}, "required": ["account"]},
+                    "example": {"account": {"a": 1}},
+                }
+            },
+            "description": "The account",
+            "required": True,
+        }
+        assert paths["/embed-default"]["post"]["requestBody"] == {
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object", "properties": {"count": {"type": "integer", "default": 5}}}
+                }
+            },
+            "description": "Request body for count",
+            "required": False,
+        }
+        assert paths["/plain"]["post"]["requestBody"] == {
+            "content": {"application/json": {"schema": user_ref, "example": {"name": "Ana"}}},
+            "description": "The user",
+            "required": True,
+        }
+        assert paths["/no-options"]["post"]["requestBody"] == {
+            "content": {"application/json": {"schema": user_ref}},
+            "description": "Request body for user",
+            "required": True,
+        }
+        form_schema = paths["/form"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+        assert form_schema["properties"]["tag"] == {"type": "string", "description": "A tag", "examples": ["blue"]}
+
+
 class TestBodyOfNonStructType:
     """A body with a type that is not a Struct is decoded as the type, with the same errors."""
 
@@ -377,6 +514,297 @@ class TestParseMsgspecDecodeError:
         detail = self._parse(body)
 
         assert detail["loc"] == ("body", 2, len('"b": ') + 1)
+
+
+@pytest.mark.parametrize("method", ["post", "put", "patch"])
+def test_a_dict_parameter_with_no_marker_is_the_json_body(method):
+    """A query string cannot hold a dict. A route whose method has a body reads the dict from the JSON body."""
+    api = BoltAPI()
+    route = getattr(api, method)
+
+    @route("/plain")
+    async def plain(data: dict):
+        return {"data": data}
+
+    @route("/typed/{item_id}")
+    async def typed(item_id: int, counts: dict[str, int], page: int = 1):
+        return {"item_id": item_id, "counts": counts, "page": page}
+
+    @route("/optional")
+    async def optional(data: dict | None = None):
+        return {"data": data}
+
+    # A list of simple values stays a repeated query parameter.
+    @route("/numbers")
+    async def numbers(ids: list[int]):
+        return {"ids": ids}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        send = getattr(client, method)
+        response = send("/plain", json={"a": 1, "b": [2]})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"data": {"a": 1, "b": [2]}}
+
+        response = send("/typed/7?page=2", json={"a": 1})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"item_id": 7, "counts": {"a": 1}, "page": 2}
+
+        response = send("/typed/7", json={"a": "x"})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"][0] == "body"
+
+        # A JSON array is not a dict.
+        assert send("/plain", json=[1]).status_code == 422
+
+        assert send("/optional", json={"a": 1}).json() == {"data": {"a": 1}}
+        assert send("/numbers?ids=1&ids=2").json() == {"ids": [1, 2]}
+
+        operations = client.get("/docs/openapi.json").json()["paths"]
+        plain_operation = operations["/plain"][method]
+        assert plain_operation["requestBody"]["content"]["application/json"]["schema"] == {"type": "object"}
+        assert "parameters" not in plain_operation
+        typed_operation = operations["/typed/{item_id}"][method]
+        assert typed_operation["requestBody"]["content"]["application/json"]["schema"] == {
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+        }
+        assert [parameter["name"] for parameter in typed_operation["parameters"]] == ["item_id", "page"]
+        assert "requestBody" not in operations["/numbers"][method]
+
+
+def _complex_query(api):
+    @api.get("/h")
+    async def handler(value: complex):
+        return {"value": repr(value)}
+
+
+def _dict_query_of_a_get_route(api):
+    @api.get("/h")
+    async def handler(filters: dict | None = None):
+        return {"filters": filters}
+
+
+def _list_of_dicts_query_of_a_get_route(api):
+    @api.get("/h")
+    async def handler(rows: list[dict]):
+        return {"rows": rows}
+
+
+def _nested_list_query(api):
+    @api.get("/h")
+    async def handler(rows: Annotated[list[list[int]], Query()]):
+        return {"rows": rows}
+
+
+def _dataclass_query(api):
+    @api.get("/h")
+    async def handler(point: Annotated[Point, Query()]):
+        return {"point": repr(point)}
+
+
+def _complex_path(api):
+    @api.get("/h/{value}")
+    async def handler(value: complex):
+        return {"value": repr(value)}
+
+
+def _dict_header(api):
+    @api.get("/h")
+    async def handler(x_filters: Annotated[dict, Header()]):
+        return {"filters": x_filters}
+
+
+def _complex_cookie(api):
+    @api.get("/h")
+    async def handler(value: Annotated[complex, Cookie()]):
+        return {"value": repr(value)}
+
+
+def _dict_form(api):
+    @api.post("/h")
+    async def handler(filters: Annotated[dict, Form()]):
+        return {"filters": filters}
+
+
+def _str_file(api):
+    @api.post("/h")
+    async def handler(upload: Annotated[str, File()]):
+        return {"upload": upload}
+
+
+def _complex_in_a_dependency(api):
+    async def dependency(value: complex):
+        return value
+
+    @api.get("/h")
+    async def handler(value: Annotated[complex, Depends(dependency)]):
+        return {"value": repr(value)}
+
+
+@pytest.mark.parametrize(
+    ("register", "source", "name"),
+    [
+        (_complex_query, "query", "value"),
+        (_dict_query_of_a_get_route, "query", "filters"),
+        (_list_of_dicts_query_of_a_get_route, "query", "rows"),
+        (_nested_list_query, "query", "rows"),
+        (_dataclass_query, "query", "point"),
+        (_complex_path, "path", "value"),
+        (_dict_header, "header", "x_filters"),
+        (_complex_cookie, "cookie", "value"),
+        (_dict_form, "form", "filters"),
+        (_str_file, "file", "upload"),
+        (_complex_in_a_dependency, "query", "value"),
+    ],
+)
+def test_a_parameter_type_that_bolt_cannot_convert_stops_registration(register, source, name):
+    """The handler got the text of the request, or the file dict, with no error. Now the route does not register."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError) as error:
+        register(api)
+        # A dependency compiles with the injector of its route.
+        api._register_openapi_routes()
+
+    message = str(error.value)
+    assert f"{source} parameter {name!r}" in message
+    owner = "dependency" if register is _complex_in_a_dependency else "handler"
+    assert f"{register.__name__}.<locals>.{owner} " in message
+
+
+def test_each_parameter_type_that_converts_from_text_registers():
+    """The registration check refuses no type that a text value can give."""
+    api = BoltAPI()
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    @api.get("/scalars/{item_id}")
+    async def scalars(
+        item_id: uuid.UUID,
+        untyped,
+        anything: Any,
+        thing: object,
+        flag: bool,
+        price: decimal.Decimal,
+        day: datetime.date,
+        colors: list[Color],
+        orders: tuple[Literal["asc", "desc"], ...],
+        waits: list[datetime.timedelta],
+        ratio: float | None = None,
+        tags: frozenset[str] = frozenset(),
+    ):
+        return {
+            "item_id": str(item_id),
+            "untyped": untyped,
+            "anything": anything,
+            "thing": thing,
+            "flag": flag,
+            "price": str(price),
+            "day": day.isoformat(),
+            "colors": [color.name for color in colors],
+            "orders": list(orders),
+            "waits": [wait.total_seconds() for wait in waits],
+            "ratio": ratio,
+            "tags": sorted(tags),
+        }
+
+    with TestClient(api) as client:
+        response = client.get(
+            "/scalars/12345678-1234-5678-1234-567812345678?untyped=u&anything=a&thing=t&flag=true&price=1.50"
+            "&day=2026-01-02&colors=red&orders=asc&orders=desc&waits=PT90S&tags=b&tags=a"
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "item_id": "12345678-1234-5678-1234-567812345678",
+            "untyped": "u",
+            "anything": "a",
+            "thing": "t",
+            "flag": True,
+            "price": "1.50",
+            "day": "2026-01-02",
+            "colors": ["RED"],
+            "orders": ["asc", "desc"],
+            "waits": [90.0],
+            "ratio": None,
+            "tags": ["a", "b"],
+        }
+
+
+def test_a_timedelta_parameter_registers_and_converts_and_the_hint_names_it():
+    """A scalar timedelta converts for each text source, so the hint of the error lists it."""
+    api = BoltAPI()
+
+    @api.get("/wait/{pause}")
+    async def wait(
+        pause: datetime.timedelta,
+        timeout: datetime.timedelta,
+        x_ttl: Annotated[datetime.timedelta, Header()],
+        ttl: Annotated[datetime.timedelta, Cookie()],
+        grace: datetime.timedelta | None = None,
+    ):
+        values = {"pause": pause, "timeout": timeout, "x_ttl": x_ttl, "ttl": ttl, "grace": grace}
+        return {name: value.total_seconds() if value is not None else None for name, value in values.items()}
+
+    @api.post("/form")
+    async def form(delay: Annotated[datetime.timedelta, Form()]):
+        return {"delay": delay.total_seconds()}
+
+    with TestClient(api) as client:
+        response = client.get("/wait/PT1S?timeout=PT5S", headers={"x-ttl": "P1D", "cookie": "ttl=PT2M"})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"pause": 1.0, "timeout": 5.0, "x_ttl": 86400.0, "ttl": 120.0, "grace": None}
+        assert client.post("/form", data={"delay": "PT90S"}).json() == {"delay": 90.0}
+        assert client.get("/wait/PT1S?timeout=soon", headers={"x-ttl": "P1D", "cookie": "ttl=PT2M"}).status_code == 422
+
+    with pytest.raises(TypeError) as error:
+        _complex_query(BoltAPI())
+    assert "date, datetime, time, timedelta, an Enum" in str(error.value)
+
+
+def test_a_json_only_parameter_with_no_marker_is_the_json_body():
+    """A list of dicts, a nested list and a TypedDict come only from JSON. `Any` stays a query parameter."""
+    api = BoltAPI()
+
+    @api.post("/rows")
+    async def rows(rows: list[dict]):
+        return {"rows": rows}
+
+    @api.post("/matrix")
+    async def matrix(matrix: list[list[int]]):
+        return {"matrix": matrix}
+
+    @api.post("/typed")
+    async def typed(counts: Counts, page: int = 1):
+        return {"counts": counts, "page": page}
+
+    @api.post("/any")
+    async def anything(value: Any):
+        return {"value": value}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.post("/rows", json=[{"a": 1}, {"b": [2]}])
+        assert response.status_code == 200, response.text
+        assert response.json() == {"rows": [{"a": 1}, {"b": [2]}]}
+        # A JSON object is not a list.
+        assert client.post("/rows", json={"a": 1}).status_code == 422
+
+        assert client.post("/matrix", json=[[1, 2], [3]]).json() == {"matrix": [[1, 2], [3]]}
+        assert client.post("/typed?page=2", json={"total": 3}).json() == {"counts": {"total": 3}, "page": 2}
+        assert client.post("/typed", json={"total": "x"}).status_code == 422
+
+        assert client.post("/any?value=x", json={"a": 1}).json() == {"value": "x"}
+
+        operations = client.get("/docs/openapi.json").json()["paths"]
+        rows_schema = operations["/rows"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        assert rows_schema == {"type": "array", "items": {"type": "object"}}
+        assert "parameters" not in operations["/rows"]["post"]
+        assert [parameter["name"] for parameter in operations["/any"]["post"]["parameters"]] == ["value"]
+        assert "requestBody" not in operations["/any"]["post"]
 
 
 class TestMsgspecStructValidation:

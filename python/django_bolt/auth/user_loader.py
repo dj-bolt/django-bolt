@@ -104,7 +104,8 @@ class LazyUser(SimpleLazyObject):
             self._setup()
         user = self._wrapped
         if user is None:
-            raise Unauthorized(detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
+            # Rust adds the challenge of the auth backends of the route to this 401.
+            raise Unauthorized(detail="Authentication required")
         return getattr(user, name)
 
     def __repr__(self) -> str:

@@ -27,7 +27,7 @@ from django.db.models import AutoField, Model, ObjectDoesNotExist, QuerySet
 
 from ._kwargs.extractors import create_body_extractor
 from ._view_context import _current_action, _current_request
-from .exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
+from .exceptions import HTTPException
 from .pagination import PaginationBase
 from .request import Request
 from .serializers.base import Serializer
@@ -51,6 +51,37 @@ def _copy_route_middleware(source: Callable, target: Callable) -> None:
         target.__bolt_skip_middleware__ = set(source.__bolt_skip_middleware__)
 
 
+_REQUEST_PARAM_NAMES = frozenset({"request", "req"})
+
+
+def _plan_request_argument(
+    params: list[inspect.Parameter],
+) -> tuple[list[inspect.Parameter], int | None, str | None, int]:
+    """Find where the handler of a view method gets the request.
+
+    Bolt passes the request to the parameter with the name ``request`` or
+    ``req``. A method with no such parameter gets one in the handler signature,
+    in front. The handler reads it for ``self.request`` and does not pass it on.
+
+    Returns:
+        The handler parameters, the positional index of the request (or None),
+        the keyword name of the request (or None), and the number of leading
+        arguments that the method does not take.
+    """
+    for index, param in enumerate(params):
+        if param.name in _REQUEST_PARAM_NAMES:
+            if param.kind is inspect.Parameter.KEYWORD_ONLY:
+                return params, None, param.name, 0
+            return params, index, None, 0
+
+    kind = (
+        inspect.Parameter.POSITIONAL_ONLY
+        if params and params[0].kind is inspect.Parameter.POSITIONAL_ONLY
+        else inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    return [inspect.Parameter("request", kind), *params], 0, None, 1
+
+
 # PATCH takes a JSON object with a subset of the serializer fields. The body
 # extractor of the framework gives the 422 of a function route for other input.
 _decode_patch_body = create_body_extractor("body", dict[str, Any])
@@ -59,15 +90,10 @@ _decode_patch_body = create_body_extractor("body", dict[str, Any])
 def _validate_json_body[S: Serializer](serializer_class: type[S], body: bytes) -> S:
     """Validate the request body of a write action as ``serializer_class``.
 
-    A body that is not JSON gives the 422 of a function route (``json_invalid``).
+    The body extractor of the framework decodes it. Thus a bad body gives the
+    422 of a function route with the same body type.
     """
-    try:
-        return serializer_class.model_validate_json(body)
-    except msgspec.ValidationError:
-        # ValidationError is a subclass of DecodeError. The error handler makes its 422.
-        raise
-    except msgspec.DecodeError as e:
-        raise RequestValidationError(errors=[parse_msgspec_decode_error(e, body)], body=body) from e
+    return create_body_extractor("body", serializer_class)(body)
 
 
 @cache
@@ -185,6 +211,10 @@ class APIView:
         sig = inspect.signature(method_handler)
         params = list(sig.parameters.values())[1:]  # Skip 'self' parameter
 
+        # Decide one time where the request is. A method with no request
+        # parameter gets one in the handler signature, for `self.request`.
+        params, request_index, request_name, skip = _plan_request_argument(params)
+
         # Build new signature without 'self'
         new_sig = sig.replace(parameters=params)
 
@@ -203,16 +233,16 @@ class APIView:
             async def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated async view handler that calls bound method directly."""
                 _current_action.set(_action)
-                _current_request.set(args[0])
-                return await bound_method(*args, **kwargs)
+                _current_request.set(args[request_index] if request_name is None else kwargs[request_name])
+                return await bound_method(*args[skip:], **kwargs)
 
         else:
             # Create sync wrapper for sync methods
             def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated sync view handler that calls bound method directly."""
                 _current_action.set(_action)
-                _current_request.set(args[0])
-                return bound_method(*args, **kwargs)
+                _current_request.set(args[request_index] if request_name is None else kwargs[request_name])
+                return bound_method(*args[skip:], **kwargs)
 
         view_handler.__wrapped__ = method_handler
 
@@ -754,10 +784,13 @@ class PartialUpdateMixin(_ViewSet):
         if not patch_data:
             return obj
 
+        # msgspec reads the wire names, so the merged data uses them.
         current_state = await serializer_class.afrom_model(obj)
-        merged_data = current_state.to_dict()
-        merged_data.update(patch_data)
-        validated_obj = serializer_class.model_validate(merged_data)
+        merged_data = {rename_map.get(name, name): value for name, value in current_state.to_dict().items()}
+        for field_name, value in patch_data.items():
+            merged_data[rename_map.get(field_name, field_name)] = value
+        # The error handler makes the 422 of a function route from the error of msgspec.
+        validated_obj = msgspec.convert(merged_data, type=serializer_class)
 
         # Apply only the patched fields, but use the validated values.
         for field_name in patch_data:

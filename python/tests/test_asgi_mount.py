@@ -230,6 +230,40 @@ def test_mount_asgi_longest_prefix_wins():
         assert response.json() == {"source": "long"}
 
 
+@pytest.mark.parametrize(
+    ("child_mount", "url", "root_path"),
+    [("/legacy", "/v2/legacy/page", "/v2/legacy"), ("/", "/v2/page", "/v2")],
+)
+def test_mount_copies_the_asgi_mounts_of_the_mounted_api(child_mount, url, root_path):
+    """An ASGI mount of a mounted API answers below the mount path of that API."""
+    parent = BoltAPI()
+    child = BoltAPI()
+
+    async def asgi_app(scope, receive, send):
+        await receive()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        body = json.dumps({"root_path": scope["root_path"]}).encode()
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    child.mount_asgi(child_mount, asgi_app)
+    parent.mount("/v2", child)
+
+    with TestClient(parent) as client:
+        response = client.get(url)
+        assert response.status_code == 200
+        assert response.json() == {"root_path": root_path}
+
+    # The parent knows the copied prefix, so a second mount there is an error.
+    with pytest.raises(ValueError, match="Duplicate ASGI mount prefix"):
+        parent.mount_asgi(root_path, asgi_app)
+
+
 def test_mount_asgi_chunked_response_body_is_combined():
     api = BoltAPI()
 

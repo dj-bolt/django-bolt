@@ -67,6 +67,32 @@ fn is_client_gone(error: &PyErr) -> bool {
     })
 }
 
+/// The close that a handler asks for with a raised `WebSocketException`.
+///
+/// `WebSocketDisconnect` is a subclass, but it reports that the client left.
+/// It asks for no close.
+fn requested_close(error: &PyErr) -> Option<(u16, String)> {
+    Python::attach(|py| {
+        let module = py.import("django_bolt.websocket").ok()?;
+        let exception = module.getattr("WebSocketException").ok()?;
+        if !error.is_instance(py, &exception)
+            || error.is_instance(py, get_disconnect_class(py).ok()?.bind(py))
+        {
+            return None;
+        }
+        let value = error.value(py);
+        let code: u16 = value.getattr("code").ok()?.extract().ok()?;
+        let reason: String = value.getattr("reason").ok()?.extract().ok()?;
+        // The last defense. `WebSocketException` checks its code and reason when
+        // the handler makes it. Attributes that make an invalid close frame are
+        // an error of the handler, which closes with 1011.
+        if !is_close_frame_code(code) || reason.len() > MAX_CLOSE_REASON_BYTES {
+            return None;
+        }
+        Some((code, reason))
+    })
+}
+
 /// The error of a send to a client that left. ASGI requires an `OSError`.
 fn client_gone() -> PyErr {
     pyo3::exceptions::PyConnectionResetError::new_err("WebSocket client disconnected")
@@ -500,9 +526,11 @@ const MAX_CLOSE_REASON_BYTES: usize = 123;
 
 /// Whether an endpoint can send this code in a close frame.
 ///
-/// RFC 6455 7.4.1: 1005, 1006 and 1015 are never in a close frame.
+/// RFC 6455 7.4.1: 1004 is reserved, and 1005, 1006 and 1015 are never in a
+/// close frame. RFC 6455 7.4.2: 1016 to 2999 are reserved for the protocol and
+/// its extensions. The `websockets` library accepts the same codes.
 fn is_close_frame_code(code: u16) -> bool {
-    (1000..=4999).contains(&code) && !matches!(code, 1005 | 1006 | 1015)
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 /// Create Python send function that sends to actor
@@ -607,13 +635,15 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                             .filter(|code| is_close_frame_code(*code))
                             .ok_or_else(|| {
                                 pyo3::exceptions::PyValueError::new_err(format!(
-                                    "WebSocket close code {} is not valid: use 1000 to 4999, but not 1005, 1006 or 1015",
+                                    "WebSocket close code {} is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999",
                                     value
                                 ))
                             })?,
                     };
+                    // The ASGI specification permits None for the reason.
                     let reason: String = message
                         .get_item("reason")?
+                        .filter(|v| !v.is_none())
                         .map(|v| v.extract())
                         .transpose()?
                         .unwrap_or_default();
@@ -961,7 +991,8 @@ fn refusal(status: StatusCode) -> HttpResponse {
 /// The handler decides the handshake. If it ends without a decision, the
 /// upgrade gets 403 on return and 500 on error, as in uvicorn. If it ends
 /// after accept with no close, the connection gets a close frame: 1000 on
-/// return and 1011 on error.
+/// return and 1011 on error. A raised `WebSocketException` gives 403 before
+/// accept, and a close frame with its code and reason after accept.
 fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsTarget) {
     actix_web::rt::spawn(async move {
         // Wrap the entire handler execution in catch_unwind to handle panics
@@ -1043,6 +1074,13 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
                     close_accepted(&ws_state, 1000, "").await;
                 }
                 Some(e) => {
+                    // A raised WebSocketException is the close of the handler,
+                    // as in Starlette: 403 before accept, its code and reason after.
+                    if let Some((code, reason)) = requested_close(&e) {
+                        ws_state.refuse(StatusCode::FORBIDDEN);
+                        close_accepted(&ws_state, code, &reason).await;
+                        return;
+                    }
                     // A client that left is not an error of the handler.
                     if !is_client_gone(&e) {
                         eprintln!("[django-bolt] WebSocket handler error: {}", e);
@@ -1083,11 +1121,11 @@ mod tests {
     use super::{is_close_frame_code, requested_subprotocols};
 
     #[test]
-    fn close_frame_codes_are_1000_to_4999_without_the_reserved_three() {
-        for code in [1000, 1001, 1004, 1007, 1011, 1014, 1016, 3000, 4999] {
+    fn close_frame_codes_are_the_defined_and_the_private_codes() {
+        for code in [1000, 1001, 1003, 1007, 1011, 1014, 3000, 4999] {
             assert!(is_close_frame_code(code), "{code}");
         }
-        for code in [0, 999, 1005, 1006, 1015, 5000, u16::MAX] {
+        for code in [0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, u16::MAX] {
             assert!(!is_close_frame_code(code), "{code}");
         }
     }

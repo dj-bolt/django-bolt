@@ -220,6 +220,21 @@ async def paint(color: Color, order: Literal["asc", "desc"] = "asc"):
 An `IntEnum` or a `Literal` of numbers converts the text to a number first.
 This applies to path, query, header, cookie and form parameters.
 
+### Durations
+
+A `datetime.timedelta` parameter takes an ISO 8601 duration, such as `PT5S` or `P1DT2H`. It also takes a number of seconds, such as `90`:
+
+```python
+import datetime
+
+@api.get("/wait")
+async def wait(timeout: datetime.timedelta):
+    return {"seconds": timeout.total_seconds()}
+```
+
+`/wait?timeout=PT5S` gives `timedelta(seconds=5)`. Text that is not a duration gives a 422.
+This applies to path, query, header, cookie and form parameters.
+
 ### bytes parameters
 
 A `bytes` parameter gets the UTF-8 bytes of the text value:
@@ -237,7 +252,18 @@ A `msgspec.Meta` constraint such as `max_length` counts the bytes.
 
 A `bytes` field of a [parameter model](#parameter-models) follows the same rule. The model can be a `Query()`, `Form()`, `Header()` or `Cookie()` model.
 
-A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64.
+A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64. The OpenAPI document shows this difference. A `bytes` parameter, form field or field of a parameter model is `{"type": "string"}`. A `bytes` field of a JSON body is `{"type": "string", "contentEncoding": "base64"}`.
+
+### Types that Bolt cannot convert
+
+A path, query, header, cookie or form parameter gets text from the request.
+Bolt converts the text to `str`, `int`, `float`, `bool`, `Decimal`, `UUID`, `date`, `datetime`, `time`, `timedelta`, an `Enum` and a `Literal`.
+It also builds one `list`, `set`, `frozenset` or `tuple` of these types.
+A parameter with no annotation, or of the type `Any`, gets the text.
+
+Text cannot give each other type, for example `complex`, `dict`, a dataclass or your own class.
+A parameter of such a type stops the registration with a `TypeError`. The error names the handler, the parameter and the type.
+A `File()` parameter takes `UploadFile`, `bytes`, `dict`, or a list of one of them. Each other type gets the same error.
 
 ## Request body
 
@@ -276,6 +302,36 @@ async def search(filters: CreateUser | None = None):
 
 A request with no body then gives the default. A body that is present must be valid JSON of the type.
 
+### Body options
+
+`Body()` marks a parameter as the JSON body and takes options:
+
+```python
+from typing import Annotated
+from django_bolt.params import Body
+
+@api.post("/items")
+async def create_item(
+    item: Annotated[CreateUser, Body(embed=True, description="The new item", example={"username": "ana"})],
+):
+    return {"username": item.username}
+
+@api.post("/counters")
+async def set_counter(count: Annotated[int, Body(embed=True, alias="item-count")] = 0):
+    return {"count": count}
+```
+
+| Option | Effect |
+|--------|--------|
+| `embed=True` | The body is a JSON object, and the value is at the key of the parameter name. `/items` reads `{"item": {"username": "ana"}}`. Bolt does not read the other keys of the object. |
+| `alias` | The key name with `embed=True`. `/counters` reads `{"item-count": 3}`. Without `embed`, `alias` has no effect. |
+| `default` | The value for a request with no body. With `embed=True`, it is also the value for an object that does not have the key. Set it with `=`, or as the first argument of `Body()`. |
+| `description` | The description of the request body in the OpenAPI document. |
+| `example` | The example of the request body in the OpenAPI document. |
+
+With `embed=True`, a body that is not a JSON object, or that does not have the key of a required parameter, gets a 422.
+The OpenAPI document shows the wrapper object. `Form(description=..., example=...)` documents a form field in the same way.
+
 ### Raw body access
 
 Access the raw body bytes:
@@ -286,6 +342,27 @@ async def raw_body(request):
     body = request.get("body", b"")
     return {"size": len(body)}
 ```
+
+### JSON object without a schema
+
+A `dict` parameter reads a JSON object that has no fixed fields. The route must be a `POST`, `PUT` or `PATCH` route:
+
+```python
+@api.post("/events")
+async def create_event(payload: dict):
+    return {"keys": sorted(payload)}
+
+@api.put("/counters")
+async def set_counters(counters: dict[str, int]):
+    return {"total": sum(counters.values())}
+```
+
+A `dict[K, V]` type validates the keys and the values. A body that is not a JSON object gets a 422.
+
+Each other type that only JSON can give is the body too. Examples are `list[dict]`, `list[list[int]]` and a `TypedDict`.
+A parameter of the type `Any` stays a query parameter. Use `Body()` to read an `Any` value from the body.
+
+A `GET`, `HEAD`, `DELETE` or `OPTIONS` request has no body. On such a route, a parameter of one of these types stops the registration with a `TypeError`.
 
 ## Headers
 
@@ -585,6 +662,8 @@ class SessionCookies(msgspec.Struct):
 async def get_preferences(cookies: Annotated[SessionCookies, Cookie()]):
     return {"theme": cookies.theme, "language": cookies.language}
 ```
+
+The OpenAPI document shows a query, header or cookie model as one parameter for each field. The name of each parameter is the name that Bolt reads. For a header field, that name is in lower case with `-` for each `_`, for example `x-api-key`.
 
 ### Optional models
 

@@ -51,6 +51,21 @@ async def code_1006(websocket: WebSocket):
     await _close_and_report(websocket, 1006, "")
 
 
+@api.websocket("/ws/code-1004")
+async def code_1004(websocket: WebSocket):
+    await _close_and_report(websocket, 1004, "")
+
+
+@api.websocket("/ws/code-1016")
+async def code_1016(websocket: WebSocket):
+    await _close_and_report(websocket, 1016, "")
+
+
+@api.websocket("/ws/code-1014")
+async def code_1014(websocket: WebSocket):
+    await _close_and_report(websocket, 1014, "")
+
+
 async def raw_close_app(scope, receive, send):
     """Send the close message of the path with no ``WebSocket`` wrapper."""
     await receive()
@@ -58,6 +73,9 @@ async def raw_close_app(scope, receive, send):
     closes = {
         "/raw/reason-200-bytes": {"code": 1000, "reason": "x" * 200},
         "/raw/code-70000": {"code": 70000},
+        "/raw/code-2999": {"code": 2999},
+        # The ASGI specification permits None for the reason.
+        "/raw/reason-none": {"code": 4001, "reason": None},
     }
     try:
         await send({"type": "websocket.close", **closes[scope["path"]]})

@@ -26,6 +26,7 @@ from ..responses import (
     Redirect,
     StreamingResponse,
 )
+from ..serializers.base import Serializer
 from ..serializers.fields import FieldConfig, _FieldMarker
 from ..typing import is_msgspec_struct, is_optional, resolve_type_alias, unwrap_optional
 from ..views import _layer
@@ -380,6 +381,8 @@ class SchemaGenerator:
         schema = self._type_to_schema(annotation, null_arm=False)
         if isinstance(schema, Schema) and marker and marker.description:
             schema = replace(schema, description=marker.description)
+        if isinstance(schema, Schema) and marker and marker.example is not None:
+            schema = replace(schema, examples=[marker.example])
         if default not in (inspect.Parameter.empty, None):
             schema = self._with_default(schema, default)
         return schema
@@ -394,6 +397,28 @@ class SchemaGenerator:
         if schema.type == "array" and schema.items is not None:
             return replace(schema, items=cls._file_part_schema(schema.items))
         return schema
+
+    @classmethod
+    def _text_value_schema(cls, schema: Schema | Reference) -> Schema | Reference:
+        """The schema of a value that the request gives as text.
+
+        A path, query, header, cookie or form value of the type ``bytes`` is the
+        UTF-8 bytes of the text. Only a JSON body holds bytes as base64 text.
+        """
+        if not isinstance(schema, Schema):
+            return schema
+        changes: dict[str, Any] = {}
+        if schema.content_encoding == "base64":
+            changes["content_encoding"] = None
+        if schema.items is not None:
+            changes["items"] = cls._text_value_schema(schema.items)
+        for name in ("any_of", "one_of", "all_of", "prefix_items"):
+            members = getattr(schema, name)
+            if members:
+                changes[name] = [cls._text_value_schema(member) for member in members]
+        if schema.properties:
+            changes["properties"] = {key: cls._text_value_schema(value) for key, value in schema.properties.items()}
+        return replace(schema, **changes) if changes else schema
 
     @staticmethod
     def _enum_values_schema(values: list[Any] | tuple[Any, ...]) -> Schema:
@@ -553,17 +578,33 @@ class SchemaGenerator:
         return Schema(all_of=[schema], **options)
 
     @staticmethod
-    def _field_in_schema(field: Any) -> bool:
+    def _field_configs(struct_type: Any) -> dict[str, FieldConfig]:
+        """Give the ``field()`` config of each field of a Serializer class, by field name.
+
+        The class keeps one config map for a field with a default and for a required field.
+        A struct that is not a Serializer has no config.
+        """
+        if not (isinstance(struct_type, type) and issubclass(struct_type, Serializer)):
+            return {}
+        struct_type._ensure_dump_ready()
+        return struct_type.__field_configs__
+
+    @staticmethod
+    def _field_in_schema(config: FieldConfig | None) -> bool:
         """False for a Serializer field with ``field(include_in_schema=False)``."""
-        default = field.default
-        return not isinstance(default, _FieldMarker) or default.config.include_in_schema
+        return config is None or config.include_in_schema
 
     def _msgspec_field_schema(
-        self, field: Any, *, register_component: bool = False
+        self, field: Any, config: FieldConfig | None = None, *, register_component: bool = False
     ) -> tuple[str, Schema | Reference, bool]:
-        """Build a schema and required flag for a msgspec-inspected field."""
+        """Build a schema and required flag for a msgspec-inspected field.
+
+        ``config`` is the ``field()`` config of a Serializer field, or None.
+        """
         field_name = field.encode_name
         field_schema = self._type_to_schema(field.type, register_component=register_component)
+        if config is not None:
+            field_schema = self._with_field_options(field_schema, config)
 
         default = field.default
         has_default = default is not msgspec.NODEFAULT
@@ -573,7 +614,6 @@ class SchemaGenerator:
         # the default, so field.required is False even when the marker carries
         # only config and no real default.
         if isinstance(default, _FieldMarker):
-            field_schema = self._with_field_options(field_schema, default.config)
             if default.config.has_default():
                 default = default.config.get_default()
             else:
@@ -994,17 +1034,28 @@ class SchemaGenerator:
                 or (default == inspect.Parameter.empty and not is_optional(annotation))
             )
 
-            # Handle msgspec.Struct in query parameters
-            if source == "query" and is_msgspec_struct(annotation):
+            # A query, header or cookie model is one parameter for each field.
+            if is_msgspec_struct(annotation):
                 struct_info = msgspec.inspect.type_info(annotation)
+                field_configs = self._field_configs(annotation)
                 for struct_field in struct_info.fields:
-                    if not self._field_in_schema(struct_field):
+                    field_config = field_configs.get(struct_field.name)
+                    if not self._field_in_schema(field_config):
                         continue
-                    field_name, field_schema, field_required = self._msgspec_field_schema(struct_field)
+                    field_name, field_schema, field_required = self._msgspec_field_schema(struct_field, field_config)
+                    field_schema = self._text_value_schema(field_schema)
+                    if source == "header":
+                        # Bolt reads the x_request_id field from the x-request-id header.
+                        field_name = field_name.lower().replace("_", "-")
+                    if source != "query" and isinstance(field_schema, Schema) and field_schema.type == "array":
+                        # A header or a cookie gives one value, so its array holds exactly one item.
+                        # An empty default must stay valid for the schema, so it sets no minimum.
+                        min_items = None if field_schema.default == [] else 1
+                        field_schema = replace(field_schema, min_items=min_items, max_items=1)
                     parameters.append(
                         Parameter(
                             name=field_name,
-                            param_in="query",
+                            param_in=param_in,
                             required=field_required,
                             schema=field_schema,
                             description=f"Parameter {field_name}",
@@ -1013,7 +1064,7 @@ class SchemaGenerator:
                 continue
 
             # Get schema for parameter type
-            schema = self._type_to_schema(annotation, null_arm=False)
+            schema = self._text_value_schema(self._type_to_schema(annotation, null_arm=False))
             # A path, a header or a cookie gives one value, so its array holds exactly one item.
             if param_in != "query" and isinstance(schema, Schema) and schema.type == "array":
                 # An empty default must stay valid for the schema, so it sets no minimum.
@@ -1068,6 +1119,12 @@ class SchemaGenerator:
         body_param = meta.get("body_struct_param")
         body_type = meta.get("body_struct_type")
         fields = self._route_fields(meta)
+        # The Body() marker of the handler gives the description and the example.
+        body_field = next((f for f in fields if f.source == "body"), None)
+        marker = body_field.param if body_field is not None else None
+
+        if body_field is not None and body_field.embed:
+            return self._embedded_request_body(body_field)
 
         if not body_param or not body_type:
             # A dependency can read the JSON body.
@@ -1083,6 +1140,12 @@ class SchemaGenerator:
             body_field = next((f for f in fields if f.source == "body"), None)
             if body_field is not None:
                 body_param, body_type, body_required = body_field.name, body_field.annotation, body_field.is_required
+
+        if not body_param or not body_type:
+            # A JSON body of another type, such as a dict.
+            plain_body = next((f for f in fields if f.source == "body"), None)
+            if plain_body is not None:
+                body_param, body_type = plain_body.name, plain_body.annotation
 
         if not body_param or not body_type:
             # Check for form/file fields
@@ -1105,13 +1168,15 @@ class SchemaGenerator:
                     # UploadFile branch in _type_to_schema fires for file fields.
                     unwrapped = unwrap_optional(annotation)
                     if is_msgspec_struct(unwrapped):
+                        field_configs = self._field_configs(unwrapped)
                         for struct_field in msgspec.structs.fields(unwrapped):
-                            if not self._field_in_schema(struct_field):
+                            field_config = field_configs.get(struct_field.name)
+                            if not self._field_in_schema(field_config):
                                 continue
                             sub_name, sub_schema, sub_required = self._msgspec_field_schema(
-                                struct_field, register_component=False
+                                struct_field, field_config, register_component=False
                             )
-                            properties[sub_name] = sub_schema
+                            properties[sub_name] = self._text_value_schema(sub_schema)
                             if sub_required:
                                 required.append(sub_name)
                         continue
@@ -1119,6 +1184,8 @@ class SchemaGenerator:
                     field_schema = self._form_field_schema(annotation, field.param, default)
                     if field.source == "file":
                         field_schema = self._file_part_schema(field_schema)
+                    else:
+                        field_schema = self._text_value_schema(field_schema)
                     properties[name] = field_schema
                     if default == inspect.Parameter.empty and not is_optional(annotation):
                         required.append(name)
@@ -1144,14 +1211,69 @@ class SchemaGenerator:
             schema = self._type_to_schema(body_type, register_component=True)
         finally:
             self._input_schema = False
+        if body_field is None or body_field.name != body_param:
+            # The body comes from a dependency or from a ViewSet action.
+            marker = None
 
         return RequestBody(
-            description=f"Request body for {body_param}",
+            description=marker.description if marker and marker.description else f"Request body for {body_param}",
             content={
-                "application/json": OpenAPIMediaType(schema=schema),
+                "application/json": OpenAPIMediaType(schema=schema, example=marker.example if marker else None),
             },
             required=body_required,
         )
+
+    def _embedded_request_body(self, field: Any) -> RequestBody:
+        """The request body of a ``Body(embed=True)`` parameter: a JSON object with the value at one key."""
+        marker = field.param
+        key = field.alias or field.name
+        schema = self._type_to_schema(field.annotation, register_component=True)
+        has_default = field.default is not inspect.Parameter.empty
+        if has_default and field.default is not None:
+            schema = self._with_default(schema, field.default)
+        required = not has_default and not is_optional(field.annotation)
+        wrapper = Schema(type="object", properties={key: schema}, required=[key] if required else None)
+        example = {key: marker.example} if marker.example is not None else None
+        return RequestBody(
+            description=marker.description or f"Request body for {field.name}",
+            content={"application/json": OpenAPIMediaType(schema=wrapper, example=example)},
+            required=required,
+        )
+
+    def _response_type_content(self, response_type: Any) -> dict[str, OpenAPIMediaType]:
+        """Return the content of a response type, by the media type of each result.
+
+        Bolt sends a ``str`` result as text/plain and a ``bytes`` result as
+        application/octet-stream. Each other result is JSON. Thus ``str | None``
+        has a text/plain string and an application/json null.
+        """
+        arms = get_args(response_type) if get_origin(response_type) in (Union, UnionType) else (response_type,)
+        json_arms = [arm for arm in arms if arm not in (str, bytes, bytearray)]
+        if len(json_arms) == len(arms):
+            schema = self._type_to_schema(response_type, register_component=True)
+            examples = _build_union_examples(response_type)
+            return {"application/json": OpenAPIMediaType(schema=schema, examples=examples)}
+
+        content: dict[str, OpenAPIMediaType] = {}
+        if str in arms:
+            content[_STR_MEDIA[0]] = OpenAPIMediaType(schema=_STR_MEDIA[1])
+        if bytes in arms or bytearray in arms:
+            content[_BYTES_MEDIA[0]] = OpenAPIMediaType(schema=_BYTES_MEDIA[1])
+        if not json_arms:
+            return content
+        # The JSON results: the type with no str arm and no bytes arm.
+        json_type = json_arms[0]
+        for arm in json_arms[1:]:
+            json_type = json_type | arm
+        if len(json_arms) == 2 and type(None) in json_arms:
+            # A None result is the JSON null, so T | None keeps its null arm.
+            value_type = json_arms[0] if json_arms[1] is type(None) else json_arms[1]
+            value_schema = self._type_to_schema(value_type, register_component=True)
+            schema = self._union_schema([value_schema], has_none=True, tagged=False)
+        else:
+            schema = self._type_to_schema(json_type, register_component=True)
+        content["application/json"] = OpenAPIMediaType(schema=schema, examples=_build_union_examples(json_type))
+        return content
 
     def _extract_responses(
         self, meta: dict[str, Any], handler_id: int, *, method: str = "", path: str = ""
@@ -1176,15 +1298,9 @@ class SchemaGenerator:
                 if resp_type is None:
                     responses[str(code)] = OpenAPIResponse(description=desc)
                 else:
-                    schema = self._type_to_schema(resp_type, register_component=True)
                     responses[str(code)] = OpenAPIResponse(
                         description=desc,
-                        content={
-                            "application/json": OpenAPIMediaType(
-                                schema=schema,
-                                examples=_build_union_examples(resp_type),
-                            )
-                        },
+                        content=self._response_type_content(resp_type),
                     )
             # Ellipsis catch-all → OpenAPI "default" response
             if ... in response_map:
@@ -1192,15 +1308,9 @@ class SchemaGenerator:
                 if ellipsis_type is None:
                     responses["default"] = OpenAPIResponse(description="Default response")
                 else:
-                    schema = self._type_to_schema(ellipsis_type, register_component=True)
                     responses["default"] = OpenAPIResponse(
                         description="Default response",
-                        content={
-                            "application/json": OpenAPIMediaType(
-                                schema=schema,
-                                examples=_build_union_examples(ellipsis_type),
-                            )
-                        },
+                        content=self._response_type_content(ellipsis_type),
                     )
             # fall through to error response logic below
         else:
@@ -1237,16 +1347,9 @@ class SchemaGenerator:
                     content={media_type: OpenAPIMediaType(schema=body_schema)},
                 )
             elif has_type:
-                schema = self._type_to_schema(response_type, register_component=True)
-
                 responses[str(default_status)] = OpenAPIResponse(
                     description="Successful response",
-                    content={
-                        "application/json": OpenAPIMediaType(
-                            schema=schema,
-                            examples=_build_union_examples(response_type),
-                        ),
-                    },
+                    content=self._response_type_content(response_type),
                 )
             else:
                 # Opaque JSON: nothing to type. Recorded for strict mode.
@@ -1695,15 +1798,16 @@ class SchemaGenerator:
         required = []
 
         read_only = self._read_only_fields(struct_type)
-
+        field_configs = self._field_configs(struct_type)
         for field in struct_info.fields:
-            if not self._field_in_schema(field):
+            field_config = field_configs.get(field.name)
+            if not self._field_in_schema(field_config):
                 continue
             is_read_only = field.name in read_only
             if is_read_only and self._input_schema:
                 continue
             field_name, field_schema, field_required = self._msgspec_field_schema(
-                field, register_component=register_component
+                field, field_config, register_component=register_component
             )
             properties[field_name] = self._mark_read_only(field_schema) if is_read_only else field_schema
 

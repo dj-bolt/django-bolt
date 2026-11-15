@@ -21,13 +21,13 @@ import jwt
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Request, action
 from django_bolt.auth.backends import JWTAuthentication
 from django_bolt.auth.guards import IsAuthenticated, Requires
 from django_bolt.exceptions import HTTPException
 from django_bolt.params import Depends
 from django_bolt.testing import TestClient
-from django_bolt.views import APIView
+from django_bolt.views import APIView, ViewSet
 
 # --- Test Fixtures ---
 
@@ -191,6 +191,65 @@ def test_bolt_api_view_dependency_injection():
 
 
 # --- Guards and Authentication Tests ---
+
+
+def test_view_method_gets_the_request_at_each_position():
+    """`self.request` is the request for each position of the request parameter, and with none."""
+    api = BoltAPI()
+
+    @api.view("/no-request")
+    class NoRequestView(APIView):
+        async def get(self):
+            return {"path": self.request.path}
+
+        def post(self, name: str):
+            return {"path": self.request.path, "name": name}
+
+    @api.view("/users/{user_id}")
+    class RequestLastView(APIView):
+        async def get(self, user_id: int, request: Request):
+            return {"user_id": user_id, "same": self.request is request, "path": self.request.path}
+
+        def put(self, user_id: int, *, req: Request):
+            return {"user_id": user_id, "same": self.request is req}
+
+    @api.viewset("/items")
+    class ItemViewSet(ViewSet):
+        async def list(self):
+            return [self.request.path, self.action]
+
+        @action(methods=["GET"], detail=False)
+        async def count(self):
+            return {"path": self.request.path, "action": self.action}
+
+        @action(methods=["GET"], detail=True)
+        def owner(self, pk: int, request: Request):
+            return {"pk": pk, "same": self.request is request}
+
+    with TestClient(api) as client:
+        response = client.get("/no-request")
+        assert response.status_code == 200
+        assert response.json() == {"path": "/no-request"}
+        response = client.post("/no-request?name=a")
+        assert response.status_code == 200
+        assert response.json() == {"path": "/no-request", "name": "a"}
+
+        response = client.get("/users/7")
+        assert response.status_code == 200
+        assert response.json() == {"user_id": 7, "same": True, "path": "/users/7"}
+        response = client.put("/users/7")
+        assert response.status_code == 200
+        assert response.json() == {"user_id": 7, "same": True}
+
+        response = client.get("/items")
+        assert response.status_code == 200
+        assert response.json() == ["/items", "list"]
+        response = client.get("/items/count")
+        assert response.status_code == 200
+        assert response.json() == {"path": "/items/count", "action": "count"}
+        response = client.get("/items/3/owner")
+        assert response.status_code == 200
+        assert response.json() == {"pk": 3, "same": True}
 
 
 def test_bolt_api_view_class_level_guards():

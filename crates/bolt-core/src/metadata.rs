@@ -150,8 +150,14 @@ impl Default for CorsConfig {
 
 /// Compile the origin patterns of a CORS config. `name` is the setting or the
 /// option that holds them. A pattern that does not compile is an error: a
-/// dropped pattern changes which origins the server allows.
+/// dropped pattern changes which origins the server allows. An empty pattern
+/// is an error: it matches every origin.
 fn compile_origin_regexes(name: &str, patterns: &[String]) -> Result<Vec<Regex>, String> {
+    if patterns.iter().any(String::is_empty) {
+        return Err(format!(
+            "{name} holds an empty pattern, which matches every origin"
+        ));
+    }
     patterns
         .iter()
         .map(|pattern| {
@@ -210,9 +216,9 @@ impl CorsConfig {
 
     /// Create CorsConfig from Django settings (django-cors-headers compatible).
     ///
-    /// An origin pattern that does not compile, or a method or header name
-    /// that cannot be in an HTTP header, gives `Err` with a message that names
-    /// the setting and the value.
+    /// An origin pattern that is empty or does not compile, or a method or
+    /// header name that cannot be in an HTTP header, gives `Err` with a
+    /// message that names the setting and the value.
     #[expect(
         clippy::too_many_arguments,
         reason = "one argument for each django-cors-headers setting"
@@ -1057,12 +1063,6 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<
 
     // Parse origin_regexes and compile them at startup
     if let Some(regex_patterns) = cors_str_list(dict, py, "origin_regexes")? {
-        // An empty pattern matches every origin.
-        if regex_patterns.iter().any(String::is_empty) {
-            return Err(PyValueError::new_err(
-                "cors origin_regexes holds an empty pattern, which matches every origin",
-            ));
-        }
         config.compiled_origin_regexes =
             compile_origin_regexes("cors origin_regexes", &regex_patterns)
                 .map_err(PyValueError::new_err)?;
@@ -1967,6 +1967,10 @@ mod tests {
             (
                 settings(&["^ok$", "(unclosed"], &["GET"], &["X-A"], &[]),
                 r#"CORS_ALLOWED_ORIGIN_REGEXES holds a pattern that is not a valid regex: "(unclosed""#,
+            ),
+            (
+                settings(&["^ok$", ""], &["GET"], &["X-A"], &[]),
+                "CORS_ALLOWED_ORIGIN_REGEXES holds an empty pattern, which matches every origin",
             ),
             (
                 settings(&[], &["GET", "PO\nST"], &["X-A"], &[]),

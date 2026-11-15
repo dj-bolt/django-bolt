@@ -365,6 +365,45 @@ def test_problem_details_errors_stay_a_list_of_field_errors():
     msgspec.convert(body, ProblemDetails)
 
 
+@pytest.mark.parametrize(
+    ("detail", "extra", "members"),
+    [
+        # The keys of a dict detail are extension members, as the keys of the extra are.
+        ({"code": "out_of_stock", "items": [3, 7]}, None, {"code": "out_of_stock", "items": [3, 7]}),
+        # A list detail is the "extra" member, as an extra that is a list.
+        ([{"item": 3}, {"item": 7}], None, {"extra": [{"item": 3}, {"item": 7}]}),
+        # A key does not replace a standard member or a key of the extra, and "errors" is not used.
+        (
+            {"status": 200, "detail": {"a": 1}, "errors": "x", "code": "detail", "poll": 7},
+            {"code": "extra"},
+            {"code": "extra", "poll": 7},
+        ),
+    ],
+)
+def test_problem_details_detail_is_a_string(detail, extra, members):
+    """RFC 9457 section 3.1.4: "detail" is a string. Extension members hold structured data."""
+    api = BoltAPI(error_formatter=problem_details)
+
+    @api.get("/order")
+    async def order():
+        raise HTTPException(400, detail=detail, extra=extra)
+
+    with TestClient(api) as client:
+        response = client.get("/order")
+
+    assert response.status_code == 400
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.json() == {
+        "type": "about:blank",
+        "title": "Bad Request",
+        "status": 400,
+        "detail": "Bad Request",
+        "instance": "/order",
+        **members,
+    }
+    msgspec.convert(response.json(), ProblemDetails)
+
+
 def test_declared_error_schema_documents_the_422():
     api = _api(vendor_error, strict=True)
     spec = _spec(api)

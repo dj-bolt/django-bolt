@@ -133,6 +133,8 @@ async def get_comment(post_id: int, comment_id: int):
     return {"post_id": post_id, "comment_id": comment_id}
 ```
 
+Give each parameter of a path its own name. A path with one name two times, such as `/d/{x}/{x}`, raises `ValueError` at registration.
+
 See [Request Handling](requests.md) for details on path parameters, query parameters, headers, cookies, form data, and file uploads.
 
 ## Route options
@@ -258,6 +260,8 @@ def sync_handler():
 ```
 
 Sync handlers are automatically wrapped to run in a thread pool.
+
+A handler is a function, a bound method, or an object with `__call__`. For an object, Bolt registers its `__call__` method. A `functools.partial` is not a handler, and the route decorator raises `TypeError` for it. Register a function that calls the partial. The rule is the same for `@api.websocket()`, where the function or the method must be `async`.
 
 ## WebSocket routes
 
@@ -499,3 +503,5 @@ async def list_users():
 ```
 
 This is useful for versioning your API or grouping routes under a common path.
+
+Bolt gives each path and each prefix a leading slash. Thus `BoltAPI(prefix="api/v1")` with `@api.get("users")` serves `/api/v1/users`. The rule is the same for `Router(prefix=...)`, `include_router(prefix=...)`, `mount()`, views, viewsets and WebSocket routes.
