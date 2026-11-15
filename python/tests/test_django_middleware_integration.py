@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import io
 import logging
 import re
 from functools import partial
@@ -25,7 +26,8 @@ from django.contrib.auth.models import AnonymousUser, User
 from django.contrib.messages.middleware import MessageMiddleware
 from django.contrib.sessions.middleware import SessionMiddleware
 from django.core.exceptions import PermissionDenied
-from django.http import HttpResponse
+from django.http import FileResponse as DjangoFileResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.middleware.common import CommonMiddleware
 from django.middleware.csrf import _does_token_match
 from django.template import RequestContext, Template
@@ -2131,6 +2133,57 @@ class TestFileAndStreamThroughDjangoMiddleware:
         assert response.headers["content-type"] == "text/plain"
         assert response.headers["x-own"] == "stream"
         assert {name: response.headers[name] for name in headers} == headers
+
+
+class _DjangoStreamAnswer(MiddlewareMixin):
+    """Answer with a Django streaming response, as a Django middleware can."""
+
+    def process_request(self, request):
+        return StreamingHttpResponse(iter([b"one-", b"two"]), content_type="text/plain", headers={"X-Own": "stream"})
+
+
+class _DjangoFileAnswer(MiddlewareMixin):
+    """Answer with a Django file response."""
+
+    def process_request(self, request):
+        return DjangoFileResponse(io.BytesIO(b"file-body"), as_attachment=True, filename="data.txt")
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        lambda middleware: DjangoMiddleware(middleware),
+        lambda middleware: DjangoMiddlewareStack([middleware]),
+    ],
+    ids=["wrapper", "stack"],
+)
+class TestDjangoStreamingResponseFromMiddleware:
+    """A Django middleware can answer with a streaming or a file response."""
+
+    def _get(self, layout, middleware):
+        api = BoltAPI(middleware=[layout(middleware)])
+
+        @api.get("/answer")
+        async def answer_route():
+            return {"from": "handler"}
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            return client.get("/answer", headers={"Accept-Encoding": "identity"})
+
+    def test_streaming_response(self, layout):
+        response = self._get(layout, _DjangoStreamAnswer)
+
+        assert response.status_code == 200
+        assert response.content == b"one-two"
+        assert response.headers["content-type"] == "text/plain"
+        assert response.headers["x-own"] == "stream"
+
+    def test_file_response(self, layout):
+        response = self._get(layout, _DjangoFileAnswer)
+
+        assert response.status_code == 200
+        assert response.content == b"file-body"
+        assert response.headers["content-disposition"] == 'attachment; filename="data.txt"'
 
 
 class _StateAttributesHook(MiddlewareMixin):
