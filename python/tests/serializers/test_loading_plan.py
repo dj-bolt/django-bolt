@@ -135,6 +135,38 @@ def test_plan_follows_dotted_source():
     assert PostWithAuthorEmail.loading_plan(BlogPost).select_related == ("author",)
 
 
+class PostWithTagsAndComments(Serializer):
+    id: int
+    tags: list[TagMini]
+    comments: list[CommentWithAuthor]
+
+
+class CommentWithPaths(Serializer):
+    id: int
+    author: int
+    author_name: str = field(source="author.name")
+    post_author_email: str = field(source="post.author.email")
+    post: PostWithTagsAndComments
+
+
+def test_plan_joins_each_level_of_a_path_and_moves_nested_prefetches_under_the_relation():
+    plan = CommentWithPaths.loading_plan(Comment)
+
+    assert plan.select_related == ("author", "post", "post__author")
+    tags, comments = plan.prefetch
+    assert tags == "post__tags"
+    assert isinstance(comments, Prefetch)
+    assert comments.prefetch_to == "post__comments"
+    assert comments.queryset.query.select_related == {"author": {}}
+    assert bool(PostWithTagsAndComments.loading_plan(BlogPost))
+    assert not bool(TagMini.loading_plan(Tag))
+
+    # A Prefetch that the caller already has for the same lookup stays the only one.
+    own = Prefetch("post__comments", queryset=Comment.objects.order_by("-id"))
+    lookups = plan.apply(Comment.objects.prefetch_related(own))._prefetch_related_lookups
+    assert lookups == (own, "post__tags")
+
+
 def test_plan_carries_config_annotations():
     assert list(AuthorWithPostCount.loading_plan(Author).annotations) == ["post_count"]
 

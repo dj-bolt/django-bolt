@@ -58,6 +58,16 @@ def test_runbolt_applies_global_cors_settings_at_startup(make_server_project):
     assert response.headers.get("access-control-allow-origin") == "https://example.com"
 
 
+def test_runbolt_runs_the_lifespan_of_a_mounted_api(make_server_project):
+    project = make_server_project(api_module=app_module("mounted_lifespan"))
+
+    with project.start(startup_path="/health") as server:
+        response = server.get("/child/state")
+
+    assert response.status_code == 200
+    assert response.json() == {"started": True}
+
+
 def test_runbolt_prints_system_checks_and_migration_warning(make_server_project):
     """runbolt prints runserver-style startup diagnostics before the banner.
 
