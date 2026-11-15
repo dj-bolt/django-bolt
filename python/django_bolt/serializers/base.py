@@ -38,6 +38,7 @@ from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
 
 from django_bolt import _json
+from django_bolt._serializer_before import PLAN_NOT_BUILT, RAW_VALIDATED, before_plan, run_before_validators
 from django_bolt.error_handlers import msgspec_validation_error_to_dict
 from django_bolt.exceptions import (
     RequestValidationError,
@@ -397,8 +398,16 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     # Class attributes for validators (populated by __init_subclass__)
     __field_validators__: ClassVar[dict[str, list[Any]]] = {}
     __model_validators__: ClassVar[list[Any]] = []
-    # Pre-computed tuple of (field_name, validators_tuple) for faster iteration
+    # Pre-computed tuple of (field_name, validators_tuple) for faster iteration.
+    # It has the validators with mode="after". __field_validators__ has each mode, in definition order.
     __field_validators_tuple__: ClassVar[tuple[tuple[str, tuple[Any, ...]], ...]] = ()
+    # Validators with mode="before", in the order that they run.
+    __before_field_validators__: ClassVar[tuple[tuple[str, tuple[Any, ...]], ...]] = ()
+    __before_model_validators__: ClassVar[tuple[Any, ...]] = ()
+    # How model_validate() runs the before validators of this class and of its
+    # nested serializers: PLAN_NOT_BUILT until the first input, then the plan,
+    # or None for a class that keeps the direct msgspec decode.
+    __before_plan__: ClassVar[Any] = None
     _computed_dump_specs: ClassVar[tuple[_ComputedDumpSpec, ...]] = ()
 
     # Cached type hints and metadata (populated by __init_subclass__)
@@ -474,8 +483,19 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         # Pre-compute validators as tuple for faster iteration (no dict overhead)
         cls.__field_validators_tuple__ = tuple(
-            (field_name, tuple(validators)) for field_name, validators in cls.__field_validators__.items()
+            (field_name, tuple(validators))
+            for field_name, validators in collect_field_validators(cls, mode="after").items()
         )
+        cls.__before_field_validators__ = tuple(
+            (field_name, tuple(validators))
+            for field_name, validators in collect_field_validators(cls, mode="before").items()
+        )
+        cls.__before_model_validators__ = tuple(collect_model_validators(cls, mode="before"))
+        cls.__before_plan__ = PLAN_NOT_BUILT
+        # Only a class with a before validator gets the slower validation step.
+        # Each other class keeps _run_field_validators() as it is.
+        if cls.__before_field_validators__ or cls.__before_model_validators__:
+            cls._run_field_validators = Serializer._run_before_then_field_validators
 
         cls.__default_values_map__ = None
         # A subclass must rebuild its own specs even when the parent already
@@ -497,7 +517,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Set fast-path flags to control which validation runs
         cls.__has_nested_or_literal__ = bool(cls.__nested_fields__ or cls.__literal_fields__)
         cls.__has_field_validators__ = bool(cls.__field_validators__)
-        cls.__has_model_validators__ = bool(cls.__model_validators__)
+        cls.__has_model_validators__ = bool(cls.__model_validators__ or cls.__before_model_validators__)
         cls.__has_computed_fields__ = bool(cls.__computed_fields__)
 
         # Skip all validation if there's nothing to validate
@@ -643,10 +663,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         Validators are executed in order:
         1. Fix _FieldMarker defaults (only if field() is used)
-        2. Field validators with mode='before'
-        3. Field validators with mode='after'
-        4. Model validators with mode='before'
+        2. Model validators with mode='before'
+        3. Field validators with mode='before'
+        4. Field validators with mode='after'
         5. Model validators with mode='after'
+
+        Steps 2 and 3 run here only for an instance that Python code builds.
+        For input (a request body, model_validate(), model_validate_json()),
+        they run on the raw data before msgspec builds the instance.
         """
         cls = self.__class__
 
@@ -834,6 +858,52 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         return errors
 
+    def _run_before_then_field_validators(self) -> list[dict]:
+        """_run_field_validators() of a class that has a validator with mode="before"."""
+        if not RAW_VALIDATED.get():
+            # Python code built this instance. No raw input went through the plan.
+            errors = self._run_before_validators()
+            if errors:
+                return errors
+        return Serializer._run_field_validators(self)
+
+    def _run_before_validators(self) -> list[dict]:
+        """
+        Run the before validators on an instance that Python code built.
+
+        msgspec does no type conversion for such an instance, so the validators
+        get the values of the fields. A model validator gets them as a dict with
+        the input names of the fields, and Bolt sets the fields from its result.
+        """
+        cls = self.__class__
+        errors: list[dict] = []
+        _setattr = msgspec_structs.force_setattr
+
+        if cls.__before_model_validators__:
+            rename_map = cls.__rename_map__
+            input_names = [(name, rename_map.get(name, name)) for name in cls.__struct_fields__]
+            data: Any = {input_name: getattr(self, name) for name, input_name in input_names}
+            try:
+                for validator in cls.__before_model_validators__:
+                    data = validator(cls, data)
+            except (ValueError, TypeError) as e:
+                return [{"loc": ["body"], "msg": str(e), "type": "value_error"}]
+            if isinstance(data, dict):
+                for name, input_name in input_names:
+                    if input_name in data:
+                        _setattr(self, name, data[input_name])
+
+        for field_name, validators in cls.__before_field_validators__:
+            try:
+                value = getattr(self, field_name)
+                for validator in validators:
+                    value = validator(cls, value)
+                _setattr(self, field_name, value)
+            except (ValueError, TypeError) as e:
+                errors.append({"loc": ["body", field_name], "msg": str(e), "type": "value_error"})
+
+        return errors
+
     def _validate_nested_and_literal_fields(self) -> list[dict]:
         """
         Validate nested serializer fields and Literal (choice) fields using cached metadata.
@@ -934,6 +1004,33 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         return msgspec.convert(data, type=self.__class__)
 
     @classmethod
+    def _get_before_plan(cls) -> Any:
+        """The plan for the before validators of this class and its nested serializers. Built one time."""
+        plan = cls.__before_plan__
+        if plan is PLAN_NOT_BUILT:
+            plan = cls.__before_plan__ = before_plan(cls)
+        return plan
+
+    @classmethod
+    def _validate_json_with_before(cls: type[T], plan: Any, json_data: str | bytes) -> T:
+        """model_validate_json() of a class with a before validator: builtins, the plan, then convert."""
+        data = run_before_validators(plan, msgspec.json.decode(json_data))
+        token = RAW_VALIDATED.set(True)
+        try:
+            # str_keys: the keys of a JSON object are strings.
+            return msgspec.convert(data, type=cls, str_keys=True)
+        except MsgspecValidationError as e:
+            if isinstance(e.__cause__, RequestValidationError):
+                raise e.__cause__ from e
+            if isinstance(data, dict):
+                errors = cls._collect_msgspec_errors(data)
+                if errors:
+                    raise RequestValidationError(errors=errors) from e
+            raise
+        finally:
+            RAW_VALIDATED.reset(token)
+
+    @classmethod
     def _collect_msgspec_errors(cls: type[T], data: dict[str, Any]) -> list[dict[str, Any]]:
         """
         Collect all msgspec validation errors by validating each field individually.
@@ -1026,6 +1123,16 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # author.name == 'John' (stripped)
             # author.email == 'john@example.com' (lowercased)
         """
+        if cls.__before_plan__ is not None and not RAW_VALIDATED.get():
+            plan = cls._get_before_plan()
+            if plan is not None:
+                data = run_before_validators(plan, data)
+                token = RAW_VALIDATED.set(True)
+                try:
+                    return cls.model_validate(data)
+                finally:
+                    RAW_VALIDATED.reset(token)
+
         try:
             return msgspec.convert(data, type=cls)
         except MsgspecValidationError as e:
@@ -1060,6 +1167,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # author.name == 'John' (stripped)
             # author.email == 'john@example.com' (lowercased)
         """
+        if cls.__before_plan__ is not None and not RAW_VALIDATED.get():
+            plan = cls._get_before_plan()
+            if plan is not None:
+                return cls._validate_json_with_before(plan, json_data)
+
         try:
             return msgspec.json.decode(json_data, type=cls)
         except MsgspecValidationError as e:

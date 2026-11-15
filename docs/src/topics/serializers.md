@@ -367,6 +367,59 @@ TestSerializer(value="test")
 # Prints: "Field validator" then "Model validator"
 ```
 
+### Validator modes
+
+`@field_validator` and `@model_validator` take `mode="after"` (the default) or `mode="before"`.
+
+| Validator | Gets | Returns |
+|-----------|------|---------|
+| `@field_validator(name, mode="before")` | The raw input value, before the type of the field converts it. | The value that the type of the field then validates. Bolt uses the result, also `None`. |
+| `@field_validator(name)` | The value that the type of the field accepted. | The new value, or `None` to keep the value. |
+| `@model_validator(mode="before")` | The raw input data, usually a `dict`. It is a classmethod. | The data to validate. |
+| `@model_validator` | The built instance. | Nothing. |
+
+```python
+from django_bolt.serializers import Serializer, field_validator, model_validator
+
+class OrderSerializer(Serializer):
+    order_id: int
+    tags: list[str] = []
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_old_key(cls, data):
+        if isinstance(data, dict) and "id" in data:
+            data = {**data, "order_id": data["id"]}
+            del data["id"]
+        return data
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def split_tags(cls, value):
+        return value.split(",") if isinstance(value, str) else value
+
+order = OrderSerializer.model_validate({"id": 7, "tags": "a,b"})
+# OrderSerializer(order_id=7, tags=['a', 'b'])
+```
+
+The order does not depend on the order of the definitions:
+
+1. Model validators with `mode="before"`. The last one in the class runs first.
+2. Field validators with `mode="before"`. The last one in the class runs first.
+3. The type conversion and the constraints of msgspec.
+4. Field validators with `mode="after"`, in the order of the class.
+5. Model validators with `mode="after"`, in the order of the class.
+
+After validators of a parent class run before those of a subclass. Before validators of a subclass run before those of a parent class. This is the order of pydantic.
+
+Notes:
+
+- Before validators get raw values for a JSON request body, `model_validate()` and `model_validate_json()`, also in a nested serializer. A field validator with `mode="before"` runs only if the input has the field. The keys of the raw data are the names in the input (the names after `rename=`).
+- For an instance that Python code builds (`OrderSerializer(order_id=7)`), msgspec does no type conversion. The before validators then get the values of the fields.
+- If a before validator raises `ValueError` or `TypeError`, Bolt reports the errors of the before validators and stops. The `loc` of an error has the full path, for example `["body", "lines", 0, "qty"]`.
+- A serializer with a before validator, at any depth of a body type, decodes the body to builtins first and then converts it. This is slower than the direct decode. A serializer without one keeps the direct decode.
+- `mode="wrap"` and `mode="plain"` are not supported. The decorator raises `ValueError`.
+
 ## Computed fields
 
 ### Basic computed fields
