@@ -6,6 +6,7 @@ No mocking - tests the full integration stack.
 """
 
 import base64
+from collections import UserList
 from datetime import UTC, datetime
 from typing import Generic, TypeVar
 from urllib.parse import quote
@@ -1792,6 +1793,75 @@ def test_pagination_with_values_list(sample_articles):
         assert len(data["items"]) == 10
         # values_list() returns tuples (serialized as lists)
         assert isinstance(data["items"][0], list)
+
+
+@pytest.mark.parametrize("scheme", [PageNumberPagination, LimitOffsetPagination])
+@pytest.mark.parametrize("rows", [range(7), UserList(range(7))], ids=["range", "UserList"])
+def test_pagination_counts_a_sequence_with_len(scheme, rows):
+    """The count() of a sequence counts one value. The total of a sequence is its len()."""
+    api = BoltAPI()
+
+    @api.get("/numbers")
+    @paginate(scheme)
+    async def list_numbers(request):
+        return rows
+
+    with TestClient(api) as client:
+        response = client.get("/numbers")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 7
+    assert data["items"] == [0, 1, 2, 3, 4, 5, 6]
+
+
+class _AsyncRows:
+    """A collection of the application with an async count and an async iterator."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def acount(self):
+        return len(self.rows)
+
+    def __getitem__(self, key):
+        return _AsyncRows(self.rows[key])
+
+    async def __aiter__(self):
+        for row in self.rows:
+            yield row
+
+
+class _LazyRows:
+    """A collection of the application with a sync count() and no len()."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def count(self):
+        return len(self.rows)
+
+    def __getitem__(self, key):
+        return iter(self.rows[key])
+
+
+@pytest.mark.parametrize("rows_class", [_AsyncRows, _LazyRows])
+def test_pagination_counts_a_collection_that_is_not_a_sequence(rows_class):
+    """A collection with acount(), or with count() and no argument, gives its total and its slice."""
+    api = BoltAPI()
+
+    @api.get("/numbers")
+    @paginate(LimitOffsetPagination)
+    async def list_numbers(request):
+        return rows_class([0, 1, 2, 3, 4])
+
+    with TestClient(api) as client:
+        response = client.get("/numbers?limit=2&offset=1")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 5
+    assert data["items"] == [1, 2]
 
 
 @pytest.mark.django_db(transaction=True)
