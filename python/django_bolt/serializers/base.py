@@ -1952,8 +1952,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Copy field validators for included fields
         for field_name, validators in cls.__field_validators__.items():
             if field_name in fields_set:
-                for validator in validators:
-                    class_dict[f"_validator_{field_name}"] = validator
+                for index, validator in enumerate(validators):
+                    class_dict[f"_validator_{field_name}_{index}"] = validator
 
         # Copy Config with adjusted field_sets (only include subsets of our fields)
         parent_meta = getattr(cls, "Config", None)
