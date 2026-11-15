@@ -137,6 +137,8 @@ This creates:
 | PATCH | `/items/{pk}` | `partial_update` |
 | DELETE | `/items/{pk}` | `destroy` |
 
+An action can be `async def` or `def`. Bolt registers only the actions that the class defines.
+
 Set `pagination_class` on a `ViewSet`, `ReadOnlyModelViewSet`, or `ModelViewSet`
 to have the `list()` action paginated automatically. Use `@paginate(...)` when
 you want per-method control instead.
