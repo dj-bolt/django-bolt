@@ -29,8 +29,9 @@ class FieldConfig:
 
     read_only: bool = False
     """
-    If True, input cannot set the field. Input is a JSON request body,
-    model_validate() and model_validate_json(). The field gets its default, so
+    If True, input cannot set the field. Input is a JSON request body, a
+    Query(), Header(), Cookie() or Form() model, model_validate() and
+    model_validate_json(). The field gets its default, so
     it must have one. Python code and from_model() set the field.
     """
 
