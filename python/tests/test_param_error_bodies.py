@@ -155,6 +155,45 @@ def test_missing_renamed_header_field_names_the_header():
     assert response.json()["detail"] == [_missing("header", "header", "x-api-key")]
 
 
+def test_an_optional_struct_parameter_takes_its_default_when_the_request_has_none_of_its_keys():
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(filters: Annotated[Filters | None, Query()] = None):
+        return {"page": filters.page if filters else None}
+
+    @api.get("/cookie")
+    async def cookie(filters: Annotated[Filters | None, Cookie()]):
+        return {"page": filters.page if filters else None}
+
+    @api.post("/form")
+    async def form(filters: Annotated[Filters | None, Form()] = None):
+        return {"page": filters.page if filters else None}
+
+    @api.get("/header")
+    async def header(headers: Annotated[Headers | None, Header()] = None):
+        return {"key": headers.x_api_key if headers else None}
+
+    with TestClient(api) as client:
+        assert client.get("/query").json() == {"page": None}
+        assert client.get("/query?other=1").json() == {"page": None}
+        assert client.get("/query?page=3").json() == {"page": 3}
+        assert client.get("/cookie").json() == {"page": None}
+        assert client.get("/cookie", headers={"Cookie": "page=3"}).json() == {"page": 3}
+        assert client.post("/form", data={"other": "1"}).json() == {"page": None}
+        assert client.post("/form", data={"page": "3"}).json() == {"page": 3}
+        assert client.get("/header").json() == {"key": None}
+        assert client.get("/header", headers={"X-Api-Key": "k"}).json() == {"key": "k"}
+
+        # With one of its keys in the request, the struct validates as a required one does.
+        response = client.get("/query?size=5")
+        assert response.status_code == 422
+        assert response.json()["detail"] == [_missing("query", "query parameter", "page")]
+        response = client.get("/header", headers={"X-Count": "2"})
+        assert response.status_code == 422
+        assert response.json()["detail"] == [_missing("header", "header", "x-api-key")]
+
+
 @pytest.mark.parametrize(
     ("path", "send", "source"),
     [
