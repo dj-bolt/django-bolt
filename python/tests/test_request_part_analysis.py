@@ -9,6 +9,7 @@ handler must run in the thread pool, not on the server thread.
 from __future__ import annotations
 
 import functools
+import inspect
 import threading
 import urllib.request
 from dataclasses import dataclass
@@ -163,6 +164,30 @@ def test_a_lambda_handler_gets_the_query():
         response = client.get("/search?q=bolt")
 
     assert response.json() == {"query": {"q": "bolt"}}
+
+
+def test_a_handler_with_a_synthetic_signature_gets_each_request_part():
+    """A ``__signature__`` can hide the code that reads the request, so Rust parses each request part."""
+    api = BoltAPI()
+
+    async def template(request: Request): ...
+
+    async def handler(*args):
+        request = args[0]
+        return {
+            "header": request.headers.get("x-token"),
+            "cookie": request.cookies.get("session"),
+            "query": request.query.get("q"),
+            "body": bytes(request.body).decode(),
+        }
+
+    handler.__signature__ = inspect.signature(template)
+    api.post("/parts")(handler)
+
+    with TestClient(api) as client:
+        response = client.post("/parts?q=bolt", headers={"x-token": "abc", "cookie": "session=s1"}, content=b"text")
+
+    assert response.json() == {"header": "abc", "cookie": "s1", "query": "bolt", "body": "text"}
 
 
 def test_a_lambda_dependency_gets_the_query():
