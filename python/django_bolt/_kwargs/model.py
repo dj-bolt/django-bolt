@@ -842,8 +842,9 @@ def compile_argument_injector(
         else:
             form_map, files_map = _EMPTY_FORM_FILES
 
+        # Each body type has one extractor. Parameters of one type share one decode.
         body_obj: Any = None
-        body_loaded: bool = False
+        body_decoder: Any = None
 
         for src_id, extractor, positional, name, needs_files in _extraction_plan:
             if src_id == _SRC_REQUEST:
@@ -861,9 +862,9 @@ def compile_argument_injector(
             elif src_id == _SRC_FILE:
                 value = extractor(files_map)
             else:  # _SRC_BODY
-                if not body_loaded:
+                if extractor is not body_decoder:
                     body_obj = extractor(request["body"])
-                    body_loaded = True
+                    body_decoder = extractor
                 value = body_obj
 
             if positional:

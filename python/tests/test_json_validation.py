@@ -285,6 +285,26 @@ class TestBodyOfNonStructType:
             assert wrong.status_code == 422
             assert wrong.json()["detail"][0]["loc"] == ["body", "0"]
 
+    def test_two_body_parameters_each_decode_the_body_as_their_own_type(self):
+        api = BoltAPI()
+
+        @api.post("/both")
+        async def both(user: UserWithDefaults, strict: UserCreate):
+            return {"user": type(user).__name__, "strict": type(strict).__name__, "age": strict.age}
+
+        with TestClient(api) as client:
+            body = {"name": "Ana", "email": "ana@example.com", "age": 30}
+            assert client.post("/both", json=body).json() == {
+                "user": "UserWithDefaults",
+                "strict": "UserCreate",
+                "age": 30,
+            }
+
+            # The second type has a required field more than the first.
+            missing = client.post("/both", json={"name": "Ana"})
+            assert missing.status_code == 422
+            assert missing.json()["detail"][0]["loc"] == ["body", "email"]
+
 
 class TestParseMsgspecDecodeError:
     """Test the line and column of a JSON decode error."""
