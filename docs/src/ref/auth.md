@@ -39,7 +39,7 @@ JWTAuthentication(
 | `cookie`           | `str`           | `None`            | Cookie containing token (replaces `header` when set) |
 | `audience`         | `str`           | `None`            | Required `aud` claim    |
 | `issuer`           | `str`           | `None`            | Required `iss` claim    |
-| `leeway`           | `int`           | `60`              | Clock-skew tolerance (seconds) for `exp`/`nbf` |
+| `leeway`           | `int`           | `60`              | Clock-skew tolerance (seconds) for `exp`/`nbf`. A `revocation_store` must not have a smaller `leeway` |
 | `token_type`       | `str`           | `None`            | Required `typ` claim (e.g. `"refresh"` for a rotation endpoint); access routes reject `typ:"refresh"` |
 | `csrf`             | `bool`          | `True`            | For cookie tokens, enforce a cross-site origin check on unsafe methods that carry the auth cookie |
 | `jwks_url`         | `str`           | `None`            | HTTPS JWKS endpoint; requires `issuer` and `audience`, refreshed at runtime |
@@ -47,6 +47,8 @@ JWTAuthentication(
 | `oidc_issuer`      | `str`           | `None`            | HTTPS issuer for OIDC discovery; requires `audience` |
 | `jwks_refresh_interval` | `int`       | `300`             | Periodic remote JWKS refresh interval in seconds |
 | `revocation_store` | RevocationStore | `None`            | Token revocation store  |
+
+For `cookie`, `audience`, `issuer` and `token_type`, `None` means "not set". An empty string for one of them, or for `header`, raises `ImproperlyConfigured`.
 
 #### Supported algorithms
 
@@ -124,8 +126,10 @@ APIKeyAuthentication(
 | Parameter         | Type       | Default       | Description                |
 | ----------------- | ---------- | ------------- | -------------------------- |
 | `api_keys`        | `set[str]` | `set()`       | Valid API keys             |
-| `header`          | `str`      | `"x-api-key"` | Header containing key      |
+| `header`          | `str`      | `"x-api-key"` | Header containing key. An empty string raises `ImproperlyConfigured` |
 | `key_permissions` | `dict`     | `None`        | Key to permissions mapping |
+
+`api_keys` is a set, list or tuple of non-empty strings. Each value of `key_permissions` is a set, list or tuple of strings, and each of its keys must be in `api_keys`. A different value raises `ImproperlyConfigured`. For example, `api_keys="sk-123"` and `api_keys={os.environ.get("API_KEY", "")}` with no `API_KEY` raise.
 
 ## Permission guards
 
@@ -230,6 +234,8 @@ token = create_jwt_for_user(
     extra_claims={"permissions": list(user.get_all_permissions())}
 )
 ```
+
+`extra_claims` cannot hold `sub`, `exp`, `iat`, `is_staff` or `is_superuser`. Such a claim raises `ValueError`. The function sets these claims from the user and from `expires_in`.
 
 ### get_current_user
 
@@ -344,9 +350,15 @@ checks every authenticated request against the store and rejects revoked
 tokens with `401`. You don't call `is_revoked()` from your handlers.
 
 All `revoke()` calls accept an `exp` keyword: pass the token's own `exp`
-claim so the entry expires exactly when the token would have. Call
-sites without `exp` fall back to `default_ttl` (set per instance) or to
-the module-level `_DEFAULT_TTL_SECONDS` (7 days).
+claim. `DjangoCacheRevocation` and `DjangoORMRevocation` then keep the
+entry until `exp + leeway`, the time when `JWTAuthentication` stops
+accepting the token. Call sites without `exp` fall back to `default_ttl`
+(set per instance) or to the module-level `_DEFAULT_TTL_SECONDS` (7 days).
+
+Set the `leeway` of the store to the `leeway` of the `JWTAuthentication`
+that reads it. Both have a default of 60 seconds. `JWTAuthentication`
+raises `ImproperlyConfigured` when the `leeway` of its store is smaller
+than its own.
 
 ### Store methods
 
@@ -392,6 +404,7 @@ store = DjangoCacheRevocation(
     cache_alias="default",
     key_prefix="revoked:",
     default_ttl=86400 * 7,  # fallback when revoke() is called without exp
+    leeway=60,  # the leeway of the JWTAuthentication that reads this store
 )
 ```
 
@@ -411,6 +424,7 @@ from django_bolt.auth import DjangoORMRevocation
 store = DjangoORMRevocation(
     model="myapp.RevokedToken",  # 'app_label.ModelName' — exactly two parts
     default_ttl=86400 * 7,
+    leeway=60,  # the leeway of the JWTAuthentication that reads this store
 )
 ```
 

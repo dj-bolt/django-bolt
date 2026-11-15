@@ -7,10 +7,13 @@ schema instead of expanding their fields.
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import msgspec
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
+from django_bolt.params import Body
 from django_bolt.testing import TestClient
 
 
@@ -192,6 +195,40 @@ def test_nested_struct_as_request_body():
     assert "Child" in schemas
     assert "id" in schemas["Child"]["properties"]
     assert "name" in schemas["Child"]["properties"]
+
+
+def test_a_body_that_is_not_a_struct_has_a_request_body():
+    """The route reads the JSON body, so the document must show it."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test", version="1.0.0"))
+
+    @api.post("/children")
+    async def create_children(items: Annotated[list[Child], Body()]) -> dict:
+        return {"count": len(items)}
+
+    @api.post("/counts")
+    async def set_counts(counts: Annotated[dict[str, int] | None, Body()] = None) -> dict:
+        return {"count": len(counts or {})}
+
+    schema = _get_schema(api)
+
+    children = schema["paths"]["/children"]["post"]
+    assert "parameters" not in children
+    assert children["requestBody"]["required"] is True
+    assert children["requestBody"]["content"]["application/json"]["schema"] == {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/Child"},
+    }
+    assert "id" in schema["components"]["schemas"]["Child"]["properties"]
+
+    counts = schema["paths"]["/counts"]["post"]["requestBody"]
+    assert counts["required"] is False
+    assert "application/json" in counts["content"]
+
+    # The document says what the route does.
+    with TestClient(api) as client:
+        response = client.post("/children", json=[{"id": "1", "name": "a"}, {"id": "2", "name": "b"}])
+        assert response.status_code == 200, response.text
+        assert response.json() == {"count": 2}
 
 
 def test_self_referential_struct_does_not_recurse():

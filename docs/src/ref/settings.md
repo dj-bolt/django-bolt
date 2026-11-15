@@ -335,7 +335,9 @@ JWTAuthentication(secret="custom-jwt-secret")
 
 Default authentication backends applied to all endpoints.
 
-**Default:** `[]` (no authentication)
+**Default:** not set. A route with no guard then has no authentication. A route with a guard that needs a user, such as `IsAuthenticated()`, then uses `JWTAuthentication()`. See [A guard with no auth backend](../topics/authentication.md#a-guard-with-no-auth-backend).
+
+Set the setting to `[]` to give no route a default backend.
 
 ### BOLT_DEFAULT_PERMISSION_CLASSES
 
@@ -480,6 +482,8 @@ The `runbolt` management command accepts these options:
 | `--keep-alive` | OS default | HTTP keep-alive timeout |
 | `--skip-checks` | off | Skip the Django system checks at startup |
 
+A number out of range stops `runbolt` before startup, with an error that names the option. `--port` takes 0 to 65535. `--workers` takes 1 to 512. `--processes` takes 1 or more. `--backlog`, `--keep-alive`, `--max-rss`, `--workers-lifetime` and `--workers-kill-timeout` take 0 or more.
+
 At startup, `runbolt` runs the Django system checks and the migration check, like `runserver`. A check error stops startup. The unapplied-migration warning prints before the banner. In `--dev` mode, each reload runs the checks again. Multi-process mode runs them once, in the parent process. `--skip-checks` skips the system checks; the migration check still runs.
 
 ### Examples
@@ -575,7 +579,7 @@ api = BoltAPI(
 | `BOLT_EMIT_SIGNALS` | `bool` | `False` | Enable Django request signals |
 | `BOLT_DEV_FORCE_POLLING` | `bool` | `False` | Force `--dev` reloader to use polling instead of native file events |
 | `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |
-| `BOLT_AUTHENTICATION_CLASSES` | `list` | `[]` | Default authentication backends |
+| `BOLT_AUTHENTICATION_CLASSES` | `list` | not set | Default authentication backends. Not set: `JWTAuthentication()` for a route with a guard that needs a user |
 | `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |
 | `DJANGO_BOLT_MAX_PARAM_LENGTH` | `int` (env var) | `8192` | Max path/query/form parameter size in bytes, from `1` to `1048576` (1 MB); requests over the limit return `422` |
 | `DJANGO_BOLT_ORM_THREADS` | `int` (env var) | `1` (SQLite) or `4` | Threads in the ORM pool of each process |
