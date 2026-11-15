@@ -114,12 +114,14 @@ logger = logging.getLogger(__name__)
 def _middleware_names(middleware: Any) -> frozenset[str]:
     """The names that @skip_middleware can give for a middleware class or function.
 
-    The names are ``__name__`` and the dotted path. A Django middleware class
-    can also be a dotted path string.
+    The names are ``__name__`` and the dotted path, in lower case as
+    @skip_middleware keeps them. A Django middleware class can also be a dotted
+    path string.
     """
     if isinstance(middleware, str):
+        middleware = middleware.lower()
         return frozenset({middleware, middleware.rpartition(".")[2]})
-    return frozenset({middleware.__name__, f"{middleware.__module__}.{middleware.__qualname__}"})
+    return frozenset({middleware.__name__.lower(), f"{middleware.__module__}.{middleware.__qualname__}".lower()})
 
 
 def _revocation_handlers(backends: list[Any]) -> tuple[tuple[Callable, bool] | None, ...] | None:
@@ -3089,7 +3091,7 @@ class BoltAPI:
 
         ``skip`` holds the names of @skip_middleware. A name selects a middleware
         class, a function middleware or a Django middleware class by its
-        ``__name__`` or its dotted path. "*" selects each Python middleware of Bolt,
+        ``__name__`` or its dotted path, in lower case. "*" selects each Python middleware of Bolt,
         but no Django middleware: a ``DjangoMiddleware`` or a class of a
         ``DjangoMiddlewareStack`` runs until a name selects it. Thus "*" cannot
         remove a CSRF check. Dict specs stay, because the compiler removes them.

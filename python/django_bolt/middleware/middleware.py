@@ -671,7 +671,7 @@ def cors(
     return decorator
 
 
-def skip_middleware(*middleware_names: str):
+def skip_middleware(*middleware_names: str | type):
     """
     Skip specific middleware for this route.
 
@@ -679,9 +679,13 @@ def skip_middleware(*middleware_names: str):
         middleware_names: Names of middleware to skip. A name is "cors",
             "rate_limit" or "compression" for a Rust middleware. For a Python
             middleware, a name is the name or the dotted path of its class or
-            function. "*" skips each Bolt middleware, Python and Rust. "*"
-            does not skip a Django middleware. Give the name of a Django
-            middleware class to skip it, for example "CsrfViewMiddleware".
+            function, or the class itself. "*" skips each Bolt middleware,
+            Python and Rust. "*" does not skip a Django middleware. Give the
+            name of a Django middleware class, or the class, to skip it, for
+            example "CsrfViewMiddleware". A name ignores the letter case.
+
+    Raises:
+        TypeError: A value is not a str or a class.
 
     Examples:
         @api.get("/no-compression")
@@ -700,10 +704,23 @@ def skip_middleware(*middleware_names: str):
             return {"fast": True}
     """
 
+    # Keep each name in lower case, and a class as its dotted path. Rust reads
+    # the names as a list of str and compares them in lower case.
+    names: list[str] = []
+    for name in middleware_names:
+        if isinstance(name, type):
+            name = f"{name.__module__}.{name.__qualname__}"
+        elif not isinstance(name, str):
+            raise TypeError(
+                "@skip_middleware() takes the name of a middleware or a middleware class, "
+                f"not {type(name).__name__} {name!r}"
+            )
+        names.append(name.lower())
+
     def decorator(func):
         if not hasattr(func, "__bolt_skip_middleware__"):
             func.__bolt_skip_middleware__ = set()
-        func.__bolt_skip_middleware__.update(middleware_names)
+        func.__bolt_skip_middleware__.update(names)
         return func
 
     return decorator

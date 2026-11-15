@@ -55,6 +55,15 @@ class CustomTestMiddleware(Middleware):
         return await self.get_response(request)
 
 
+class HeaderProbe(Middleware):
+    """Mark each response that it handles."""
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.headers["X-Probe"] = "ran"
+        return response
+
+
 def _wrap_argument_injectors(api: BoltAPI, wrap) -> None:
     """Give each route that registers after this call the injector ``wrap(injector)``.
 
@@ -737,6 +746,48 @@ class TestMiddlewareMetadata:
             response = client.get("/with-cors", headers={"Origin": "https://example.com"})
             assert response.status_code == 200
             assert response.headers.get("Access-Control-Allow-Origin") == "https://example.com"
+
+    @pytest.mark.parametrize(
+        "names",
+        [
+            (HeaderProbe,),
+            ("headerprobe",),
+            ("HEADERPROBE",),
+            (f"{__name__}.headerprobe",),
+            (HeaderProbe, "CORS", "Rate_Limit"),
+        ],
+        ids=["class", "lower-case-name", "upper-case-name", "dotted-path-case", "class-with-rust-names"],
+    )
+    def test_skip_middleware_takes_a_class_and_ignores_the_letter_case_of_a_name(self, names):
+        api = BoltAPI(middleware=[HeaderProbe])
+
+        @api.get("/skipped")
+        @skip_middleware(*names)
+        @cors(origins=["https://example.com"])
+        @rate_limit(rps=1, burst=1)
+        async def skipped():
+            return {}
+
+        @api.get("/plain")
+        async def plain():
+            return {}
+
+        with TestClient(api) as client:
+            responses = [client.get("/skipped", headers={"Origin": "https://example.com"}) for _ in range(3)]
+            assert client.get("/plain").headers["x-probe"] == "ran"
+
+        assert all("x-probe" not in response.headers for response in responses)
+        if len(names) > 1:
+            # A class in the names must not hide the names of the Rust middleware.
+            assert [response.status_code for response in responses] == [200, 200, 200]
+            assert all("access-control-allow-origin" not in response.headers for response in responses)
+
+    @pytest.mark.parametrize("name", [42, None, CustomTestMiddleware(_plain_function), _plain_function])
+    def test_skip_middleware_rejects_a_name_that_is_not_a_str_or_a_class(self, name):
+        with pytest.raises(
+            TypeError, match=r"@skip_middleware\(\) takes the name of a middleware or a middleware class"
+        ):
+            skip_middleware("cors", name)
 
     def test_rust_arg_prebinding_skips_injector_on_http_fast_path(self):
         """Simple path/query handlers should execute without calling Python injector."""
