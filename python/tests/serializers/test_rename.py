@@ -1,5 +1,8 @@
 """Tests for Serializer rename parameter support (camelCase, pascal, kebab, etc.)."""
 
+from datetime import datetime
+from uuid import UUID
+
 import msgspec
 import pytest
 
@@ -157,6 +160,35 @@ class TestRenameWithDefaults:
         data = profile.dump(exclude_none=True)
         assert data == {"userName": "alice"}
 
+    def test_rename_and_tag_dump_gives_the_values_of_the_other_dump_paths(self):
+        """dump() changes only the keys. The values are the same on each path of dump()."""
+
+        class Plain(Serializer):
+            created_at: datetime
+            ident: UUID
+            labels: set[str]
+
+        class Camel(Serializer, rename="camel"):
+            created_at: datetime
+            ident: UUID
+            labels: set[str]
+
+        class Tagged(Serializer, tag="event"):
+            created_at: datetime
+            ident: UUID
+            labels: set[str]
+
+        values = {"created_at": datetime(2024, 1, 2, 3, 4, 5), "ident": UUID(int=1), "labels": {"a"}}
+        camel_values = {"createdAt": values["created_at"], "ident": values["ident"], "labels": values["labels"]}
+
+        assert Plain(**values).dump() == values
+        assert Camel(**values).dump() == camel_values
+        assert Camel(**values).dump(exclude_none=True) == camel_values
+        assert Camel.dump_many([Camel(**values)]) == [camel_values]
+        assert Tagged(**values).dump() == {"type": "event", **values}
+        assert Tagged.dump_many([Tagged(**values)]) == [{"type": "event", **values}]
+        assert list(Tagged(**values).dump()) == ["type", "created_at", "ident", "labels"]
+
 
 class TestRenameWithFieldAlias:
     """Test rename with per-field alias override."""
@@ -293,13 +325,13 @@ class TestRenameBackwardCompat:
         assert SimpleSerializer.__rename_map__ == {}
         assert SimpleSerializer.__has_rename__ is False
 
-    def test_rename_keeps_fast_path_with_to_builtins(self):
-        """Serializers with rename still use the fast path (via to_builtins)."""
+    def test_rename_keeps_fast_path(self):
+        """Serializers with rename still use the fast path."""
 
         class CamelSerializer(Serializer, rename="camel"):
             user_name: str
 
-        # Fast path is still enabled — dump() uses to_builtins() instead of asdict()
+        # Fast path is still enabled. dump() pairs the encoded names with the values.
         assert CamelSerializer.__dump_fast_path__ is True
         assert CamelSerializer.__rename_map__ == {"user_name": "userName"}
         assert CamelSerializer.__has_rename__ is True
