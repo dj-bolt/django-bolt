@@ -552,6 +552,8 @@ async def get_item(item_id: int):
     ...  # any non-200 status code is documented as Error
 ```
 
+A key is an integer status code or `...`. The dict needs one integer key or more. A `bool` key (`True` or `False`) stops registration with `TypeError`.
+
 **Explicit status_code** — Override the auto-detected default status code:
 
 ```python

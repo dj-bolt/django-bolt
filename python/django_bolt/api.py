@@ -1892,6 +1892,12 @@ class BoltAPI:
                     final_response_type = None
                 elif isinstance(response_model, dict):
                     # Dict mode: per-status-code response schemas
+                    # A bool is an int in Python, but it is not a status code.
+                    for code in response_model:
+                        if isinstance(code, bool):
+                            raise TypeError(
+                                f"response_model has the key {code!r}. A key must be an integer status code or `...`."
+                            )
                     int_codes = sorted(c for c in response_model if isinstance(c, int))
                     if not int_codes:
                         raise ValueError(
