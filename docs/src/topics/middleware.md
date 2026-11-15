@@ -306,12 +306,14 @@ api.include_router(admin_router)
 
 ### Allowed middleware entries
 
-- Middleware classes (`__init__(get_response)`)
+- Middleware classes (`__init__(get_response)` and `__call__(request)`)
 - `DjangoMiddleware(...)` wrappers
 - `DjangoMiddlewareStack(...)` wrappers
 - Dict middleware configs for Rust-handled middleware (`cors`, `rate_limit`)
 
 Passing plain middleware instances in these lists fails fast with `TypeError` (`pass class, not instance`).
+
+A class with no `__call__` method, for example `int`, also raises `TypeError`. Bolt calls the instance with the request.
 
 In a `cors` dict, `origins` and `origin_regexes` take a `str` or a collection of `str`. Another type, or an empty pattern, stops startup with `TypeError` or `ValueError`.
 

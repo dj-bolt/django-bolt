@@ -276,6 +276,40 @@ class _CallableInstance:
 async def _plain_function(request, call_next): ...
 
 
+class _NoCall:
+    """A class that takes get_response, with instances that are not callable."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+
+class _DjangoStyle:
+    """A plain class of the Django style. It has no base class of Bolt."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    async def __call__(self, request):
+        request.state["seen"] = type(self).__name__
+        return await self.get_response(request)
+
+
+class _InheritsCall(_DjangoStyle):
+    """A class that gets __call__ from its base class."""
+
+
+class _ProcessRequestOnly(Middleware):
+    async def process_request(self, request):
+        request.state["seen"] = type(self).__name__
+        return await self.get_response(request)
+
+
+class _BaseProcessRequestOnly(BaseMiddleware):
+    async def process_request(self, request):
+        request.state["seen"] = type(self).__name__
+        return await self.get_response(request)
+
+
 class TestMiddlewareEntryValidation:
     """Registration rejects a middleware entry of the wrong kind, and the message names the level."""
 
@@ -323,6 +357,50 @@ class TestMiddlewareEntryValidation:
             build()
 
         assert str(raised.value) == message.format(level=level)
+
+    @pytest.mark.parametrize("level", ["api", "router", "route"])
+    @pytest.mark.parametrize("entry", [int, str, dict, _NoCall], ids=["int", "str", "dict", "class-with-no-call"])
+    def test_each_level_rejects_a_class_whose_instances_are_not_callable(self, level, entry):
+        """The chain calls the instance with the request. Such a class gave a 500 for each request."""
+
+        def build():
+            if level == "api":
+                BoltAPI(middleware=[entry])
+            elif level == "router":
+                Router(middleware=[entry])
+            else:
+                middleware(entry)(lambda: None)
+
+        with pytest.raises(TypeError) as raised:
+            build()
+
+        assert str(raised.value) == (
+            f"{level} middleware class {entry.__name__} has no __call__. "
+            "A middleware class takes get_response in __init__, and Bolt calls its instance with the request."
+        )
+
+    @pytest.mark.parametrize(
+        "entry",
+        [_DjangoStyle, _ProcessRequestOnly, _BaseProcessRequestOnly, _InheritsCall],
+        ids=["django-style", "middleware-subclass", "base-middleware-subclass", "inherited-call"],
+    )
+    @pytest.mark.parametrize("level", ["api", "router", "route"])
+    def test_each_level_runs_a_class_whose_instances_are_callable(self, level, entry):
+        api = BoltAPI(middleware=[entry] if level == "api" else None)
+        router = Router(middleware=[entry] if level == "router" else None)
+
+        @router.get("/entry")
+        @middleware(*([entry] if level == "route" else []))
+        async def handler(request):
+            return {"seen": request.state.get("seen")}
+
+        api.include_router(router)
+
+        with TestClient(api) as client:
+            response = client.get("/entry")
+
+        assert response.status_code == 200
+        assert response.json() == {"seen": entry.__name__}
 
     def test_each_kind_of_entry_stays_in_the_list_in_order(self):
         """A kind of entry that the function accepts does not stop the loop."""
