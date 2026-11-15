@@ -345,6 +345,8 @@ In a `cors` dict, `origins` and `origin_regexes` take a `str` or a collection of
 
 Router middleware is inherited parent-to-child and executes in declared order.
 
+A nested router also takes `auth`, `guards` and `tags` from its parent router. A value that the child router or the route sets wins. The nearest parent that sets a value gives it.
+
 ## Django middleware integration
 
 Django-Bolt seamlessly integrates with Django's middleware system, allowing you to use existing Django middleware with your API endpoints.

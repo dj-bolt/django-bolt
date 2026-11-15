@@ -3,6 +3,7 @@ Router for Django-Bolt API.
 
 Provides hierarchical routing with middleware inheritance.
 Routes defined on a router inherit the router's middleware, auth, and guards.
+A nested router inherits the middleware, auth, guards and tags of its parent.
 """
 
 from collections.abc import Callable
@@ -25,6 +26,8 @@ class Router:
     - Middleware inheritance (routes inherit router middleware)
     - Authentication/guard defaults
     - OpenAPI tags
+    - Nested routers: a child router takes the auth, guards and tags that it
+      does not set from the nearest parent router that sets them
 
     Example:
         # Create router with middleware
@@ -222,6 +225,7 @@ class Router:
         for method, path, handler, meta in self._routes:
             route_meta = dict(meta)
             owner_router = route_meta.pop("_owner_router", self)
+            owner_router._inherit_parent_defaults(route_meta)
             route_meta["_router_middleware"] = owner_router.get_middleware_chain()
             routes.append((method, self.prefix + path, handler, route_meta))
 
@@ -230,6 +234,22 @@ class Router:
             for method, path, handler, meta in child.get_all_routes():
                 routes.append((method, self.prefix + path, handler, meta))
         return routes
+
+    def _inherit_parent_defaults(self, meta: dict[str, Any]) -> None:
+        """Fill auth, guards and tags that the route and this router do not set.
+
+        The nearest parent router that sets a value gives it. The parent of a
+        router can change until the API includes the routers, so this runs then.
+        """
+        parent = self._parent
+        while parent is not None:
+            if parent.tags and "tags" not in meta:
+                meta["tags"] = parent.tags
+            if parent.auth is not None and "auth" not in meta:
+                meta["auth"] = parent.auth
+            if parent.guards is not None and "guards" not in meta:
+                meta["guards"] = parent.guards
+            parent = parent._parent
 
     def get_middleware_chain(self) -> list["MiddlewareType"]:
         """
