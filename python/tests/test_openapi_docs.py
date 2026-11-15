@@ -93,6 +93,35 @@ def test_openapi_json_endpoint():
         assert "/items" in data["paths"]
 
 
+@pytest.mark.parametrize(
+    ("names", "title"),
+    [
+        ({"PROJECT_NAME": "Shop", "SITE_NAME": "Site"}, "Shop"),
+        ({"SITE_NAME": "Site"}, "Site"),
+        ({}, "API"),
+    ],
+    ids=["project-name", "site-name", "no-name"],
+)
+def test_default_openapi_config_takes_the_title_from_the_settings(settings, names, title):
+    """With no ``openapi_config``, the title is PROJECT_NAME, then SITE_NAME, then "API"."""
+    for name, value in names.items():
+        setattr(settings, name, value)
+
+    api = BoltAPI()
+
+    @api.get("/items")
+    async def items():
+        return []
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get("/docs/openapi.json")
+
+    assert response.status_code == 200
+    assert response.json()["info"] == {"title": title, "version": "1.0.0"}
+
+
 def test_swagger_ui_endpoint():
     """Test that /docs/swagger (Swagger UI) loads without internal errors."""
     # Create API with Swagger UI enabled (default path is /docs)

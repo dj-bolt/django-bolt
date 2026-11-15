@@ -64,6 +64,32 @@ def test_view_decorator_with_multiple_methods(api):
     assert response.json()["created"] is True
 
 
+@pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete", "query"])
+def test_method_decorator_passes_its_arguments_to_the_route(api, method):
+    """Each method decorator gives ``status_code`` and the OpenAPI arguments to its route."""
+
+    @getattr(api, method)(
+        "/things", status_code=202, tags=["stock"], summary="Short text", description="Long text", name="things"
+    )
+    async def things():
+        return {"ok": True}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.request(method.upper(), "/things")
+        assert response.status_code == 202
+        assert response.json() == {"ok": True}
+
+        operation = client.get("/docs/openapi.json").json()["paths"]["/things"][method]
+
+    assert operation["tags"] == ["stock"]
+    assert operation["summary"] == "Short text"
+    assert operation["description"] == "Long text"
+    assert list(operation["responses"]) == ["202"]
+    assert api._handler_meta[api._routes[0][2]]["name"] == "things"
+
+
 @pytest.mark.django_db(transaction=True)
 def test_viewset_decorator_syntax(api):
     """Test @api.viewset() decorator syntax."""
