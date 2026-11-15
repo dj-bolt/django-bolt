@@ -1171,6 +1171,34 @@ class TestCreateSerializerHelpersWithDjango:
         assert "created_at" in dumped
         assert "password_hash" not in dumped
 
+    def test_create_serializer_selects_the_fields_and_the_set_passes_its_options(self):
+        """exclude, an unknown name and a many-to-many field drop out. Each serializer of the set gets its options."""
+        PostSerializer = create_serializer(BlogPost, fields=["title", "tags", "author", "unknown"], exclude=["title"])
+        TagSerializer = create_serializer(Tag, exclude=["description"])
+
+        assert (PostSerializer.__name__, set(PostSerializer.__struct_fields__)) == ("BlogPostSerializer", {"author"})
+        assert set(TagSerializer.__struct_fields__) == {"id", "name"}
+
+        UserCreate, UserUpdate, UserPublic = create_serializer_set(
+            User,
+            create_fields=["username", "password_hash"],
+            update_fields=["email", "password_hash"],
+            public_fields=["id", "username"],
+            write_only={"password_hash"},
+            read_only={"id"},
+        )
+
+        assert [cls.__name__ for cls in (UserCreate, UserUpdate, UserPublic)] == [
+            "UserCreate",
+            "UserUpdate",
+            "UserPublic",
+        ]
+        assert set(UserPublic.__struct_fields__) == {"id", "username"}
+        assert UserCreate(username="u", password_hash="h").dump() == {"username": "u"}
+        assert UserUpdate(email="u@example.com", password_hash="h").dump() == {"email": "u@example.com"}
+        assert UserPublic.__read_only_fields__ == frozenset({"id"})
+        assert UserCreate.__read_only_fields__ == frozenset()
+
     @pytest.mark.django_db
     def test_create_serializer_set_with_django(self):
         """Test create_serializer_set with Django model."""
