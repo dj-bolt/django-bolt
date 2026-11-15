@@ -56,7 +56,8 @@ class CookieMixin:
             domain: Cookie domain (default: None, current domain)
             secure: Require HTTPS (default: False)
             httponly: Prevent JavaScript access (default: False)
-            samesite: SameSite policy - "Strict", "Lax", "None", or False (default: "Lax")
+            samesite: SameSite policy - "Strict", "Lax", "None", or False (default: "Lax").
+                The letter case has no meaning. Another value raises ValueError.
 
         Returns:
             Self for method chaining
@@ -266,18 +267,6 @@ class File(CookieMixin):
             return f.read()
 
 
-class UploadFile:
-    def __init__(self, name: str, filename: str | None, content_type: str | None, path: str):
-        self.name = name
-        self.filename = filename
-        self.content_type = content_type
-        self.path = path
-
-    def read(self) -> bytes:
-        with open(self.path, "rb") as f:
-            return f.read()
-
-
 class FileResponse(CookieMixin):
     def __init__(
         self,
@@ -392,8 +381,18 @@ def format_sse_event(
     Pass ``data_bytes`` instead of ``data_str`` when the payload is already
     encoded (e.g. from msgspec) to avoid a decode/encode round-trip.
     """
-    # Fast path: data-only event with pre-encoded bytes (most common from auto-framing)
-    if data_bytes is not None and event is None and id is None and retry is None and comment is None:
+    # Fast path: data-only event with pre-encoded bytes (most common from auto-framing).
+    # JSON bytes have no line break. Data with a line break needs one data line for each line.
+    # The check for a byte value (10 is LF, 13 is CR) is a memchr, about 15 ns for each.
+    if (
+        data_bytes is not None
+        and event is None
+        and id is None
+        and retry is None
+        and comment is None
+        and 10 not in data_bytes
+        and 13 not in data_bytes
+    ):
         return b"data: " + data_bytes + b"\n\n"
 
     lines: list[str] = []
