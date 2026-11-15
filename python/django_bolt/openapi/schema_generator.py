@@ -1032,6 +1032,41 @@ class SchemaGenerator:
             required=True,
         )
 
+    def _response_type_content(self, response_type: Any) -> dict[str, OpenAPIMediaType]:
+        """Return the content of a response type, by the media type of each result.
+
+        Bolt sends a ``str`` result as text/plain and a ``bytes`` result as
+        application/octet-stream. Each other result is JSON. Thus ``str | None``
+        has a text/plain string and an application/json null.
+        """
+        arms = get_args(response_type) if get_origin(response_type) in (Union, UnionType) else (response_type,)
+        json_arms = [arm for arm in arms if arm not in (str, bytes, bytearray)]
+        if len(json_arms) == len(arms):
+            schema = self._type_to_schema(response_type, register_component=True)
+            examples = _build_union_examples(response_type)
+            return {"application/json": OpenAPIMediaType(schema=schema, examples=examples)}
+
+        content: dict[str, OpenAPIMediaType] = {}
+        if str in arms:
+            content[_STR_MEDIA[0]] = OpenAPIMediaType(schema=_STR_MEDIA[1])
+        if bytes in arms or bytearray in arms:
+            content[_BYTES_MEDIA[0]] = OpenAPIMediaType(schema=_BYTES_MEDIA[1])
+        if not json_arms:
+            return content
+        # The JSON results: the type with no str arm and no bytes arm.
+        json_type = json_arms[0]
+        for arm in json_arms[1:]:
+            json_type = json_type | arm
+        if len(json_arms) == 2 and type(None) in json_arms:
+            # A None result is the JSON null, so T | None keeps its null arm.
+            value_type = json_arms[0] if json_arms[1] is type(None) else json_arms[1]
+            value_schema = self._type_to_schema(value_type, register_component=True)
+            schema = self._union_schema([value_schema], has_none=True, tagged=False)
+        else:
+            schema = self._type_to_schema(json_type, register_component=True)
+        content["application/json"] = OpenAPIMediaType(schema=schema, examples=_build_union_examples(json_type))
+        return content
+
     def _extract_responses(
         self, meta: dict[str, Any], handler_id: int, *, method: str = "", path: str = ""
     ) -> dict[str, OpenAPIResponse]:
@@ -1055,15 +1090,9 @@ class SchemaGenerator:
                 if resp_type is None:
                     responses[str(code)] = OpenAPIResponse(description=desc)
                 else:
-                    schema = self._type_to_schema(resp_type, register_component=True)
                     responses[str(code)] = OpenAPIResponse(
                         description=desc,
-                        content={
-                            "application/json": OpenAPIMediaType(
-                                schema=schema,
-                                examples=_build_union_examples(resp_type),
-                            )
-                        },
+                        content=self._response_type_content(resp_type),
                     )
             # Ellipsis catch-all → OpenAPI "default" response
             if ... in response_map:
@@ -1071,15 +1100,9 @@ class SchemaGenerator:
                 if ellipsis_type is None:
                     responses["default"] = OpenAPIResponse(description="Default response")
                 else:
-                    schema = self._type_to_schema(ellipsis_type, register_component=True)
                     responses["default"] = OpenAPIResponse(
                         description="Default response",
-                        content={
-                            "application/json": OpenAPIMediaType(
-                                schema=schema,
-                                examples=_build_union_examples(ellipsis_type),
-                            )
-                        },
+                        content=self._response_type_content(ellipsis_type),
                     )
             # fall through to error response logic below
         else:
@@ -1112,16 +1135,9 @@ class SchemaGenerator:
                     content={media_type: OpenAPIMediaType(schema=body_schema)},
                 )
             elif has_type:
-                schema = self._type_to_schema(response_type, register_component=True)
-
                 responses[str(default_status)] = OpenAPIResponse(
                     description="Successful response",
-                    content={
-                        "application/json": OpenAPIMediaType(
-                            schema=schema,
-                            examples=_build_union_examples(response_type),
-                        ),
-                    },
+                    content=self._response_type_content(response_type),
                 )
             else:
                 # Opaque JSON: nothing to type. Recorded for strict mode.

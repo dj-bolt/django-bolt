@@ -354,6 +354,77 @@ def test_str_or_bytes_return_type_documents_the_media_type_that_the_route_sends(
     assert content[media_type]["schema"] == expected_schema
 
 
+class _Problem(msgspec.Struct):
+    message: str
+
+
+_TEXT = {"text/plain": {"type": "string"}}
+_BINARY = {"application/octet-stream": {"type": "string", "format": "binary"}}
+_NULL_JSON = {"application/json": {"type": "null"}}
+_PROBLEM_JSON = {"application/json": {"$ref": "#/components/schemas/_Problem"}}
+
+
+@pytest.mark.parametrize(
+    ("route_kwargs", "return_type", "value", "status", "sent_media_type", "expected"),
+    [
+        ({}, str | None, "hello", "200", "text/plain", _TEXT | _NULL_JSON),
+        ({}, str | None, None, "200", "application/json", _TEXT | _NULL_JSON),
+        ({}, bytes | None, b"\x00", "200", "application/octet-stream", _BINARY | _NULL_JSON),
+        ({}, str | _Problem, "hello", "200", "text/plain", _TEXT | _PROBLEM_JSON),
+        ({}, str | _Problem, _Problem("m"), "200", "application/json", _TEXT | _PROBLEM_JSON),
+        (
+            {},
+            str | _Problem | None,
+            None,
+            "200",
+            "application/json",
+            _TEXT | {"application/json": {"anyOf": [_PROBLEM_JSON["application/json"], {"type": "null"}]}},
+        ),
+        ({"response_model": str | None}, None, "hello", "200", "text/plain", _TEXT | _NULL_JSON),
+        ({"response_model": {200: str, 404: _Problem}}, None, "hello", "200", "text/plain", _TEXT),
+        ({"response_model": {200: str, 404: _Problem}}, None, (404, _Problem("m")), "404", "application/json", None),
+        ({"response_model": {200: _Problem, 202: str}}, None, (202, "accepted"), "202", "text/plain", _TEXT),
+        ({"response_model": {200: bytes, 404: _Problem}}, None, b"\x00", "200", "application/octet-stream", _BINARY),
+        ({"response_model": {404: _Problem, ...: str}}, None, (201, "made"), "default", "text/plain", _TEXT),
+    ],
+    ids=[
+        "optional-str",
+        "optional-str-none",
+        "optional-bytes",
+        "str-or-struct",
+        "str-or-struct-struct",
+        "str-or-struct-or-none",
+        "response-model-optional-str",
+        "map-str",
+        "map-str-other-status",
+        "map-second-status-str",
+        "map-bytes",
+        "map-catch-all-str",
+    ],
+)
+def test_str_or_bytes_in_a_union_or_a_response_map_documents_the_media_type_that_the_route_sends(
+    route_kwargs, return_type, value, status, sent_media_type, expected
+):
+    api = BoltAPI(openapi_config=_config())
+
+    async def thing():
+        return value
+
+    if return_type is not None:
+        thing.__annotations__["return"] = return_type
+    api.get("/thing", **route_kwargs)(thing)
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        content = _ok_response(client.get("/docs/openapi.json").json(), "/thing", status=status)["content"]
+        sent = client.get("/thing")
+
+    assert sent.headers["content-type"].split(";")[0] == sent_media_type
+    assert sent_media_type in content
+    documented = {media_type: media["schema"] for media_type, media in content.items()}
+    assert documented == (expected or _PROBLEM_JSON)
+
+
 # ---------------------------------------------------------------------------
 # #290 — strict mode
 # ---------------------------------------------------------------------------
