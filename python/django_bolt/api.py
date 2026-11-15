@@ -50,6 +50,7 @@ from .concurrency import (
     LaneAffinityError,
     _drop_broken_connections_after_error,
     _thread_state,
+    check_connections_before_sync_dispatch,
     release_pooled_connections_after_sync_dispatch,
     run_in_orm_executor,
     run_on_request_lane,
@@ -3784,7 +3785,14 @@ class BoltAPI:
         if meta["can_lane_dispatch"]:
             return run_on_request_lane(self._dispatch, handler, request, handler_id)
 
+        # One thread-local read for each request. The flags are plain attributes.
+        connection_flags = _thread_state.connections
         try:
+            # A thread that opened a connection can hold one that another thread
+            # found dead, or one that CONN_MAX_AGE or CONN_HEALTH_CHECKS must check.
+            if connection_flags.opened:
+                check_connections_before_sync_dispatch()
+
             # Lazy user loading: only set when auth context has a user_id.
             # Skip setting user=None — PyRequest.user getter already returns None.
             if meta["_has_auth_backends"] and (auth_context := request.get("auth")):
@@ -3807,7 +3815,7 @@ class BoltAPI:
         finally:
             # A handler that ran the ORM inline on this thread holds a pooled
             # connection. An idle worker thread must not keep a pool slot.
-            if _thread_state.holds_pooled:
+            if connection_flags.holds_pooled:
                 release_pooled_connections_after_sync_dispatch()
             if meta["has_file_uploads"]:
                 upload_files = request.state.get("_upload_files", [])

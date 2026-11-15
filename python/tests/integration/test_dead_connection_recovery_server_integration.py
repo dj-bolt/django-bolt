@@ -521,6 +521,39 @@ def test_a_sync_handler_on_the_worker_thread_gives_its_pooled_connection_back(ma
             assert query_each_orm_thread(server, 1) == ["ok"]
 
 
+@pytest.mark.parametrize(
+    "database_options",
+    [
+        pytest.param({}, id="default"),
+        pytest.param({"CONN_MAX_AGE": 600, "CONN_HEALTH_CHECKS": True}, id="health-checks"),
+    ],
+)
+def test_a_sync_handler_on_the_worker_thread_reconnects_before_its_request(
+    make_server_project, postgres_database, database_options
+):
+    """A sync handler with no query in its own source runs on the worker thread, and its helper queries there.
+
+    The worker thread keeps that connection between requests. With the default
+    settings, the ORM thread meets the first dead connection, and each thread
+    then reconnects before its next call. With ``CONN_HEALTH_CHECKS``, the
+    check before the request replaces the dead connection. In both cases, no
+    request of the handler fails.
+    """
+    server, application_name = start_server(make_server_project, postgres_database, **database_options)
+    with server:
+        for _ in range(8):
+            assert server.get("/query-in-a-helper").status_code == 200
+        assert query_each_orm_thread(server, 1) == ["ok"]
+
+        killed = terminate_backends(postgres_database, application_name)
+        assert killed >= 2, "the worker thread and the ORM thread must each keep a connection"
+
+        if not database_options:
+            assert query_each_orm_thread(server, 1) == ["OperationalError"]
+        statuses = [server.get("/query-in-a-helper").status_code for _ in range(8)]
+        assert statuses == [200] * 8, statuses
+
+
 def test_a_lane_keeps_its_pooled_connection_until_its_request_ends(make_server_project, postgres_database):
     """A request with Django middleware runs its ORM calls on its lane.
 
