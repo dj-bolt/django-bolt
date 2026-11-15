@@ -351,12 +351,9 @@ class WebSocketTestClient:
             # Build request dict from scope (same as Rust's build_websocket_request call)
             request = build_websocket_request(scope)
 
-            # Call the pre-compiled injector to get (args, kwargs)
-            injector = meta["injector"]
-            if meta.get("injector_is_async", False):
-                args, kwargs = await injector(request)
-            else:
-                args, kwargs = injector(request)
+            # Call the pre-compiled injector to get (args, kwargs). The server
+            # calls it with no await, so this client does the same.
+            args, kwargs = meta["injector"](request)
 
             # Prepend websocket to args (same as Rust does)
             args = [ws] + list(args)

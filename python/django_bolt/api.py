@@ -235,6 +235,25 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
     return execute
 
 
+def _defer_async_websocket_injector(handler: Callable, injector: Callable) -> tuple[Callable, Callable]:
+    """Return a handler and a sync injector that run ``injector`` in the handler coroutine.
+
+    The WebSocket handshake calls the injector of a route with no await. The
+    returned injector only passes the request on. The returned handler awaits
+    ``injector`` and then calls ``handler``.
+    """
+
+    @functools.wraps(handler)
+    async def handler_with_injector(websocket: Any, request: dict[str, Any]) -> Any:
+        args, kwargs = await injector(request)
+        return await handler(websocket, *args, **kwargs)
+
+    def pass_request(request: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        return (request,), {}
+
+    return handler_with_injector, pass_request
+
+
 def _normalize_path(path: str, trailing_slash: str = "strip") -> str:
     """Normalize a path based on trailing slash mode.
 
@@ -1060,8 +1079,6 @@ class BoltAPI:
             # Build full path with prefix
             full_path = f"{self.prefix}{path}" if self.prefix else path
 
-            # Store the route
-            self._websocket_routes.append((full_path, handler_id, fn))
             self._handlers[handler_id] = fn
 
             # Compile parameter binder for WebSocket (reuses HTTP binding logic)
@@ -1087,9 +1104,16 @@ class BoltAPI:
 
             # Compile optimized argument injector (same as HTTP handlers)
             injector = self._compile_argument_injector(meta)
+            route_handler = fn
+            if inspect.iscoroutinefunction(injector):
+                # An async dependency makes the injector async. The handshake
+                # calls the injector with no await.
+                route_handler, injector = _defer_async_websocket_injector(fn, injector)
             meta["injector"] = injector
-            meta["injector_is_async"] = inspect.iscoroutinefunction(injector)
+            meta["injector_is_async"] = False
 
+            # Store the route
+            self._websocket_routes.append((full_path, handler_id, route_handler))
             self._handler_meta[handler_id] = meta
 
             # Django middleware does not run on a WebSocket, so no code could
