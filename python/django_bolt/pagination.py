@@ -30,7 +30,8 @@ from functools import wraps
 from typing import Any, Generic, TypeVar, get_args, get_origin
 
 import msgspec
-from django.db.models import CompositePrimaryKey, F
+from django.core.exceptions import FieldDoesNotExist, ValidationError
+from django.db.models import CompositePrimaryKey, F, Field
 from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, TupleLessThan
 
 from . import _json
@@ -49,6 +50,40 @@ __all__ = [
 ]
 
 T = TypeVar("T")
+# A cursor uses the URL-safe base64 alphabet. A cursor from an earlier release has "+" and "/".
+_URL_SAFE_TO_STANDARD = str.maketrans("-_", "+/")
+
+
+def _cursor_field(model: Any, name: str) -> Any:
+    """Return the model field that a cursor value must fit. Return None when ``name`` is not a model field."""
+    if name == "pk":
+        return model._meta.pk
+    try:
+        field = model._meta.get_field(name)
+    except FieldDoesNotExist:
+        return None
+    # A reverse relation is not a Field and has no get_prep_value().
+    return field if isinstance(field, Field) else None
+
+
+def _field_accepts(field: Any, value: Any) -> bool:
+    """Return True when a lookup on ``field`` can use ``value``. A cursor value comes from the client."""
+    if field is None:
+        return True
+    if isinstance(field, CompositePrimaryKey):
+        # The cursor holds a list with one value for each column of the key.
+        columns = field.fields
+        return (
+            isinstance(value, list)
+            and len(value) == len(columns)
+            and all(_field_accepts(column, item) for column, item in zip(columns, value, strict=True))
+        )
+    try:
+        # The lookup makes the same call. Without this check, its error is a 500.
+        field.get_prep_value(value)
+    except (ValueError, TypeError, ValidationError):
+        return False
+    return True
 
 
 class PaginatedResponse(msgspec.Struct, Generic[T], omit_defaults=True):  # noqa: UP046 — PEP 695 params are unresolvable under PEP 563
@@ -58,18 +93,24 @@ class PaginatedResponse(msgspec.Struct, Generic[T], omit_defaults=True):  # noqa
     Uses omit_defaults=True so only relevant fields are included in response:
     - PageNumberPagination: page, page_size, total_pages, next_page, previous_page
     - LimitOffsetPagination: limit, offset
-    - CursorPagination: next_cursor, previous_cursor
+    - CursorPagination: page_size, next_cursor
 
     Attributes:
         items: List of paginated items
         total: Total number of items across all pages
         has_next: Whether there is a next page (always included)
-        has_previous: Whether there is a previous page (always included)
+        has_previous: Whether there is a previous page (always included).
+            For CursorPagination, it is True when the request has a valid cursor.
+            A cursor page gives no cursor to go back.
         page: Current page number (for PageNumber pagination)
         page_size: Number of items per page
         total_pages: Total number of pages
         next_page: Next page number (None if no next page)
         previous_page: Previous page number (None if no previous page)
+        limit: Number of items requested (for LimitOffset pagination)
+        offset: Position of the first item (for LimitOffset pagination)
+        next_cursor: Cursor of the next page (for Cursor pagination, None if no next page)
+        previous_cursor: Not set by the built-in schemes. A custom scheme can set it.
     """
 
     # Required fields (always included in response)
@@ -164,7 +205,7 @@ class PaginationBase(ABC):
         """Build the envelope for one page.
 
         ``info`` carries the scheme-specific fields (page/page_size/total_pages/
-        next_page/previous_page, limit/offset, next_cursor/previous_cursor).
+        next_page/previous_page, limit/offset, page_size/next_cursor).
         Override to return an instance of a custom ``response_class``.
         """
         return self.response_class(items=items, total=total, has_next=has_next, has_previous=has_previous, **info)
@@ -430,9 +471,9 @@ class PageNumberPagination(PaginationBase):
         # Calculate total pages
         total_pages = (total + page_size - 1) // page_size if total > 0 else 0
 
-        # Validate page number
-        if page_number > total_pages and total_pages > 0:
-            page_number = total_pages
+        # A page after the last page is the last page. With no rows, it is page 1.
+        if page_number > total_pages:
+            page_number = max(total_pages, 1)
 
         # Calculate offset
         offset = (page_number - 1) * page_size
@@ -526,8 +567,12 @@ class LimitOffsetPagination(PaginationBase):
         # Get total count
         total = await self._get_queryset_count(queryset)
 
-        # Slice queryset and get raw items
-        raw_items = await self._evaluate_queryset_slice(queryset[offset : offset + limit])
+        # An offset at or after the end selects no row, so it needs no query.
+        # The database also refuses an offset that does not fit its integer type.
+        if offset >= total:
+            raw_items = []
+        else:
+            raw_items = await self._evaluate_queryset_slice(queryset[offset : offset + limit])
 
         # Serialize items using efficient batch serialization
         items = await self._serialize_items(raw_items)
@@ -578,34 +623,38 @@ class CursorPagination(PaginationBase):
 
     def _encode_cursor(self, value: Any, pk: Any = None) -> str:
         """
-        Encode cursor position to base64 string.
+        Encode cursor position to a URL-safe base64 string.
 
         Args:
             value: Ordering value of the last row
             pk: Primary key of the last row. None when the ordering field is the primary key.
 
         Returns:
-            Base64-encoded cursor string
+            Cursor string. A client can put it into a query string with no percent-encoding.
         """
         cursor_data = _json.encode({"v": value} if pk is None else {"v": value, "pk": pk})
-        return base64.b64encode(cursor_data).decode("utf-8")
+        return base64.urlsafe_b64encode(cursor_data).decode("ascii")
 
     def _decode_cursor(self, cursor: str) -> tuple[Any, Any]:
         """
         Decode cursor string to position.
 
         Args:
-            cursor: Base64-encoded cursor string
+            cursor: Cursor string in the URL-safe or the standard base64 alphabet
 
         Returns:
             (ordering value, primary key). Each is None when the cursor does not hold it.
+            A cursor that is not base64 of a JSON object gives (None, None).
         """
         try:
-            cursor_data = base64.b64decode(cursor.encode("utf-8"))
-            data = msgspec.json.decode(cursor_data)
-            return data.get("v"), data.get("pk")
-        except Exception:
+            data = msgspec.json.decode(base64.b64decode(cursor.translate(_URL_SAFE_TO_STANDARD)))
+        except (ValueError, RecursionError):
+            # ValueError includes binascii.Error, UnicodeError and msgspec.DecodeError.
+            # JSON with too many levels raises RecursionError.
             return None, None
+        if not isinstance(data, dict):
+            return None, None
+        return data.get("v"), data.get("pk")
 
     async def get_page_params(self, request: dict[str, Any]) -> dict[str, Any]:
         """Extract cursor and page_size from request."""
@@ -652,6 +701,13 @@ class CursorPagination(PaginationBase):
         else:
             ordered_qs = queryset.order_by(ordering)
 
+        # A value that its field cannot use means no cursor, as a cursor that does not decode.
+        if cursor_value is not None and not (
+            _field_accepts(_cursor_field(queryset.model, ordering_field), cursor_value)
+            and (cursor_pk is None or not tie_break or _field_accepts(pk_field, cursor_pk))
+        ):
+            cursor_value = None
+
         # Apply cursor filter if present
         if cursor_value is not None:
             # Descending order continues with smaller values, ascending with larger values.
@@ -685,12 +741,16 @@ class CursorPagination(PaginationBase):
             last_item = raw_items[-1]
             # Items are raw (Django models or dicts from values()), get cursor value
             if isinstance(last_item, dict):
-                if ordering_field not in last_item:
+                value_key = ordering_field
+                if not tie_break and ordering_field not in last_item:
+                    # The ordering field is the primary key. The row can have it as the column name or as "pk".
+                    value_key = pk_field.attname if pk_field.attname in last_item else "pk"
+                if value_key not in last_item:
                     raise ValueError(
                         f"CursorPagination ordering {ordering!r} needs {ordering_field!r} in values() "
                         f"to make the next cursor."
                     )
-                last_value = last_item[ordering_field]
+                last_value = last_item[value_key]
                 last_pk = last_item.get(pk_field.attname, last_item.get("pk"))
             else:
                 last_value = getattr(last_item, ordering_field, None)
@@ -734,6 +794,11 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     The decorated handler should return a Django QuerySet or list.
     The decorator will automatically apply pagination and return a PaginatedResponse.
 
+    The handler can be async or sync. Bolt calls a sync handler on the event loop.
+    Thus a sync handler must return a lazy QuerySet or a list. If it runs a query,
+    Django raises ``SynchronousOnlyOperation``. The pagination runs the queries of
+    the QuerySet on the ORM executor.
+
     When used with response_model or return type annotation like list[UserSerializer],
     the serializer will be used for efficient batch serialization via dump_many().
 
@@ -762,6 +827,8 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     """
 
     def decorator(handler: Callable) -> Callable:
+        # The route decorator uses the same test for is_async.
+        handler_is_async = inspect.iscoroutinefunction(handler)
         # Store original handler for introspection
         original_handler = handler
         signature, request_getter, added_request_index = _compile_request_getter(original_handler)
@@ -787,7 +854,9 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
 
             # Call original handler to get queryset
             # Pass all args along (including self for methods)
-            queryset = await handler(*args, **kwargs)
+            queryset = handler(*args, **kwargs)
+            if handler_is_async:
+                queryset = await queryset
 
             # Apply pagination using dict version
             paginated = await cached_paginator.paginate_queryset(queryset, request)

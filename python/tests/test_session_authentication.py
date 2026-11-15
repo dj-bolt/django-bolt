@@ -7,11 +7,15 @@ guards of the route against ``request.user``.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from django.contrib.auth import alogin
 from django.contrib.auth.models import Permission, User
+from django.contrib.sessions.models import Session
 from django.core.exceptions import ImproperlyConfigured
 from django.test import override_settings
+from django.utils import timezone
 
 from django_bolt import BoltAPI, CurrentUser, Request, Router
 from django_bolt.auth import (
@@ -24,11 +28,15 @@ from django_bolt.auth import (
 )
 from django_bolt.auth.session import auth_without_session
 from django_bolt.concurrency import in_lane_mode
+from django_bolt.error_handlers import problem_details
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.testing import TestClient, WebSocketTestClient
 
+from .test_models import User as UserWithoutSuperuser
+
 SAME_ORIGIN = {"sec-fetch-site": "same-origin"}
+TOKEN_SECRET = "session-test-secret-of-32-bytes!!"
 
 
 def _add_login(api: BoltAPI) -> None:
@@ -108,6 +116,53 @@ def test_requires_is_staff_checks_the_django_user():
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("error_formatter", [None, problem_details], ids=["default", "problem-details"])
+def test_a_session_rejection_is_the_same_response_as_a_rejection_in_rust(error_formatter):
+    """Python rejects a request with a session cookie. A client gets the response that Rust sends."""
+    api = BoltAPI(error_formatter=error_formatter)
+    _add_login(api)
+
+    @api.get("/me", auth=[SessionAuthentication()], guards=[IsAuthenticated()])
+    async def me():
+        return {"ok": True}
+
+    # Rust checks the guards of a token request, and Python those of a session request.
+    @api.get(
+        "/staff",
+        auth=[JWTAuthentication(), SessionAuthentication()],
+        guards=[Requires("is_staff", True, message="Staff only")],
+    )
+    async def staff():
+        return {"ok": True}
+
+    user = User.objects.create_user(username="session_member", password="pw-for-tests")
+    with TestClient(api) as client:
+        rust_401 = client.get("/me")
+        python_401 = client.get("/me", headers={"cookie": "sessionid=not-a-session"})
+        token = create_jwt_for_user(user)
+        rust_403 = client.get("/staff", headers={"authorization": f"Bearer {token}"})
+        _login(client, "session_member")
+        python_403 = client.get("/staff")
+
+    def seen(response):
+        return (
+            response.status_code,
+            response.headers["content-type"],
+            response.json(),
+            response.headers.get("www-authenticate"),
+        )
+
+    assert seen(python_401) == seen(rust_401)
+    assert seen(python_403) == seen(rust_403)
+    if error_formatter is None:
+        assert seen(python_401) == (401, "application/json", {"detail": "Authentication required"}, "Bearer")
+        assert seen(python_403) == (403, "application/json", {"detail": "Staff only"}, None)
+    else:
+        assert python_401.headers["content-type"] == "application/problem+json"
+        assert python_403.json()["detail"] == "Staff only"
+
+
+@pytest.mark.django_db(transaction=True)
 def test_requires_permissions_checks_the_django_user():
     api = BoltAPI()
     _add_login(api)
@@ -140,6 +195,76 @@ def test_requires_permissions_checks_the_django_user():
 
 
 @pytest.mark.django_db(transaction=True)
+def test_requires_reads_is_superuser_and_sub_of_the_django_user_and_no_other_claim():
+    api = BoltAPI()
+    _add_login(api)
+    User.objects.create_user(username="session_only_staff", password="pw-for-tests", is_staff=True)
+    superuser = User.objects.create_superuser(username="session_root", password="pw-for-tests")
+
+    @api.get("/root", auth=[SessionAuthentication()], guards=[Requires("is_superuser", True)])
+    async def root():
+        return {"ok": True}
+
+    # ``sub`` is the primary key of the user, as in a token.
+    @api.get("/owner", auth=[SessionAuthentication()], guards=[Requires("sub", str(superuser.pk))])
+    async def owner():
+        return {"ok": True}
+
+    @api.get(
+        "/tenant",
+        auth=[JWTAuthentication(secret=TOKEN_SECRET), SessionAuthentication()],
+        guards=[Requires("tenant_id", message="Use a tenant token")],
+    )
+    async def tenant():
+        return {"ok": True}
+
+    token = create_jwt_for_user(superuser, secret=TOKEN_SECRET, extra_claims={"tenant_id": "t1"})
+    with TestClient(api) as staff_client, TestClient(api) as root_client, TestClient(api) as token_client:
+        _login(staff_client, "session_only_staff")
+        _login(root_client, "session_root")
+        staff_root = staff_client.get("/root")
+        assert staff_client.get("/owner").status_code == 403
+        assert root_client.get("/root").status_code == 200
+        assert root_client.get("/owner").status_code == 200
+        # A session user has no ``tenant_id`` claim, also a superuser.
+        root_tenant = root_client.get("/tenant")
+        # Rust checked the claim of the token. Python does not check the token user as a session user.
+        assert token_client.get("/tenant", headers={"authorization": f"Bearer {token}"}).status_code == 200
+
+    assert (staff_root.status_code, staff_root.json()) == (403, {"detail": "Permission denied"})
+    assert (root_tenant.status_code, root_tenant.json()) == (403, {"detail": "Use a tenant token"})
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("change", ["inactive", "deleted", "expired"])
+def test_a_session_that_django_accepts_no_more_gets_401(change):
+    """Django loads the user for each request. An old cookie gives no access."""
+    api = BoltAPI()
+    _add_login(api)
+
+    # The handler reads no user. Only the guard check can reject the request.
+    @api.get("/page", auth=[SessionAuthentication()], guards=[IsAuthenticated()])
+    async def page():
+        return {"ok": True}
+
+    user = User.objects.create_user(username="session_leaver", password="pw-for-tests")
+    with TestClient(api) as client:
+        _login(client, "session_leaver")
+        assert client.get("/page").status_code == 200
+        if change == "inactive":
+            User.objects.filter(pk=user.pk).update(is_active=False)
+        elif change == "deleted":
+            user.delete()
+        else:
+            Session.objects.filter(session_key=client.cookies["sessionid"]).update(
+                expire_date=timezone.now() - timedelta(seconds=1)
+            )
+        response = client.get("/page")
+
+    assert (response.status_code, response.json()) == (401, {"detail": "Authentication required"})
+
+
+@pytest.mark.django_db(transaction=True)
 def test_login_url_redirects_an_anonymous_request():
     api = BoltAPI()
 
@@ -152,6 +277,38 @@ def test_login_url_redirects_an_anonymous_request():
 
     assert response.status_code == 302, response.text
     assert response.headers["location"] == "/accounts/login/?next=/page%3Ftab%3D1"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_login_url_redirects_only_a_request_with_no_user():
+    """A user that a guard rejects gets 403. The login page cannot help that user."""
+    api = BoltAPI()
+    _add_login(api)
+
+    # The session backend is the second backend. Rust reports its position.
+    @api.get(
+        "/staff",
+        auth=[
+            JWTAuthentication(secret=TOKEN_SECRET),
+            SessionAuthentication(login_url="/accounts/login/"),
+        ],
+        guards=[Requires("is_staff", True)],
+    )
+    async def staff():
+        return {"ok": True}
+
+    User.objects.create_user(username="session_no_staff", password="pw-for-tests")
+    with TestClient(api) as client:
+        stale = client.get("/staff", headers={"cookie": "sessionid=not-a-session"}, follow_redirects=False)
+        _login(client, "session_no_staff")
+        rejected = client.get("/staff", follow_redirects=False)
+
+    assert stale.status_code == 302, stale.text
+    assert stale.headers["location"] == "/accounts/login/?next=/staff"
+    # The redirect has no body, so it has no content type.
+    assert stale.content == b""
+    assert "content-type" not in stale.headers
+    assert (rejected.status_code, rejected.json()) == (403, {"detail": "Permission denied"})
 
 
 @pytest.mark.django_db(transaction=True)
@@ -382,6 +539,32 @@ def test_none_of_on_a_claim_that_a_session_user_lacks_is_an_error():
         @api.get("/page", auth=[SessionAuthentication()], guards=[Requires("role", none_of=["banned"])])
         async def page():
             return {"ok": True}
+
+
+@pytest.mark.parametrize(
+    ("guard", "message"),
+    [
+        (Requires("is_superuser", True), "reads is_superuser"),
+        (Requires("permissions", "auth.view_user"), "reads permissions"),
+        (Requires("is_staff", True), None),
+    ],
+    ids=["is_superuser", "permissions", "is_staff"],
+)
+def test_a_guard_that_reads_a_field_that_the_user_model_lacks_is_an_error(guard, message):
+    """The user model of the test has ``is_staff`` only. Startup fails for the other fields."""
+    api = BoltAPI()
+
+    def add_route():
+        @api.get("/page", auth=[SessionAuthentication()], guards=[guard])
+        async def page():
+            return {"ok": True}
+
+    with override_settings(AUTH_USER_MODEL=UserWithoutSuperuser._meta.label):
+        if message is None:
+            add_route()
+        else:
+            with pytest.raises(ImproperlyConfigured, match=message):
+                add_route()
 
 
 @pytest.mark.asyncio

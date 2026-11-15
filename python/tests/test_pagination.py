@@ -7,6 +7,7 @@ No mocking - tests the full integration stack.
 
 import base64
 from datetime import UTC, datetime
+from typing import Generic, TypeVar
 from urllib.parse import quote
 
 import msgspec
@@ -44,6 +45,16 @@ class ArticleListSchema(msgspec.Struct):
     id: int
     title: str
     author: str
+
+
+T = TypeVar("T")
+
+
+class PathPage(msgspec.Struct, Generic[T]):  # noqa: UP046 — PEP 695 params are unresolvable under PEP 563
+    """Envelope that shows the request path. Only build_response() can fill it."""
+
+    path: str
+    results: list[T]
 
 
 # ============================================================================
@@ -204,6 +215,65 @@ def test_page_number_pagination_empty_results(db):
 
 
 @pytest.mark.django_db(transaction=True)
+def test_pagination_page_or_offset_beyond_the_data(db):
+    """A page or an offset after the last row gives an empty page. A very large number is not a server error."""
+    for number in range(7):
+        Article.objects.create(title=f"Article {number}", content="content", author="author")
+    api = BoltAPI()
+
+    @api.get("/none/page")
+    @paginate(PageNumberPagination)
+    async def page_of_no_rows(request):
+        return Article.objects.filter(author="nobody")
+
+    @api.get("/none-list/page")
+    @paginate(PageNumberPagination)
+    async def page_of_empty_list(request):
+        return []
+
+    @api.get("/all/offset")
+    @paginate(LimitOffsetPagination)
+    async def offset_of_rows(request):
+        return Article.objects.all()
+
+    @api.get("/all-list/offset")
+    @paginate(LimitOffsetPagination)
+    async def offset_of_list(request):
+        return [{"id": number} for number in range(7)]
+
+    with TestClient(api) as client:
+        # With no rows, each page number is page 1. There is no page before it.
+        for path in ("/none/page", "/none-list/page"):
+            first_page = client.get(path).json()
+            assert first_page == {
+                "items": [],
+                "total": 0,
+                "has_next": False,
+                "has_previous": False,
+                "page": 1,
+                "page_size": 100,
+                "total_pages": 0,
+            }
+            assert client.get(f"{path}?page=3").json() == first_page
+            # The row offset of this page does not fit the integer of the database.
+            assert client.get(f"{path}?page={2**64}").json() == first_page
+
+        # An offset after the last row gives no items. The response shows the offset of the request.
+        for path in ("/all/offset", "/all-list/offset"):
+            for offset in (100, 2**63):
+                response = client.get(f"{path}?limit=2&offset={offset}")
+                assert response.status_code == 200, response.text
+                assert response.json() == {
+                    "items": [],
+                    "total": 7,
+                    "has_next": False,
+                    "has_previous": True,
+                    "limit": 2,
+                    "offset": offset,
+                }
+
+
+@pytest.mark.django_db(transaction=True)
 def test_page_number_pagination_with_filtering(sample_articles):
     """Test pagination with queryset filtering"""
     api = BoltAPI()
@@ -283,6 +353,34 @@ def test_page_number_pagination_with_ordering(sample_articles):
         # Alphabetical ordering: Article 1, Article 10, Article 11, ..., Article 19, Article 2, ...
         assert data["items"][0]["title"] == "Article 1"
         assert data["items"][1]["title"] == "Article 10"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_paginate_accepts_a_sync_handler(sample_articles):
+    """A sync handler under @paginate gives the same page as an async handler."""
+    api = BoltAPI()
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 10
+
+    @api.get("/sync")
+    @paginate(SmallPagePagination)
+    def list_sync(request):
+        return Article.objects.order_by("id")
+
+    @api.get("/async")
+    @paginate(SmallPagePagination)
+    async def list_async(request):
+        return Article.objects.order_by("id")
+
+    with TestClient(api) as client:
+        response = client.get("/sync?page=2")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert (data["page"], data["total"]) == (2, 50)
+        assert [item["title"] for item in data["items"]] == [f"Article {i}" for i in range(11, 21)]
+        assert data == client.get("/async?page=2").json()
 
 
 # ============================================================================
@@ -744,7 +842,7 @@ def test_cursor_pagination_ordering_by_title(sample_articles):
         assert data["items"][0]["title"] == "Article 1"
 
 
-def _walk_cursor_pages(client, path):
+def _walk_cursor_pages(client, path, key="id"):
     """Follow next_cursor from the first page to the last page. Return the item IDs in order."""
     ids = []
     url = path
@@ -752,7 +850,7 @@ def _walk_cursor_pages(client, path):
         response = client.get(url)
         assert response.status_code == 200, response.content
         data = response.json()
-        ids.extend(item["id"] for item in data["items"])
+        ids.extend(item[key] for item in data["items"])
         cursor = data.get("next_cursor")
         if cursor is None:
             return ids
@@ -809,8 +907,12 @@ def test_cursor_pagination_keeps_rows_with_equal_datetimes(sample_articles):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_cursor_pagination_keeps_tied_rows_with_values_queryset(sample_articles):
-    """A values() queryset that includes the primary key pages through tied values without gaps."""
+@pytest.mark.parametrize("pk_name", ["id", "pk"])
+def test_cursor_pagination_keeps_tied_rows_with_values_queryset(sample_articles, pk_name):
+    """A values() queryset that includes the primary key pages through tied values without gaps.
+
+    The primary key can have its column name or the name "pk".
+    """
     api = BoltAPI()
 
     class AuthorCursorPagination(CursorPagination):
@@ -820,10 +922,10 @@ def test_cursor_pagination_keeps_tied_rows_with_values_queryset(sample_articles)
     @api.get("/articles")
     @paginate(AuthorCursorPagination)
     async def list_articles(request):
-        return Article.objects.values("id", "title", "author")
+        return Article.objects.values(pk_name, "title", "author")
 
     with TestClient(api) as client:
-        ids = _walk_cursor_pages(client, "/articles")
+        ids = _walk_cursor_pages(client, "/articles", key=pk_name)
 
     assert ids == list(Article.objects.order_by("author", "pk").values_list("pk", flat=True))
 
@@ -869,15 +971,22 @@ def test_cursor_pagination_keeps_tied_rows_with_a_composite_primary_key(db):
         return Release.objects.all()
 
     expected = [f"{r.product}:{r.version}" for r in Release.objects.order_by("channel", "pk")]
+    legacy_cursor = base64.b64encode(b'{"v":"beta"}').decode()
     with TestClient(api) as client:
         pages = []
         url = "/release-models"
-        while url:
+        for _ in range(len(expected)):  # A cursor that does not move must not hang the test.
             data = client.get(url).json()
             pages.extend(f"{item['product']}:{item['version']}" for item in data["items"])
-            url = f"/release-models?cursor={quote(data['next_cursor'])}" if data.get("next_cursor") else None
+            if not data.get("next_cursor"):
+                break
+            url = f"/release-models?cursor={quote(data['next_cursor'])}"
+
+        # A cursor from before the tie-breaker holds no primary key. It continues after its value.
+        legacy_page = client.get(f"/release-models?cursor={quote(legacy_cursor)}").json()
 
     assert pages == expected
+    assert [f"{item['product']}:{item['version']}" for item in legacy_page["items"]] == expected[6:10]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -928,6 +1037,101 @@ def test_cursor_pagination_accepts_a_cursor_without_a_primary_key(sample_article
 
 
 @pytest.mark.django_db(transaction=True)
+def test_cursor_pagination_cursor_needs_no_percent_encoding(db):
+    """A client can put next_cursor into the query string as it is."""
+    # In the standard base64 alphabet, the cursors of these titles have "+" and "/".
+    # A "+" in a query string is a space, so such a cursor did not decode.
+    for title in ("ab>", "ab?", "ac"):
+        Article.objects.create(title=title, content="content", author="author")
+    api = BoltAPI()
+
+    class TitleCursorPagination(CursorPagination):
+        page_size = 1
+        ordering = "title"
+
+    @api.get("/articles")
+    @paginate(TitleCursorPagination)
+    async def list_articles(request):
+        return Article.objects.all()
+
+    with TestClient(api) as client:
+        titles = []
+        url = "/articles"
+        for _ in range(4):
+            data = client.get(url).json()
+            titles.extend(item["title"] for item in data["items"])
+            if "next_cursor" not in data:
+                break
+            url = f"/articles?cursor={data['next_cursor']}"
+        assert titles == ["ab>", "ab?", "ac"]
+
+        # A client can hold a cursor in the standard alphabet from an earlier release.
+        first_pk = Article.objects.get(title="ab>").pk
+        legacy_cursor = base64.b64encode(b'{"v":"ab>","pk":%d}' % first_pk).decode()
+        assert "+" in legacy_cursor
+        response = client.get(f"/articles?cursor={quote(legacy_cursor)}")
+        assert [item["title"] for item in response.json()["items"]] == ["ab?"]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("path", "cursor_json"),
+    [
+        ("/by-id", b'{"v":"x"}'),
+        ("/by-id", b'{"v":[1]}'),
+        ("/by-id", b'"x"'),
+        ("/by-id", b"[1]"),
+        ("/by-author", b'{"v":"Author 1","pk":"x"}'),
+        ("/by-author", b'{"v":"Author 1","pk":[1]}'),
+        ("/by-channel", b'{"v":"stable","pk":["api","x"]}'),
+        ("/by-channel", b'{"v":"stable","pk":["api"]}'),
+    ],
+)
+def test_cursor_pagination_cursor_with_a_wrong_value_gives_the_first_page(sample_articles, path, cursor_json):
+    """A cursor that decodes to a value of the wrong type is no cursor. It is not a server error."""
+    for version in range(1, 5):
+        Release.objects.create(product="api", version=version, channel="stable")
+    api = BoltAPI()
+
+    class IdCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "-id"
+
+    class AuthorCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "author"
+
+    class ChannelCursorPagination(CursorPagination):
+        page_size = 3
+        ordering = "channel"
+
+    @api.get("/by-id")
+    @paginate(IdCursorPagination)
+    async def list_by_id(request):
+        return Article.objects.all()
+
+    @api.get("/by-author")
+    @paginate(AuthorCursorPagination)
+    async def list_by_author(request):
+        return Article.objects.all()
+
+    @api.get("/by-channel")
+    @paginate(ChannelCursorPagination)
+    async def list_by_channel(request):
+        return Release.objects.all()  # a composite primary key
+
+    cursor = base64.urlsafe_b64encode(cursor_json).decode()
+    with TestClient(api) as client:
+        first_page = client.get(path)
+        response = client.get(f"{path}?cursor={cursor}")
+
+    assert first_page.status_code == 200
+    assert len(first_page.json()["items"]) == 3
+    assert response.status_code == 200, response.text
+    assert response.json() == first_page.json()
+
+
+@pytest.mark.django_db(transaction=True)
 def test_cursor_pagination_multiple_pages_continuity(sample_articles):
     """Test that cursor pagination maintains continuity across pages"""
     api = BoltAPI()
@@ -965,6 +1169,38 @@ def test_cursor_pagination_multiple_pages_continuity(sample_articles):
 
         # Ensure ordering is maintained (descending IDs)
         assert all_ids == sorted(all_ids, reverse=True)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("ordering", "key"),
+    [("-pk", "id"), ("pk", "id"), ("-id", "pk")],
+)
+def test_cursor_pagination_finds_the_primary_key_of_a_values_row_by_each_name(sample_articles, ordering, key):
+    """An ordering by the primary key reads it from a values() row as "pk" or as the column name."""
+    api = BoltAPI()
+
+    class PkCursorPagination(CursorPagination):
+        page_size = 20
+
+    PkCursorPagination.ordering = ordering
+
+    @api.get("/articles")
+    @paginate(PkCursorPagination)
+    async def list_articles(request):
+        return Article.objects.values(key, "title")
+
+    ids = []
+    url = "/articles"
+    with TestClient(api) as client:
+        for _ in range(3):
+            response = client.get(url)
+            assert response.status_code == 200, response.content
+            data = response.json()
+            ids.extend(item[key] for item in data["items"])
+            url = f"/articles?cursor={quote(data.get('next_cursor') or '')}"
+
+    assert ids == list(Article.objects.order_by(ordering).values_list("pk", flat=True))
 
 
 # ============================================================================
@@ -1202,6 +1438,166 @@ def test_pagination_zero_page_size_uses_default(sample_articles):
 
         data = response.json()
         assert data["page_size"] == 10  # Default
+
+
+@pytest.mark.django_db(transaction=True)
+def test_pagination_boundary_values_of_the_query_parameters(db):
+    """The smallest and the last valid values work. Values that are not valid give the defaults."""
+    for number in range(1, 6):
+        Article.objects.create(title=f"a{number}", content="c", author="x", is_published=True)
+    api = BoltAPI()
+
+    class PagePagination(PageNumberPagination):
+        page_size = 2
+        max_page_size = 5
+
+    class OffsetPagination(LimitOffsetPagination):
+        page_size = 2
+        max_page_size = 5
+
+    @api.get("/page")
+    @paginate(PagePagination)
+    async def list_by_page(request):
+        return Article.objects.order_by("id")
+
+    @api.get("/offset")
+    @paginate(OffsetPagination)
+    async def list_by_offset(request):
+        return Article.objects.order_by("id")
+
+    page_1 = {"titles": ["a1", "a2"], "page": 1, "page_size": 2, "has_previous": False, "previous_page": None}
+    first_2 = {"titles": ["a1", "a2"], "limit": 2, "offset": 0, "has_previous": False}
+    cases = {
+        # Page number: a page below 1 is page 1.
+        "/page?page=0": page_1,
+        "/page?page=-3": page_1,
+        "/page?page=2": {"titles": ["a3", "a4"], "page": 2, "previous_page": 1, "next_page": 3},
+        "/page?page=3": {"titles": ["a5"], "page": 3, "has_next": False, "next_page": None},
+        # A page after the only page is that page.
+        "/page?page=9&page_size=5": {"titles": ["a1", "a2", "a3", "a4", "a5"], "page": 1, "total_pages": 1},
+        "/page?page_size=1": {"titles": ["a1"], "page_size": 1, "total_pages": 5},
+        "/page?page_size=-1": page_1,
+        "/page?page_size=many": page_1,
+        # Limit and offset.
+        "/offset?limit=1": {"titles": ["a1"], "limit": 1, "has_next": True},
+        "/offset?limit=-1": first_2,
+        "/offset?limit=many": first_2,
+        "/offset?offset=far": first_2,
+        "/offset?offset=1": {"titles": ["a2", "a3"], "offset": 1, "has_previous": True},
+        "/offset?limit=2&offset=2": {"titles": ["a3", "a4"], "has_next": True},
+        # The page ends with the last row, so there is no next page.
+        "/offset?limit=2&offset=3": {"titles": ["a4", "a5"], "has_next": False},
+    }
+
+    with TestClient(api) as client:
+        for url, expected in cases.items():
+            response = client.get(url)
+            assert response.status_code == 200, url
+            data = response.json()
+            actual = {key: data.get(key) for key in expected if key != "titles"}
+            actual["titles"] = [item["title"] for item in data["items"]]
+            assert actual == expected, url
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("scheme", [PageNumberPagination, LimitOffsetPagination, CursorPagination])
+def test_build_response_gets_the_request(db, scheme):
+    """Each scheme gives the request to build_response(), so a custom envelope can make links."""
+    Article.objects.create(title="a1", content="c", author="x", is_published=True)
+    api = BoltAPI()
+
+    class PathPagination(scheme):
+        response_class = PathPage
+
+        def build_response(self, items, *, total, request, has_next, has_previous, **info):
+            return PathPage(path=request.path, results=items)
+
+    @api.get("/articles", response_model=list[ArticleListSchema])
+    @paginate(PathPagination)
+    async def list_articles(request):
+        return Article.objects.all()
+
+    with TestClient(api) as client:
+        response = client.get("/articles")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["path"] == "/articles"
+    assert [item["title"] for item in data["results"]] == ["a1"]
+
+
+def test_pagination_of_a_list():
+    """A handler can return a list. The page is a slice of the list."""
+    rows = [{"id": number, "name": f"row {number}"} for number in range(1, 8)]
+    api = BoltAPI()
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 3
+
+    @api.get("/by-page")
+    @paginate(SmallPagePagination)
+    async def list_by_page(request):
+        return rows
+
+    @api.get("/by-offset")
+    @paginate(LimitOffsetPagination)
+    async def list_by_offset(request):
+        return rows
+
+    with TestClient(api) as client:
+        by_page = client.get("/by-page?page=3")
+        by_offset = client.get("/by-offset?limit=2&offset=4")
+
+    assert by_page.status_code == 200
+    assert by_page.json() == {
+        "items": [{"id": 7, "name": "row 7"}],
+        "total": 7,
+        "has_next": False,
+        "has_previous": True,
+        "page": 3,
+        "page_size": 3,
+        "total_pages": 3,
+        "previous_page": 2,
+    }
+    assert by_offset.status_code == 200
+    assert by_offset.json() == {
+        "items": [{"id": 5, "name": "row 5"}, {"id": 6, "name": "row 6"}],
+        "total": 7,
+        "has_next": True,
+        "has_previous": True,
+        "limit": 2,
+        "offset": 4,
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_paginate_reads_the_request_parameter_of_the_handler(sample_articles):
+    """The request can come after another parameter, and it can have a name other than "request"."""
+    api = BoltAPI()
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 2
+
+    @api.get("/request-after-a-parameter")
+    @paginate(SmallPagePagination)
+    async def request_after_a_parameter(author: str, request):
+        return Article.objects.filter(author=author).order_by("id")
+
+    @api.get("/request-with-another-name")
+    @paginate(SmallPagePagination)
+    async def request_with_another_name(req: Request):
+        return Article.objects.order_by("id")
+
+    with TestClient(api) as client:
+        after_a_parameter = client.get("/request-after-a-parameter?author=Author 1&page=2")
+        another_name = client.get("/request-with-another-name?page=2")
+
+    assert after_a_parameter.status_code == 200
+    assert after_a_parameter.json()["page"] == 2
+    assert [item["title"] for item in after_a_parameter.json()["items"]] == ["Article 21", "Article 31"]
+    assert another_name.status_code == 200
+    assert another_name.json()["page"] == 2
+    assert [item["title"] for item in another_name.json()["items"]] == ["Article 3", "Article 4"]
 
 
 @pytest.mark.django_db(transaction=True)

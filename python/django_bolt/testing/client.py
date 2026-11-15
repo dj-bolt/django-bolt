@@ -27,6 +27,7 @@ from django_bolt.api import (
     _routes_and_native_routes,
     _validate_asgi_mount_conflicts,
     _validate_mcp_mount_conflicts,
+    run_lifespans,
 )
 from django_bolt.testing.dbshare import SharedConnections
 
@@ -113,7 +114,9 @@ class BoltTestTransport(httpx.BaseTransport):
 
     Args:
         app_id: Test app instance ID
-        raise_server_exceptions: If True, raise exceptions from handlers
+        raise_server_exceptions: If True, raise an error of the test backend, for example an
+            unsupported HTTP method. A handler exception still gives a 500 response.
+            If False, the backend error gives a 500 response too
     """
 
     def __init__(self, app_id: int, raise_server_exceptions: bool = True):
@@ -181,7 +184,9 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
 
     Args:
         app_id: Test app instance ID
-        raise_server_exceptions: If True, raise exceptions from handlers
+        raise_server_exceptions: If True, raise an error of the test backend, for example an
+            unsupported HTTP method. A handler exception still gives a 500 response.
+            If False, the backend error gives a 500 response too
     """
 
     def __init__(self, app_id: int, raise_server_exceptions: bool = True):
@@ -325,7 +330,9 @@ class TestClient(httpx.Client):
         Args:
             api: BoltAPI instance to test
             base_url: Base URL for requests
-            raise_server_exceptions: If True, raise exceptions from handlers
+            raise_server_exceptions: If True, raise an error of the test backend, for example an
+                unsupported HTTP method. A handler exception still gives a 500 response.
+                If False, the backend error gives a 500 response too
             cors_allowed_origins: Global CORS allowed origins for this test. They
                                   replace the CORS settings. A "*" entry allows every origin.
             read_django_settings: If True (the default), read the CORS, static and media
@@ -428,7 +435,7 @@ class TestClient(httpx.Client):
             _warn_if_inside_atomic_block()
         if self.api._has_lifespan:
             loop = asyncio.new_event_loop()
-            cm = self.api._lifespan_context(self.api)
+            cm = run_lifespans(self.api._source_lifespans)
             try:
                 loop.run_until_complete(cm.__aenter__())
             except BaseException:
@@ -673,7 +680,9 @@ class AsyncTestClient(httpx.AsyncClient):
         Args:
             api: BoltAPI instance to test
             base_url: Base URL for requests
-            raise_server_exceptions: If True, raise exceptions from handlers
+            raise_server_exceptions: If True, raise an error of the test backend, for example an
+                unsupported HTTP method. A handler exception still gives a 500 response.
+                If False, the backend error gives a 500 response too
             cors_allowed_origins: Global CORS allowed origins for this test. They
                                   replace the CORS settings. A "*" entry allows every origin.
             read_django_settings: If True (the default), read the CORS, static and media
@@ -765,7 +774,7 @@ class AsyncTestClient(httpx.AsyncClient):
         if self._lifespan is not None:
             raise RuntimeError("AsyncTestClient is already open. Enter it once.")
         if self.api._has_lifespan:
-            cm = self.api._lifespan_context(self.api)
+            cm = run_lifespans(self.api._source_lifespans)
             await cm.__aenter__()
             self._lifespan = cm
         try:

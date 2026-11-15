@@ -209,6 +209,25 @@ class TestInvalidJSONParsing:
         with pytest.raises(msgspec.ValidationError):
             extractor(b"42")
 
+    def test_an_empty_body_gives_the_default_of_an_optional_body_parameter(self):
+        api = BoltAPI()
+
+        @api.post("/optional")
+        async def optional(user: UserWithDefaults | None = None):
+            return {"name": user.name if user else None}
+
+        @api.post("/required")
+        async def required(user: UserWithDefaults):
+            return {"name": user.name}
+
+        with TestClient(api) as client:
+            assert client.post("/optional").json() == {"name": None}
+            assert client.post("/optional", json={"name": "Ana"}).json() == {"name": "Ana"}
+            # A body that is present must still be valid JSON of the type.
+            assert client.post("/optional", content=b"{").status_code == 422
+            assert client.post("/optional", json={"name": 1}).status_code == 422
+            assert client.post("/required").status_code == 422
+
 
 class TestBodyOfNonStructType:
     """A body with a type that is not a Struct is decoded as the type, with the same errors."""
@@ -284,6 +303,26 @@ class TestBodyOfNonStructType:
             wrong = client.post("/ids", content=b'["a"]', headers={"content-type": "application/json"})
             assert wrong.status_code == 422
             assert wrong.json()["detail"][0]["loc"] == ["body", "0"]
+
+    def test_two_body_parameters_each_decode_the_body_as_their_own_type(self):
+        api = BoltAPI()
+
+        @api.post("/both")
+        async def both(user: UserWithDefaults, strict: UserCreate):
+            return {"user": type(user).__name__, "strict": type(strict).__name__, "age": strict.age}
+
+        with TestClient(api) as client:
+            body = {"name": "Ana", "email": "ana@example.com", "age": 30}
+            assert client.post("/both", json=body).json() == {
+                "user": "UserWithDefaults",
+                "strict": "UserCreate",
+                "age": 30,
+            }
+
+            # The second type has a required field more than the first.
+            missing = client.post("/both", json={"name": "Ana"})
+            assert missing.status_code == 422
+            assert missing.json()["detail"][0]["loc"] == ["body", "email"]
 
 
 class TestParseMsgspecDecodeError:

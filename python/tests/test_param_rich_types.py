@@ -215,6 +215,32 @@ def test_a_sequence_header_or_cookie_gives_one_item(form_client):
     assert form_client.get("/cookie", headers={"Cookie": "tags=a"}).json() == {"value": ["a"], "type": "set"}
 
 
+class _TagHeaders(msgspec.Struct):
+    x_name: str = "none"
+    x_tags: list[str] = []
+    x_ids: set[int] | None = None
+
+
+def test_a_sequence_field_of_a_header_model_gives_one_item():
+    api = BoltAPI()
+
+    @api.get("/model")
+    async def model(headers: Annotated[_TagHeaders, Header()]):
+        return {"name": headers.x_name, "tags": headers.x_tags, "ids": _show(headers.x_ids)}
+
+    with TestClient(api) as client:
+        response = client.get("/model", headers={"X-Name": "bo", "X-Tags": "a, b", "X-Ids": "4"})
+        assert response.status_code == 200, response.text
+        # The value is one item, as for a sequence header parameter. Bolt does not split it at a comma.
+        assert response.json() == {"name": "bo", "tags": ["a, b"], "ids": {"value": [4], "type": "set"}}
+        assert client.get("/model").json() == {"name": "none", "tags": [], "ids": {"value": None, "type": "NoneType"}}
+
+        bad = client.get("/model", headers={"X-Ids": "x"})
+        assert bad.status_code == 422
+        assert bad.json()["detail"][0]["loc"] == ["header", "x-ids"]
+        assert bad.json()["detail"][0]["input"] == ["x"]
+
+
 @pytest.mark.parametrize(
     ("route", "annotation"),
     [
@@ -721,6 +747,17 @@ def test_a_missing_form_field_takes_its_default_or_none(form_field_client):
     assert form_field_client.post("/limited-default", data={}).json() == {"value": 5, "type": "int"}
     assert form_field_client.post("/limited-optional", data={}).json() == {"value": None, "type": "NoneType"}
     assert form_field_client.post("/limited-optional", data={"count": "2"}).json() == {"value": 2, "type": "int"}
+
+
+def test_a_repeated_form_field_that_is_not_a_sequence_keeps_its_last_value(form_field_client):
+    for url, name in [("/required", "name"), ("/default", "nick"), ("/optional", "alt")]:
+        response = form_field_client.post(url, data={name: ["a", "b"]})
+        assert response.json() == {"value": "b", "type": "str"}, url
+    for url in ["/limited", "/limited-default", "/limited-optional"]:
+        response = form_field_client.post(url, data={"count": ["3", "4"]})
+        assert response.json() == {"value": 4, "type": "int"}, url
+    # The constraint applies to the value that the handler gets.
+    assert form_field_client.post("/limited", data={"count": ["3", "0"]}).status_code == 422
 
 
 def test_a_form_field_outside_its_constraint_names_the_field(form_field_client):

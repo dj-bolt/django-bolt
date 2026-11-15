@@ -23,7 +23,7 @@ import logging
 import sys
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -439,6 +439,19 @@ class JWTAuthentication(BaseAuthentication):
             return None
 
 
+def _check_str_collection(value: Any, name: str, item_name: str) -> None:
+    """Raise ``ImproperlyConfigured`` unless ``value`` is a collection of str, and not a str or bytes."""
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Collection):
+        raise ImproperlyConfigured(
+            f"APIKeyAuthentication {name} must be a set, list or tuple of str, not {type(value).__name__}."
+        )
+    for item in value:
+        if not isinstance(item, str):
+            raise ImproperlyConfigured(
+                f"APIKeyAuthentication each {item_name} must be a str, not {type(item).__name__}."
+            )
+
+
 class APIKeyAuthentication(BaseAuthentication):
     """
     API key authentication.
@@ -447,9 +460,16 @@ class APIKeyAuthentication(BaseAuthentication):
     Keys should be provided in the configured header (default: X-API-Key).
 
     Args:
-        api_keys: Set of valid API keys
+        api_keys: Set, list or tuple of valid API keys. Each key is a
+            non-empty str.
         header: Header name to extract API key from (default: "x-api-key")
-        key_permissions: Optional mapping of API keys to permission sets
+        key_permissions: Optional mapping of API keys to permission sets.
+            Each key must be in ``api_keys``.
+
+    Raises:
+        ImproperlyConfigured: ``api_keys`` or ``key_permissions`` has a
+            value of the wrong type, an empty key, or a key that is not in
+            ``api_keys``.
     """
 
     def __init__(
@@ -458,6 +478,24 @@ class APIKeyAuthentication(BaseAuthentication):
         header: str = "x-api-key",
         key_permissions: dict[str, set[str]] | None = None,
     ):
+        # A str is a collection of its characters. Without this check, each
+        # character of a str is a valid key, and "" is a valid key too.
+        if api_keys is not None:
+            _check_str_collection(api_keys, "api_keys", "key in api_keys")
+            if "" in api_keys:
+                raise ImproperlyConfigured("APIKeyAuthentication api_keys must not contain an empty key.")
+        if key_permissions is not None:
+            if not isinstance(key_permissions, dict):
+                raise ImproperlyConfigured(
+                    f"APIKeyAuthentication key_permissions must be a dict, not {type(key_permissions).__name__}."
+                )
+            for key, permissions in key_permissions.items():
+                name = f"key_permissions[{key!r}]"
+                _check_str_collection(permissions, name, f"permission in {name}")
+                if api_keys is None or key not in api_keys:
+                    raise ImproperlyConfigured(
+                        f"APIKeyAuthentication key_permissions has the key {key!r}, which is not in api_keys."
+                    )
         self.api_keys = api_keys or set()
         self.header = header
         self.key_permissions = key_permissions or {}

@@ -1046,10 +1046,8 @@ class Command(BaseCommand):
                     features=features,
                 )
 
-        # Collect lifecycle contexts (merged APIs store them, single APIs check directly)
+        # The lifespans of the API, of the APIs that it merges, and of the APIs that they mount.
         source_lifespans = merged_api._source_lifespans
-        if source_lifespans is None and merged_api._has_lifespan:
-            source_lifespans = [(merged_api, merged_api._lifespan_context)]
 
         # Start the server (all handlers go through async dispatch with thread pool for sync)
         if source_lifespans:
@@ -1483,7 +1481,11 @@ class Command(BaseCommand):
         merged._next_handler_id = next_handler_id
 
         # Collect lifecycle contexts from source APIs
-        merged._source_lifespans = [(api, api._lifespan_context) for _, api in apis if api._has_lifespan]
+        merged._source_lifespans = []
+        for _, api in apis:
+            for source_lifespan in api._source_lifespans:
+                if source_lifespan not in merged._source_lifespans:
+                    merged._source_lifespans.append(source_lifespan)
 
         return merged
 

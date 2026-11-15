@@ -79,7 +79,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     names ``loc`` and ``key``. With ``one_item``, a source that gives one value
     (a path, a header or a cookie) gives a sequence of that one item. A type
     that cannot hold one item, such as ``tuple[int, str]``, then raises
-    ``TypeError`` here, when the route registers.
+    ``TypeError`` here, when the route registers. A form field (``loc`` is
+    ``body``) that is not a sequence keeps the last value of a repeated key.
     """
     target = unwrap_optional(annotation)
     base = get_args(target)[0] if get_origin(target) is Annotated else target
@@ -95,6 +96,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     if not is_sequence and not constrained:
         return None
     wrap = is_sequence and one_item
+    # Rust gives each value of a repeated form key as a list.
+    take_last = loc == "body" and not is_sequence
     if wrap and loc in _SINGLE_VALUE_SOURCES and not _holds_one_item(target):
         raise TypeError(
             f"The {loc} parameter {key!r} gets one value, but its type {target!r} cannot hold one item. "
@@ -107,6 +110,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     def convert(value: Any) -> Any:
         if wrap and not isinstance(value, list):
             value = [value]
+        elif take_last and type(value) is list:
+            value = value[-1]
         try:
             return msgspec.convert((value,), holder, strict=False).value
         except msgspec.ValidationError as error:
@@ -310,6 +315,9 @@ def create_form_extractor(name: str, annotation: Any, default: Any, alias: str |
     fields from the form data and constructs the struct instance.
 
     Note: Rust pre-converts values to typed Python objects (int, float, bool, str).
+    Rust gives each value of a repeated key as a list. A field that is not a
+    sequence keeps the last value, as a query parameter does. An ``Any`` field
+    gets the list.
     """
     # Check if annotation is a Struct/Serializer type
     unwrapped = unwrap_optional(annotation)
@@ -326,16 +334,29 @@ def create_form_extractor(name: str, annotation: Any, default: Any, alias: str |
     if optional:
         default_value = None if default is inspect.Parameter.empty else default
 
-        def extract(form_map: dict[str, Any]) -> Any:
+        def extract_all(form_map: dict[str, Any]) -> Any:
             return form_map.get(key, default_value)
-    else:
 
         def extract(form_map: dict[str, Any]) -> Any:
+            if key not in form_map:
+                return default_value
+            value = form_map[key]
+            return value[-1] if type(value) is list else value
+    else:
+
+        def extract_all(form_map: dict[str, Any]) -> Any:
             if key not in form_map:
                 raise HTTPException(status_code=422, detail=f"Missing required form field: {key}")
             return form_map[key]
 
-    return extract
+        def extract(form_map: dict[str, Any]) -> Any:
+            try:
+                value = form_map[key]
+            except KeyError:
+                raise HTTPException(status_code=422, detail=f"Missing required form field: {key}") from None
+            return value[-1] if type(value) is list else value
+
+    return extract_all if unwrapped is Any else extract
 
 
 def _upload_file_dec_hook(typ: type, obj: Any) -> Any:
@@ -561,19 +582,20 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
 
 
 def _collect_header_struct_errors(
-    header_fields: tuple[tuple[str, str, Any, bool], ...], data: dict[str, Any]
+    header_fields: tuple[tuple[str, str, Any, bool], ...], data: dict[str, Any], strict: bool = True
 ) -> list[dict[str, Any]]:
     """Return one error for each missing or invalid field of a header struct.
 
     ``header_fields`` holds the header name, the encoded name, the type and the
     required flag of each field. ``data`` maps encoded names to header values.
+    ``strict`` is the conversion mode of the extractor.
     The ``loc`` of each error is ``("header", header name)``, as for a scalar header.
     """
     errors: list[dict[str, Any]] = []
     for header_name, encoded_name, field_type, required in header_fields:
         if encoded_name in data:
             try:
-                msgspec.convert(data[encoded_name], type=field_type)
+                msgspec.convert(data[encoded_name], type=field_type, strict=strict)
             except msgspec.ValidationError as e:
                 errors.append(
                     {
@@ -606,6 +628,11 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     ``create_header_extractor``), so msgspec gets typed values. A missing or
     invalid field gives a RequestValidationError with one error for each field.
 
+    A header gives one value. A sequence field (``list``, ``set``, ``frozenset``
+    or ``tuple``) gets a sequence of that one item, as a sequence header
+    parameter does. Rust does not convert the item, so a struct with a sequence
+    field converts with ``strict=False``, as the cookie struct does.
+
     Args:
         struct_type: The msgspec.Struct or Serializer class
         default: Default value if the entire struct is optional
@@ -617,26 +644,27 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
 
     # Pre-compute header name mapping at registration time
     # Maps kebab-case header name → encoded field name (for msgspec alias support)
-    header_to_encoded: list[tuple[str, str]] = []
+    header_to_encoded: list[tuple[str, str, bool]] = []
     header_fields: list[tuple[str, str, Any, bool]] = []
     for field in msgspec.structs.fields(struct_type):
         encoded_name = getattr(field, "encode_name", field.name)
         header_name = encoded_name.lower().replace("_", "-")
-        header_to_encoded.append((header_name, encoded_name))
+        header_to_encoded.append((header_name, encoded_name, _is_sequence_field(field.type)))
         header_fields.append((header_name, encoded_name, field.type, field.required))
     error_fields = tuple(header_fields)
+    strict = not any(wrap for _, _, wrap in header_to_encoded)
 
     def extract(headers_map: dict[str, str]) -> Any:
         converted = {}
-        for header_name, encoded_name in header_to_encoded:
+        for header_name, encoded_name, wrap in header_to_encoded:
             value = headers_map.get(header_name)
             if value is not None:
-                converted[encoded_name] = value
+                converted[encoded_name] = [value] if wrap else value
 
         try:
-            return msgspec.convert(converted, struct_type)
+            return msgspec.convert(converted, struct_type, strict=strict)
         except msgspec.ValidationError as e:
-            errors = _collect_header_struct_errors(error_fields, converted)
+            errors = _collect_header_struct_errors(error_fields, converted, strict)
             if errors:
                 raise RequestValidationError(errors=errors) from e
             raise
@@ -765,9 +793,11 @@ def create_file_extractor(
 
 
 _BODY_EXTRACTORS: dict[Any, Callable] = {}
+# The extractors of optional bodies with the default None, by the extractor of the type.
+_OPTIONAL_BODY_EXTRACTORS: dict[Callable, Callable] = {}
 
 
-def create_body_extractor(name: str, annotation: Any) -> Callable:
+def create_body_extractor(name: str, annotation: Any, default: Any = inspect.Parameter.empty) -> Callable:
     """
     Create a pre-compiled extractor for request body.
 
@@ -776,15 +806,38 @@ def create_body_extractor(name: str, annotation: Any) -> Callable:
 
     Each body type has one extractor. So a handler and a dependency with the
     same body type decode the body one time (see ``decode_body_once``).
+
+    An empty body gives the default of a parameter that has one, and None for
+    an ``Optional`` type without default. A required parameter gets a 422.
     """
     try:
-        return _BODY_EXTRACTORS[annotation]
+        extractor = _BODY_EXTRACTORS[annotation]
     except KeyError:
         extractor = _BODY_EXTRACTORS[annotation] = _build_body_extractor(annotation)
-        return extractor
     except TypeError:
         # An unhashable annotation gets its own extractor.
-        return _build_body_extractor(annotation)
+        extractor = _build_body_extractor(annotation)
+
+    if default is inspect.Parameter.empty:
+        if not is_optional(annotation):
+            return extractor
+        default = None
+    if default is not None:
+        return _with_empty_body_default(extractor, default)
+    try:
+        return _OPTIONAL_BODY_EXTRACTORS[extractor]
+    except KeyError:
+        optional = _OPTIONAL_BODY_EXTRACTORS[extractor] = _with_empty_body_default(extractor, None)
+        return optional
+
+
+def _with_empty_body_default(extractor: Callable, default_value: Any) -> Callable:
+    def extract_or_default(body_bytes: bytes) -> Any:
+        if not body_bytes:
+            return default_value
+        return extractor(body_bytes)
+
+    return extract_or_default
 
 
 def _build_body_extractor(annotation: Any) -> Callable:
@@ -881,7 +934,7 @@ def create_extractor_for_field(field: FieldDefinition) -> Callable | None:
             max_files=max_files,
         )
     elif source == "body":
-        return create_body_extractor(name, annotation)
+        return create_body_extractor(name, annotation, default)
     elif source == "request":
         # Request source is handled directly in the injector
         return None

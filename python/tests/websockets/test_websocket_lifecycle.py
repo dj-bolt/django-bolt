@@ -106,6 +106,34 @@ async def test_accept_after_close_raises():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("iterator_name", "sender_name", "messages"),
+    [
+        ("iter_text", "send_text", ["one", "two"]),
+        ("iter_bytes", "send_bytes", [b"one", b"two"]),
+        ("iter_json", "send_json", [{"n": 1}, {"n": 2}]),
+    ],
+)
+async def test_client_iterator_yields_the_messages_sent_before_the_server_close(iterator_name, sender_name, messages):
+    api = BoltAPI()
+
+    @api.websocket("/ws")
+    async def handler(websocket: WebSocket):
+        await websocket.accept()
+        for message in messages:
+            await getattr(websocket, sender_name)(message)
+        await websocket.close()
+
+    async with WebSocketTestClient(api, "/ws") as ws:
+        received = [message async for message in getattr(ws, iterator_name)()]
+        # The connection is closed and has no more messages. A receive does not wait for the timeout.
+        with pytest.raises(ConnectionClosed):
+            await ws.receive(timeout=0.01)
+
+    assert received == messages
+
+
+@pytest.mark.asyncio
 async def test_send_after_close_says_closed():
     api = BoltAPI()
     seen: list[str] = []
