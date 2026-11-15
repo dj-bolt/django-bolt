@@ -126,6 +126,10 @@ async def connect(websocket: WebSocket, token: str | None = None):
     # ...
 ```
 
+This `close()` runs before `accept()`, so it refuses the handshake with `403`.
+The client does not get the close code. To send a close code, call `accept()`
+first. See [Refuse the handshake](#refuse-the-handshake).
+
 When a query key repeats, the parameter gets the last value, as for HTTP
 routes.
 
@@ -221,7 +225,7 @@ Access close codes:
 ```python
 from django_bolt import CloseCode
 
-await websocket.close(code=CloseCode.NORMAL_CLOSURE)
+await websocket.close(code=CloseCode.NORMAL)
 ```
 
 ## Subprotocols
@@ -385,13 +389,37 @@ A route without `include_in_schema` uses the value of its `BoltAPI`, as an HTTP 
 Use the `WebSocketTestClient`:
 
 ```python
-from django_bolt.testing import TestClient
+import pytest
 
-with TestClient(api) as client:
-    with client.websocket_connect("/ws/echo") as ws:
-        ws.send_text("Hello")
-        response = ws.receive_text()
+from django_bolt.testing import WebSocketTestClient
+
+
+@pytest.mark.asyncio
+async def test_echo():
+    async with WebSocketTestClient(api, "/ws/echo") as ws:
+        await ws.send_text("Hello")
+        response = await ws.receive_text()
         assert response == "Echo: Hello"
+```
+
+`WebSocketTestClient` is an async client. Each connection is one `async with` block.
+`TestClient` is for HTTP requests and has no WebSocket method.
+
+When the handler closes the connection, the receive methods raise `ConnectionClosed`.
+Its `code` attribute has the close code:
+
+```python
+from django_bolt.testing import ConnectionClosed, WebSocketTestClient
+
+@api.websocket("/ws/once")
+async def once(websocket: WebSocket):
+    await websocket.accept()
+    await websocket.close(code=4001)
+
+async with WebSocketTestClient(api, "/ws/once") as ws:
+    with pytest.raises(ConnectionClosed) as closed:
+        await ws.receive_text()
+assert closed.value.code == 4001
 ```
 
 `WebSocketTestClient` waits for the handshake decision of the handler, as the
