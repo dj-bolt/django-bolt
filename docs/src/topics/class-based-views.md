@@ -137,6 +137,8 @@ This creates:
 | PATCH | `/items/{pk}` | `partial_update` |
 | DELETE | `/items/{pk}` | `destroy` |
 
+An action can be `async def` or `def`. Bolt registers only the actions that the class defines.
+
 Set `pagination_class` on a `ViewSet`, `ReadOnlyModelViewSet`, or `ModelViewSet`
 to have the `list()` action paginated automatically. Use `@paginate(...)` when
 you want per-method control instead.
@@ -294,6 +296,20 @@ class ArticleViewSet(ViewSet):
 | `summary`        | no       | Summary for OpenAPI documentation                                                        |
 | `description`    | no       | Detailed description for OpenAPI documentation                                           |
 
+An action with no `auth`, `guards`, `status_code`, `validate_response` or `tags` uses the value of `@api.viewset(...)`. For `auth`, `guards` and `validate_response`, the class attribute comes next.
+
+```python
+@api.viewset("/articles", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+class ArticleViewSet(ViewSet):
+    @action(methods=["POST"], detail=True)
+    async def publish(self, request, pk: int):  # Needs a valid token
+        ...
+
+    @action(methods=["GET"], detail=False, auth=[], guards=[AllowAny()])
+    async def featured(self, request):  # Public
+        ...
+```
+
 ### Custom path
 
 Override the URL path:
@@ -445,6 +461,11 @@ Available mixins:
 | `UpdateMixin` | `update` | `/items/{pk}` | PUT |
 | `PartialUpdateMixin` | `partial_update` | `/items/{pk}` | PATCH |
 | `DestroyMixin` | `destroy` | `/items/{pk}` | DELETE |
+
+The write actions do not take each field from the request body:
+
+- `update` and `partial_update` write to the object that `get_object()` returns. They do not write the primary key, the lookup field or a `read_only` serializer field. Thus the body cannot move the write to a row outside `get_queryset()`.
+- `create` does not write a `read_only` serializer field. It does not write the primary key when the database gives the primary key (`AutoField`, `BigAutoField`).
 
 ## ReadOnlyModelViewSet
 
