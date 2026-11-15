@@ -275,6 +275,148 @@ def test_rapidoc_and_stoplight_endpoints_render_the_page(plugin, url, expected_p
     assert 'name="viewport"' in response.text
 
 
+_FAVICON = '<link rel="icon" href="/static/docs.ico">'
+_STYLE = "<style>body { margin: 4px }</style>"
+
+
+@pytest.mark.parametrize(
+    ("plugin_class", "options", "url", "present", "absent"),
+    [
+        (
+            SwaggerRenderPlugin,
+            {"version": "5.40.0"},
+            "/docs/swagger",
+            [
+                '<link href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.40.0/swagger-ui.css" rel="stylesheet">',
+                '<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.40.0/swagger-ui-bundle.js" crossorigin>',
+                '<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.40.0/swagger-ui-standalone-preset.js"',
+            ],
+            [],
+        ),
+        (
+            SwaggerRenderPlugin,
+            {"js_url": "/static/ui.js", "css_url": "/static/ui.css", "standalone_preset_js_url": "/static/preset.js"},
+            "/docs/swagger",
+            [
+                '<link href="/static/ui.css" rel="stylesheet">',
+                '<script src="/static/ui.js" crossorigin>',
+                '<script src="/static/preset.js" crossorigin>',
+            ],
+            ["cdn.jsdelivr.net"],
+        ),
+        (RedocRenderPlugin, {}, "/docs/redoc", ['<link href="https://fonts.googleapis.com/css?family='], []),
+        (RedocRenderPlugin, {"google_fonts": False}, "/docs/redoc", ["Redoc.init("], ["fonts.googleapis.com"]),
+        (
+            ScalarRenderPlugin,
+            {"version": "1.25.0"},
+            "/docs/scalar",
+            [
+                '<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.25.0" crossorigin>',
+                f'<link rel="stylesheet" type="text/css" href="{ScalarRenderPlugin._default_css_url}">',
+                'data-url="/docs/openapi.json"',
+            ],
+            ["dataset.configuration"],
+        ),
+        (
+            ScalarRenderPlugin,
+            {"js_url": "/static/scalar.js", "css_url": "/static/scalar.css", "options": {"theme": "moon"}},
+            "/docs/scalar",
+            [
+                '<script src="/static/scalar.js" crossorigin>',
+                '<link rel="stylesheet" type="text/css" href="/static/scalar.css">',
+                "dataset.configuration = ",
+                '{"theme":"moon"}',
+            ],
+            ["cdn.jsdelivr.net"],
+        ),
+        (
+            RapidocRenderPlugin,
+            {"version": "9.3.8"},
+            "/docs/rapidoc",
+            ['<script src="https://unpkg.com/rapidoc@9.3.8/dist/rapidoc-min.js" crossorigin>'],
+            [],
+        ),
+        (
+            RapidocRenderPlugin,
+            {"js_url": "/static/rapidoc.js"},
+            "/docs/rapidoc",
+            ['<script src="/static/rapidoc.js" crossorigin>'],
+            ["unpkg.com"],
+        ),
+        (
+            StoplightRenderPlugin,
+            {"version": "8.0.0"},
+            "/docs/elements",
+            [
+                '<link rel="stylesheet" href="https://unpkg.com/@stoplight/elements@8.0.0/styles.min.css">',
+                '<script src="https://unpkg.com/@stoplight/elements@8.0.0/web-components.min.js" crossorigin>',
+            ],
+            [],
+        ),
+        (
+            StoplightRenderPlugin,
+            {"js_url": "/static/elements.js", "css_url": "/static/elements.css"},
+            "/docs/elements",
+            ['<link rel="stylesheet" href="/static/elements.css">', '<script src="/static/elements.js" crossorigin>'],
+            ["unpkg.com"],
+        ),
+    ],
+    ids=[
+        "swagger-version",
+        "swagger-urls",
+        "redoc-fonts",
+        "redoc-no-fonts",
+        "scalar-version",
+        "scalar-urls-options",
+        "rapidoc-version",
+        "rapidoc-url",
+        "stoplight-version",
+        "stoplight-urls",
+    ],
+)
+def test_docs_page_options_change_the_page(plugin_class, options, url, present, absent):
+    """A UI plugin serves its page at its default path, with the options of its constructor."""
+    plugin = plugin_class(favicon=_FAVICON, style=_STYLE, **options)
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Options API", version="1.0.0", render_plugins=[plugin]))
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    page = response.text
+    assert "<title>Options API</title>" in page
+    assert _FAVICON in page
+    assert _STYLE in page
+    for part in present:
+        assert part in page
+    for part in absent:
+        assert part not in page
+
+
+def test_openapi_root_serves_the_plugin_with_the_root_path():
+    """The docs root serves the plugin that has the "/" path. With no such plugin, it serves the first plugin."""
+    scalar_last = BoltAPI(
+        openapi_config=OpenAPIConfig(
+            title="Root API", version="1.0.0", render_plugins=[RedocRenderPlugin(), ScalarRenderPlugin()]
+        )
+    )
+    no_root = BoltAPI(
+        openapi_config=OpenAPIConfig(
+            title="Root API", version="1.0.0", render_plugins=[RapidocRenderPlugin(), RedocRenderPlugin()]
+        )
+    )
+    scalar_last._register_openapi_routes()
+    no_root._register_openapi_routes()
+
+    with TestClient(scalar_last) as client:
+        assert 'id="api-reference"' in client.get("/docs").text
+        assert "Redoc.init(" in client.get("/docs/redoc").text
+    with TestClient(no_root) as client:
+        assert "<rapi-doc" in client.get("/docs").text
+
+
 def test_swagger_ui_supports_openapi_3_2_query_specs():
     """Regression: the default Swagger UI must understand schemas containing QUERY.
 
