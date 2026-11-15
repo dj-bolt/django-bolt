@@ -1377,8 +1377,10 @@ class BoltAPI:
                 if not hasattr(viewset_cls, action_name):
                     continue
 
+                # A sync action is a route too, as a sync APIView method is. An
+                # attribute that is not a function, such as ``destroy = None``, is not.
                 action_method = getattr(viewset_cls, action_name)
-                if not inspect.iscoroutinefunction(action_method):
+                if not inspect.isfunction(action_method):
                     continue
 
                 # Use action name (e.g., "list") not HTTP method name (e.g., "get")

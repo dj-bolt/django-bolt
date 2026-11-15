@@ -272,6 +272,39 @@ def test_viewset_action_inheritance(api, view_set_class: type):
         assert response.json() == {"message": "from child"}
 
 
+def test_viewset_registers_sync_standard_actions(api):
+    """A sync standard action gets its route, as a sync APIView method and a sync @action do."""
+
+    @api.viewset("/notes")
+    class NoteViewSet(ViewSet):
+        def list(self, request):
+            return [{"id": 1}]
+
+        def create(self, request):
+            return {"id": 2}
+
+        def retrieve(self, request, pk: int):
+            return {"id": pk}
+
+        def destroy(self, request, pk: int):
+            return None
+
+    with TestClient(api) as client:
+        response = client.get("/notes")
+        assert response.status_code == 200
+        assert response.json() == [{"id": 1}]
+
+        response = client.post("/notes")
+        assert response.status_code == 201
+        assert response.json() == {"id": 2}
+
+        response = client.get("/notes/7")
+        assert response.status_code == 200
+        assert response.json() == {"id": 7}
+
+        assert client.delete("/notes/7").status_code == 204
+
+
 @pytest.mark.django_db(transaction=True)
 def test_viewset_get_object_accepts_explicit_lookup_values(api):
     article = Article.objects.create(title="Lookup Title", content="Lookup Content", author="Author 1")
