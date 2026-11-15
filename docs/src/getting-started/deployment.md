@@ -68,6 +68,8 @@ For production, run Django-Bolt as a managed service behind a reverse proxy.
 
 You need a process manager to keep Django-Bolt running. Choose systemd (most Linux distributions) or supervisor.
 
+`runbolt` stops with exit status 1 when it cannot start. Examples are a port in use, a failed system check, and a project with no `BoltAPI`.
+
 #### With systemd
 
 Create `/etc/systemd/system/django-bolt.service`:
