@@ -122,6 +122,8 @@ def get_me(request):
 
 The user is only loaded from the database when you access `request.user`. If you don't need the full user object, use `request.context` which is available without a database query.
 
+A user with `is_active = False` is no user, as in Django's `ModelBackend`. `request.user` is then falsy, `await request.auser()` gives `None`, and `CurrentUser` answers 401. The same applies to a user that has no row. The check reads the loaded row, so it adds no query. A route that does not read the user accepts the token, because Bolt verifies the token without the database. To reject such a token on each route, revoke it: see [Token revocation](#token-revocation). A custom `get_user` or `get_user_sync` does its own check.
+
 In an async handler or an async middleware, prefer `await request.auser()`:
 
 ```python
@@ -394,6 +396,10 @@ flows.
 
 `/auth/logout` and `/auth/logout-all` accept only a refresh token that
 `/auth/refresh` also accepts. A used, revoked or old-version token gets a 401.
+
+With the default credential check, `/auth/login` and `/auth/refresh` refuse an
+inactive user with a 401. `/auth/refresh` reads the user row for this check.
+With a `credential_validator=`, `/auth/refresh` does not load the user.
 
 ### Issuing a pair
 
