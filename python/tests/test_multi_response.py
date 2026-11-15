@@ -832,8 +832,9 @@ def test_a_blocking_multi_response_handler_runs_with_its_dependencies_on_one_poo
     """A sync handler that uses the ORM runs on the pool. Its sync dependencies run on that thread too."""
     api = BoltAPI()
 
-    @api.get("/count", response_model={200: dict})
-    def count(*, label: str, dependency_thread: str = Depends(thread_name)):
+    @api.get("/labels/{label}", response_model={200: dict})
+    def count(label: str, *, dependency_thread: str = Depends(thread_name)):
+        # ``label`` is positional: the injector gives it apart from the dependency.
         return 200, {
             "count": Article.objects.count(),
             "label": label,
@@ -850,7 +851,7 @@ def test_a_blocking_multi_response_handler_runs_with_its_dependencies_on_one_poo
         }
 
     with TestClient(api) as client:
-        with_dependency = client.get("/count", params={"label": "all"}).json()
+        with_dependency = client.get("/labels/all").json()
         with_arguments = client.get("/count/5", params={"label": "five"}).json()
 
     assert (with_dependency["count"], with_dependency["label"]) == (0, "all")
