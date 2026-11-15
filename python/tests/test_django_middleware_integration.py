@@ -1308,6 +1308,9 @@ class _DjangoRequestRecorder(MiddlewareMixin):
             "method": request.method,
             "path": request.path,
             "path_info": request.path_info,
+            "meta_path_info": request.META["PATH_INFO"],
+            "full_path": request.get_full_path(),
+            "absolute_uri": request.build_absolute_uri(),
             "get_tags": request.GET.getlist("tag"),
             "get_x": request.GET.get("x"),
             "get_is_mutable": request.GET._mutable,
@@ -1349,6 +1352,32 @@ class TestDjangoSideRequest:
         assert seen["get_is_mutable"] is True
         assert seen["post"] == {}
         assert seen["read"] == seen["body"] == b""
+
+    @pytest.mark.parametrize(
+        ("raw_path", "path", "full_path"),
+        [
+            ("/p/%C3%A9", "/p/\u00e9", "/p/%C3%A9"),
+            ("/p/a%2Fb", "/p/a/b", "/p/a/b"),
+            ("/p/a%20b", "/p/a b", "/p/a%20b"),
+            ("/p/%FF", "/p/%FF", "/p/%25FF"),
+        ],
+        ids=["utf-8", "encoded-slash", "space", "invalid-utf-8"],
+    )
+    def test_path_is_decoded_as_django_servers_give_it(self, layout, raw_path, path, full_path):
+        _DjangoRequestRecorder.seen = {}
+        api = BoltAPI(middleware=[layout()])
+
+        @api.get("/p/{name:path}")
+        async def route(name: str):
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            assert client.get(raw_path + "?q=1").status_code == 200
+        seen = _DjangoRequestRecorder.seen
+
+        assert seen["path"] == seen["path_info"] == seen["meta_path_info"] == path
+        assert seen["full_path"] == full_path + "?q=1"
+        assert seen["absolute_uri"] == "http://testserver" + full_path + "?q=1"
 
     def test_request_with_no_query_has_an_empty_query_dict(self, layout):
         seen = self._send(layout, "GET", "/plain")
@@ -1684,6 +1713,48 @@ class TestCSRFMiddleware:
             assert post_response.status_code == 200
             assert post_response.json() == {"status": "submitted"}
 
+    def test_csrf_accepts_a_token_in_a_multipart_form(self):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+
+        @api.post("/submit")
+        async def submit_route():
+            return {"status": "submitted"}
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/submit",
+                data={"csrfmiddlewaretoken": _CSRF_SECRET},
+                files={"upload": ("note.txt", b"text")},
+                headers={"Cookie": f"csrftoken={_CSRF_SECRET}"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "submitted"}
+
+    @pytest.mark.parametrize(
+        ("content_type", "body"),
+        [
+            ("multipart/form-data", b"no boundary"),
+            ("application/x-www-form-urlencoded; charset=utf-16", b"a=1"),
+        ],
+        ids=["multipart-without-boundary", "urlencoded-with-utf-16"],
+    )
+    def test_csrf_rejects_an_unreadable_form_with_a_400(self, content_type, body):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+
+        @api.post("/submit")
+        async def submit_route():
+            return {"status": "submitted"}
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/submit",
+                content=body,
+                headers={"content-type": content_type, "Cookie": f"csrftoken={_CSRF_SECRET}"},
+            )
+
+        assert response.status_code == 400
+
 
 # =============================================================================
 # Test process_view through the single wrapper and the stack
@@ -1691,6 +1762,39 @@ class TestCSRFMiddleware:
 
 # A CSRF secret has 32 letters or digits. The cookie and the header carry it.
 _CSRF_SECRET = "abcdefghijklmnopqrstuvwxyz012345"
+
+
+class _RecordsUnsupportedHooks(MiddlewareMixin):
+    """Record the hooks that Bolt does not run. process_view is the one that it runs."""
+
+    calls: list = []
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        type(self).calls.append("process_view")
+
+    def process_exception(self, request, exception):
+        type(self).calls.append("process_exception")
+        return HttpResponse("handled", status=418)
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [lambda: DjangoMiddleware(_RecordsUnsupportedHooks), lambda: DjangoMiddlewareStack([_RecordsUnsupportedHooks])],
+    ids=["wrapper", "stack"],
+)
+def test_process_view_runs_and_process_exception_does_not(layout):
+    _RecordsUnsupportedHooks.calls = []
+    api = BoltAPI(middleware=[layout()])
+
+    @api.get("/boom")
+    async def boom():
+        raise ValueError("boom")
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/boom")
+
+    assert _RecordsUnsupportedHooks.calls == ["process_view"]
+    assert response.status_code == 500
 
 
 class _BlockInViewMiddleware(MiddlewareMixin):

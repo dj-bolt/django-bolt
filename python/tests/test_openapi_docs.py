@@ -26,7 +26,13 @@ from django_bolt.auth import (
     SessionAuthentication,
 )
 from django_bolt.datastructures import UploadFile
-from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, SwaggerRenderPlugin
+from django_bolt.openapi import (
+    OpenAPIConfig,
+    RapidocRenderPlugin,
+    RedocRenderPlugin,
+    StoplightRenderPlugin,
+    SwaggerRenderPlugin,
+)
 from django_bolt.openapi.spec import Components, SecurityScheme
 from django_bolt.params import File, Form
 from django_bolt.serializers import Serializer, field
@@ -144,6 +150,50 @@ def test_redoc_endpoint_uses_available_bundle(options, expected_url):
     assert f'<script src="{expected_url}" crossorigin></script>' in response.text
     assert "Redoc.init(" in response.text
     assert '"/items"' in response.text
+
+
+@pytest.mark.parametrize(
+    ("plugin", "url", "expected_parts"),
+    [
+        (
+            RapidocRenderPlugin(),
+            "/docs/rapidoc",
+            [
+                "<title>Docs UI API</title>",
+                '<script src="https://unpkg.com/rapidoc@9.3.4/dist/rapidoc-min.js" crossorigin></script>',
+                '<rapi-doc spec-url="/docs/openapi.json" />',
+            ],
+        ),
+        (
+            StoplightRenderPlugin(),
+            "/docs/elements",
+            [
+                "<title>Docs UI API</title>",
+                '<link rel="stylesheet" href="https://unpkg.com/@stoplight/elements@7.7.18/styles.min.css">',
+                '<script src="https://unpkg.com/@stoplight/elements@7.7.18/web-components.min.js" crossorigin></script>',
+                'apiDescriptionUrl="/docs/openapi.json"',
+                'router="hash"',
+                'layout="sidebar"',
+            ],
+        ),
+    ],
+)
+def test_rapidoc_and_stoplight_endpoints_render_the_page(plugin, url, expected_parts):
+    """Each UI page names the API title, its bundle and the schema URL."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Docs UI API", version="1.0.0", render_plugins=[plugin]))
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.text.lstrip().startswith("<!DOCTYPE html>")
+    for part in expected_parts:
+        assert part in response.text
+    assert plugin.favicon in response.text
+    assert plugin.style in response.text
+    assert '<meta charset="utf-8"/>' in response.text
+    assert 'name="viewport"' in response.text
 
 
 def test_swagger_ui_supports_openapi_3_2_query_specs():

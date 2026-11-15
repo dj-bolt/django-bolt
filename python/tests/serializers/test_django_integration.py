@@ -735,6 +735,29 @@ class TestSubsetWithDjango:
         assert mini.username == "uppercase"
         assert mini.email == "upper@example.com"
 
+    def test_subset_keeps_each_validator_of_a_field(self):
+        """A subset runs all the validators of a field, as the parent does."""
+
+        class Account(Serializer):
+            id: int
+            name: str
+
+            @field_validator("name")
+            def strip_name(cls, value):
+                return value.strip()
+
+            @field_validator("name")
+            def reject_empty_name(cls, value):
+                if not value:
+                    raise ValueError("Name is empty")
+                return value
+
+        AccountMini = Account.subset("name")
+
+        assert AccountMini(name="  ada  ").name == Account(id=1, name="  ada  ").name == "ada"
+        with pytest.raises(RequestValidationError, match="Name is empty"):
+            AccountMini(name="   ")
+
     @pytest.mark.django_db
     def test_subset_with_computed_field(self):
         """Test subset includes computed fields."""

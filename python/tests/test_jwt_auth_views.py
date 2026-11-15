@@ -5,12 +5,15 @@ from typing import ClassVar
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from django.contrib.auth import get_user_model
 from django.contrib.auth.backends import ModelBackend
+from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 
 from django_bolt import BoltAPI
-from django_bolt.auth import InMemoryRevocation, JWTAuthViews
+from django_bolt.auth import InMemoryRevocation, IsAuthenticated, JWTAuthentication, JWTAuthViews
 from django_bolt.testing import TestClient
 
 pytestmark = pytest.mark.django_db
@@ -80,7 +83,8 @@ def _views_api(**options) -> BoltAPI:
     async def validate(request, credentials):
         return User() if credentials.password == "correct" else None
 
-    JWTAuthViews(store=InMemoryRevocation(), secret=SECRET, credential_validator=validate, **options).register(api)
+    options.setdefault("secret", SECRET)
+    JWTAuthViews(store=InMemoryRevocation(), credential_validator=validate, **options).register(api)
     return api
 
 
@@ -124,6 +128,70 @@ def test_views_use_the_given_key_algorithm_and_prefix():
         assert client.post("/api/auth-X/logout", headers=NO_CSRF_ORIGIN).status_code == 200
 
 
+@pytest.fixture(scope="module")
+def rsa_pems() -> tuple[str, str]:
+    """Give one RSA key pair as (private PEM, public PEM). Key generation is slow."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    public_pem = (
+        private_key.public_key()
+        .public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+        .decode()
+    )
+    return private_pem, public_pem
+
+
+def test_views_sign_with_the_private_key_and_verify_with_the_public_key(rsa_pems):
+    """With an asymmetric algorithm, ``secret`` signs the tokens and ``public_key`` verifies them."""
+    private_pem, public_pem = rsa_pems
+    api = _views_api(secret=private_pem, public_key=public_pem, algorithm="RS256", kid="k1", secure_cookies=False)
+
+    @api.get("/me", auth=[JWTAuthentication(public_key=public_pem, algorithms=["RS256"])], guards=[IsAuthenticated()])
+    async def me(request):
+        return {"user_id": request["context"]["user_id"]}
+
+    with TestClient(api) as client:
+        assert client.post("/auth/login", json=LOGIN).status_code == 200
+        first_refresh = client.cookies.get("refresh_token")
+
+        refreshed = client.post("/auth/refresh", headers=NO_CSRF_ORIGIN)
+        assert refreshed.status_code == 200, refreshed.text
+        access = client.cookies.get("access_token")
+        refresh = client.cookies.get("refresh_token")
+        assert refresh != first_refresh
+        # The refresh route signs the new pair with the private key.
+        for token in (access, refresh):
+            assert jwt.get_unverified_header(token)["kid"] == "k1"
+            assert jwt.decode(token, public_pem, algorithms=["RS256"])["sub"] == "view-user"
+
+        # A route of the application verifies the access token with the public key only.
+        profile = client.get("/me", headers={"Authorization": f"Bearer {access}"})
+        assert profile.status_code == 200, profile.text
+        assert profile.json() == {"user_id": "view-user"}
+
+        assert client.post("/auth/logout", headers=NO_CSRF_ORIGIN).status_code == 200
+        assert client.cookies.get("refresh_token") is None
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"algorithm": "RS256", "secret": "private-pem"}, "requires 'secret' and 'public_key'"),
+        ({"algorithm": "RS256", "public_key": "public-pem"}, "requires 'secret' and 'public_key'"),
+        ({"public_key": "public-pem"}, "'public_key' only with an asymmetric algorithm"),
+    ],
+    ids=["asymmetric-without-public-key", "asymmetric-without-private-key", "hmac-with-public-key"],
+)
+def test_keys_that_do_not_match_the_algorithm_fail_at_construction(options, message):
+    """A key set that cannot work must stop the startup, not the first refresh."""
+    with pytest.raises(ImproperlyConfigured, match=message):
+        JWTAuthViews(store=InMemoryRevocation(), **options)
+
+
 def test_refresh_cookie_without_a_jti_is_rejected():
     """A refresh token that cannot be revoked must not reach the lifecycle routes."""
     now = int(time.time())
@@ -157,7 +225,10 @@ def test_used_refresh_token_cannot_log_out_the_token_that_replaced_it(path):
         assert client.post("/auth/refresh", headers=NO_CSRF_ORIGIN).status_code == 200
         live = client.cookies.get("refresh_token")
 
-        assert _post_with_refresh(client, path, used).status_code == 401
+        rejected = _post_with_refresh(client, path, used)
+        assert rejected.status_code == 401
+        # The body is the same as for a token that the refresh route rejects.
+        assert rejected.json() == {"detail": "Invalid token"}
         assert _post_with_refresh(client, "/auth/refresh", live).status_code == 200
 
 
@@ -172,6 +243,8 @@ def test_refresh_token_from_before_logout_all_cannot_log_out_a_new_login():
 
         assert _post_with_refresh(client, "/auth/logout-all", old).status_code == 401
         assert _post_with_refresh(client, "/auth/refresh", new).status_code == 200
+        # The tokens of the new login have version 1. They are live, so they can log out.
+        assert client.post("/auth/logout", headers=NO_CSRF_ORIGIN).status_code == 200
 
 
 def test_logged_out_refresh_token_cannot_log_out_everywhere():
@@ -204,6 +277,20 @@ def test_refresh_token_without_a_family_cannot_log_out(family):
             paths, (401, {"detail": "Invalid token"})
         )
         assert _post_with_refresh(client, "/auth/refresh", live).status_code == 200
+
+
+def test_refresh_token_without_a_version_has_version_zero():
+    """The refresh route reads a token with no ``ver`` claim as version 0. The logout routes do the same."""
+    now = int(time.time())
+    claims = {"sub": "view-user", "typ": "refresh", "fam": "family-1", "iat": now, "exp": now + 600}
+    first, second = (jwt.encode({**claims, "jti": jti}, SECRET, algorithm="HS256") for jti in ("jti-1", "jti-2"))
+
+    with TestClient(_views_api()) as client:
+        # The user has version 0, so the token is live. This logout-all gives the user version 1.
+        assert _post_with_refresh(client, "/auth/logout-all", first).status_code == 200
+        # Version 0 is now old.
+        assert _post_with_refresh(client, "/auth/logout-all", second).status_code == 401
+        assert _post_with_refresh(client, "/auth/refresh", second).status_code == 401
 
 
 class RecordingBackend(ModelBackend):
