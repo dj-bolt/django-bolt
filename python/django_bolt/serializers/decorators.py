@@ -106,16 +106,22 @@ class ComputedFieldConfig:
     """Return type of the computed field."""
 
     description: str | None = None
-    """Description for OpenAPI documentation."""
+    """The ``description`` of the property in the OpenAPI schema. The default is the docstring of the method."""
 
     alias: str | None = None
     """Alternative name for this field in JSON output."""
 
     deprecated: bool = False
-    """Mark this field as deprecated."""
+    """If True, the property has ``deprecated: true`` in the OpenAPI schema."""
 
     include_in_schema: bool = True
-    """Whether to include this field in OpenAPI schema."""
+    """If False, the OpenAPI schema has no property for this field. ``dump()`` still returns it."""
+
+    title: str | None = None
+    """The ``title`` of the property in the OpenAPI schema."""
+
+    examples: list[Any] | None = None
+    """The ``examples`` list of the property in the OpenAPI schema."""
 
 
 def computed_field(
@@ -125,6 +131,8 @@ def computed_field(
     description: str | None = None,
     deprecated: bool = False,
     include_in_schema: bool = True,
+    title: str | None = None,
+    examples: list[Any] | None = None,
 ) -> Any:
     """
     Mark a method as a computed field for serialization output.
@@ -133,12 +141,21 @@ def computed_field(
     stored as struct fields. They are similar to DRF's SerializerMethodField
     or Pydantic's @computed_field.
 
+    The OpenAPI response schema of the serializer has a property for each
+    computed field. The property is required and has ``readOnly: true``. Its
+    type is the return type of the method. A request body schema has no
+    computed field.
+
     Args:
         func: The method to use for computing the value (if used without parentheses)
         alias: Alternative name for this field in JSON output.
-        description: Description for OpenAPI documentation.
-        deprecated: Mark this field as deprecated.
-        include_in_schema: Whether to include this field in OpenAPI schema.
+        description: The description of the property in the OpenAPI schema.
+                     The default is the docstring of the method.
+        deprecated: If True, the OpenAPI schema marks the property as deprecated.
+        include_in_schema: If False, the OpenAPI schema has no property for this field.
+                           dump() still returns the field.
+        title: The title of the property in the OpenAPI schema.
+        examples: A list of example values for the property in the OpenAPI schema.
 
     Returns:
         The decorated method with computed field metadata.
@@ -188,6 +205,8 @@ def computed_field(
             alias=alias,
             deprecated=deprecated,
             include_in_schema=include_in_schema,
+            title=title,
+            examples=examples,
         )
         return method
 

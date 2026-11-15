@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_
 import msgspec
 from django.conf import settings as django_settings
 
-from .._serializer_input import input_has_read_only_fields
+from .._serializer_input import any_serializer
 from ..datastructures import UploadFile
 from ..responses import (
     HTML,
@@ -118,7 +118,9 @@ def _type_display_name(annotation: Any) -> str:
 class _InputComponent:
     """The component key of the request body schema of a serializer.
 
-    A serializer with a ``read_only`` field has two schemas. The response
+    A serializer has two schemas if its input and its output have other fields:
+    a ``read_only`` field, a field that ``dump()`` leaves out (``write_only``,
+    ``exclude``) or a computed field. The response
     schema keeps the name of the class. The request body schema has the name
     ``<class>Input``, or the name of the class if the document has no other
     schema of that class. The attributes are those that the component names read.
@@ -355,8 +357,9 @@ class SchemaGenerator:
         # registration order the name map iterates.
         self._component_ref: dict[type, Reference] = {}
         self._component_schema: dict[type, Schema] = {}
-        # True while the schema of a JSON request body is built. Input cannot
-        # set a read_only serializer field, so that schema leaves it out.
+        # True while the schema of a JSON request body is built. That schema has
+        # no read_only field and no computed field of a serializer. Each other
+        # schema has no field that dump() leaves out.
         self._input_schema = False
         self._input_components: dict[type, _InputComponent] = {}
         # strict mode bookkeeping (see OpenAPIStrictError)
@@ -1797,8 +1800,13 @@ class SchemaGenerator:
         properties = {}
         required = []
 
-        read_only = self._read_only_fields(struct_type)
+        # Only a Serializer has fields that are in one of its two schemas.
+        serializer = self._serializer_class(struct_type)
+        read_only = serializer.__read_only_fields__ if serializer else frozenset()
+        write_only = serializer.__write_only_fields__ if serializer else frozenset()
+        not_in_output = self._fields_not_in_output(serializer) if serializer else frozenset()
         field_configs = self._field_configs(struct_type)
+
         for field in struct_info.fields:
             field_config = field_configs.get(field.name)
             if not self._field_in_schema(field_config):
@@ -1806,10 +1814,17 @@ class SchemaGenerator:
             is_read_only = field.name in read_only
             if is_read_only and self._input_schema:
                 continue
+            # The schema of a response has the fields that dump() returns.
+            if field.name in not_in_output and not self._input_schema:
+                continue
             field_name, field_schema, field_required = self._msgspec_field_schema(
                 field, field_config, register_component=register_component
             )
-            properties[field_name] = self._mark_read_only(field_schema) if is_read_only else field_schema
+            if is_read_only:
+                field_schema = self._with_keywords(field_schema, read_only=True)
+            elif field.name in write_only:
+                field_schema = self._with_keywords(field_schema, write_only=True)
+            properties[field_name] = field_schema
 
             # Check if required
             if field_required:
@@ -1820,6 +1835,9 @@ class SchemaGenerator:
         if tag_field and tag is not None:
             properties[tag_field] = self._enum_values_schema([tag])
             required.append(tag_field)
+
+        if serializer is not None and not self._input_schema:
+            self._add_computed_fields(serializer, properties, required, register_component)
 
         # Pull `description` from the struct's *own* docstring only (see
         # _own_docstring — avoids inheriting msgspec.Struct's base docstring).
@@ -1833,24 +1851,69 @@ class SchemaGenerator:
         )
 
     @staticmethod
-    def _read_only_fields(struct_type: Any) -> frozenset[str]:
-        """The ``read_only`` field names of a Serializer. Empty for each other struct."""
+    def _serializer_class(struct_type: Any) -> Any:
+        """The Serializer class of a struct type, with its field metadata collected. None for each other struct."""
         cls = _struct_origin(struct_type)
         if not getattr(cls, "__is_bolt_serializer__", False):
-            return frozenset()
+            return None
         cls._ensure_dump_ready()
-        return cls.__read_only_fields__
+        return cls
 
     @staticmethod
-    def _mark_read_only(schema: Schema | Reference) -> Schema:
-        """Add ``readOnly: true`` to an inline schema or to a component reference."""
+    def _fields_not_in_output(serializer: Any) -> frozenset[str]:
+        """The struct fields that ``dump()`` leaves out: ``write_only`` and ``field(exclude=True)``."""
+        dumped = {spec.field_name for spec in serializer._dump_field_specs}
+        return frozenset(name for name in serializer.__struct_fields__ if name not in dumped)
+
+    @staticmethod
+    def _with_keywords(schema: Schema | Reference, **keywords: Any) -> Schema:
+        """Add keywords to an inline schema, or next to a component reference."""
         if isinstance(schema, Schema):
-            return replace(schema, read_only=True)
-        return Schema(all_of=[schema], read_only=True)
+            return replace(schema, **keywords)
+        return Schema(all_of=[schema], **keywords)
+
+    def _add_computed_fields(
+        self, serializer: Any, properties: dict[str, Any], required: list[str], register_component: bool
+    ) -> None:
+        """Add the ``@computed_field`` methods of a serializer to its response schema.
+
+        Each one is required and read-only: ``dump()`` returns it, and input cannot set it.
+        """
+        for field_name, config in serializer.__computed_fields__.items():
+            if not config.include_in_schema:
+                continue
+            if config.return_type is Any:
+                # No return annotation: each value is valid.
+                schema: Schema | Reference = Schema()
+            else:
+                schema = self._type_to_schema(
+                    msgspec.inspect.type_info(config.return_type), register_component=register_component
+                )
+            description = config.description or inspect.getdoc(getattr(serializer, config.method_name))
+            properties[field_name] = self._with_keywords(
+                schema,
+                read_only=True,
+                **self._schema_kwargs(
+                    description=description,
+                    title=config.title,
+                    examples=config.examples,
+                    deprecated=config.deprecated or None,
+                ),
+            )
+            required.append(field_name)
+
+    def _has_two_schemas(self, serializer: Any) -> bool:
+        """Tell if the request body schema of a serializer class is not its response schema."""
+        serializer._ensure_dump_ready()
+        return bool(
+            serializer.__read_only_fields__
+            or self._fields_not_in_output(serializer)
+            or any(config.include_in_schema for config in serializer.__computed_fields__.values())
+        )
 
     def _component_key(self, struct_type: Any) -> Any:
         """The registry key of a struct: the type, or its input variant in a request body."""
-        if not (self._input_schema and input_has_read_only_fields(struct_type)):
+        if not (self._input_schema and any_serializer(struct_type, self._has_two_schemas)):
             return struct_type
         key = self._input_components.get(struct_type)
         if key is None:
