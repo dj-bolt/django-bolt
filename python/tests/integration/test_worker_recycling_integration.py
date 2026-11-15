@@ -131,6 +131,26 @@ def test_sigterm_does_not_wait_for_an_idle_keep_alive_connection(make_server_pro
     assert elapsed < 10, f"SIGTERM waited {elapsed:.1f} s for an idle keep-alive connection"
 
 
+def test_workers_kill_timeout_limits_the_shutdown_of_one_process(make_server_project):
+    """With one process and no recycling option, --workers-kill-timeout is the graceful-shutdown window."""
+    project = make_server_project(api_module=app_module("shutdown_slow"))
+
+    with (
+        project.start(extra_args=["--workers-kill-timeout", "2"]) as server,
+        socket.create_connection((server.host, server.port), timeout=5) as in_flight,
+    ):
+        in_flight.sendall(f"GET /slow?seconds=25 HTTP/1.1\r\nHost: {server.host}\r\n\r\n".encode())
+        # Let the handler start before the signal.
+        time.sleep(1.0)
+
+        started = time.monotonic()
+        os.kill(server.process.pid, signal.SIGTERM)
+        server.process.wait(timeout=60)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 10, f"SIGTERM waited {elapsed:.1f} s for the request, the timeout is 2 s"
+
+
 def test_workers_lifetime_recycles_worker_without_downtime(make_server_project):
     project = make_server_project(api_module=app_module("recycling_pid"))
 

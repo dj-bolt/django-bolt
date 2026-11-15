@@ -9,6 +9,7 @@ handler must run in the thread pool, not on the server thread.
 from __future__ import annotations
 
 import functools
+import inspect
 import threading
 import urllib.request
 from dataclasses import dataclass
@@ -120,6 +121,22 @@ class TokenInNew(AcceptsAnything):
         return self
 
 
+class NewReadsToken:
+    """A class with no base class. Its __new__ reads the header, and its __init__ reads no request part."""
+
+    def __new__(cls, request):
+        self = super().__new__(cls)
+        self.token = request.headers.get("x-token")
+        return self
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class TokenInInheritedNew(NewReadsToken):
+    """The class inherits __new__ from its last base class. Its own body has no __new__."""
+
+
 class TokenFromMetaclass(type):
     """A metaclass __call__ runs before __new__ and __init__. Here it reads the header."""
 
@@ -147,6 +164,30 @@ def test_a_lambda_handler_gets_the_query():
         response = client.get("/search?q=bolt")
 
     assert response.json() == {"query": {"q": "bolt"}}
+
+
+def test_a_handler_with_a_synthetic_signature_gets_each_request_part():
+    """A ``__signature__`` can hide the code that reads the request, so Rust parses each request part."""
+    api = BoltAPI()
+
+    async def template(request: Request): ...
+
+    async def handler(*args):
+        request = args[0]
+        return {
+            "header": request.headers.get("x-token"),
+            "cookie": request.cookies.get("session"),
+            "query": request.query.get("q"),
+            "body": bytes(request.body).decode(),
+        }
+
+    handler.__signature__ = inspect.signature(template)
+    api.post("/parts")(handler)
+
+    with TestClient(api) as client:
+        response = client.post("/parts?q=bolt", headers={"x-token": "abc", "cookie": "session=s1"}, content=b"text")
+
+    assert response.json() == {"header": "abc", "cookie": "s1", "query": "bolt", "body": "text"}
 
 
 def test_a_lambda_dependency_gets_the_query():
@@ -358,6 +399,13 @@ def test_the_analysis_fails_for_a_class_whose_init_has_no_source():
     assert analysis.failure_reason.startswith("Could not get source:")
 
 
+def test_the_failed_analysis_names_the_class_that_runs_new_before_init():
+    analysis = analyze_handler(TokenInNew, {"request"})
+
+    assert analysis.analysis_failed is True
+    assert analysis.failure_reason == "TokenInNew runs a __new__ or a metaclass __call__ before __init__"
+
+
 def test_a_form_route_parses_no_headers_for_python():
     """Rust reads the Content-Type of a form from its own map, so Python needs no headers dict."""
     api = BoltAPI()
@@ -407,10 +455,17 @@ def test_a_class_dependency_whose_new_reads_the_header_gets_it():
     def items(holder: Annotated[TokenInNew, Depends(TokenInNew)]):
         return {"token": holder.token}
 
+    # The __new__ can come from a base class.
+    @api.get("/inherited")
+    def inherited(holder: Annotated[TokenInInheritedNew, Depends(TokenInInheritedNew)]):
+        return {"token": holder.token}
+
     with TestClient(api) as client:
         response = client.get("/items", headers={"x-token": "secret"})
+        inherited_response = client.get("/inherited", headers={"x-token": "secret"})
 
     assert response.json() == {"token": "secret"}
+    assert inherited_response.json() == {"token": "secret"}
 
 
 def test_a_class_dependency_whose_metaclass_call_reads_the_header_gets_it():

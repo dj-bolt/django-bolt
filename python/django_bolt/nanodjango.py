@@ -45,8 +45,20 @@ _BOLT_DECORATOR_NAMES: tuple[str, ...] = (
     "options",
     "query",
     "websocket",
+    "view",
+    "viewset",
 )
-_BOLT_MOUNT_NAMES: tuple[str, ...] = ("mount_django", "mount")
+# Calls on the API object that add routes: ``bolt.mount(...)`` and the others.
+_BOLT_MOUNT_NAMES: tuple[str, ...] = (
+    "mount_django",
+    "mount",
+    "mount_asgi",
+    "mount_mcp",
+    "include_router",
+    "native_route",
+)
+# Classes whose instances take route decorators.
+_BOLT_API_CLASS_NAMES: tuple[str, ...] = ("BoltAPI", "Router")
 
 
 class BoltAPI(_RealBoltAPI):
@@ -180,7 +192,7 @@ def convert_build_settings(converter: Converter, resolver: Resolver, settings_as
 
 
 def _is_bolt_assignment(node: ast.AST, api_objs: set[str], resolver: Resolver) -> bool:
-    """Detect ``bolt = BoltAPI(...)`` or ``bolt = something.BoltAPI(...)``."""
+    """Detect ``bolt = BoltAPI(...)``, ``bolt = something.BoltAPI(...)`` and ``router = Router(...)``."""
     if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
         return False
     func = node.value.func
@@ -190,7 +202,7 @@ def _is_bolt_assignment(node: ast.AST, api_objs: set[str], resolver: Resolver) -
         func_name = func.attr
     else:
         return False
-    if func_name != "BoltAPI":
+    if func_name not in _BOLT_API_CLASS_NAMES:
         return False
     for target in node.targets:
         if isinstance(target, ast.Name):
@@ -200,8 +212,8 @@ def _is_bolt_assignment(node: ast.AST, api_objs: set[str], resolver: Resolver) -
 
 
 def _is_bolt_decorated_function(node: ast.AST, api_objs: set[str], resolver: Resolver) -> bool:
-    """Detect ``@bolt.get(...)`` / ``@bolt.websocket(...)`` etc. on a function def."""
-    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    """Detect ``@bolt.get(...)`` / ``@bolt.websocket(...)`` etc. on a function, and ``@bolt.view(...)`` on a class."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return False
     for decorator in get_decorators(node):
         if isinstance(decorator, ast.Call):
@@ -218,7 +230,7 @@ def _is_bolt_decorated_function(node: ast.AST, api_objs: set[str], resolver: Res
 
 
 def _is_bolt_mount_call(node: ast.AST, api_objs: set[str]) -> bool:
-    """Detect ``bolt.mount_django(...)`` or ``bolt.mount(...)`` expression statements."""
+    """Detect ``bolt.mount(...)``, ``bolt.include_router(...)`` and the other calls that add routes."""
     if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
         return False
     func = node.value.func
@@ -239,8 +251,12 @@ def convert_build_app_api(converter: Converter, resolver: Resolver, extra_src: l
     Detects:
     - ``bolt = BoltAPI(...)``  (from django_bolt.nanodjango or django_bolt)
     - ``bolt = django_bolt.nanodjango.BoltAPI(...)``
+    - ``router = Router(...)``
     - ``@bolt.get(...)``, ``@bolt.post(...)``, etc. on async/sync functions
-    - ``bolt.mount_django(...)`` and ``bolt.mount(...)`` calls
+    - ``@bolt.view(...)`` and ``@bolt.viewset(...)`` on classes
+    - ``bolt.mount_django(...)``, ``bolt.mount(...)``, ``bolt.mount_asgi(...)``,
+      ``bolt.mount_mcp(...)``, ``bolt.include_router(...)`` and
+      ``bolt.native_route(...)`` calls
     """
     api_objs: set[str] = set()
 
