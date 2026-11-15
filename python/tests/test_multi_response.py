@@ -17,7 +17,7 @@ import pytest
 from django_bolt import BoltAPI, Depends
 from django_bolt.openapi.config import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
-from django_bolt.responses import JSON
+from django_bolt.responses import HTML, JSON, PlainText
 from django_bolt.serialization import (
     serialize_response,
     serialize_response_sync,
@@ -631,6 +631,100 @@ def test_a_tuple_with_an_undeclared_status_keeps_that_status(path, content_type,
         assert response.status_code == 418
         assert response.headers["content-type"] == content_type
         assert response.content == body
+
+
+# ============================================================================
+# A (status, response object) tuple sends the response object with the tuple status
+# ============================================================================
+
+
+_SHARED_NOT_FOUND = JSON({"detail": "shared"})
+
+
+@pytest.mark.parametrize("prefix", ["", "/async"])
+def test_a_tuple_with_a_response_object_sends_it_with_the_tuple_status(prefix):
+    """The tuple names the status. The response object gives the body, the headers and the cookies."""
+    api = BoltAPI()
+
+    def json_response():
+        response = JSON({"detail": "no item"}, headers={"x-reason": "missing"})
+        response.set_cookie("seen", "1")
+        return 404, response
+
+    def text_response():
+        # The status of the tuple wins over the status of the response object.
+        return 404, PlainText("gone", status_code=410)
+
+    def unlisted_status():
+        return 418, HTML("<p>teapot</p>")
+
+    def shared_response():
+        return 404, _SHARED_NOT_FOUND
+
+    for path, body in [
+        ("/json", json_response),
+        ("/text", text_response),
+        ("/unlisted", unlisted_status),
+        ("/shared", shared_response),
+    ]:
+
+        def sync_handler(body=body):
+            return body()
+
+        async def async_handler(body=body):
+            return body()
+
+        api.get(path, response_model={200: OkSchema, 404: ErrorSchema})(sync_handler)
+        api.get(f"/async{path}", response_model={200: OkSchema, 404: ErrorSchema})(async_handler)
+
+    with TestClient(api) as client:
+        json_result = client.get(f"{prefix}/json")
+        text_result = client.get(f"{prefix}/text")
+        unlisted_result = client.get(f"{prefix}/unlisted")
+        shared_result = client.get(f"{prefix}/shared")
+
+    assert json_result.status_code == 404
+    assert json_result.json() == {"detail": "no item"}
+    assert json_result.headers["x-reason"] == "missing"
+    assert json_result.cookies["seen"] == "1"
+
+    assert text_result.status_code == 404
+    assert text_result.headers["content-type"] == "text/plain; charset=utf-8"
+    assert text_result.text == "gone"
+
+    assert unlisted_result.status_code == 418
+    assert unlisted_result.headers["content-type"] == "text/html; charset=utf-8"
+    assert unlisted_result.text == "<p>teapot</p>"
+
+    assert shared_result.status_code == 404
+    assert shared_result.json() == {"detail": "shared"}
+    # The response object of the handler keeps its own status.
+    assert _SHARED_NOT_FOUND.status_code == 200
+
+
+@pytest.mark.parametrize("prefix", ["", "/async"])
+@pytest.mark.parametrize("flag", [True, False])
+def test_a_bool_is_not_the_status_of_a_tuple(prefix, flag, capfd):
+    """A bool is an int in Python. It is not an HTTP status, so the tuple gives the 500 of an invalid status."""
+    api = BoltAPI()
+
+    @api.get("/flag", response_model={200: OkSchema, 404: ErrorSchema})
+    def sync_flag():
+        return flag, {"id": 1, "name": "a"}
+
+    @api.get("/async/flag", response_model={200: OkSchema, 404: ErrorSchema})
+    async def async_flag():
+        return flag, {"id": 1, "name": "a"}
+
+    with TestClient(api) as client:
+        response = client.get(f"{prefix}/flag")
+
+    assert response.status_code == 500
+    # The Rust core writes its log records to stderr.
+    assert (
+        f"[django-bolt] ERROR django_bolt::handler: The response status must be an int from 200 to 599, got {flag}."
+        " Bolt sends a 500."
+    ) in capfd.readouterr().err.splitlines()
 
 
 # ============================================================================
