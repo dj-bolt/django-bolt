@@ -89,11 +89,34 @@ _MIDDLEWARE_KEYWORD_DECORATORS = {
 
 
 def _check_dict_middleware(spec: dict[str, Any], context: str) -> None:
-    """Raise ValueError for a dict config that no middleware reads."""
+    """Raise for a dict config that no middleware reads, or that its decorator refuses.
+
+    The dict gets the checks of @cors or @rate_limit. The dict itself does not
+    change: Rust reads it. A None value is a missing value, as in Rust.
+    """
     if "type" not in spec:
         raise ValueError(f"{context} middleware dict has no 'type'. {_DICT_MIDDLEWARE_HINT}")
     if spec["type"] not in _DICT_MIDDLEWARE_TYPES:
         raise ValueError(f"{context} middleware dict has the unknown type {spec['type']!r}. {_DICT_MIDDLEWARE_HINT}")
+
+    options = {name: value for name, value in spec.items() if value is not None}
+    if spec["type"] == "rate_limit":
+        _checked_rate_limit_config(options.get("rps", 100), options.get("burst"), options.get("key", "ip"))
+        return
+    # The config of a route is its complete allow list, so it needs an origin.
+    # The config of an API or a router can keep the allow list of the outer config.
+    on_route = context == "route"
+    _checked_cors_config(
+        "@middleware(type='cors')" if on_route else f"{context} cors dict",
+        origins=options.get("origins"),
+        origin_regexes=options.get("origin_regexes"),
+        methods=options.get("methods"),
+        headers=options.get("headers"),
+        expose_headers=options.get("expose_headers"),
+        credentials=options.get("credentials", False),
+        max_age=options.get("max_age", 3600),
+        require_origins=on_route,
+    )
 
 
 def normalize_middleware_specs(
@@ -113,8 +136,9 @@ def normalize_middleware_specs(
     - Raw middleware functions (route-level only; converted to FunctionMiddlewareSpec)
 
     Raises:
-        TypeError: An entry is of another kind.
-        ValueError: A dict has no "type", or a type that is not "cors" or "rate_limit".
+        TypeError: An entry is of another kind, or a dict holds a value of the wrong type.
+        ValueError: A dict has no "type", or a type that is not "cors" or "rate_limit",
+            or a value that @cors or @rate_limit refuses.
     """
     normalized: list[Any] = []
     if not middleware_specs:
@@ -383,14 +407,16 @@ def middleware(*args, **kwargs):
     - @middleware(MyMiddlewareClass, OtherMiddlewareClass)
     - @middleware on a function `(request, call_next)`, which makes a route decorator
     - @middleware(type="cors", origins=["https://example.com"]) or the same as one dict.
-      The type is "cors" or "rate_limit". @cors(...) and @rate_limit(...) do the same
-      and check each value.
+      The type is "cors" or "rate_limit". The config gets the checks of @cors(...) or
+      @rate_limit(...).
 
     To skip a middleware, use @skip_middleware(...).
 
     Raises:
-        TypeError: A keyword argument without `type`, or an entry that is not a middleware.
-        ValueError: A dict or keyword config whose type is not "cors" or "rate_limit".
+        TypeError: A keyword argument without `type`, an entry that is not a middleware,
+            or a config value of the wrong type.
+        ValueError: A dict or keyword config whose type is not "cors" or "rate_limit",
+            or a config value that @cors or @rate_limit refuses.
 
     Example:
         @api.post("/upload")
@@ -462,6 +488,25 @@ def _rate_limit_count(name: str, value: Any) -> int:
     return value
 
 
+def _checked_rate_limit_config(rps: Any, burst: Any, key: Any) -> dict[str, Any]:
+    """Return the rate limit config that Rust reads. Raise for a bad value.
+
+    @rate_limit and a rate_limit dict both use this check.
+    """
+    rps = _rate_limit_count("rps", rps)
+    burst = rps * 2 if burst is None else _rate_limit_count("burst", burst)
+    if not isinstance(key, str):
+        raise TypeError(f"rate_limit key must be a str, got {type(key).__name__} {key!r}")
+    if not key:
+        raise ValueError("rate_limit key must not be empty")
+    # Rust reads "ip", "user" and "api_key" in any letter case. Each other key
+    # is the name of a request header. No request has a header with another
+    # character in its name, so each caller would share one bucket.
+    if not _HEADER_NAME.fullmatch(key):
+        raise ValueError(f'rate_limit key must be "ip", "user", "api_key" or the name of a request header, got {key!r}')
+    return {"type": "rate_limit", "rps": rps, "burst": burst, "key": key}
+
+
 def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     """
     Rate limiting decorator (Rust-accelerated).
@@ -503,23 +548,13 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
 
     # Check the values here. Rust cannot read a bad value, and the route must
     # not get another limit than the one its author gave.
-    rps = _rate_limit_count("rps", rps)
-    burst = rps * 2 if burst is None else _rate_limit_count("burst", burst)
-    if not isinstance(key, str):
-        raise TypeError(f"rate_limit key must be a str, got {type(key).__name__} {key!r}")
-    if not key:
-        raise ValueError("rate_limit key must not be empty")
-    # Rust reads "ip", "user" and "api_key" in any letter case. Each other key
-    # is the name of a request header. No request has a header with another
-    # character in its name, so each caller would share one bucket.
-    if not _HEADER_NAME.fullmatch(key):
-        raise ValueError(f'rate_limit key must be "ip", "user", "api_key" or the name of a request header, got {key!r}')
+    config = _checked_rate_limit_config(rps, burst, key)
 
     def decorator(func):
         _reject_second_config(func, "rate_limit")
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
-        func.__bolt_middleware__.append({"type": "rate_limit", "rps": rps, "burst": burst, "key": key})
+        func.__bolt_middleware__.append(dict(config))
         return func
 
     return decorator
@@ -548,7 +583,7 @@ def _reject_second_config(handler: Callable, mw_type: Any) -> None:
         )
 
 
-def _cors_str_list(name: str, value: Any) -> list[str]:
+def _cors_str_list(where: str, name: str, value: Any) -> list[str]:
     """Return a str or a sequence of str as a list of str.
 
     Any other type raises TypeError here, at decoration, with the name of the argument.
@@ -558,32 +593,95 @@ def _cors_str_list(name: str, value: Any) -> list[str]:
     if isinstance(value, str):
         return [value]
     if not isinstance(value, (list, tuple, set, frozenset)):
-        raise TypeError(f"@cors() {name} must be a str or a list of str, not {type(value).__name__}")
+        raise TypeError(f"{where} {name} must be a str or a list of str, not {type(value).__name__}")
     items = list(value)
     for item in items:
         if not isinstance(item, str):
-            raise TypeError(f"@cors() {name} must hold only str, not {type(item).__name__}")
+            raise TypeError(f"{where} {name} must hold only str, not {type(item).__name__}")
     return items
 
 
-def _cors_name_list(name: str, value: Any) -> list[str] | None:
-    """Return the methods or the headers of @cors as a list of str. None stays None.
+def _cors_name_list(where: str, name: str, value: Any) -> list[str] | None:
+    """Return the methods or a header list of a cors config as a list of str. None stays None.
 
     A str raises TypeError. It is not one name here, and it is not a sequence of characters.
     """
     if value is None:
         return None
     if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
-        raise TypeError(f"@cors() {name} must be a list of str, not {type(value).__name__} {value!r}")
+        raise TypeError(f"{where} {name} must be a list of str, not {type(value).__name__} {value!r}")
     items = list(value)
     for item in items:
         if not isinstance(item, str):
-            raise TypeError(f"@cors() {name} must hold only str, not {type(item).__name__} {item!r}")
+            raise TypeError(f"{where} {name} must hold only str, not {type(item).__name__} {item!r}")
     return items
 
 
 # Rust keeps max_age in a u32.
 _CORS_MAX_AGE_LIMIT = 2**32 - 1
+
+
+def _checked_cors_config(
+    where: str,
+    *,
+    origins: Any = None,
+    origin_regexes: Any = None,
+    methods: Any = None,
+    headers: Any = None,
+    expose_headers: Any = None,
+    credentials: Any = False,
+    max_age: Any = 3600,
+    require_origins: bool = True,
+) -> dict[str, Any]:
+    """Return the cors config that Rust reads. Raise for a bad value.
+
+    @cors and a cors dict both use this check. `where` names the form in the
+    error. The config must not get the default of an option when its author
+    gave another value.
+    """
+    method_list = _cors_name_list(where, "methods", methods)
+    header_list = _cors_name_list(where, "headers", headers)
+    expose_list = _cors_name_list(where, "expose_headers", expose_headers)
+    if not isinstance(credentials, bool):
+        raise TypeError(f"{where} credentials must be a bool, not {type(credentials).__name__} {credentials!r}")
+    if isinstance(max_age, bool) or not isinstance(max_age, int):
+        raise TypeError(f"{where} max_age must be an int, not {type(max_age).__name__} {max_age!r}")
+    if not 0 <= max_age <= _CORS_MAX_AGE_LIMIT:
+        raise ValueError(f"{where} max_age must be from 0 to {_CORS_MAX_AGE_LIMIT}, got {max_age}")
+
+    # A str is one origin or one pattern, not a sequence of characters.
+    origin_list = _cors_str_list(where, "origins", origins)
+    regex_list = _cors_str_list(where, "origin_regexes", origin_regexes)
+
+    # SECURITY: Require explicit origins - an empty route config is a common mistake.
+    # An empty list would use the global settings, which the route replaces.
+    if require_origins and not origin_list and not regex_list:
+        raise ValueError(
+            f"{where} requires an 'origins' or 'origin_regexes' argument. Examples:\n"
+            "  @cors(origins=['https://example.com'])  # Specific origin\n"
+            "  @cors(origins=['*'])  # Allow all origins\n"
+            "  @cors(origin_regexes=[r'^https://\\w+\\.example\\.com$'])  # Origin patterns\n"
+            "\n"
+            "If you want to use global CORS settings from Django (CORS_ALLOWED_ORIGINS),\n"
+            "simply remove the @cors decorator - global config applies automatically."
+        )
+
+    # SECURITY: An empty pattern matches every origin.
+    if any(not pattern for pattern in regex_list):
+        raise ValueError(f"{where} origin_regexes holds an empty pattern, which matches every origin.")
+
+    config = {
+        "type": "cors",
+        "origins": origin_list,
+        "origin_regexes": regex_list,
+        "methods": method_list or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"],
+        "headers": header_list,
+        "credentials": credentials,
+        "max_age": max_age,
+    }
+    if expose_list is not None:
+        config["expose_headers"] = expose_list
+    return config
 
 
 def cors(
@@ -639,44 +737,22 @@ def cors(
     """
 
     def decorator(func):
-        # Check the values here. The route must not get the default of an
-        # option when its author gave another value.
-        method_list = _cors_name_list("methods", methods)
-        header_list = _cors_name_list("headers", headers)
-        if not isinstance(credentials, bool):
-            raise TypeError(f"@cors() credentials must be a bool, not {type(credentials).__name__} {credentials!r}")
-        if isinstance(max_age, bool) or not isinstance(max_age, int):
-            raise TypeError(f"@cors() max_age must be an int, not {type(max_age).__name__} {max_age!r}")
-        if not 0 <= max_age <= _CORS_MAX_AGE_LIMIT:
-            raise ValueError(f"@cors() max_age must be from 0 to {_CORS_MAX_AGE_LIMIT}, got {max_age}")
-
-        # A str is one origin or one pattern, not a sequence of characters.
-        origin_list = _cors_str_list("origins", origins)
-        regex_list = _cors_str_list("origin_regexes", origin_regexes)
-
-        # SECURITY: Require explicit origins - empty @cors() is a common mistake.
-        # An empty list would use the global settings, which the route replaces.
-        if not origin_list and not regex_list:
-            raise ValueError(
-                "@cors() requires an 'origins' or 'origin_regexes' argument. Examples:\n"
-                "  @cors(origins=['https://example.com'])  # Specific origin\n"
-                "  @cors(origins=['*'])  # Allow all origins\n"
-                "  @cors(origin_regexes=[r'^https://\\w+\\.example\\.com$'])  # Origin patterns\n"
-                "\n"
-                "If you want to use global CORS settings from Django (CORS_ALLOWED_ORIGINS),\n"
-                "simply remove the @cors decorator - global config applies automatically."
-            )
-
-        # SECURITY: An empty pattern matches every origin.
-        if any(not pattern for pattern in regex_list):
-            raise ValueError("@cors() origin_regexes holds an empty pattern, which matches every origin.")
+        config = _checked_cors_config(
+            "@cors()",
+            origins=origins,
+            origin_regexes=origin_regexes,
+            methods=methods,
+            headers=headers,
+            credentials=credentials,
+            max_age=max_age,
+        )
 
         _reject_second_config(func, "cors")
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
 
         # SECURITY: Validate wildcard + credentials
-        if "*" in origin_list and credentials:
+        if "*" in config["origins"] and credentials:
             warnings.warn(
                 "CORS misconfiguration: Cannot use wildcard '*' with credentials=True. "
                 "This violates the CORS specification. Please specify explicit origins.",
@@ -684,17 +760,7 @@ def cors(
                 stacklevel=2,
             )
 
-        func.__bolt_middleware__.append(
-            {
-                "type": "cors",
-                "origins": origin_list,
-                "origin_regexes": regex_list,
-                "methods": method_list or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"],
-                "headers": header_list,
-                "credentials": credentials,
-                "max_age": max_age,
-            }
-        )
+        func.__bolt_middleware__.append(config)
         return func
 
     return decorator
