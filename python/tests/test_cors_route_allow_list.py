@@ -211,6 +211,23 @@ def test_a_cors_setting_that_rust_cannot_use_stops_startup(settings, name, value
     assert str(raised.value) == message
 
 
+def test_an_empty_pattern_in_the_cors_setting_stops_startup(settings):
+    # Before, the empty pattern matched each origin, so each origin got Access-Control-Allow-Origin.
+    settings.CORS_ALLOWED_ORIGINS = ["https://global.test"]
+    settings.CORS_ALLOWED_ORIGIN_REGEXES = [r"^https://[a-z]+\.example\.com$", ""]
+    settings.CORS_ALLOW_CREDENTIALS = True
+    api = BoltAPI()
+
+    @api.get("/plain")
+    async def plain():
+        return {}
+
+    with pytest.raises(ImproperlyConfigured) as raised, TestClient(api, use_http_layer=True) as client:
+        assert _origin_headers(client, "/plain", "https://attacker.evil") == (None, None)
+
+    assert str(raised.value) == "CORS_ALLOWED_ORIGIN_REGEXES holds an empty pattern, which matches every origin."
+
+
 def test_route_cors_wins_over_the_cors_of_the_api():
     api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://api.test"]}])
 

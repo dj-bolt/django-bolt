@@ -78,7 +78,7 @@ CORS_EXPOSE_HEADERS = ["X-Total-Count", "X-Page-Count"]
 CORS_PREFLIGHT_MAX_AGE = 86400  # 24 hours
 ```
 
-Without these settings, Bolt allows the methods `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `QUERY`, and the headers `Content-Type` and `Authorization`. A preflight answer is cached for 3600 seconds. A `"*"` entry in `CORS_ALLOWED_ORIGINS` is not a wildcard. Use `CORS_ALLOW_ALL_ORIGINS = True` to allow each origin. A pattern in `CORS_ALLOWED_ORIGIN_REGEXES` can match a part of the origin, so start it with `^` and end it with `$`. An invalid pattern stops startup with `ImproperlyConfigured`. A value in `CORS_ALLOW_METHODS`, `CORS_ALLOW_HEADERS` or `CORS_EXPOSE_HEADERS` that is not valid in an HTTP header does the same.
+Without these settings, Bolt allows the methods `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `QUERY`, and the headers `Content-Type` and `Authorization`. A preflight answer is cached for 3600 seconds. A `"*"` entry in `CORS_ALLOWED_ORIGINS` is not a wildcard. Use `CORS_ALLOW_ALL_ORIGINS = True` to allow each origin. A pattern in `CORS_ALLOWED_ORIGIN_REGEXES` can match a part of the origin, so start it with `^` and end it with `$`. An invalid pattern or an empty pattern stops startup with `ImproperlyConfigured`. A value in `CORS_ALLOW_METHODS`, `CORS_ALLOW_HEADERS` or `CORS_EXPOSE_HEADERS` that is not valid in an HTTP header does the same.
 
 ## Rate limiting
 
